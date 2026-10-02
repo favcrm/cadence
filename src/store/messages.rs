@@ -412,7 +412,7 @@ impl Store {
         refs: Option<&Value>,
         app: Option<&Value>,
     ) -> Result<(bool, String)> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let mut named: Vec<&str> = Vec::new();
             for m in steer.supersedes {
@@ -472,7 +472,7 @@ impl Store {
                 )?;
             }
             Ok(out)
-        });
+        })
     }
 
     /// CAD-445: a message the daemon itself originates — a master wake,
@@ -524,7 +524,7 @@ impl Store {
                 "a daemon message needs a daemon id and source, not {id}/{source}"
             )));
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let out = self.enqueue_tx_as(
                 &tx,
@@ -543,7 +543,7 @@ impl Store {
                 None,
             )?;
             Ok(out)
-        });
+        })
     }
 
     /// The ids a steering send superseded, oldest first.
@@ -1029,7 +1029,7 @@ impl Store {
         alias: &str,
         proof: Option<(&str, &str)>,
     ) -> Result<Take> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
             if !agent.enabled {
@@ -1156,12 +1156,12 @@ impl Store {
                 Self::event(&tx, alias, "submitting", json!({"message": message.id}))?;
                 return Ok(Take::Message(Box::new(message)));
             }
-        });
+        })
     }
 
     /// Record that the provider acknowledged a turn start.
     pub fn mark_running(&self, message_id: &str, turn_id: &str) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             tx.execute(
                 "UPDATE messages SET state='running',turn_id=? WHERE id=?",
@@ -1182,27 +1182,27 @@ impl Store {
             // are untouched).
             self.task_on_running(&tx, message_id, &alias)?;
             Ok(())
-        });
+        })
     }
 
     /// Return a `submitting` message to `queued` — the submission gate
     /// refused before any paste, so retry is safe.
     pub fn requeue(&self, message_id: &str) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.execute(
                 "UPDATE messages SET state='queued',started=NULL
                          WHERE id=? AND state='submitting'",
                 [message_id],
             )?;
             Ok(())
-        });
+        })
     }
 
     /// PTY submission was accepted by the terminal: the message stays
     /// `running` (turn_id already recorded) with a durable `submitted`
     /// marker until an explicit ack/result report lands.
     pub fn mark_submitted(&self, message: &Message) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             tx.execute(
                 "UPDATE messages SET result=? WHERE id=? AND state='running'",
@@ -1218,7 +1218,7 @@ impl Store {
                 json!({"message": message.id, "turn_id": message.turn_id}),
             )?;
             Ok(())
-        });
+        })
     }
 
     /// Explicit acknowledgement for a running message; it stays
@@ -1227,7 +1227,7 @@ impl Store {
     /// pty-style (explicitly reported) turn carries the `submitted`
     /// marker, so a managed ack never makes its turn `awaiting_report`.
     pub fn mark_ack(&self, message: &Message, text: Option<&str>) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let turn_result = tx
                 .query_opt(
@@ -1268,7 +1268,7 @@ impl Store {
                 json!({"message": message.id, "turn_id": message.turn_id}),
             )?;
             Ok(())
-        });
+        })
     }
 
     /// Count an agent's queued inbound messages (`cadence self` for an
@@ -1503,7 +1503,7 @@ impl Store {
     /// so each probe is an index seek on `msg_queue(alias,state,…)`,
     /// never a scan of the history.
     pub fn running_turn_tokens(&self) -> Result<Vec<(String, String)>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stmt_sql = "SELECT a.alias, m.turn_id
                          FROM agents a JOIN messages m ON m.alias = a.alias AND m.state = 'running'
                          WHERE m.turn_id IS NOT NULL AND m.turn_id != ''";
@@ -1511,13 +1511,13 @@ impl Store {
                 .query_vec(stmt_sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        });
+        })
     }
 
     /// Queued deliveries that are turns of their own — what an
     /// unreported turn holds back (routed notifications still pass).
     pub fn queued_turns(&self, alias: &str) -> Result<i64> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             Ok(conn.query_row(
                 &format!(
                     "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'
@@ -1526,7 +1526,7 @@ impl Store {
                 [alias],
                 |r| r.get(0),
             )?)
-        });
+        })
     }
 
     /// Providers with at least one *live* in-flight turn — the WAL
@@ -1536,7 +1536,7 @@ impl Store {
     /// report bound has not run out at `now`: a stale row on a dead actor
     /// or an overdue one never defers a checkpoint.
     pub fn busy_providers(&self, live: &HashSet<String>, now: f64) -> Result<HashSet<String>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stmt_sql = "SELECT a.provider AS agent_provider, a.params AS agent_params,
                                 a.endpoint_kind AS agent_kind, m.*
                          FROM agents a JOIN messages m ON m.alias = a.alias
@@ -1566,14 +1566,14 @@ impl Store {
                 busy.insert(provider);
             }
             Ok(busy)
-        });
+        })
     }
 
     /// Bound a non-agent event stream to its newest `keep` rows — the
     /// daemon's `wal_checkpointed` stream has no agents row, so the
     /// agent-removal `DELETE` never reaches it.
     pub fn prune_stream(&self, alias: &str, keep: i64) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.execute(
                 "DELETE FROM events WHERE alias=?1 AND seq NOT IN (
                              SELECT seq FROM events WHERE alias=?1
@@ -1581,7 +1581,7 @@ impl Store {
                 params![alias, keep],
             )?;
             Ok(())
-        });
+        })
     }
 
     /// The next still-waiting message for the agent — `queued` or

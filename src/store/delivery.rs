@@ -61,7 +61,7 @@ impl Store {
     /// One alert after held-recovery gives up. The agent stays unfenced
     /// and the held message is not replayed. A second call is a no-op.
     pub fn escalate_cloud_hold(&self, message: &Message, reason: &str) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let already: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='cloud_recover_escalated' \
@@ -94,7 +94,7 @@ impl Store {
                 )?;
             }
             Ok(())
-        });
+        })
     }
 
     /// CAD-152: reserve an `agent recover-submit` Enter for running
@@ -111,7 +111,7 @@ impl Store {
         id: &str,
         detail: Value,
     ) -> Result<Option<i64>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     if let Some(message) = self.message_in(&tx, id)? {
@@ -147,13 +147,13 @@ impl Store {
                     Self::event(&tx, alias, "submit_recovered", detail)?;
                     let seq = tx.last_insert_rowid();
                     Ok(Some(seq))
-        });
+        })
     }
 
     /// CAD-152: merge the outcome (`after`, `result`, …) into the
     /// `submit_recovered` record reserved at `seq`.
     pub fn finish_submit_recovery(&self, seq: i64, outcome: &Value) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let raw: String = tx.query_row(
                 "SELECT payload FROM events WHERE seq=?1 AND kind='submit_recovered'",
@@ -171,14 +171,14 @@ impl Store {
                 params![payload.to_string(), seq],
             )?;
             Ok(())
-        });
+        })
     }
 
     /// CAD-152: the `submit_recovered` record of an earlier `agent
     /// recover-submit` for message `id` on `alias`, if one exists — the
     /// durable marker that makes a second recovery refuse.
     pub fn submit_recovered(&self, alias: &str, id: &str) -> Result<Option<Value>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let raw: Option<String> = conn.query_opt(
                 "SELECT payload FROM events WHERE alias=?1 AND kind='submit_recovered' \
                              AND json_extract(payload,'$.message')=?2 ORDER BY seq LIMIT 1",
@@ -186,20 +186,20 @@ impl Store {
                 |row| row.get(0),
             )?;
             Ok(raw.map(|r| serde_json::from_str(&r).unwrap_or(Value::Null)))
-        });
+        })
     }
 
     /// Endpoint died while submitted PTY messages were in flight — each
     /// may have reached the provider, so they are `unknown`, never retried.
     pub fn orphan_running(&self, alias: &str, error: &str) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.execute(
                 "UPDATE messages SET state='unknown',error=?,completed=?
                          WHERE alias=? AND state='running'",
                 params![error, now(), alias],
             )?;
             Ok(())
-        });
+        })
     }
 
     /// Persist the result and route it to `reply_to` in the SAME
@@ -212,11 +212,11 @@ impl Store {
         result: &Value,
         error: Option<&str>,
     ) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             self.finish_in(&tx, message, status, result, error)?;
             Ok(())
-        });
+        })
     }
 
     /// CAD-250: a nudge never outlives the pane it was aimed at. Cancel the
@@ -282,21 +282,21 @@ impl Store {
     /// CAD-250 N2: the alias's actor stopped (stop, fence, shutdown, any
     /// exit) — its queued nudges are cancelled, never pasted later.
     pub fn cancel_nudges_for(&self, alias: &str, reason: &str) -> Result<Vec<(String, String)>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let closed = Self::cancel_nudges_in(&tx, Some(alias), reason, None)?;
             Ok(closed)
-        });
+        })
     }
 
     /// CAD-250 N3: a nudge still queued `ttl` seconds after it was created
     /// (a pane that stayed busy) is stale steering — cancelled at `now`.
     pub fn expire_queued_nudges(&self, now: f64, ttl: f64) -> Result<Vec<(String, String)>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let closed = Self::cancel_nudges_in(&tx, None, "ttl", Some(now - ttl))?;
             Ok(closed)
-        });
+        })
     }
 
     /// CAD-250: finish a turn from its worker's `message result` — only
@@ -312,7 +312,7 @@ impl Store {
         result: &Value,
         error: Option<&str>,
     ) -> Result<std::result::Result<Message, Option<Message>>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let current = self.message_in(&tx, message_id)?;
             let Some(current) = current.filter(|m| m.state == "running") else {
@@ -320,7 +320,7 @@ impl Store {
             };
             self.finish_in(&tx, &current, status, result, error)?;
             Ok(Ok(current))
-        });
+        })
     }
 
     /// CAD-250: move a delivered, unreported pty turn to `unknown` —
@@ -338,7 +338,7 @@ impl Store {
         bound: Option<(u64, f64)>,
         reason: &str,
     ) -> Result<bool> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let Some(current) = self.message_in(&tx, message_id)? else {
                 return Ok(false);
@@ -354,7 +354,7 @@ impl Store {
                                         "via": "report_timeout", "turn_id": current.turn_id});
             self.finish_in(&tx, &current, "unknown", &stored, Some(reason))?;
             Ok(true)
-        });
+        })
     }
 
     pub(super) fn finish_in(
@@ -746,14 +746,14 @@ impl Store {
     /// True when the alias has an `unknown` in-flight attempt that must be
     /// reconciled before it may run again.
     pub fn has_unknown(&self, alias: &str) -> Result<bool> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let count: i64 = conn.query_row(
                 &format!("SELECT COUNT(*) FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL}"),
                 [alias],
                 |r| r.get(0),
             )?;
             Ok(count > 0)
-        });
+        })
     }
 
     /// The unknown `error` a fence restamp should show. One column, one
@@ -764,7 +764,7 @@ impl Store {
     /// literals `recover` and `orphan_running` write; message rows are
     /// not rewritten here.
     pub fn preferred_unknown_error(&self, alias: &str) -> Result<Option<String>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             match conn.query_row(
                 &format!(
                     "SELECT error FROM messages
@@ -786,14 +786,14 @@ impl Store {
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(error) => Err(error.into()),
             }
-        });
+        })
     }
 
     /// Ids of the alias's fencing `unknown` messages, oldest first — what
     /// `agent unfence` reconciles in one call. An unconfirmed nudge is
     /// `unknown` too but fences nothing, so it is not listed (CAD-250).
     pub fn unknown_messages(&self, alias: &str) -> Result<Vec<String>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stmt_sql = &format!(
                 "SELECT id FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL} ORDER BY seq"
             );
@@ -802,7 +802,7 @@ impl Store {
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                 .collect::<rusqlite::Result<Vec<String>>>()?;
             Ok(ids)
-        });
+        })
     }
 
     /// Operator reconcile — the only exit from `unknown` that keeps the
@@ -837,7 +837,7 @@ impl Store {
             )));
         }
         let sha = sha.map(check_commit_sha).transpose()?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let message = self
                 .message_in(&tx, message_id)?
@@ -910,7 +910,7 @@ impl Store {
             }
             self.message_in(&*tx, message_id)?
                 .ok_or_else(|| Error::internal("reconciled message vanished"))
-        });
+        })
     }
 
     /// Operator/agent cancel of a still-`queued` message — the row keeps
@@ -920,7 +920,7 @@ impl Store {
     /// `worker_notice` so a waiter is never left hanging. A task-bound
     /// delivery is refused — `task cancel` owns that lifecycle.
     pub fn cancel(&self, message_id: &str, by: &str, reason: Option<&str>) -> Result<Message> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let message = self
                 .message_in(&tx, message_id)?
@@ -963,7 +963,7 @@ impl Store {
             self.route_notice(&tx, &message, "cancelled", &result)?;
             self.message_in(&*tx, message_id)?
                 .ok_or_else(|| Error::internal("cancelled message vanished"))
-        });
+        })
     }
 
     /// Routed job notification to the PM — `source='job_event'` so it
@@ -1049,13 +1049,13 @@ impl Store {
         dedupe: &str,
         note: &str,
     ) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let task = self.task_in(&tx, task_id)?;
             let job = self.job_in(&tx, &task.job_id)?;
             self.route_job_event(&tx, &job, &task, new_state, dedupe, note)?;
             Ok(())
-        });
+        })
     }
 
     /// Task edge for `mark_running`: a task-attached kickoff observed

@@ -240,7 +240,7 @@ impl Store {
     /// whether it already existed (the dedupe), so the caller omits a
     /// second `request_opened` event.
     pub fn effect_stage(&self, row: &EffectRow) -> Result<(EffectRow, bool)> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let existing: Option<EffectRow> = tx.query_opt(
                 "SELECT * FROM platform_effects WHERE request=?1",
@@ -298,36 +298,36 @@ impl Store {
                                "input_summary": row.input_summary}),
             )?;
             Ok((row.clone(), false))
-        });
+        })
     }
 
     /// One row by brokered handle.
     pub fn effect_by_request(&self, request: &str) -> Result<Option<EffectRow>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.query_opt(
                 "SELECT * FROM platform_effects WHERE request=?1",
                 params![request],
                 EffectRow::from_row,
             )
             .map_err(Into::into)
-        });
+        })
     }
 
     /// One row by durable id.
     pub fn effect_by_id(&self, effect_id: &str) -> Result<Option<EffectRow>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.query_opt(
                 "SELECT * FROM platform_effects WHERE effect_id=?1",
                 params![effect_id],
                 EffectRow::from_row,
             )
             .map_err(Into::into)
-        });
+        })
     }
 
     /// Pending-effect records — all of them, or one agent's.
     pub fn platform_effects(&self, agent: Option<&str>) -> Result<Vec<EffectRow>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let mut out = Vec::new();
                     match agent {
@@ -346,13 +346,13 @@ impl Store {
                         }
                     }
                     Ok(out)
-        });
+        })
     }
 
     /// The draft log — the information-only "ran without you" rows.
     /// `limit` bounds the listing; newest first.
     pub fn platform_drafts(&self, agent: Option<&str>, limit: usize) -> Result<Vec<DraftRow>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let mut out = Vec::new();
             let sql = match agent {
                 Some(_) => {
@@ -373,13 +373,13 @@ impl Store {
                 out.push(r?);
             }
             Ok(out)
-        });
+        })
     }
 
     /// Record one `draft` execution — row and `effect_executed` audit in
     /// one transaction (§5.5 audits drafts too; there is no pending row).
     pub fn draft_record(&self, row: &DraftRow, verified_ok: &Value) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             tx.execute(
                 "INSERT INTO platform_drafts
@@ -407,7 +407,7 @@ impl Store {
                                "result": verified_ok, "verified": true}),
             )?;
             Ok(())
-        });
+        })
     }
 
     /// The press — `accept` or `decline`. One atomic guarded update is
@@ -425,7 +425,7 @@ impl Store {
         accept: bool,
         decision: &Value,
     ) -> Result<Option<EffectRow>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let state = if accept { "decided" } else { "declined" };
             let n = tx.execute(
@@ -450,7 +450,7 @@ impl Store {
                 EffectRow::from_row,
             )?;
             Ok(Some(row))
-        });
+        })
     }
 
     /// `decided` → `executing`, immediately before the platform call.
@@ -458,14 +458,14 @@ impl Store {
     /// distinguishable from "executing" at restart — both reconcile,
     /// but the record says exactly where the run stopped.
     pub fn effect_executing(&self, effect_id: &str) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.execute(
                 "UPDATE platform_effects SET state='executing', updated_at=?2
                          WHERE effect_id=?1 AND state='decided'",
                 params![effect_id, now()],
             )?;
             Ok(())
-        });
+        })
     }
 
     /// The platform outcome: `executing` → `done`|`failed` with the
@@ -478,7 +478,7 @@ impl Store {
         outcome: &Value,
         summary: &str,
     ) -> Result<EffectRow> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let needs_you = outcome["verified"] == json!(false);
             tx.execute(
@@ -518,7 +518,7 @@ impl Store {
                 EffectRow::from_row,
             )?;
             Ok(row)
-        });
+        })
     }
 
     /// Cancel a `waiting` (or `reconcile`) row: `closed` with the
@@ -549,7 +549,7 @@ impl Store {
         reason: &str,
         states: &[&'static str],
     ) -> Result<Option<EffectRow>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let (where_by, arg): (&str, String) = match key {
                 EffectKey::Request(r) => ("request", r),
@@ -585,7 +585,7 @@ impl Store {
                                "reason": reason}),
             )?;
             Ok(Some(row))
-        });
+        })
     }
 
     /// §5.4 step 8 — restart reconciliation, inside `recover`'s
@@ -630,7 +630,7 @@ impl Store {
     /// state); only the row bookkeeping clears. Answers `None` when
     /// the row is not a flagged terminal.
     pub fn effect_ack(&self, effect_id: &str) -> Result<Option<EffectRow>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let n = tx.execute(
                 "UPDATE platform_effects SET needs_you=0, updated_at=?2 \
@@ -652,7 +652,7 @@ impl Store {
                 EffectRow::from_row,
             )?;
             Ok(Some(row))
-        });
+        })
     }
 
     /// `waiting` rows re-park as live pending entries after restart.

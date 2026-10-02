@@ -508,19 +508,19 @@ impl Store {
         platform: &str,
         account: &str,
     ) -> Result<Option<CredentialRecord>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.query_opt(
                 "SELECT * FROM platform_credentials WHERE platform=?1 AND account=?2",
                 params![platform, account],
                 credential_row,
             )
             .map_err(Into::into)
-        });
+        })
     }
 
     /// Every enrolled credential record, sorted by platform/account.
     pub fn platform_credentials(&self) -> Result<Vec<CredentialRecord>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stmt_sql = "SELECT * FROM platform_credentials ORDER BY platform, account";
             let rows = conn
                 .query_vec(stmt_sql, [], credential_row)
@@ -530,7 +530,7 @@ impl Store {
                 out.push(r?);
             }
             Ok(out)
-        });
+        })
     }
 
     /// Insert the custody record for `(platform, account)` and its
@@ -556,7 +556,7 @@ impl Store {
         if record.credential_revision > i64::MAX as u64 {
             return Err(Error::rejected("connection revision exceeds storage bound"));
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let existing: Option<(String, String, u64)> = tx
@@ -639,7 +639,7 @@ impl Store {
                     }
                     Self::event(&tx, PLATFORM_STREAM, PLATFORM_CONNECTED_EVENT, payload)?;
                     Ok(())
-        });
+        })
     }
 
     /// Revoke `(platform, account)`'s credential: custody row gone,
@@ -657,7 +657,7 @@ impl Store {
         reason: Option<&str>,
         effects_closed: &[String],
     ) -> Result<Option<(CredentialRecord, Vec<Grant>)>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let record: Option<CredentialRecord> = tx.query_opt(
                 "SELECT * FROM platform_credentials WHERE platform=?1 AND account=?2",
@@ -712,7 +712,7 @@ impl Store {
                                "effects_closed": effects_closed, "by": by}),
             )?;
             Ok(Some((record, grants)))
-        });
+        })
     }
 
     /// The grant `(agent, platform, account)` currently holds.
@@ -722,19 +722,19 @@ impl Store {
         platform: &str,
         account: &str,
     ) -> Result<Option<Grant>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.query_opt(
                 "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
                 params![agent, platform, account],
                 grant_row,
             )
             .map_err(Into::into)
-        });
+        })
     }
 
     /// Grants — all of them, or one agent's.
     pub fn platform_grants(&self, agent: Option<&str>) -> Result<Vec<Grant>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let mut out = Vec::new();
             match agent {
                 Some(agent) => {
@@ -759,7 +759,7 @@ impl Store {
                 }
             }
             Ok(out)
-        });
+        })
     }
 
     /// Record `(agent, platform, account, scopes)` — the operator's
@@ -775,7 +775,7 @@ impl Store {
         by: &str,
     ) -> Result<Grant> {
         identifier(agent, "Agent")?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             // The credential must exist — a grant on nothing is a latent
             // privilege the next enroll would silently arm. The built-in
@@ -852,7 +852,7 @@ impl Store {
                                "scopes": added, "by": by}),
             )?;
             Ok(grant)
-        });
+        })
     }
 
     /// Revoke `scopes` from `(agent, platform, account)`'s grant —
@@ -867,7 +867,7 @@ impl Store {
         scopes: Option<&[String]>,
         by: &str,
     ) -> Result<(bool, Option<Grant>)> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let existing: Option<Grant> = tx.query_opt(
                 "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
@@ -917,7 +917,7 @@ impl Store {
                     })
                 },
             ))
-        });
+        })
     }
 
     /// Record `project`'s default account for `platform`. The account
@@ -930,7 +930,7 @@ impl Store {
         account: &str,
         by: &str,
     ) -> Result<ProjectDefault> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let enrolled: Option<i64> = tx.query_opt(
                 "SELECT 1 FROM platform_credentials WHERE platform=?1 AND account=?2",
@@ -962,7 +962,7 @@ impl Store {
                 set_at: now(),
                 by: by.to_string(),
             })
-        });
+        })
     }
 
     /// `project`'s default account for `platform`, if one is set.
@@ -971,7 +971,7 @@ impl Store {
         project: &str,
         platform: &str,
     ) -> Result<Option<ProjectDefault>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.query_opt(
                 "SELECT * FROM platform_defaults WHERE project=?1 AND platform=?2",
                 params![project, platform],
@@ -986,12 +986,12 @@ impl Store {
                 },
             )
             .map_err(Into::into)
-        });
+        })
     }
 
     /// Every project default — `platform_defaults` lists them.
     pub fn platform_defaults(&self) -> Result<Vec<ProjectDefault>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stmt_sql = "SELECT * FROM platform_defaults ORDER BY project, platform";
             let rows = conn
                 .query_vec(stmt_sql, [], |row| {
@@ -1009,7 +1009,7 @@ impl Store {
                 out.push(r?);
             }
             Ok(out)
-        });
+        })
     }
 
     // ---------- CAD-577: app-derived grants ----------
@@ -1033,11 +1033,11 @@ impl Store {
         grants: &[(String, String, String, Vec<String>)],
         by: &str,
     ) -> Result<Vec<(String, String, String)>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let changed = apply_derived(&tx, app, install_id, grants, by)?;
             Ok(changed)
-        });
+        })
     }
 
     /// Re-derive or revoke under one write lock, re-reading the approval
@@ -1052,7 +1052,7 @@ impl Store {
         grants: &[Derived],
         by: &str,
     ) -> Result<Vec<(String, String, String)>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let approval = latest_app_approval(&tx, app)?;
             let live = digest.is_some_and(|d| {
@@ -1066,7 +1066,7 @@ impl Store {
                 revoke_derived(&tx, app, by)?
             };
             Ok(changed)
-        });
+        })
     }
 
     /// Record an approval and derive its grants in one transaction, so a
@@ -1079,7 +1079,7 @@ impl Store {
         grants: &[Derived],
         by: &str,
     ) -> Result<Vec<(String, String, String)>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let install_id = approval
                 .get("install_id")
@@ -1089,7 +1089,7 @@ impl Store {
             Self::event(&tx, APPROVAL_STREAM, APP_APPROVED_EVENT, approval)?;
             let changed = apply_derived(&tx, app, &install_id, grants, by)?;
             Ok(changed)
-        });
+        })
     }
 
     /// Record a withdrawn approval and subtract its derived grants in
@@ -1101,12 +1101,12 @@ impl Store {
         app: &str,
         by: &str,
     ) -> Result<Vec<(String, String, String)>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::event(&tx, APPROVAL_STREAM, APP_APPROVED_EVENT, approval)?;
             let changed = revoke_derived(&tx, app, by)?;
             Ok(changed)
-        });
+        })
     }
 
     /// Every app key that still holds derived grant rows (CAD-577) —
@@ -1114,13 +1114,13 @@ impl Store {
     /// removed from the tracker, so a removal can never leave a
     /// standing grant behind.
     pub fn app_grants_apps(&self) -> Result<Vec<String>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stmt_sql = "SELECT DISTINCT app FROM app_grants ORDER BY app";
             let rows = conn
                 .query_vec(stmt_sql, [], |r| r.get::<_, String>(0))
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.flatten().collect())
-        });
+        })
     }
 
     /// Drop grant rows for `app` whose install id is not `install_id`,
@@ -1133,7 +1133,7 @@ impl Store {
         install_id: &str,
         by: &str,
     ) -> Result<Vec<(String, String, String)>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let rows: Vec<Derived> = tx.query_vec(
                 "SELECT agent, platform, account, scopes FROM app_grants \
@@ -1163,14 +1163,14 @@ impl Store {
                 )?;
             }
             Ok(changed)
-        });
+        })
     }
 
     /// Every derived-grant row's `(app, install_id)`. The sweep uses
     /// this to find a grant whose install is no longer the current one,
     /// including a row whose approval derived nothing else to list.
     pub fn app_grant_installs(&self) -> Result<Vec<(String, String)>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stmt_sql = "SELECT DISTINCT app, install_id FROM app_grants ORDER BY app";
             let rows = conn
                 .query_vec(stmt_sql, [], |r| {
@@ -1178,7 +1178,7 @@ impl Store {
                 })
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.flatten().collect())
-        });
+        })
     }
 
     /// Revoke every grant an app's approval derived: the `app_grants`
@@ -1189,11 +1189,11 @@ impl Store {
     /// account)` triples whose platform grant changed, so the caller
     /// can drain the waiting effects that lost a scope (CAD-506).
     pub fn app_grants_revoke(&self, app: &str, by: &str) -> Result<Vec<(String, String, String)>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let changed = revoke_derived(&tx, app, by)?;
             Ok(changed)
-        });
+        })
     }
 }
 

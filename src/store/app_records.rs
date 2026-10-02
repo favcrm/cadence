@@ -796,12 +796,12 @@ impl RecordStore {
                 if existing != digest {
                     return Err(Error::rejected("record ID already holds different content"));
                 }
-                return Ok(json!({"record": self.show_in(&*tx, context, record_id)?}));
+                return Ok(json!({"record": self.show_in(tx, context, record_id)?}));
             }
             // One address, one live row per context: a new ID behind a
             // held normalized email is refused, never merged. Profiles
             // without an address skip the check.
-            Self::email_conflict_in(&*tx, context, record_id, profile)?;
+            Self::email_conflict_in(tx, context, record_id, profile)?;
             let count: i64 = tx
                 .query_row(
                     "SELECT count(*) FROM app_records WHERE context_id=?",
@@ -822,7 +822,7 @@ impl RecordStore {
                 params![context, record_id, body, digest, now()],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
-            Ok(json!({"record": self.show_in(&*tx, context, record_id)?}))
+            Ok(json!({"record": self.show_in(tx, context, record_id)?}))
         })?;
         Ok(result)
     }
@@ -934,14 +934,14 @@ impl RecordStore {
         // normalized-email check + update: a racing writer's commit is
         // seen before this lands (IMMEDIATE, like create).
         self.write_tx(|tx| {
-            let current = self.show_in(&*tx, context, record_id)?;
+            let current = self.show_in(tx, context, record_id)?;
             if current["revision"].as_i64() != Some(expected) {
                 return Err(Error::rejected("record revision is stale"));
             }
             // A move onto another live row's normalized email is
             // refused, never merged; the row itself is excluded from
             // the check.
-            Self::email_conflict_in(&*tx, context, record_id, profile)?;
+            Self::email_conflict_in(tx, context, record_id, profile)?;
             let revision = expected
                 .checked_add(1)
                 .ok_or_else(|| Error::rejected("record revision exhausted"))?;
@@ -959,7 +959,7 @@ impl RecordStore {
                 params![context, record_id, revision, body, digest, now()],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
-            Ok(json!({"record": self.show_in(&*tx, context, record_id)?}))
+            Ok(json!({"record": self.show_in(tx, context, record_id)?}))
         })
     }
 }

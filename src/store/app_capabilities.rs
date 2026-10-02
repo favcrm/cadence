@@ -148,7 +148,7 @@ impl Store {
             input_digest,
             call_id,
         } = claim;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let active: bool = tx.query_row(
@@ -197,7 +197,7 @@ impl Store {
                         ));
                     }
                     Ok(())
-        });
+        })
     }
 
     pub(crate) fn app_selected_source_input(
@@ -322,7 +322,7 @@ impl Store {
             "asset":asset.map(|(kind,bytes)|json!({"media_type":kind,
                 "digest":app_runs::artifact_digest(bytes),"size":bytes.len()}))
         }));
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let active: bool = tx.query_row(
@@ -402,7 +402,7 @@ impl Store {
                         json!({"run_id":run,"step_id":step,"slot":slot,"receipt_id":id,"digest":digest}),
                     )?;
                     Self::app_capability_result_in(&tx, id)
-        });
+        })
     }
 
     pub(crate) fn app_capability_result(&self, id: &str) -> Result<Value> {

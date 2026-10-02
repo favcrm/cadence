@@ -295,7 +295,7 @@ impl Store {
     /// (`payload.message`) — e.g. the daemon's `master_dispatched`
     /// record of a master kickoff (CAD-323).
     pub fn event_names_message(&self, alias: &str, kind: &str, message_id: &str) -> Result<bool> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let n: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind=?2 \
                          AND json_extract(payload,'$.message')=?3",
@@ -303,7 +303,7 @@ impl Store {
                 |row| row.get(0),
             )?;
             Ok(n > 0)
-        });
+        })
     }
 
     /// CAD-405: record the operator's approval of a project's work gate
@@ -319,7 +319,7 @@ impl Store {
     /// bounded; returns the number folded — `limit` means more may
     /// remain.
     pub fn roll_up_delivery_events(&self, cutoff: f64, limit: usize) -> Result<usize> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let mut rows: Vec<(i64, String, String, f64)> = tx.query_vec(
                 &format!(
@@ -390,12 +390,11 @@ impl Store {
                 }
             }
             Ok(rows.len())
-        });
+        })
     }
 
     pub fn record_work_approval(&self, payload: Value) -> Result<()> {
-        return self
-            .write_tx(|conn| Self::event(&conn, APPROVAL_STREAM, WORK_APPROVED_EVENT, payload));
+        self.write_tx(|conn| Self::event(&conn, APPROVAL_STREAM, WORK_APPROVED_EVENT, payload))
     }
 
     /// CAD-487: record the operator's approval of a workflow's gate
@@ -404,9 +403,7 @@ impl Store {
     /// `"<project>/<name>"` so a project approval and a workflow
     /// approval never share a row.
     pub fn record_workflow_approval(&self, payload: Value) -> Result<()> {
-        return self.write_tx(|conn| {
-            Self::event(&conn, APPROVAL_STREAM, WORKFLOW_APPROVED_EVENT, payload)
-        });
+        self.write_tx(|conn| Self::event(&conn, APPROVAL_STREAM, WORKFLOW_APPROVED_EVENT, payload))
     }
 
     /// CAD-487: the latest workflow approval per `"<project>/<name>"`.
@@ -437,8 +434,7 @@ impl Store {
     /// workflow approvals — a separate event kind, so a workflow named
     /// `a` and an app named `a` never share a row.
     pub fn record_app_approval(&self, payload: Value) -> Result<()> {
-        return self
-            .write_tx(|conn| Self::event(&conn, APPROVAL_STREAM, APP_APPROVED_EVENT, payload));
+        self.write_tx(|conn| Self::event(&conn, APPROVAL_STREAM, APP_APPROVED_EVENT, payload))
     }
 
     /// CAD-547: the latest app approval per `"<project>/<name>"`.
@@ -466,8 +462,7 @@ impl Store {
     /// CAD-449: record a verdict `report_verdict` accepted (`issue`,
     /// `verdict`, `sha`, `reviewer`, `report`) on [`VERDICT_STREAM`].
     pub fn record_review_verdict(&self, payload: Value) -> Result<()> {
-        return self
-            .write_tx(|conn| Self::event(&conn, VERDICT_STREAM, VERDICT_RECORDED_EVENT, payload));
+        self.write_tx(|conn| Self::event(&conn, VERDICT_STREAM, VERDICT_RECORDED_EVENT, payload))
     }
 
     /// CAD-449: did `report_verdict` record exactly this verdict — the
@@ -542,7 +537,7 @@ impl Store {
 
     /// CAD-405: the latest work-gate approval per project.
     pub fn work_approvals(&self) -> Result<std::collections::HashMap<String, Value>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let rows: Vec<String> = conn.query_vec(
                 "SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq",
                 params![APPROVAL_STREAM, WORK_APPROVED_EVENT],
@@ -558,12 +553,12 @@ impl Store {
                 }
             }
             Ok(out)
-        });
+        })
     }
 
     /// Standalone event insert for runtime/daemon bookkeeping.
     pub fn event_public(&self, alias: &str, kind: &str, payload: Value) -> Result<()> {
-        return self.write_tx(|conn| Self::event(&conn, alias, kind, payload));
+        self.write_tx(|conn| Self::event(&conn, alias, kind, payload))
     }
 
     /// The first approval event of `kind` naming approval `id` on
@@ -610,7 +605,7 @@ impl Store {
             None => default_approval_id(a.action, a.pr, a.head_sha),
         };
         identifier(&base, "Approval id")?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             for n in 1..=1000u32 {
                 let id = if n == 1 {
@@ -655,7 +650,7 @@ impl Store {
             Err(Error::rejected(format!(
                 "Approval id '{base}': no free default id — pass --id"
             )))
-        });
+        })
     }
 
     /// Every approval-stream event, oldest first: `(kind, payload, at)`.
@@ -728,7 +723,7 @@ impl Store {
         approval_source(a.source)?;
         approval_head(a.head_sha)?;
         approval_repo(a.repo)?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let stream = Self::approval_stream(&tx)?;
@@ -776,7 +771,7 @@ impl Store {
                     let base = default_approval_id(a.action, a.pr, a.head_sha);
                     let id = Self::append_approval(&tx, &stream, &base, payload)?;
                     Ok((true, id))
-        });
+        })
     }
 
     /// CAD-918: the operator pre-approved the scope of `issue` at ticket
@@ -789,7 +784,7 @@ impl Store {
         recorded_via: &str,
     ) -> Result<(bool, String)> {
         approval_source(source)?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let stream = Self::approval_stream(&tx)?;
             let scope = json!({"issue": issue, "digest": digest});
@@ -806,12 +801,12 @@ impl Store {
             let base = format!("scope-{}-{}", issue.to_ascii_lowercase(), &digest[..12]);
             let id = Self::append_approval(&tx, &stream, &base, payload)?;
             Ok((true, id))
-        });
+        })
     }
 
     /// A live (unrevoked) scope pre-approval by id: `(issue, digest)`.
     pub fn scope_approval(&self, id: &str) -> Result<Option<(String, String)>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stream = Self::approval_stream(&conn)?;
             if Self::revoked_ids(&stream).contains(id) {
                 return Ok(None);
@@ -826,7 +821,7 @@ impl Store {
                         (text("issue"), text("digest"))
                     })
             }))
-        });
+        })
     }
 
     /// CAD-918: designate (`active`) or undesignate `alias` for
@@ -842,7 +837,7 @@ impl Store {
     ) -> Result<bool> {
         identifier(alias, "Designated alias")?;
         approval_source(source)?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             // An active designation that predates the agent's current
             // registration counts for nothing, so designating again writes.
@@ -860,7 +855,7 @@ impl Store {
                                          "source": source, "recorded_via": recorded_via});
             Self::event(&tx, APPROVAL_STREAM, DESIGNATION_EVENT, payload)?;
             Ok(true)
-        });
+        })
     }
 
     /// The designation in force per `(alias, project)`, with its time.
@@ -899,7 +894,7 @@ impl Store {
         approval_source(source)?;
         approval_text(reason, "Approval revocation reason", 256)?;
         let evidence = json!({"approval_id": id, "source": source, "reason": reason});
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             if Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, id)?.is_none() {
                 return Err(Error::rejected(format!(
@@ -921,7 +916,7 @@ impl Store {
             payload["recorded_via"] = json!(recorded_via);
             Self::event(&tx, APPROVAL_STREAM, APPROVAL_REVOKED_EVENT, payload)?;
             Ok(true)
-        });
+        })
     }
 
     /// `event_public` with job/task scope — the stall watch uses it so
@@ -935,8 +930,7 @@ impl Store {
         job_id: Option<&str>,
         task_id: Option<&str>,
     ) -> Result<()> {
-        return self
-            .write_tx(|conn| Self::event_scoped(&conn, alias, kind, payload, job_id, task_id));
+        self.write_tx(|conn| Self::event_scoped(&conn, alias, kind, payload, job_id, task_id))
     }
 
     /// Record the build commit this daemon process is running.

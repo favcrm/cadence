@@ -30,7 +30,7 @@ impl Store {
     /// transaction. The receipt is local mailbox history; `route_result`
     /// deliberately does not turn it into a synthetic worker notification.
     pub fn inbox_drain(&self, alias: &str, after: i64) -> Result<Vec<Message>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             self.inbox_agent_in(&tx, alias)?;
             let pending = tx.query_vec(
@@ -50,7 +50,7 @@ impl Store {
                 self.route_result(&tx, m, &result)?;
             }
             Ok(pending)
-        });
+        })
     }
 
     /// Peek at an inbox agent's queue (CAD-480): every `queued` message
@@ -62,7 +62,7 @@ impl Store {
     /// queued and countable but stop blocking the follower's head of
     /// line.
     pub fn inbox_peek(&self, alias: &str, after: i64, reader: &str) -> Result<Vec<Message>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             self.inbox_agent_in(&conn, alias)?;
             let stmt_sql = "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
                          ORDER BY seq";
@@ -76,7 +76,7 @@ impl Store {
                 .into_iter()
                 .filter(|m| !parked.contains(&m.id))
                 .collect())
-        });
+        })
     }
 
     /// The message ids `reader` parked on this inbox (`inbox_park`
@@ -116,7 +116,7 @@ impl Store {
     /// Returns the seqs this call completed and the remaining unread
     /// count.
     pub fn inbox_ack(&self, alias: &str, through: i64, reader: &str, by: &str) -> Result<Value> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             self.inbox_agent_in(&tx, alias)?;
             let tail: i64 = tx.query_row(
@@ -170,7 +170,7 @@ impl Store {
             )?;
             Ok(json!({"acked": acked, "through": through, "reader": reader,
                               "unread": unread}))
-        });
+        })
     }
 
     /// Park one still-queued message for `reader` (CAD-480): the
@@ -187,7 +187,7 @@ impl Store {
         by: &str,
         reason: &str,
     ) -> Result<Value> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             self.inbox_agent_in(&tx, alias)?;
             let state: Option<String> = tx.query_opt(
@@ -221,7 +221,7 @@ impl Store {
                 |r| r.get(0),
             )?;
             Ok(json!({"parked": message, "reader": reader, "unread": unread}))
-        });
+        })
     }
 
     /// Reset one reader's cursor (CAD-480): the `inbox_ack_reset` event
@@ -230,7 +230,7 @@ impl Store {
     /// the cursor moves — completed messages stay completed, so nothing
     /// is lost; queued ones come back.
     pub fn inbox_ack_reset(&self, alias: &str, reader: &str, by: &str) -> Result<Value> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             self.inbox_agent_in(&tx, alias)?;
             Self::event(
@@ -240,7 +240,7 @@ impl Store {
                 json!({"reader": reader, "by": by}),
             )?;
             Ok(json!({"reset": reader}))
-        });
+        })
     }
 
     /// Per-reader consume watermarks for an inbox (CAD-480), derived

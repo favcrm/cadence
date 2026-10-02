@@ -154,7 +154,7 @@
         s.enqueue("w1", "task", None, "m-work", "user").unwrap();
         s.set_state_detached("w1", "stopped", None).unwrap();
         s.fixture_write(|c| (*c).execute("UPDATE messages SET state='unknown' WHERE id='m-nudge'", [])
-            .map_err(Into::into)).unwrap();
+            ).unwrap();
         let err = s
             .remove_agent("w1", true, &operator_by())
             .unwrap_err()
@@ -165,7 +165,7 @@
         assert_eq!(s.message("m-work").unwrap().unwrap().state, "queued");
         // A fencing unknown also offers unfence.
         s.fixture_write(|c| (*c).execute("UPDATE messages SET state='unknown' WHERE id='m-work'", [])
-            .map_err(Into::into)).unwrap();
+            ).unwrap();
         let err = s
             .remove_agent("w1", true, &operator_by())
             .unwrap_err()
@@ -254,7 +254,7 @@
                 "UPDATE messages SET state='completed' WHERE id='fresh-1'",
                 [],
             )
-            .map_err(Into::into)).unwrap();
+            ).unwrap();
         s.remove_agent("w1", false, &operator_by()).unwrap();
     }
 
@@ -701,13 +701,13 @@
                 "UPDATE messages SET state='completed' WHERE id='m-chat'",
                 [],
             )
-            .map_err(Into::into)).unwrap();
+            ).unwrap();
         s.fixture_write(|c| (*c).execute(
                 "UPDATE agents SET state='stopped', enabled=0, endpoint=NULL,
                  updated=? WHERE alias='w1'",
                 params![now() - 30.0 * 86_400.0],
             )
-            .map_err(Into::into)).unwrap();
+            ).unwrap();
 
         assert!(s.timer_gc_remove("w1", 86_400.0).unwrap().is_some());
         assert!(s.agent_opt("w1").unwrap().is_none());
@@ -739,7 +739,7 @@
                      updated=? WHERE alias=?",
                     params![aged, alias],
                 )
-                .map_err(Into::into)).unwrap();
+                ).unwrap();
         }
         // Terminal history does not keep a row; every other state does,
         // including one the store has never heard of.
@@ -752,7 +752,7 @@
         ] {
             s.enqueue(alias, "work", None, id, "user").unwrap();
             s.fixture_write(|c| (*c).execute("UPDATE messages SET state=? WHERE id=?", params![state, id])
-                .map_err(Into::into)).unwrap();
+                ).unwrap();
         }
         s.fixture_write(|c| {
             (*c).execute("UPDATE agents SET enabled=1 WHERE alias='enabled'", [])?;

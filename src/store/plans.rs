@@ -330,18 +330,18 @@ impl Store {
     }
 
     pub fn tasks_for_job(&self, job_id: &str) -> Result<Vec<Task>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stmt_sql = "SELECT * FROM tasks WHERE job_id=? ORDER BY created";
             let rows = conn
                 .query_vec(stmt_sql, [job_id], row_task)
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        });
+        })
     }
 
     /// An alias's non-terminal task assignments — derived, never stored.
     pub fn tasks_for_assignee(&self, alias: &str) -> Result<Vec<Task>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stmt_sql = "SELECT * FROM tasks WHERE assignee=?
                          AND state NOT IN ('verified','done','cancelled','failed')
                          ORDER BY updated";
@@ -349,29 +349,29 @@ impl Store {
                 .query_vec(stmt_sql, [alias], row_task)
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        });
+        })
     }
 
     pub fn verdicts_for_task(&self, task_id: &str) -> Result<Vec<Verdict>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stmt_sql = "SELECT * FROM verdicts WHERE task_id=? ORDER BY revision, seq";
             let rows = conn
                 .query_vec(stmt_sql, [task_id], row_verdict)
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        });
+        })
     }
 
     /// Every message attached to a task (kickoffs + `--task` sends),
     /// oldest first — `job task show`'s delivery view.
     pub fn messages_for_task(&self, task_id: &str) -> Result<Vec<Message>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stmt_sql = "SELECT * FROM messages WHERE task_id=? ORDER BY seq";
             let rows = conn
                 .query_vec(stmt_sql, [task_id], row_message)
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        });
+        })
     }
 
     /// `job new`: bookkeeping, not spawning. One transaction writes the
@@ -410,7 +410,7 @@ impl Store {
         if stall_secs.is_some_and(|s| s < 0) {
             return Err(Error::rejected("--stall-secs must be >= 0"));
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             self.agent_in(&tx, pm_alias)?;
             if let Ok(existing) = self.job_in(&tx, id) {
@@ -502,7 +502,7 @@ impl Store {
                 Some(&task_id),
             )?;
             Ok((false, self.job_in(&conn, id)?))
-        });
+        })
     }
 
     /// `job task add`: a draft task in an open job. `--assignee` is
@@ -522,7 +522,7 @@ impl Store {
         base_sha: Option<&str>,
     ) -> Result<Task> {
         identifier(id, "Task id")?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_job(&tx, job_id)?;
             let job = self.job_in(&tx, job_id)?;
@@ -560,7 +560,7 @@ impl Store {
                 Some(id),
             )?;
             self.task_in(&conn, id)
-        });
+        })
     }
 
     fn task_opt_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<bool> {
@@ -610,7 +610,7 @@ impl Store {
         message_id: Option<&str>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_task(&tx, task_id)?;
             let task = self.task_in(&tx, task_id)?;
@@ -734,7 +734,7 @@ impl Store {
             let behind_dead = worker.endpoint.is_none()
                 && registry::has_actor(&worker.provider, &worker.endpoint_kind);
             Ok((self.task_in(&conn, task_id)?, kickoff, false, behind_dead))
-        });
+        })
     }
 
     /// `job verdict`: validate + record + transition + notify in one
@@ -770,7 +770,7 @@ impl Store {
             )));
         }
         let sha = check_commit_sha(sha)?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_task(&tx, task_id)?;
             let task = self.task_in(&tx, task_id)?;
@@ -913,7 +913,7 @@ impl Store {
             self.route_job_event(&tx, &job, &task, next, &format!("verdict:{seq}"), &note)?;
             let verdict_row = self.verdict_in(&conn, seq)?;
             Ok((self.task_in(&conn, task_id)?, verdict_row))
-        });
+        })
     }
 
     /// `job accept`: verified → done, the acceptance edge. `--merged-sha`
@@ -923,7 +923,7 @@ impl Store {
         if let Some(s) = merged_sha {
             check_commit_sha(s)?;
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_task(&tx, task_id)?;
             let task = self.task_in(&tx, task_id)?;
@@ -960,13 +960,13 @@ impl Store {
                 ),
             )?;
             self.task_in(&conn, task_id)
-        });
+        })
     }
 
     /// `job task reopen`: blocked/verified/failed → draft, revision
     /// resets to 0 — a re-scope, not a continuation. Operator intent.
     pub fn reopen_task(&self, task_id: &str, by: &str) -> Result<Task> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_task(&tx, task_id)?;
             let task = self.task_in(&tx, task_id)?;
@@ -991,12 +991,12 @@ impl Store {
                 Some(task_id),
             )?;
             self.task_in(&conn, task_id)
-        });
+        })
     }
 
     /// `job task fail`: PM marks a task unrecoverable. Terminal.
     pub fn fail_task(&self, task_id: &str, reason: &str, by: &str) -> Result<Task> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_task(&tx, task_id)?;
             let task = self.task_in(&tx, task_id)?;
@@ -1019,7 +1019,7 @@ impl Store {
                 Some(task_id),
             )?;
             self.task_in(&conn, task_id)
-        });
+        })
     }
 
     /// `job task cancel`: task → cancelled; its kickoff is cancelled in
@@ -1027,7 +1027,7 @@ impl Store {
     /// `running` kickoff cannot be unpasted and finishes on its own.
     /// Agents are never stopped by a job.
     pub fn cancel_task(&self, task_id: &str, by: &str) -> Result<Task> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_task(&tx, task_id)?;
             let task = self.task_in(&tx, task_id)?;
@@ -1039,7 +1039,7 @@ impl Store {
             }
             self.cancel_task_tx(&tx, &task, by)?;
             self.task_in(&conn, task_id)
-        });
+        })
     }
 
     fn cancel_task_tx(&self, tx: &impl super::StoreConn, task: &Task, by: &str) -> Result<()> {
@@ -1069,7 +1069,7 @@ impl Store {
     /// in one transaction (queued kickoffs included). Running kickoffs
     /// are left alone — agents are never stopped by a job.
     pub fn cancel_job(&self, job_id: &str, by: &str) -> Result<Job> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_job(&tx, job_id)?;
             let job = self.job_in(&tx, job_id)?;
@@ -1101,12 +1101,12 @@ impl Store {
                 None,
             )?;
             self.job_in(&conn, job_id)
-        });
+        })
     }
 
     /// `job close`: legal only when every task is `done`.
     pub fn close_job(&self, job_id: &str, by: &str) -> Result<Job> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_job(&tx, job_id)?;
             let job = self.job_in(&tx, job_id)?;
@@ -1141,7 +1141,7 @@ impl Store {
                 None,
             )?;
             self.job_in(&conn, job_id)
-        });
+        })
     }
 
     /// `job task sha`: record the reported commit manually — the repair
@@ -1150,7 +1150,7 @@ impl Store {
     /// event; overwriting a different SHA is rejected.
     pub fn set_task_sha(&self, task_id: &str, sha: &str, by: &str) -> Result<Task> {
         let sha = check_commit_sha(sha)?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_task(&tx, task_id)?;
             let task = self.task_in(&tx, task_id)?;
@@ -1183,7 +1183,7 @@ impl Store {
                 Some(task_id),
             )?;
             self.task_in(&conn, task_id)
-        });
+        })
     }
 
     fn verdict_in(&self, conn: &impl super::StoreConn, seq: i64) -> Result<Verdict> {

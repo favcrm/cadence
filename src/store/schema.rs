@@ -949,7 +949,7 @@ impl Store {
     /// again. Anything else falls back to the fence below, one
     /// `turn_adopt_refused` event per rejected entry.
     fn recover(&self, marker: Option<&ConsumedMarker>) -> Result<RecoveryOutcome> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     // Store-level qualification of every recorded entry. A refused
@@ -1158,7 +1158,7 @@ impl Store {
                     // nothing needs re-parking.
                     self.reconcile_effects_in(&tx)?;
                     Ok(outcome)
-        });
+        })
     }
 
     /// CAD-162: `token` is current for `generation` under the alias's

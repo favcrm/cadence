@@ -94,13 +94,13 @@ impl Store {
     }
     pub fn app_context_show(&self, install: &str, id: &str) -> Result<Value> {
         {
-            return self.write_tx(|conn| {
+            self.write_tx(|conn| {
                 Ok(json!({"context":Self::app_context_show_in(&conn,install,id)?}))
-            });
+            })
         }
     }
     pub fn app_context_list(&self, install: &str) -> Result<Value> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let ids = conn.query_vec("SELECT id FROM app_contexts WHERE install_id=? ORDER BY created,id LIMIT 101", [install], |r| r.get::<_, String>(0)).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -112,14 +112,14 @@ impl Store {
                     Ok(
                         json!({"contexts":ids.iter().map(|id|Self::app_context_show_in(&conn,install,id)).collect::<Result<Vec<_>>>()?}),
                     )
-        });
+        })
     }
     pub fn app_context_proof(
         &self,
         install: &str,
         id: &str,
     ) -> Result<(ContextConfig, ContextProof)> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let row = Self::app_context_show_in(&conn, install, id)?;
             if row["state"] != "active" {
                 return Err(Error::rejected("context is archived"));
@@ -135,7 +135,7 @@ impl Store {
                     digest: row["digest"].as_str().unwrap().to_string(),
                 },
             ))
-        });
+        })
     }
     pub(super) fn app_context_proof_current_in(
         conn: &impl super::StoreConn,
@@ -165,7 +165,7 @@ impl Store {
         crate::proto::identifier(install, "installation ID")?;
         crate::proto::identifier(request, "context request ID")?;
         let digest = config.digest(install)?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     if let Some(id) = tx
@@ -204,7 +204,7 @@ impl Store {
                     )?;
                     let result = json!({"context":Self::app_context_show_in(&tx,install,&id)?});
                     Ok(result)
-        });
+        })
     }
     pub fn app_context_update(
         &self,
@@ -230,7 +230,7 @@ impl Store {
                 "expected context revision must be positive",
             ));
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let row = Self::app_context_show_in(&tx, install, id)?;
@@ -270,6 +270,6 @@ impl Store {
                     )?;
                     let result = json!({"context":Self::app_context_show_in(&tx,install,id)?});
                     Ok(result)
-        });
+        })
     }
 }

@@ -876,7 +876,6 @@ impl Store {
     /// `sealed_tx` with the rusqlite error channel preserved end-to-end —
     /// the callback and the boundary calls return `rusqlite::Result` so a
     /// caller classifies BUSY/constraint at the source.
-
     fn sealed_tx_fenced_raw<T>(
         &self,
         arm: u8,

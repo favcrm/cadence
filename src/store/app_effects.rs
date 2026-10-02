@@ -337,10 +337,10 @@ impl Store {
     }
 
     pub fn app_effect_show(&self, id: &str) -> Result<Value> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let (row, authority, digest) = child_in(&conn, id)?;
             Ok(envelope(&row, &authority, &digest))
-        });
+        })
     }
 
     /// A provider may have committed even when its confirmation failed.
@@ -352,7 +352,7 @@ impl Store {
         {
             return Err(Error::rejected("invalid uncertain app artifact outcome"));
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let (row, authority, digest) = child_in(&tx, id)?;
@@ -375,13 +375,13 @@ impl Store {
                     let (row, _, _) = child_in(&tx, id)?;
                     let result = envelope(&row, &authority, &digest);
                     Ok(result)
-        });
+        })
     }
 
     /// Operator resolution changes bookkeeping only. The exact historical
     /// child and digest survive, including when its installation is gone.
     pub fn app_effect_resolve(&self, id: &str, digest: &str, resolution: &str) -> Result<Value> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let (row, authority, stored_digest) = child_in(&tx, id)?;
@@ -418,13 +418,13 @@ impl Store {
                     let (resolved, _, _) = child_in(&tx, id)?;
                     let result = envelope(&resolved, &authority, &stored_digest);
                     Ok(result)
-        });
+        })
     }
     pub fn app_effect_list(&self, install: Option<&str>, context: Option<&str>) -> Result<Value> {
         if context.is_some() && install.is_none() {
             return Err(Error::rejected("context filter requires installation"));
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let stmt_sql = "SELECT effect_id FROM app_effect_authorizations WHERE (? IS NULL OR install_id=?) AND (? IS NULL OR context_id=?) ORDER BY effect_id LIMIT 100";
                     let ids = conn.query_vec(stmt_sql, params![install, install, context, context], |r| {
@@ -437,7 +437,7 @@ impl Store {
                         list.push(envelope(&row, &authority, &digest)["effect"].clone());
                     }
                     Ok(json!({"effects":list}))
-        });
+        })
     }
     pub fn app_effect_is_child(&self, id: &str) -> Result<bool> {
         Ok(self
@@ -455,7 +455,7 @@ impl Store {
     /// authority and presentation, not merely matching provider arguments.
     pub fn app_effect_stage(&self, row: &EffectRow, authority: &Value) -> Result<Value> {
         validate_child(row, authority)?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let existing = tx
@@ -498,7 +498,7 @@ impl Store {
                     )?;
                     let (stored, authority, digest) = child_in(&tx, &row.effect_id)?;
                     Ok(envelope(&stored, &authority, &digest))
-        });
+        })
     }
 
     /// Eligibility and the exactly-one claim share a transaction. A caller
@@ -513,7 +513,7 @@ impl Store {
     where
         F: FnOnce(&super::WriteTxn<'_>, &Value) -> Result<bool>,
     {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let (row, authority, stored_digest) = child_in(&tx, id)?;
@@ -530,7 +530,7 @@ impl Store {
                     let mut claimed = row;
                     claimed.state = "executing".into();
                     Ok(Some(claimed))
-        });
+        })
     }
 }
 

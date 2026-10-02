@@ -220,7 +220,7 @@ impl Store {
         Ok(())
     }
     pub fn app_capability_decide(&self, id: &str, digest: &str, approve: bool) -> Result<Value> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let previous: Option<(String, String)> = tx
@@ -270,7 +270,7 @@ impl Store {
                     Ok(
                         json!({"install_id":id,"epoch":epoch,"digest":digest,"approved":approve,"capabilities":["local.text.produce","local.text.review"],"outward_release":false}),
                     )
-        });
+        })
     }
 }
 
@@ -329,7 +329,7 @@ impl Store {
         let verified_source = selected_source
             .map(|(receipt, _)| self.app_capability_result(receipt))
             .transpose()?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     if let Some(proof) = context {
@@ -594,10 +594,10 @@ impl Store {
                         json!({"run_id":id,"install_id":install_id,"snapshot_digest":digest,"actor":"operator"}),
                     )?;
                     Self::app_run_show_in(&*tx, &id)
-        });
+        })
     }
     pub fn app_run_show(&self, id: &str) -> Result<Value> {
-        return self.write_tx(|conn| Self::app_run_show_in(&conn, id));
+        self.write_tx(|conn| Self::app_run_show_in(&conn, id))
     }
     pub(super) fn app_run_show_in(conn: &impl super::StoreConn, id: &str) -> Result<Value> {
         let mut value=conn.query_row("SELECT install_id,epoch,snapshot,snapshot_digest,project_link,state,approved_digest FROM app_runs WHERE id=?",[id],|r|Ok(json!({"id":id,"install_id":r.get::<_,String>(0)?,"epoch":r.get::<_,i64>(1)?,"snapshot":r.get::<_,String>(2)?,"snapshot_digest":r.get::<_,String>(3)?,"project_link":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"approved_digest":r.get::<_,Option<String>>(6)?}))).optional()?.ok_or_else(||Error::rejected("unknown app run"))?;
@@ -653,7 +653,7 @@ impl Store {
         cancel: bool,
         current_bundle: Option<&str>,
     ) -> Result<Value> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let run = Self::app_run_show_in(&tx, id)?;
@@ -696,7 +696,7 @@ impl Store {
                         json!({"run_id":id,"digest":run["snapshot_digest"],"actor":"operator"}),
                     )?;
                     Self::app_run_show_in(&tx, id)
-        });
+        })
     }
     pub(super) fn app_current_in(
         conn: &impl super::StoreConn,
@@ -910,7 +910,7 @@ impl Store {
     /// Called only while the daemon holds the installation's PM lock. SQL
     /// rechecks the epoch and dependency state in the enqueue transaction.
     pub fn app_run_dispatch(&self, id: &str, current_bundle: &str) -> Result<Value> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let run = Self::app_run_show_in(&tx, id)?;
@@ -1006,16 +1006,16 @@ impl Store {
                         params![now(), id],
                     )?;
                     Self::app_run_show_in(&tx, id)
-        });
+        })
     }
     /// Authority loss is terminal; existing artifacts and turn receipts remain
     /// immutable. This never retries uncertain provider work.
     pub fn app_run_invalidate(&self, id: &str) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             self.app_run_invalidate_in(&tx, id)?;
             Ok(())
-        });
+        })
     }
     pub(super) fn app_run_invalidate_in(&self, tx: &impl super::StoreConn, id: &str) -> Result<()> {
         let changed = tx.execute("UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state IN ('awaiting_approval','approved','running')", params![now(), id])?;
@@ -1698,10 +1698,10 @@ impl Store {
 
     pub fn app_message_installation(&self, message: &str) -> Result<Option<(String, String)>> {
         {
-            return self.write_tx(|conn| {
+            self.write_tx(|conn| {
 
                             Ok(conn.query_opt("SELECT r.id,r.install_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.message_id=?",[message],|r|Ok((r.get(0)?,r.get(1)?)))?)
-            });
+            })
         }
     }
     pub(super) fn app_message_admit_in(
@@ -1740,10 +1740,10 @@ impl Store {
         Ok(())
     }
     pub fn app_message_admit(&self, message: &Message, bundle: &str) -> Result<()> {
-        return self.write_tx(|conn| self.app_message_admit_in(&conn, message, bundle));
+        self.write_tx(|conn| self.app_message_admit_in(&conn, message, bundle))
     }
     pub fn reject_app_submission(&self, message: &str) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     if let Some((run, step, task)) = tx
@@ -1771,7 +1771,7 @@ impl Store {
                         }
                     }
                     Ok(())
-        });
+        })
     }
 }
 

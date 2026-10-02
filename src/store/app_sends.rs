@@ -501,7 +501,7 @@ impl RecordStore {
             }
             Ok(None)
         })? {
-            Some(stored) => return Ok(stored),
+            Some(stored) => Ok(stored),
             None => self
                 .app_campaign_send(context, &draft.send_id)?
                 .ok_or_else(|| Error::internal("campaign send vanished after prepare")),

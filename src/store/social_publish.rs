@@ -240,7 +240,7 @@ impl Store {
         crate::proto::identifier(row.request_id, "social publish request id")?;
         let frozen = frozen_of(row);
         let digest = app_runs::material_digest(&frozen);
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     if let Some(existing) = tx
@@ -289,12 +289,12 @@ impl Store {
                     )?;
                     let result = read_row(&tx, &intent_id)?;
                     Ok(result)
-        });
+        })
     }
 
     /// Operator cancellation before dispatch. Any other state refuses.
     pub fn social_publish_cancel(&self, intent_id: &str) -> Result<Value> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let changed = tx.execute("UPDATE social_publish_intents SET state='cancelled',updated=? WHERE intent_id=? AND state='queued'",params![now(),intent_id])?;
@@ -311,7 +311,7 @@ impl Store {
                     )?;
                     let result = read_row(&tx, intent_id)?;
                     Ok(result)
-        });
+        })
     }
 
     pub fn social_publish_show(&self, intent_id: &str) -> Result<Value> {
@@ -326,7 +326,7 @@ impl Store {
         if context.is_some() && install.is_none() {
             return Err(Error::rejected("context filter requires installation"));
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let stmt_sql = "SELECT intent_id FROM social_publish_intents WHERE (? IS NULL OR install_id=?) AND (? IS NULL OR context_id=?) ORDER BY intent_id LIMIT 100";
                     let ids = conn.query_vec(stmt_sql, params![install, install, context, context], |r| {
@@ -338,14 +338,14 @@ impl Store {
                         list.push(read_row(&conn, &id)?["intent"].clone());
                     }
                     Ok(json!({"intents":list}))
-        });
+        })
     }
 
     /// Peek the oldest due queued intent without claiming. The dispatch
     /// RPC uses it to compare operator-supplied current authority against
     /// frozen before claiming; the claim itself re-verifies in-transaction.
     pub(crate) fn social_publish_peek_due(&self, now_epoch: i64) -> Result<Option<Value>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let next: Option<String> = conn
                         .query_opt(
@@ -354,7 +354,7 @@ impl Store {
                             |r| r.get(0),
                         )?;
                     next.map(|id| read_row(&conn, &id)).transpose()
-        });
+        })
     }
 
     /// Re-prove approved material at dispatch for artifact-frozen intents.
@@ -405,7 +405,7 @@ impl Store {
     where
         F: FnOnce(&super::WriteTxn<'_>, &Value) -> Result<bool>,
     {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let next: Option<String> = tx
@@ -438,7 +438,7 @@ impl Store {
                     )?;
                     let result = read_row(&tx, &id)?;
                     Ok(Some(result))
-        });
+        })
     }
 
     /// Persist daemon-observed dispatch evidence on a processing intent.
@@ -475,7 +475,7 @@ impl Store {
                 "dispatch evidence must carry state, ids and an opaque-or-absent payload",
             ));
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let frozen_text: Option<String> = tx
@@ -502,7 +502,7 @@ impl Store {
                     }
                     let result = read_row(&tx, intent_id)?;
                     Ok(result)
-        });
+        })
     }
 
     /// Record the dispatch outcome. `posted` requires a verified
@@ -560,7 +560,7 @@ impl Store {
                 ));
             }
         };
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     if state == "posted" {
@@ -635,7 +635,7 @@ impl Store {
                     )?;
                     let result = read_row(&tx, intent_id)?;
                     Ok(result)
-        });
+        })
     }
 }
 

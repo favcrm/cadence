@@ -111,7 +111,7 @@ impl Store {
     /// Read one link row for the send/show path. `None` is "no sender
     /// is bound", never a default — the caller refuses.
     pub fn crm_smtp_link(&self, install: &str, context: &str) -> Result<Option<SmtpLink>> {
-        return self.write_tx(|conn| self.crm_smtp_row(&conn, install, context));
+        self.write_tx(|conn| self.crm_smtp_row(&conn, install, context))
     }
 
     /// Bind one sender connection to an installation/context. At most
@@ -135,7 +135,7 @@ impl Store {
         if connection_id.is_empty() || auth_revision <= 0 {
             return Err(Error::rejected("SMTP sender binding is invalid"));
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let digest = link_digest(install, context, connection_id, auth_revision, projection);
@@ -201,7 +201,7 @@ impl Store {
                         .crm_smtp_row(&tx, install, context)?
                         .ok_or_else(|| Error::internal("SMTP sender binding vanished after bind"))?;
                     Ok(json!({"binding": link_json(install, context, &row, projection)}))
-        });
+        })
     }
 
     /// Rebind under CAS: the expected link revision must be the live
@@ -223,7 +223,7 @@ impl Store {
         if expected_revision <= 0 || connection_id.is_empty() || auth_revision <= 0 {
             return Err(Error::rejected("SMTP sender rebinding is invalid"));
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let row = self.crm_smtp_row(&tx, install, context)?.ok_or_else(|| {
@@ -258,7 +258,7 @@ impl Store {
                         .crm_smtp_row(&tx, install, context)?
                         .ok_or_else(|| Error::internal("SMTP sender binding vanished after rebind"))?;
                     Ok(json!({"binding": link_json(install, context, &row, projection)}))
-        });
+        })
     }
 
     /// Revoke the live link under CAS. The credential itself is
@@ -278,7 +278,7 @@ impl Store {
                 "expected binding revision must be a positive integer",
             ));
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let row = self.crm_smtp_row(&tx, install, context)?.ok_or_else(|| {
@@ -307,7 +307,7 @@ impl Store {
                         json!({"install_id": install, "context_id": context, "connection_id": row.connection_id, "link_revision": revision}),
                     )?;
                     Ok(json!({"revoked": true, "link_revision": revision}))
-        });
+        })
     }
 
     /// Best-effort audit for a test send: digests and the SMTP

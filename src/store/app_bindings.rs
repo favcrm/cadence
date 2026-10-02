@@ -382,7 +382,7 @@ impl Store {
     /// Upgrade compatibility must inspect every configured binding, including
     /// rows intentionally hidden by the bounded operator inventory.
     pub fn app_binding_upgrade_configured(&self, install: &str) -> Result<Vec<Value>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let ids: Vec<String> = conn.query_vec(
                 "SELECT id FROM app_bindings WHERE install_id=? AND state='configured' ORDER BY id",
                 [install],
@@ -391,7 +391,7 @@ impl Store {
             ids.iter()
                 .map(|id| binding_in(&*conn, install, id))
                 .collect()
-        });
+        })
     }
 
     /// Called under the PM upgrade lock before any journal write. Every
@@ -405,7 +405,7 @@ impl Store {
         if slots.is_empty() {
             return Ok(());
         }
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let total: i64 = conn.query_row(
                         "SELECT count(*) FROM app_bindings WHERE install_id=?",
@@ -436,7 +436,7 @@ impl Store {
                         ));
                     }
                     Ok(())
-        });
+        })
     }
 
     pub fn app_binding_create(
@@ -450,7 +450,7 @@ impl Store {
         validate_config(install, context, config)?;
         crate::proto::identifier(slot, "publication slot")?;
         crate::proto::identifier(request, "binding request id")?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let existing = tx
@@ -523,7 +523,7 @@ impl Store {
                     )?;
                     let row = binding_in(&tx, install, &id)?;
                     Ok(json!({"binding":row}))
-        });
+        })
     }
 
     pub fn app_binding_update(
@@ -533,7 +533,7 @@ impl Store {
         expected: i64,
         config: &Value,
     ) -> Result<Value> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let row = binding_in(&tx, install, id)?;
@@ -582,11 +582,11 @@ impl Store {
                     )?;
                     let next = binding_in(&tx, install, id)?;
                     Ok(json!({"binding":next}))
-        });
+        })
     }
 
     pub fn app_binding_revoke(&self, install: &str, id: &str, expected: i64) -> Result<Value> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let row = binding_in(&tx, install, id)?;
@@ -614,7 +614,7 @@ impl Store {
                     )?;
                     let next = binding_in(&tx, install, id)?;
                     Ok(json!({"binding":next}))
-        });
+        })
     }
 
     pub fn app_binding_for_slot(

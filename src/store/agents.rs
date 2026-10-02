@@ -290,7 +290,7 @@ impl Store {
         // register waits, then observes the committed alias, instead of
         // resolving against a stale snapshot and returning
         // `params_too_large`.
-        return self.write_tx(|tx| {
+        self.write_tx(|tx| {
             // A relaunch of a saved alias must keep that row. Resolving the
             // current defaults first can reject a previously valid near-cap
             // params blob with `params_too_large` and hide the duplicate.
@@ -368,7 +368,7 @@ impl Store {
                    "team_role": resolved.team_role}),
             )?;
             Ok(())
-        });
+        })
     }
 
     /// Same text `INSERT` raises for `agents.alias`, including the `sqlite:`
@@ -455,13 +455,13 @@ impl Store {
     /// `attention` / `stopped` can never be overwritten. `error` is
     /// untouched. Returns whether the row matched.
     pub fn set_agent_state_if(&self, alias: &str, to: &str, from: &str) -> Result<bool> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let n = conn.execute(
                 "UPDATE agents SET state=?,updated=? WHERE alias=? AND state=?",
                 params![to, now(), alias, from],
             )?;
             Ok(n > 0)
-        });
+        })
     }
 
     /// Live-actor states only (`starting`, `stopping`, busy/idle
@@ -469,13 +469,13 @@ impl Store {
     /// terminal writes go through `set_state_detached` so the state
     /// never lands ahead of the cleared runtime fields.
     pub fn set_agent_state(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.execute(
                 "UPDATE agents SET state=?,error=?,updated=? WHERE alias=?",
                 params![state, error, now(), alias],
             )?;
             Ok(())
-        });
+        })
     }
 
     /// Persist native provider identity after a successful adapter `open`.
@@ -532,7 +532,7 @@ impl Store {
         adopted: Option<&[AdoptEntry]>,
         quota: Option<&Value>,
     ) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
             let quota = quota.map(|snapshot| {
@@ -610,7 +610,7 @@ impl Store {
                 )?;
             }
             Ok(())
-        });
+        })
     }
 
     /// Persist a provider notification only while it still belongs to the
@@ -624,7 +624,7 @@ impl Store {
         expected_thread_id: &str,
         snapshot: &Value,
     ) -> Result<bool> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
             if agent.provider != provider || agent.thread_id.as_deref() != Some(expected_thread_id)
@@ -668,7 +668,7 @@ impl Store {
                 }),
             )?;
             Ok(true)
-        });
+        })
     }
 
     /// Merge `patch` (a JSON object of string keys/values) into the
@@ -677,13 +677,13 @@ impl Store {
     /// Record the model the provider reports it is running (claude's
     /// stream `system/init`) — the `model` column, never a launch param.
     pub fn set_model_reported(&self, alias: &str, model: &str) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.execute(
                 "UPDATE agents SET model=?,updated=? WHERE alias=?",
                 params![model, now(), alias],
             )?;
             Ok(())
-        });
+        })
     }
 
     /// CAD-559: a register-time gate that fills the launch model
@@ -691,13 +691,13 @@ impl Store {
     /// provenance over the `explicit` label `register_agent` derives
     /// from the merged params.
     pub fn set_model_selection(&self, alias: &str, selection: &Value) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.execute(
                 "UPDATE agents SET model_selection=?,updated=? WHERE alias=?",
                 params![selection.to_string(), now(), alias],
             )?;
             Ok(())
-        });
+        })
     }
 
     pub fn set_params(&self, alias: &str, patch: &Value) -> Result<()> {
@@ -710,7 +710,7 @@ impl Store {
     /// and each changed key with its old and new stored value (`null` =
     /// absent), written in the same transaction as the change.
     pub fn set_params_by(&self, alias: &str, patch: &Value, audit: &Value) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
             let mut merged = agent.params.clone().unwrap_or_else(|| json!({}));
@@ -814,15 +814,15 @@ impl Store {
             }
             Self::event(&tx, alias, "params_updated", detail)?;
             Ok(())
-        });
+        })
     }
 
     pub fn model_defaults(&self) -> Result<ModelDefaultsSnapshot> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let snapshot = Self::read_model_defaults_tx(&tx)?;
             Ok(snapshot)
-        });
+        })
     }
 
     /// Replace the singleton document when `document` names the current
@@ -835,7 +835,7 @@ impl Store {
         let write = crate::model_defaults::parse_settings_document(document)?;
         let attribution = crate::model_defaults::normalize_attribution(attribution)?;
         let stored = serde_json::to_string(&write.config)?;
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let current = Self::read_model_defaults_tx(&tx)?;
             if current.revision != write.expected_revision {
@@ -872,7 +872,7 @@ impl Store {
                 revision: next,
                 config: write.config,
             })
-        });
+        })
     }
 
     fn read_model_defaults_tx(tx: &impl super::StoreConn) -> Result<ModelDefaultsSnapshot> {
@@ -901,7 +901,7 @@ impl Store {
     /// disposable-session endpoint proves its stored id can never
     /// resume; the next open mints a fresh session instead.
     pub fn clear_native_session(&self, alias: &str) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
             let old = agent
@@ -925,17 +925,17 @@ impl Store {
                 json!({"session": old, "thread_id": agent.thread_id}),
             )?;
             Ok(())
-        });
+        })
     }
 
     pub fn set_enabled(&self, alias: &str, enabled: bool) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.execute(
                 "UPDATE agents SET enabled=?,updated=? WHERE alias=?",
                 params![enabled as i64, now(), alias],
             )?;
             Ok(())
-        });
+        })
     }
 
     /// Publish a detached runtime state in ONE write: the state, its
@@ -946,14 +946,14 @@ impl Store {
     /// attachable endpoint belong to the dead process regardless, so
     /// leaving them would also point `agent attach` at a stale address.
     pub fn set_state_detached(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             conn.execute(
                 "UPDATE agents SET state=?,error=?,pid=NULL,pid_start=NULL,endpoint=NULL,
                             generation=NULL,updated=? WHERE alias=?",
                 params![state, error, now(), alias],
             )?;
             Ok(())
-        });
+        })
     }
 
     /// Explicit removal of a dead agent: the registry row plus the
@@ -981,7 +981,7 @@ impl Store {
     /// reaching here). Returns the `reply_to` aliases a forced finish
     /// notified — the caller wakes them.
     pub fn remove_agent(&self, alias: &str, force: bool, by: &Value) -> Result<Vec<String>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
             // Inbox rows own no process or pane — their pseudo-endpoint is
@@ -1156,7 +1156,7 @@ impl Store {
                                "by": by["by"], "by_kind": by["by_kind"]}),
             )?;
             Ok(notify)
-        });
+        })
     }
 
     /// Drops a removed alias's message/event history except what job
@@ -1189,14 +1189,14 @@ impl Store {
     /// [`Store::timer_gc_remove`].
     pub fn gc_candidates(&self, older_than: Option<f64>) -> Result<Vec<Agent>> {
         let cutoff = older_than.map(|age| now() - age).unwrap_or(f64::MAX);
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let stmt_sql = "SELECT * FROM agents WHERE endpoint IS NULL
                          AND state IN ('attention','stopped') AND updated < ?";
             let rows = conn
                 .query_vec(stmt_sql, params![cutoff], row_agent)
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        });
+        })
     }
 
     pub(super) fn agent_opt_in(
@@ -1225,7 +1225,7 @@ impl Store {
     /// it was listed). Records only — frees no memory and no disk, and
     /// the removed agent can no longer be resumed.
     pub fn timer_gc_remove(&self, alias: &str, older_than: f64) -> Result<Option<Agent>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let Some(agent) =
                 tx.query_opt("SELECT * FROM agents WHERE alias=?", [alias], row_agent)?
@@ -1273,7 +1273,7 @@ impl Store {
                 }),
             )?;
             Ok(Some(agent))
-        });
+        })
     }
 
     /// CAD-96: per alias, the newest durable activity and the count of

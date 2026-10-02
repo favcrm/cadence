@@ -359,12 +359,12 @@ fn message_entry<'a>(
 impl Store {
     /// The alias's thread, created on first use. The agent must exist.
     pub fn ensure_thread(&self, alias: &str) -> Result<Thread> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             self.agent_in(&tx, alias)?;
             let thread = Self::ensure_thread_in(&tx, alias)?;
             Ok(thread)
-        });
+        })
     }
 
     /// [`Self::ensure_thread`] inside the caller's transaction; the
@@ -419,7 +419,7 @@ impl Store {
 
     /// The alias's thread, if one was ever started.
     pub fn thread(&self, alias: &str) -> Result<Option<Thread>> {
-        return self.write_tx(|conn| Self::thread_in(&conn, alias));
+        self.write_tx(|conn| Self::thread_in(&conn, alias))
     }
 
     fn thread_in(conn: &impl super::StoreConn, alias: &str) -> Result<Option<Thread>> {
@@ -431,11 +431,11 @@ impl Store {
     /// Append to the alias's thread. `Ok(None)` when it has none —
     /// agents without a chat are untouched.
     pub fn thread_append(&self, alias: &str, entry: NewEntry) -> Result<Option<i64>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             let seq = Self::thread_append_in(&tx, alias, entry)?;
             Ok(seq)
-        });
+        })
     }
 
     /// [`Self::thread_append`] for managed provider output: the entry
@@ -448,7 +448,7 @@ impl Store {
         text: &str,
         payload: Option<Value>,
     ) -> Result<Option<i64>> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             if Self::thread_in(&tx, alias)?.is_none() {
                 return Ok(None);
@@ -466,7 +466,7 @@ impl Store {
                 },
             )?;
             Ok(seq)
-        });
+        })
     }
 
     /// Agent text that the turn result may repeat — Codex `final_answer`
@@ -480,7 +480,7 @@ impl Store {
     /// appended now. A daemon restart drops what is held — the provider
     /// transcript still has it.
     pub fn thread_hold_running(&self, alias: &str, text: &str, payload: Value) -> Result<()> {
-        return self.write_tx(|conn| {
+        self.write_tx(|conn| {
             let tx = &mut *conn;
             if Self::thread_in(&tx, alias)?.is_none() {
                 return Ok(());
@@ -509,7 +509,7 @@ impl Store {
                     payload,
                 });
             Ok(())
-        });
+        })
     }
 
     /// The alias's in-flight turn. `submitting` counts: a provider can
