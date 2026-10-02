@@ -4627,6 +4627,15 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_report_router());
     }
+    // CAD-1020: the publish driver — claims due intents, sends through
+    // the attached sender, reconciles processing rows through status.
+    // Joined before `Shared::shutdown` so a tick never outlives the
+    // daemon; a SIGKILL mid-send is safe by construction (the row is
+    // left `processing` for the next boot's reconcile).
+    let publish_driver = {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_social_publish_driver())
+    };
 
     // CAD-719: the wiki index refresh worker — a committed wiki
     // mutation kicks one coalesced rebuild; the query-time tree check
@@ -4736,6 +4745,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // lets a kickoff from that last tick settle into the shutdown marker.
     let _ = monitor_watch.join();
     let _ = test_watch.join();
+    // CAD-1020: join the publish driver before `Shared::shutdown` — a
+    // tick can be mid-send, so worst-case join is that send's remaining
+    // door budget (≈4×DOOR_TIMEOUT ≈ 120s; documented on the contract).
+    let _ = publish_driver.join();
     // CAD-702: the heartbeat is NOT joined here — it stays the single
     // renewal poster through the flush below. Joining it before the
     // flush would leave the final WAL checkpoint and tracker commit

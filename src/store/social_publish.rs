@@ -346,7 +346,6 @@ impl Store {
     /// permanently-unknown keys can never starve newer claims.
     /// Returns `(intent_id, request_key, updated)` rows ordered by
     /// `intent_id`.
-    #[allow(dead_code)] // the driver's reconcile sweep lands in the stacked PR
     pub(crate) fn social_publish_processing(
         &self,
         limit: usize,
