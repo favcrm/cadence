@@ -10,6 +10,15 @@ export interface IntentRead {
   status: "ok" | "unavailable";
   intents: PublishIntent[];
 }
+/** The next read for a scope. A failed read keeps the last good read of the
+ *  SAME scope (a transient error must not blank the calendar); any other
+ *  scope, or no earlier good read, becomes `unavailable`. */
+export function settleIntentRead(previous: IntentRead | undefined, installId: string, contextId: string,
+  intents: PublishIntent[] | null): IntentRead {
+  if (intents) return { installId, contextId, status: "ok", intents };
+  if (previous?.status === "ok" && previous.installId === installId && previous.contextId === contextId) return previous;
+  return { installId, contextId, status: "unavailable", intents: [] };
+}
 const ID_MAX = 128;
 const isId = (value: string) => value.length > 0 && value.length <= ID_MAX;
 function isZone(timezone: string): boolean {

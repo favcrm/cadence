@@ -1,4 +1,4 @@
-import { screenProjection, screenTag } from "../src/features/workspace-apps/screen/screenProjection";
+import { screenProjection, screenTag, settleIntentRead } from "../src/features/workspace-apps/screen/screenProjection";
 import type { PublishIntent } from "../src/features/workspace-apps/socialPublish";
 import { legacyPush, pushBytes, shapeFor, PUSH_BYTES_MAX } from "../src/features/workspace-apps/screen/screenProtocol";
 import type { Installation, AppContext, WorkspaceRun, AppEffect } from "../src/features/workspace-apps/workspaceApps";
@@ -72,6 +72,7 @@ check(refused, "more rows than the daemon cap fail closed");
 const legacy = legacyPush(history);
 check(!("publish_intents" in legacy) && legacy.runs.every(r => !("context_id" in r)) && legacy.outbox.every(o => !("run_id" in o) && !("context_id" in o)),
   "a child without publish-intents.v1 receives the exact CAD-1006 shape");
+
 // The byte cap applies to the shape each child receives (review should-fix).
 const nearCap = (n: number) => screenProjection(installation, "main", "brand", [context],
   Array.from({ length: n }, (_, k) => ({ ...long, id: `near${k}` })), [],
@@ -101,4 +102,10 @@ for (const broken of [
   check(shapeFor(broken, false) !== null, "a legacy child never sees those fields and is unaffected");
 }
 
+// A failed read keeps the last good read of the same scope only.
+const good = settleIntentRead(undefined, "our", "brand", [intent({})]);
+check(good.status === "ok" && settleIntentRead(good, "our", "brand", null) === good, "a transient failure keeps the last good read");
+check(settleIntentRead(good, "our", "", null).status === "unavailable", "a failure never reuses another context's read");
+check(settleIntentRead(good, "other", "brand", null).status === "unavailable", "a failure never reuses another install's read");
+check(settleIntentRead(undefined, "our", "brand", null).status === "unavailable", "no earlier read is unavailable");
 console.log("screen projection scope and privacy checks pass");

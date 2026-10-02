@@ -41,7 +41,7 @@ import { forgetContext, initialContext, rememberedContext, rememberContext } fro
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
 import ScreenOutlet from "./screen/ScreenOutlet";
-import { screenTag, screenProjection, type IntentRead } from "./screen/screenProjection";
+import { screenTag, screenProjection, settleIntentRead, type IntentRead } from "./screen/screenProjection";
 import { socialPublish } from "./socialPublish";
 
 type Section =
@@ -243,20 +243,33 @@ export default function WorkspaceApp({
   };
   // CAD-1025: the mounted screen's publish intents, read with the existing
   // operator-only list and tagged with its scope; the projection pushes it
-  // only while that tag still matches the route install and context.
+  // only while that tag still matches the route install and context. The
+  // read follows the scope (plus a slow refresh), not the 5 s board poll.
   const screenInstall = data && screenTag(data.installation) ? data.installation.install_id : null;
   useEffect(() => {
     if (screenInstall !== installId || accessDenied) return;
-    const controller = new AbortController();
-    socialPublish.list(installId, contextId || null, controller.signal)
-      .then(reply => { if (!controller.signal.aborted) setIntentRead({ installId, contextId, status: "ok", intents: reply.intents }); })
-      .catch((error: unknown) => {
-        if (controller.signal.aborted) return;
-        if (error instanceof ApiError && [401, 403].includes(error.status)) clearPrivate();
-        setIntentRead({ installId, contextId, status: "unavailable", intents: [] });
-      });
-    return () => controller.abort();
-  }, [screenInstall, installId, contextId, data, accessDenied, clearPrivate]);
+    let controller = new AbortController();
+    const read = () => {
+      controller.abort();
+      const current = controller = new AbortController();
+      socialPublish.list(installId, contextId || null, current.signal)
+        .then(reply => { if (!current.signal.aborted) setIntentRead(previous => settleIntentRead(previous, installId, contextId, reply.intents)); })
+        .catch((error: unknown) => {
+          if (current.signal.aborted) return;
+          if (error instanceof ApiError && [401, 403].includes(error.status)) {
+            clearPrivate();
+            setIntentRead(settleIntentRead(undefined, installId, contextId, null));
+            return;
+          }
+          setIntentRead(previous => settleIntentRead(previous, installId, contextId, null));
+        });
+    };
+    read();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "hidden") read();
+    }, 60000);
+    return () => { window.clearInterval(timer); controller.abort(); };
+  }, [screenInstall, installId, contextId, accessDenied, clearPrivate]);
   const runs =
     data?.runs.filter((run) => (run.context_id ?? "") === contextId) ?? [];
   const isSourceRun = (value: WorkspaceRun) => !!value.snapshot.inputs.profile_handle;
