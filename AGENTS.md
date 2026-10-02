@@ -250,6 +250,36 @@ Bot reviews (Devin Review, CodeRabbit and similar) are advisory:
   3110–3199.
 - Never signal or kill a process you did not start.
 
+### Explicitly delegated development staging
+
+The production safety rules above protect production. The operator may explicitly
+assign an agent to manage a named, isolated development or demo instance without
+requiring a new permission request for every refresh. Record the delegation in
+the issue before acting: state and PM directories, board port, any exact tailnet
+mapping, process owner, permitted operations and rollback artifact.
+
+- State and PM directories must be isolated from production; local ports stay
+  in 3110–3199. A shared staging instance has one refresh owner at a time.
+- Within that recorded scope, agents may build, update app bundles, and start,
+  stop or refresh the staging board and daemon through supported commands.
+  Operator-created staging processes require explicit ownership handoff first;
+  permission to inspect staging alone does not authorize stopping them.
+- Reuse the recorded tailnet mapping. Creating, removing or changing a staging
+  mapping requires explicit delegation for that exact port and target; never
+  alter unrelated mappings, the tailnet configuration or operator-user settings.
+- Before a refresh, verify instance identity, process and port ownership,
+  artifact hashes and current mappings. Retain data backups and a pinned rollback
+  build; validate actual served build and application behavior afterward.
+- This exception changes operational scope, not caller identity. Honor native
+  authorization and rollout guards. If a supported command requires an operator
+  connection, implement and independently review a bounded staging delegation
+  path, or use an actual operator connection. Never impersonate an operator,
+  clear identity variables, bypass a guard, or record operator approval as an agent.
+- Production paths, port3010, the installed binary, live customer runtimes and
+  production rollout remain outside this exception. Standard source reviews,
+  tests and audit requirements still apply unless the operator explicitly grants
+  a separate emergency delivery exception.
+
 ### Shared scratch space
 - The session scratchpad is shared between agents. Write only inside your
   own `<scratchpad>/<lane>/` subdirectory, and delete only your own files,
