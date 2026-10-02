@@ -501,8 +501,12 @@ pub enum IssueAction {
     /// worktree and `pr:` refs, and mark `done` the ones whose work
     /// provably merged — one commit per issue naming the evidence.
     /// `held`/`stalled` rows are reported, never moved: an open PR or
-    /// a claim newer than the merge blocks the flip. Merged worktree
-    /// refs are swept with the same guard `finish --merged` uses.
+    /// a claim newer than the merge blocks the flip. A note-derived
+    /// candidate also needs a fresh note — a status write newer than
+    /// the newest tagged note keeps it parked, and a failed history
+    /// walk parks the whole notes arm for that sweep (reported on
+    /// `history`, never widened on a guess). Merged worktree refs are
+    /// swept with the same guard `finish --merged` uses.
     /// `issue sync` runs this sweep after a successful push.
     Reconcile {
         /// Limit the sweep to one project (all projects when omitted).
@@ -1559,6 +1563,15 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             if *json {
                 print_json(&out);
             } else {
+                // A failed history walk parks every note-derived
+                // candidate without producing a row — say so up
+                // front or the sweep reads as a quiet no-op (CAD-878).
+                if let Some(e) = reconcile::history_failure(&out) {
+                    println!(
+                        "history: tracker status-line walk failed ({e}); \
+                         note-driven candidates stay parked this sweep"
+                    );
+                }
                 for row in out["rows"].as_array().into_iter().flatten() {
                     let mut line = format!(
                         "{}: {}",
@@ -1607,6 +1620,12 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             if !*dry_run {
                 match reconcile::run(&pm, None, false, "", state_dir, 0) {
                     Ok(rec) => {
+                        if let Some(e) = reconcile::history_failure(&rec) {
+                            eprintln!(
+                                "reconcile: status-line history failed ({e}); \
+                                 note-driven candidates stayed parked"
+                            );
+                        }
                         let done = rec["done"].as_array().map(|d| d.len()).unwrap_or(0);
                         let held = rec["held"].as_array().map(|h| h.len()).unwrap_or(0);
                         eprintln!("reconcile: {done} closed, {held} held");

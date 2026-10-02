@@ -634,6 +634,17 @@ impl Shared {
         };
         match crate::issue::reconcile::run_daemon(&pm, "daemon", RECONCILE_BATCH) {
             Ok(out) => {
+                // A failed history walk is silent in the row counts:
+                // note-derived candidates simply never classify, so a
+                // stuck walk would starve them unseen. Log it so the
+                // condition is diagnosable (CAD-878); the next tick
+                // retries the walk.
+                if let Some(e) = crate::issue::reconcile::history_failure(&out) {
+                    eprintln!(
+                        "issue reconcile: status-line history failed ({e}); \
+                         note-driven candidates parked this tick"
+                    );
+                }
                 let done = out["done"].as_array().map(|d| d.len()).unwrap_or(0);
                 let held = out["held"].as_array().map(|h| h.len()).unwrap_or(0);
                 if done > 0 || held > 0 {
