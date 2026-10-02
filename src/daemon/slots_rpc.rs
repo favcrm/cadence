@@ -183,6 +183,19 @@ impl Shared {
         if exec && pid != peer_pid {
             return Err(crate::slots::exec_not_peer(pid));
         }
+        // CAD-1021: a `check` slot is the lane's pre-push gate — admitted
+        // ONLY against a project recipe declared `kind: check` (verbatim
+        // name match). An arbitrary `acquire check`/`run check` with no
+        // recipe, or a recipe that is not check-kind, is refused — an
+        // agent can never label a full build `check` and drain the pool.
+        if kind == SlotKind::Check {
+            self.check_recipe_for_caller(params, pid)?;
+        } else if params.get("recipe").is_some() {
+            return Err(Error::rejected(
+                "'recipe' is only meaningful for kind=check — a build/test/\
+                 suite slot takes no recipe binding",
+            ));
+        }
         let clk = crate::slots::SlotClock::at((self.slot_clock)(), epoch_secs());
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let (result, events) = match &who {
@@ -194,6 +207,61 @@ impl Shared {
         drop(slots);
         self.emit_slot_events(events);
         Ok(result)
+    }
+
+    /// CAD-1021: validate that `params.recipe` names a `build.recipes`
+    /// entry of kind `check` for the project the caller's cwd resolves
+    /// to. The recipe name is caller-supplied but constrained to the
+    /// declared allowlist — anything else refuses the `check` grant.
+    fn check_recipe_for_caller(&self, params: &Value, pid: u32) -> Result<()> {
+        let recipe = optional_text(params, "recipe")?.ok_or_else(|| {
+            Error::rejected(
+                "kind=check needs --recipe <name> naming a build.recipes entry \
+                 of kind check — the pre-push path, never an arbitrary command",
+            )
+        })?;
+        let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()
+            .filter(|p| p.is_dir())
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "check slot caller pid {pid}: cannot read its cwd to resolve \
+                     the project the recipe belongs to"
+                ))
+            })?;
+        let pm_dir = self.pm_dir()?;
+        let projects = crate::issue::project::list(&pm_dir)?;
+        let key = crate::issue::project::key_for_cwd(&pm_dir, &cwd).ok_or_else(|| {
+            Error::rejected(format!(
+                "check slot caller cwd {} resolves to no project — the recipe \
+                 allowlist lives in the project's project.yaml",
+                cwd.display()
+            ))
+        })?;
+        let project = projects.iter().find(|p| p.key == key).unwrap();
+        let recipes = project.build.as_ref().map(|b| &b.recipes);
+        let r = recipes.and_then(|rs| rs.get(recipe)).ok_or_else(|| {
+            let known: Vec<&str> = recipes
+                .map(|rs| rs.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            Error::rejected(format!(
+                "check slot recipe '{recipe}' is not declared for project \
+                 '{key}' — it defines: {}",
+                if known.is_empty() {
+                    "none".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ))
+        })?;
+        if r.kind.as_deref() != Some("check") {
+            return Err(Error::rejected(format!(
+                "check slot recipe '{recipe}' is kind '{}' — only \
+                 build.recipes.*.kind = 'check' admit a check slot",
+                r.kind.as_deref().unwrap_or("build")
+            )));
+        }
+        Ok(())
     }
 
     /// `slot_release` — the release must name the holding (lane,

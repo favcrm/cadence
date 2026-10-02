@@ -562,6 +562,19 @@ pub(super) fn resolve_slot_config(opts: &ServeOptions) -> SlotConfig {
         if let Some(v) = o.max_hold_secs {
             c.max_hold_secs = v;
         }
+        // CAD-1021: the check pool + resource floors.
+        if let Some(v) = o.check_slots {
+            c.check_slots = v as usize;
+        }
+        if let Some(v) = o.slot_mem_min_available_bytes {
+            c.slot_mem_min_available_bytes = v;
+        }
+        if let Some(v) = o.slot_mem_min_available_check_bytes {
+            c.slot_mem_min_available_check_bytes = v;
+        }
+        if let Some(v) = o.slot_disk_min_free_bytes {
+            c.slot_disk_min_free_bytes = v;
+        }
     }
     c
 }

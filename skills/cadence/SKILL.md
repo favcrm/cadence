@@ -298,6 +298,19 @@ refused when a step fails, and the hook leaves a receipt
 worktree's git dir. `--no-verify` still pushes, but the missing receipt is the
 detectable signal. The main checkout has no hook.
 
+The same push path draws on a dedicated `check` slot pool (default 2
+concurrent) that build/test work never fills: a lane's `git push` can run
+`scripts/pre-push` even while every build slot is held. A `check` slot is
+admitted only for a `build.recipes` entry whose `kind: check` —
+`cadence build-slot acquire check --recipe <name>` or
+`build-slot run check --recipe <name> -- <cmd>`; there is no way to name a
+free command under `kind: check`. Slot admission is also resource-aware:
+when the host's MemAvailable or the state filesystem's free bytes drop
+below the `[host]` floors (`slot_mem_min_available_bytes`,
+`slot_mem_min_available_check_bytes`, `slot_disk_min_free_bytes`), a slot
+request waits — `build-slot status` names the `wait_reason`
+(`capacity`/`memory`/`disk`) — and never fails the caller outright.
+
 Job work (the work axis over messages — see docs/JOBS.md):
 
 ```bash

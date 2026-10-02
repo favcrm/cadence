@@ -1036,6 +1036,10 @@ tests = [
     "build_slot_run_binds_the_real_process",
     "build_slot_cli_wait_then_grant",
     "a_silent_managed_worker_fails_with_its_own_evidence",
+    "check_acquire_without_a_recipe_is_refused",
+    "check_acquire_names_a_check_kind_recipe_only",
+    "check_grants_while_build_pool_is_full",
+    "forged_slot_pid_does_not_skip_the_queue",
 ]
 helpers = [
     "slot_release",
