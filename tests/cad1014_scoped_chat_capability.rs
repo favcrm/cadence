@@ -214,6 +214,24 @@ fn cad1014_scoped_chat_csv_import_redeems_scope_once() {
 
     // The operator confirms the exact previewed plan (host side); the
     // agent redeems the minted nonce.
+    // The scoped-chat CSV preview read admits the agent on the live
+    // turn — the agent plans the import read-only, no claim consumed.
+    let preview: Value = lane.rpc(
+        &w.daemon.state,
+        "app_record_csv_assistant_preview",
+        json!({"install_id": install, "context_id": context_id, "csv_text": CSV,
+               "message": "chat-1014-1", "token": token}),
+    );
+    assert_eq!(
+        preview["ok"], true,
+        "scoped CSV preview refused for the agent: {preview}"
+    );
+    assert_eq!(
+        preview["result"]["preview_token"].as_str(),
+        Some(token_preview.as_str()),
+        "agent preview token differs from operator's: {preview}"
+    );
+
     let confirm_token = w.confirm(install, context_id, &token_preview, "req-1014-1");
     let redeem: Value = lane.rpc(
         &w.daemon.state,
@@ -256,6 +274,77 @@ fn cad1014_scoped_chat_csv_import_redeems_scope_once() {
     );
 }
 
+/// Durable pending intent: the claim burns the message BEFORE the CSV
+/// write commits, so a failed import still holds the intent — a retry
+/// with the SAME request id + bytes replays/completes, and a retry with
+/// a CHANGED payload under that spent claim refuses. Proves the
+/// claim-then-write ordering never lets one message mint two intents
+/// nor lose the confirmed plan to a mid-import failure.
+#[test]
+fn cad1014_scoped_chat_csv_failed_row_keeps_intent() {
+    let w = Crm::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-1014-5");
+    let context_id = context["id"].as_str().unwrap();
+    // Row 1 valid, row 2 malformed (missing display_name) so the import
+    // lands a partial failure — the claim is still spent.
+    let bad_csv = "record_id,display_name,email\ncust-ok,Amina,amina@example.invalid\ncust-bad,,x@example.invalid\n";
+    let token_preview = w.preview(install, context_id, bad_csv)["preview_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "crm-chat", "claude", None, lane.pid());
+    let token = w.chat_turn("crm-chat", install, context_id, "chat-1014-5");
+    let confirm = w.confirm(install, context_id, &token_preview, "req-1014-5");
+
+    let first: Value = lane.rpc(
+        &w.daemon.state,
+        "app_record_csv_assistant_import",
+        json!({"install_id": install, "context_id": context_id,
+               "csv_text": bad_csv, "preview_token": token_preview, "request_id": "req-1014-5",
+               "confirm_token": confirm, "message": "chat-1014-5", "token": token}),
+    );
+    assert_eq!(first["ok"], true, "partial import refused: {first}");
+    // The bad row drops as skipped/"row error" — a partial import, not
+    // an all-or-nothing failure; the claim+confirm are still spent.
+    assert!(
+        first["result"]["summary"]["skipped"].as_i64().unwrap_or(0) >= 1
+            || first["result"]["summary"]["failed"].as_i64().unwrap_or(0) >= 1,
+        "expected a dropped/failed row: {first}"
+    );
+    // A retry under the SAME request id + bytes replays the stored
+    // receipt without needing a new confirm (claim binds the payload).
+    let retry: Value = lane.rpc(
+        &w.daemon.state,
+        "app_record_csv_assistant_import",
+        json!({"install_id": install, "context_id": context_id,
+               "csv_text": bad_csv, "preview_token": token_preview, "request_id": "req-1014-5",
+               "confirm_token": confirm, "message": "chat-1014-5", "token": token}),
+    );
+    assert_eq!(retry["ok"], true, "same-request replay refused: {retry}");
+    // A CHANGED CSV under the spent claim+request is a different intent
+    // — refused even though request id and message match.
+    let other_csv = "record_id,display_name,email\ncust-2,Other,o@example.invalid\n";
+    let other_token = w.preview(install, context_id, other_csv)["preview_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let changed: Value = lane.rpc(
+        &w.daemon.state,
+        "app_record_csv_assistant_import",
+        json!({"install_id": install, "context_id": context_id,
+               "csv_text": other_csv, "preview_token": other_token, "request_id": "req-1014-5",
+               "confirm_token": confirm, "message": "chat-1014-5", "token": token}),
+    );
+    assert_eq!(
+        changed["ok"], false,
+        "changed payload under a spent claim admitted: {changed}"
+    );
+}
+
 #[test]
 fn cad1014_scoped_chat_segment_save_redeems_scope_once() {
     let w = Crm::new();
@@ -282,19 +371,35 @@ fn cad1014_scoped_chat_segment_save_redeems_scope_once() {
         Some("vip"),
         "{redeem}"
     );
-    // A second segment on the SAME message is refused (one claim).
-    let second: Value = lane.rpc(
+    // The scoped-chat READ admits the agent on the same live turn —
+    // segment revision/membership, no claim consumed.
+    let read: Value = lane.rpc(
         &w.daemon.state,
-        "app_segment_assistant_save",
+        "app_segment_assistant_list",
+        json!({"install_id": install, "context_id": context_id,
+               "message": "chat-1014-2", "token": token}),
+    );
+    assert_eq!(read["ok"], true, "scoped segment list refused: {read}");
+    // A second segment on the SAME message is refused (one claim), AND
+    // a same-id segment with a CHANGED payload is a different intent —
+    // the claim binds the normalized payload digest, so it refuses too.
+    for probe in [
         json!({"install_id": install, "context_id": context_id,
                "segment_id": "other", "name": "Another",
                "predicates": [{"field": "tag", "op": "eq", "value": "x"}],
                "message": "chat-1014-2", "token": token}),
-    );
-    assert_eq!(
-        second["ok"], false,
-        "one message minted two segment saves: {second}"
-    );
+        // same segment id, edited payload — a second intent, not a replay
+        json!({"install_id": install, "context_id": context_id,
+               "segment_id": "vip", "name": "Renamed VIP",
+               "predicates": [{"field": "tag", "op": "eq", "value": "vip"}],
+               "message": "chat-1014-2", "token": token}),
+    ] {
+        let frame: Value = lane.rpc(&w.daemon.state, "app_segment_assistant_save", probe);
+        assert_eq!(
+            frame["ok"], false,
+            "one message minted a second save: {frame}"
+        );
+    }
 }
 
 /// Cross-scope, forged-field, wrong-turn and detached-child refusals —

@@ -549,13 +549,21 @@ impl Shared {
         let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant CSV import")?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
         // One stamped message redeems one action across all request ids
-        // (CAD-1014). The claim commits before the action opens its own
-        // transaction; a replay must ride the same request id.
+        // (CAD-1014). The claim binds the normalized payload (byte token
+        // + request id + decisions) so a changed payload under a spent
+        // claim refuses as a second intent, never a replay.
+        let payload_digest = crate::store::app_runs::material_digest(&json!({
+            "domain": "cadence-app-csv-assistant-import-v1",
+            "preview_token": required_str(params, "preview_token")?,
+            "request_id": required_str(params, "request_id")?,
+            "decisions": params.get("decisions").cloned().unwrap_or(Value::Null),
+        }));
         records.app_assistant_claim(
             &scoped.context,
             &scoped.message_id,
             "app_record_csv_assistant_import",
             Some(required_str(params, "request_id")?),
+            &payload_digest,
             &scoped.caller,
         )?;
         // Explicit host-side confirm, not chat prose: the operator's
@@ -642,14 +650,22 @@ impl Shared {
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
         // One stamped message redeems one action across all ids
         // (CAD-1014); `expected_revision` is the CAS on the named
-        // segment. The segment id is the claim key: a re-save of the
-        // SAME segment replays, a different segment on this message
-        // refuses as a second action.
+        // segment. The claim binds the normalized segment payload — a
+        // re-save of the SAME segment replays, a same-id segment with a
+        // changed name/predicates/revision refuses as a different intent.
+        let payload_digest = crate::store::app_runs::material_digest(&json!({
+            "domain": "cadence-app-segment-assistant-save-v1",
+            "segment_id": required_str(params, "segment_id")?,
+            "name": required_str(params, "name")?,
+            "predicates": params.get("predicates").cloned().unwrap_or(Value::Null),
+            "expected_revision": params.get("expected_revision").cloned().unwrap_or(Value::Null),
+        }));
         records.app_assistant_claim(
             &scoped.context,
             &scoped.message_id,
             "app_segment_assistant_save",
             Some(required_str(params, "segment_id")?),
+            &payload_digest,
             &scoped.caller,
         )?;
         let result = records.app_segment_save(

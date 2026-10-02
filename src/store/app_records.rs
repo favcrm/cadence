@@ -228,7 +228,8 @@ CREATE TABLE IF NOT EXISTS app_unsubscribe_tokens(
  created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS app_assistant_claims(
  context_id TEXT NOT NULL, message_id TEXT NOT NULL,
- action TEXT NOT NULL, request_id TEXT, agent TEXT NOT NULL,
+ action TEXT NOT NULL, request_id TEXT, payload_digest TEXT NOT NULL,
+ agent TEXT NOT NULL,
  created REAL NOT NULL,
  PRIMARY KEY(context_id, message_id));
 CREATE TABLE IF NOT EXISTS app_csv_confirms(
@@ -704,7 +705,8 @@ impl RecordStore {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS app_assistant_claims(\
                  context_id TEXT NOT NULL, message_id TEXT NOT NULL,\
-                 action TEXT NOT NULL, request_id TEXT, agent TEXT NOT NULL,\
+                 action TEXT NOT NULL, request_id TEXT, payload_digest TEXT NOT NULL,\
+                 agent TEXT NOT NULL,\
                  created REAL NOT NULL,\
                  PRIMARY KEY(context_id, message_id));\
                  CREATE TABLE IF NOT EXISTS app_csv_confirms(\
@@ -716,6 +718,25 @@ impl RecordStore {
                  PRIMARY KEY(context_id, request_id))",
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            // CAD-1014 payload binding: files whose claim table predates
+            // the column gain it empty (a pre-column claim can only have
+            // come from an earlier build of this same lane, never a
+            // release — the column never silently appears on a foreign
+            // file because every other write would have failed first).
+            let needs_payload_digest =
+                match conn.prepare("SELECT payload_digest FROM app_assistant_claims LIMIT 0") {
+                    Ok(_) => false,
+                    Err(error) if is_contention(&error) => {
+                        return Err(Error::internal("record file is busy"));
+                    }
+                    Err(_) => true,
+                };
+            if needs_payload_digest {
+                conn.execute_batch(
+                    "ALTER TABLE app_assistant_claims ADD COLUMN payload_digest TEXT NOT NULL DEFAULT ''",
+                )
+                .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            }
         }
         Ok(Self {
             install_id: install_id.to_string(),
@@ -1781,12 +1802,19 @@ impl RecordStore {
     /// rather than mint a second claim. This is the message-level gate
     /// the daemon's redeem verbs call after the scoped-chat proof; the
     /// operator path never claims.
+    /// `payload_digest` binds the normalized operation payload (the
+    /// byte token + decisions for a CSV import; segment id + name +
+    /// predicates + expected revision for a segment save) — the SAME
+    /// action+request on a CHANGED payload is a different intent and
+    /// refuses, so a replay can never smuggle an edited segment or CSV
+    /// under a spent claim's request id.
     pub fn app_assistant_claim(
         &self,
         context: &str,
         message_id: &str,
         action: &str,
         request_id: Option<&str>,
+        payload_digest: &str,
         agent: &str,
     ) -> Result<()> {
         crate::proto::identifier(context, "context ID")?;
@@ -1814,16 +1842,22 @@ impl RecordStore {
         // second action mints: the SAME action+request id is a replay
         // (the verb's own idempotency then returns the stored receipt),
         // anything else is a second action on one intent and refuses.
-        let existing: Option<(String, Option<String>)> = tx
+        let existing: Option<(String, Option<String>, String)> = tx
             .query_row(
-                "SELECT action,request_id FROM app_assistant_claims WHERE context_id=? AND message_id=?",
+                "SELECT action,request_id,payload_digest FROM app_assistant_claims WHERE context_id=? AND message_id=?",
                 params![context, message_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .map_err(|e| Error::internal(e.to_string()))?;
-        if let Some((claimed_action, claimed_request)) = existing {
-            if claimed_action == action && claimed_request.as_deref() == request_id {
+        if let Some((claimed_action, claimed_request, claimed_digest)) = existing {
+            // Replay is only identical-intent: same action, same request
+            // key AND the same normalized payload digest. A changed
+            // payload under a spent claim is a second action, refused.
+            if claimed_action == action
+                && claimed_request.as_deref() == request_id
+                && claimed_digest == payload_digest
+            {
                 tx.commit().map_err(|e| Error::internal(e.to_string()))?;
                 return Ok(());
             }
@@ -1832,8 +1866,8 @@ impl RecordStore {
             ));
         }
         tx.execute(
-            "INSERT INTO app_assistant_claims(context_id,message_id,action,request_id,agent,created) VALUES(?,?,?,?,?,?)",
-            params![context, message_id, action, request_id, agent, now()],
+            "INSERT INTO app_assistant_claims(context_id,message_id,action,request_id,payload_digest,agent,created) VALUES(?,?,?,?,?,?,?)",
+            params![context, message_id, action, request_id, payload_digest, agent, now()],
         )
         .map_err(|error| {
             if matches!(error, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::ConstraintViolation)
