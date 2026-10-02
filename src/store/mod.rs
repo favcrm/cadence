@@ -133,8 +133,10 @@ pub struct Store {
     /// CAD-1011: this store's bound identity — the canonicalized database
     /// path recorded at open. `OwnerMaintenancePermit::database_id` must
     /// equal it, so a permit issued for one store can never authorize
-    /// owner maintenance on another.
-    db_identity: String,
+    /// owner maintenance on another. `pub(super)` — the owner-op bodies
+    /// in `seal.rs` read it; it is a local identity only, never
+    /// authenticated restore/incarnation provenance.
+    pub(super) db_identity: String,
 }
 
 /// The `shutdown_entries` test seam (CAD-694): called with each
@@ -219,31 +221,17 @@ impl Store {
                 // or a verified rollback) gets the forensic row.
                 let clean = !matches!(recovery, seal::PoisonRecovery::Unverified);
                 let fenced = self.write_fence.get().is_some_and(|f| f.check().is_some());
-                // CAD-1011: a sealed or Protected-unknown store must
-                // never write the recovery event — a forensic write into
-                // a closed latch would both fail the authorizer's
-                // latch-table deny and mislabel a sealed store's state.
-                // `preflight_read` is a plain read (allowed even while
-                // disarmed); only an unsealed store may record the row.
-                let sealed = matches!(
-                    super::seal::preflight_read(&guard),
-                    Ok(super::seal::Preflight::Sealed)
-                );
-                if !fenced && !sealed && clean {
+                if !fenced && clean {
                     // CAD-1011: the forensic recovery event is an
-                    // owner-maintenance write — armed so the authorizer
-                    // permits it while the caller's lane is still disarmed.
+                    // owner-maintenance write inside ONE held BEGIN
+                    // IMMEDIATE — the closure-latch re-check and the row
+                    // are one critical section, and only an explicit safe
+                    // unsealed outcome (LatchAbsent/LatchOpen) may write.
+                    // A sealed, malformed or unreadable latch records
+                    // nothing — never a false `rolled_back` on a closed
+                    // or unknown store.
                     let rolled_back = matches!(recovery, seal::PoisonRecovery::RolledBack);
-                    seal::with_owner_tx_control(&self.seal_state, || {
-                        if let Err(e) = Self::event(
-                            &*guard,
-                            Self::DAEMON_STREAM,
-                            "store_poisoned",
-                            json!({"rolled_back": rolled_back, "state": state_label}),
-                        ) {
-                            eprintln!("store: could not record store_poisoned: {e}");
-                        }
-                    });
+                    Self::forensic_poison_event(&self.seal_state, &guard, rolled_back, state_label);
                 }
                 guard
             }

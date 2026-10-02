@@ -58,6 +58,18 @@ impl GuardState {
     const TX_CONTROL: u8 = 1;
 }
 
+/// The finite owner-maintenance operation a permit authorizes. A permit
+/// minted for `Close` can never authorize `Witness` and vice versa — the
+/// discriminant is a private field checked at the barrier, so separate
+/// one-use permits cannot be repurposed across operations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum OwnerOp {
+    /// `propose_close` — flip the durable closure latch.
+    Close,
+    /// `witness_commit` — the sealed-store witness barrier.
+    Witness,
+}
+
 /// A single-use, externally-issued authority to run ONE owner
 /// maintenance operation on *this* database. The permit is bound to the
 /// database's identity, the closure challenge, the operator's close
@@ -74,8 +86,14 @@ impl GuardState {
 /// unreachable in this build) and the `#[cfg(test)]` synthetic factory
 /// produce one.
 pub(super) struct OwnerMaintenancePermit {
-    /// The database this permit authorizes — bound so a permit issued for
-    /// one store cannot authorize maintenance on another.
+    /// The operation this permit authorizes — `Close` vs `Witness`; a
+    /// permit issued for one operation refuses the other.
+    op: OwnerOp,
+    /// The database this permit authorizes — bound to the *recorded local
+    /// identity* (the canonicalized path at open), so a permit minted for
+    /// one store cannot authorize maintenance on another. This is a local
+    /// identity binding only — it is NOT authenticated restore/incarnation
+    /// provenance (no external authority exists to supply one).
     database_id: String,
     /// The closure challenge the sealed latch recorded.
     challenge: Vec<u8>,
@@ -103,6 +121,7 @@ impl OwnerMaintenancePermit {
     #[allow(dead_code)]
     pub(super) fn issue(
         _database_id: &str,
+        _op: OwnerOp,
         _challenge: &[u8],
         _attempt: &str,
         _artifact: &str,
@@ -115,11 +134,13 @@ impl OwnerMaintenancePermit {
         ))
     }
 
-    /// Test/synthetic factory — exists only so tests can exercise the
-    /// owner-maintenance barrier. Never reachable in a production build.
-    #[cfg(any(test, feature = "test-seam"))]
+    /// Test-only synthetic factory — `#[cfg(test)]` so a release build
+    /// can never mint one even under `test-seam`. Exists purely so unit
+    /// tests exercise the owner-maintenance barrier.
+    #[cfg(test)]
     pub(super) fn synthetic(
         database_id: &str,
+        op: OwnerOp,
         challenge: &[u8],
         attempt: &str,
         artifact: &str,
@@ -127,6 +148,7 @@ impl OwnerMaintenancePermit {
         deadline_unix: i64,
     ) -> Self {
         Self {
+            op,
             database_id: database_id.to_string(),
             challenge: challenge.to_vec(),
             attempt: attempt.to_string(),
@@ -137,9 +159,15 @@ impl OwnerMaintenancePermit {
         }
     }
 
-    /// Consume the one-use barrier. `Ok` flips `consumed` exactly once;
-    /// a second call refuses. Also refuses a stale permit (deadline).
-    fn take(&self) -> Result<()> {
+    /// Consume the one-use barrier for `expected` operation — refuses a
+    /// permit minted for a different operation, a stale deadline, or a
+    /// second use. `Ok` flips `consumed` exactly once.
+    fn take(&self, expected: OwnerOp) -> Result<()> {
+        if self.op != expected {
+            return Err(Error::rejected(
+                "owner-maintenance permit authorizes a different operation",
+            ));
+        }
         if self.deadline_unix <= super::now() as i64 {
             return Err(Error::rejected(
                 "owner-maintenance permit is past its deadline",
@@ -156,7 +184,7 @@ impl OwnerMaintenancePermit {
         Ok(())
     }
 
-    /// The database identity this permit is bound to.
+    /// The recorded local identity this permit is bound to.
     fn database_id(&self) -> &str {
         &self.database_id
     }
@@ -469,6 +497,7 @@ CREATE TABLE IF NOT EXISTS closure_state(
     reason TEXT,
     challenge BLOB,
     attempt TEXT,
+    artifact TEXT,
     epoch INTEGER,
     witness_done INTEGER NOT NULL DEFAULT 0,
     closed_at REAL);
@@ -968,25 +997,50 @@ impl Store {
         }
     }
 
-    /// Owner-maintenance write scope: takes the conn mutex, checks the
-    /// durable latch, then runs `f(&Connection)` with `Owner`+`TxControl`
-    /// armed — the only scope in which DDL (`CREATE/ALTER/…`), migration
-    /// DML and the latch/witness tables are authorized. Private: only the
-    /// finite owner-maintenance operations below call it — it is never a
-    /// business callback surface, and the authorizer still denies the
-    /// latch tables unless `Owner`. The latch is still honored — a sealed
-    /// store refuses.
-    fn with_owner_conn<R>(&self, f: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
+    /// Owner-maintenance write scope: takes the conn mutex, opens a held
+    /// `BEGIN IMMEDIATE`, re-checks the durable latch *inside* that tx,
+    /// then runs `f(&Connection)` armed `Owner`+`TxControl` — the latch
+    /// check and every DDL/migration/DML commit atomically, so a second
+    /// connection cannot seal between the check and the write. `f` sees
+    /// the live tx's `&Connection` (a `Transaction` derefs to it) — never
+    /// a business facade. Private: only the finite owner-maintenance ops
+    /// below call it; the authorizer still denies the latch tables unless
+    /// `Owner`. A sealed store refuses inside the tx before `f` runs.
+    fn with_owner_tx<R>(&self, f: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
         let guard = self.conn();
         let state = &*self.seal_state;
-        Self::check_closed_tx(&guard)?;
-        with_owner_tx_control(state, || f(&guard))
+        let _armed = ArmGuard::enter(state, GuardState::OWNER);
+        // BEGIN IMMEDIATE in the tx-control window; the authorizer
+        // permits the boundary only here.
+        let tx = {
+            let _ctrl = ControlPhase::enter(state);
+            Transaction::new_unchecked(&guard, TransactionBehavior::Immediate)
+                .map_err(|e| Error::internal(e.to_string()))?
+        };
+        // Latch check INSIDE the held tx — serializes the check+write
+        // against any other writer on the file.
+        if let Err(e) = Self::check_closed_tx(&tx) {
+            Self::rollback_tx(state, &guard, tx)?;
+            return Err(e);
+        }
+        let out = f(&tx);
+        match out {
+            Ok(v) => {
+                let _ctrl = ControlPhase::enter(state);
+                tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+                Ok(v)
+            }
+            Err(e) => {
+                Self::rollback_tx(state, &guard, tx)?;
+                Err(e)
+            }
+        }
     }
 
     /// Owner maintenance: record the running daemon build in the rollout
     /// guard table (DDL + upsert). Finite operation — no caller callback.
     pub(crate) fn owner_record_running_build(&self, commit: &str) -> Result<()> {
-        self.with_owner_conn(|conn| {
+        self.with_owner_tx(|conn| {
             crate::rollout::upsert_daemon_build(conn, commit, crate::rollout::unix_now())
         })
     }
@@ -994,14 +1048,14 @@ impl Store {
     /// Owner maintenance: enforce that this binary's commit is the one
     /// the daemon last recorded unless the caller holds the lease.
     pub(crate) fn owner_enforce_running_build(&self) -> Result<()> {
-        self.with_owner_conn(crate::rollout::enforce_running_build)
+        self.with_owner_tx(crate::rollout::enforce_running_build)
     }
 
     /// Owner maintenance: fold a refused migration's side log into the
     /// daemon event stream (the refusal cannot be written into the db it
     /// is refusing to modify).
     pub(crate) fn owner_ingest_rollout_gate(&self, state_dir: &Path) -> Result<()> {
-        self.with_owner_conn(|conn| crate::rollout::ingest_gate_log(state_dir, conn))
+        self.with_owner_tx(|conn| crate::rollout::ingest_gate_log(state_dir, conn))
             .map(|_| ())
     }
 
@@ -1013,7 +1067,63 @@ impl Store {
     #[cfg(any(test, feature = "test-seam"))]
     #[allow(dead_code)]
     pub(crate) fn fixture_write<R>(&self, f: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
-        self.with_owner_conn(f)
+        self.with_owner_tx(f)
+    }
+
+    /// The conn-`lock()` poison recovery: write the `store_poisoned`
+    /// forensic row in ONE held `BEGIN IMMEDIATE` whose critical section
+    /// covers the closure-latch re-check and the insert — never a
+    /// process-local preflight read then an unrestricted owner write.
+    /// Only an explicit safe unsealed outcome (`LatchAbsent`/`LatchOpen`)
+    /// may write; a `Sealed`, `Malformed` or unreadable latch records
+    /// nothing (a sealed or Protected-unknown store never produces a
+    /// false `rolled_back`/`store_poisoned` row). `conn` is the held
+    /// guard — this never re-locks `self.conn()`.
+    pub(crate) fn forensic_poison_event(
+        state: &GuardState,
+        conn: &Connection,
+        rolled_back: bool,
+        state_label: &'static str,
+    ) {
+        let _armed = ArmGuard::enter(state, GuardState::OWNER);
+        let tx = {
+            let _ctrl = ControlPhase::enter(state);
+            match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("store: forensic tx begin failed: {e}");
+                    return;
+                }
+            }
+        };
+        // Latch check INSIDE the held tx — serializes with the DML.
+        let safe = matches!(
+            preflight_read(&tx),
+            Ok(Preflight::LatchAbsent) | Ok(Preflight::LatchOpen)
+        );
+        if !safe {
+            let _ = tx;
+            return;
+        }
+        let out = Store::event(
+            &tx,
+            Store::DAEMON_STREAM,
+            "store_poisoned",
+            serde_json::json!({"rolled_back": rolled_back, "state": state_label}),
+        );
+        match out {
+            Ok(()) => {
+                let _ctrl = ControlPhase::enter(state);
+                if let Err(e) = tx.commit() {
+                    eprintln!("store: forensic commit failed: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("store: could not record store_poisoned: {e}");
+                let _ctrl = ControlPhase::enter(state);
+                let _ = tx.rollback();
+            }
+        }
     }
 
     /// Test/fixture guard: an armed-`Owner`+`TxControl` conn guard for
@@ -1045,28 +1155,42 @@ impl Store {
         permit: &OwnerMaintenancePermit,
         reason: &str,
     ) -> Result<()> {
-        // Consume the one-use barrier and check the deadline before any
-        // write — a stale or spent permit refuses without touching the db.
-        permit.take()?;
-        // The permit must be bound to THIS store's identity — a permit
-        // issued for a different database refuses.
+        // A Close permit only — a Witness permit cannot propose the latch.
+        permit.take(OwnerOp::Close)?;
+        // The permit must be bound to THIS store's recorded local
+        // identity — a permit minted for another database refuses.
         if permit.database_id() != self.db_identity {
             return Err(Error::rejected(
                 "owner-maintenance permit is bound to a different database",
             ));
         }
+        // Reject an epoch that cannot fit the latch's INTEGER column —
+        // `as i64` would silently wrap a u64 > i64::MAX into a negative.
+        let epoch = i64::try_from(permit.epoch).map_err(|_| {
+            Error::rejected("owner-maintenance permit epoch overflows the latch")
+        })?;
         self.sealed_tx(GuardState::OWNER, false, |wtx| {
+            // Re-check the deadline + one-use inside the held tx — the
+            // DML below must not outlive the permit's authority window.
+            if permit.deadline_unix <= super::now() as i64 {
+                return Err(Error::rejected(
+                    "owner-maintenance permit is past its deadline",
+                ));
+            }
             wtx.execute_batch(SEAL_SCHEMA)?;
+            // The latch binds challenge + attempt + the exact artifact +
+            // epoch — a later witness must present the same binding.
             wtx.execute(
-                "INSERT INTO closure_state(id,closed,reason,challenge,attempt,epoch,witness_done,closed_at)
-                 VALUES(1,1,?,?,?,?,0,?)
+                "INSERT INTO closure_state(id,closed,reason,challenge,attempt,artifact,epoch,witness_done,closed_at)
+                 VALUES(1,1,?,?,?,?,?,0,?)
                  ON CONFLICT(id) DO UPDATE SET closed=1,reason=excluded.reason,closed_at=excluded.closed_at
                    WHERE closure_state.witness_done=0",
                 rusqlite::params![
                     reason,
                     permit.challenge.as_slice(),
                     permit.attempt.as_str(),
-                    permit.epoch as i64,
+                    permit.artifact.as_str(),
+                    epoch,
                     super::now()
                 ],
             )?;
@@ -1083,30 +1207,38 @@ impl Store {
     /// a single row writes. Synthetic/test in this draft (production
     /// `Protected` open is unreachable).
     #[allow(dead_code)]
-    pub(super) fn witness_commit(
-        &self,
-        permit: &OwnerMaintenancePermit,
-    ) -> Result<u64> {
-        // Consume the one-use barrier + deadline before any db work.
-        permit.take()?;
-        // The permit must be bound to THIS store's identity.
+    pub(super) fn witness_commit(&self, permit: &OwnerMaintenancePermit) -> Result<u64> {
+        // A Witness permit only — a Close permit cannot commit a witness.
+        permit.take(OwnerOp::Witness)?;
+        // The permit must be bound to THIS store's recorded local
+        // identity.
         if permit.database_id() != self.db_identity {
             return Err(Error::rejected(
                 "owner-maintenance permit is bound to a different database",
             ));
         }
+        let epoch = i64::try_from(permit.epoch).map_err(|_| {
+            Error::rejected("owner-maintenance permit epoch overflows the latch")
+        })?;
         // The witness is the owner barrier that commits *after* the latch
         // is sealed — it runs `on_sealed` and verifies the latch in `f`.
         self.sealed_tx(GuardState::OWNER, true, |wtx| {
-            let (closed, wdone, schallenge, sattempt, sepoch): (
+            // Deadline re-check inside the held tx before any DML.
+            if permit.deadline_unix <= super::now() as i64 {
+                return Err(Error::rejected(
+                    "owner-maintenance permit is past its deadline",
+                ));
+            }
+            let (closed, wdone, schallenge, sattempt, sartifact, sepoch): (
                 i64,
                 i64,
                 Vec<u8>,
                 String,
+                Option<String>,
                 i64,
             ) = wtx
                 .query_row(
-                    "SELECT closed,witness_done,challenge,attempt,epoch FROM closure_state WHERE id=1",
+                    "SELECT closed,witness_done,challenge,attempt,artifact,epoch FROM closure_state WHERE id=1",
                     [],
                     |r| {
                         Ok((
@@ -1115,6 +1247,7 @@ impl Store {
                             r.get(2)?,
                             r.get(3)?,
                             r.get(4)?,
+                            r.get(5)?,
                         ))
                     },
                 )
@@ -1126,12 +1259,13 @@ impl Store {
                 return Err(Error::rejected("owner witness already committed"));
             }
             // Every permit binding must equal the sealed latch —
-            // challenge, the close attempt AND the epoch. A witness for a
-            // different attempt/epoch/challenge than the one that sealed
+            // challenge, close attempt, the exact artifact AND the epoch.
+            // A witness for a different binding than the one that sealed
             // refuses.
             if schallenge != permit.challenge
                 || sattempt != permit.attempt
-                || sepoch != permit.epoch as i64
+                || sartifact.as_deref() != Some(permit.artifact.as_str())
+                || sepoch != epoch
             {
                 return Err(Error::rejected(
                     "witness permit does not match the sealed latch",
@@ -1144,7 +1278,7 @@ impl Store {
                     permit.challenge.as_slice(),
                     permit.attempt.as_str(),
                     permit.artifact.as_str(),
-                    permit.epoch as i64,
+                    epoch,
                     PROTECTED_SCHEMA_MAX,
                     super::now()
                 ],
@@ -1519,6 +1653,7 @@ mod tests {
     /// deadline so expiry is not under test here.
     fn permit(
         db: &std::path::Path,
+        op: OwnerOp,
         challenge: &[u8],
         attempt: &str,
         artifact: &str,
@@ -1530,6 +1665,7 @@ mod tests {
             &db.canonicalize()
                 .unwrap_or_else(|_| db.to_path_buf())
                 .to_string_lossy(),
+            op,
             challenge,
             attempt,
             artifact,
@@ -1545,7 +1681,7 @@ mod tests {
         // A producer write goes through.
         s.event_public("daemon", "probe", json!({})).unwrap();
         // Seal it via the owner lane.
-        s.propose_close(&permit(&db, b"chal", "attempt-1", "", 7), "test").unwrap();
+        s.propose_close(&permit(&db, OwnerOp::Close, b"chal", "attempt-1", "", 7), "test").unwrap();
         // Every producer write now refuses.
         assert!(s.event_public("daemon", "probe", json!({})).is_err());
         assert!(s.write_conn().is_err());
@@ -1560,14 +1696,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (_db, s) = open_legacy(&dir);
         // Create the latch tables through the owner lane (unsealed db).
-        s.propose_close(&permit(&_db, b"c", "a", "", 1), "t").unwrap();
+        s.propose_close(&permit(&_db, OwnerOp::Close, b"c", "a", "", 1), "t").unwrap();
         // Reopen is refused on the sealed file, so exercise the *armed*
         // business conn on a fresh unsealed db that also carries the
         // latch: a Business-armed conn must not write closure_state or
         // owner_witness even though it can write business tables.
         let dir2 = TempDir::new().unwrap();
         let (_db2, s2) = open_legacy(&dir2);
-        s2.propose_close(&permit(&_db2, b"c", "a", "", 1), "t").unwrap();
+        s2.propose_close(&permit(&_db2, OwnerOp::Close, b"c", "a", "", 1), "t").unwrap();
         // s2's conn is the armed path — but sealing already closed it.
         // Use a third, unsealed store whose latch tables exist via a
         // *second* owner pass is impossible; instead assert the authorizer
@@ -1613,7 +1749,7 @@ mod tests {
         // A sealed db refuses under both modes.
         let dir2 = TempDir::new().unwrap();
         let (db2, s2) = open_legacy(&dir2);
-        s2.propose_close(&permit(&_db2, b"c", "a", "", 1), "t").unwrap();
+        s2.propose_close(&permit(&db2, OwnerOp::Close, b"c", "a", "", 1), "t").unwrap();
         drop(s2);
         assert!(Store::open_mode(&db2, OpenMode::Protected).is_err());
         assert!(Store::open_mode(&db2, OpenMode::Legacy).is_err());
@@ -1623,7 +1759,7 @@ mod tests {
     fn legacy_open_of_latch_present_db_refuses() {
         let dir = TempDir::new().unwrap();
         let (db, s) = open_legacy(&dir);
-        s.propose_close(&permit(&_db, b"c", "a", "", 1), "t").unwrap();
+        s.propose_close(&permit(&db, OwnerOp::Close, b"c", "a", "", 1), "t").unwrap();
         drop(s);
         // Legacy open of a latch-carrying db refuses (no autocommit
         // conversion or recovery on a protected file).
@@ -1644,15 +1780,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (_db, s) = open_legacy(&dir);
         // Not sealed -> witness refuses.
-        assert!(s.witness_commit(&permit(&_db, b"c", "a", "art", 1)).is_err());
-        s.propose_close(&permit(&_db, b"ch", "attempt-x", "art", 9), "t").unwrap();
+        assert!(s.witness_commit(&permit(&_db, OwnerOp::Witness, b"c", "a", "art", 1)).is_err());
+        s.propose_close(&permit(&_db, OwnerOp::Close, b"ch", "attempt-x", "art", 9), "t").unwrap();
         // Wrong challenge -> refuse.
-        assert!(s.witness_commit(&permit(&_db, b"WRONG", "attempt-x", "art", 9)).is_err());
+        assert!(s.witness_commit(&permit(&_db, OwnerOp::Witness, b"WRONG", "attempt-x", "art", 9)).is_err());
         // Correct -> one row, seq 1.
-        let seq = s.witness_commit(&permit(&_db, b"ch", "attempt-x", "art", 9)).unwrap();
+        let seq = s.witness_commit(&permit(&_db, OwnerOp::Witness, b"ch", "attempt-x", "art", 9)).unwrap();
         assert_eq!(seq, 1);
         // Replay -> witness_done refuses.
-        assert!(s.witness_commit(&permit(&_db, b"ch", "attempt-x", "art", 9)).is_err());
+        assert!(s.witness_commit(&permit(&_db, OwnerOp::Witness, b"ch", "attempt-x", "art", 9)).is_err());
     }
 
     /// Adversarial: a business-armed write conn must not mutate connection
