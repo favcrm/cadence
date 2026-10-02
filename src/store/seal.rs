@@ -1056,7 +1056,7 @@ pub(crate) trait StoreConn {
         f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
     ) -> rusqlite::Result<()>;
     fn last_insert_rowid(&self) -> i64;
-    fn changes(&self) -> usize;
+    fn changes(&self) -> u64;
     /// `pragma_query_value` for a pragma whose value the caller decodes.
     fn pragma_query_value<T, F>(
         &self,
@@ -1137,7 +1137,7 @@ macro_rules! storeconn_impl {
                 let $g = self;
                 ($get).last_insert_rowid()
             }
-            fn changes(&self) -> usize {
+            fn changes(&self) -> u64 {
                 let $g = self;
                 ($get).changes()
             }
@@ -1172,20 +1172,20 @@ storeconn_impl!(WriteTxn<'_>, |g| -> &Connection { &**g.tx });
 // at a `*_in(&impl StoreConn)` call site match one of these shapes.
 storeconn_impl!(&Connection, |g| -> &Connection { *g });
 storeconn_impl!(&mut Connection, |g| -> &Connection { &**g });
+storeconn_impl!(&&Connection, |g| -> &Connection { **g });
+storeconn_impl!(&&mut Connection, |g| -> &Connection { &***g });
 storeconn_impl!(&std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &***g });
 storeconn_impl!(&mut std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &***g });
-storeconn_impl!(&Transaction<'_>, |g| -> &Connection { &**g });
-storeconn_impl!(&mut Transaction<'_>, |g| -> &Connection { &***g });
-storeconn_impl!(&WriteTxn<'_>, |g| -> &Connection { &**g.tx });
-storeconn_impl!(&mut WriteTxn<'_>, |g| -> &Connection { &***g.tx });
-storeconn_impl!(&&mut WriteTxn<'_>, |g| -> &Connection { &****g.tx });
-storeconn_impl!(&&WriteTxn<'_>, |g| -> &Connection { &***g.tx });
-storeconn_impl!(&&Transaction<'_>, |g| -> &Connection { &***g });
-storeconn_impl!(&&mut Transaction<'_>, |g| -> &Connection { &****g });
-storeconn_impl!(&&Connection, |g| -> &Connection { &**g });
-storeconn_impl!(&&mut Connection, |g| -> &Connection { &***g });
 storeconn_impl!(&&std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &****g });
 storeconn_impl!(&&mut std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &****g });
+storeconn_impl!(&Transaction<'_>, |g| -> &Connection { &***g });
+storeconn_impl!(&mut Transaction<'_>, |g| -> &Connection { &***g });
+storeconn_impl!(&&Transaction<'_>, |g| -> &Connection { &****g });
+storeconn_impl!(&&mut Transaction<'_>, |g| -> &Connection { &****g });
+storeconn_impl!(&WriteTxn<'_>, |g| -> &Connection { &**g.tx });
+storeconn_impl!(&mut WriteTxn<'_>, |g| -> &Connection { &**g.tx });
+storeconn_impl!(&&WriteTxn<'_>, |g| -> &Connection { &**g.tx });
+storeconn_impl!(&&mut WriteTxn<'_>, |g| -> &Connection { &**g.tx });
 
 
 
@@ -1268,7 +1268,7 @@ impl<'t> WriteTxn<'t> {
         self.tx.last_insert_rowid()
     }
     /// Rows touched by the most recent DML on this tx's connection.
-    pub(crate) fn changes(&self) -> usize {
+    pub(crate) fn changes(&self) -> u64 {
         self.tx.changes()
     }
     /// `PRAGMA` query inside the tx (read-form only reaches the
