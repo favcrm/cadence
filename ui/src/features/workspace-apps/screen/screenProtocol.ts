@@ -55,6 +55,9 @@ export type ChildToHost =
  *  `{v:1, op:"ready", accepts:["publish-intents.v1"]}`; a child that sends
  *  the bare `ready` keeps receiving the exact CAD-1006 v1 shape. */
 export const PUBLISH_INTENTS_V1 = "publish-intents.v1";
+/** Every PUSH a child receives is at most this many UTF-8 bytes. */
+export const PUSH_BYTES_MAX = 128 * 1024;
+const LINK_ID_MAX = 128;
 
 /** One verified publish intent, read-only. Every field is required; there is
  *  no grant, approval, idempotency key, receipt, upstream evidence, caption or
@@ -207,4 +210,30 @@ export function legacyPush(push: ScreenPush): ScreenPush {
     runs: push.runs.map(({ context_id: _context, ...run }) => run),
     outbox: push.outbox.map(({ run_id: _run, context_id: _context, ...row }) => row),
   };
+}
+
+export function pushBytes(push: ScreenPush): number {
+  return new TextEncoder().encode(JSON.stringify(push)).byteLength;
+}
+const linkId = (value: string | undefined, required: boolean) =>
+  typeof value === "string" && value.length <= LINK_ID_MAX && (!required || value.length > 0);
+
+/** The exact PUSH one child receives, or `null` when it cannot be sent (the
+ *  caller then closes the mount and the board shows its native workspace).
+ *  The byte cap is checked on THIS shape, so a legacy child is never refused
+ *  for bytes only an opted-in child would get. For an opted-in child, the
+ *  linkage ids must meet the app's bounds (fail closed otherwise), and when
+ *  the intent rows alone push it over the cap they are replaced by an honest
+ *  `unavailable` block rather than dropping the screen. */
+export function shapeFor(push: ScreenPush, intents: boolean): ScreenPush | null {
+  if (!intents) {
+    const legacy = legacyPush(push);
+    return pushBytes(legacy) <= PUSH_BYTES_MAX ? legacy : null;
+  }
+  if (!push.publish_intents ||
+      !push.runs.every(run => linkId(run.context_id, false)) ||
+      !push.outbox.every(row => linkId(row.run_id, true) && linkId(row.context_id, false))) return null;
+  if (pushBytes(push) <= PUSH_BYTES_MAX) return push;
+  const degraded: ScreenPush = { ...push, publish_intents: { status: "unavailable", withheld: 0, rows: [] } };
+  return pushBytes(degraded) <= PUSH_BYTES_MAX ? degraded : null;
 }

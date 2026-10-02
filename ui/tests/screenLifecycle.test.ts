@@ -81,7 +81,22 @@ check(!("publish_intents" in (bare.port.sent[1] as object)), "later updates keep
 const forgedOptIn = mount(); forgedOptIn.channel.receive(forgedOptIn.event);
 forgedOptIn.port.receive({ v: 1, op: "ready", accepts: ["publish-intents.v1", "credentials"] });
 check(forgedOptIn.port.closed && forgedOptIn.port.sent.length === 0, "forged opt-in closes the mount with nothing sent");
-const switched = mount(); switched.channel.receive(switched.event); switched.port.receive({ v: 1, op: "ready", accepts: ["publish-intents.v1"] });
+const unextended = mount(); unextended.channel.receive(unextended.event); unextended.port.receive({ v: 1, op: "ready", accepts: ["publish-intents.v1"] });
+check(unextended.port.closed && unextended.port.sent.length === 0, "an opted-in child never gets a push without publish_intents");
+const switched = mount(); switched.channel.update(extended); switched.channel.receive(switched.event); switched.port.receive({ v: 1, op: "ready", accepts: ["publish-intents.v1"] });
 switched.channel.update({ ...extended, context_id: "other", publish_intents: intents });
 check(switched.port.closed && switched.port.sent.length === 1, "intents for a switched context never reach the old mount");
+const overCap = { ...extended, publish_intents: { status: "ok" as const, withheld: 0,
+  rows: Array.from({ length: 100 }, (_, k) => ({ ...intents.rows[0], intent_id: `i${k}`, destination_id: "d".repeat(1400) })) } };
+const heavyOpt = mount(); heavyOpt.channel.update(overCap); heavyOpt.channel.receive(heavyOpt.event);
+heavyOpt.port.receive({ v: 1, op: "ready", accepts: ["publish-intents.v1"] });
+check(!heavyOpt.port.closed && (heavyOpt.port.sent[0] as ScreenPush).publish_intents?.status === "unavailable",
+  "an opted-in push over the cap degrades to unavailable intents");
+const heavyBare = mount(); heavyBare.channel.update(overCap); heavyBare.channel.receive(heavyBare.event);
+heavyBare.port.receive({ v: 1, op: "ready" });
+check(!heavyBare.port.closed && !("publish_intents" in (heavyBare.port.sent[0] as object)), "a legacy child is sized on its own shape");
+const badLink = mount(); badLink.channel.update({ ...extended, outbox: [{ ...extended.outbox[0], run_id: "" }] });
+badLink.channel.receive(badLink.event); badLink.port.receive({ v: 1, op: "ready", accepts: ["publish-intents.v1"] });
+check(badLink.port.closed && badLink.port.sent.length === 0 && badLink.counts().failed === 1 && badLink.counts().ready === 0,
+  "out-of-range linkage closes an opted-in mount with nothing sent and no ready");
 console.log("screen lifecycle adversarial checks pass");

@@ -1,6 +1,6 @@
 import { screenProjection, screenTag } from "../src/features/workspace-apps/screen/screenProjection";
 import type { PublishIntent } from "../src/features/workspace-apps/socialPublish";
-import { legacyPush } from "../src/features/workspace-apps/screen/screenProtocol";
+import { legacyPush, pushBytes, shapeFor, PUSH_BYTES_MAX } from "../src/features/workspace-apps/screen/screenProtocol";
 import type { Installation, AppContext, WorkspaceRun, AppEffect } from "../src/features/workspace-apps/workspaceApps";
 function check(value: unknown, message: string) { if (!value) throw new Error(message); }
 const installation = { install_id: "our", digest: "sha256:a", name: "portable", title: "App", version: "1", summary: "summary", files: ["screens/main/screens.json"], approved: true, executable: true } as Installation;
@@ -72,4 +72,33 @@ check(refused, "more rows than the daemon cap fail closed");
 const legacy = legacyPush(history);
 check(!("publish_intents" in legacy) && legacy.runs.every(r => !("context_id" in r)) && legacy.outbox.every(o => !("run_id" in o) && !("context_id" in o)),
   "a child without publish-intents.v1 receives the exact CAD-1006 shape");
+// The byte cap applies to the shape each child receives (review should-fix).
+const nearCap = (n: number) => screenProjection(installation, "main", "brand", [context],
+  Array.from({ length: n }, (_, k) => ({ ...long, id: `near${k}` })), [],
+  { installId: "our", contextId: "brand", status: "ok",
+    intents: Array.from({ length: 100 }, (_, k) => intent({ intent_id: `n${k}`.padEnd(100, "n"), run_id: `near${k % n}`, destination_id: "d".repeat(100) })) });
+let n = 1;
+while (pushBytes(legacyPush(nearCap(n + 1))) < PUSH_BYTES_MAX - 6000) n++;
+const heavy = nearCap(n);
+check(pushBytes(heavy) > PUSH_BYTES_MAX, "fixture: the extended projection is over the cap");
+const toLegacy = shapeFor(heavy, false)!;
+check(toLegacy && pushBytes(toLegacy) <= PUSH_BYTES_MAX && !("publish_intents" in toLegacy),
+  "a legacy child near the cap still gets its exact v1 push");
+const toOptedIn = shapeFor(heavy, true)!;
+check(toOptedIn && pushBytes(toOptedIn) <= PUSH_BYTES_MAX && toOptedIn.publish_intents!.status === "unavailable" &&
+  toOptedIn.publish_intents!.rows.length === 0, "an opted-in child gets an honest unavailable block, not an oversize push");
+
+// Linkage ids meet the app's bounds or the opted-in shape fails closed.
+const linked = scoped("brand", [intent({})]);
+check(shapeFor(linked, true) !== null, "in-bound linkage is sent");
+for (const broken of [
+  { ...linked, outbox: [{ ...linked.outbox[0], run_id: "" }] },
+  { ...linked, outbox: [{ ...linked.outbox[0], run_id: "r".repeat(129) }] },
+  { ...linked, outbox: [{ ...linked.outbox[0], context_id: "c".repeat(129) }] },
+  { ...linked, runs: [{ ...linked.runs[0], context_id: "c".repeat(129) }] },
+]) {
+  check(shapeFor(broken, true) === null, "out-of-range linkage fails closed for an opted-in child");
+  check(shapeFor(broken, false) !== null, "a legacy child never sees those fields and is unaffected");
+}
+
 console.log("screen projection scope and privacy checks pass");

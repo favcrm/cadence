@@ -1,6 +1,6 @@
 import type { Installation, AppContext, WorkspaceRun, AppEffect } from "../workspaceApps";
 import { PUBLISH_LIST_CAP, type PublishIntent } from "../socialPublish";
-import { type ScreenIntent, type ScreenIntents, type ScreenPush } from "./screenProtocol";
+import { shapeFor, type ScreenIntent, type ScreenIntents, type ScreenPush } from "./screenProtocol";
 
 /** The verified `socialPublish.list` read, tagged with the scope it was
  *  issued for. A read for any other install/context is never pushed. */
@@ -75,6 +75,7 @@ export function screenProjection(installation: Installation, tag: string, contex
       new Map(scopedRuns.map(r => [r.id, r.context_id ?? ""]))),
     now: Math.floor(Date.now() / 1000),
   };
-  if (new TextEncoder().encode(JSON.stringify(projection)).byteLength > 128 * 1024) throw new Error("The screen projection exceeds its message limit");
+  // The base CAD-1006 shape must fit; each child's own shape is re-checked at send.
+  if (!shapeFor(projection, false)) throw new Error("The screen projection exceeds its message limit");
   return projection;
 }
