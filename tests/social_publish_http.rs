@@ -149,10 +149,17 @@ fn cad787_relay_operator_list_empty_and_show_missing() {
     let (status, body) = b.operator("GET", "/api/social-publishes?install_id=install-a", "");
     assert_eq!(status, 200, "operator list route missing: {body}");
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("list returns JSON");
+    // CAD-1020: the envelope carries the driver's status block beside
+    // the (empty) intents list — `sender_not_configured`/`off`/idle are
+    // the visible no-driver answers the operator reads here.
     assert_eq!(
-        parsed,
-        json!({"intents": []}),
+        parsed["intents"],
+        json!([]),
         "empty scope lists no intents: {body}"
+    );
+    assert!(
+        parsed["driver"].is_object(),
+        "the list envelope carries the driver status: {body}"
     );
     let (status, body) = b.operator("GET", "/api/social-publishes/nope", "");
     assert_eq!(status, 400, "missing intent did not refuse: {body}");
