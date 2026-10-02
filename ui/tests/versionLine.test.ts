@@ -40,7 +40,7 @@ function mount(node: unknown) {
   return { host, done: () => { act(() => root.unmount()); host.remove(); } };
 }
 const href = routePath({ screen: "settings", section: "update" });
-const line = (props: object) => createElement(VersionLine, { release: null, build: "abcdef0123456789", href, updatePending: false, ...props });
+const line = (props: object) => createElement(VersionLine, { release: null, build: `0.1.0+${sha}`, href, updatePending: false, ...props });
 const sha = "c78b8a0535e0ddbc58b77d9df4a757261413c842";
 
 // releaseLabel is the Settings › Update formatter, moved unchanged.
@@ -50,6 +50,7 @@ assert(releaseLabel(null, null) === "Not installed", "nothing known");
 // Meta feeds it with no extra fetch.
 assert(runningRelease({ version: "1.2.3", build_commit: sha }) === "1.2.3+c78b8a0", "meta release");
 assert(runningRelease({ version: "1.2.3", build_commit: "unknown" }) === "1.2.3", "unknown commit keeps version");
+assert(runningRelease({ version: `1.2.3+${sha}`, build_commit: sha }) === "1.2.3+c78b8a0", "no double append");
 assert(runningRelease({ version: "", build_commit: sha }) === null, "no version -> fallback");
 assert(runningRelease(null) === null, "no meta -> fallback");
 
@@ -66,7 +67,13 @@ assert(runningRelease(null) === null, "no meta -> fallback");
 // UI_BUILD fallback.
 {
   const { host, done } = mount(line({}));
-  assert(host.textContent === "build abcdef0", `fallback text: ${host.textContent}`);
+  assert(host.textContent === "build 0.1.0+c78b8a0", `fallback text: ${host.textContent}`);
+  done();
+}
+// "unknown" (no build baked in) stays readable.
+{
+  const { host, done } = mount(line({ build: "unknown" }));
+  assert(host.textContent === "build unknown", `unknown text: ${host.textContent}`);
   done();
 }
 // What's new only while pending.

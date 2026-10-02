@@ -98,6 +98,23 @@ const rowTrigger = (host: Element) => host.querySelector("aside button[aria-hasp
   done();
 }
 
+// CAD-1034: both triggers (sidebar row, phone header avatar) carry the version line.
+{
+  const sha = "c78b8a0535e0ddbc58b77d9df4a757261413c842";
+  const { host, done } = await mountApp({ ...base, version: "1.2.3", build_commit: sha, signed_in: true, session: { id: "s1", origin: "public", user } });
+  for (const [where, selector] of [["sidebar row", "aside button[aria-haspopup=dialog]"], ["header avatar", "header button[aria-haspopup=dialog]"]]) {
+    const trigger = host.querySelector(selector) as HTMLButtonElement | null;
+    assert(trigger, `${where}: trigger renders`);
+    await React.act(async () => { trigger.click(); });
+    const line = host.querySelector(`${selector.split(" ")[0]} [role=dialog] [data-version-line]`) as HTMLAnchorElement | null;
+    assert(line, `${where}: the dialog carries the version line`);
+    assert(line.textContent === "v1.2.3+c78b8a0", `${where}: version text, got ${line.textContent}`);
+    assert(line.getAttribute("href") === "/settings/update", `${where}: links to Settings > Update, got ${line.getAttribute("href")}`);
+    await React.act(async () => { trigger.click(); });
+  }
+  done();
+}
+
 // Read-only board with a session: the row stays, the dialog hides Sign out.
 {
   const { host, done } = await mountApp({ ...base, read_only: true, signed_in: true, session: { id: "s1", origin: "public", user } });

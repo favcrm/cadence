@@ -62,5 +62,5 @@ export function runningRelease(
 ): string | null {
   if (!meta?.version) return null;
   const commit = meta.build_commit ?? "";
-  return releaseLabel(/^[a-f0-9]{7,40}$/.test(commit) ? `${meta.version}+${commit}` : meta.version, commit);
+  return releaseLabel(!meta.version.includes("+") && /^[a-f0-9]{7,40}$/.test(commit) ? `${meta.version}+${commit}` : meta.version, commit);
 }

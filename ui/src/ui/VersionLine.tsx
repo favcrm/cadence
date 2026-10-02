@@ -1,3 +1,4 @@
+import { releaseLabel } from "../lib/fmt";
 import Link from "./Link";
 
 /**
@@ -21,9 +22,9 @@ export default function VersionLine({
     <Link
       href={href}
       data-version-line
-      className="num mt-1 flex justify-between gap-3 rounded border-t border-ink-700 px-2 pt-2 pb-1.5 text-micro text-ink-500 hover:text-accent"
+      className="num mt-1 flex justify-between gap-3 border-t border-ink-700 px-2 pt-2 pb-1.5 text-micro text-ink-500 hover:text-accent"
     >
-      <span>{release ? `v${release}` : `build ${build.slice(0, 7)}`}</span>
+      <span>{release ? `v${release}` : `build ${releaseLabel(build, null)}`}</span>
       {updatePending && <span className="text-ink-300">What's new</span>}
     </Link>
   );
