@@ -95,3 +95,84 @@ ok(!render(items.pending, "compact").includes("text-body"), "compact: pending te
 // entryRefs stays exported and tolerant.
 ok(entryRefs({ refs: [{ kind: "issue", id: "CAD-1" }, { kind: 3 }] }).length === 1, "entryRefs keeps typed refs");
 ok(entryRefs(null).length === 0, "entryRefs of null is none");
+
+// CAD-1062: system routing and ref chips, asserted in both densities.
+const sys = (over: Partial<ThreadEntry>): ThreadItem => ({
+  type: "system",
+  key: "sx",
+  entry: entry({ role: "system", kind: "system", text: "short note", ...over }),
+});
+const isDivider = (html: string) => html.includes('data-kind="system"');
+const isNote = (html: string) => html.includes('data-kind="system-note"');
+const isBriefing = (html: string) => html.includes('data-kind="briefing"');
+
+for (const density of ["full", "compact"] as const) {
+  const d = density;
+
+  // 1. Permission entries render ThreadPermission, never the divider.
+  const perm = render(
+    sys({ text: "Permission requested (perm-7): ls", payload: { source: "permission" } }),
+    density,
+  );
+  ok(perm.includes('data-permission-thread="perm-7"'), `${d}: permission renders ThreadPermission`);
+  ok(!isDivider(perm), `${d}: permission is not the divider`);
+  // Even a long multi-line permission text takes the permission route.
+  const permLong = render(
+    sys({ text: `Permission requested (perm-8)\n${"x".repeat(300)}`, payload: { source: "permission" } }),
+    density,
+  );
+  ok(permLong.includes('data-permission-thread="perm-8"'), `${d}: long permission still ThreadPermission`);
+  ok(!isNote(permLong), `${d}: long permission is not a SystemNote`);
+
+  // 2. Collapsed SystemNote vs divider.
+  const bySource = render(sys({ payload: { source: "bootstrap" } }), density);
+  ok(isBriefing(bySource) && bySource.includes("Session briefing"), `${d}: bootstrap source is a briefing`);
+  ok(bySource.includes('aria-expanded="false"') && !bySource.includes("data-open"), `${d}: briefing closed`);
+  ok(!isDivider(bySource), `${d}: briefing is not the divider`);
+  const byMessage = render(sys({ message: "bootstrap-master" }), density);
+  ok(isBriefing(byMessage) && byMessage.includes('aria-expanded="false"'), `${d}: bootstrap-master message is a briefing`);
+  const multi = render(sys({ text: "line one\nline two" }), density);
+  ok(isNote(multi) && multi.includes("Details"), `${d}: newline is a SystemNote`);
+  ok(multi.includes('aria-expanded="false"') && !multi.includes("data-open"), `${d}: note closed`);
+  ok(!isDivider(multi), `${d}: newline is not the divider`);
+  const long = render(sys({ text: "a".repeat(241) }), density);
+  ok(isNote(long), `${d}: 241 chars is a SystemNote`);
+  const edge = render(sys({ text: "a".repeat(240) }), density);
+  ok(isDivider(edge) && !isNote(edge), `${d}: 240 chars stays a divider`);
+  const short = render(sys({ text: "just a line" }), density);
+  ok(isDivider(short) && short.includes("just a line"), `${d}: short line is the divider`);
+  ok(!isNote(short) && !isBriefing(short), `${d}: short line is not collapsed`);
+  const from = render(sys({ text: "joined", payload: { from: "alice" } }), density);
+  ok(from.includes("alice: ") && from.includes("joined"), `${d}: payload.from prefix`);
+  ok(!short.includes(": just"), `${d}: no prefix without payload.from`);
+
+  // 3. Ref chips.
+  const withRefs = render(
+    {
+      type: "operator",
+      key: "or",
+      entry: entry({
+        role: "operator",
+        kind: "operator_message",
+        text: "see",
+        payload: { refs: [{ kind: "issue", id: "CAD-1" }, { kind: "agent", id: "w1" }] },
+      }),
+    },
+    density,
+  );
+  ok((withRefs.match(/class="refchip/g) ?? []).length === 2, `${d}: one chip per ref`);
+  ok(withRefs.includes(">issue:CAD-1<") || withRefs.includes("issue:CAD-1"), `${d}: issue chip label`);
+  ok(withRefs.includes("agent:w1"), `${d}: agent chip label`);
+  const noRefs = render(items.operator, density);
+  ok(!noRefs.includes("refchip") && !noRefs.includes("refsrow"), `${d}: operator without refs has no chips`);
+  const pendingRefs = render(
+    {
+      type: "pending",
+      key: "pr",
+      pending: { message: "m2", text: "go", state: "sent", at: 1, refs: [{ kind: "issue", id: "CAD-9" }] },
+    },
+    density,
+  );
+  ok((pendingRefs.match(/class="refchip/g) ?? []).length === 1 && pendingRefs.includes("issue:CAD-9"), `${d}: pending refs render`);
+  ok(!render(items.pending, density).includes("refchip"), `${d}: pending without refs has no chips`);
+}
