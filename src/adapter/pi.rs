@@ -513,6 +513,9 @@ fn build_command(env: &ProviderEnv, agent: &Agent, state_dir: &Path) -> Result<V
     ] {
         cmd.push(flag.to_string());
     }
+    if crate::master::is_master(&agent.alias) {
+        cmd.push("--no-context-files".to_string());
+    }
     // CAD-559: the only extensions loaded are the generated guard
     // (master) plus the operator's pinned `[pi].providers` packages —
     // `--no-extensions` still fences off everything else, so each entry
@@ -529,7 +532,6 @@ fn build_command(env: &ProviderEnv, agent: &Agent, state_dir: &Path) -> Result<V
     ]);
     if crate::master::is_master(&agent.alias) {
         let agenticos_read = agenticos_read_extension(env)?;
-        cmd.push("--no-context-files".to_string());
         cmd.extend([
             "--extension".to_string(),
             pi_guard_path(state_dir).to_string_lossy().to_string(),

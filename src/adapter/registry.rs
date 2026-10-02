@@ -1852,6 +1852,7 @@ mod tests {
             "managed_codex_ws",
             "managed_claude_stream",
             "managed_pi_rpc",
+            "native_turn_steering",
             "pty_claude_tmux",
             "pty_devin_tmux",
             "pty_cursor_tmux",
@@ -1869,7 +1870,7 @@ mod tests {
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 20);
+        assert_eq!(caps.len(), 21);
     }
 
     #[test]

@@ -169,6 +169,12 @@ fn recorded_env(state: &Path) -> Vec<String> {
 /// `read` joined under CAD-552; `write` under CAD-614. Both are
 /// confined to `master/tmp`. Claude's tool string stays `Bash`.
 fn expected_master_argv(mode: &str, guard: &Path) -> Vec<String> {
+    let turn_guard = guard
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("pi-turn-guards/master/guard.ts");
     [
         mode,
         "--mode",
@@ -180,6 +186,8 @@ fn expected_master_argv(mode: &str, guard: &Path) -> Vec<String> {
         "--no-prompt-templates",
         "--no-context-files",
         "--no-extensions",
+        "--extension",
+        turn_guard.to_str().unwrap(),
         "--extension",
         guard.to_str().unwrap(),
         "--tools",
@@ -406,6 +414,12 @@ fn master_launch_has_exact_lockdown_argv_and_a_real_guard() {
         recorded_argv(state.path()),
         expected_master_argv("normal", &guard),
         "the master's provider argv"
+    );
+    let turn_guard = state.path().join("pi-turn-guards/master/guard.ts");
+    assert_eq!(
+        std::fs::read_to_string(turn_guard).unwrap(),
+        include_str!("../src/adapter/pi_turn_guard.ts"),
+        "first-loaded turn guard is the real generated implementation"
     );
     let src = std::fs::read_to_string(&guard).unwrap();
     assert!(
@@ -2077,13 +2091,33 @@ fn pinned_provider_packages_extend_argv_and_the_read_set() {
         argv.iter().any(|a| a == "--no-extensions"),
         "--no-extensions must survive: {argv:?}"
     );
-    // The guard is still the first extension.
-    let first = argv
+    // Exact-turn admission closes before ANY other extension can yield.
+    // The command-policy guard follows it, still before provider packages.
+    let extensions: Vec<_> = argv
         .windows(2)
-        .find(|w| w[0] == "--extension")
+        .filter(|w| w[0] == "--extension")
         .map(|w| w[1].clone())
-        .unwrap();
-    assert!(first.contains("pi-guard"), "{argv:?}");
+        .collect();
+    assert_eq!(
+        extensions,
+        vec![
+            state
+                .join("pi-turn-guards/master/guard.ts")
+                .to_string_lossy()
+                .to_string(),
+            state
+                .join("master/pi-guard.js")
+                .to_string_lossy()
+                .to_string(),
+            pkg.join("extensions/index.ts")
+                .to_string_lossy()
+                .to_string(),
+            pkg.join("extensions/extra.js")
+                .to_string_lossy()
+                .to_string(),
+        ],
+        "turn guard, command guard, then exactly the pinned provider files: {argv:?}"
+    );
     pi.close();
 
     // The same resolution feeds confinement: the package dir is in the
