@@ -179,7 +179,7 @@ impl Store {
                 bundle_digest,
                 bundle_digest
             ],
-            &mut |r| r.get::<_, String>(0),
+            |r| r.get::<_, String>(0),
         )?;
         for id in ids {
             conn.execute("UPDATE platform_effects SET state='closed',close_reason='app_authority_changed',updated_at=? WHERE effect_id=? AND state IN ('waiting','decided')",params![now(),id])?;
@@ -513,7 +513,7 @@ impl Store {
         eligible: F,
     ) -> Result<Option<EffectRow>>
     where
-        F: FnOnce(&Connection, &Value) -> Result<bool>,
+        F: FnOnce(&super::WriteTxn<'_>, &Value) -> Result<bool>,
     {
         return self.write_tx(|conn| {
 
@@ -522,7 +522,7 @@ impl Store {
                     if digest != stored_digest {
                         return Err(Error::rejected("app effect release digest changed"));
                     }
-                    if row.state != "decided" || !eligible(&tx, &authority)? {
+                    if row.state != "decided" || !eligible(&*tx, &authority)? {
                         return Ok(None);
                     }
                     let count = tx.execute("UPDATE platform_effects SET state='executing',updated_at=? WHERE effect_id=? AND state='decided' AND authorization_kind='app_artifact'",params![now(),id])?;

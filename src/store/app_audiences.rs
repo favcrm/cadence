@@ -249,21 +249,21 @@ struct Computation {
 
 impl RecordStore {
     fn customers_in(conn: &impl super::StoreConn, context: &str) -> Result<Vec<CustomerRow>> {
-        let mut stmt = conn
-            .prepare("SELECT id,revision,body FROM app_records WHERE context_id=? ORDER BY id")
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let found = stmt
-            .query_map([context], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
+        let found = conn
+            .query_vec(
+                "SELECT id,revision,body FROM app_records WHERE context_id=? ORDER BY id",
+                [context],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
             .map_err(|e| Error::internal(e.to_string()))?;
         let mut rows = Vec::new();
-        for row in found {
-            let (id, revision, body) = row.map_err(|e| Error::internal(e.to_string()))?;
+        for (id, revision, body) in found {
             let profile = serde_json::from_str::<Value>(&body)
                 .ok()
                 .and_then(|stored| CustomerProfile::parse(&stored).ok());
@@ -283,18 +283,16 @@ impl RecordStore {
         std::collections::HashSet<String>,
         std::collections::HashSet<String>,
     )> {
-        let mut stmt = conn
-            .prepare("SELECT kind,key FROM app_suppressions WHERE context_id=?")
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let found = stmt
-            .query_map([context], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
+        let found = conn
+            .query_vec(
+                "SELECT kind,key FROM app_suppressions WHERE context_id=?",
+                [context],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
             .map_err(|e| Error::internal(e.to_string()))?;
         let mut emails = std::collections::HashSet::new();
         let mut customers = std::collections::HashSet::new();
-        for row in found {
-            let (kind, key) = row.map_err(|e| Error::internal(e.to_string()))?;
+        for (kind, key) in found {
             if kind == "email" {
                 emails.insert(key);
             } else {
@@ -305,18 +303,13 @@ impl RecordStore {
     }
 
     fn suppression_digest_in(conn: &impl super::StoreConn, context: &str) -> Result<String> {
-        let mut stmt = conn
-            .prepare("SELECT kind,key FROM app_suppressions WHERE context_id=? ORDER BY kind,key")
+        let rows = conn
+            .query_vec(
+                "SELECT kind,key FROM app_suppressions WHERE context_id=? ORDER BY kind,key",
+                [context],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
             .map_err(|e| Error::internal(e.to_string()))?;
-        let found = stmt
-            .query_map([context], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let mut rows = Vec::new();
-        for row in found {
-            rows.push(row.map_err(|e| Error::internal(e.to_string()))?);
-        }
         Ok(material_digest(
             &json!({"domain": "cadence-app-suppressions-v1", "rows": rows}),
         ))
@@ -622,7 +615,7 @@ impl RecordStore {
                 .query_opt(
                     "SELECT revision FROM app_segments WHERE context_id=? AND id=?",
                     params![context, segment_id],
-                    &mut |r| r.get(0),
+                    |r| r.get(0),
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
             let revision = match (current, expected_revision) {
@@ -759,7 +752,7 @@ impl RecordStore {
                 .query_opt(
                     "SELECT revision FROM app_exclusions WHERE context_id=? AND id=?",
                     params![context, list_id],
-                    &mut |r| r.get(0),
+                    |r| r.get(0),
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
             let revision = match (current, expected_revision) {

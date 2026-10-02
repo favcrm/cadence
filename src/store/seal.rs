@@ -1278,7 +1278,7 @@ impl<'t> WriteTxn<'t> {
         &self,
         sql: &str,
         params: impl rusqlite::Params,
-        f: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     ) -> Result<T> {
         self.query_row_raw(sql, params, f).map_err(Into::into)
     }
@@ -1287,7 +1287,7 @@ impl<'t> WriteTxn<'t> {
         &self,
         sql: &str,
         params: impl rusqlite::Params,
-        f: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
         self.tx.query_row(sql, params, f)
     }
@@ -1316,7 +1316,7 @@ impl<'t> WriteTxn<'t> {
         self.tx.last_insert_rowid()
     }
     /// Rows touched by the most recent DML on this tx's connection.
-    pub(crate) fn changes(&self) -> u64 {
+    pub(crate) fn changes(&self) -> usize {
         self.tx.changes()
     }
     /// `PRAGMA` query inside the tx (read-form only reaches the
@@ -1324,10 +1324,12 @@ impl<'t> WriteTxn<'t> {
     pub(crate) fn pragma_query_value<T>(
         &self,
         pragma: &str,
-        f: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<T> {
-        self.tx
-            .pragma_query_value(None, pragma, f)
+        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T>
+    where
+        T: rusqlite::types::FromSql,
+    {
+        self.tx.pragma_query_value(None, pragma, f)
     }
     /// An owner-scoped savepoint for a nested sub-batch — the guard
     /// issues `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` inside its own

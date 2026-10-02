@@ -198,7 +198,7 @@ fn credential_row(row: &rusqlite::Row) -> rusqlite::Result<CredentialRecord> {
 /// platform grant actually changed, so the caller can drain the waiting
 /// effects that lost coverage.
 fn subtract_derived(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &impl super::StoreConn,
     app: &str,
     rows: &[(String, String, String, Vec<String>)],
     keep_install: Option<&str>,
@@ -222,18 +222,19 @@ fn subtract_derived(
         // dropping a previous install's rows without taking the current
         // install's scopes with them. `None` is the whole-app revoke:
         // no row of this app counts.
-        let still: Vec<String> = {
-            let mut stmt = tx.prepare(
+        let still: Vec<String> = tx
+            .query_vec(
                 "SELECT scopes FROM app_grants WHERE agent=?2 AND platform=?3 \
                  AND account=?4 AND (app<>?1 OR (?5 IS NOT NULL AND install_id=?5))",
-            )?;
-            let rows =
-                stmt.query_map(params![app, agent, platform, account, keep_install], |r| {
+                params![app, agent, platform, account, keep_install],
+                |r| {
                     let raw: String = r.get(0)?;
                     Ok(scopes_of(&raw))
-                })?;
-            rows.flatten().flatten().collect()
-        };
+                },
+            )?
+            .into_iter()
+            .flatten()
+            .collect();
         let kept: Vec<String> = existing
             .scopes
             .iter()
@@ -357,21 +358,25 @@ pub(crate) type Derived = (String, String, String, Vec<String>);
 /// narrower scope — the caller drains a waiting effect only when the
 /// surviving grant no longer covers that effect's scopes.
 fn apply_derived(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &impl super::StoreConn,
     app: &str,
     install_id: &str,
     grants: &[Derived],
     by: &str,
 ) -> Result<Vec<(String, String, String)>> {
-    let prior: Vec<Derived> = {
-        let mut stmt =
-            tx.prepare("SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1")?;
-        let rows = stmt.query_map(params![app], |r| {
+    let prior: Vec<Derived> = tx.query_vec(
+        "SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1",
+        params![app],
+        |r| {
             let raw: String = r.get(3)?;
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&raw)))
-        })?;
-        rows.flatten().collect()
-    };
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                scopes_of(&raw),
+            ))
+        },
+    )?;
     tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
     let changed = subtract_derived(tx, app, &prior, None)?;
     if !prior.is_empty() {
@@ -465,19 +470,23 @@ fn apply_derived(
 /// Drop this app's derived rows and subtract their scopes, on the
 /// caller's transaction. A scope another app still derives is kept.
 fn revoke_derived(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &impl super::StoreConn,
     app: &str,
     by: &str,
 ) -> Result<Vec<(String, String, String)>> {
-    let rows: Vec<Derived> = {
-        let mut stmt =
-            tx.prepare("SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1")?;
-        let rows = stmt.query_map(params![app], |r| {
+    let rows: Vec<Derived> = tx.query_vec(
+        "SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1",
+        params![app],
+        |r| {
             let scopes: String = r.get(3)?;
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&scopes)))
-        })?;
-        rows.flatten().collect()
-    };
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                scopes_of(&scopes),
+            ))
+        },
+    )?;
     tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
     let changed = subtract_derived(tx, app, &rows, None)?;
     for (agent, platform, account, derived) in &rows {

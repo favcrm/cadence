@@ -217,17 +217,23 @@ impl Store {
         install_id: &str,
         by: &str,
     ) -> Result<()> {
-        let apps: Vec<String> = tx
-            .prepare("SELECT DISTINCT app FROM app_grants WHERE install_id=?")?
-            .query_map([install_id], |r| r.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let apps: Vec<String> = tx.query_vec(
+            "SELECT DISTINCT app FROM app_grants WHERE install_id=?",
+            [install_id],
+            |r| r.get(0),
+        )?;
         for app in apps {
-            let raws = tx.query_vec(
+            let raws: Vec<(String, String, String, String)> = tx.query_vec(
                 "SELECT agent, platform, account, scopes FROM app_grants WHERE app=? AND install_id=?",
                 params![app, install_id],
-                &mut |r| {
+                |r| {
                     let raw: String = r.get(3)?;
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, raw))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        raw,
+                    ))
                 },
             )?;
             let mut rows: Vec<(String, String, String, Vec<String>)> = Vec::new();
@@ -248,7 +254,7 @@ impl Store {
                     let raws = tx.query_vec(
                         "SELECT scopes FROM app_grants WHERE agent=? AND platform=? AND account=?",
                         params![agent, plat, account],
-                        &mut |r| r.get::<_, String>(0),
+                        |r| r.get::<_, String>(0),
                     )?;
                     let mut still: Vec<String> = Vec::new();
                     for raw in raws {
@@ -263,7 +269,7 @@ impl Store {
                     .query_opt(
                         "SELECT scopes FROM platform_grants WHERE agent=? AND platform=? AND account=?",
                         params![agent, plat, account],
-                        &mut |r| r.get(0),
+                        |r| r.get(0),
                     )?;
                 let Some(raw) = existing else {
                     continue;
@@ -313,7 +319,7 @@ impl Store {
         let rows: Vec<(String, String)> = tx.query_vec(
             "SELECT install_id, id FROM app_bindings WHERE state='configured' AND json_extract(config,'$.provider')=? AND json_extract(config,'$.account')=?",
             params![platform_name, account],
-            &mut |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         if rows.is_empty() {
             return Ok(());
@@ -381,7 +387,7 @@ impl Store {
                     let ids: Vec<String> = conn.query_vec(
                         "SELECT id FROM app_bindings WHERE install_id=? AND state='configured' ORDER BY id",
                         [install],
-                        &mut |row| row.get::<_, String>(0),
+                        |row| row.get::<_, String>(0),
                     )?;
                     ids.iter()
                         .map(|id| binding_in(&*conn, install, id))

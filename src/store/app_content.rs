@@ -188,7 +188,7 @@ impl Block {
 pub struct BlockRefused;
 
 impl std::fmt::Display for BlockRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "email content exceeds its supported shape or bounds")
     }
 }

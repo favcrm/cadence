@@ -654,6 +654,28 @@ impl RecordStore {
         }
     }
 
+    /// One `BEGIN IMMEDIATE` write against this record file: guard held,
+    /// `f` runs on the live `Transaction`, commit on `Ok`, rollback on
+    /// `Err`/panic (the `Transaction` drops). The record-file DB is a
+    /// separate file from `cadence.sqlite3` — it is NOT under `Store`'s
+    /// producer seal; this is `RecordStore`'s own write shape, not the
+    /// daemon witness.
+    fn write_tx<R>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<R>,
+    ) -> Result<R> {
+        let conn = self.conn();
+        let tx = rusqlite::Transaction::new_unchecked(
+            &conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| Error::internal(e.to_string()))?;
+        let out = f(&tx)?;
+        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+        drop(conn);
+        Ok(out)
+    }
+
     fn history_in(conn: &impl super::StoreConn, context: &str, id: &str) -> rusqlite::Result<Vec<Value>> {
         conn.query_vec(
             "SELECT revision,body_digest,actor,at FROM app_record_revisions WHERE context_id=? AND record_id=? ORDER BY revision",
@@ -977,7 +999,7 @@ pub struct CustomerProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileRefused;
 impl std::fmt::Display for ProfileRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("record profile exceeds its supported shape or bounds")
     }
 }
@@ -1298,7 +1320,7 @@ impl RecordStore {
     /// an IMMEDIATE transaction, so a sibling writer blocks on the
     /// write lock and commits first — then this read sees it.
     fn email_conflict_in(
-        tx: &rusqlite::Transaction<'_>,
+        tx: &impl super::StoreConn,
         context: &str,
         record_id: &str,
         profile: &CustomerProfile,
@@ -1306,16 +1328,14 @@ impl RecordStore {
         let Some(address) = profile.email.as_deref().map(str::to_lowercase) else {
             return Ok(());
         };
-        let mut stmt = tx
-            .prepare("SELECT id,body FROM app_records WHERE context_id=?")
+        let found = tx
+            .query_vec(
+                "SELECT id,body FROM app_records WHERE context_id=?",
+                [context],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
             .map_err(|e| Error::internal(e.to_string()))?;
-        let found = stmt
-            .query_map([context], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(|e| Error::internal(e.to_string()))?;
-        for row in found {
-            let (id, body) = row.map_err(|e| Error::internal(e.to_string()))?;
+        for (id, body) in found {
             if id == record_id {
                 continue;
             }
@@ -1554,22 +1574,21 @@ impl RecordStore {
         let mut by_email: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         {
-            let mut stmt = conn
-                .prepare("SELECT id,revision,body_digest,body FROM app_records WHERE context_id=?")
+            let found = conn
+                .query_vec(
+                    "SELECT id,revision,body_digest,body FROM app_records WHERE context_id=?",
+                    [context],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    },
+                )
                 .map_err(|e| Error::internal(e.to_string()))?;
-            let found = stmt
-                .query_map([context], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                })
-                .map_err(|e| Error::internal(e.to_string()))?;
-            for row in found {
-                let (id, revision, digest, body) =
-                    row.map_err(|e| Error::internal(e.to_string()))?;
+            for (id, revision, digest, body) in found {
                 let email = serde_json::from_str::<Value>(&body).ok().and_then(|value| {
                     value
                         .get("email")

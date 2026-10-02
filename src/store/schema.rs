@@ -1352,7 +1352,7 @@ impl Store {
                 match self.write_tx_raw(|tx| self.shutdown_entries_tx(tx, facts)) {
                     Ok(v) => Ok(v),
                     Err(rusqlite::Error::ToSqlConversionFailure(b))
-                        if matches!(b.as_ref(), crate::Error::Rejected(_)) =>
+                        if matches!(b.downcast_ref::<crate::Error>(), Some(crate::Error::Rejected(_))) =>
                     {
                         return Err(ShutdownDrainError::Fenced(crate::Error::rejected(
                             b.to_string(),
@@ -1380,7 +1380,7 @@ impl Store {
     /// the caller can tell retryable lock contention from a dead store.
     fn shutdown_entries_tx(
         &self,
-        tx: &mut super::WriteTxn<'_>,
+        tx: super::WriteTxn<'_>,
         facts: &std::collections::HashMap<String, (String, u32, String)>,
     ) -> rusqlite::Result<Vec<AdoptEntry>> {
         // The sealed facade already opened this `BEGIN IMMEDIATE` —
@@ -1480,7 +1480,7 @@ impl ShutdownDrainError {
 }
 
 impl std::fmt::Display for ShutdownDrainError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Fenced(e) | Self::Failed(e) => e.fmt(f),
         }

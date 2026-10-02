@@ -404,7 +404,7 @@ impl Store {
         eligible: F,
     ) -> Result<Option<Value>>
     where
-        F: FnOnce(&Connection, &Value) -> Result<bool>,
+        F: FnOnce(&super::WriteTxn<'_>, &Value) -> Result<bool>,
     {
         return self.write_tx(|conn| {
 
@@ -424,7 +424,7 @@ impl Store {
                         |r| r.get(0),
                     )?;
                     let frozen: Value = serde_json::from_str(&frozen_text)?;
-                    if !eligible(&tx, &frozen)? {
+                    if !eligible(&*tx, &frozen)? {
                         return Ok(None);
                     }
                     let changed = tx.execute("UPDATE social_publish_intents SET state='processing',updated=? WHERE intent_id=? AND state='queued'",params![now(),id])?;

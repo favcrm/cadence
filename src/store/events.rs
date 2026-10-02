@@ -982,6 +982,7 @@ impl Store {
     /// refusing to modify.
     pub fn ingest_rollout_gate(&self, state_dir: &Path) -> Result<()> {
         self.with_owner_conn(|conn| crate::rollout::ingest_gate_log(state_dir, conn))
+            .map(|_| ())
     }
 
     /// Event log page for the `events` API; cursor is the last seq seen.
