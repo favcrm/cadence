@@ -669,18 +669,20 @@ export default function App() {
               onNavigate={() => setMenuOpen(false)}
             />
             <div className="slabel pt-2">projects</div>
-            <ProjectList
-              project={navProject}
-              projectHref={projectHref}
-              projects={projects}
-              issues={issuesState}
-              projectsError={projectsState.status === "failed" ? projectsState.error : null}
-              onNavigate={() => setMenuOpen(false)}
-            />
+            <nav aria-label="Projects">
+              <ProjectList
+                project={navProject}
+                projectHref={projectHref}
+                projects={projects}
+                issues={issuesState}
+                projectsError={projectsState.status === "failed" ? projectsState.error : null}
+                onNavigate={() => setMenuOpen(false)}
+              />
+            </nav>
             {/* The header carries these as icons under lg — here they keep
                 their words, so the meaning is one tap away on touch. */}
             <div className="slabel pt-2">board</div>
-            <div className="flex flex-wrap items-center gap-1.5">
+            <div role="region" aria-label="Board" className="flex flex-wrap items-center gap-1.5">
               <StatusChips
                 variant="menu"
                 readOnly={boardReadOnly}
