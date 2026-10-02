@@ -78,11 +78,8 @@ impl Store {
     pub fn crm_sends_sending(&self) -> Result<Vec<(String, String, String)>> {
         return self.write_tx(|conn| {
 
-                    let mut stmt = conn
-                        .prepare("SELECT install_id,context_id,send_id FROM crm_sends WHERE state='sending' ORDER BY created")
-                        .map_err(|e| Error::internal(e.to_string()))?;
-                    let rows = stmt
-                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    let stmt_sql = "SELECT install_id,context_id,send_id FROM crm_sends WHERE state='sending' ORDER BY created";
+                    let rows = conn.query_vec(stmt_sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))
                         .map_err(|e| Error::internal(e.to_string()))?;
                     let mut out = Vec::new();
                     for row in rows {

@@ -1504,12 +1504,12 @@ impl Store {
     /// never a scan of the history.
     pub fn running_turn_tokens(&self) -> Result<Vec<(String, String)>> {
         return self.write_tx(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT a.alias, m.turn_id
+            let stmt_sql = "SELECT a.alias, m.turn_id
                          FROM agents a JOIN messages m ON m.alias = a.alias AND m.state = 'running'
-                         WHERE m.turn_id IS NOT NULL AND m.turn_id != ''",
-            )?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                         WHERE m.turn_id IS NOT NULL AND m.turn_id != ''";
+            let rows = conn
+                .query_vec(stmt_sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         });
     }
@@ -1537,21 +1537,21 @@ impl Store {
     /// or an overdue one never defers a checkpoint.
     pub fn busy_providers(&self, live: &HashSet<String>, now: f64) -> Result<HashSet<String>> {
         return self.write_tx(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT a.provider AS agent_provider, a.params AS agent_params,
+            let stmt_sql = "SELECT a.provider AS agent_provider, a.params AS agent_params,
                                 a.endpoint_kind AS agent_kind, m.*
                          FROM agents a JOIN messages m ON m.alias = a.alias
-                         WHERE m.state IN ('submitting','running')",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                let params: Option<String> = r.get("agent_params")?;
-                Ok((
-                    r.get::<_, String>("agent_provider")?,
-                    params.and_then(|p| serde_json::from_str::<Value>(&p).ok()),
-                    r.get::<_, String>("agent_kind")? == "pty",
-                    row_message(r)?,
-                ))
-            })?;
+                         WHERE m.state IN ('submitting','running')";
+            let rows = conn
+                .query_vec(stmt_sql, [], |r| {
+                    let params: Option<String> = r.get("agent_params")?;
+                    Ok((
+                        r.get::<_, String>("agent_provider")?,
+                        params.and_then(|p| serde_json::from_str::<Value>(&p).ok()),
+                        r.get::<_, String>("agent_kind")? == "pty",
+                        row_message(r)?,
+                    ))
+                })
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             let mut busy = HashSet::new();
             for row in rows {
                 let (provider, params, pty, message) = row?;

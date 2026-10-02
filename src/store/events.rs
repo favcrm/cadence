@@ -543,12 +543,13 @@ impl Store {
     /// CAD-405: the latest work-gate approval per project.
     pub fn work_approvals(&self) -> Result<std::collections::HashMap<String, Value>> {
         return self.write_tx(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq")?;
-            let mut rows = stmt.query(params![APPROVAL_STREAM, WORK_APPROVED_EVENT])?;
+            let rows: Vec<String> = conn.query_vec(
+                "SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq",
+                params![APPROVAL_STREAM, WORK_APPROVED_EVENT],
+                |row| row.get(0),
+            )?;
             let mut out = std::collections::HashMap::new();
-            while let Some(row) = rows.next()? {
-                let raw: String = row.get(0)?;
+            for raw in rows {
                 let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
                     continue;
                 };

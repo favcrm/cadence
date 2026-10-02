@@ -331,8 +331,10 @@ impl Store {
 
     pub fn tasks_for_job(&self, job_id: &str) -> Result<Vec<Task>> {
         return self.write_tx(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM tasks WHERE job_id=? ORDER BY created")?;
-            let rows = stmt.query_map([job_id], row_task)?;
+            let stmt_sql = "SELECT * FROM tasks WHERE job_id=? ORDER BY created";
+            let rows = conn
+                .query_vec(stmt_sql, [job_id], row_task)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         });
     }
@@ -340,21 +342,22 @@ impl Store {
     /// An alias's non-terminal task assignments — derived, never stored.
     pub fn tasks_for_assignee(&self, alias: &str) -> Result<Vec<Task>> {
         return self.write_tx(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT * FROM tasks WHERE assignee=?
+            let stmt_sql = "SELECT * FROM tasks WHERE assignee=?
                          AND state NOT IN ('verified','done','cancelled','failed')
-                         ORDER BY updated",
-            )?;
-            let rows = stmt.query_map([alias], row_task)?;
+                         ORDER BY updated";
+            let rows = conn
+                .query_vec(stmt_sql, [alias], row_task)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         });
     }
 
     pub fn verdicts_for_task(&self, task_id: &str) -> Result<Vec<Verdict>> {
         return self.write_tx(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT * FROM verdicts WHERE task_id=? ORDER BY revision, seq")?;
-            let rows = stmt.query_map([task_id], row_verdict)?;
+            let stmt_sql = "SELECT * FROM verdicts WHERE task_id=? ORDER BY revision, seq";
+            let rows = conn
+                .query_vec(stmt_sql, [task_id], row_verdict)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         });
     }
@@ -363,8 +366,10 @@ impl Store {
     /// oldest first — `job task show`'s delivery view.
     pub fn messages_for_task(&self, task_id: &str) -> Result<Vec<Message>> {
         return self.write_tx(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM messages WHERE task_id=? ORDER BY seq")?;
-            let rows = stmt.query_map([task_id], row_message)?;
+            let stmt_sql = "SELECT * FROM messages WHERE task_id=? ORDER BY seq";
+            let rows = conn
+                .query_vec(stmt_sql, [task_id], row_message)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         });
     }

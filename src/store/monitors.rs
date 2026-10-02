@@ -216,8 +216,10 @@ impl Store {
 
     pub fn monitors(&self) -> Result<Vec<Monitor>> {
         return self.write_tx(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM monitors ORDER BY id")?;
-            let rows = stmt.query_map([], row_monitor)?;
+            let stmt_sql = "SELECT * FROM monitors ORDER BY id";
+            let rows = conn
+                .query_vec(stmt_sql, [], row_monitor)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         });
     }
@@ -624,13 +626,13 @@ impl Store {
 
     pub fn due_monitors(&self, at: f64) -> Result<Vec<Monitor>> {
         return self.write_tx(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT * FROM monitors
+            let stmt_sql = "SELECT * FROM monitors
                          WHERE state IN ('active','degraded') AND next_check_at IS NOT NULL
                            AND next_check_at<=?
-                         ORDER BY next_check_at,id",
-            )?;
-            let rows = stmt.query_map([at], row_monitor)?;
+                         ORDER BY next_check_at,id";
+            let rows = conn
+                .query_vec(stmt_sql, [at], row_monitor)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         });
     }
@@ -989,9 +991,14 @@ impl Store {
                 "SELECT * FROM monitor_alerts WHERE monitor_id=? AND seq>?
                          ORDER BY seq LIMIT ?"
             };
-            let mut stmt = conn.prepare(sql)?;
-            let rows =
-                stmt.query_map(params![id, after, limit.clamp(1, 500)], row_monitor_alert)?;
+            let stmt_sql = sql;
+            let rows = conn
+                .query_vec(
+                    stmt_sql,
+                    params![id, after, limit.clamp(1, 500)],
+                    row_monitor_alert,
+                )
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         });
     }

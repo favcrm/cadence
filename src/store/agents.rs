@@ -1002,22 +1002,26 @@ impl Store {
                 }
             }
             let open: Vec<Message> = tx
-                .prepare(
+                .query_vec(
                     "SELECT * FROM messages WHERE alias=? AND state NOT IN
                              ('completed','failed','interrupted','cancelled') ORDER BY seq",
-                )?
-                .query_map([alias], row_message)?
+                    [alias],
+                    row_message,
+                )
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                 .collect::<rusqlite::Result<_>>()?;
             let open_messages: Vec<(String, String)> = open
                 .iter()
                 .map(|m| (m.id.clone(), m.state.clone()))
                 .collect();
             let open_tasks: Vec<(String, String)> = tx
-                .prepare(
+                .query_vec(
                     "SELECT id,state FROM tasks WHERE assignee=? AND state NOT IN
                              ('verified','done','cancelled','failed') ORDER BY created",
-                )?
-                .query_map([alias], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    [alias],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                 .collect::<rusqlite::Result<_>>()?;
             let mut notify: Vec<String> = Vec::new();
             if !open_messages.is_empty() || !open_tasks.is_empty() {
@@ -1186,11 +1190,11 @@ impl Store {
     pub fn gc_candidates(&self, older_than: Option<f64>) -> Result<Vec<Agent>> {
         let cutoff = older_than.map(|age| now() - age).unwrap_or(f64::MAX);
         return self.write_tx(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT * FROM agents WHERE endpoint IS NULL
-                         AND state IN ('attention','stopped') AND updated < ?",
-            )?;
-            let rows = stmt.query_map(params![cutoff], row_agent)?;
+            let stmt_sql = "SELECT * FROM agents WHERE endpoint IS NULL
+                         AND state IN ('attention','stopped') AND updated < ?";
+            let rows = conn
+                .query_vec(stmt_sql, params![cutoff], row_agent)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         });
     }

@@ -794,11 +794,12 @@ impl Store {
     /// `unknown` too but fences nothing, so it is not listed (CAD-250).
     pub fn unknown_messages(&self, alias: &str) -> Result<Vec<String>> {
         return self.write_tx(|conn| {
-            let mut stmt = conn.prepare(&format!(
+            let stmt_sql = &format!(
                 "SELECT id FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL} ORDER BY seq"
-            ))?;
-            let ids = stmt
-                .query_map([alias], |r| r.get(0))?
+            );
+            let ids = conn
+                .query_vec(stmt_sql, [alias], |r| r.get(0))
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                 .collect::<rusqlite::Result<Vec<String>>>()?;
             Ok(ids)
         });

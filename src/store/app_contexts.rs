@@ -102,11 +102,7 @@ impl Store {
     pub fn app_context_list(&self, install: &str) -> Result<Value> {
         return self.write_tx(|conn| {
 
-                    let ids = conn
-                        .prepare(
-                            "SELECT id FROM app_contexts WHERE install_id=? ORDER BY created,id LIMIT 101",
-                        )?
-                        .query_map([install], |r| r.get::<_, String>(0))?
+                    let ids = conn.query_vec("SELECT id FROM app_contexts WHERE install_id=? ORDER BY created,id LIMIT 101", [install], |r| r.get::<_, String>(0)).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                     if ids.len() > CONTEXT_LIMIT as usize {
                         return Err(Error::rejected(

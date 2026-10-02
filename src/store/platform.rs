@@ -521,9 +521,10 @@ impl Store {
     /// Every enrolled credential record, sorted by platform/account.
     pub fn platform_credentials(&self) -> Result<Vec<CredentialRecord>> {
         return self.write_tx(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT * FROM platform_credentials ORDER BY platform, account")?;
-            let rows = stmt.query_map([], credential_row)?;
+            let stmt_sql = "SELECT * FROM platform_credentials ORDER BY platform, account";
+            let rows = conn
+                .query_vec(stmt_sql, [], credential_row)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
@@ -737,19 +738,22 @@ impl Store {
             let mut out = Vec::new();
             match agent {
                 Some(agent) => {
-                    let mut stmt = conn.prepare(
-                        "SELECT * FROM platform_grants WHERE agent=?1 \
-                                 ORDER BY platform, account",
-                    )?;
-                    for r in stmt.query_map(params![agent], grant_row)? {
+                    let stmt_sql = "SELECT * FROM platform_grants WHERE agent=?1 \
+                                 ORDER BY platform, account";
+                    for r in conn
+                        .query_vec(stmt_sql, params![agent], grant_row)
+                        .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
+                    {
                         out.push(r?);
                     }
                 }
                 None => {
-                    let mut stmt = conn.prepare(
-                        "SELECT * FROM platform_grants ORDER BY agent, platform, account",
-                    )?;
-                    for r in stmt.query_map([], grant_row)? {
+                    let stmt_sql =
+                        "SELECT * FROM platform_grants ORDER BY agent, platform, account";
+                    for r in conn
+                        .query_vec(stmt_sql, [], grant_row)
+                        .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
+                    {
                         out.push(r?);
                     }
                 }
@@ -988,17 +992,18 @@ impl Store {
     /// Every project default — `platform_defaults` lists them.
     pub fn platform_defaults(&self) -> Result<Vec<ProjectDefault>> {
         return self.write_tx(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT * FROM platform_defaults ORDER BY project, platform")?;
-            let rows = stmt.query_map([], |row| {
-                Ok(ProjectDefault {
-                    project: row.get("project")?,
-                    platform: row.get("platform")?,
-                    account: row.get("account")?,
-                    set_at: row.get("set_at")?,
-                    by: row.get("by")?,
+            let stmt_sql = "SELECT * FROM platform_defaults ORDER BY project, platform";
+            let rows = conn
+                .query_vec(stmt_sql, [], |row| {
+                    Ok(ProjectDefault {
+                        project: row.get("project")?,
+                        platform: row.get("platform")?,
+                        account: row.get("account")?,
+                        set_at: row.get("set_at")?,
+                        by: row.get("by")?,
+                    })
                 })
-            })?;
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
@@ -1110,8 +1115,10 @@ impl Store {
     /// standing grant behind.
     pub fn app_grants_apps(&self) -> Result<Vec<String>> {
         return self.write_tx(|conn| {
-            let mut stmt = conn.prepare("SELECT DISTINCT app FROM app_grants ORDER BY app")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let stmt_sql = "SELECT DISTINCT app FROM app_grants ORDER BY app";
+            let rows = conn
+                .query_vec(stmt_sql, [], |r| r.get::<_, String>(0))
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.flatten().collect())
         });
     }
@@ -1164,10 +1171,12 @@ impl Store {
     /// including a row whose approval derived nothing else to list.
     pub fn app_grant_installs(&self) -> Result<Vec<(String, String)>> {
         return self.write_tx(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT DISTINCT app, install_id FROM app_grants ORDER BY app")?;
-            let rows =
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let stmt_sql = "SELECT DISTINCT app, install_id FROM app_grants ORDER BY app";
+            let rows = conn
+                .query_vec(stmt_sql, [], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.flatten().collect())
         });
     }

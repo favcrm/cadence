@@ -64,14 +64,13 @@ impl Store {
     pub fn inbox_peek(&self, alias: &str, after: i64, reader: &str) -> Result<Vec<Message>> {
         return self.write_tx(|conn| {
             self.inbox_agent_in(&conn, alias)?;
-            let mut stmt = conn.prepare(
-                "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
-                         ORDER BY seq",
-            )?;
-            let pending = stmt
-                .query_map(params![alias, after], row_message)?
+            let stmt_sql = "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
+                         ORDER BY seq";
+            let pending = conn
+                .query_vec(stmt_sql, params![alias, after], row_message)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(stmt);
+
             let parked = self.inbox_parked_in(&conn, alias, reader)?;
             Ok(pending
                 .into_iter()

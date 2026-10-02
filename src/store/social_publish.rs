@@ -328,11 +328,10 @@ impl Store {
         }
         return self.write_tx(|conn| {
 
-                    let mut stmt = conn.prepare("SELECT intent_id FROM social_publish_intents WHERE (? IS NULL OR install_id=?) AND (? IS NULL OR context_id=?) ORDER BY intent_id LIMIT 100")?;
-                    let ids = stmt
-                        .query_map(params![install, install, context, context], |r| {
+                    let stmt_sql = "SELECT intent_id FROM social_publish_intents WHERE (? IS NULL OR install_id=?) AND (? IS NULL OR context_id=?) ORDER BY intent_id LIMIT 100";
+                    let ids = conn.query_vec(stmt_sql, params![install, install, context, context], |r| {
                             r.get::<_, String>(0)
-                        })?
+                        }).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                         .collect::<std::result::Result<Vec<_>, _>>()?;
                     let mut list = Vec::new();
                     for id in ids {

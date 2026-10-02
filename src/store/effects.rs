@@ -332,18 +332,15 @@ impl Store {
                     let mut out = Vec::new();
                     match agent {
                         Some(agent) => {
-                            let mut stmt = conn.prepare(
-                                "SELECT * FROM platform_effects WHERE agent=?1 AND authorization_kind='agent_grant' \
-                                 ORDER BY staged_at, effect_id",
-                            )?;
-                            for r in stmt.query_map(params![agent], EffectRow::from_row)? {
+                            let stmt_sql = "SELECT * FROM platform_effects WHERE agent=?1 AND authorization_kind='agent_grant' \
+                                 ORDER BY staged_at, effect_id";
+                            for r in conn.query_vec(stmt_sql, params![agent], EffectRow::from_row).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))? {
                                 out.push(r?);
                             }
                         }
                         None => {
-                            let mut stmt =
-                                conn.prepare("SELECT * FROM platform_effects WHERE authorization_kind='agent_grant' ORDER BY staged_at, effect_id")?;
-                            for r in stmt.query_map([], EffectRow::from_row)? {
+                            let stmt_sql = "SELECT * FROM platform_effects WHERE authorization_kind='agent_grant' ORDER BY staged_at, effect_id";
+                            for r in conn.query_vec(stmt_sql, [], EffectRow::from_row).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))? {
                                 out.push(r?);
                             }
                         }
@@ -364,11 +361,15 @@ impl Store {
                 }
                 None => "SELECT * FROM platform_drafts ORDER BY id DESC LIMIT ?2",
             };
-            let mut stmt = conn.prepare(sql)?;
-            for r in stmt.query_map(
-                params![agent.unwrap_or_default(), limit as i64],
-                DraftRow::from_row,
-            )? {
+            let stmt_sql = sql;
+            for r in conn
+                .query_vec(
+                    stmt_sql,
+                    params![agent.unwrap_or_default(), limit as i64],
+                    DraftRow::from_row,
+                )
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
+            {
                 out.push(r?);
             }
             Ok(out)

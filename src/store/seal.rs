@@ -1707,7 +1707,7 @@ mod tests {
         let (_db3, s3) = open_legacy(&dir3);
         // Inject the latch tables through the owner-armed fixture write
         // lane (restricted WriteTxn) — DDL is authorized, no raw conn.
-        s3.fixture_write(|wtx| wtx.execute_batch(SEAL_SCHEMA))
+        s3.fixture_write(|wtx| Ok(wtx.execute_batch(SEAL_SCHEMA)?))
             .unwrap();
         // A business WriteTxn must not write latch/witness tables even
         // though it can write business tables.
@@ -2137,11 +2137,13 @@ mod tests {
             if gate.entered.try_send(()).is_err() {
                 return false;
             }
-            gate.release
+            let released = gate
+                .release
                 .lock()
                 .unwrap()
                 .recv_timeout(Duration::from_secs(5))
-                .is_ok()
+                .is_ok();
+            released
         }
         struct Reset;
         impl Drop for Reset {
@@ -2165,12 +2167,13 @@ mod tests {
             second.conn().busy_handler(Some(busy)).unwrap();
             let callback_ran = std::sync::atomic::AtomicBool::new(false);
             std::thread::scope(|scope| {
-                let holding = scope.spawn(|| {
+                let first_ref = &first;
+                let holding = scope.spawn(move || {
                     if close_first {
                         // Test-only private owner setup holds the actual close
                         // DML until commit. It proves lock/latch ordering, not
                         // external authority or a production permit factory.
-                        first.with_owner_tx(|conn| {
+                        first_ref.with_owner_tx(|conn| {
                             conn.execute_batch(SEAL_SCHEMA)?;
                             conn.execute("INSERT INTO closure_state(id,closed,reason,challenge,attempt,artifact,epoch,witness_done,closed_at) VALUES(1,1,'test',X'63','a','art',1,0,0)", [])?;
                             held_tx.send(()).unwrap();
@@ -2178,7 +2181,7 @@ mod tests {
                             Ok(())
                         })
                     } else {
-                        first.with_sealed_tx(|wtx| {
+                        first_ref.with_sealed_tx(|wtx| {
                             wtx.execute("INSERT INTO events(alias,kind,payload,at) VALUES('race-probe','probe','{}',0)", [])?;
                             held_tx.send(()).unwrap();
                             commit_rx.recv_timeout(Duration::from_secs(5)).unwrap();
