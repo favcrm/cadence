@@ -345,8 +345,10 @@ await React.act(async () => {
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
 });
 // CAD-1013: Escape now plays the close transition and unmounts on
-// transitionend (or the reduced-motion/timer fallback) — wait for the
-// deferred unmount rather than a single synchronous frame.
+// transitionend, or on the 320ms fallback timer. happy-dom fires no real
+// transitionend, so the unmount only lands after that fallback — wait it
+// out (sleep > 320) inside act, then settle to confirm the drawer is gone.
+await React.act(async () => { await sleep(400); });
 await settle(() => assert(!host.querySelector('[data-drawer="customer"]'), "Escape closes the drawer"));
 assert(!location.search.includes("record="), "closing clears the record scope");
 
