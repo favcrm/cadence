@@ -670,18 +670,12 @@ impl Store {
                     let Some(record) = record else {
                         return Ok(None);
                     };
-                    let grants: Vec<Grant> = {
-                        let mut stmt = tx.prepare(
-                            "SELECT * FROM platform_grants WHERE platform=?1 AND account=?2 \
-                             ORDER BY agent",
-                        )?;
-                        let rows = stmt.query_map(params![platform, account], grant_row)?;
-                        let mut out = Vec::new();
-                        for r in rows {
-                            out.push(r?);
-                        }
-                        out
-                    };
+                    let grants: Vec<Grant> = tx.query_vec(
+                        "SELECT * FROM platform_grants WHERE platform=?1 AND account=?2 \
+                         ORDER BY agent",
+                        params![platform, account],
+                        grant_row,
+                    )?;
                     tx.execute(
                         "DELETE FROM platform_grants WHERE platform=?1 AND account=?2",
                         params![platform, account],
@@ -1154,17 +1148,15 @@ impl Store {
         return self.write_tx(|conn| {
 
                     let tx = &mut *conn;
-                    let rows: Vec<Derived> = {
-                        let mut stmt = tx.prepare(
-                            "SELECT agent, platform, account, scopes FROM app_grants \
-                             WHERE app=?1 AND install_id<>?2",
-                        )?;
-                        let mapped = stmt.query_map(params![app, install_id], |r| {
+                    let rows: Vec<Derived> = tx.query_vec(
+                        "SELECT agent, platform, account, scopes FROM app_grants \
+                         WHERE app=?1 AND install_id<>?2",
+                        params![app, install_id],
+                        |r| {
                             let scopes: String = r.get(3)?;
                             Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&scopes)))
-                        })?;
-                        mapped.flatten().collect()
-                    };
+                        },
+                    )?;
                     if rows.is_empty() {
                         return Ok(Vec::new());
                     }

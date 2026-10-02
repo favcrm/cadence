@@ -679,14 +679,12 @@ impl Store {
                         });
                     }
                     let coverage: HashSet<String> = self.monitor_coverage_in(&tx, id)?.into_iter().collect();
-                    let events = {
-                        let mut stmt = tx.prepare(
-                            "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
-                             WHERE seq>? ORDER BY seq LIMIT 500",
-                        )?;
-                        let rows = stmt.query_map([monitor.event_cursor], row_event)?;
-                        rows.collect::<rusqlite::Result<Vec<_>>>()?
-                    };
+                    let events = tx.query_vec(
+                        "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
+                         WHERE seq>? ORDER BY seq LIMIT 500",
+                        [monitor.event_cursor],
+                        row_event,
+                    )?;
                     let mut cursor = monitor.event_cursor;
                     let mut alerts_created = 0;
                     for event in &events {

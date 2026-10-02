@@ -254,8 +254,8 @@ impl Store {
                     } else {
                         tx.execute("UPDATE app_contexts SET revision=?,state='archived',updated=? WHERE id=? AND install_id=? AND revision=? AND state='active'",params![revision,now(),id,install,expected])?;
                     }
-                    let runs = tx.prepare("SELECT id FROM app_runs WHERE install_id=? AND context_id=? AND state IN ('awaiting_approval','approved','running')")?
-                        .query_map(params![install,id],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    let runs = tx.query_vec("SELECT id FROM app_runs WHERE install_id=? AND context_id=? AND state IN ('awaiting_approval','approved','running')",
+                        params![install,id],|r|r.get::<_,String>(0))?;
                     for run in runs {
                         self.app_run_invalidate_in(&tx, &run)?;
                     }

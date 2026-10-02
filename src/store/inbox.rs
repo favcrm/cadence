@@ -34,14 +34,12 @@ impl Store {
 
                     let tx = &mut *conn;
                     self.inbox_agent_in(&tx, alias)?;
-                    let mut stmt = tx.prepare(
+                    let pending = tx.query_vec(
                         "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
                          ORDER BY seq",
+                        params![alias, after],
+                        row_message,
                     )?;
-                    let pending = stmt
-                        .query_map(params![alias, after], row_message)?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    drop(stmt);
                     for m in &pending {
                         let result = json!({"status": "completed", "via": "inbox_read"});
                         tx.execute(
@@ -131,14 +129,12 @@ impl Store {
                         |r| r.get(0),
                     )?;
                     let through = through.min(tail);
-                    let mut stmt = tx.prepare(
+                    let pending = tx.query_vec(
                         "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq<=?
                          ORDER BY seq",
+                        params![alias, through],
+                        row_message,
                     )?;
-                    let pending = stmt
-                        .query_map(params![alias, through], row_message)?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    drop(stmt);
                     // Messages this reader parked stay queued under its own
                     // watermark too — the ack asserts consumption, and a parked
                     // message is precisely what the reader could not consume. The

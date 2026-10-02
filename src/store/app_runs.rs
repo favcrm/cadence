@@ -925,7 +925,7 @@ impl Store {
                             return Err(Error::rejected("registered app assignment changed"));
                         }
                     }
-                    let rows=tx.prepare("SELECT step_id,task_id,spec,identity_digest FROM app_run_steps WHERE run_id=? AND state='pending' ORDER BY step_id")?.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    let rows=tx.query_vec("SELECT step_id,task_id,spec,identity_digest FROM app_run_steps WHERE run_id=? AND state='pending' ORDER BY step_id",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?;
                     for (step_id, task_id, spec, generation) in rows {
                         let step: LocalStep =
                             serde_json::from_str(&spec).map_err(|e| Error::internal(e.to_string()))?;

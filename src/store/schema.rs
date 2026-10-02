@@ -1036,20 +1036,18 @@ impl Store {
                     // and the outcome record needs the row list plus which of them
                     // carry no refusal evidence at all. No `source` filter: this
                     // list must equal exactly what the UPDATE below rewrites.
-                    let swept: Vec<(String, String, String)> = {
-                        let mut stmt = tx.prepare(
-                            "SELECT alias, id, turn_id FROM messages
-                             WHERE state IN ('submitting','running')",
-                        )?;
-                        let rows = stmt
-                            .query_map([], |r| {
-                                Ok((
-                                    r.get::<_, String>(0)?,
-                                    r.get::<_, String>(1)?,
-                                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                                ))
-                            })?
-                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let swept: Vec<(String, String, String)> = tx.query_vec(
+                        "SELECT alias, id, turn_id FROM messages
+                         WHERE state IN ('submitting','running')",
+                        [],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                            ))
+                        },
+                    )?;
                         drop(stmt);
                         rows.into_iter()
                             .filter(|(_, id, _)| !kept_ids.contains(id))
@@ -1092,16 +1090,17 @@ impl Store {
                     let mut evidenced: std::collections::HashSet<String> = std::collections::HashSet::new();
                     for chunk in unprobed.chunks(500) {
                         let marks = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                        let mut stmt = tx.prepare(&format!(
-                            "SELECT DISTINCT json_extract(payload,'$.message') FROM events
-                             WHERE kind='turn_adopt_refused'
-                               AND json_extract(payload,'$.message') IN ({marks})"
-                        ))?;
-                        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
-                            r.get::<_, String>(0)
-                        })?;
+                        let rows = tx.query_vec(
+                            &format!(
+                                "SELECT DISTINCT json_extract(payload,'$.message') FROM events
+                                 WHERE kind='turn_adopt_refused'
+                                   AND json_extract(payload,'$.message') IN ({marks})"
+                            ),
+                            rusqlite::params_from_iter(chunk.iter()),
+                            |r| r.get::<_, String>(0),
+                        )?;
                         for row in rows {
-                            evidenced.insert(row?);
+                            evidenced.insert(row);
                         }
                     }
                     let unevidenced: Vec<(String, String)> = swept

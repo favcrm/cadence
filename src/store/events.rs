@@ -323,17 +323,15 @@ impl Store {
         return self.write_tx(|conn| {
 
                     let tx = &mut *conn;
-                    let mut rows: Vec<(i64, String, String, f64)> = {
-                        let mut st = tx.prepare(&format!(
+                    let mut rows: Vec<(i64, String, String, f64)> = tx.query_vec(
+                        &format!(
                             "SELECT e.seq, e.alias, e.kind, e.at FROM events e WHERE {} \
                              ORDER BY e.seq LIMIT ?2",
                             rollable_events_where()
-                        ))?;
-                        let rows = st.query_map(params![cutoff, limit as i64], |r| {
-                            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                        })?;
-                        rows.collect::<rusqlite::Result<_>>()?
-                    };
+                        ),
+                        params![cutoff, limit as i64],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )?;
                     // Per-alias runs, each in seq order, for the fold below.
                     rows.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
                     let kinds_sql = ROLLABLE_EVENT_KINDS
@@ -388,11 +386,10 @@ impl Store {
                                 &batch[1..]
                             }
                         };
-                        let mut delete = tx.prepare(&format!(
-                            "DELETE FROM events WHERE seq=?1 AND kind IN ({kinds_sql})"
-                        ))?;
+                        let delete_sql =
+                            format!("DELETE FROM events WHERE seq=?1 AND kind IN ({kinds_sql})");
                         for (seq, ..) in folded {
-                            delete.execute([seq])?;
+                            tx.execute(&delete_sql, [seq])?;
                         }
                     }
                     Ok(rows.len())

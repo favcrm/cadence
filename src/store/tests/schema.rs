@@ -388,12 +388,13 @@
         std::thread::scope(|scope| {
             let crashed = scope
                 .spawn(|| {
-                    // Fixture-armed conn so the raw BEGIN is authorized;
-                    // the panic still leaves an open tx for recovery to
-                    // roll back.
-                    let conn = s.fixture_conn().unwrap();
-                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-                    panic!("store closure panicked while holding the lock");
+                    // A panic inside a fixture-armed owner write leaves
+                    // the callback's BEGIN IMMEDIATE tx open mid-unwind;
+                    // `sealed_tx` rolls it back under TxControl and the
+                    // dropped guard still poisons the mutex for recovery.
+                    let _ = s.fixture_write(|_wtx| -> Result<()> {
+                        panic!("store closure panicked while holding the lock");
+                    });
                 })
                 .join();
             assert!(crashed.is_err());

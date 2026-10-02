@@ -1166,23 +1166,6 @@ impl Store {
         }
     }
 
-    /// Test/fixture guard: an armed-`Owner`+`TxControl` conn guard for
-    /// fixture code that binds `let conn = s.fixture_conn();` then
-    /// writes — DDL, DML and tx-boundary all authorized while held, the
-    /// latch still checked. Test/seam only — never a production writer.
-    #[cfg(any(test, feature = "test-seam"))]
-    #[allow(dead_code)]
-    pub(crate) fn fixture_conn(&self) -> Result<FixtureConn<'_>> {
-        let guard = self.conn();
-        let state = &*self.seal_state;
-        Self::check_closed_tx(&guard)?;
-        Ok(FixtureConn {
-            guard,
-            _armed: ArmGuard::enter(state, GuardState::OWNER),
-            _ctrl: ControlPhase::enter(state),
-        })
-    }
-
     /// `propose_close` — flip the durable latch (owner lane), authorized
     /// by an [`OwnerMaintenancePermit`]. The permit is consumed one-use
     /// and its `challenge`/`attempt`/`epoch` are bound into the latch row
@@ -1327,24 +1310,6 @@ impl Store {
             wtx.execute("UPDATE closure_state SET witness_done=1 WHERE id=1", [])?;
             Ok(seq as u64)
         })
-    }
-}
-
-/// Test/fixture connection guard — `fixture_conn`'s return type. Holds
-/// the conn mutex + `Owner`+`TxControl` for its lifetime and `Deref`s to
-/// `Connection` so test fixtures keep the `conn.execute`/`prepare` shape.
-/// Compiled only under `test`/`test-seam`; never a production writer.
-#[cfg(any(test, feature = "test-seam"))]
-pub(crate) struct FixtureConn<'a> {
-    guard: std::sync::MutexGuard<'a, Connection>,
-    _armed: ArmGuard<'a>,
-    _ctrl: ControlPhase<'a>,
-}
-#[cfg(any(test, feature = "test-seam"))]
-impl<'a> std::ops::Deref for FixtureConn<'a> {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
-        &self.guard
     }
 }
 
@@ -1594,14 +1559,6 @@ impl<'t> WriteTxn<'t> {
     ) -> rusqlite::Result<T> {
         self.tx.query_row(sql, params, f)
     }
-    /// `'t`-bound prepared statement — cannot escape the closure
-    /// (`'t`-bound; `R: 'static` forbids returning it).
-    pub(crate) fn prepare<'s>(&'s self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'s>>
-    where
-        't: 's,
-    {
-        self.tx.prepare(sql)
-    }
     /// `query_map` returning the collected Vec — `pub` for test hooks;
     /// the `Statement` borrow stays inside the impl so none escapes.
     /// Flattened to the crate `Result` like the other facade verbs.
@@ -1757,14 +1714,14 @@ mod tests {
         // *second* owner pass is impossible; instead assert the authorizer
         // semantics directly: a business conn that tries latch writes is
         // denied at PREPARE. Build an unsealed store, inject latch tables
-        // via the owner lane *without* sealing by using fixture_conn (Owner)
+        // via the owner-armed `fixture_write` lane (restricted WriteTxn),
         // then drop to a fresh business conn.
         let dir3 = TempDir::new().unwrap();
         let (_db3, s3) = open_legacy(&dir3);
-        {
-            let c = s3.fixture_conn().unwrap();
-            c.execute_batch(SEAL_SCHEMA).unwrap();
-        }
+        // Inject the latch tables through the owner-armed fixture write
+        // lane (restricted WriteTxn) — DDL is authorized, no raw conn.
+        s3.fixture_write(|wtx| wtx.execute_batch(SEAL_SCHEMA))
+            .unwrap();
         // A business WriteTxn must not write latch/witness tables even
         // though it can write business tables.
         s3.with_sealed_tx(|wtx| {

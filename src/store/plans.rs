@@ -1087,14 +1087,12 @@ impl Store {
                             job.state
                         )));
                     }
-                    let tasks: Vec<Task> = {
-                        let mut stmt = tx.prepare(
-                            "SELECT * FROM tasks WHERE job_id=? AND state NOT IN
-                             ('verified','done','cancelled','failed')",
-                        )?;
-                        let rows = stmt.query_map([job_id], row_task)?;
-                        rows.collect::<rusqlite::Result<Vec<_>>>()?
-                    };
+                    let tasks: Vec<Task> = tx.query_vec(
+                        "SELECT * FROM tasks WHERE job_id=? AND state NOT IN
+                         ('verified','done','cancelled','failed')",
+                        [job_id],
+                        row_task,
+                    )?;
                     for task in &tasks {
                         self.cancel_task_tx(&tx, task, by)?;
                     }
@@ -1127,11 +1125,11 @@ impl Store {
                             job.state
                         )));
                     }
-                    let open: Vec<String> = {
-                        let mut stmt = tx.prepare("SELECT id FROM tasks WHERE job_id=? AND state != 'done'")?;
-                        let rows = stmt.query_map([job_id], |r| r.get(0))?;
-                        rows.collect::<rusqlite::Result<Vec<_>>>()?
-                    };
+                    let open: Vec<String> = tx.query_vec(
+                        "SELECT id FROM tasks WHERE job_id=? AND state != 'done'",
+                        [job_id],
+                        |r| r.get(0),
+                    )?;
                     if !open.is_empty() {
                         return Err(Error::rejected(format!(
                             "Job '{job_id}' has tasks not done: {} — \
