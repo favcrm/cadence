@@ -767,6 +767,44 @@ async function mountedFlow() {
   await click(byText("button", "Discard"));
   await settle(() => assert(text().includes("draft unchanged at r3"), "discard is non-mutating"));
 
+  // ---- CAD-1013 pinned inline edit ----
+  // While the operator edits text, a concurrent agent Apply lands a
+  // newer revision. The editor must keep the local text, flag the edit
+  // stale and pin the save to the revision it began on — a conflict
+  // refuses instead of silently overwriting the agent's newer draft.
+  await click(byText("button", "Edit subject / text"));
+  await settle(() => assert(host.querySelector("#cmp-subject"), "inline edit opens for the pinned test"));
+  const pinnedBase = openDoc().revision as number;
+  await fillInput("#cmp-subject", "My kept local correction");
+  // A concurrent assistant proposal lands and applies → doc r(N+1).
+  const mintsBefore = mintBodies.length;
+  await click(mintButton0());
+  await settle(() => assert(mintBodies.length === mintsBefore + 1, "a fresh request minted mid-edit"), 15000);
+  redeem(mintBodies.at(-1)!.request_id as string);
+  await settle(() => assert(host.querySelectorAll('[data-proposal]').length > 0, "a fresh proposal pends"), 30000);
+  const freshLi = Array.from(host.querySelectorAll('[data-proposal]')).at(-1)!;
+  await click(Array.from(freshLi.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Apply")));
+  await settle(() => assert(openDoc().revision === pinnedBase + 1, "a concurrent apply bumped the doc mid-edit"));
+  // Local text is preserved and the stale flag shows.
+  assert(
+    (host.querySelector("#cmp-subject") as HTMLInputElement).value === "My kept local correction",
+    "the concurrent apply did not clobber the local edit",
+  );
+  assert(host.querySelector('[data-stale-edit]'), "the stale-edit warning renders");
+  // Saving stays pinned to the base revision → the backend conflicts.
+  await click(byText("button", "Save text corrections (new revision)"));
+  await settle(() =>
+    assert(
+      text().includes("revision is stale") || text().includes("moved since you started editing"),
+      "the pinned save conflicts instead of overwriting the newer draft",
+    ),
+  );
+  assert(
+    (host.querySelector("#cmp-subject") as HTMLInputElement).value === "My kept local correction",
+    "the refused save keeps the local text for a reload decision",
+  );
+  await click(byText("button", "Cancel"));
+
   // ---- CAD-813: the verified assistant draft seam ----
   // No scoped chat message yet: the mint control stays disabled with
   // its explanation, and no request body ever leaves the browser.

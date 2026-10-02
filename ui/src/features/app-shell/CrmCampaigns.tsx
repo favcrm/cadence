@@ -1827,6 +1827,13 @@ function CampaignWorkspace({
   const [subject, setSubject] = useState(doc?.subject ?? "");
   const [preheader, setPreheader] = useState(doc?.preheader ?? "");
   const [blocks, setBlocks] = useState<EditorBlock[]>(() => blocksFromDoc(doc));
+  // CAD-1013 pinned inline edit: the revision the operator began editing
+  // against. `save` sends it as expectedRevision so a concurrent agent
+  // Apply/newer draft can never be silently overwritten — a drift is a
+  // conflict, not a merge. `staleEdit` flags that a newer doc landed
+  // while editing so the local text is preserved, not clobbered.
+  const [editSourceRevision, setEditSourceRevision] = useState<number | null>(null);
+  const [staleEdit, setStaleEdit] = useState(false);
   const [pending, setPending] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [savedNote, setSavedNote] = useState<string | null>(null);
@@ -1860,14 +1867,23 @@ function CampaignWorkspace({
   const mintPoll = useRef<{ deadline: number; requestId: string } | null>(null);
 
   // The doc is the saved truth: editor follows a newly saved revision
-  // (create, Apply) but never clobbers typing mid-draft.
+  // (create, Apply) but never clobbers typing mid-draft. While editing,
+  // a newer doc marks the edit stale instead — the operator's text stays
+  // put and the save keeps the pinned editSourceRevision, so a conflict
+  // refuses rather than overwriting an agent's newer draft.
   const docIdentity = doc === null ? "none" : `${doc.revision}:${doc.contentDigest}`;
   useEffect(() => {
     if (doc === null) return;
+    if (editing) {
+      // A new saved revision landed mid-edit: keep local text, flag it.
+      setStaleEdit(true);
+      return;
+    }
     setSubject(doc.subject);
     setPreheader(doc.preheader);
     setBlocks(blocksFromDoc(doc));
     setTestReceipt(null);
+    setStaleEdit(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docIdentity]);
 
@@ -2070,7 +2086,13 @@ function CampaignWorkspace({
         subject,
         preheader,
         blocks: grammarBlocks(),
-        ...(doc === null ? {} : { expectedRevision: doc.revision }),
+        // CAD-1013 pinned edit: expectedRevision is the revision the
+        // operator began editing against, not whatever doc is current —
+        // a concurrent agent Apply must refuse as a conflict, never be
+        // silently overwritten.
+        ...(editSourceRevision === null || editSourceRevision === 0
+          ? {}
+          : { expectedRevision: editSourceRevision }),
       })
       .then((value) => {
         const next = parseContentDoc(value);
@@ -2078,6 +2100,8 @@ function CampaignWorkspace({
         setRender(null);
         setTestReceipt(null);
         setEditing(false);
+        setEditSourceRevision(null);
+        setStaleEdit(false);
         setSavedNote(
           doc === null
             ? `Created revision ${next.revision} — earlier content approval does not exist yet.`
@@ -2089,7 +2113,7 @@ function CampaignWorkspace({
         // open and ask for a reload — never overwrite an agent's newer draft.
         setFormError(
           friendlyCampaignError(err) +
-            " Reload the draft to retry against the newer revision.",
+            " The draft moved since you started editing — reload it to retry, or Cancel to keep browsing.",
         );
       })
       .finally(() => setPending(false));
@@ -2242,6 +2266,8 @@ function CampaignWorkspace({
     setSubject(doc?.subject ?? "");
     setPreheader(doc?.preheader ?? "");
     setBlocks(blocksFromDoc(doc));
+    setEditSourceRevision(doc === null ? 0 : doc.revision);
+    setStaleEdit(false);
     setFormError(null);
     setEditing(true);
   };
@@ -2249,6 +2275,8 @@ function CampaignWorkspace({
     setBlocks(blocksFromDoc(doc));
     setSubject(doc?.subject ?? "");
     setPreheader(doc?.preheader ?? "");
+    setEditSourceRevision(null);
+    setStaleEdit(false);
     setFormError(null);
     setEditing(false);
   };
@@ -2303,6 +2331,13 @@ function CampaignWorkspace({
           </>
         ) : (
           <form className="grid gap-3" aria-label="Correct email text" onSubmit={save}>
+            {staleEdit && (
+              <p className="text-label text-warn" role="status" data-stale-edit>
+                A newer revision was saved while you were editing — your text is kept, but
+                saving now is pinned to revision {editSourceRevision}. If it conflicts, reload
+                the draft or Cancel — your newer text is never overwritten silently.
+              </p>
+            )}
             <div className="crm-field-row">
               <Field
                 label="Subject"
