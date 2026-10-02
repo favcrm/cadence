@@ -4,6 +4,10 @@ import Link from "../../ui/Link";
 import type { Viewer } from "../projects/work";
 import CrmShell from "./CrmCustomers";
 import type { HostScope } from "./hostActions";
+/* CAD-1013 drawer motion is CRM-owned — kept off the Social-authored
+   app-shell.css. The .crm-drawer geometry lives there; this adds only
+   the open/close motion. */
+import "./crm-drawer.css";
 
 export type OutletView = "list" | "new";
 
