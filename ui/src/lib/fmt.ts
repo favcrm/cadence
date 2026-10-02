@@ -39,3 +39,28 @@ export function fmtBytes(n: number): string {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
+
+/** `x.y.z+<7-hex>` for a release, the short SHA without a version. */
+export function releaseLabel(
+  version: string | null | undefined,
+  sha: string | null | undefined,
+): string {
+  if (version)
+    return version.replace(
+      /\+([a-f0-9]{40})$/,
+      (_, build: string) => `+${build.slice(0, 7)}`,
+    );
+  return sha ? sha.slice(0, 7) : "Not installed";
+}
+
+/**
+ * The running build as the account menu shows it (CAD-1034): the serving
+ * binary's release label from `Meta`, or null when meta carries no version.
+ */
+export function runningRelease(
+  meta: { version?: string | null; build_commit?: string | null } | null | undefined,
+): string | null {
+  if (!meta?.version) return null;
+  const commit = meta.build_commit ?? "";
+  return releaseLabel(/^[a-f0-9]{7,40}$/.test(commit) ? `${meta.version}+${commit}` : meta.version, commit);
+}
