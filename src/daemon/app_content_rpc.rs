@@ -704,6 +704,10 @@ impl Shared {
             "install_id",
             "context_id",
             "segment_id",
+            "campaign_id",
+            "proposal_id",
+            "limit",
+            "cursor",
             "csv_text",
             "message",
             "token",
@@ -724,6 +728,22 @@ impl Shared {
             "app_record_csv_assistant_preview" => {
                 records.app_record_csv_preview(&scoped.context, &csv_text(params)?)
             }
+            // A bounded membership preview over a SAVED segment —
+            // counts + bounded sample, never the full member list,
+            // never a freeze or send (root's required segment-preview
+            // acceptance).
+            "app_segment_assistant_preview" => {
+                records.app_segment_preview(&scoped.context, required_str(params, "segment_id")?)
+            }
+            // The agent's inert pending draft must be discoverable in
+            // the campaign's proposal list BEFORE the operator applies
+            // it — list by campaign (optionally) and show one proposal.
+            "app_content_assistant_proposals" => records.app_content_proposal_list(
+                &scoped.context,
+                params.get("campaign_id").and_then(Value::as_str),
+            ),
+            "app_content_assistant_proposal_show" => records
+                .app_content_proposal_show(&scoped.context, required_str(params, "proposal_id")?),
             _ => Err(Error::rejected("unknown app assistant read method")),
         }
     }

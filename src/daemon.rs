@@ -2960,12 +2960,12 @@ impl Shared {
             // Scoped-chat reads — data exposes, never mutations; the
             // same verified-turn gate, no claim (a read doesn't spend).
             // One handler routes all three to their store calls.
-            "app_segment_assistant_list" | "app_segment_assistant_show" | "app_record_csv_assistant_preview" => {
-                self.rpc_app_assistant_read(method, params, peer_pid)
-            }
             "app_segment_assistant_list"
             | "app_segment_assistant_show"
-            | "app_record_csv_assistant_preview" => {
+            | "app_record_csv_assistant_preview"
+            | "app_segment_assistant_preview"
+            | "app_content_assistant_proposals"
+            | "app_content_assistant_proposal_show" => {
                 self.rpc_app_assistant_read(method, params, peer_pid)
             }
             "app_segment_show" => self.rpc_app_audience(method, params, peer_pid),

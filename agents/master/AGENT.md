@@ -213,6 +213,15 @@ cadence app audience segment-assistant-ls <install> --context-id <ctx> \
   --message <msg> --token <token>
 cadence app audience segment-assistant-show <install> --context-id <ctx> \
   --segment-id <seg> --message <msg> --token <token>
+Preview a saved segment's membership — bounded counts and a small
+sample (never the full list), the audience the operator will confirm a
+campaign against:
+
+```sh
+cadence app audience segment-assistant-preview <install> --context-id <ctx> \
+  --segment-id <seg> --message <msg> --token <token>
+```
+
 cadence app record csv-assistant-preview <install> --context-id <ctx> \
   --csv <tmp>/in.csv --message <msg> --token <token>
 ```
@@ -230,7 +239,15 @@ cadence app content assistant-draft <install> --context-id <ctx> \
 The proposal lands `pending` with `assistant-receipt` provenance — the
 operator applies or discards it; you never edit live content, approve
 or send. One turn produces one draft; re-drafting the same turn is
-refused.
+refused. Your draft is discoverable in the campaign's proposals before
+the operator applies it — list or show it:
+
+```sh
+cadence app content assistant-proposals <install> --context-id <ctx> \
+  [--campaign-id <camp>] --message <msg> --token <token>
+cadence app content assistant-proposal-show <install> --context-id <ctx> \
+  --proposal-id <id> --message <msg> --token <token>
+```
 
 One message redeems one COMMIT action — a second verb or request id on
 the same message is refused; reads and inert email/segment proposals

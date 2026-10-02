@@ -393,6 +393,32 @@ pub(crate) enum ContentAction {
         #[arg(long, requires = "message")]
         token: String,
     },
+    /// List the context's email proposals (optionally one campaign) on
+    /// the live scoped turn — the agent's inert pending draft must be
+    /// discoverable before the operator applies it.
+    AssistantProposals {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        campaign_id: Option<String>,
+        #[arg(long, requires = "token")]
+        message: String,
+        #[arg(long, requires = "message")]
+        token: String,
+    },
+    /// Show one proposal on the live scoped turn (read-only).
+    AssistantProposalShow {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        proposal_id: String,
+        #[arg(long, requires = "token")]
+        message: String,
+        #[arg(long, requires = "message")]
+        token: String,
+    },
 }
 
 /// CAD-780 audience verbs. JSON files hold predicates (`[{field,
@@ -454,6 +480,20 @@ pub(crate) enum AudienceAction {
     /// CAD-1014: show one segment (revision/membership) on the live
     /// scoped chat turn (read-only).
     SegmentAssistantShow {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        segment_id: String,
+        #[arg(long, requires = "token")]
+        message: String,
+        #[arg(long, requires = "message")]
+        token: String,
+    },
+    /// CAD-1014: a bounded membership preview over a saved segment
+    /// (base/exclusion/final counts + a bounded sample — never the full
+    /// member list, never a freeze or send) on the live scoped turn.
+    SegmentAssistantPreview {
         install_id: String,
         #[arg(long)]
         context_id: String,
@@ -907,6 +947,29 @@ fn content_params(action: &ContentAction) -> Result<(&'static str, serde_json::V
             }
             ("app_content_assistant_draft", params)
         }
+        ContentAction::AssistantProposals {
+            install_id,
+            context_id,
+            campaign_id,
+            message,
+            token,
+        } => {
+            let mut params = json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token});
+            if let Some(campaign) = campaign_id {
+                params["campaign_id"] = json!(campaign);
+            }
+            ("app_content_assistant_proposals", params)
+        }
+        ContentAction::AssistantProposalShow {
+            install_id,
+            context_id,
+            proposal_id,
+            message,
+            token,
+        } => (
+            "app_content_assistant_proposal_show",
+            json!({"install_id":install_id,"context_id":context_id,"proposal_id":proposal_id,"message":message,"token":token}),
+        ),
     })
 }
 
@@ -950,6 +1013,16 @@ fn audience_params(action: &AudienceAction) -> Result<(&'static str, serde_json:
         } => (
             "app_segment_assistant_list",
             json!({"install_id": install_id, "context_id": context_id, "message": message, "token": token}),
+        ),
+        AudienceAction::SegmentAssistantPreview {
+            install_id,
+            context_id,
+            segment_id,
+            message,
+            token,
+        } => (
+            "app_segment_assistant_preview",
+            json!({"install_id":install_id,"context_id":context_id,"segment_id":segment_id,"message":message,"token":token}),
         ),
         AudienceAction::SegmentAssistantShow {
             install_id,

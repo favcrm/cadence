@@ -131,23 +131,6 @@ impl Crm {
 
     /// The operator mints a one-time email proposal request on a scoped
     /// chat message — the CAD-813 verb, reused for the no-draft case.
-    fn mint(
-        &self,
-        install: &str,
-        context: &str,
-        campaign: &str,
-        message: &str,
-        request: &str,
-    ) -> Value {
-        self.daemon
-            .operator_rpc(
-                "app_content_proposal_request",
-                json!({"install_id": install, "context_id": context, "campaign_id": campaign,
-                       "message": message, "request_id": request}),
-            )
-            .unwrap()
-    }
-
     fn preview(&self, install: &str, context: &str, csv: &str) -> Value {
         self.daemon
             .operator_rpc(
@@ -609,4 +592,98 @@ fn cad1014_scoped_chat_email_draft_binds_live_revision() {
     // Host-derived live revision 1 — never agent text; doc unchanged.
     assert_eq!(proposed["result"]["proposal"]["source_revision"], 1);
     assert_eq!(proposed["result"]["proposal"]["state"], "pending");
+}
+
+/// The required segment-preview acceptance: a scoped turn reads a
+/// bounded membership preview (counts + a small sample) over a SAVED
+/// segment — never the full member list, never a freeze or send. And
+/// the agent's inert pending draft is discoverable in the campaign's
+/// proposal list BEFORE the operator applies it.
+#[test]
+fn cad1014_scoped_chat_segment_preview_and_draft_discoverable() {
+    let w = Crm::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-1014-7");
+    let context_id = context["id"].as_str().unwrap();
+    // Two customers so the preview has membership to count/sample —
+    // the customer profile grammar is `{schema, display_name, email,
+    // consent:{email}}`; a `consent.email:"granted"` counts as opted-in.
+    for id in ["cust-a", "cust-b"] {
+        w.daemon
+            .operator_rpc(
+                "app_record_create",
+                json!({"install_id": install, "context_id": context_id, "record_id": id,
+                       "profile": {"schema":1, "email": format!("{id}@ex.com"), "display_name": id,
+                                   "tags": [], "consent": {"email":"granted"}}}),
+            )
+            .unwrap();
+    }
+    // A saved segment (operator-saved, predicated on consent_email).
+    w.daemon
+        .operator_rpc(
+            "app_segment_save",
+            json!({"install_id": install, "context_id": context_id, "segment_id": "engaged",
+                   "name": "Engaged", "predicates": [{"field":"consent_email","op":"eq","value":"granted"}]}),
+        )
+        .unwrap();
+
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "crm-chat", "claude", None, lane.pid());
+    let token = w.chat_turn("crm-chat", install, context_id, "chat-1014-7");
+
+    // Bounded membership preview over the saved segment.
+    let preview: Value = lane.rpc(
+        &w.daemon.state,
+        "app_segment_assistant_preview",
+        json!({"install_id": install, "context_id": context_id, "segment_id": "engaged",
+               "message": "chat-1014-7", "token": token}),
+    );
+    assert_eq!(preview["ok"], true, "{preview}");
+    let body = &preview["result"];
+    assert_eq!(body["base_count"].as_i64(), Some(2), "{body}");
+    assert_eq!(body["final_count"].as_i64(), Some(2), "{body}");
+    // A bounded sample, never the full member list.
+    assert!(body["sample"].is_array());
+    // No send/freeze — a read only; the segment revision is unchanged.
+
+    // An inert draft is discoverable in the campaign's proposal list.
+    let token2 = w.chat_turn("crm-chat", install, context_id, "chat-1014-8");
+    let drafted: Value = lane.rpc(
+        &w.daemon.state,
+        "app_content_assistant_draft",
+        json!({"install_id": install, "context_id": context_id, "campaign_id": "welcome-9",
+               "proposal_id": "prop-1014-e9", "subject": "Hi", "preheader": "P",
+               "blocks": blocks(), "message": "chat-1014-8", "token": token2}),
+    );
+    assert_eq!(drafted["ok"], true, "{drafted}");
+    // Discoverable: list by campaign surfaces the pending proposal.
+    let listed: Value = lane.rpc(
+        &w.daemon.state,
+        "app_content_assistant_proposals",
+        json!({"install_id": install, "context_id": context_id, "campaign_id": "welcome-9",
+               "message": "chat-1014-8", "token": token2}),
+    );
+    assert_eq!(listed["ok"], true, "{listed}");
+    let ids: Vec<&str> = listed["result"]["proposals"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|p| p["proposal_id"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        ids.contains(&"prop-1014-e9"),
+        "draft not discoverable: {listed}"
+    );
+    // And shown directly by proposal id.
+    let shown: Value = lane.rpc(
+        &w.daemon.state,
+        "app_content_assistant_proposal_show",
+        json!({"install_id": install, "context_id": context_id, "proposal_id": "prop-1014-e9",
+               "message": "chat-1014-8", "token": token2}),
+    );
+    assert_eq!(shown["ok"], true, "{shown}");
+    assert_eq!(shown["result"]["proposal"]["state"], "pending");
 }

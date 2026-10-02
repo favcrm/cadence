@@ -100,6 +100,13 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "app_segment_assistant_list",
     "app_segment_assistant_show",
     "app_record_csv_assistant_preview",
+    // Bounded membership preview over a saved segment — counts + a
+    // bounded sample, never the full list, never a freeze or send.
+    "app_segment_assistant_preview",
+    // The agent's inert pending draft must be discoverable in the
+    // campaign's proposal list before the operator applies it.
+    "app_content_assistant_proposals",
+    "app_content_assistant_proposal_show",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for
