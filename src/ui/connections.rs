@@ -214,18 +214,19 @@ pub(super) fn handle(
             if operator_refusal {
                 return err_response(403, "connection management requires the signed-in operator");
             }
-            // Stable daemon codes map to actionable refusals; the code
-            // itself is wire metadata the UI may key on. Any other
-            // failure keeps the historic opaque body — a vague refusal
-            // beats a reflected one.
+            // The connection path emits exactly ONE coded refusal on
+            // the wire — `custody_unprotected` (`Error::invalid` in
+            // `platform_rpc`'s enroll gate). `revision_conflict` is
+            // never produced here (the connection CAS refuses plain
+            // `Error::rejected`), so it is deliberately NOT mapped:
+            // inventing a friendly conflict message would misdiagnose.
+            // Every other failure keeps the historic opaque body — a
+            // vague refusal beats a reflected one (a custody or host
+            // error can name an account).
             let (code, message): (&str, &str) = match error.code() {
                 Some("custody_unprotected") => (
                     "custody_unprotected",
                     "the daemon refused to store the credential: custody is not isolated from managed agents — enrol only if you accept the same-user custody risk (the form's custody-risk acceptance), or isolate custody first",
-                ),
-                Some("revision_conflict") => (
-                    "revision_conflict",
-                    "the connection changed since the page loaded — reload and retry",
                 ),
                 _ => {
                     let status = match error {
