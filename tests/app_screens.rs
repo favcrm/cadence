@@ -397,9 +397,13 @@ fn cad1006_frame_get_renders_csp_and_exact_bytes() {
     // The frame GET is headerless — the nonce in the path is the sole
     // authority; the daemon's `operator_connection` peer guard denies a
     // registered-agent/detached caller even without a cookie.
-    let req = format!(
-        "GET {mount} HTTP/1.0\r\nHost: {host}\r\n\r\n",
-        host = session.host,
+    // The GET stays cookie/key-free — the nonce is the sole authority;
+    // on a seam-armed fixture it carries ONLY the CAD-482 caller
+    // assertion so the board's in-process peer proof resolves `operator`.
+    let req = common::op::assert_as(
+        format!("GET {mount} HTTP/1.0\r\nHost: {host}\r\n\r\n", host = session.host),
+        &s.daemon.state,
+        "operator",
     );
     let (code, head, body) = common::op::raw(port, &req);
     assert_eq!(code, 200, "frame GET refused: {code} {head}");
@@ -440,8 +444,10 @@ fn cad1006_frame_origin_uses_trusted_host_not_forged() {
     let mint = s.mint(&token, &session.key, "loopback", 1).unwrap();
     let mount = mint["mount"].as_str().unwrap();
     // A forged/arbitrary Host must not become the trusted parent_origin.
-    let req = format!(
-        "GET {mount} HTTP/1.0\r\nHost: evil.example\r\n\r\n",
+    let req = common::op::assert_as(
+        format!("GET {mount} HTTP/1.0\r\nHost: evil.example\r\n\r\n"),
+        &s.daemon.state,
+        "operator",
     );
     let (_, _, body) = common::op::raw(port, &req);
     assert!(
@@ -676,7 +682,7 @@ fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
             .unwrap()["catalog_generation"].as_str().unwrap().to_string()
     };
 
-    let check_path = format!("/api/app-installations/{install_id}/upgrade-check");
+    let check_path = format!("/api/app-installations/{install_id}/upgrade/check");
     let up_path = format!("/api/app-installations/{install_id}/upgrade");
 
     // ---- NEGATIVES against the SAME valid files map ----
