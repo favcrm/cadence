@@ -285,6 +285,10 @@ export interface ProposalDoc {
   campaignId: string;
   sourceRevision: number;
   subject: string;
+  preheader: string;
+  /** The inert draft's bounded blocks — the proposal body the host
+   *  renders for the pre-Apply preview (CAD-1016). */
+  blocks: CampaignBlock[];
   state: string;
   actor: string;
   origin: string;
@@ -303,7 +307,8 @@ export function parseProposal(value: unknown): ProposalDoc {
     typeof row.campaign_id !== "string" ||
     typeof row.source_revision !== "number" ||
     typeof row.subject !== "string" ||
-    typeof row.state !== "string"
+    typeof row.state !== "string" ||
+    !Array.isArray(row.blocks)
   ) {
     throw new ApiError("The server returned an invalid proposal receipt", 502);
   }
@@ -312,6 +317,8 @@ export function parseProposal(value: unknown): ProposalDoc {
     campaignId: row.campaign_id,
     sourceRevision: row.source_revision,
     subject: row.subject,
+    preheader: typeof row.preheader === "string" ? row.preheader : "",
+    blocks: row.blocks as CampaignBlock[],
     state: row.state,
     actor: typeof row.actor === "string" ? row.actor : "operator",
     origin: typeof row.origin === "string" ? row.origin : "operator-direct",

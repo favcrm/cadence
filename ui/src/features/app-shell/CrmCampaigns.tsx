@@ -2819,6 +2819,7 @@ function ProposalRow({
   onError: (message: string | null) => void;
 }) {
   const [pending, setPending] = useState<"apply" | "discard" | null>(null);
+  const [showBody, setShowBody] = useState(false);
   const verified = proposal.actor === "assistant" && proposal.assistantReceipt !== null;
   const stale = proposal.sourceRevision !== expectedRevision;
   const receipt = proposal.assistantReceipt;
@@ -2855,10 +2856,50 @@ function ProposalRow({
           </span>
         </p>
       )}
+      {/* CAD-1016: the pending draft's actual body renders BEFORE Apply —
+          subject, preheader and the bounded blocks, all escaped text
+          (no raw HTML). This is the real draft the operator reviews,
+          never a save or a render of unsaved editor state. */}
+      <button
+        type="button"
+        className="lnk text-label mt-1"
+        aria-expanded={showBody}
+        data-proposal-preview={proposal.proposalId}
+        onClick={() => setShowBody((open) => !open)}
+      >
+        {showBody ? "Hide draft body" : "Preview draft body"}
+      </button>
+      {showBody && (
+        <div className="crm-proposal-body mt-2" data-proposal-body={proposal.proposalId}>
+          <p className="text-label text-ink-200">
+            <span className="text-ink-500">Subject:</span> {proposal.subject}
+          </p>
+          {proposal.preheader !== "" && (
+            <p className="text-label text-ink-400">
+              <span className="text-ink-500">Preheader:</span> {proposal.preheader}
+            </p>
+          )}
+          <ol className="grid gap-1 mt-1" aria-label="Draft body blocks">
+            {proposal.blocks.map((block, index) => (
+              <li key={index} className="text-label text-ink-300">
+                {block.type === "heading" ? (
+                  <strong className="text-ink-100">{block.text}</strong>
+                ) : block.type === "button" ? (
+                  <span className="chip" data-block="button">
+                    Button: {block.label}
+                  </span>
+                ) : (
+                  block.text
+                )}
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
       {stale && proposal.state === "pending" && (
         <p className="text-label text-warn mt-1" data-state="stale">
           Needs review (stale) — stamped against source r{proposal.sourceRevision}, the draft is
-          now r{expectedRevision}. Re-review its text before re-minting a request.
+          now r{expectedRevision}. Re-review its text before asking the assistant to draft again.
         </p>
       )}
       {canWrite && (

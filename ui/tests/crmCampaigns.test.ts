@@ -815,6 +815,16 @@ async function mountedFlow() {
   await settle(() => assert(host.querySelector(`[data-proposal="${landed.proposal_id}"]`), "the landed draft appears in the pending list"), 30000);
   assert(text().includes("crm-writer"), "the badge names the receipt's agent");
 
+  // The pending draft's actual body is previewable BEFORE Apply — the
+  // proposal's subject, preheader and block text render in a bounded
+  // preview, with no save and no unsaved-editor state involved.
+  await click(host.querySelector(`[data-proposal-preview="${landed.proposal_id}"]`));
+  await settle(() => assert(host.querySelector(`[data-proposal-body="${landed.proposal_id}"]`), "the draft body preview opens"));
+  const bodyPreview = host.querySelector(`[data-proposal-body="${landed.proposal_id}"]`);
+  assert(bodyPreview?.textContent?.includes("Assistant draft subject"), "the pending body's subject renders before Apply");
+  assert(bodyPreview?.textContent?.includes("From the chat turn"), "the pending body's preheader renders before Apply");
+  assert(bodyPreview?.textContent?.includes("Assistant copy"), "the pending body's block text renders before Apply");
+
   // Apply the verified draft: expected_revision = current draft, the
   // revision moves, approval invalidates and the stale row clears.
   const revisionBefore = openDoc().revision as number;
