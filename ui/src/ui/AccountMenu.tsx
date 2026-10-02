@@ -32,6 +32,7 @@ export default function AccountMenu({
   placement,
   settingsHref,
   footer,
+  onOpenChange,
 }: {
   meta: Meta | null;
   actor: string;
@@ -43,6 +44,8 @@ export default function AccountMenu({
   settingsHref?: string;
   /** Slot at the end of the panel for the version line (CAD-1034). */
   footer?: ReactNode;
+  /** Reports the dialog's open state (the sidebar raises itself while it is open). */
+  onOpenChange?: (open: boolean) => void;
 }) {
   const panelId = useId();
   const [open, setOpen] = useState(false);
@@ -54,6 +57,12 @@ export default function AccountMenu({
   const triggerRef = useRef<HTMLButtonElement>(null);
   const user = meta?.session?.user;
   const name = user?.name || user?.email || user?.handle || user?.sub || "operator";
+
+  useEffect(() => {
+    if (!open) return;
+    onOpenChange?.(true);
+    return () => onOpenChange?.(false);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;

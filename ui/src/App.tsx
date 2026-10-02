@@ -148,6 +148,7 @@ export default function App() {
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
   // The serving build when it differs from this bundle's — drives the
   // reload banner (CAD-573).
   const [staleBuild, setStaleBuild] = useState<string | null>(null);
@@ -609,7 +610,9 @@ export default function App() {
         issues={issuesState}
         projectsError={projectsState.status === "failed" ? projectsState.error : null}
         signedIn={meta?.signed_in ?? null}
+        accountOpen={accountOpen}
         account={<AccountMenu
+          onOpenChange={setAccountOpen}
           meta={meta}
           actor={actor}
           mayWrite={!readOnly}

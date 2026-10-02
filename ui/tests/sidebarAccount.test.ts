@@ -74,6 +74,13 @@ const rowTrigger = (host: Element) => host.querySelector("aside button[aria-hasp
   assert(row.className.includes("account-row") && row.textContent?.includes("Fable Chen") && row.textContent.includes("member · localhost"), "row shows name and role · host");
   assert(!(host.querySelector("aside")?.textContent ?? "").toLowerCase().includes("session"), "no old SESSION block");
   assert(!row.closest(".overflow-y-auto"), "the footer is outside the scrolling nav, so its dialog is not clipped");
+  const aside = host.querySelector("aside")!;
+  const raised = () => /\bz-\[/.test(aside.className) || aside.hasAttribute("data-account-open");
+  assert(!raised(), "menu closed: the aside carries no z-index (it must not cover the page's scrims)");
+  await React.act(async () => { row.click(); });
+  assert(raised(), "menu open: the aside is raised over the page");
+  await React.act(async () => { row.click(); });
+  assert(!raised(), "menu closed again: the aside drops back");
   await React.act(async () => { row.click(); });
   const dialog = host.querySelector("aside [role=dialog]");
   assert(dialog && (dialog.className as string).includes("bottom-full"), "the row opens the dialog above itself");
@@ -105,7 +112,7 @@ const rowTrigger = (host: Element) => host.querySelector("aside button[aria-hasp
 {
   const { host, done } = await mountApp({ ...base, signed_in: false });
   const footer = host.querySelector("aside [data-sidebar-footer]");
-  assert(footer?.textContent?.trim() === "Not signed in · read only", `signed-out footer text, got ${footer?.textContent}`);
+  assert(footer?.textContent?.trim() === "not signed in · read only", `signed-out footer text, got ${footer?.textContent}`);
   assert(!host.querySelector("[data-account-menu]"), "signed out: no account menu anywhere");
   done();
 }
