@@ -14,17 +14,14 @@ import {
   checkCampaignId,
   checkContent,
   friendlyCampaignError,
-  newRequestId,
   parseContentDoc,
   parseContentList,
   parseProposalList,
-  parseProposalRequest,
   parseRender,
   type CampaignBlock,
   type ContentDoc,
   type ContentRender,
   type ProposalDoc,
-  type ProposalRequestDoc,
 } from "./campaignGrammar";
 import { contentClient } from "./contentClient";
 import {
@@ -157,6 +154,7 @@ function CampaignList({
   const canWrite = viewer.operator && !viewer.readOnly;
   const [campaigns, setCampaigns] = useState<ContentDoc[]>([]);
   const [sends, setSends] = useState<SendListEntry[]>([]);
+  const [pendingDrafts, setPendingDrafts] = useState<ProposalDoc[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
@@ -176,6 +174,28 @@ function CampaignList({
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reloadToken]);
+
+  // CAD-1016: pending assistant drafts are discoverable here even when
+  // the campaign has no saved content yet — a scoped-chat assistant draft
+  // lands `pending` under a campaign_id the content list does not know.
+  // Proposals are scope-partitioned already; failure to load them is
+  // advisory and never blocks the saved-content list.
+  useEffect(() => {
+    if (scope.contextId === "" || !viewer.operator) return;
+    const controller = new AbortController();
+    contentClient
+      .proposalList(scope)
+      .then((value) => {
+        if (!controller.signal.aborted) {
+          setPendingDrafts(parseProposalList(value).filter((row) => row.state === "pending"));
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setPendingDrafts([]);
       });
     return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -348,6 +368,46 @@ function CampaignList({
           </table>
         </div>
       )}
+      {(() => {
+        // Campaigns that exist only as a pending assistant draft — no
+        // saved content yet. Opening one shows the proposal and its
+        // Visual/HTML/Text preview before Apply (source_revision 0
+        // creates revision 1); the missing saved-content 404 is the
+        // expected pending-only state, not an error.
+        const savedIds = new Set(campaigns.map((row) => row.campaignId));
+        const draftOnly = pendingDrafts.filter((row) => !savedIds.has(row.campaignId));
+        if (scope.contextId === "" || !viewer.operator || error !== null || draftOnly.length === 0) {
+          return null;
+        }
+        return (
+          <div className="card px-4 py-4 mt-4" data-pending-drafts>
+            <h4 className="text-cardtitle font-medium text-ink-100">
+              Assistant drafts awaiting review
+            </h4>
+            <p className="text-secondary text-ink-400">
+              A scoped-chat assistant turn drafted these campaigns. Nothing is saved until you
+              open one and Apply.
+            </p>
+            <ul className="grid gap-2 mt-2">
+              {draftOnly.map((proposal) => (
+                <li key={proposal.proposalId} className="flex items-center gap-3">
+                  <span className="text-ink-100 flex-1">
+                    {proposal.subject !== "" ? proposal.subject : <em>Untitled draft</em>}
+                    <span className="num text-micro text-ink-500"> · {proposal.campaignId}</span>
+                  </span>
+                  <button
+                    type="button"
+                    className="lnk"
+                    onClick={() => onSelect(proposal.campaignId)}
+                  >
+                    Review draft
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      })()}
     </section>
   );
 }
@@ -1859,12 +1919,6 @@ function CampaignWorkspace({
   const [proposalToken, setProposalToken] = useState(0);
   const [proposalError, setProposalError] = useState<string | null>(null);
   const [proposalNote, setProposalNote] = useState<string | null>(null);
-  // CAD-813: the minted request's host stamp, plus the bounded poll
-  // that watches for the assistant's turn to redeem it.
-  const [minted, setMinted] = useState<ProposalRequestDoc | null>(null);
-  const [mintPending, setMintPending] = useState(false);
-  const [mintWatching, setMintWatching] = useState(false);
-  const mintPoll = useRef<{ deadline: number; requestId: string } | null>(null);
 
   // The doc is the saved truth: editor follows a newly saved revision
   // (create, Apply) but never clobbers typing mid-draft. While editing,
@@ -1999,72 +2053,10 @@ function CampaignWorkspace({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [proposalsKey]);
 
-  // Bounded post-mint watch: after a proposal request lands, poll the
-  // list every 3s until the assistant's receipt names it, the request
-  // is spent, or two minutes pass — then stop. No busy loop, and the
-  // watch dies with the workspace.
-  useEffect(() => {
-    if (!mintWatching || minted === null) return;
-    const timer = setInterval(() => {
-      const watch = mintPoll.current;
-      if (watch === null || watch.requestId !== minted.requestId || Date.now() >= watch.deadline) {
-        setMintWatching(false);
-        return;
-      }
-      contentClient
-        .proposalList(scope)
-        .then((value) => {
-          const matched = parseProposalList(value).some(
-            (row) =>
-              row.campaignId === campaignId &&
-              row.assistantReceipt?.requestId === watch.requestId,
-          );
-          if (matched) {
-            mintPoll.current = null;
-            setMintWatching(false);
-            setProposalToken((count) => count + 1);
-            setProposalNote(
-              `Verified assistant draft landed for request ${watch.requestId} — review and Apply or Discard below.`,
-            );
-            return;
-          }
-          setProposalToken((count) => count + 1);
-        })
-        .catch(() => {
-          /* a transient read failure retries on the next tick */
-        });
-    }, 3000);
-    return () => clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mintWatching, minted?.requestId]);
-
-  // CAD-1013: the assistant can mint a request even before revision 1
-  // exists — the host stamps source_revision=0 and Apply creates the
-  // first revision, so the preview-first flow never strands creation.
-  const mintRequest = () => {
-    if (scopedChatMessage === null) return;
-    setMintPending(true);
-    setProposalError(null);
-    setProposalNote(null);
-    const requestId = newRequestId();
-    void contentClient
-      .proposalRequest(scope, {
-        campaignId,
-        messageId: scopedChatMessage,
-        requestId,
-      })
-      .then((value) => {
-        const request = parseProposalRequest(value);
-        setMinted(request);
-        mintPoll.current = { deadline: Date.now() + 120_000, requestId: request.requestId };
-        setMintWatching(true);
-        setProposalNote(
-          `Request ${request.requestId} minted against chat message ${request.messageId} — the assistant's next turn can attach one draft to it.`,
-        );
-      })
-      .catch((err: unknown) => setProposalError(friendlyCampaignError(err)))
-      .finally(() => setMintPending(false));
-  };
+  // CAD-1016: no manual proposal-request mint — an ordinary scoped chat
+  // message invokes the CAD-1014 assistant-draft turn, which lands an
+  // inert `pending` proposal on this campaign. The drafts list below
+  // refreshes to surface it; there is no request id to mint or poll.
 
   const grammarBlocks = (): CampaignBlock[] => blocksToGrammar(blocks);
 
@@ -2674,42 +2666,10 @@ function CampaignWorkspace({
             </p>
           )}
           {canWrite && (
-            <div className="grid gap-2" data-assistant-mint>
-              <div className="crm-toolbar">
-                <Button
-                  size="sm"
-                  variant="primary"
-                  loading={mintPending}
-                  disabled={mintPending || scopedChatMessage === null}
-                  title={
-                    scopedChatMessage === null
-                      ? "Send the assistant a message in the left chat first"
-                      : `Mint a one-time proposal request on chat message ${scopedChatMessage}`
-                  }
-                  onClick={mintRequest}
-                >
-                  Ask assistant to draft
-                </Button>
-                {scopedChatMessage === null && (
-                  <span className="text-label text-ink-500" data-mint-hint>
-                    Send the assistant a message in the left chat first
-                  </span>
-                )}
-                {mintWatching && (
-                  <span className="text-label text-ink-400" role="status" data-mint-watching>
-                    Watching for the assistant's draft…
-                  </span>
-                )}
-              </div>
-              {minted !== null && (
-                <p className="num text-micro text-ink-500" data-minted-request>
-                  Request {minted.requestId} · campaign {minted.campaignId} · stamped source r
-                  {minted.sourceRevision} · draft r{doc === null ? 0 : doc.revision} ·{" "}
-                  {minted.state === "open" ? "awaiting the assistant's turn" : minted.state}
-                  {minted.usedBy !== null ? ` by ${minted.usedBy}` : ""}
-                </p>
-              )}
-            </div>
+            <p className="text-label text-ink-500" data-assistant-hint>
+              Ask the assistant in the left chat to draft this email — its
+              proposal appears below for review.
+            </p>
           )}
           {proposals.filter((row) => row.state === "pending").length === 0 ? (
             <p className="text-label text-ink-400" data-empty="proposals">
@@ -3172,6 +3132,11 @@ function CampaignDetail({
   const [doc, setDoc] = useState<ContentDoc | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // CAD-1016: a campaign that exists only as a pending assistant draft
+  // has no saved content — the show 404 is the expected pending-only
+  // state, not an error. True when a pending proposal names this
+  // campaign and the saved content reads back absent.
+  const [pendingOnly, setPendingOnly] = useState(false);
   const [pick, setPick] = useState<AudiencePick>({ base: { mode: "all" }, exclusionListId: null });
   const [, setAudiencePreview] = useState<AudiencePreview | null>(null);
   const [freezeId, setFreezeId] = useState(`${campaignId}-freeze-1`);
@@ -3194,13 +3159,34 @@ function CampaignDetail({
     const controller = new AbortController();
     setLoading(true);
     setError(null);
+    setPendingOnly(false);
     contentClient
       .show(scope, campaignId)
       .then((value) => {
         if (!controller.signal.aborted) setDoc(parseContentDoc(value));
       })
       .catch((e: unknown) => {
-        if (!controller.signal.aborted) setError(friendlyCampaignError(e));
+        if (controller.signal.aborted) return;
+        // A missing saved content doc is the expected pending-only state
+        // when an assistant draft names this campaign — check before
+        // surfacing it as an error.
+        if (e instanceof ApiError && e.status === 404) {
+          contentClient
+            .proposalList(scope)
+            .then((value) => {
+              if (controller.signal.aborted) return;
+              const hasPending = parseProposalList(value).some(
+                (row) => row.campaignId === campaignId && row.state === "pending",
+              );
+              setPendingOnly(hasPending);
+              if (!hasPending) setError(friendlyCampaignError(e));
+            })
+            .catch(() => {
+              if (!controller.signal.aborted) setError(friendlyCampaignError(e));
+            });
+        } else {
+          setError(friendlyCampaignError(e));
+        }
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
@@ -3283,8 +3269,14 @@ function CampaignDetail({
           </button>
         </p>
       )}
-      {!loading && error === null && doc !== null && (
+      {!loading && error === null && (doc !== null || pendingOnly) && (
         <>
+          {pendingOnly && doc === null && (
+            <p className="card px-4 py-3 text-label text-ink-300" data-pending-only>
+              This campaign exists only as a pending assistant draft — no content is saved yet.
+              Review it below and Apply to save the first revision, or Discard it.
+            </p>
+          )}
           <CampaignWorkspace
             scope={scope}
             scopedChatMessage={scopedChatMessage}
