@@ -70,7 +70,10 @@ pub(super) fn frame_route(path: &str) -> Option<&str> {
 /// presents no session cookie for its origin — refused upstream by the
 /// daemon's check either way. Used ONLY by the mint POST; the frame GET
 /// relays nothing (the nonce is its sole authority).
-fn request_credentials(request: &Request, opts: &ServeOpts) -> Option<(String, String, &'static str)> {
+fn request_credentials(
+    request: &Request,
+    opts: &ServeOpts,
+) -> Option<(String, String, &'static str)> {
     let origin = operator::request_origin_kind(request, opts)?;
     let token = operator::session_token_for(request, opts, origin)?;
     let key = super::header_value(request, operator::SESSION_HEADER).unwrap_or_default();
@@ -130,11 +133,7 @@ pub(super) fn frame(
     opts: &ServeOpts,
     nonce: &str,
 ) -> HttpResp {
-    let out = match client::rpc(
-        state_dir,
-        "app_screen_consume",
-        json!({"nonce": nonce}),
-    ) {
+    let out = match client::rpc(state_dir, "app_screen_consume", json!({"nonce": nonce})) {
         Ok(v) => v,
         Err(e) => {
             let msg = e.to_string();
@@ -218,11 +217,52 @@ fn board_origin(request: &Request, opts: &ServeOpts) -> String {
 
 /// The canonical origin for a classified request origin — pure, so the
 /// per-class resolution is unit-testable without a live `Request`.
+/// A fresh 128-bit CSP nonce, base64url no-pad — one per document.
+fn fresh_csp_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("getrandom");
+    b64url(&bytes)
+}
+
+fn b64url(bytes: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(T[((n >> 6) & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(T[(n & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Monotonic mount generation for this board process — defense in depth
+/// behind the nonce so a replayed mint never reuses a mount identity.
+fn next_generation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static GEN: AtomicU64 = AtomicU64::new(1);
+    GEN.fetch_add(1, Ordering::SeqCst)
+}
+
 fn origin_for(class: Option<Origin>, opts: &ServeOpts) -> String {
     match class {
         Some(Origin::Public) => match &opts.public {
             Some(public) => {
-                format!("{}://{}", operator::public_scheme(&public.host), public.host)
+                format!(
+                    "{}://{}",
+                    operator::public_scheme(&public.host),
+                    public.host
+                )
             }
             None => format!("http://{}", operator::board_host(opts.port)),
         },
@@ -292,37 +332,4 @@ mod tests {
             format!("http://{}", operator::board_host(8080))
         );
     }
-}
-
-/// A fresh 128-bit CSP nonce, base64url no-pad — one per document.
-fn fresh_csp_nonce() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("getrandom");
-    b64url(&bytes)
-}
-
-fn b64url(bytes: &[u8]) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity((bytes.len() * 4 + 2) / 3);
-    for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(T[((n >> 18) & 63) as usize] as char);
-        out.push(T[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(T[((n >> 6) & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(T[(n & 63) as usize] as char);
-        }
-    }
-    out
-}
-
-/// Monotonic mount generation for this board process — defense in depth
-/// behind the nonce so a replayed mint never reuses a mount identity.
-fn next_generation() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static GEN: AtomicU64 = AtomicU64::new(1);
-    GEN.fetch_add(1, Ordering::SeqCst)
 }

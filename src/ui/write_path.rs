@@ -14,9 +14,9 @@ use tiny_http::{Header, Method, Request, Response, StatusCode};
 use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
-    app_audiences, app_content, app_contexts, app_records, app_release, app_runs, app_screens, apps,
-    connections, crm_send, crm_smtp, home, lane, operator, read_model, social_publish, stages,
-    threads, updates, wiki, workflows,
+    app_audiences, app_content, app_contexts, app_records, app_release, app_runs, app_screens,
+    apps, connections, crm_send, crm_smtp, home, lane, operator, read_model, social_publish,
+    stages, threads, updates, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;

@@ -392,7 +392,7 @@ fn cad779_receipt_write_failure_cannot_leave_imported_rows() {
 
     assert!(
         store
-            .app_record_csv_import("ctx-1", csv, token, "req-receipt-failure", None)
+            .app_record_csv_import("ctx-1", csv, token, "req-receipt-failure", None, None)
             .is_err(),
         "an import without a durable receipt was accepted"
     );
@@ -430,14 +430,14 @@ fn cad779_csv_receipt_state_column_migrates_older_files() {
     let preview = store.app_record_csv_preview("ctx-1", csv).unwrap();
     let token = preview["preview_token"].as_str().unwrap();
     let imported = store
-        .app_record_csv_import("ctx-1", csv, token, "req-migrated", None)
+        .app_record_csv_import("ctx-1", csv, token, "req-migrated", None, None)
         .unwrap();
     assert_eq!(
         imported["summary"],
         json!({"applied": 1, "skipped": 0, "failed": 0})
     );
     let replayed = store
-        .app_record_csv_import("ctx-1", csv, token, "req-migrated", None)
+        .app_record_csv_import("ctx-1", csv, token, "req-migrated", None, None)
         .unwrap();
     assert_eq!(replayed["replayed"], true);
 }
@@ -460,10 +460,11 @@ fn cad779_invalid_csv_decision_does_not_reserve_request_id() {
                 action: CsvAction::Update,
                 expected_revision: Some(1),
             }]),
+            None,
         )
         .is_err());
     let imported = store
-        .app_record_csv_import("ctx-1", csv, token, "req-decision", None)
+        .app_record_csv_import("ctx-1", csv, token, "req-decision", None, None)
         .unwrap();
     assert_eq!(imported["summary"]["applied"], 1);
 }

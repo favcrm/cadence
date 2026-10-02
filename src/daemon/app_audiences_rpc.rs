@@ -21,7 +21,7 @@ use crate::issue::app_catalog::workspace;
 use crate::store::app_audiences::{AudienceBase, Predicate};
 use crate::store::app_records::RecordStore;
 
-fn audience_predicates(params: &Value) -> Result<Vec<Predicate>> {
+pub(super) fn audience_predicates(params: &Value) -> Result<Vec<Predicate>> {
     let list = params
         .get("predicates")
         .and_then(Value::as_array)
@@ -51,7 +51,7 @@ fn audience_predicates(params: &Value) -> Result<Vec<Predicate>> {
     Ok(predicates)
 }
 
-fn audience_name(params: &Value) -> Result<String> {
+pub(super) fn audience_name(params: &Value) -> Result<String> {
     let name = required_str(params, "name")?;
     if name.is_empty()
         || name.len() > crate::store::app_audiences::SEGMENT_NAME_BYTES
@@ -108,7 +108,7 @@ fn audience_members(params: &Value) -> Result<Vec<String>> {
     Ok(members)
 }
 
-fn audience_expected(params: &Value) -> Result<Option<i64>> {
+pub(super) fn audience_expected(params: &Value) -> Result<Option<i64>> {
     match params.get("expected_revision") {
         None => Ok(None),
         Some(Value::Number(number)) => Ok(Some(

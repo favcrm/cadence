@@ -56,7 +56,7 @@ fn record_list_scope(params: &Value) -> Result<(Option<String>, i64, Option<Stri
     Ok((query, limit, cursor))
 }
 
-fn csv_text(params: &Value) -> Result<String> {
+pub(super) fn csv_text(params: &Value) -> Result<String> {
     let text = required_str(params, "csv_text")?;
     if text.is_empty() || text.len() > crate::store::app_records::CSV_TEXT_BYTES {
         return Err(Error::rejected("customer CSV exceeds its size bound"));
@@ -64,7 +64,7 @@ fn csv_text(params: &Value) -> Result<String> {
     Ok(text.to_string())
 }
 
-fn csv_decisions(params: &Value) -> Result<Option<Vec<CsvDecision>>> {
+pub(super) fn csv_decisions(params: &Value) -> Result<Option<Vec<CsvDecision>>> {
     let Some(list) = params.get("decisions") else {
         return Ok(None);
     };
@@ -151,6 +151,15 @@ impl Shared {
                 "request_id",
                 "decisions",
             ],
+            "app_record_csv_confirm" => &[
+                "install_id",
+                "context_id",
+                "preview_token",
+                "request_id",
+                "decisions_digest",
+                "csv_text",
+                "decisions",
+            ],
             _ => return Err(Error::rejected("unknown app record method")),
         };
         let fields = params
@@ -165,7 +174,10 @@ impl Shared {
         let pm = self.pm_at(&self.pm_dir()?)?;
         let write = matches!(
             method,
-            "app_record_create" | "app_record_update" | "app_record_csv_import"
+            "app_record_create"
+                | "app_record_update"
+                | "app_record_csv_import"
+                | "app_record_csv_confirm"
         );
         // The installation snapshot and (for writes) the live context
         // proof come from core; the record file opens after, in
@@ -207,6 +219,24 @@ impl Shared {
                 required_str(params, "preview_token")?,
                 required_str(params, "request_id")?,
                 csv_decisions(params)?,
+                // The operator's own direct import needs no confirm —
+                // the operator connection IS the authority; the
+                // confirm receipt exists only for the delegated agent.
+                None,
+            ),
+            // CAD-1014: the operator's explicit confirm of the exact
+            // byte-bound plan — mints the host-held one-use nonce the
+            // assistant import redeems. `decisions_digest` is the
+            // material digest of the confirmed decisions array
+            // (`sha256:`); the confirm binds token + scope + request +
+            // decisions, never agent text.
+            "app_record_csv_confirm" => records.app_record_csv_confirm(
+                context,
+                required_str(params, "request_id")?,
+                required_str(params, "preview_token")?,
+                required_str(params, "decisions_digest")?,
+                &csv_text(params)?,
+                params.get("decisions").unwrap_or(&Value::Null),
             ),
             _ => Err(Error::rejected("unknown app record method")),
         }?;

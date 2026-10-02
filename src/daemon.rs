@@ -2951,7 +2951,31 @@ impl Shared {
             "app_record_update" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_preview" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_import" => self.rpc_app_record(method, params, peer_pid),
+            "app_record_csv_confirm" => self.rpc_app_record(method, params, peer_pid),
             "app_segment_save" => self.rpc_app_audience(method, params, peer_pid),
+            "app_record_csv_assistant_import" => {
+                self.rpc_app_record_csv_assistant_import(params, peer_pid)
+            }
+            "app_segment_assistant_save" => self.rpc_app_segment_assistant_save(params, peer_pid),
+            // Scoped-chat reads — data exposes, never mutations; the
+            // same verified-turn gate, no claim (a read doesn't spend).
+            // One handler routes each to its store call. Each method is
+            // its own `=>` arm on ONE line: the caller-rule method-table
+            // parser scans per-arm lines for the `"name" =>` shape.
+            "app_segment_assistant_list" => self.rpc_app_assistant_read(method, params, peer_pid),
+            "app_segment_assistant_show" => self.rpc_app_assistant_read(method, params, peer_pid),
+            "app_record_csv_assistant_preview" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
+            "app_segment_assistant_preview" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
+            "app_content_assistant_proposals" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
+            "app_content_assistant_proposal_show" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
             "app_segment_show" => self.rpc_app_audience(method, params, peer_pid),
             "app_segment_list" => self.rpc_app_audience(method, params, peer_pid),
             "app_exclusion_save" => self.rpc_app_audience(method, params, peer_pid),
@@ -2975,7 +2999,9 @@ impl Shared {
             "app_content_assistant_propose" => {
                 self.rpc_app_content_assistant_propose(params, peer_pid)
             }
+            "app_content_assistant_draft" => self.rpc_app_content_assistant_draft(params, peer_pid),
             "app_content_proposal_show" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_render" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_list" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_apply" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_discard" => self.rpc_app_content(method, params, peer_pid),

@@ -106,13 +106,16 @@ pub fn tags_in(files: &BTreeMap<String, String>) -> Result<Vec<String>> {
 /// present with its sha256+size. Any refusal aborts the whole mount.
 pub fn extract(files: &BTreeMap<String, String>, tag: &str) -> Result<ScreenPackage> {
     if !valid_tag(tag) {
-        return Err(Error::rejected(format!("screen tag {tag:?} is not a valid tag")));
+        return Err(Error::rejected(format!(
+            "screen tag {tag:?} is not a valid tag"
+        )));
     }
     let prefix = format!("{SCREENS_DIR}/{tag}/");
     let manifest_key = format!("{prefix}{SCREEN_MANIFEST}");
-    let manifest = files.get(&manifest_key).cloned().ok_or_else(|| {
-        Error::rejected(format!("installation has no screen package '{tag}'"))
-    })?;
+    let manifest = files
+        .get(&manifest_key)
+        .cloned()
+        .ok_or_else(|| Error::rejected(format!("installation has no screen package '{tag}'")))?;
     // Collect the leaf assets for this tag — every other member under
     // the prefix. The declaration decides which leaves are admitted;
     // an undeclared leaf present in the live tree refuses via the
@@ -136,9 +139,8 @@ pub fn extract(files: &BTreeMap<String, String>, tag: &str) -> Result<ScreenPack
         }
         assets.insert(rest.to_string(), text.clone());
     }
-    let checked = app_screen_decl::validate_map(&manifest, &assets).map_err(|e| {
-        Error::rejected(format!("screen package '{tag}' failed integrity: {e}"))
-    })?;
+    let checked = app_screen_decl::validate_map(&manifest, &assets)
+        .map_err(|e| Error::rejected(format!("screen package '{tag}' failed integrity: {e}")))?;
     Ok(ScreenPackage {
         tag: tag.to_string(),
         manifest,
@@ -193,7 +195,11 @@ mod tests {
         let js = "console.log('x');";
         let css = "body{}";
         let decl = decl(&[("client.js", js), ("styles.css", css)]);
-        let files = bundle_with("day-cards", &decl, &[("client.js", js), ("styles.css", css)]);
+        let files = bundle_with(
+            "day-cards",
+            &decl,
+            &[("client.js", js), ("styles.css", css)],
+        );
         let pkg = extract(&files, "day-cards").unwrap();
         assert_eq!(pkg.tag, "day-cards");
         assert_eq!(pkg.app, "crm");
@@ -207,7 +213,7 @@ mod tests {
         let decl = decl(&[("client.js", js)]);
         // No screens.json.
         let mut files = BTreeMap::new();
-        files.insert(format!("screens/a/client.js"), js.to_string());
+        files.insert("screens/a/client.js".to_string(), js.to_string());
         assert!(extract(&files, "a").is_err());
         // Tampered asset body (declared hash is for different bytes).
         let files = bundle_with("a", &decl, &[("client.js", "tampered")]);

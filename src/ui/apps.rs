@@ -204,9 +204,7 @@ impl<'de> Deserialize<'de> for UpgradeWire {
                         return Err(serde::de::Error::unknown_field(&key, ALLOWED));
                     }
                     if !seen.insert(key.clone()) {
-                        return Err(serde::de::Error::custom(format!(
-                            "duplicate field '{key}'"
-                        )));
+                        return Err(serde::de::Error::custom(format!("duplicate field '{key}'")));
                     }
                     match key.as_str() {
                         "files" => {
@@ -282,8 +280,7 @@ fn upload_path_ok(path: &str) -> bool {
         // tag-named package dir holding `screens.json` or a
         // `<stem>.<js|css|svg|json>` leaf per the validator grammar.
         ["screens", tag, leaf] => {
-            crate::issue::model::valid_tag(tag)
-                && crate::issue::app_screen_pkg::leaf_ok(leaf)
+            crate::issue::model::valid_tag(tag) && crate::issue::app_screen_pkg::leaf_ok(leaf)
         }
         _ => false,
     }
@@ -405,7 +402,12 @@ fn workspace_upgrade_transport(
         ));
     }
     let expected: &[&str] = if method == "app_workspace_upgrade" {
-        &["expected_digest", "expected_generation", "expected_new_digest", "request_id"]
+        &[
+            "expected_digest",
+            "expected_generation",
+            "expected_new_digest",
+            "request_id",
+        ]
     } else {
         &["expected_digest", "expected_generation"]
     };
@@ -418,7 +420,10 @@ fn workspace_upgrade_transport(
                 .is_none_or(str::is_empty)
         })
     {
-        return Err(err_response(400, "upgrade body has missing or unsupported fields"));
+        return Err(err_response(
+            400,
+            "upgrade body has missing or unsupported fields",
+        ));
     }
     if let Some(files) = files {
         // `{files}` mode — server-derived `source` via secure staging.
@@ -452,7 +457,10 @@ fn workspace_upgrade_transport(
         // unchanged; no staging, the daemon re-checks it natively.
         let source = source.unwrap();
         if source.as_str().map(str::is_empty).unwrap_or(true) {
-            return Err(err_response(400, "upgrade source must be a non-empty string"));
+            return Err(err_response(
+                400,
+                "upgrade source must be a non-empty string",
+            ));
         }
         let mut params = Value::Object(fields);
         params["source"] = source;
@@ -1014,11 +1022,10 @@ pub(super) fn workspace(
             Some(id) => id,
             None => return err_response(400, "upgrade needs an installation id"),
         };
-        let (params, staging) =
-            match workspace_upgrade_transport(method, id, wire) {
-                Ok(pair) => pair,
-                Err(resp) => return resp,
-            };
+        let (params, staging) = match workspace_upgrade_transport(method, id, wire) {
+            Ok(pair) => pair,
+            Err(resp) => return resp,
+        };
         _upgrade_staging = staging;
         params
     } else if method == "app_workspace_upgrade_recover" {
