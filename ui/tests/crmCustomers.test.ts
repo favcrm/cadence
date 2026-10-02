@@ -344,8 +344,10 @@ assert(!location.search.includes("beta-two"), "no customer content in the URL");
 await React.act(async () => {
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
 });
-await flush();
-assert(!host.querySelector('[data-drawer="customer"]'), "Escape closes the drawer");
+// CAD-1013: Escape now plays the close transition and unmounts on
+// transitionend (or the reduced-motion/timer fallback) — wait for the
+// deferred unmount rather than a single synchronous frame.
+await settle(() => assert(!host.querySelector('[data-drawer="customer"]'), "Escape closes the drawer"));
 assert(!location.search.includes("record="), "closing clears the record scope");
 
 // New customer: invalid email blocks before the wire; valid posts exact grammar.
