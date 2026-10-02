@@ -46,7 +46,10 @@ pub(crate) struct ScreenCap {
     pub install_id: String,
     pub digest: String,
     pub tag: String,
-    /// Verified minting session display id (server-resolved at mint).
+    /// Verified minting session's FULL credential hash (server-resolved
+    /// at mint) — the cap's internal binding. Never the 8-hex display
+    /// prefix, so a surviving prefix-colliding row cannot keep a revoked
+    /// mint's cap live. Internal only — never rendered or transmitted.
     pub session: String,
     /// Host mount counter for this install — a superseded mount's mint
     /// is refused at consume.
@@ -94,12 +97,13 @@ fn nonce_ok(nonce: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// A session display id is bounded — the 8-hex `SessionView.id`. Refuse
-/// anything else before trusting it as a comparison key.
-fn session_id_ok(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+/// A stored minting-session hash is exactly a `sha256(token)` — 64
+/// lowercase hex. Refuse anything else before trusting it as a key.
+fn session_hash_ok(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl Shared {
@@ -111,32 +115,50 @@ impl Shared {
     /// is absent, dead, revoked or malformed — never an error, so a
     /// lookup failure is indistinguishable from "no such session" and
     /// fails closed. The token is used only inside `Auth`, never stored.
+    /// Resolve the request's real session bearer credential to a
+    /// `(session, view)` pair: `session` is the verified row's FULL
+    /// credential hash — the internal value the cap binds to (never the
+    /// 8-hex display id, so a prefix collision with a surviving row
+    /// cannot keep a revoked mint's cap live) — and `view` the public
+    /// `SessionView` for the public-role check. Returns `None` when the
+    /// credential is absent, dead, revoked or malformed. The token/key
+    /// are consumed by `Auth` only — never stored here.
     fn session_for_credential(
         &self,
         token: &str,
         key: &str,
         origin: Origin,
-    ) -> Option<crate::operator_auth::SessionView> {
+    ) -> Option<(String, crate::operator_auth::SessionView)> {
         let now = self.operator_now();
         let mut auth = self.operator_auth();
-        match origin {
+        let hash = match origin {
+            Origin::Public => auth.public_session_hash(token, now),
+            _ => auth.session_hash(token, key, origin, now),
+        }
+        .ok()
+        .flatten()?;
+        // The same verified lookup for the public-role surface.
+        let view = match origin {
             Origin::Public => auth.check_public(token, now),
             _ => auth.check(token, key, origin, now),
         }
         .ok()
-        .flatten()
+        .flatten()?;
+        Some((hash, view))
     }
 
-    /// Whether `session_id` is still a live session — re-verified in
-    /// `Auth` at consume so a revoke between mint and consume kills the
-    /// cap. Fail-closed on any lookup error.
-    fn session_id_live(&self, session_id: &str) -> bool {
-        if !session_id_ok(session_id) {
+    /// Whether the minting session is still live — re-verified in `Auth`
+    /// at consume so a revoke between mint and consume kills the cap.
+    /// `session_hash` is the cap's stored FULL credential hash; a
+    /// different row sharing the 8-hex display prefix does not satisfy
+    /// it. Fail-closed on any lookup error.
+    fn session_id_live(&self, session_hash: &str) -> bool {
+        if !session_hash_ok(session_hash) {
             return false;
         }
         let now = self.operator_now();
         let mut auth = self.operator_auth();
-        auth.live_session_id(session_id, now).unwrap_or(false)
+        auth.live_hash(session_hash, now).unwrap_or(false)
     }
 
     /// Rolling-window mint-rate check for one verified session. Sweeps
@@ -220,7 +242,7 @@ impl Shared {
         // Verify the real credential natively; on the public surface the
         // session must also carry the operator role — a public `member`
         // session never mounts a screen.
-        let view = self
+        let (session, view) = self
             .session_for_credential(token, key, origin)
             .ok_or_else(|| {
                 Error::rejected("screen mint needs a live operator session — sign in again")
@@ -236,8 +258,8 @@ impl Shared {
                 ));
             }
         }
-        let session = view.id;
-        // Bounded mint-rate gate BEFORE the expensive live digest/approval/
+        // `session` is the verified row's full credential hash — the
+        // cap's internal binding. Bounded mint-rate gate BEFORE the expensive live digest/approval/
         // package re-proof — the caller is a proven operator + verified
         // session, so this cheap bound is what an abusive caller hits first.
         self.check_mint_rate(&session)?;
