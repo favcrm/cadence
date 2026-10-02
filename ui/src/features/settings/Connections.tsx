@@ -49,7 +49,27 @@ const ENROLL_ERROR: Record<string, string> = {
     "This provider is not registered for enrollment. Choose a provider from the list, then retry.",
   scope_not_reviewed:
     "A declared scope is not reviewed for this provider. Keep only the reviewed scopes, then retry.",
+  // CAD-1014 backend (52a2a7d0): the daemon's stable enrollment codes.
+  custody_unprotected:
+    "The daemon could not store this credential under its protection. Choose 'I understand…' in Advanced only if you accept that risk, then retry — nothing was saved.",
+  revision_conflict:
+    "This connection changed since you opened the form. Reload the page, then retry — your credential was not saved.",
 };
+
+/**
+ * CAD-1013: the scopes an SMTP sender must enroll — exactly the reviewed
+ * send-capability scopes on the provider descriptor, never the union of
+ * every provider permission. Falls back to the reviewed-union hint only
+ * when no send capability is declared (kept narrow, still reviewed).
+ */
+function smtpRequiredScopes(provider: ConnectionProvider | null): string[] {
+  const caps = provider?.descriptor?.capabilities ?? [];
+  const send = caps.filter((c) => c.effect === "send");
+  const source = send.length > 0 ? send : caps;
+  const seen = new Set<string>();
+  for (const cap of source) for (const scope of cap.scopes ?? []) seen.add(scope);
+  return [...seen].sort();
+}
 
 function enrollErrorMessage(e: unknown): string {
   const err = e instanceof ApiError ? e : null;
@@ -653,6 +673,7 @@ function AddConnection({
   const [scopes, setScopes] = useState("");
   const [token, setToken] = useState("");
   const [acceptRisk, setAcceptRisk] = useState(false);
+  const [riskNeeded, setRiskNeeded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const chosen = providers.find((p) => p.provider === provider) ?? null;
@@ -665,12 +686,12 @@ function AddConnection({
   const submit = () => {
     if (busy) return;
     const cleanedAccount = account.trim();
-    // CAD-1013 SMTP simplification: an SMTP sender enrolls exactly its
-    // provider's reviewed scopes — they are not operator-typed grants, so
-    // the form derives them instead of asking. Token providers still
-    // take an explicit scope list.
+    // CAD-1013 SMTP simplification: an SMTP sender enrolls exactly the
+    // send capability's reviewed scope — not operator-typed, and never
+    // the union of every provider permission. Token providers still take
+    // an explicit scope list.
     const wanted = smtpShape
-      ? hint
+      ? smtpRequiredScopes(chosen)
       : scopes.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
     if (!provider || cleanedAccount === "" || wanted.length === 0) {
       setError(
@@ -712,7 +733,13 @@ function AddConnection({
           ...(acceptRisk ? { accept_same_uid_risk: true } : {}),
         })
         .then((out) => onAdded(out.connection.id))
-        .catch((e: ApiError) => setError(e.message ?? String(e)))
+        // CAD-1013: typed-code safe reason — never the raw downstream
+        // message, which can echo the SMTP host/password just typed.
+        // custody_unprotected surfaces the risk toggle near Save.
+        .catch((e: ApiError) => {
+          setRiskNeeded(e instanceof ApiError && e.code === "custody_unprotected");
+          setError(enrollErrorMessage(e));
+        })
         .finally(() => {
           // The password crossed this one request into daemon
           // custody. It must not survive in the form, whatever the
@@ -739,7 +766,10 @@ function AddConnection({
       })
       .then((out) => onAdded(out.connection.id))
       // CAD-1013: typed-code safe reason — never raw downstream text.
-      .catch((e: ApiError) => setError(enrollErrorMessage(e)))
+      .catch((e: ApiError) => {
+        setRiskNeeded(e instanceof ApiError && e.code === "custody_unprotected");
+        setError(enrollErrorMessage(e));
+      })
       .finally(() => {
         // The credential crossed this one request into daemon custody.
         // It must not survive in the form, whatever the outcome.
@@ -991,6 +1021,13 @@ function AddConnection({
           {error && (
             <p className="text-label text-fail break-words" role="alert">
               {error}
+            </p>
+          )}
+          {riskNeeded && !acceptRisk && (
+            <p className="text-label text-warn break-words" data-risk-needed>
+              The daemon reports this credential is stored unprotected. To save it anyway,
+              open <strong>Advanced: custody risk acceptance</strong> above and check the box —
+              it is never pre-selected.
             </p>
           )}
           <div className="flex flex-wrap gap-2">
