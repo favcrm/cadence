@@ -26,9 +26,11 @@ import { assertCleanBody, assertScope, listPath, type HostScope } from "./hostAc
 const PREVIEW_KEYS = ["csv_text"] as const;
 const IMPORT_KEYS = ["csv_text", "preview_token", "request_id", "decisions"] as const;
 // CAD-1016: the operator's explicit confirm of the byte-bound previewed
-// plan — mints the one-use confirm receipt the assistant import redeems.
-// Strict body: only the three bound ids, never credentials or scope.
-const CONFIRM_KEYS = ["request_id", "preview_token", "decisions_digest"] as const;
+// plan — mints the durable intent the assistant import redeems. The body
+// carries the exact CSV + the reviewed decisions so the host can store
+// the immutable plan; the agent never carries bytes. Strict keys — never
+// credentials or scope.
+const CONFIRM_KEYS = ["request_id", "preview_token", "decisions_digest", "csv_text", "decisions"] as const;
 
 /** The daemon's bounds for this surface (CSV_TEXT_BYTES / CSV_ROWS_MAX /
  *  body caps): refuse early, before the wire. */
@@ -319,19 +321,23 @@ export const csvActions = {
   },
 
   /** `POST …/records/csv-confirm` — the operator's explicit, host-side
-   *  confirm of the exact previewed plan. Mints the one-use
+   *  confirm of the exact previewed plan. Mints the durable intent: the
+   *  host stores `csv_text` + the reviewed `decisions` bound to the byte
+   *  token + request id + decisions digest, and returns the one-use
    *  `confirm_token` nonce the agent's scoped turn redeems via
-   *  csv-assistant-import. `decisionsDigest` is the material digest the
-   *  daemon recomputes over its own normalized decisions — a mismatch
-   *  refuses, so a confirmed plan can never drift from what the
-   *  assistant applies. Writes nothing to records itself. */
+   *  csv-assistant-import. The bytes never ride the text-only chat — the
+   *  agent resolves the plan by request id + nonce. `decisions` is the
+   *  wire `[{row, action, expected_revision?}]` the daemon re-digests. */
   async confirm(
     scope: HostScope,
+    csvText: string,
     previewToken: string,
     requestId: string,
     decisionsDigest: string,
+    decisions?: { row: number; action: string; expected_revision?: number }[],
   ): Promise<CsvConfirmReceipt> {
     assertScope(scope);
+    checkCsvText(csvText);
     if (!TOKEN_PATTERN.test(previewToken)) {
       throw new ApiError("the CSV preview token is missing or malformed — preview again", 400);
     }
@@ -345,7 +351,31 @@ export const csvActions = {
       request_id: requestId,
       preview_token: previewToken,
       decisions_digest: decisionsDigest,
+      csv_text: csvText,
     };
+    if (decisions !== undefined) {
+      if (decisions.length === 0 || decisions.length > CSV_MAX_ROWS) {
+        throw new ApiError("the CSV decisions are out of bounds", 400);
+      }
+      const seen = new Set<number>();
+      body.decisions = decisions.map((item) => {
+        if (!Number.isInteger(item.row) || item.row < 1 || seen.has(item.row)) {
+          throw new ApiError("a CSV decision targets an unknown or repeated row", 400);
+        }
+        seen.add(item.row);
+        if (!["create", "update", "skip"].includes(item.action)) {
+          throw new ApiError("a CSV decision names an unknown action", 400);
+        }
+        const entry: Record<string, unknown> = { row: item.row, action: item.action };
+        if (item.expected_revision !== undefined) {
+          if (!Number.isInteger(item.expected_revision) || item.expected_revision < 1) {
+            throw new ApiError("a CSV decision carries a malformed expected revision", 400);
+          }
+          entry.expected_revision = item.expected_revision;
+        }
+        return entry;
+      });
+    }
     assertCleanBody(body, CONFIRM_KEYS);
     const value = await post<Record<string, unknown>>(`${listPath(scope)}/csv-confirm`, body);
     if (typeof value.confirm_token !== "string" || typeof value.request_id !== "string") {

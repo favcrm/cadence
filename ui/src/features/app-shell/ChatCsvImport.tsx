@@ -20,28 +20,21 @@ import { friendlyError, viewProfile } from "./customerProfile";
 import type { HostScope } from "./hostActions";
 
 /**
- * The chat-bounded CSV import (CAD-1016): a small pasted customer list is
+ * The chat-bounded CSV import (CAD-1016): a pasted customer list is
  * previewed read-only into an exact create/update/skip/error plan; the
  * operator reviews the rows, resolves `needs_revision`, then Confirms.
- * The confirm mints the host-held one-use `confirm_token` (`csv-confirm`,
- * bound to the byte token + request id + decisions digest — never agent
- * text) and hands the immutable import intent to the next scoped agent
- * turn as a scoped chat message. The agent's turn then redeems the
- * receipt via `csv-assistant-import` — the operator's own connection is
- * the only thing that can confirm; a scoped message alone is not consent.
- *
- * The intent rides the bounded chat message: total serialized size is
- * checked against the real message bound before the confirm is even
- * minted — a list that does not fit is refused up front with a clear
- * message, never silently truncated. No token is ever shown to copy, no
- * CLI is run by the user, and the CSV/decisions never reach a log or an
- * error string. Cancel writes nothing.
+ * The confirm stores the durable plan host-side (`csv-confirm` carries the
+ * exact CSV bytes + the reviewed decisions, bound to the byte token +
+ * request id + decisions digest) and returns the one-use `confirm_token`.
+ * The scoped chat message then carries ONLY `{cadence_csv_import:
+ * {request_id, confirm_token}}` — the agent's next turn resolves the
+ * stored plan by that pair and redeems it via `csv-assistant-import`.
+ * The CSV bytes and decisions never ride the text-only message, so no
+ * size bound on the paste is needed beyond the daemon's own CSV cap, and
+ * a plan can never be substituted for one the operator did not confirm.
+ * No token is ever shown to copy, no CLI is run by the user, and the
+ * CSV/decisions never reach a log or an error string. Cancel writes nothing.
  */
-
-/** The serialized scoped-message bound — the chat transport's text cap
- *  minus the envelope + scope field headroom. A paste whose intent will
- *  not fit under this is refused before the confirm is minted. */
-const CHAT_INTENT_MAX_BYTES = 40 * 1024;
 
 const CSV_HINT =
   "record_id,display_name,email,phone,tags,source,consent_email,consent_sms,expected_revision";
@@ -53,15 +46,12 @@ export default function ChatCsvImport({
 }: {
   scope: HostScope;
   canWrite: boolean;
-  /** Sends the serialized import intent as a scoped chat message to the
-   *  next agent turn. The caller attaches the verified scope and posts. */
+  /** Sends the scoped chat message carrying only
+   *  `{cadence_csv_import: {request_id, confirm_token}}` to the next
+   *  agent turn — the durable plan lives host-side; the bytes/decisions
+   *  never travel in the message. Returns null on success. */
   onSendIntent: (intent: {
-    request_id: string;
-    preview_token: string;
-    decisions_digest: string;
-    confirm_token: string;
-    csv_text: string;
-    decisions?: { row: number; action: string; expected_revision?: number }[];
+    cadence_csv_import: { request_id: string; confirm_token: string };
   }) => Promise<string | null>;
 }) {
   const [csvText, setCsvText] = useState("");
@@ -121,43 +111,28 @@ export default function ChatCsvImport({
     const scopeKey = live.current.scope;
     const decisions = buildCsvDecisions(preview.rows, choices, revisions);
     const wireDecisions = toWireDecisions(decisions);
-    // Serialize the immutable intent for the agent's next turn before
-    // minting the confirm — if it cannot fit the chat message bound, the
-    // confirm is never minted and nothing is silently truncated. The
-    // decisions ride the message in the daemon's snake_case wire form so
-    // the agent can recompute the bound digest and pass them on verbatim.
-    const intentCore = {
-      // `kind` marks the scoped message as an immutable import intent
-      // the assistant turn recognises and redeems — not free chat text.
-      kind: "crm-csv-import",
-      request_id: requestId,
-      preview_token: preview.previewToken,
-      decisions_digest: csvDecisionsDigest(decisions),
-      csv_text: csvText,
-      ...(wireDecisions.length > 0 ? { decisions: wireDecisions } : {}),
-    };
-    // confirm_token is appended after mint; size it with a placeholder
-    // of the same bounded form so the bound is checked against the real
-    // message the agent's turn will receive.
-    const probe = { ...intentCore, confirm_token: "confirm-" + "0".repeat(32) };
-    const bytes = new TextEncoder().encode(JSON.stringify(probe)).length;
-    if (bytes > CHAT_INTENT_MAX_BYTES) {
-      setError(
-        `This list is too large to hand to the assistant through chat (${Math.round(bytes / 1024)} KiB over the ${Math.round(CHAT_INTENT_MAX_BYTES / 1024)} KiB bound). Import a smaller batch — split the CSV and confirm each part.`,
-      );
-      return;
-    }
+    const digest = csvDecisionsDigest(decisions);
     setPending("confirm");
     setError(null);
     try {
+      // The confirm mints the durable plan host-side: csv_text + the
+      // reviewed decisions + the digest all travel to the store here —
+      // the bytes never ride the text-only chat.
       const receipt = await csvActions.confirm(
         scope,
+        csvText,
         preview.previewToken,
         requestId,
-        intentCore.decisions_digest,
+        digest,
+        wireDecisions.length > 0 ? wireDecisions : undefined,
       );
       if (!live.current.mounted || live.current.scope !== scopeKey) return;
-      const sendError = await onSendIntent({ ...intentCore, confirm_token: receipt.confirmToken });
+      // Hand off only the confirm receipt to the agent's scoped turn —
+      // the message carries just request_id + confirm_token; the agent
+      // resolves the stored plan by that pair.
+      const sendError = await onSendIntent({
+        cadence_csv_import: { request_id: requestId, confirm_token: receipt.confirmToken },
+      });
       if (!live.current.mounted || live.current.scope !== scopeKey) return;
       if (sendError === null) {
         setSent("Confirmed — the import intent went to the assistant's scoped turn. It applies the reviewed rows; this board shows the outcome.");
