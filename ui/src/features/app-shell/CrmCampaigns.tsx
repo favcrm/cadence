@@ -3,7 +3,6 @@ import { api } from "../../lib/api";
 import type { Connection } from "../../lib/types";
 import { smtpSummary } from "../settings/connectionsView";
 import Button from "../../ui/Button";
-import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
 import {
@@ -83,6 +82,10 @@ import { friendlyAudienceError, newAudienceId } from "./segmentGrammar";
  *   plus a non-null receipt — anything else is operator-submitted.
  *   The manual Submit stays for operator copy and is labelled as
  *   such; it never claims assistant provenance.
+ *
+ * The shell's own header row is the single Apps → App breadcrumb and
+ * title; the section renders its own real heading instead of a
+ * second crumb (CAD-863 release correction).
  */
 
 export default function CrmCampaigns({
@@ -109,23 +112,6 @@ export default function CrmCampaigns({
 }) {
   return (
     <div className="crm-list" data-section="campaigns">
-      <nav className="crm-crumb" aria-label="Breadcrumb">
-        <Link href="/apps" className="lnk text-label">
-          Apps
-        </Link>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="text-label text-ink-300">CRM</span>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="text-label text-ink-100" aria-current="page">
-          Campaigns{view === "new" ? " / New" : ""}
-          {recordId !== null ? " / Details" : ""}
-        </span>
-      </nav>
-
       {recordId !== null ? (
         <CampaignDetail
           scope={scope}
@@ -224,7 +210,10 @@ function CampaignList({
   })();
 
   return (
-    <section aria-label="Campaigns list">
+    <section aria-label="Campaigns list" className="crm-list">
+      <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
+        Campaigns
+      </h3>
       <div className="crm-toolbar">
         <p className="text-secondary text-ink-300">
           Versioned email content with content-only approval. Audience freezes and test-send

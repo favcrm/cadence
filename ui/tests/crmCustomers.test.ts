@@ -282,7 +282,9 @@ await React.act(async () => {
   root.render(React.createElement(Harness, { viewer: { operator: true, readOnly: false } }));
 });
 await settle(() => assert(text().includes("Search Alpha One"), "list paints real server rows"));
-assert(text().includes("Apps") && text().includes("CRM") && text().includes("Customers"), "nested breadcrumb Apps → CRM → Customers");
+assert(host.querySelector("[data-outlet-heading]")?.textContent?.trim() === "Customers", "customers list retains its section heading");
+assert(!host.querySelector(".crm-crumb"), "the CRM outlet does not duplicate the shell breadcrumb");
+assert(host.querySelector('nav[aria-label="CRM sections"] a[aria-current="page"]')?.textContent?.trim() === "Customers", "the submenu identifies the current customers page");
 assert(text().includes("r1") && text().includes("granted"), "revision and consent cues render");
 assert(!text().includes("No records yet"), "populated list shows no empty state");
 

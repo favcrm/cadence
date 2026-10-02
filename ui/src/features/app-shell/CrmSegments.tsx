@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
-import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
 import {
@@ -32,6 +31,10 @@ import {
  * action addresses a saved rule, so Create lands atomically on the
  * detail drawer where the exact counts, suppression breakdown and
  * bounded sample render.
+ *
+ * The shell's own header row is the single Apps → App breadcrumb and
+ * title; the section renders its own real heading instead of a
+ * second crumb (CAD-863 release correction).
  */
 
 export interface SegmentDoc {
@@ -139,23 +142,6 @@ export default function CrmSegments({
 }) {
   return (
     <div className="crm-list" data-section="segments">
-      <nav className="crm-crumb" aria-label="Breadcrumb">
-        <Link href="/apps" className="lnk text-label">
-          Apps
-        </Link>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="text-label text-ink-300">CRM</span>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="text-label text-ink-100" aria-current="page">
-          Segments{view === "new" ? " / New" : ""}
-          {recordId !== null ? " / Details" : ""}
-        </span>
-      </nav>
-
       {view === "list" && (
         <SegmentList
           scope={scope}
@@ -229,7 +215,10 @@ function SegmentList({
   }, [reloadToken]);
 
   return (
-    <section aria-label="Segments list">
+    <section aria-label="Segments list" className="crm-list">
+      <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
+        Segments
+      </h3>
       <div className="crm-toolbar">
         <p className="text-secondary text-ink-300">
           Saved rules over customer tags, source, consent and email domain.

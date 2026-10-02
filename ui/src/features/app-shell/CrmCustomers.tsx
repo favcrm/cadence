@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
-import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
 import CrmCampaigns from "./CrmCampaigns";
@@ -32,6 +31,10 @@ import { hostActions, type HostRecord, type HostScope } from "./hostActions";
  * and browser back keep it; switching sections clears the record
  * view in the shell. Search text lives in component state only — the
  * route URL keeps scope (`ctx`, `record`) and never record content.
+ *
+ * The shell's own header row is the single Apps → App breadcrumb and
+ * title; each section renders its own real heading instead of a
+ * second crumb (CAD-863 release correction).
  */
 export default function CrmShell({
   scope,
@@ -86,25 +89,6 @@ export default function CrmShell({
         />
       )}
 
-      {section === "customers" && (
-        <nav className="crm-crumb" aria-label="Breadcrumb">
-          <Link href="/apps" className="lnk text-label">
-            Apps
-          </Link>
-          <span aria-hidden="true" className="text-ink-600">
-            /
-          </span>
-          <span className="text-label text-ink-300">CRM</span>
-          <span aria-hidden="true" className="text-ink-600">
-            /
-          </span>
-          <span className="text-label text-ink-100" aria-current="page">
-            Customers
-            {view === "new" ? " / New" : ""}
-            {recordId !== null ? " / Details" : ""}
-          </span>
-        </nav>
-      )}
       {section === "customers" && view === "list" && (
         <CustomerList
           scope={scope}
@@ -211,6 +195,9 @@ function CustomerList({
 
   return (
     <section aria-label="Customers list" className="crm-list">
+      <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
+        Customers
+      </h3>
       <div className="crm-toolbar">
         <div className="crm-search">
           <label className="sr-only" htmlFor="crm-customer-search">
