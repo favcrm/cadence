@@ -92,6 +92,10 @@ export interface PublishIntent {
   upstream: unknown | null;
 }
 
+/** The daemon caps `GET /api/social-publishes` at this many rows (ORDER BY
+ *  intent_id). One constant for every reader of that cap. */
+export const PUBLISH_LIST_CAP = 100;
+
 const STATES = ["queued", "processing", "posted", "refused", "cancelled", "held"] as const;
 
 function str(value: unknown): string | null {

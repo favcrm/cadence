@@ -48,8 +48,43 @@ export interface ScreenInit {
  *  else closes the port. `state` is the child's opaque draft snapshot
  *  (≤ 32 KiB string), held host-side in memory only. */
 export type ChildToHost =
-  | { v: 1; op: "ready" }
+  | { v: 1; op: "ready"; accepts?: [typeof PUBLISH_INTENTS_V1] }
   | { v: 1; op: "state"; data: string };
+
+/** CAD-1025 — the one optional PUSH extension. A child opts in by sending
+ *  `{v:1, op:"ready", accepts:["publish-intents.v1"]}`; a child that sends
+ *  the bare `ready` keeps receiving the exact CAD-1006 v1 shape. */
+export const PUBLISH_INTENTS_V1 = "publish-intents.v1";
+/** Every PUSH a child receives is at most this many UTF-8 bytes. */
+export const PUSH_BYTES_MAX = 128 * 1024;
+const LINK_ID_MAX = 128;
+
+/** One verified publish intent, read-only. Every field is required; there is
+ *  no grant, approval, idempotency key, receipt, upstream evidence, caption or
+ *  image digest. `context_id` `""` means no context. */
+export interface ScreenIntent {
+  intent_id: string;
+  install_id: string;
+  context_id: string;
+  run_id: string;
+  effect_id: string;
+  state: "queued" | "processing" | "posted" | "refused" | "cancelled" | "held";
+  channel: "instagram" | "facebook";
+  destination_id: string;
+  due_epoch: number;
+  timezone: string;
+}
+
+/** `ok`: the complete scoped list (empty rows = honestly nothing planned).
+ *  `truncated`: the list hit its cap, so absence proves nothing.
+ *  `loading`/`unavailable`: no verified read for this scope; rows are empty.
+ *  `withheld` counts host-dropped rows (foreign, dangling, malformed, or a
+ *  duplicated id), never their content. */
+export interface ScreenIntents {
+  status: "loading" | "ok" | "truncated" | "unavailable";
+  withheld: number;
+  rows: ScreenIntent[];
+}
 
 /** The host's only PUSH: the closed read-only projection of the verified
  *  scope. Every identity field is host-stamped — the child can never
@@ -88,6 +123,8 @@ export interface ScreenPush {
     workflow: { title: string };
     created?: number;
     closed?: number;
+    /** publish-intents.v1 only: the run's context, `""` = none. */
+    context_id?: string;
   }[];
   /** Scoped effects/outbox/calendar-intent receipts — real rows only. */
   outbox: {
@@ -95,7 +132,12 @@ export interface ScreenPush {
     state: string;
     title: string;
     scheduled_at?: number;
+    /** publish-intents.v1 only: the effect's full linkage identity. */
+    run_id?: string;
+    context_id?: string;
   }[];
+  /** publish-intents.v1 only. */
+  publish_intents?: ScreenIntents;
   /** Server epoch seconds for day-row alignment. */
   now: number;
   /** The child's own last `state` snapshot, replayed on remount. */
@@ -141,6 +183,12 @@ export function parseChild(data: unknown): ChildToHost | null {
     return { v: 1, op: "ready" };
   }
   if (
+    Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
+    Array.isArray(d.accepts) && d.accepts.length === 1 && d.accepts[0] === PUBLISH_INTENTS_V1
+  ) {
+    return { v: 1, op: "ready", accepts: [PUBLISH_INTENTS_V1] };
+  }
+  if (
     Object.keys(d).sort().join() === "data,op,v" &&
     d.v === 1 &&
     d.op === "state" &&
@@ -151,4 +199,41 @@ export function parseChild(data: unknown): ChildToHost | null {
     return { v: 1, op: "state", data: d.data };
   }
   return null;
+}
+
+/** The exact CAD-1006 v1 shape for a child that did not opt in: every
+ *  publish-intents.v1 field is removed, nothing else changes. */
+export function legacyPush(push: ScreenPush): ScreenPush {
+  const { publish_intents: _intents, ...rest } = push;
+  return {
+    ...rest,
+    runs: push.runs.map(({ context_id: _context, ...run }) => run),
+    outbox: push.outbox.map(({ run_id: _run, context_id: _context, ...row }) => row),
+  };
+}
+
+export function pushBytes(push: ScreenPush): number {
+  return new TextEncoder().encode(JSON.stringify(push)).byteLength;
+}
+const linkId = (value: string | undefined, required: boolean) =>
+  typeof value === "string" && value.length <= LINK_ID_MAX && (!required || value.length > 0);
+
+/** The exact PUSH one child receives, or `null` when it cannot be sent (the
+ *  caller then closes the mount and the board shows its native workspace).
+ *  The byte cap is checked on THIS shape, so a legacy child is never refused
+ *  for bytes only an opted-in child would get. For an opted-in child, the
+ *  linkage ids must meet the app's bounds (fail closed otherwise), and when
+ *  the intent rows alone push it over the cap they are replaced by an honest
+ *  `unavailable` block rather than dropping the screen. */
+export function shapeFor(push: ScreenPush, intents: boolean): ScreenPush | null {
+  if (!intents) {
+    const legacy = legacyPush(push);
+    return pushBytes(legacy) <= PUSH_BYTES_MAX ? legacy : null;
+  }
+  if (!push.publish_intents ||
+      !push.runs.every(run => linkId(run.context_id, false)) ||
+      !push.outbox.every(row => linkId(row.run_id, true) && linkId(row.context_id, false))) return null;
+  if (pushBytes(push) <= PUSH_BYTES_MAX) return push;
+  const degraded: ScreenPush = { ...push, publish_intents: { status: "unavailable", withheld: 0, rows: [] } };
+  return pushBytes(degraded) <= PUSH_BYTES_MAX ? degraded : null;
 }
