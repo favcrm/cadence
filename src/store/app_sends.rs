@@ -465,7 +465,7 @@ impl RecordStore {
                     && stored.send_digest == draft.send_digest
                     && stored.unsubscribe_origin == draft.unsubscribe_origin
                 {
-                    return Ok(stored);
+                    return Ok(Some(stored));
                 }
                 return Err(Error::rejected(
                     "campaign send request ID is already used for different material",
@@ -499,10 +499,13 @@ impl RecordStore {
             if changed != 1 {
                 return Err(Error::rejected("campaign send ID is already used"));
             }
-            Ok(())
-        })?;
-        self.app_campaign_send(context, &draft.send_id)?
-            .ok_or_else(|| Error::internal("campaign send vanished after prepare"))
+            Ok(None)
+        })? {
+            Some(stored) => Ok(stored),
+            None => self
+                .app_campaign_send(context, &draft.send_id)?
+                .ok_or_else(|| Error::internal("campaign send vanished after prepare")),
+        }
     }
 
     /// Read one send row.
