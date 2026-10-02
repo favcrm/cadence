@@ -1772,7 +1772,7 @@ impl RecordStore {
             if spent != 1 {
                 return Err(Error::rejected("email proposal request is already claimed"));
             }
-            if let Err(error) = tx.execute_raw(
+            if let Err(error) = tx.execute(
                 "INSERT INTO app_content_proposals(context_id,proposal_id,campaign_id,source_revision,subject,preheader,blocks,content_digest,actor,origin,receipt_message,receipt_agent,receipt_request,state,created,decided) VALUES(?,?,?,?,?,?,?,?,'assistant','assistant-receipt',?,?,?,'pending',?,NULL)",
                 params![context, proposal_id, campaign, source_revision, draft.subject, draft.preheader, blocks_text, digest, message, agent, request_id, now()],
             ) {

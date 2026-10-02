@@ -19,6 +19,7 @@
 use super::app_audiences::AudienceBase;
 use super::app_records::{email_shape_valid, ConsentState, CustomerProfile, RecordStore};
 use super::app_runs::material_digest;
+use super::StoreConn;
 use crate::error::{Error, Result};
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
