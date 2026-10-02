@@ -731,7 +731,7 @@ impl Store {
     /// (a bare `Transaction` drop would be denied by the authorizer).
     pub(crate) fn with_sealed_tx<R>(
         &self,
-        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> Result<R>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
     ) -> Result<R>
     where
         R: 'static,
@@ -747,7 +747,7 @@ impl Store {
     pub(crate) fn with_sealed_tx_fenced<R>(
         &self,
         fence: impl FnOnce() -> Option<String>,
-        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> Result<R>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
     ) -> Result<R>
     where
         R: 'static,
@@ -759,7 +759,7 @@ impl Store {
     pub(crate) fn with_sealed_tx_fenced_raw<T>(
         &self,
         fence: impl FnOnce() -> Option<String>,
-        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> rusqlite::Result<T>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T>
     where
         T: 'static,
@@ -771,7 +771,7 @@ impl Store {
     /// classify sqlite errors (e.g. `shutdown_entries`' BUSY retry).
     pub(crate) fn with_sealed_tx_raw<T>(
         &self,
-        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> rusqlite::Result<T>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T>
     where
         T: 'static,
@@ -783,7 +783,7 @@ impl Store {
         &self,
         arm: u8,
         on_sealed: bool,
-        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> Result<R>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
     ) -> Result<R>
     where
         R: 'static,
@@ -796,7 +796,7 @@ impl Store {
         arm: u8,
         on_sealed: bool,
         fence: Option<impl FnOnce() -> Option<String>>,
-        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> Result<R>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
     ) -> Result<R>
     where
         R: 'static,
@@ -839,7 +839,7 @@ impl Store {
         // free to move/rollback/commit once it ends.
         let outcome = {
             let mut facade = WriteTxn { tx: &tx, state };
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&facade)))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut facade)))
         };
         match outcome {
             Ok(Ok(v)) => {
@@ -871,7 +871,7 @@ impl Store {
         &self,
         arm: u8,
         on_sealed: bool,
-        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> rusqlite::Result<T>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T>
     where
         T: 'static,
@@ -884,7 +884,7 @@ impl Store {
         arm: u8,
         on_sealed: bool,
         fence: Option<impl FnOnce() -> Option<String>>,
-        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> rusqlite::Result<T>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T>
     where
         T: 'static,
@@ -917,7 +917,7 @@ impl Store {
         }
         let outcome = {
             let mut facade = WriteTxn { tx: &tx, state };
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&facade)))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut facade)))
         };
         match outcome {
             Ok(Ok(v)) => {
@@ -1097,7 +1097,7 @@ impl Store {
     #[allow(dead_code)]
     pub(crate) fn fixture_write<R>(
         &self,
-        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> Result<R>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
     ) -> Result<R>
     where
         R: 'static,
@@ -1730,7 +1730,9 @@ mod tests {
         s.propose_close(&permit(&db, OwnerOp::Close, b"chal", "attempt-1", "", 7), "test").unwrap();
         // Every producer write now refuses.
         assert!(s.event_public("daemon", "probe", json!({})).is_err());
-        assert!(s.with_sealed_tx(|wtx| wtx.execute_batch("SELECT 1")).is_err());
+        assert!(s
+            .with_sealed_tx(|wtx| Ok(wtx.execute_batch("SELECT 1")?))
+            .is_err());
         // Reopen: the durable latch survives — a fresh Store on the file
         // refuses writable open.
         drop(s);
@@ -2349,9 +2351,9 @@ mod tests {
         // A business write on the same (now-sealed) store refuses.
         assert!(s1
             .with_sealed_tx(|wtx| {
-                wtx.execute_batch(
+                Ok(wtx.execute_batch(
                     "INSERT INTO events(alias,kind,payload,at) VALUES('d','k','{}',1)",
-                )
+                )?)
             })
             .is_err());
         // A second Store handle on the same file must refuse writable

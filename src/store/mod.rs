@@ -204,8 +204,9 @@ impl Store {
     /// The returned guard is DISARMED — the authorizer denies every
     /// write/DML/DDL/tx-boundary it attempts, so test/fixture read
     /// probes (`s.conn().query_row`) are safe: this is a read surface,
-    /// never a producer path.
-    pub(super) fn conn(&self) -> MutexGuard<'_, Connection> {
+    /// never a producer path. Private to `store` — test children under
+    /// `store::tests` still reach it as a private ancestor member.
+    fn conn(&self) -> MutexGuard<'_, Connection> {
         match self.conn.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -277,7 +278,7 @@ impl Store {
     /// before it returns, so no write starts post-trip.
     pub(crate) fn write_tx<R>(
         &self,
-        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> Result<R>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
     ) -> Result<R>
     where
         R: 'static,
@@ -293,7 +294,7 @@ impl Store {
     /// source (e.g. `shutdown_entries`' typed-retry path).
     pub(crate) fn write_tx_raw<T>(
         &self,
-        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> rusqlite::Result<T>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T>
     where
         T: 'static,

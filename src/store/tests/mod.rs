@@ -104,7 +104,7 @@ fn v3_db(dir: &TempDir) -> std::path::PathBuf {
     }
     // Downgrade to a genuine v3: drop the v4 objects + columns.
     let conn = Connection::open(&db).unwrap();
-    (*conn).execute_batch(
+    conn.execute_batch(
         "DROP TABLE verdicts; DROP TABLE tasks; DROP TABLE jobs;
              DROP INDEX msg_task; DROP INDEX events_job;
              ALTER TABLE messages DROP COLUMN task_id;
