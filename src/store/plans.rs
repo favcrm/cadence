@@ -3,7 +3,7 @@
 use crate::adapter::registry;
 use crate::error::{Error, Result};
 use crate::proto::identifier;
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use serde_json::{json, Value};
 use uuid::Uuid;
 

@@ -765,16 +765,18 @@ fn live_grants(conn: &Connection, now: f64) -> Result<Vec<Value>> {
 
 pub fn note_restart_proceeded(state_dir: &Path, ticket: &RestartTicket) -> Result<()> {
     let conn = connect(&db_file(state_dir))?;
-    insert_event(
-        &conn,
-        "rollout_restart_proceeded",
-        json!({
-            "holder": ticket.holder,
-            "lease_id": ticket.lease_id,
-            "build": crate::overview::BUILD_COMMIT,
-        }),
-        unix_now(),
-    )
+    immediate(&conn, |tx| {
+        insert_event(
+            tx,
+            "rollout_restart_proceeded",
+            json!({
+                "holder": ticket.holder,
+                "lease_id": ticket.lease_id,
+                "build": crate::overview::BUILD_COMMIT,
+            }),
+            unix_now(),
+        )
+    })
 }
 
 pub struct ClaimRequest<'a> {
@@ -2043,22 +2045,18 @@ fn connect_ensured(path: &Path) -> Result<Connection> {
         }
     }
     let conn = connect(path)?;
-    ensure_lease_tables(&conn)?;
+    immediate(&conn, ensure_lease_tables)?;
     Ok(conn)
 }
 
 fn immediate<T>(conn: &Connection, body: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    match body(conn) {
-        Ok(value) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(error)
-        }
-    }
+    // SQLite serializes the held latch check with every other connection's
+    // close. RAII also rolls back callback errors and unwinds before reuse.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    crate::store::require_legacy_writer_tx(&tx)?;
+    let value = body(&tx)?;
+    tx.commit()?;
+    Ok(value)
 }
 
 fn active_lease(conn: &Connection) -> Result<Option<Lease>> {

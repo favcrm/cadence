@@ -2,7 +2,7 @@
 
 use crate::adapter::registry;
 use crate::error::{Error, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::params;
 use serde_json::{json, Value};
 
 use super::agents::Agent;

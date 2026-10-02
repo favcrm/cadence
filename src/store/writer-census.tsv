@@ -37,9 +37,10 @@ remote_result_outbox.rs	separate-results.sqlite3	execute	10
 remote_result_outbox.rs	separate-results.sqlite3	open	5
 remote_result_outbox.rs	separate-results.sqlite3	prepare	2
 remote_result_outbox.rs	separate-results.sqlite3	transaction	4
-rollout.rs	legacy-rollout-owner-and-inline-tests	execute	35
+rollout.rs	legacy-rollout-owner-and-inline-tests	execute	32
 rollout.rs	legacy-rollout-owner-and-inline-tests	open	25
 rollout.rs	legacy-rollout-owner-and-inline-tests	prepare	5
+rollout.rs	legacy-rollout-owner-and-inline-tests	transaction	1
 store/agents.rs	guarded-store-and-read-queries	execute	20
 store/agents.rs	guarded-store-and-read-queries	guarded_write	16
 store/agents.rs	guarded-store-and-read-queries	prepare	4
@@ -101,10 +102,10 @@ store/schema.rs	sqlite-schema-owner-and-restricted-recovery	guarded_write	2
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	open	2
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	prepare	22
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	transaction	29
-store/seal.rs	sqlite-guard-owner-and-inline-tests	execute	27
+store/seal.rs	sqlite-guard-owner-and-inline-tests	execute	23
 store/seal.rs	sqlite-guard-owner-and-inline-tests	guarded_write	16
 store/seal.rs	sqlite-guard-owner-and-inline-tests	open	12
-store/seal.rs	sqlite-guard-owner-and-inline-tests	prepare	4
+store/seal.rs	sqlite-guard-owner-and-inline-tests	prepare	2
 store/seal.rs	sqlite-guard-owner-and-inline-tests	transaction	4
 store/social_publish.rs	guarded-store-and-read-queries	execute	5
 store/social_publish.rs	guarded-store-and-read-queries	guarded_write	7

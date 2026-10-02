@@ -29,7 +29,7 @@
 //! turn token is never copied into a payload; one quoted in prose is
 //! still caught by the export's generic turn-token redaction.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 

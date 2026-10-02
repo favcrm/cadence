@@ -551,8 +551,7 @@ impl Store {
                                 "request ID already has a different immutable snapshot",
                             ));
                         }
-                        drop(conn);
-                        return self.app_run_show(&id);
+                        return Self::app_run_show_in(&tx, &id);
                     }
                     let id = format!("run-{}", uuid::Uuid::new_v4().simple());
                     tx.execute("INSERT INTO jobs(id,title,spec_path,spec_sha256,pm_alias,state,max_revisions,created,updated) VALUES(?,?,?,?,?,'open',1,?,?)",params![id,"App run","app-run",digest,owner_pm,now(),now()])?;
@@ -696,8 +695,7 @@ impl Store {
                         },
                         json!({"run_id":id,"digest":run["snapshot_digest"],"actor":"operator"}),
                     )?;
-                    drop(conn);
-                    self.app_run_show(id)
+                    Self::app_run_show_in(&tx, id)
         });
     }
     pub(super) fn app_current_in(
@@ -1007,8 +1005,7 @@ impl Store {
                         "UPDATE app_runs SET state='running',updated=? WHERE id=?",
                         params![now(), id],
                     )?;
-                    drop(conn);
-                    self.app_run_show(id)
+                    Self::app_run_show_in(&tx, id)
         });
     }
     /// Authority loss is terminal; existing artifacts and turn receipts remain

@@ -89,7 +89,7 @@ pub use seal::OpenMode;
 // `execute`/`execute_batch`/`query_row`/`query_map` a hook legitimately
 // needs, and there is no `commit`/`rollback`/`Connection` escape.
 pub use seal::WriteTxn;
-pub(crate) use seal::{preflight_writer_guard, StoreConn};
+pub(crate) use seal::{preflight_writer_guard, require_legacy_writer_tx, StoreConn};
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

@@ -17,7 +17,7 @@
 //! `refuse_leak` check against the enrolled credential before it
 //! lands.
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -594,7 +594,10 @@ impl Store {
     /// platform, so it becomes `reconcile` for a human — never
     /// re-fired. `waiting` rows survive untouched; the request listing
     /// reads them from this table, so nothing needs re-parking.
-    pub fn reconcile_effects_in(&self, tx: &impl super::StoreConn) -> Result<Vec<EffectRow>> {
+    pub(super) fn reconcile_effects_in(
+        &self,
+        tx: &impl super::StoreConn,
+    ) -> Result<Vec<EffectRow>> {
         let rows: Vec<EffectRow> = tx.query_vec(
             "SELECT * FROM platform_effects WHERE state IN ('decided','executing')",
             [],

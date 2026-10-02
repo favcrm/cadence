@@ -3,7 +3,7 @@
 use crate::adapter::registry;
 use crate::error::{Error, Result};
 use crate::proto::identifier;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 

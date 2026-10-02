@@ -627,6 +627,27 @@ impl From<SealError> for Error {
     }
 }
 
+/// Recheck a legacy sibling writer after it has acquired BEGIN IMMEDIATE.
+/// Only latch-absent databases qualify; this grants no protected authority.
+/// Private callers must hold that transaction through their complete mutation.
+pub(crate) fn require_legacy_writer_tx(tx: &Transaction<'_>) -> Result<()> {
+    if tx.is_autocommit() {
+        return Err(SealError::Unknown("sibling writer has no held transaction".into()).into());
+    }
+    match preflight_read(tx)
+        .map_err(|e| SealError::Unknown(format!("held writer-guard read: {e}")))?
+    {
+        Preflight::LatchAbsent => Ok(()),
+        Preflight::Sealed => {
+            Err(SealError::Closed("producer closure latch is set — writes refused".into()).into())
+        }
+        Preflight::LatchOpen | Preflight::Malformed => Err(SealError::Unknown(
+            "closure latch present on a sibling-writer path — refusing the write".into(),
+        )
+        .into()),
+    }
+}
+
 /// What `preflight` decided for the open path.
 #[derive(Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -728,6 +749,7 @@ impl Store {
     /// section. A sealed store refuses before `f` runs; a callback error
     /// or panic rolls back inside the guard's private `TxControl` window
     /// (a bare `Transaction` drop would be denied by the authorizer).
+    #[cfg(test)]
     pub(crate) fn with_sealed_tx<R>(
         &self,
         f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
@@ -764,18 +786,6 @@ impl Store {
         T: 'static,
     {
         self.sealed_tx_fenced_raw(GuardState::BUSINESS, false, Some(fence), f)
-    }
-
-    /// Raw-error variant of [`Self::with_sealed_tx`] for callers that
-    /// classify sqlite errors (e.g. `shutdown_entries`' BUSY retry).
-    pub(crate) fn with_sealed_tx_raw<T>(
-        &self,
-        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<T>
-    where
-        T: 'static,
-    {
-        self.sealed_tx_raw(GuardState::BUSINESS, false, f)
     }
 
     fn sealed_tx<R>(
@@ -837,7 +847,7 @@ impl Store {
         // The facade borrow is scoped to the closure call so `tx` is
         // free to move/rollback/commit once it ends.
         let outcome = {
-            let mut facade = WriteTxn { tx: &tx, state };
+            let mut facade = WriteTxn { tx: &tx };
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut facade)))
         };
         match outcome {
@@ -866,17 +876,6 @@ impl Store {
     /// `sealed_tx` with the rusqlite error channel preserved end-to-end —
     /// the callback and the boundary calls return `rusqlite::Result` so a
     /// caller classifies BUSY/constraint at the source.
-    fn sealed_tx_raw<T>(
-        &self,
-        arm: u8,
-        on_sealed: bool,
-        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<T>
-    where
-        T: 'static,
-    {
-        self.sealed_tx_fenced_raw(arm, on_sealed, None::<fn() -> Option<String>>, f)
-    }
 
     fn sealed_tx_fenced_raw<T>(
         &self,
@@ -913,7 +912,7 @@ impl Store {
             }
         }
         let outcome = {
-            let mut facade = WriteTxn { tx: &tx, state };
+            let mut facade = WriteTxn { tx: &tx };
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut facade)))
         };
         match outcome {
@@ -1299,7 +1298,7 @@ impl Store {
 /// DDL the SQL text sneaks in at `phase=Callback`.
 /// The restricted connection surface every read-guard and write-facade
 /// shares: the `Connection`/`Transaction` DML+query verbs under their
-/// rusqlite names, plus collecting helpers (`query_vec`, `for_each_row`)
+/// rusqlite names, plus collecting helpers (`query_vec`)
 /// that keep the `Statement` borrow local so no `Statement` escapes a
 /// callback. Methods are generic over `rusqlite::Params`, so `params!`,
 /// `[]`, `[x]` and `params_from_iter` all work unchanged — the trait is
@@ -1325,8 +1324,6 @@ pub(crate) trait StoreConn {
         params: impl rusqlite::Params,
         f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<Option<T>>;
-    /// `EXISTS`-style boolean probe over `sql`.
-    fn exists(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<bool>;
     /// `query_map` collected to a `Vec` — the `Statement` borrow stays
     /// inside the impl so none escapes a callback.
     fn query_vec<T>(
@@ -1335,25 +1332,8 @@ pub(crate) trait StoreConn {
         params: impl rusqlite::Params,
         f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<Vec<T>>;
-    /// `query_map` driven row-by-row, early-return safe.
-    fn for_each_row(
-        &self,
-        sql: &str,
-        params: impl rusqlite::Params,
-        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
-    ) -> rusqlite::Result<()>;
     fn last_insert_rowid(&self) -> i64;
     fn changes(&self) -> u64;
-    /// `pragma_query_value` for a pragma whose value the caller decodes.
-    fn pragma_query_value<T, F>(
-        &self,
-        database_name: Option<rusqlite::DatabaseName<'_>>,
-        pragma_name: &str,
-        f: F,
-    ) -> rusqlite::Result<T>
-    where
-        T: rusqlite::types::FromSql,
-        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>;
 }
 
 /// Implement `StoreConn` for a type that derefs to a `&Connection`
@@ -1389,10 +1369,6 @@ macro_rules! storeconn_impl {
                 let $g = self;
                 ($get).query_row(sql, params, f).optional()
             }
-            fn exists(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<bool> {
-                let $g = self;
-                ($get).prepare(sql)?.exists(params)
-            }
             fn query_vec<T>(
                 &self,
                 sql: &str,
@@ -1402,20 +1378,6 @@ macro_rules! storeconn_impl {
                 let $g = self;
                 ($get).prepare(sql)?.query_map(params, f)?.collect()
             }
-            fn for_each_row(
-                &self,
-                sql: &str,
-                params: impl rusqlite::Params,
-                f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
-            ) -> rusqlite::Result<()> {
-                let $g = self;
-                let mut stmt = ($get).prepare(sql)?;
-                let mut rows = stmt.query_map(params, f)?;
-                while let Some(next) = rows.next() {
-                    next?;
-                }
-                Ok(())
-            }
             fn last_insert_rowid(&self) -> i64 {
                 let $g = self;
                 ($get).last_insert_rowid()
@@ -1423,19 +1385,6 @@ macro_rules! storeconn_impl {
             fn changes(&self) -> u64 {
                 let $g = self;
                 ($get).changes()
-            }
-            fn pragma_query_value<T, F>(
-                &self,
-                database_name: Option<rusqlite::DatabaseName<'_>>,
-                pragma_name: &str,
-                f: F,
-            ) -> rusqlite::Result<T>
-            where
-                T: rusqlite::types::FromSql,
-                F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-            {
-                let $g = self;
-                ($get).pragma_query_value(database_name, pragma_name, f)
             }
         }
     };
@@ -1484,16 +1433,13 @@ storeconn_impl!(&&WriteTxn<'_>, |g| -> &Connection { &**g.tx });
 storeconn_impl!(&&mut WriteTxn<'_>, |g| -> &Connection { &**g.tx });
 
 /// The restricted write facade handed to a business callback. Wraps the
-/// live `Transaction`; exposes only DML/read and owner-managed savepoints
+/// live `Transaction`; exposes only DML/read
 /// — never `commit`/`rollback`/tx-boundary, and never a `Connection` or
 /// `Transaction` borrow that outlives the closure. `rusqlite`-typed
 /// methods preserve the raw error so callers classify a BUSY/constraint
 /// at the source; the crate-`Error` variants flatten for prose callers.
 pub struct WriteTxn<'t> {
     tx: &'t Transaction<'t>,
-    /// The shared arm/phase cells — carried so `savepoint` can open the
-    /// owner's `TxControl` window. `'t`-bound; never escape the closure.
-    state: &'t GuardState,
 }
 
 impl<'t> WriteTxn<'t> {
@@ -1517,10 +1463,6 @@ impl<'t> WriteTxn<'t> {
     /// `COMMIT`/`BEGIN` inside `sql` is denied at `phase=Callback`).
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
         self.tx.execute_batch(sql).map_err(Into::into)
-    }
-    /// Raw-error `execute_batch` for callers that classify sqlite errors.
-    pub(crate) fn execute_batch_raw(&self, sql: &str) -> rusqlite::Result<()> {
-        self.tx.execute_batch(sql)
     }
     /// `query_row` — `pub` for test hooks that probe the tx.
     pub fn query_row<T>(
@@ -1553,68 +1495,6 @@ impl<'t> WriteTxn<'t> {
         let rows = stmt.query_map(params, f).map_err(Error::from)?;
         rows.collect::<rusqlite::Result<Vec<T>>>()
             .map_err(Error::from)
-    }
-    /// Rowid of the last successful insert on this tx's connection.
-    pub(crate) fn last_insert_rowid(&self) -> i64 {
-        self.tx.last_insert_rowid()
-    }
-    /// Rows touched by the most recent DML on this tx's connection.
-    pub(crate) fn changes(&self) -> u64 {
-        self.tx.changes()
-    }
-    /// `PRAGMA` query inside the tx (read-form only reaches the
-    /// authorizer; a write-form pragma is denied at `phase=Callback`).
-    pub(crate) fn pragma_query_value<T>(
-        &self,
-        pragma: &str,
-        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<T>
-    where
-        T: rusqlite::types::FromSql,
-    {
-        self.tx.pragma_query_value(None, pragma, f)
-    }
-    /// An owner-scoped savepoint for a nested sub-batch — the guard
-    /// issues `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` inside its own
-    /// `TxControl` window, so a business callback never reaches a tx
-    /// boundary itself. `f` returns the sub-batch result; on `Err` the
-    /// savepoint is rolled back and released, on `Ok` released.
-    pub(crate) fn savepoint<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
-        let state = self.state;
-        // The name is fixed and guard-owned — the authorizer consults
-        // `phase`, not the name, so a business callback still cannot
-        // issue a boundary; this path is the owner acting on its behalf.
-        let name = "cadence_sp";
-        {
-            let _ctrl = ControlPhase::enter(state);
-            self.tx.execute_batch(&format!("SAVEPOINT {name}"))?;
-        }
-        match f() {
-            Ok(v) => {
-                let _ctrl = ControlPhase::enter(state);
-                self.tx
-                    .execute_batch(&format!("RELEASE {name}"))
-                    .map_err(Error::from)?;
-                Ok(v)
-            }
-            Err(e) => {
-                // A failed savepoint rollback must propagate — swallowing
-                // it would report the sub-batch as cleanly aborted while
-                // the savepoint's writes may still be live. The rollback
-                // failure is the worse fault, so it wins the error.
-                let rb = {
-                    let _ctrl = ControlPhase::enter(state);
-                    self.tx
-                        .execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"))
-                };
-                match rb {
-                    Ok(()) => Err(e),
-                    Err(rb_err) => Err(Error::internal(format!(
-                        "savepoint rollback failed after callback error ({e}): {rb_err}"
-                    ))),
-                }
-            }
-        }
     }
 }
 

@@ -371,8 +371,7 @@ impl Store {
                                 "approved run capability slot already has its one result",
                             ));
                         }
-                        drop(conn);
-                        return self.app_capability_result(&existing_id);
+                        return Self::app_capability_result_in(&tx, &existing_id);
                     }
                     tx.execute(
                         "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,
@@ -402,13 +401,15 @@ impl Store {
                         "app_capability_result_recorded",
                         json!({"run_id":run,"step_id":step,"slot":slot,"receipt_id":id,"digest":digest}),
                     )?;
-                    drop(conn);
-                    self.app_capability_result(id)
+                    Self::app_capability_result_in(&tx, id)
         });
     }
 
     pub(crate) fn app_capability_result(&self, id: &str) -> Result<Value> {
-        let conn = self.conn();
+        Self::app_capability_result_in(&self.conn(), id)
+    }
+
+    fn app_capability_result_in(conn: &impl super::StoreConn, id: &str) -> Result<Value> {
         let row = conn.query_row(
             "SELECT run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,asset_type,asset_digest,length(asset),receipt_schema FROM app_capability_results WHERE id=?",
             [id], |r| Ok((

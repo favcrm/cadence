@@ -1,7 +1,7 @@
 //! Turn delivery: finish/route, fencing, reconcile, job-event notices.
 
 use crate::error::{Error, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
