@@ -144,6 +144,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         } => setup::run(state_dir, json, port, no_open),
         Commands::Daemon { action } => daemon::run(state_dir, action),
         Commands::Rollout { action } => rollout::run(state_dir, action),
+        Commands::Staging { action } => staging::run(state_dir, action),
         Commands::Backup { dir, keep, reason } => backup::run(state_dir, dir, keep, reason),
         Commands::Export { out } => export::run(state_dir, out),
         Commands::Restore {

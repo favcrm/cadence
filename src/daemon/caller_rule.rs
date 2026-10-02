@@ -638,6 +638,23 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "rollout_revoke",
         Rule::Handler("operator_connection (CAD-384)"),
     ),
+    // CAD-1024: the staging allowlist and grant store. Every write is the
+    // operator's alone — an agent, a detached child or a forged operator
+    // field never reaches `staging_delegate`/`staging_revoke`/
+    // `staging_register`. `staging_delegations` is read-only.
+    (
+        "staging_register",
+        Rule::Handler("operator_connection (CAD-1024)"),
+    ),
+    (
+        "staging_delegate",
+        Rule::Handler("operator_connection (CAD-1024)"),
+    ),
+    (
+        "staging_revoke",
+        Rule::Handler("operator_connection (CAD-1024)"),
+    ),
+    ("staging_delegations", Rule::Read),
     (
         "project_new",
         Rule::Handler("caller_is_master or operator_connection (CAD-358)"),

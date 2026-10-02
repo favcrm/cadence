@@ -263,6 +263,11 @@ All commands (one line per path):
     session start
     session end
     session ack
+  staging        CAD-1024: the staging-delegation allowlist and grant store (operator-only...
+    staging register
+    staging delegate
+    staging revoke
+    staging delegations
   agent-uid      ADR 0007 T1: the dedicated-agent-uid lane — provision the boundary once (explicitly,...
     agent-uid provision
     agent-uid doctor
