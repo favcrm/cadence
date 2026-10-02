@@ -157,6 +157,80 @@ impl<'de> Deserialize<'de> for FilesMap {
     }
 }
 
+/// The upgrade request body decoded STRICTLY — a `Value` parse would
+/// collapse a duplicate `files`/`source`/`expected_*` key to the last
+/// write before any gate ran. This visitor rejects a repeated or unknown
+/// top-level key outright, decodes `files` via the duplicate-rejecting
+/// [`FilesMap`], and keeps `source`/the `expected_*`/`request_id` pins as
+/// raw `Value`s for the field-count/schema gate in
+/// [`workspace_upgrade_transport`]. The wire shape is closed: only
+/// `files`, `source`, `expected_digest`, `expected_generation`,
+/// `expected_new_digest`, `request_id`.
+struct UpgradeWire {
+    files: Option<Vec<(String, String)>>,
+    source: Option<Value>,
+    fields: serde_json::Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for UpgradeWire {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const ALLOWED: &[&str] = &[
+            "files",
+            "source",
+            "expected_digest",
+            "expected_generation",
+            "expected_new_digest",
+            "request_id",
+        ];
+        struct WireVisitor;
+        impl<'de> Visitor<'de> for WireVisitor {
+            type Value = UpgradeWire;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a closed upgrade object")
+            }
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<UpgradeWire, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut files: Option<Vec<(String, String)>> = None;
+                let mut source: Option<Value> = None;
+                let mut fields = serde_json::Map::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !ALLOWED.contains(&key.as_str()) {
+                        return Err(serde::de::Error::unknown_field(&key, ALLOWED));
+                    }
+                    if !seen.insert(key.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate field '{key}'"
+                        )));
+                    }
+                    match key.as_str() {
+                        "files" => {
+                            files = Some(map.next_value::<FilesMap>()?.0);
+                        }
+                        "source" => {
+                            source = Some(map.next_value::<Value>()?);
+                        }
+                        _ => {
+                            fields.insert(key, map.next_value::<Value>()?);
+                        }
+                    }
+                }
+                Ok(UpgradeWire {
+                    files,
+                    source,
+                    fields,
+                })
+            }
+        }
+        deserializer.deserialize_map(WireVisitor)
+    }
+}
+
 /// A leaf file name is a visible flat name — non-empty, ASCII, no `.`-lead
 /// (dotfile), no `..`, no embedded `\`/`\0`. `seg` is already a single raw
 /// segment (the caller split on literal `/`). `workflows/` leaves additionally
@@ -250,16 +324,6 @@ fn stage_files(files: &[(String, String)]) -> Result<(tempfile::TempDir, String)
     Ok((staging, source))
 }
 
-/// A `{files}` map for the upgrade transport — the same strict visitor
-/// (`UploadBody`) the install upload uses, parsed out of a body that
-/// also carries the upgrade pins. Returns `(files, extra)` where `extra`
-/// is the non-`files` fields for the caller's own schema gate.
-fn files_map(value: &Value) -> Option<Vec<(String, String)>> {
-    let files = value.get("files")?;
-    let map: FilesMap = serde_json::from_value(files.clone()).ok()?;
-    Some(map.0)
-}
-
 /// Stage the validated file-map to a server-derived temp dir OUTSIDE the PM
 /// tracker (`workspace.rs` refuses a source inside `pm.dir` — the tracker is
 /// never its own source), then hand its absolute path to the unchanged
@@ -321,17 +385,20 @@ pub(super) fn workspace_upload(request: &mut Request, state: &std::path::Path) -
 pub(super) fn workspace_upgrade_transport(
     method: &str,
     id: &str,
-    mut fields: serde_json::Map<String, Value>,
+    wire: UpgradeWire,
 ) -> std::result::Result<(Value, Option<tempfile::TempDir>), HttpResp> {
-    let files_val = fields.remove("files");
-    let source_val = fields.remove("source");
-    if files_val.is_some() && source_val.is_some() {
+    let UpgradeWire {
+        files,
+        source,
+        fields,
+    } = wire;
+    if files.is_some() && source.is_some() {
         return Err(err_response(
             400,
             "upgrade body must carry `files` or `source`, never both",
         ));
     }
-    if files_val.is_none() && source_val.is_none() {
+    if files.is_none() && source.is_none() {
         return Err(err_response(
             400,
             "upgrade body requires a `files` map or a `source`",
@@ -353,11 +420,12 @@ pub(super) fn workspace_upgrade_transport(
     {
         return Err(err_response(400, "upgrade body has missing or unsupported fields"));
     }
-    if let Some(files_val) = files_val {
+    if let Some(files) = files {
         // `{files}` mode — server-derived `source` via secure staging.
-        let Some(files) = files_map(&json!({"files": files_val})) else {
-            return Err(err_response(400, "upgrade files must be a {{path: text}} map"));
-        };
+        // `files` is already the strict duplicate-free Vec<(path,text)>.
+        if files.is_empty() {
+            return Err(err_response(400, "upgrade files map is empty"));
+        }
         let mut total: u64 = 0;
         for (path, text) in &files {
             if !upload_path_ok(path) {
@@ -382,7 +450,7 @@ pub(super) fn workspace_upgrade_transport(
     } else {
         // Legacy `source` mode — the validated path/URL passes through
         // unchanged; no staging, the daemon re-checks it natively.
-        let source = source_val.unwrap();
+        let source = source.unwrap();
         if source.as_str().map(str::is_empty).unwrap_or(true) {
             return Err(err_response(400, "upgrade source must be a non-empty string"));
         }
@@ -934,19 +1002,20 @@ pub(super) fn workspace(
             Ok(bytes) => bytes,
             Err(response) => return response,
         };
-        let value: Value = match serde_json::from_slice(&bytes) {
-            Ok(value) => value,
+        // Decode STRICTLY — a `Value` parse would silently collapse a
+        // duplicate `files`/`source`/expected key before the gate ran;
+        // `UpgradeWire` rejects repeated or unknown top-level keys and
+        // duplicate inner path keys at parse time.
+        let wire: UpgradeWire = match serde_json::from_slice(&bytes) {
+            Ok(w) => w,
             Err(_) => return err_response(400, "upgrade body must be a JSON object"),
-        };
-        let Some(fields) = value.as_object() else {
-            return err_response(400, "upgrade body must be a JSON object");
         };
         let id = match id {
             Some(id) => id,
             None => return err_response(400, "upgrade needs an installation id"),
         };
         let (params, staging) =
-            match workspace_upgrade_transport(method, id, fields.clone()) {
+            match workspace_upgrade_transport(method, id, wire) {
                 Ok(pair) => pair,
                 Err(resp) => return resp,
             };

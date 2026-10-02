@@ -1377,10 +1377,11 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 }
             }
             // CAD-1006: the nonce-consumed frame document — exact prefix,
-            // ordered before every `/api/app-installations/` arm. Authority
-            // is the burned one-use nonce plus the request's own session
-            // credential (relayed and re-verified by the daemon), so it
-            // deliberately does NOT run `admit_operator_read`.
+            // ordered before every `/api/app-installations/` arm. The
+            // nonce is the SOLE authority relayed to `app_screen_consume`
+            // (peer guard + burned cap + stored-session liveness + digest/
+            // approval re-proof), so it deliberately does NOT run
+            // `admit_operator_read`.
             if let Some(nonce) = app_screens::frame_route(&path) {
                 let response = app_screens::frame(&request, state_dir, opts, nonce);
                 send(request, response);

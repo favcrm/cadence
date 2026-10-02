@@ -13,12 +13,14 @@
 //!   cap to the *resolved* session id. Returns `{mount: path}`.
 //!
 //! - `GET /api/app-screen/<nonce>` — the frame document. A navigation
-//!   carries the session cookie but no page-key header, so it never runs
-//!   `admit_operator_read`; its authority is the one-use nonce PLUS the
-//!   request's real cookie+key relayed to `app_screen_consume`, which
-//!   re-verifies them natively and requires the resolved session to equal
-//!   the mint's (and still be live). No asset bytes or session material
-//!   ever reach the child or a log.
+//!   is headerless (no `X-Cadence-Session` page key), so it never runs
+//!   `admit_operator_read` and relays ONLY the nonce to
+//!   `app_screen_consume`: its sole authority is the burned one-use
+//!   FrameCap PLUS the daemon's `operator_connection` peer guard (denying
+//!   agent/detached callers) PLUS the stored mint-verified session id
+//!   re-proved live in `Auth`, PLUS the live digest/approval/package
+//!   re-check. No cookie, key, or session field is read on this path and
+//!   no session material reaches the child or a log.
 //!
 //! The rendered document carries its own CSP (nonce-pinned script,
 //! `frame-ancestors` = this board's origin) — the board CSP is unchanged.
@@ -200,19 +202,95 @@ pub(super) fn frame(
 /// `postMessage` target — derived from the TRUSTED origin classification
 /// (`request_origin_kind`), never the raw `Host` header or a forwarded
 /// `X-Forwarded-Proto` (an arbitrary Host/scheme must not steer the
-/// origin the child is told to trust). The session-bearing origins the
-/// board serves resolve to canonical names: `Origin::Public` → the
-/// configured `https://<public.host>` (the public surface is TLS); the
-/// loopback/tailnet frame is reached on the board's own loopback origin
-/// `http://<board_host(port)>`. A `NoSession`/unknown classification
-/// still yields the loopback origin so `frame-ancestors` pins exactly.
+/// origin the child is told to trust). Each classified origin resolves
+/// to the board's canonical name for it:
+/// - `Origin::Public` → `{public_scheme(public.host)}://{public.host}`
+///   (https in production, http only when the configured public host is
+///   `*.localhost`) via [`operator::public_scheme`];
+/// - `Origin::Tailnet` → [`super::tailnet_url`] of the configured
+///   `(dns_name, https_port)` (the `:443` is omitted, others kept);
+/// - loopback/`NoSession` → `http://<board_host(port)>` — the canonical
+///   loopback name the frame is always reached on, so `frame-ancestors`
+///   still pins exactly.
 fn board_origin(request: &Request, opts: &ServeOpts) -> String {
-    match operator::request_origin_kind(request, opts) {
+    origin_for(operator::request_origin_kind(request, opts), opts)
+}
+
+/// The canonical origin for a classified request origin — pure, so the
+/// per-class resolution is unit-testable without a live `Request`.
+fn origin_for(class: Option<Origin>, opts: &ServeOpts) -> String {
+    match class {
         Some(Origin::Public) => match &opts.public {
-            Some(public) => format!("https://{}", public.host),
+            Some(public) => {
+                format!("{}://{}", operator::public_scheme(&public.host), public.host)
+            }
+            None => format!("http://{}", operator::board_host(opts.port)),
+        },
+        Some(Origin::Tailnet) => match &opts.tailnet {
+            Some((dns_name, https_port)) => super::tailnet_url(dns_name, *https_port),
             None => format!("http://{}", operator::board_host(opts.port)),
         },
         _ => format!("http://{}", operator::board_host(opts.port)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(public: Option<crate::ui::PublicBoard>, tailnet: Option<(String, u16)>) -> ServeOpts {
+        ServeOpts {
+            port: 8080,
+            public,
+            tailnet,
+            ..Default::default()
+        }
+    }
+
+    fn public_board(host: &str) -> crate::ui::PublicBoard {
+        crate::ui::PublicBoard {
+            host: host.to_string(),
+            issuer: "https://issuer".into(),
+            company: "c".into(),
+            authorize_url: "https://app/x".into(),
+        }
+    }
+
+    #[test]
+    fn origin_for_uses_canonical_names_not_request_host() {
+        // Tailnet: the configured dns_name + https_port; :443 omitted, a
+        // non-default port kept.
+        let t = opts(None, Some(("box.tail-abc.ts.net".into(), 443)));
+        assert_eq!(
+            origin_for(Some(Origin::Tailnet), &t),
+            "https://box.tail-abc.ts.net"
+        );
+        let t9460 = opts(None, Some(("box.tail-abc.ts.net".into(), 9460)));
+        assert_eq!(
+            origin_for(Some(Origin::Tailnet), &t9460),
+            "https://box.tail-abc.ts.net:9460"
+        );
+        // Public: production host is https; a configured *.localhost is http.
+        let prod = opts(Some(public_board("acme.cadencecloud.app")), None);
+        assert_eq!(
+            origin_for(Some(Origin::Public), &prod),
+            "https://acme.cadencecloud.app"
+        );
+        let local = opts(Some(public_board("acme.board.localhost:3123")), None);
+        assert_eq!(
+            origin_for(Some(Origin::Public), &local),
+            "http://acme.board.localhost:3123"
+        );
+        // Loopback/absent classification -> the board's own loopback name.
+        let plain = opts(None, None);
+        assert_eq!(
+            origin_for(Some(Origin::Loopback), &plain),
+            format!("http://{}", operator::board_host(8080))
+        );
+        assert_eq!(
+            origin_for(None, &plain),
+            format!("http://{}", operator::board_host(8080))
+        );
     }
 }
 

@@ -628,6 +628,17 @@ fn files_obj(map: &Value) -> Value {
     map["files"].clone()
 }
 
+/// The PM repo HEAD — a refused request must not move it (no mutation).
+fn git_head(s: &Screen) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&s.pm.dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
 #[test]
 fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
     let s = Screen::new();
@@ -685,6 +696,34 @@ fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
     foreign.insert("actor".into(), json!("operator"));
     let (code, _, _) = common::op::raw(port, &session.request("POST", &check_path, &Value::Object(foreign).to_string()));
     assert_eq!(code, 400, "foreign field accepted");
+
+    // (e) a DUPLICATE top-level `files` key — a `Value` parse would keep
+    // the last; the strict wire visitor must refuse it at parse time.
+    let files_raw = files_obj(&files).to_string();
+    let dup_top = format!(
+        "{{\"files\":{{\"app.md\":\"junk\"}},\"files\":{},\"expected_digest\":{},\"expected_generation\":{}}}",
+        files_raw, json!(before_digest), json!(gen(&s))
+    );
+    let head = git_head(&s);
+    let (code, _, resp) = common::op::raw(port, &session.request("POST", &check_path, &dup_top));
+    assert_eq!(code, 400, "duplicate top-level files accepted: {resp}");
+    assert_eq!(git_head(&s), head, "duplicate-files request mutated state");
+
+    // (f) a DUPLICATE inner path key inside `files` — the strict FilesMap
+    // visitor must refuse (a Value-overwrites decoder would silently pick
+    // one staged bundle).
+    let inner = files["files"].as_object().unwrap();
+    let mut inner_raw = String::new();
+    for (k, v) in inner {
+        inner_raw.push_str(&format!("{}:{},", json!(k), v));
+    }
+    let dup_inner = format!(
+        "{{\"files\":{{\"app.md\":\"JUNK\",{}\"app.md\":{}}},\"expected_digest\":{},\"expected_generation\":{}}}",
+        inner_raw, inner["app.md"], json!(before_digest), json!(gen(&s))
+    );
+    let (code, _, resp) = common::op::raw(port, &session.request("POST", &check_path, &dup_inner));
+    assert_eq!(code, 400, "duplicate inner path accepted: {resp}");
+    assert_eq!(git_head(&s), head, "duplicate-path request mutated state");
 
     // ---- POSITIVE: proposal (upgrade-check) then upgrade, same files ----
     let mut chk = serde_json::Map::new();
