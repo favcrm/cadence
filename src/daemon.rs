@@ -2959,13 +2959,21 @@ impl Shared {
             "app_segment_assistant_save" => self.rpc_app_segment_assistant_save(params, peer_pid),
             // Scoped-chat reads — data exposes, never mutations; the
             // same verified-turn gate, no claim (a read doesn't spend).
-            // One handler routes all three to their store calls.
-            "app_segment_assistant_list"
-            | "app_segment_assistant_show"
-            | "app_record_csv_assistant_preview"
-            | "app_segment_assistant_preview"
-            | "app_content_assistant_proposals"
-            | "app_content_assistant_proposal_show" => {
+            // One handler routes each to its store call. Each method is
+            // its own `=>` arm on ONE line: the caller-rule method-table
+            // parser scans per-arm lines for the `"name" =>` shape.
+            "app_segment_assistant_list" => self.rpc_app_assistant_read(method, params, peer_pid),
+            "app_segment_assistant_show" => self.rpc_app_assistant_read(method, params, peer_pid),
+            "app_record_csv_assistant_preview" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
+            "app_segment_assistant_preview" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
+            "app_content_assistant_proposals" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
+            "app_content_assistant_proposal_show" => {
                 self.rpc_app_assistant_read(method, params, peer_pid)
             }
             "app_segment_show" => self.rpc_app_audience(method, params, peer_pid),
