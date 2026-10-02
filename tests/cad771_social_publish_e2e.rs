@@ -2036,10 +2036,8 @@ fn cad1027_one_approval_one_intent_rpc_and_http() {
     // The HTTP relay is at least as strict: replay and forged grant refuse.
     let board = Board::serve(&h);
     let (code, text) = board.post(&h, "/api/social-publishes", &body("cad1027-replay-http"));
-    assert!(
-        (400..500).contains(&code),
-        "HTTP replay accepted: {code} {text}"
-    );
+    // The relay maps the store's "already" refusal to 409 Conflict.
+    assert_eq!(code, 409, "HTTP replay: {text}");
     assert!(text.contains("approval_replay"), "{text}");
     for grant in ["grant-a", "dpq_short", "DPQ_synthetic_grant_fb"] {
         let mut forged = freeze_params(
