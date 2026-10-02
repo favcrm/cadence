@@ -1998,6 +1998,104 @@ mod tests {
     /// bounded channels release the first commit before its retry. No sleeps
     /// or reopening a sealed file stand in for an actual competing writer.
     #[test]
+    fn lease_loss_while_waiting_for_sqlite_writer_refuses_both_callbacks() {
+        use std::sync::{mpsc, Mutex};
+        use std::time::Duration;
+        struct BusyGate {
+            entered: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        static GATE: Mutex<Option<Arc<BusyGate>>> = Mutex::new(None);
+        fn busy(count: i32) -> bool {
+            if count != 0 {
+                return false;
+            }
+            let Some(gate) = GATE.lock().unwrap().clone() else {
+                return false;
+            };
+            if gate.entered.try_send(()).is_err() {
+                return false;
+            }
+            let released = gate
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .is_ok();
+            released
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                *GATE.lock().unwrap() = None;
+            }
+        }
+        let _reset = Reset;
+        for raw in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let (db, store) = open_legacy(&dir);
+            let fence = Arc::new(crate::lease::Fence::default());
+            store.install_write_fence(Arc::clone(&fence));
+            let blocker = Connection::open(&db).unwrap();
+            let held =
+                Transaction::new_unchecked(&blocker, TransactionBehavior::Immediate).unwrap();
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            *GATE.lock().unwrap() = Some(Arc::new(BusyGate {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }));
+            store.conn().busy_handler(Some(busy)).unwrap();
+            let called = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    if raw {
+                        store.write_tx_raw(|tx| {
+                            called.store(true, Ordering::SeqCst);
+                            tx.execute_raw("INSERT INTO events(alias,kind,payload,at) VALUES('lease-wait','probe','{}',0)", [])?;
+                            Ok(())
+                        }).map_err(Error::from)
+                    } else {
+                        store.write_tx(|tx| {
+                            called.store(true, Ordering::SeqCst);
+                            tx.execute("INSERT INTO events(alias,kind,payload,at) VALUES('lease-wait','probe','{}',0)", [])?;
+                            Ok(())
+                        })
+                    }
+                });
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                // The initial fence check passed, but BEGIN is genuinely
+                // waiting on another connection when the lease is lost.
+                fence.trip("test lease lost during SQLite writer wait");
+                held.commit().unwrap();
+                release_tx.send(()).unwrap();
+                let result = writer.join().unwrap();
+                assert!(
+                    result.is_err(),
+                    "raw={raw}: writer admitted after lease loss"
+                );
+                assert!(
+                    !called.load(Ordering::SeqCst),
+                    "raw={raw}: callback started after lease loss"
+                );
+            });
+            let conn = store.conn();
+            assert!(conn.is_autocommit());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE alias='lease-wait'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            conn.busy_handler(None).unwrap();
+            *GATE.lock().unwrap() = None;
+        }
+    }
+
+    #[test]
     fn second_connection_seal_serializes_with_business_write() {
         use std::sync::{mpsc, Mutex};
         use std::time::Duration;

@@ -102,11 +102,11 @@ store/schema.rs	sqlite-schema-owner-and-restricted-recovery	guarded_write	2
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	open	2
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	prepare	22
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	transaction	29
-store/seal.rs	sqlite-guard-owner-and-inline-tests	execute	23
-store/seal.rs	sqlite-guard-owner-and-inline-tests	guarded_write	16
-store/seal.rs	sqlite-guard-owner-and-inline-tests	open	12
+store/seal.rs	sqlite-guard-owner-and-inline-tests	execute	25
+store/seal.rs	sqlite-guard-owner-and-inline-tests	guarded_write	18
+store/seal.rs	sqlite-guard-owner-and-inline-tests	open	13
 store/seal.rs	sqlite-guard-owner-and-inline-tests	prepare	2
-store/seal.rs	sqlite-guard-owner-and-inline-tests	transaction	4
+store/seal.rs	sqlite-guard-owner-and-inline-tests	transaction	5
 store/social_publish.rs	guarded-store-and-read-queries	execute	5
 store/social_publish.rs	guarded-store-and-read-queries	guarded_write	7
 store/tests/agents.rs	test-fixtures	execute	2
