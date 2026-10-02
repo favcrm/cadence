@@ -37,8 +37,8 @@ remote_result_outbox.rs	separate-results.sqlite3	execute	10
 remote_result_outbox.rs	separate-results.sqlite3	open	5
 remote_result_outbox.rs	separate-results.sqlite3	prepare	2
 remote_result_outbox.rs	separate-results.sqlite3	transaction	4
-rollout.rs	legacy-rollout-owner-and-inline-tests	execute	28
-rollout.rs	legacy-rollout-owner-and-inline-tests	open	24
+rollout.rs	legacy-rollout-owner-and-inline-tests	execute	35
+rollout.rs	legacy-rollout-owner-and-inline-tests	open	25
 rollout.rs	legacy-rollout-owner-and-inline-tests	prepare	5
 store/agents.rs	guarded-store-and-read-queries	execute	20
 store/agents.rs	guarded-store-and-read-queries	guarded_write	16

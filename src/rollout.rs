@@ -2299,6 +2299,68 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
 
+    #[test]
+    fn sibling_writer_rechecks_latch_after_open_before_callback() {
+        for closed in [0, 1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cadence.sqlite3");
+            let conn = connect(&path).unwrap();
+            conn.execute_batch("CREATE TABLE evidence(value INTEGER)")
+                .unwrap();
+            // A different connection closes the check/open gap. This is
+            // refusal evidence only, never an external owner permit.
+            let closer = Connection::open(&path).unwrap();
+            closer
+                .execute_batch("CREATE TABLE closure_state(id INTEGER PRIMARY KEY, closed INTEGER)")
+                .unwrap();
+            closer
+                .execute("INSERT INTO closure_state VALUES(1, ?1)", [closed])
+                .unwrap();
+            let mut called = false;
+            let result = immediate(&conn, |tx| {
+                called = true;
+                tx.execute("INSERT INTO evidence VALUES(1)", [])?;
+                Ok(())
+            });
+            assert!(result.is_err(), "latch {closed} admitted a sibling writer");
+            assert!(!called, "callback ran after latch {closed}");
+            assert!(conn.is_autocommit());
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM evidence", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_writer_panic_rolls_back_before_connection_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = connect(&dir.path().join("cadence.sqlite3")).unwrap();
+        conn.execute_batch("CREATE TABLE evidence(value INTEGER)")
+            .unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = immediate(&conn, |tx| {
+                tx.execute("INSERT INTO evidence VALUES(1)", [])?;
+                panic!("sibling writer callback panic");
+            });
+        }));
+        assert!(outcome.is_err());
+        assert!(conn.is_autocommit(), "panic left a live write transaction");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM evidence", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        immediate(&conn, |tx| {
+            tx.execute("INSERT INTO evidence VALUES(2)", [])?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
     fn caller(name: &str) -> Caller {
         Caller {
             identity: name.into(),
