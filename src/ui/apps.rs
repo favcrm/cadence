@@ -382,7 +382,7 @@ pub(super) fn workspace_upload(request: &mut Request, state: &std::path::Path) -
 /// ever trusting a caller-controlled path; `source` mode preserves the
 /// existing CLI/git transport unchanged. Returns `(params, staging)` —
 /// `staging` is `Some` only for `files` mode and must outlive the RPC.
-pub(super) fn workspace_upgrade_transport(
+fn workspace_upgrade_transport(
     method: &str,
     id: &str,
     wire: UpgradeWire,

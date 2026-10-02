@@ -74,6 +74,18 @@ fn sha256_of(body: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
 }
 
+/// A VALID workflow template — the exact schema `app::validate_texts` and
+/// `LocalWorkflow::validate_template` accept (title/goal/inputs frontmatter
+/// + `## Task` sections + `agent:`/`size:`/`### Acceptance` lines). Mirrors
+/// the tested `workspace.rs` `WORKFLOW` fixture, trimmed to one task.
+const WORKFLOW: &str = "---\ntitle: \"Do {{topic}}\"\ngoal: \"Do {{topic}}\"\n\
+inputs:\n  topic: { ask: \"What?\" }\n---\n\nWhy.\n\n## Do {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance\n- [ ] done\n";
+
+/// The v2 variant for the upgrade path — same valid schema, distinct bytes
+/// so the bundle digest changes.
+const WORKFLOW_V2: &str = "---\ntitle: \"Do {{topic}} v2\"\ngoal: \"Do {{topic}} v2\"\n\
+inputs:\n  topic: { ask: \"What?\" }\n---\n\nWhy v2.\n\n## Do {{topic}}\nagent: dev-1\nsize: S\n\nDo it again.\n\n### Acceptance\n- [ ] done twice\n";
+
 /// The full 10-file UTF-8 bundle map — `app.md` + one workflow + the
 /// `screens/main/` package (screens.json, client.js, styles.css + flat
 /// metadata leaves). Exact bytes; no fabricated manifest.
@@ -92,7 +104,10 @@ fn screen_bundle() -> Vec<(String, String)> {
     let decl = screens_decl("crm", assets);
     let mut files: Vec<(String, String)> = vec![
         ("app.md".into(), "---\napp: crm\ntitle: CRM\nversion: '1'\n---\nGuide.\n".into()),
-        ("workflows/do.md".into(), "---\nworkflow: do\n---\nbody\n".into()),
+        // A valid workflow per the tested schema (title/goal/inputs
+        // frontmatter + `## Task` section + `agent:`/`### Acceptance`):
+        // mirrors the workspace.rs WORKFLOW fixture exactly.
+        ("workflows/do.md".into(), WORKFLOW.to_string()),
         (format!("screens/{TAG}/screens.json"), decl),
     ];
     for (name, body) in assets {
@@ -484,21 +499,22 @@ fn cad1006_screen_package_bounds() {
     );
 
     // The declared screen `app` must equal the installed manifest app —
-    // a package that claims a different app refuses at `extract`.
+    // a package that claims a different app refuses at the mount's
+    // `screen_package_checked` (declared app vs installed app). Use a
+    // legal lowercase tag ("other") so the package validates, then prove
+    // its declared app is recovered verbatim — the mismatch refusal is
+    // exercised at the mint/digest recheck, not here.
     let js = "x()";
-    let decl_wrong_app = json!({"contract":"app-screens/v1","app":"OTHER","entry":"client.js",
+    let decl_wrong_app = json!({"contract":"app-screens/v1","app":"other","entry":"client.js",
         "assets":[{"name":"client.js","media_type":"text/javascript","sha256":sha(js),"size":js.len()}],
         "provenance":{"source_digest":sha("s"),"sdk_digest":sha("k"),"toolchain_digest":sha("t")},
         "may":[]}).to_string();
     let mut files = std::collections::BTreeMap::new();
     files.insert(format!("screens/{TAG}/screens.json"), decl_wrong_app);
     files.insert(format!("screens/{TAG}/client.js"), js.to_string());
-    // `extract` itself only checks the package vs its own declaration; the
-    // app==manifest-app guard lives in `screen_package_checked`. Here we at
-    // least prove the package's declared app is recovered verbatim (the
-    // mismatch assertion belongs to the mint/digest recheck).
     let pkg = app_screen_pkg::extract(&files, TAG).unwrap();
-    assert_eq!(pkg.app, "OTHER");
+    assert_eq!(pkg.app, "other", "declared app not recovered verbatim");
+    assert_ne!(pkg.app, "crm", "declared app must differ from install app crm");
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +633,7 @@ fn upgrade_files_map(new_version: &str) -> Value {
         "may":[]}).to_string();
     let mut files = Map::new();
     files.insert("app.md".into(), json!(format!("---\napp: crm\ntitle: CRM\nversion: '{new_version}'\n---\nGuide v{new_version}.\n")));
-    files.insert("workflows/do.md".into(), json!("---\nworkflow: do\n---\nbody v2\n"));
+    files.insert("workflows/do.md".into(), json!(WORKFLOW_V2));
     files.insert(format!("screens/{TAG}/screens.json"), json!(decl));
     for (name, body) in assets {
         files.insert(format!("screens/{TAG}/{name}"), json!(body));
