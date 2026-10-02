@@ -32,6 +32,7 @@
 #![allow(dead_code)]
 
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
 
 use super::ProviderEnv;
 use crate::error::{Error, Result};
@@ -215,11 +216,27 @@ impl GuestCtx {
 
     /// Build the spawn plan handed to `StdioAdapter::launch`: the materialized
     /// argv/envp for `pre_exec`+`execveat`. The provider argv is appended
-    /// verbatim after the fixed helper profile tokens.
-    pub(crate) fn spawn_plan(&self, provider_argv: &[String]) -> Result<PreparedExec> {
+    /// verbatim after the fixed helper profile tokens. The plan takes
+    /// ownership of the bound helper fd's `OwnedFd` — custody moves with the
+    /// spawn, so no closed/reused descriptor can be exec'd in the child.
+    ///
+    /// This consumes the helper binding: a `GuestCtx` produces at most one
+    /// spawn plan, which is correct — one open, one launch, one fd.
+    pub(crate) fn spawn_plan(mut self, provider_argv: &[String]) -> Result<PreparedExec> {
+        // Take the bound helper fd out of the ctx so the plan owns it.
+        let helper = std::mem::replace(
+            &mut self.helper,
+            execfd::BoundExec {
+                fd: std::fs::File::open("/dev/null")
+                    .map_err(|e| Error::internal(format!("sentinel fd: {e}")))?
+                    .into(),
+                digest: [0u8; 32],
+                canon: PathBuf::new(),
+            },
+        );
         Ok(
-            PreparedExec::assemble(&self.segs, provider_argv, guest_envp(self))?
-                .with_helper_fd(self.helper.fd.as_raw_fd()),
+            PreparedExec::assemble(&self.segs, provider_argv, guest_envp(&self))?
+                .with_bound(helper),
         )
     }
 
