@@ -202,6 +202,15 @@ pub struct TurnResult {
     pub error: Option<String>,
 }
 
+/// Native turn-bound input acceptance, not task completion (CAD-1015).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// The runtime queued the input for this run. This does not prove application.
+    Queued,
+    /// The named run cannot accept input; never retry on its successor.
+    NotRunning,
+}
+
 /// What [`ProviderAdapter::interrupt_turn`] did (CAD-323).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptOutcome {
@@ -424,6 +433,24 @@ pub trait ProviderAdapter: Send + Sync {
         Err(Error::rejected(
             "this endpoint has no provider-native turn interrupt — \
              `cadence agent stop` ends the endpoint instead",
+        ))
+    }
+    /// Whether this live runtime has a verified exact-turn input guard.
+    /// Static provider support alone is not sufficient.
+    fn native_turn_steering(&self) -> bool {
+        false
+    }
+    /// Queue guidance only into `turn_id`, never wake/reach a later run.
+    /// A host-side active-turn snapshot alone cannot satisfy this contract.
+    fn steer_turn(
+        &self,
+        turn_id: &str,
+        text: &str,
+        client_message_id: &str,
+    ) -> Result<SteerOutcome> {
+        let _ = (turn_id, text, client_message_id);
+        Err(Error::rejected(
+            "this runtime has no verified native exact-turn input guard",
         ))
     }
     /// What `agent stop` does before it waits. Defaults to [`interrupt`].

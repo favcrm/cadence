@@ -222,7 +222,7 @@ fn validate_name(name: &str) -> Result<()> {
 /// before it — lexically once the path stops existing, which is where
 /// creating it would land too. No spelling of a dir compares
 /// differently from the dir itself.
-fn resolved(path: &Path) -> PathBuf {
+pub(crate) fn resolved(path: &Path) -> PathBuf {
     let path = if path.is_relative() {
         std::env::current_dir()
             .map(|cwd| cwd.join(path))

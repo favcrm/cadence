@@ -33,6 +33,7 @@ Details for one verb: cadence help <verb>
 
 Options:
       --state-dir <STATE_DIR>  Runtime state directory (socket, database, logs)
+      --org <ORG>              Select an org for this command — pins the destination once. Conflicts with an explicit `--state-dir` or an inherited local binding; a managed caller (`CADENCE_ALIAS`) cannot use it
   -h, --help                   Print help
   -V, --version                Print version
 

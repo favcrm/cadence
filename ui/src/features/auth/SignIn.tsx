@@ -1,18 +1,13 @@
-import { useState } from "react";
 import type { Meta } from "../../lib/types";
 import DeviceSignIn from "./DeviceSignIn";
 import { SIGN_IN_COMMAND } from "./gate";
-import { closeSession } from "./session";
 
 /**
  * The header's sign-in state: "Sign in with `cadence ui login`" when this
- * browser holds no operator session, else a signed-in chip that signs out.
+ * browser holds no operator session, else nothing. The signed-in identity lives in AccountMenu (CAD-1030).
  * Nothing on a read-only board (the read-only chip says it all).
  */
 export default function SignIn({ meta, onChange }: { meta: Meta | null; onChange: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const user = meta?.session?.user;
-  const identity = user ? `${user.name || user.email || user.handle || user.sub} · ${user.role}` : "operator";
   if (!meta || meta.read_only || meta.signed_in === undefined) return null;
   if (!meta.signed_in) {
     const cmd = meta.login_hint ?? SIGN_IN_COMMAND;
@@ -38,23 +33,5 @@ export default function SignIn({ meta, onChange }: { meta: Meta | null; onChange
       </details>
     );
   }
-  return (
-    <button
-      type="button"
-      disabled={busy}
-      onClick={() => {
-        setBusy(true);
-        closeSession()
-          .catch(() => undefined)
-          .finally(() => {
-            setBusy(false);
-            onChange();
-          });
-      }}
-      className="header-auth-target chip bg-ink-800 text-ink-400 hover:text-ink-200 transition-colors"
-      title={`Signed in as ${user ? `${user.name} <${user.email}> · ${user.role}` : "the operator"}${meta.session ? ` (session ${meta.session.id})` : ""} — click to sign out`}
-    >
-      <span className="max-w-[12rem] truncate">{identity}</span><span className="hidden sm:inline"> · sign out</span>
-    </button>
-  );
+  return null;
 }

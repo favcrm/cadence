@@ -290,6 +290,14 @@ holds, naming the holder and the claim age. Do not route around it with a
 second lane: ask the holder, or pass `--take-over "<reason>"` for a stale or
 agreed hand-over (recorded on the issue).
 
+Every lane worktree `issue start` mints carries a per-worktree git `pre-push`
+hook (`<worktree-git-dir>/cadence-hooks/pre-push`, via `core.hooksPath` under
+`extensions.worktreeConfig`): `git push` runs `scripts/pre-push` and is
+refused when a step fails, and the hook leaves a receipt
+(`cadence-pre-push-receipt`, `head= lane= kind= steps=… rc= at=`) under the
+worktree's git dir. `--no-verify` still pushes, but the missing receipt is the
+detectable signal. The main checkout has no hook.
+
 Job work (the work axis over messages — see docs/JOBS.md):
 
 ```bash

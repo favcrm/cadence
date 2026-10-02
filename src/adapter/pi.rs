@@ -281,6 +281,22 @@ fn pi_guard_path(state_dir: &Path) -> PathBuf {
     state_dir.join("master").join("pi-guard.js")
 }
 
+/// The runtime turn guard lives outside each agent's writable tree.
+fn pi_turn_guard_path(state_dir: &Path, alias: &str) -> Result<PathBuf> {
+    let _ = pi_worker_dir(state_dir, alias)?;
+    Ok(state_dir
+        .join("pi-turn-guards")
+        .join(alias)
+        .join("guard.ts"))
+}
+
+fn write_pi_turn_guard(state_dir: &Path, alias: &str) -> Result<PathBuf> {
+    let path = pi_turn_guard_path(state_dir, alias)?;
+    ensure_private_dir(path.parent().unwrap())?;
+    std::fs::write(&path, include_str!("pi_turn_guard.ts"))?;
+    Ok(path)
+}
+
 /// A pi WORKER's private dir under the state dir (CAD-544):
 /// `<state>/agents/<alias>` holds its `PI_CODING_AGENT_DIR`
 /// (`pi/`, where the copied `auth.json` lives) and its session file
@@ -497,16 +513,26 @@ fn build_command(env: &ProviderEnv, agent: &Agent, state_dir: &Path) -> Result<V
     ] {
         cmd.push(flag.to_string());
     }
+    if crate::master::is_master(&agent.alias) {
+        cmd.push("--no-context-files".to_string());
+    }
     // CAD-559: the only extensions loaded are the generated guard
     // (master) plus the operator's pinned `[pi].providers` packages —
     // `--no-extensions` still fences off everything else, so each entry
     // is an explicit `-e` file inside its pinned package dir.
     let packages = provider_packages(env)?;
+    // Admission must close before another extension's awaited turn_end
+    // listener can yield. Load the turn guard first for both roles.
+    cmd.extend([
+        "--no-extensions".to_string(),
+        "--extension".to_string(),
+        pi_turn_guard_path(state_dir, &agent.alias)?
+            .to_string_lossy()
+            .to_string(),
+    ]);
     if crate::master::is_master(&agent.alias) {
         let agenticos_read = agenticos_read_extension(env)?;
-        cmd.push("--no-context-files".to_string());
         cmd.extend([
-            "--no-extensions".to_string(),
             "--extension".to_string(),
             pi_guard_path(state_dir).to_string_lossy().to_string(),
         ]);
@@ -534,7 +560,6 @@ fn build_command(env: &ProviderEnv, agent: &Agent, state_dir: &Path) -> Result<V
         }
         cmd.extend(["--tools".to_string(), tools.join(",")]);
     } else {
-        cmd.push("--no-extensions".to_string());
         for pkg in &packages {
             for entry in &pkg.entries {
                 cmd.extend([
@@ -661,6 +686,9 @@ fn pi_confine_inputs(
     // of `master/claude` (or its `.credentials.json`) is in the policy.
     let mut extra_read = split_paths(env.var(crate::master::CONFINE_EXTRA_READ_ENV));
     extra_read.push(pi_guard_path(state_dir));
+    if let Ok(path) = pi_turn_guard_path(state_dir, crate::master::ALIAS) {
+        extra_read.push(path);
+    }
     if let Ok(Some(path)) = agenticos_read_extension(env) {
         extra_read.push(path);
     }
@@ -851,6 +879,9 @@ pub fn pi_worker_confinement(
     }
 
     let params = agent.params.clone().unwrap_or(Value::Null);
+    if let Ok(path) = pi_turn_guard_path(state_dir, &agent.alias) {
+        read.push(path);
+    }
     read.push(crate::client::briefing_path(
         state_dir,
         &params,
@@ -1423,6 +1454,14 @@ struct Shared {
     /// populated at `open` once the transport exists.
     transport: Mutex<Option<Arc<StdioAdapter>>>,
     dead: AtomicBool,
+    guard_ready: AtomicBool,
+    guard_receipts: Mutex<HashMap<String, GuardReceipt>>,
+}
+
+struct GuardReceipt {
+    operation: String,
+    turn_id: String,
+    data: Option<Value>,
 }
 
 pub struct PiAdapter {
@@ -1478,6 +1517,8 @@ impl PiAdapter {
             max_turn: Mutex::new(None),
             transport: Mutex::new(None),
             dead: AtomicBool::new(false),
+            guard_ready: AtomicBool::new(false),
+            guard_receipts: Mutex::new(HashMap::new()),
         });
         let routed = Arc::clone(&shared);
         let disconnected = Arc::clone(&shared);
@@ -1549,6 +1590,59 @@ impl PiAdapter {
             Box::new(move |incoming| routed.dispatch_for(&gen_dispatch, incoming)),
             Box::new(move || disconnected.disconnect_for(&gen_disconnect)),
         )
+    }
+
+    /// A command response says only that Pi handled a slash command.
+    /// The correlated runtime custom entry is the admission proof.
+    fn guard_command(
+        &self,
+        operation: &str,
+        turn_id: &str,
+        request: &str,
+        text: Option<&str>,
+    ) -> Result<Value> {
+        {
+            let mut receipts = self.shared.guard_receipts.lock().unwrap();
+            if receipts.contains_key(request) {
+                return Err(Error::rejected("turn input request is already in progress"));
+            }
+            receipts.insert(
+                request.to_string(),
+                GuardReceipt {
+                    operation: operation.to_string(),
+                    turn_id: turn_id.to_string(),
+                    data: None,
+                },
+            );
+        }
+        let mut envelope = json!({"request": request, "turn": turn_id});
+        if let Some(text) = text {
+            envelope["text"] = json!(text);
+        }
+        let response = self.request_with_timeout(
+            "prompt",
+            json!({
+                "message": format!("/cadence-{operation}-turn {envelope}"),
+            }),
+            Duration::from_secs(5),
+        );
+        let proof = self
+            .shared
+            .guard_receipts
+            .lock()
+            .unwrap()
+            .remove(request)
+            .and_then(|r| r.data);
+        if let Some(proof) = proof {
+            return Ok(proof);
+        }
+        Err(Error::unknown(format!(
+            "No correlated Pi runtime {operation} receipt; input acceptance is unknown ({})",
+            response
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "command response is not admission proof".to_string())
+        )))
     }
 
     /// A `request` answered `success:true` → its `data`, else the
@@ -1713,6 +1807,15 @@ impl PiAdapter {
     /// definitive reply, never `OutcomeUnknown`. A timeout is unknown:
     /// the command may have been delivered.
     fn request(&self, command: &str, fields: Value) -> Result<Value> {
+        self.request_with_timeout(command, fields, REQUEST_TIMEOUT)
+    }
+
+    fn request_with_timeout(
+        &self,
+        command: &str,
+        fields: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let id = format!(
             "c{}",
             self.shared.pending.next.fetch_add(1, Ordering::SeqCst)
@@ -1735,13 +1838,13 @@ impl PiAdapter {
             self.shared.pending.map.lock().unwrap().remove(&id);
             return Err(e);
         }
-        match rx.recv_timeout(REQUEST_TIMEOUT) {
+        match rx.recv_timeout(timeout) {
             Ok(resp) => Ok(resp),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.shared.pending.map.lock().unwrap().remove(&id);
                 Err(Error::unknown(format!(
                     "No response to '{command}' within {}s; provider state is unknown",
-                    REQUEST_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 )))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::unknown(
@@ -1784,6 +1887,27 @@ impl Shared {
             return;
         }
         match method.as_str() {
+            "entry_appended" => {
+                if params.pointer("/entry/customType").and_then(Value::as_str)
+                    == Some("cadence-turn-input")
+                {
+                    if let Some(data) = params.pointer("/entry/data") {
+                        if let Some(request) = data.get("request").and_then(Value::as_str) {
+                            let mut receipts = self.guard_receipts.lock().unwrap();
+                            if let Some(expected) = receipts.get_mut(request) {
+                                if data.get("version").and_then(Value::as_u64) == Some(1)
+                                    && data.get("operation").and_then(Value::as_str)
+                                        == Some(expected.operation.as_str())
+                                    && data.get("turn").and_then(Value::as_str)
+                                        == Some(expected.turn_id.as_str())
+                                {
+                                    expected.data = Some(data.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             "message_end" => self.on_message_end(&params),
             "tool_execution_start" => self.on_tool_start(&params),
             "tool_execution_end" => self.on_tool_end(&params),
@@ -1929,6 +2053,7 @@ impl Shared {
 
     /// Transport EOF: fail pending commands and wake turn waiters.
     fn on_disconnect(&self) {
+        self.guard_ready.store(false, Ordering::SeqCst);
         self.dead.store(true, Ordering::SeqCst);
         self.pending.fail_all("Pi process disconnected");
         let _guard = self.outcomes.lock().unwrap();
@@ -2023,6 +2148,8 @@ impl ProviderAdapter for PiAdapter {
             let agenticos_reads = agenticos_read_extension(&self.env)?.is_some();
             write_pi_guard(&self.state_dir, agenticos_reads)?;
         }
+        self.shared.guard_ready.store(false, Ordering::SeqCst);
+        let guard_path = write_pi_turn_guard(&self.state_dir, &agent.alias)?.canonicalize()?;
         let (command, confinement) = launch_command(&self.env, &self.state_dir, agent)?;
         if let Some(policy) = &confinement {
             let role = if master { "master" } else { "worker" };
@@ -2195,6 +2322,35 @@ impl ProviderAdapter for PiAdapter {
                     Err(e) => return Err(e),
                 }
             }
+            // An old/mocked runtime may not support the extension commands.
+            // Ordinary queued turns remain compatible; native input is disabled.
+            let guard_ready = self
+                .checked("get_commands", json!({}))
+                .ok()
+                .is_some_and(|data| {
+                    data.get("commands")
+                        .and_then(Value::as_array)
+                        .is_some_and(|commands| {
+                            [
+                                "cadence-bind-turn",
+                                "cadence-steer-turn",
+                                "cadence-abandon-turn",
+                            ]
+                            .iter()
+                            .all(|name| {
+                                commands.iter().any(|command| {
+                                    command.get("name").and_then(Value::as_str) == Some(*name)
+                                        && command.get("source").and_then(Value::as_str)
+                                            == Some("extension")
+                                        && command
+                                            .pointer("/sourceInfo/path")
+                                            .and_then(Value::as_str)
+                                            == guard_path.to_str()
+                                })
+                            })
+                        })
+                });
+            self.shared.guard_ready.store(guard_ready, Ordering::SeqCst);
             let state = self.request("get_state", json!({}))?;
             if state.get("success").and_then(Value::as_bool) != Some(true) {
                 return Err(self.command_error("get_state", &state));
@@ -2299,8 +2455,28 @@ impl ProviderAdapter for PiAdapter {
             }
         }
         *self.shared.turn.lock().unwrap() = TurnAcc::default();
-        let resp = self.request("prompt", json!({"message": prompt}))?;
+        let guarded = self.native_turn_steering();
+        if guarded {
+            let binding = self.guard_command("bind", &turn_id, &format!("bind-{turn_id}"), None)?;
+            if binding.get("outcome").and_then(Value::as_str) != Some("bound") {
+                return Err(Error::rejected("Pi runtime refused the new turn binding"));
+            }
+        }
+        let submitted = if guarded {
+            // RPC does not expose expandPromptTemplates:false. Do not let a
+            // plain task body invoke our private slash-control commands.
+            format!("Cadence task input (not a runtime command):\n{prompt}")
+        } else {
+            prompt.to_string()
+        };
+        let resp = self.request("prompt", json!({"message": submitted}))?;
         if resp.get("success").and_then(Value::as_bool) != Some(true) {
+            if guarded {
+                // Definite prompt refusal can leave an unused pending binding.
+                // Clear only that exact unused binding, never an active run.
+                let _ =
+                    self.guard_command("abandon", &turn_id, &format!("abandon-{turn_id}"), None);
+            }
             return Err(self.command_error("prompt", &resp));
         }
         *self.shared.active_turn.lock().unwrap() = Some(turn_id.clone());
@@ -2366,6 +2542,17 @@ impl ProviderAdapter for PiAdapter {
         })();
         *self.shared.active_turn.lock().unwrap() = None;
         let acc = waited?;
+        if guarded {
+            // The actor cannot dispatch its next kickoff until this returns.
+            // Settlement has closed runtime admission. Clear any accepted but
+            // unconsumed native input left by cancellation before a successor.
+            // An uncertain cleanup fences the kickoff rather than risking replay.
+            self.checked("clear_queue", json!({})).map_err(|error| {
+                Error::unknown(format!(
+                    "Pi native input cleanup was not confirmed: {error}"
+                ))
+            })?;
+        }
         let interrupted_here = self.shared.interrupt_at.lock().unwrap().take().is_some();
         let aborted = acc.stop.as_deref() == Some("aborted");
         let (status, error) = if aborted || (interrupted_here && acc.error.is_some()) {
@@ -2425,6 +2612,36 @@ impl ProviderAdapter for PiAdapter {
         }
         self.interrupt();
         Ok(super::InterruptOutcome::Delivered)
+    }
+
+    fn native_turn_steering(&self) -> bool {
+        self.shared.guard_ready.load(Ordering::SeqCst) && !self.shared.dead.load(Ordering::SeqCst)
+    }
+
+    fn steer_turn(
+        &self,
+        turn_id: &str,
+        text: &str,
+        client_message_id: &str,
+    ) -> Result<super::SteerOutcome> {
+        if !self.native_turn_steering() {
+            return Err(Error::rejected(
+                "Pi runtime has no verified turn-input guard",
+            ));
+        }
+        let active = self.shared.active_turn.lock().unwrap();
+        if active.as_deref() != Some(turn_id) {
+            return Ok(super::SteerOutcome::NotRunning);
+        }
+        let proof = self.guard_command("steer", turn_id, client_message_id, Some(text))?;
+        match proof.get("outcome").and_then(Value::as_str) {
+            Some("queued") => Ok(super::SteerOutcome::Queued),
+            Some("skipped_inactive") => Ok(super::SteerOutcome::NotRunning),
+            Some("rejected") => Err(Error::rejected("Pi runtime refused turn-bound guidance")),
+            _ => Err(Error::unknown(
+                "Unrecognized Pi runtime turn-input disposition",
+            )),
+        }
     }
 
     /// CAD-551: the operator's provider-session verbs. `stop` rides the
