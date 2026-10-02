@@ -88,10 +88,13 @@ impl Store {
         )
     }
     pub fn app_context_show(&self, install: &str, id: &str) -> Result<Value> {
-        Ok(json!({"context":Self::app_context_show_in(&self.conn(),install,id)?}))
+        {
+            let conn = self.write_conn()?;
+            Ok(json!({"context":Self::app_context_show_in(&conn,install,id)?}))
+        }
     }
     pub fn app_context_list(&self, install: &str) -> Result<Value> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let ids = conn
             .prepare(
                 "SELECT id FROM app_contexts WHERE install_id=? ORDER BY created,id LIMIT 101",
@@ -112,7 +115,8 @@ impl Store {
         install: &str,
         id: &str,
     ) -> Result<(ContextConfig, ContextProof)> {
-        let row = Self::app_context_show_in(&self.conn(), install, id)?;
+        let conn = self.write_conn()?;
+        let row = Self::app_context_show_in(&conn, install, id)?;
         if row["state"] != "active" {
             return Err(Error::rejected("context is archived"));
         }

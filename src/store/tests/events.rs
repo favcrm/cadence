@@ -175,7 +175,7 @@
     /// naming it — `at` backdated so the rollup's age cut applies.
     fn delivery(s: &Store, alias: &str, id: &str, state: &str, events: &[(&str, f64)]) {
         s.enqueue(alias, "work", None, id, "user").unwrap();
-        let conn = s.conn();
+        let conn = s.fixture_conn().unwrap();
         conn.execute(
             "UPDATE messages SET state=?1 WHERE id=?2",
             params![state, id],
@@ -301,7 +301,7 @@
         delivery(&s, "a1", "m-done", "completed", &[]);
         let old = now() - 30.0 * DAY;
         {
-            let conn = s.conn();
+            let conn = s.fixture_conn().unwrap();
             for kind in [
                 "turn_started",
                 "turn_finished",

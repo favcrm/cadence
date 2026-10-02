@@ -72,7 +72,7 @@ impl Store {
     /// Every send whose durable intent is still live — the boot-time
     /// sweep's worklist.
     pub fn crm_sends_sending(&self) -> Result<Vec<(String, String, String)>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let mut stmt = conn
             .prepare("SELECT install_id,context_id,send_id FROM crm_sends WHERE state='sending' ORDER BY created")
             .map_err(|e| Error::internal(e.to_string()))?;
@@ -111,7 +111,7 @@ impl Store {
         &self,
         token_hash: &str,
     ) -> Result<Option<(String, String)>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         conn.query_row(
             "SELECT install_id,context_id FROM crm_unsubscribe_index WHERE token_hash=?",
             params![token_hash],

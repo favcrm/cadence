@@ -1,7 +1,7 @@
 //! Open, schema migrations, restart recovery and adoption.
 
 use crate::adapter::registry;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use rusqlite::Connection;
 use serde_json::json;
 use std::path::Path;
@@ -106,7 +106,14 @@ pub struct RecoveryOutcome {
 impl Store {
     /// Open (creating if needed), migrate, and recover in-flight state.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_adopting(path, None).map(|(store, _)| store)
+        Self::open_mode(path, super::seal::OpenMode::Legacy)
+    }
+
+    /// `open` with an explicit deployment mode. `Protected` is a startup
+    /// *request* (agent_uid/hosted.lease provenance) that forces strict
+    /// refusals — never external restore/init authority.
+    pub fn open_mode(path: &Path, mode: super::seal::OpenMode) -> Result<Self> {
+        Self::open_adopting_mode(path, None, mode).map(|(store, _)| store)
     }
 
     /// `open` with the consumed hot-restart marker (CAD-89): `serve()`
@@ -120,7 +127,16 @@ impl Store {
         path: &Path,
         marker: Option<ConsumedMarker>,
     ) -> Result<(Self, RecoveryOutcome)> {
-        let (store, outcome) = Self::open_inner(path, marker, true, true)?;
+        Self::open_adopting_mode(path, marker, super::seal::OpenMode::Legacy)
+    }
+
+    /// `open_adopting` with an explicit deployment mode (CAD-1011).
+    pub fn open_adopting_mode(
+        path: &Path,
+        marker: Option<ConsumedMarker>,
+        mode: super::seal::OpenMode,
+    ) -> Result<(Self, RecoveryOutcome)> {
+        let (store, outcome) = Self::open_inner(path, marker, true, true, mode)?;
         Ok((store, outcome.expect("open_adopting always recovers")))
     }
 
@@ -129,7 +145,19 @@ impl Store {
     /// the daemon still holds the store — recovery would fence the
     /// daemon's in-flight turns (CAD-577).
     pub fn open_side(path: &Path) -> Result<Self> {
-        Self::open_inner(path, None, true, false).map(|(store, _)| store)
+        Self::open_side_mode(path, super::seal::OpenMode::Legacy)
+    }
+
+    /// `open_side` with a mode — under `Protected` a second writer
+    /// connection to `cadence.sqlite3` refuses outright (CAD-1011).
+    pub fn open_side_mode(path: &Path, mode: super::seal::OpenMode) -> Result<Self> {
+        if mode == super::seal::OpenMode::Protected {
+            return Err(Error::rejected(
+                "open_side refused: a second writer connection to a protected \
+                 cadence.sqlite3 is not permitted",
+            ));
+        }
+        Self::open_inner(path, None, true, false, mode).map(|(store, _)| store)
     }
 
     /// Migrate an older database without the rollout lease gate.
@@ -138,7 +166,8 @@ impl Store {
     /// `open` and `open_adopting` — the daemon and doctor paths — never
     /// call it, so a lower-schema production database still refuses.
     pub fn open_for_schema_tests(path: &Path) -> Result<Self> {
-        Self::open_inner(path, None, false, true).map(|(store, _)| store)
+        Self::open_inner(path, None, false, true, super::seal::OpenMode::Legacy)
+            .map(|(store, _)| store)
     }
 
     fn open_inner(
@@ -146,25 +175,50 @@ impl Store {
         marker: Option<ConsumedMarker>,
         gate: bool,
         recover: bool,
+        mode: super::seal::OpenMode,
     ) -> Result<(Self, Option<RecoveryOutcome>)> {
         let permit = if gate {
             crate::rollout::authorize_migration(path)?
         } else {
             crate::rollout::MigrationPermit { crossing: None }
         };
+        // CAD-1011: durable-closure preflight BEFORE any write or WAL
+        // mutation — read-only, so a sealed/protected file is never
+        // touched. Decides whether legacy WAL conversion may run.
+        let decision = Self::preflight(path, mode)?;
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
+        // Fail-closed authorizer: disarmed until a guarded tx arms it.
+        let seal_state = std::sync::Arc::new(super::seal::GuardState::default());
+        super::seal::install_authorizer(&conn, seal_state.clone());
+        // Only a legacy pre-latch db may take the autocommit WAL
+        // conversion; a protected db is already WAL by provision and a
+        // latch-carrying file can never reach this conversion.
+        if matches!(decision, super::seal::PreflightDecision::LegacyFresh)
+            || matches!(decision, super::seal::PreflightDecision::LegacyConvertWal)
+        {
+            // The autocommit WAL conversion is owner-maintenance — armed so
+            // the authorizer lets the value-bearing `journal_mode=WAL`
+            // pragma through (the business lane can never write it).
+            super::seal::with_owner_tx_control(&seal_state, || -> Result<()> {
+                conn.pragma_update(None, "journal_mode", "WAL")
+                    .map_err(Error::from)
+            })?;
+        }
+        // CAD-1011: the schema bootstrap + every migration run under the
+        // constructor's owner-maintenance + tx-control window — the only
+        // scope the authorizer allows DDL/migration writes in.
+        super::seal::with_owner_tx_control(&seal_state, || -> Result<()> {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
              INSERT INTO schema_version(version)
                SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM schema_version);",
-        )?;
-        let version: i64 =
-            conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?;
-        if version < 1 {
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS agents(
+            )?;
+            let version: i64 =
+                conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?;
+            if version < 1 {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS agents(
                     alias TEXT PRIMARY KEY, provider TEXT NOT NULL,
                     endpoint_kind TEXT NOT NULL, role TEXT NOT NULL,
                     cwd TEXT NOT NULL, sandbox TEXT NOT NULL,
@@ -185,67 +239,67 @@ impl Store {
                     alias TEXT NOT NULL, kind TEXT NOT NULL,
                     payload TEXT NOT NULL, at REAL NOT NULL);
                  UPDATE schema_version SET version=1;",
-            )?;
-        }
-        if version < 2 {
-            // Atomic: the column add and version bump commit together, so
-            // a crash cannot leave version=1 with the column present
-            // (which would permanently fail the next ALTER). The column
-            // check makes an already half-applied state converge instead
-            // of erroring on a duplicate column.
-            let has_endpoint = conn
-                .prepare("PRAGMA table_info(agents)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .any(|name| name == "endpoint");
-            let tx = conn.unchecked_transaction()?;
-            if !has_endpoint {
-                tx.execute_batch("ALTER TABLE agents ADD COLUMN endpoint TEXT")?;
+                )?;
             }
-            tx.execute("UPDATE schema_version SET version=2", [])?;
-            tx.commit()?;
-        }
-        if version < 3 {
-            // v3: `params` holds endpoint-specific registration options
-            // (pty: native session to resume); `generation` is the live
-            // endpoint generation minted per `open` for stale-token
-            // rejection. Same atomic column-check + transaction pattern
-            // as v2.
-            let columns: Vec<String> = conn
-                .prepare("PRAGMA table_info(agents)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let tx = conn.unchecked_transaction()?;
-            if !columns.iter().any(|c| c == "params") {
-                tx.execute_batch("ALTER TABLE agents ADD COLUMN params TEXT")?;
+            if version < 2 {
+                // Atomic: the column add and version bump commit together, so
+                // a crash cannot leave version=1 with the column present
+                // (which would permanently fail the next ALTER). The column
+                // check makes an already half-applied state converge instead
+                // of erroring on a duplicate column.
+                let has_endpoint = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .any(|name| name == "endpoint");
+                let tx = conn.unchecked_transaction()?;
+                if !has_endpoint {
+                    tx.execute_batch("ALTER TABLE agents ADD COLUMN endpoint TEXT")?;
+                }
+                tx.execute("UPDATE schema_version SET version=2", [])?;
+                tx.commit()?;
             }
-            if !columns.iter().any(|c| c == "generation") {
-                tx.execute_batch("ALTER TABLE agents ADD COLUMN generation TEXT")?;
+            if version < 3 {
+                // v3: `params` holds endpoint-specific registration options
+                // (pty: native session to resume); `generation` is the live
+                // endpoint generation minted per `open` for stale-token
+                // rejection. Same atomic column-check + transaction pattern
+                // as v2.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = conn.unchecked_transaction()?;
+                if !columns.iter().any(|c| c == "params") {
+                    tx.execute_batch("ALTER TABLE agents ADD COLUMN params TEXT")?;
+                }
+                if !columns.iter().any(|c| c == "generation") {
+                    tx.execute_batch("ALTER TABLE agents ADD COLUMN generation TEXT")?;
+                }
+                tx.execute("UPDATE schema_version SET version=3", [])?;
+                tx.commit()?;
             }
-            tx.execute("UPDATE schema_version SET version=3", [])?;
-            tx.commit()?;
-        }
-        if version < 4 {
-            // v4: the work axis. `jobs`/`tasks`/`verdicts` tables plus
-            // attachment columns on `messages` (`task_id`) and `events`
-            // (`job_id`/`task_id`). One transaction, existence checks
-            // before each ALTER, `IF NOT EXISTS` on the new objects —
-            // a half-applied v4 converges on reopen like v2/v3. Old
-            // messages simply read task_id NULL (unattached delivery).
-            let msg_cols: Vec<String> = conn
-                .prepare("PRAGMA table_info(messages)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let event_cols: Vec<String> = conn
-                .prepare("PRAGMA table_info(events)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS jobs(
+            if version < 4 {
+                // v4: the work axis. `jobs`/`tasks`/`verdicts` tables plus
+                // attachment columns on `messages` (`task_id`) and `events`
+                // (`job_id`/`task_id`). One transaction, existence checks
+                // before each ALTER, `IF NOT EXISTS` on the new objects —
+                // a half-applied v4 converges on reopen like v2/v3. Old
+                // messages simply read task_id NULL (unattached delivery).
+                let msg_cols: Vec<String> = conn
+                    .prepare("PRAGMA table_info(messages)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let event_cols: Vec<String> = conn
+                    .prepare("PRAGMA table_info(events)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS jobs(
                     id TEXT PRIMARY KEY,
                     title TEXT,
                     spec_path TEXT NOT NULL,
@@ -287,77 +341,77 @@ impl Store {
                     message TEXT,
                     created REAL NOT NULL);
                  CREATE INDEX IF NOT EXISTS verdicts_task ON verdicts(task_id, revision);",
-            )?;
-            if !msg_cols.iter().any(|c| c == "task_id") {
-                tx.execute_batch("ALTER TABLE messages ADD COLUMN task_id TEXT")?;
-            }
-            if !event_cols.iter().any(|c| c == "job_id") {
-                tx.execute_batch("ALTER TABLE events ADD COLUMN job_id TEXT")?;
-            }
-            if !event_cols.iter().any(|c| c == "task_id") {
-                tx.execute_batch("ALTER TABLE events ADD COLUMN task_id TEXT")?;
-            }
-            tx.execute_batch(
-                "CREATE INDEX IF NOT EXISTS msg_task ON messages(task_id);
+                )?;
+                if !msg_cols.iter().any(|c| c == "task_id") {
+                    tx.execute_batch("ALTER TABLE messages ADD COLUMN task_id TEXT")?;
+                }
+                if !event_cols.iter().any(|c| c == "job_id") {
+                    tx.execute_batch("ALTER TABLE events ADD COLUMN job_id TEXT")?;
+                }
+                if !event_cols.iter().any(|c| c == "task_id") {
+                    tx.execute_batch("ALTER TABLE events ADD COLUMN task_id TEXT")?;
+                }
+                tx.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS msg_task ON messages(task_id);
                  CREATE INDEX IF NOT EXISTS events_job ON events(job_id, seq);
                  UPDATE schema_version SET version=4;",
-            )?;
-            tx.commit()?;
-        }
-        if version < 5 {
-            // v5: `verdicts.verify` — the CLI's worktree-verification
-            // result ({checked, skipped}) stored with the verdict it
-            // gated (CAD-51). Same atomic column-check + transaction
-            // pattern as v2/v3; old rows read verify NULL.
-            let columns: Vec<String> = conn
-                .prepare("PRAGMA table_info(verdicts)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let tx = conn.unchecked_transaction()?;
-            if !columns.iter().any(|c| c == "verify") {
-                tx.execute_batch("ALTER TABLE verdicts ADD COLUMN verify TEXT")?;
+                )?;
+                tx.commit()?;
             }
-            tx.execute("UPDATE schema_version SET version=5", [])?;
-            tx.commit()?;
-        }
-        if version < 6 {
-            // v6: `jobs.stall_secs` — the per-job silence budget for
-            // stall detection (CAD-52). NULL leaves resolution to the
-            // assignee's `stall_secs` param, then the daemon default.
-            let columns: Vec<String> = conn
-                .prepare("PRAGMA table_info(jobs)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let tx = conn.unchecked_transaction()?;
-            if !columns.iter().any(|c| c == "stall_secs") {
-                tx.execute_batch("ALTER TABLE jobs ADD COLUMN stall_secs INTEGER")?;
+            if version < 5 {
+                // v5: `verdicts.verify` — the CLI's worktree-verification
+                // result ({checked, skipped}) stored with the verdict it
+                // gated (CAD-51). Same atomic column-check + transaction
+                // pattern as v2/v3; old rows read verify NULL.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(verdicts)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = conn.unchecked_transaction()?;
+                if !columns.iter().any(|c| c == "verify") {
+                    tx.execute_batch("ALTER TABLE verdicts ADD COLUMN verify TEXT")?;
+                }
+                tx.execute("UPDATE schema_version SET version=5", [])?;
+                tx.commit()?;
             }
-            tx.execute("UPDATE schema_version SET version=6", [])?;
-            tx.commit()?;
-        }
-        if version < 8 {
-            // v8: daemon-owned supervision registrations. PR #80 owns v7
-            // for provider-confirmed effort. Preserve that v7 schema contract
-            // when CAD-176 lands first: a later v7 migration will be skipped
-            // at version 8, so the prerequisite column must already exist.
-            // This bridge carries schema compatibility only; provider effort
-            // reporting remains owned by v7. Coverage is a separate table so
-            // the observer never expands a project name into implicit task
-            // membership. Alert uniqueness binds one monitor to one observed
-            // event fingerprint across restarts.
-            let agent_columns: Vec<String> = conn
-                .prepare("PRAGMA table_info(agents)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let tx = conn.unchecked_transaction()?;
-            if !agent_columns.iter().any(|column| column == "effort") {
-                tx.execute_batch("ALTER TABLE agents ADD COLUMN effort TEXT")?;
+            if version < 6 {
+                // v6: `jobs.stall_secs` — the per-job silence budget for
+                // stall detection (CAD-52). NULL leaves resolution to the
+                // assignee's `stall_secs` param, then the daemon default.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(jobs)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = conn.unchecked_transaction()?;
+                if !columns.iter().any(|c| c == "stall_secs") {
+                    tx.execute_batch("ALTER TABLE jobs ADD COLUMN stall_secs INTEGER")?;
+                }
+                tx.execute("UPDATE schema_version SET version=6", [])?;
+                tx.commit()?;
             }
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS monitors(
+            if version < 8 {
+                // v8: daemon-owned supervision registrations. PR #80 owns v7
+                // for provider-confirmed effort. Preserve that v7 schema contract
+                // when CAD-176 lands first: a later v7 migration will be skipped
+                // at version 8, so the prerequisite column must already exist.
+                // This bridge carries schema compatibility only; provider effort
+                // reporting remains owned by v7. Coverage is a separate table so
+                // the observer never expands a project name into implicit task
+                // membership. Alert uniqueness binds one monitor to one observed
+                // event fingerprint across restarts.
+                let agent_columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = conn.unchecked_transaction()?;
+                if !agent_columns.iter().any(|column| column == "effort") {
+                    tx.execute_batch("ALTER TABLE agents ADD COLUMN effort TEXT")?;
+                }
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS monitors(
                     id TEXT PRIMARY KEY,
                     project TEXT NOT NULL,
                     owner TEXT NOT NULL,
@@ -397,79 +451,79 @@ impl Store {
                  CREATE INDEX IF NOT EXISTS monitor_alerts_monitor
                     ON monitor_alerts(monitor_id, seq);
                  UPDATE schema_version SET version=8;",
-            )?;
-            tx.commit()?;
-        }
-        if version < 9 {
-            // v9: provider-owned allowance telemetry. It is kept in its own
-            // column so caller-editable `params` can never become quota
-            // evidence. The column check makes a half-applied migration
-            // converge on reopen. CAD-114 owns this schema slot.
-            let columns: Vec<String> = conn
-                .prepare("PRAGMA table_info(agents)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let tx = conn.unchecked_transaction()?;
-            if !columns.iter().any(|column| column == "quota") {
-                tx.execute_batch("ALTER TABLE agents ADD COLUMN quota TEXT")?;
-            }
-            tx.execute("UPDATE schema_version SET version=9", [])?;
-            tx.commit()?;
-        }
-        if version < 10 {
-            // v10: background dispatch is a separate, durable consent from
-            // the v8 manual `dispatch_enabled` bit. Keep the old bit's
-            // meaning stable so an existing registration cannot begin
-            // dispatching merely because the daemon was upgraded. This
-            // migration also repairs a schema-9 database made by an older
-            // PR100 candidate, which used v9 for this monitor column before
-            // the provider quota owner claimed v9. Thus either PR can be
-            // landed first without silently skipping the other column.
-            let agent_columns: Vec<String> = conn
-                .prepare("PRAGMA table_info(agents)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let monitor_columns: Vec<String> = conn
-                .prepare("PRAGMA table_info(monitors)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let tx = conn.unchecked_transaction()?;
-            if !agent_columns.iter().any(|column| column == "quota") {
-                tx.execute_batch("ALTER TABLE agents ADD COLUMN quota TEXT")?;
-            }
-            if !monitor_columns
-                .iter()
-                .any(|column| column == "auto_dispatch_enabled")
-            {
-                tx.execute_batch(
-                    "ALTER TABLE monitors
-                     ADD COLUMN auto_dispatch_enabled INTEGER NOT NULL DEFAULT 0",
                 )?;
+                tx.commit()?;
             }
-            tx.execute("UPDATE schema_version SET version=10", [])?;
-            tx.commit()?;
-        }
-        if version < 11 {
-            // v11: daemon-wide model defaults plus per-agent team role and
-            // model provenance. Existing rows stay null so resume does not
-            // re-resolve a default that did not exist when they launched.
-            let columns: Vec<String> = conn
-                .prepare("PRAGMA table_info(agents)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let tx = conn.unchecked_transaction()?;
-            if !columns.iter().any(|column| column == "team_role") {
-                tx.execute_batch("ALTER TABLE agents ADD COLUMN team_role TEXT")?;
+            if version < 9 {
+                // v9: provider-owned allowance telemetry. It is kept in its own
+                // column so caller-editable `params` can never become quota
+                // evidence. The column check makes a half-applied migration
+                // converge on reopen. CAD-114 owns this schema slot.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = conn.unchecked_transaction()?;
+                if !columns.iter().any(|column| column == "quota") {
+                    tx.execute_batch("ALTER TABLE agents ADD COLUMN quota TEXT")?;
+                }
+                tx.execute("UPDATE schema_version SET version=9", [])?;
+                tx.commit()?;
             }
-            if !columns.iter().any(|column| column == "model_selection") {
-                tx.execute_batch("ALTER TABLE agents ADD COLUMN model_selection TEXT")?;
+            if version < 10 {
+                // v10: background dispatch is a separate, durable consent from
+                // the v8 manual `dispatch_enabled` bit. Keep the old bit's
+                // meaning stable so an existing registration cannot begin
+                // dispatching merely because the daemon was upgraded. This
+                // migration also repairs a schema-9 database made by an older
+                // PR100 candidate, which used v9 for this monitor column before
+                // the provider quota owner claimed v9. Thus either PR can be
+                // landed first without silently skipping the other column.
+                let agent_columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let monitor_columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(monitors)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = conn.unchecked_transaction()?;
+                if !agent_columns.iter().any(|column| column == "quota") {
+                    tx.execute_batch("ALTER TABLE agents ADD COLUMN quota TEXT")?;
+                }
+                if !monitor_columns
+                    .iter()
+                    .any(|column| column == "auto_dispatch_enabled")
+                {
+                    tx.execute_batch(
+                        "ALTER TABLE monitors
+                     ADD COLUMN auto_dispatch_enabled INTEGER NOT NULL DEFAULT 0",
+                    )?;
+                }
+                tx.execute("UPDATE schema_version SET version=10", [])?;
+                tx.commit()?;
             }
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS model_defaults(
+            if version < 11 {
+                // v11: daemon-wide model defaults plus per-agent team role and
+                // model provenance. Existing rows stay null so resume does not
+                // re-resolve a default that did not exist when they launched.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = conn.unchecked_transaction()?;
+                if !columns.iter().any(|column| column == "team_role") {
+                    tx.execute_batch("ALTER TABLE agents ADD COLUMN team_role TEXT")?;
+                }
+                if !columns.iter().any(|column| column == "model_selection") {
+                    tx.execute_batch("ALTER TABLE agents ADD COLUMN model_selection TEXT")?;
+                }
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS model_defaults(
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     revision INTEGER NOT NULL,
                     document TEXT NOT NULL);
@@ -477,236 +531,238 @@ impl Store {
                    SELECT 1, 0, '{\"schema\":1,\"providers\":{}}'
                    WHERE NOT EXISTS (SELECT 1 FROM model_defaults WHERE id = 1);
                  UPDATE schema_version SET version=11;",
-            )?;
-            tx.commit()?;
-        }
-        if version < 12 {
-            // v12: rollout lease + the build commit the daemon last
-            // recorded. The lease gate runs before this function opens
-            // the file; reaching here means the crossing was allowed
-            // (fresh database, current schema, matching backup receipt,
-            // or the one-time CADENCE_ROLLOUT_BOOTSTRAP introduction).
-            let tx = conn.unchecked_transaction()?;
-            crate::rollout::ensure_lease_tables(&tx)?;
-            tx.execute("UPDATE schema_version SET version=12", [])?;
-            tx.commit()?;
-        }
-        if version < 13 {
-            // v13: durable conversation threads (CAD-319) — a thread per
-            // agent alias and its ordered entries, outliving provider
-            // sessions. New objects only, `IF NOT EXISTS`, one
-            // transaction: a half-applied v13 converges on reopen.
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(threads::SCHEMA_V13)?;
-            tx.execute("UPDATE schema_version SET version=13", [])?;
-            tx.commit()?;
-        }
-        if version < 14 {
-            // v14: `agents.pid_start` (CAD-385) — the recorded pid's
-            // process start time, so a reused pid never maps to a stale
-            // row's alias. Existing rows stay NULL: they fail closed
-            // until their endpoint is recorded again (recovery below
-            // clears every live pid; adoption re-records it with its
-            // start). Column add + bump in one transaction, and the add
-            // is skipped when present: a half-applied v14 converges.
-            let columns: Vec<String> = conn
-                .prepare("PRAGMA table_info(agents)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let tx = conn.unchecked_transaction()?;
-            if !columns.iter().any(|column| column == "pid_start") {
-                tx.execute_batch("ALTER TABLE agents ADD COLUMN pid_start INTEGER")?;
-            }
-            tx.execute("UPDATE schema_version SET version=14", [])?;
-            tx.commit()?;
-        }
-        if version < 15 {
-            // v15: `messages.priority` (CAD-158) — the delivery rank
-            // `take_queued` orders by (urgent first, then arrival).
-            // Existing rows read 0 = normal, so an upgraded queue keeps
-            // its FIFO order. Column add + bump in one transaction, the
-            // add skipped when present: a half-applied v15 converges.
-            let columns: Vec<String> = conn
-                .prepare("PRAGMA table_info(messages)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let tx = conn.unchecked_transaction()?;
-            if !columns.iter().any(|column| column == "priority") {
-                tx.execute_batch(
-                    "ALTER TABLE messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
                 )?;
+                tx.commit()?;
             }
-            tx.execute("UPDATE schema_version SET version=?1", [15])?;
-            tx.commit()?;
-        }
-        if version < 16 {
-            // v16: `messages.issue`/`messages.worktree` (CAD-467) —
-            // the dispatch lane a message row belongs to, written at
-            // send by the daemon. The reported-kickoff duplicate check
-            // matches on these, never on the issue's refs — tracker
-            // frontmatter is forgeable and a planted `message` ref must
-            // not be able to suppress a real kickoff.
-            let columns: Vec<String> = conn
-                .prepare("PRAGMA table_info(messages)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            let tx = conn.unchecked_transaction()?;
-            for column in ["issue", "worktree"] {
-                if !columns.iter().any(|c| c == column) {
-                    tx.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {column} TEXT"))?;
+            if version < 12 {
+                // v12: rollout lease + the build commit the daemon last
+                // recorded. The lease gate runs before this function opens
+                // the file; reaching here means the crossing was allowed
+                // (fresh database, current schema, matching backup receipt,
+                // or the one-time CADENCE_ROLLOUT_BOOTSTRAP introduction).
+                let tx = conn.unchecked_transaction()?;
+                crate::rollout::ensure_lease_tables(&tx)?;
+                tx.execute("UPDATE schema_version SET version=12", [])?;
+                tx.commit()?;
+            }
+            if version < 13 {
+                // v13: durable conversation threads (CAD-319) — a thread per
+                // agent alias and its ordered entries, outliving provider
+                // sessions. New objects only, `IF NOT EXISTS`, one
+                // transaction: a half-applied v13 converges on reopen.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(threads::SCHEMA_V13)?;
+                tx.execute("UPDATE schema_version SET version=13", [])?;
+                tx.commit()?;
+            }
+            if version < 14 {
+                // v14: `agents.pid_start` (CAD-385) — the recorded pid's
+                // process start time, so a reused pid never maps to a stale
+                // row's alias. Existing rows stay NULL: they fail closed
+                // until their endpoint is recorded again (recovery below
+                // clears every live pid; adoption re-records it with its
+                // start). Column add + bump in one transaction, and the add
+                // is skipped when present: a half-applied v14 converges.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = conn.unchecked_transaction()?;
+                if !columns.iter().any(|column| column == "pid_start") {
+                    tx.execute_batch("ALTER TABLE agents ADD COLUMN pid_start INTEGER")?;
                 }
+                tx.execute("UPDATE schema_version SET version=14", [])?;
+                tx.commit()?;
             }
-            tx.execute("UPDATE schema_version SET version=?1", [16])?;
-            tx.commit()?;
-        }
-        if version < 17 {
-            // v17: platform custody records, per-agent grants and
-            // project default accounts (CAD-366, ADR 0006 §5.1/§5.3) —
-            // handles and fingerprints only, never credential bytes.
-            // New objects, `IF NOT EXISTS`, one transaction: a
-            // half-applied v17 converges on reopen.
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(platform::SCHEMA_V17)?;
-            tx.execute("UPDATE schema_version SET version=?1", [17])?;
-            tx.commit()?;
-        }
-        if version < 18 {
-            // v18: the durable pending-effect record and the draft log
-            // (CAD-506, ADR 0006 §5.4) — one row per staged send, keyed
-            // by effect_id with the brokered handle UNIQUE, so a retried
-            // open dedupes and a restart reconciles. Input/summary/
-            // preview only — credentials never land here.
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(effects::SCHEMA_V18)?;
-            tx.execute("UPDATE schema_version SET version=?1", [18])?;
-            tx.commit()?;
-        }
-        if version < 19 {
-            // v19: app-derived grants and `install_id` (CAD-577) — the install a
-            // derived grant belongs to. Empty on rows written before
-            // install ids; those never match the current install, so
-            // the sweep withdraws them and the operator re-approves
-            // once. Released v18 has no app_grants table; intermediate
-            // builds have one without install_id. Create/alter/version
-            // bump share a transaction, preserving either upgrade path.
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(platform::SCHEMA_APP_GRANTS)?;
-            let columns: Vec<String> = tx
-                .prepare("PRAGMA table_info(app_grants)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            if !columns.iter().any(|column| column == "install_id") {
-                tx.execute_batch(
-                    "ALTER TABLE app_grants ADD COLUMN install_id TEXT NOT NULL DEFAULT ''",
-                )?;
+            if version < 15 {
+                // v15: `messages.priority` (CAD-158) — the delivery rank
+                // `take_queued` orders by (urgent first, then arrival).
+                // Existing rows read 0 = normal, so an upgraded queue keeps
+                // its FIFO order. Column add + bump in one transaction, the
+                // add skipped when present: a half-applied v15 converges.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(messages)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = conn.unchecked_transaction()?;
+                if !columns.iter().any(|column| column == "priority") {
+                    tx.execute_batch(
+                        "ALTER TABLE messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                    )?;
+                }
+                tx.execute("UPDATE schema_version SET version=?1", [15])?;
+                tx.commit()?;
             }
-            tx.execute("UPDATE schema_version SET version=?1", [19])?;
-            tx.commit()?;
-        }
-        if version < 20 {
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(super::app_runs::SCHEMA)?;
-            tx.execute("UPDATE schema_version SET version=20", [])?;
-            tx.commit()?;
-        }
-        if version < 21 {
-            let tx = conn.unchecked_transaction()?;
-            let mut statement = tx.prepare("PRAGMA table_info(platform_credentials)")?;
-            let columns = statement
-                .query_map([], |r| r.get::<_, String>(1))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(statement);
-            if !columns.iter().any(|c| c == "connection_id") {
-                tx.execute_batch("ALTER TABLE platform_credentials ADD COLUMN connection_id TEXT NOT NULL DEFAULT '';")?;
+            if version < 16 {
+                // v16: `messages.issue`/`messages.worktree` (CAD-467) —
+                // the dispatch lane a message row belongs to, written at
+                // send by the daemon. The reported-kickoff duplicate check
+                // matches on these, never on the issue's refs — tracker
+                // frontmatter is forgeable and a planted `message` ref must
+                // not be able to suppress a real kickoff.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(messages)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = conn.unchecked_transaction()?;
+                for column in ["issue", "worktree"] {
+                    if !columns.iter().any(|c| c == column) {
+                        tx.execute_batch(&format!(
+                            "ALTER TABLE messages ADD COLUMN {column} TEXT"
+                        ))?;
+                    }
+                }
+                tx.execute("UPDATE schema_version SET version=?1", [16])?;
+                tx.commit()?;
             }
-            if !columns.iter().any(|c| c == "credential_revision") {
-                tx.execute_batch("ALTER TABLE platform_credentials ADD COLUMN credential_revision INTEGER NOT NULL DEFAULT 1;")?;
+            if version < 17 {
+                // v17: platform custody records, per-agent grants and
+                // project default accounts (CAD-366, ADR 0006 §5.1/§5.3) —
+                // handles and fingerprints only, never credential bytes.
+                // New objects, `IF NOT EXISTS`, one transaction: a
+                // half-applied v17 converges on reopen.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(platform::SCHEMA_V17)?;
+                tx.execute("UPDATE schema_version SET version=?1", [17])?;
+                tx.commit()?;
             }
-            tx.execute_batch("UPDATE platform_credentials SET connection_id='conn-' || lower(hex(randomblob(16))) WHERE connection_id=''; CREATE UNIQUE INDEX IF NOT EXISTS platform_connection_id ON platform_credentials(connection_id); CREATE TABLE IF NOT EXISTS connection_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),workspace_id TEXT NOT NULL); INSERT OR IGNORE INTO connection_metadata VALUES(1,lower(hex(randomblob(16))));")?;
-            tx.execute("UPDATE schema_version SET version=21", [])?;
-            tx.commit()?;
-        }
-        if version < 22 {
-            // Context rows and the nullable association are additive. Keep
-            // historical snapshots, approvals and provider receipts untouched;
-            // DDL and the schema checkpoint either commit together or roll back.
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(super::app_contexts::SCHEMA)?;
-            let columns = tx
-                .prepare("PRAGMA table_info(app_runs)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            if !columns.iter().any(|column| column == "context_id") {
-                tx.execute_batch(
-                    "ALTER TABLE app_runs ADD COLUMN context_id TEXT REFERENCES app_contexts(id);",
-                )?;
+            if version < 18 {
+                // v18: the durable pending-effect record and the draft log
+                // (CAD-506, ADR 0006 §5.4) — one row per staged send, keyed
+                // by effect_id with the brokered handle UNIQUE, so a retried
+                // open dedupes and a restart reconciles. Input/summary/
+                // preview only — credentials never land here.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(effects::SCHEMA_V18)?;
+                tx.execute("UPDATE schema_version SET version=?1", [18])?;
+                tx.commit()?;
             }
-            tx.execute_batch("CREATE INDEX IF NOT EXISTS app_runs_context ON app_runs(install_id,context_id,created);")?;
-            tx.execute("UPDATE schema_version SET version=22", [])?;
-            tx.commit()?;
-        }
-        if version < 23 {
-            // The actual predecessor is merged CAD690's schema22. Legacy
-            // effects remain agent-grant records; an app child never falls
-            // back to them. DDL, discriminator and checkpoint are atomic.
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(super::app_bindings::SCHEMA)?;
-            tx.execute_batch(super::app_effects::SCHEMA)?;
-            let columns = tx
-                .prepare("PRAGMA table_info(platform_effects)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            if !columns.iter().any(|name| name == "authorization_kind") {
-                tx.execute_batch("ALTER TABLE platform_effects ADD COLUMN authorization_kind TEXT NOT NULL DEFAULT 'agent_grant' CHECK(authorization_kind IN ('agent_grant','app_artifact'));")?;
+            if version < 19 {
+                // v19: app-derived grants and `install_id` (CAD-577) — the install a
+                // derived grant belongs to. Empty on rows written before
+                // install ids; those never match the current install, so
+                // the sweep withdraws them and the operator re-approves
+                // once. Released v18 has no app_grants table; intermediate
+                // builds have one without install_id. Create/alter/version
+                // bump share a transaction, preserving either upgrade path.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(platform::SCHEMA_APP_GRANTS)?;
+                let columns: Vec<String> = tx
+                    .prepare("PRAGMA table_info(app_grants)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                if !columns.iter().any(|column| column == "install_id") {
+                    tx.execute_batch(
+                        "ALTER TABLE app_grants ADD COLUMN install_id TEXT NOT NULL DEFAULT ''",
+                    )?;
+                }
+                tx.execute("UPDATE schema_version SET version=?1", [19])?;
+                tx.commit()?;
             }
-            tx.execute("UPDATE schema_version SET version=23", [])?;
-            tx.commit()?;
-        }
-        if version < 24 {
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(super::app_capabilities::SCHEMA)?;
-            tx.execute("UPDATE schema_version SET version=24", [])?;
-            tx.commit()?;
-        }
-        if version < 25 {
-            // A review can additionally pin one immutable, run-scoped binary
-            // capability receipt. Both columns and the version advance commit
-            // together; existing text-only reviews retain NULL asset fields.
-            let tx = conn.unchecked_transaction()?;
-            for (table, column, definition) in [
-                (
-                    "app_run_reviews",
-                    "asset_receipt_id",
-                    "asset_receipt_id TEXT",
-                ),
-                ("app_run_reviews", "asset_digest", "asset_digest TEXT"),
-                (
-                    "app_capability_results",
-                    "receipt_schema",
-                    "receipt_schema INTEGER NOT NULL DEFAULT 1",
-                ),
-            ] {
+            if version < 20 {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(super::app_runs::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=20", [])?;
+                tx.commit()?;
+            }
+            if version < 21 {
+                let tx = conn.unchecked_transaction()?;
+                let mut statement = tx.prepare("PRAGMA table_info(platform_credentials)")?;
+                let columns = statement
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(statement);
+                if !columns.iter().any(|c| c == "connection_id") {
+                    tx.execute_batch("ALTER TABLE platform_credentials ADD COLUMN connection_id TEXT NOT NULL DEFAULT '';")?;
+                }
+                if !columns.iter().any(|c| c == "credential_revision") {
+                    tx.execute_batch("ALTER TABLE platform_credentials ADD COLUMN credential_revision INTEGER NOT NULL DEFAULT 1;")?;
+                }
+                tx.execute_batch("UPDATE platform_credentials SET connection_id='conn-' || lower(hex(randomblob(16))) WHERE connection_id=''; CREATE UNIQUE INDEX IF NOT EXISTS platform_connection_id ON platform_credentials(connection_id); CREATE TABLE IF NOT EXISTS connection_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),workspace_id TEXT NOT NULL); INSERT OR IGNORE INTO connection_metadata VALUES(1,lower(hex(randomblob(16))));")?;
+                tx.execute("UPDATE schema_version SET version=21", [])?;
+                tx.commit()?;
+            }
+            if version < 22 {
+                // Context rows and the nullable association are additive. Keep
+                // historical snapshots, approvals and provider receipts untouched;
+                // DDL and the schema checkpoint either commit together or roll back.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(super::app_contexts::SCHEMA)?;
                 let columns = tx
-                    .prepare(&format!("PRAGMA table_info({table})"))?
+                    .prepare("PRAGMA table_info(app_runs)")?
                     .query_map([], |row| row.get::<_, String>(1))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                if !columns.iter().any(|name| name == column) {
-                    tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition};"))?;
+                if !columns.iter().any(|column| column == "context_id") {
+                    tx.execute_batch(
+                    "ALTER TABLE app_runs ADD COLUMN context_id TEXT REFERENCES app_contexts(id);",
+                )?;
                 }
+                tx.execute_batch("CREATE INDEX IF NOT EXISTS app_runs_context ON app_runs(install_id,context_id,created);")?;
+                tx.execute("UPDATE schema_version SET version=22", [])?;
+                tx.commit()?;
             }
-            tx.execute("UPDATE schema_version SET version=25", [])?;
-            tx.commit()?;
-        }
-        if version < 26 {
-            // CAD-720: historical v26 source rows are inert. No migration
-            // backfills older messages: their cloud enrollment and restore
-            // generation are unknown. v27 fences every v26 row as local.
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(
+            if version < 23 {
+                // The actual predecessor is merged CAD690's schema22. Legacy
+                // effects remain agent-grant records; an app child never falls
+                // back to them. DDL, discriminator and checkpoint are atomic.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(super::app_bindings::SCHEMA)?;
+                tx.execute_batch(super::app_effects::SCHEMA)?;
+                let columns = tx
+                    .prepare("PRAGMA table_info(platform_effects)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if !columns.iter().any(|name| name == "authorization_kind") {
+                    tx.execute_batch("ALTER TABLE platform_effects ADD COLUMN authorization_kind TEXT NOT NULL DEFAULT 'agent_grant' CHECK(authorization_kind IN ('agent_grant','app_artifact'));")?;
+                }
+                tx.execute("UPDATE schema_version SET version=23", [])?;
+                tx.commit()?;
+            }
+            if version < 24 {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(super::app_capabilities::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=24", [])?;
+                tx.commit()?;
+            }
+            if version < 25 {
+                // A review can additionally pin one immutable, run-scoped binary
+                // capability receipt. Both columns and the version advance commit
+                // together; existing text-only reviews retain NULL asset fields.
+                let tx = conn.unchecked_transaction()?;
+                for (table, column, definition) in [
+                    (
+                        "app_run_reviews",
+                        "asset_receipt_id",
+                        "asset_receipt_id TEXT",
+                    ),
+                    ("app_run_reviews", "asset_digest", "asset_digest TEXT"),
+                    (
+                        "app_capability_results",
+                        "receipt_schema",
+                        "receipt_schema INTEGER NOT NULL DEFAULT 1",
+                    ),
+                ] {
+                    let columns = tx
+                        .prepare(&format!("PRAGMA table_info({table})"))?
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    if !columns.iter().any(|name| name == column) {
+                        tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition};"))?;
+                    }
+                }
+                tx.execute("UPDATE schema_version SET version=25", [])?;
+                tx.commit()?;
+            }
+            if version < 26 {
+                // CAD-720: historical v26 source rows are inert. No migration
+                // backfills older messages: their cloud enrollment and restore
+                // generation are unknown. v27 fences every v26 row as local.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS cloud_dispatch_outbox(
                     cursor INTEGER PRIMARY KEY AUTOINCREMENT,
                     message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
@@ -742,36 +798,36 @@ impl Store {
                 BEGIN SELECT RAISE(ABORT, 'cloud dispatch source or claim is immutable'); END;
                 UPDATE schema_version SET version=26;",
             )?;
-            tx.commit()?;
-        }
-        if version < 27 {
-            // Every v26 row was created by a local dispatch without issuer
-            // enrollment. Preserve it for audit, but make it permanently
-            // ineligible for a future cloud turn claim. No current insert
-            // path is permitted to create an eligible row either.
-            let tx = conn.unchecked_transaction()?;
-            let columns = tx
-                .prepare("PRAGMA table_info(cloud_dispatch_outbox)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            if !columns.iter().any(|name| name == "cloud_eligible") {
-                tx.execute_batch(
-                    "ALTER TABLE cloud_dispatch_outbox ADD COLUMN
+                tx.commit()?;
+            }
+            if version < 27 {
+                // Every v26 row was created by a local dispatch without issuer
+                // enrollment. Preserve it for audit, but make it permanently
+                // ineligible for a future cloud turn claim. No current insert
+                // path is permitted to create an eligible row either.
+                let tx = conn.unchecked_transaction()?;
+                let columns = tx
+                    .prepare("PRAGMA table_info(cloud_dispatch_outbox)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if !columns.iter().any(|name| name == "cloud_eligible") {
+                    tx.execute_batch(
+                        "ALTER TABLE cloud_dispatch_outbox ADD COLUMN
                      cloud_eligible INTEGER NOT NULL DEFAULT 0 CHECK(cloud_eligible=0);",
+                    )?;
+                }
+                let invalid: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM cloud_dispatch_outbox WHERE cloud_eligible IS NOT 0",
+                    [],
+                    |row| row.get(0),
                 )?;
-            }
-            let invalid: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM cloud_dispatch_outbox WHERE cloud_eligible IS NOT 0",
-                [],
-                |row| row.get(0),
-            )?;
-            if invalid != 0 {
-                return Err(crate::error::Error::rejected(
-                    "cloud dispatch eligibility contains an unverified row",
-                ));
-            }
-            tx.execute_batch(
-                "DROP TRIGGER IF EXISTS cloud_dispatch_eligibility_immutable;
+                if invalid != 0 {
+                    return Err(crate::error::Error::rejected(
+                        "cloud dispatch eligibility contains an unverified row",
+                    ));
+                }
+                tx.execute_batch(
+                    "DROP TRIGGER IF EXISTS cloud_dispatch_eligibility_immutable;
                  DROP TRIGGER IF EXISTS cloud_dispatch_eligibility_insert_guard;
                  CREATE TRIGGER cloud_dispatch_eligibility_immutable
                  BEFORE UPDATE ON cloud_dispatch_outbox
@@ -782,15 +838,15 @@ impl Store {
                  WHEN NEW.cloud_eligible IS NOT 0
                  BEGIN SELECT RAISE(ABORT, 'cloud dispatch eligibility is unverified'); END;
                  UPDATE schema_version SET version=27;",
-            )?;
-            tx.commit()?;
-        }
-        if version < 28 {
-            // A package upgrade preserves the exact approval epoch of completed
-            // work. Backfill only the current, independently recorded epoch;
-            // older epochs discarded by pre-v28 code cannot be reconstructed.
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(
+                )?;
+                tx.commit()?;
+            }
+            if version < 28 {
+                // A package upgrade preserves the exact approval epoch of completed
+                // work. Backfill only the current, independently recorded epoch;
+                // older epochs discarded by pre-v28 code cannot be reconstructed.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS app_capability_epochs(
                     install_id TEXT NOT NULL, epoch INTEGER NOT NULL CHECK(epoch>0),
                     digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('approved','revoked')),
@@ -804,46 +860,48 @@ impl Store {
                  WHERE state='configured';
                  UPDATE schema_version SET version=28;",
             )?;
-            tx.commit()?;
-        }
-        if version < 29 {
-            // CAD-771: durable scheduled external-post intents. New table
-            // only; existing rows and code paths are untouched.
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(super::social_publish::SCHEMA)?;
-            tx.execute("UPDATE schema_version SET version=29", [])?;
-            tx.commit()?;
-        }
-        if version < 30 {
-            // CAD-785: one host-custodied SMTP sender link per CRM
-            // installation/context. New table only; the secret itself
-            // lives in custody, never in this row.
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(super::crm_smtp::SCHEMA)?;
-            tx.execute("UPDATE schema_version SET version=30", [])?;
-            tx.commit()?;
-        }
-        if version < 31 {
-            // CAD-786: the PII-free send intent (`crm_sends`, crash
-            // reconciliation only) and the hash-only unsubscribe
-            // index. Recipient rows never live in core.
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(super::crm_sends::SCHEMA)?;
-            tx.execute("UPDATE schema_version SET version=31", [])?;
-            tx.commit()?;
-        }
-        if let Some(crossing) = permit.crossing {
-            Self::event(
-                &conn,
-                Self::DAEMON_STREAM,
-                "rollout_migration_allowed",
-                json!({
-                    "from": crossing.from,
-                    "to": crate::rollout::SCHEMA_VERSION,
-                    "reason": crossing.reason,
-                }),
-            )?;
-        }
+                tx.commit()?;
+            }
+            if version < 29 {
+                // CAD-771: durable scheduled external-post intents. New table
+                // only; existing rows and code paths are untouched.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(super::social_publish::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=29", [])?;
+                tx.commit()?;
+            }
+            if version < 30 {
+                // CAD-785: one host-custodied SMTP sender link per CRM
+                // installation/context. New table only; the secret itself
+                // lives in custody, never in this row.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(super::crm_smtp::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=30", [])?;
+                tx.commit()?;
+            }
+            if version < 31 {
+                // CAD-786: the PII-free send intent (`crm_sends`, crash
+                // reconciliation only) and the hash-only unsubscribe
+                // index. Recipient rows never live in core.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(super::crm_sends::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=31", [])?;
+                tx.commit()?;
+            }
+            if let Some(crossing) = permit.crossing {
+                Self::event(
+                    &conn,
+                    Self::DAEMON_STREAM,
+                    "rollout_migration_allowed",
+                    json!({
+                        "from": crossing.from,
+                        "to": crate::rollout::SCHEMA_VERSION,
+                        "reason": crossing.reason,
+                    }),
+                )?;
+            }
+            Ok(())
+        })?;
         let store = Self {
             conn: Mutex::new(conn),
             write_fence: Default::default(),
@@ -851,6 +909,7 @@ impl Store {
             thread_held: Mutex::new(std::collections::HashMap::new()),
             shutdown_entries_hook: None,
             shutdown_backoff_ms: 50,
+            seal_state,
         };
         let outcome = if recover {
             Some(store.recover(marker.as_ref())?)

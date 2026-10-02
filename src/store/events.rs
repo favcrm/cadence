@@ -285,7 +285,7 @@ impl Store {
     /// (`payload.message`) — e.g. the daemon's `master_dispatched`
     /// record of a master kickoff (CAD-323).
     pub fn event_names_message(&self, alias: &str, kind: &str, message_id: &str) -> Result<bool> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind=?2 \
              AND json_extract(payload,'$.message')=?3",
@@ -535,7 +535,7 @@ impl Store {
 
     /// CAD-405: the latest work-gate approval per project.
     pub fn work_approvals(&self) -> Result<std::collections::HashMap<String, Value>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let mut stmt =
             conn.prepare("SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq")?;
         let mut rows = stmt.query(params![APPROVAL_STREAM, WORK_APPROVED_EVENT])?;
@@ -802,7 +802,7 @@ impl Store {
 
     /// A live (unrevoked) scope pre-approval by id: `(issue, digest)`.
     pub fn scope_approval(&self, id: &str) -> Result<Option<(String, String)>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let stream = Self::approval_stream(&conn)?;
         if Self::revoked_ids(&stream).contains(id) {
             return Ok(None);
@@ -931,14 +931,16 @@ impl Store {
 
     /// Record the build commit this daemon process is running.
     pub fn record_running_build(&self, commit: &str) -> Result<()> {
-        let conn = self.write_conn()?;
+        // CAD-1011: rollout schema + daemon-build upsert are owner
+        // maintenance (DDL + guard-table writes), not business DML.
+        let conn = self.owner_conn()?;
         crate::rollout::upsert_daemon_build(&conn, commit, crate::rollout::unix_now())
     }
 
     /// Refuse to keep running when this binary's commit is not the one
     /// the daemon last recorded, unless the caller holds the lease.
     pub fn enforce_running_build(&self) -> Result<()> {
-        let conn = self.write_conn()?;
+        let conn = self.owner_conn()?;
         crate::rollout::enforce_running_build(&conn)
     }
 
@@ -946,7 +948,7 @@ impl Store {
     /// The refusal itself cannot be inserted into the database it is
     /// refusing to modify.
     pub fn ingest_rollout_gate(&self, state_dir: &Path) -> Result<()> {
-        let conn = self.write_conn()?;
+        let conn = self.owner_conn()?;
         crate::rollout::ingest_gate_log(state_dir, &conn)?;
         Ok(())
     }

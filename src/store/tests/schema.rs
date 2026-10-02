@@ -388,9 +388,10 @@
         std::thread::scope(|scope| {
             let crashed = scope
                 .spawn(|| {
-                    let conn = s.conn();
-                    // A raw BEGIN the panic leaves open: recovery must
-                    // roll it back, not commit the next caller into it.
+                    // Fixture-armed conn so the raw BEGIN is authorized;
+                    // the panic still leaves an open tx for recovery to
+                    // roll back.
+                    let conn = s.fixture_conn().unwrap();
                     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
                     panic!("store closure panicked while holding the lock");
                 })

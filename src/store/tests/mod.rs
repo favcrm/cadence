@@ -71,7 +71,7 @@ fn approval<'a>(id: &'a str, source: &'a str, head: &'a str, pr: u64) -> NewAppr
 
 /// `(kind, approval_id)` rows on the approval stream, in order.
 fn approval_rows(s: &Store) -> Vec<(String, String)> {
-    let conn = s.conn();
+    let conn = s.fixture_conn().unwrap();
     let mut stmt = conn
         .prepare("SELECT kind, payload FROM events WHERE alias=? ORDER BY seq")
         .unwrap();

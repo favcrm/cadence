@@ -44,7 +44,7 @@
         // that harmless presentation drift in the queued binding; the exact
         // created_bits proof must still admit the original recipient.
         let (seq, payload): (i64, String) = {
-            let conn = s.conn();
+            let conn = s.fixture_conn().unwrap();
             conn.query_row(
                 "SELECT seq,payload FROM events
                  WHERE alias='w1' AND kind='queued' ORDER BY seq DESC LIMIT 1",
@@ -58,7 +58,7 @@
         payload["recipient_identity"]["created"] =
             json!(f64::from_bits(created.to_bits().wrapping_add(1)));
         {
-            let conn = s.conn();
+            let conn = s.fixture_conn().unwrap();
             conn.execute(
                 "UPDATE events SET payload=? WHERE seq=?",
                 rusqlite::params![payload.to_string(), seq],
@@ -153,9 +153,8 @@
         s.enqueue("w1", "look", None, "m-nudge", "nudge").unwrap();
         s.enqueue("w1", "task", None, "m-work", "user").unwrap();
         s.set_state_detached("w1", "stopped", None).unwrap();
-        s.conn()
-            .execute("UPDATE messages SET state='unknown' WHERE id='m-nudge'", [])
-            .unwrap();
+        s.fixture_write(|c| c.execute("UPDATE messages SET state='unknown' WHERE id='m-nudge'", [])
+            .map_err(Into::into)).unwrap();
         let err = s
             .remove_agent("w1", true, &operator_by())
             .unwrap_err()
@@ -165,9 +164,8 @@
         assert_eq!(s.message("m-nudge").unwrap().unwrap().state, "unknown");
         assert_eq!(s.message("m-work").unwrap().unwrap().state, "queued");
         // A fencing unknown also offers unfence.
-        s.conn()
-            .execute("UPDATE messages SET state='unknown' WHERE id='m-work'", [])
-            .unwrap();
+        s.fixture_write(|c| c.execute("UPDATE messages SET state='unknown' WHERE id='m-work'", [])
+            .map_err(Into::into)).unwrap();
         let err = s
             .remove_agent("w1", true, &operator_by())
             .unwrap_err()
@@ -252,12 +250,11 @@
         assert_eq!(ids, vec!["fresh-1".to_string()]);
         // Nothing old refuses a plain removal of the new agent.
         s.set_state_detached("w1", "stopped", None).unwrap();
-        s.conn()
-            .execute(
+        s.fixture_write(|c| c.execute(
                 "UPDATE messages SET state='completed' WHERE id='fresh-1'",
                 [],
             )
-            .unwrap();
+            .map_err(Into::into)).unwrap();
         s.remove_agent("w1", false, &operator_by()).unwrap();
     }
 
@@ -700,19 +697,17 @@
         )
         .unwrap();
         s.enqueue("w1", "chat", None, "m-chat", "user").unwrap();
-        s.conn()
-            .execute(
+        s.fixture_write(|c| c.execute(
                 "UPDATE messages SET state='completed' WHERE id='m-chat'",
                 [],
             )
-            .unwrap();
-        s.conn()
-            .execute(
+            .map_err(Into::into)).unwrap();
+        s.fixture_write(|c| c.execute(
                 "UPDATE agents SET state='stopped', enabled=0, endpoint=NULL,
                  updated=? WHERE alias='w1'",
                 params![now() - 30.0 * 86_400.0],
             )
-            .unwrap();
+            .map_err(Into::into)).unwrap();
 
         assert!(s.timer_gc_remove("w1", 86_400.0).unwrap().is_some());
         assert!(s.agent_opt("w1").unwrap().is_none());
@@ -739,13 +734,12 @@
             "old", "done", "queued", "running", "unknown", "future", "enabled", "young", "live",
         ] {
             reg(&s, alias, &cwd);
-            s.conn()
-                .execute(
+            s.fixture_write(|c| c.execute(
                     "UPDATE agents SET state='stopped', enabled=0, endpoint=NULL,
                      updated=? WHERE alias=?",
                     params![aged, alias],
                 )
-                .unwrap();
+                .map_err(Into::into)).unwrap();
         }
         // Terminal history does not keep a row; every other state does,
         // including one the store has never heard of.
@@ -757,11 +751,10 @@
             ("future", "m-f", "awaiting_report"),
         ] {
             s.enqueue(alias, "work", None, id, "user").unwrap();
-            s.conn()
-                .execute("UPDATE messages SET state=? WHERE id=?", params![state, id])
-                .unwrap();
+            s.fixture_write(|c| c.execute("UPDATE messages SET state=? WHERE id=?", params![state, id])
+                .map_err(Into::into)).unwrap();
         }
-        let c = s.conn();
+        let c = s.fixture_conn().unwrap();
         c.execute("UPDATE agents SET enabled=1 WHERE alias='enabled'", [])
             .unwrap();
         c.execute(

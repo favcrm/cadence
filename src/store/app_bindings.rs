@@ -391,7 +391,7 @@ impl Store {
     /// Upgrade compatibility must inspect every configured binding, including
     /// rows intentionally hidden by the bounded operator inventory.
     pub fn app_binding_upgrade_configured(&self, install: &str) -> Result<Vec<Value>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id FROM app_bindings WHERE install_id=? AND state='configured' ORDER BY id",
         )?;
@@ -414,7 +414,7 @@ impl Store {
         if slots.is_empty() {
             return Ok(());
         }
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let total: i64 = conn.query_row(
             "SELECT count(*) FROM app_bindings WHERE install_id=?",
             [install],

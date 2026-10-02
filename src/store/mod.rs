@@ -79,8 +79,10 @@ pub mod social_publish;
 pub use plans::{current_verdict, Job, Task, Verdict, JOB_STATES};
 mod quota;
 mod schema;
+mod seal;
 pub(crate) use schema::open_read_only;
 pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
+pub use seal::OpenMode;
 #[cfg(test)]
 mod tests;
 
@@ -122,6 +124,11 @@ pub struct Store {
     /// multiplier in milliseconds — production 50; tests set 0 so the
     /// retry bound is proven without wall-clock sleeps.
     pub(crate) shutdown_backoff_ms: u64,
+    /// CAD-1011: the producer-closure guard state shared with this
+    /// connection's SQLite authorizer — arm level + tx-control phase,
+    /// driven under `conn`'s mutex so a prepared write can never step
+    /// outside the armed window.
+    seal_state: std::sync::Arc<seal::GuardState>,
 }
 
 /// The `shutdown_entries` test seam (CAD-694): called with each
@@ -182,14 +189,19 @@ impl Store {
                 // forensic row for the poison it just recovered.
                 let fenced = self.write_fence.get().is_some_and(|f| f.check().is_some());
                 if !fenced {
-                    if let Err(e) = Self::event(
-                        &guard,
-                        Self::DAEMON_STREAM,
-                        "store_poisoned",
-                        json!({"rolled_back": rolled_back}),
-                    ) {
-                        eprintln!("store: could not record store_poisoned: {e}");
-                    }
+                    // CAD-1011: the forensic recovery event is an
+                    // owner-maintenance write — armed so the authorizer
+                    // permits it while the caller's lane is still disarmed.
+                    seal::with_owner_tx_control(&self.seal_state, || {
+                        if let Err(e) = Self::event(
+                            &guard,
+                            Self::DAEMON_STREAM,
+                            "store_poisoned",
+                            json!({"rolled_back": rolled_back}),
+                        ) {
+                            eprintln!("store: could not record store_poisoned: {e}");
+                        }
+                    });
                 }
                 guard
             }
@@ -204,14 +216,18 @@ impl Store {
     /// cannot commit into a lease a successor already took. The
     /// heartbeat's [`Self::fence_writes`] drains the in-flight writer
     /// before it returns, so no write starts post-trip.
-    fn write_conn(&self) -> Result<MutexGuard<'_, Connection>> {
-        let guard = self.conn();
+    ///
+    /// CAD-1011: the returned [`seal::WriteConn`] also evaluates the
+    /// durable closure latch under the lock and arms the `Business` write
+    /// lane for the guard's lifetime — the caller's write is checked and
+    /// authorized as one critical section, and a sealed store refuses.
+    fn write_conn(&self) -> Result<seal::WriteConn<'_>> {
         if let Some(reason) = self.write_fence.get().and_then(|f| f.check()) {
             return Err(Error::rejected(format!(
                 "store write refused — the daemon's hosted lease is lost: {reason}"
             )));
         }
-        Ok(guard)
+        self.write_conn_sealed()
     }
 
     /// Install the hosted-lease fence — the daemon calls this right

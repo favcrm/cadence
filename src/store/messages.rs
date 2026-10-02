@@ -1491,7 +1491,7 @@ impl Store {
     /// so each probe is an index seek on `msg_queue(alias,state,…)`,
     /// never a scan of the history.
     pub fn running_turn_tokens(&self) -> Result<Vec<(String, String)>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let mut stmt = conn.prepare(
             "SELECT a.alias, m.turn_id
              FROM agents a JOIN messages m ON m.alias = a.alias AND m.state = 'running'
@@ -1504,7 +1504,7 @@ impl Store {
     /// Queued deliveries that are turns of their own — what an
     /// unreported turn holds back (routed notifications still pass).
     pub fn queued_turns(&self, alias: &str) -> Result<i64> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         Ok(conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'
@@ -1522,7 +1522,7 @@ impl Store {
     /// report bound has not run out at `now`: a stale row on a dead actor
     /// or an overdue one never defers a checkpoint.
     pub fn busy_providers(&self, live: &HashSet<String>, now: f64) -> Result<HashSet<String>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let mut stmt = conn.prepare(
             "SELECT a.provider AS agent_provider, a.params AS agent_params,
                     a.endpoint_kind AS agent_kind, m.*

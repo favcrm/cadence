@@ -599,7 +599,7 @@ impl Store {
         self.app_run_show(&id)
     }
     pub fn app_run_show(&self, id: &str) -> Result<Value> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         Self::app_run_show_in(&conn, id)
     }
     pub(super) fn app_run_show_in(conn: &Connection, id: &str) -> Result<Value> {
@@ -1693,7 +1693,10 @@ impl Store {
     }
 
     pub fn app_message_installation(&self, message: &str) -> Result<Option<(String, String)>> {
-        Ok(self.conn().query_row("SELECT r.id,r.install_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.message_id=?",[message],|r|Ok((r.get(0)?,r.get(1)?))).optional()?)
+        {
+            let conn = self.write_conn()?;
+            Ok(conn.query_row("SELECT r.id,r.install_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.message_id=?",[message],|r|Ok((r.get(0)?,r.get(1)?))).optional()?)
+        }
     }
     pub(super) fn app_message_admit_in(
         &self,
@@ -1731,7 +1734,8 @@ impl Store {
         Ok(())
     }
     pub fn app_message_admit(&self, message: &Message, bundle: &str) -> Result<()> {
-        self.app_message_admit_in(&self.conn(), message, bundle)
+        let conn = self.write_conn()?;
+        self.app_message_admit_in(&conn, message, bundle)
     }
     pub fn reject_app_submission(&self, message: &str) -> Result<()> {
         let conn = self.write_conn()?;

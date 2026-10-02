@@ -325,7 +325,7 @@ impl Store {
         if context.is_some() && install.is_none() {
             return Err(Error::rejected("context filter requires installation"));
         }
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let mut stmt = conn.prepare("SELECT intent_id FROM social_publish_intents WHERE (? IS NULL OR install_id=?) AND (? IS NULL OR context_id=?) ORDER BY intent_id LIMIT 100")?;
         let ids = stmt
             .query_map(params![install, install, context, context], |r| {
@@ -343,7 +343,7 @@ impl Store {
     /// RPC uses it to compare operator-supplied current authority against
     /// frozen before claiming; the claim itself re-verifies in-transaction.
     pub(crate) fn social_publish_peek_due(&self, now_epoch: i64) -> Result<Option<Value>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let next: Option<String> = conn
             .query_row(
                 "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=? ORDER BY due_epoch,intent_id LIMIT 1",

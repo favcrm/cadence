@@ -544,12 +544,11 @@
         reg(&s, "w2", &cwd);
         s.enqueue("w1", "stale", Some("pm"), "ok", "user").unwrap();
         let set_state = |id: &str, state: &str, result: Option<Value>| {
-            s.conn()
-                .execute(
+            s.fixture_write(|c| c.execute(
                     "UPDATE messages SET state=?, result=? WHERE id=?",
                     params![state, result.map(|r| r.to_string()), id],
                 )
-                .unwrap();
+                .map_err(Into::into)).unwrap();
         };
         let mut cases: Vec<(String, String)> = Vec::new();
         for state in [

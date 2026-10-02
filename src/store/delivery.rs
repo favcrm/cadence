@@ -177,7 +177,7 @@ impl Store {
     /// recover-submit` for message `id` on `alias`, if one exists — the
     /// durable marker that makes a second recovery refuse.
     pub fn submit_recovered(&self, alias: &str, id: &str) -> Result<Option<Value>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let raw: Option<String> = conn
             .query_row(
                 "SELECT payload FROM events WHERE alias=?1 AND kind='submit_recovered' \
@@ -745,7 +745,7 @@ impl Store {
     /// True when the alias has an `unknown` in-flight attempt that must be
     /// reconciled before it may run again.
     pub fn has_unknown(&self, alias: &str) -> Result<bool> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let count: i64 = conn.query_row(
             &format!("SELECT COUNT(*) FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL}"),
             [alias],
@@ -762,7 +762,7 @@ impl Store {
     /// literals `recover` and `orphan_running` write; message rows are
     /// not rewritten here.
     pub fn preferred_unknown_error(&self, alias: &str) -> Result<Option<String>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         match conn.query_row(
             &format!(
                 "SELECT error FROM messages
@@ -790,7 +790,7 @@ impl Store {
     /// `agent unfence` reconciles in one call. An unconfirmed nudge is
     /// `unknown` too but fences nothing, so it is not listed (CAD-250).
     pub fn unknown_messages(&self, alias: &str) -> Result<Vec<String>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT id FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL} ORDER BY seq"
         ))?;

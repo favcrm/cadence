@@ -110,7 +110,7 @@ impl Store {
     /// Read one link row for the send/show path. `None` is "no sender
     /// is bound", never a default — the caller refuses.
     pub fn crm_smtp_link(&self, install: &str, context: &str) -> Result<Option<SmtpLink>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         self.crm_smtp_row(&conn, install, context)
     }
 

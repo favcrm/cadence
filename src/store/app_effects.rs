@@ -339,7 +339,8 @@ impl Store {
     }
 
     pub fn app_effect_show(&self, id: &str) -> Result<Value> {
-        let (row, authority, digest) = child_in(&self.conn(), id)?;
+        let conn = self.write_conn()?;
+        let (row, authority, digest) = child_in(&conn, id)?;
         Ok(envelope(&row, &authority, &digest))
     }
 
@@ -422,7 +423,7 @@ impl Store {
         if context.is_some() && install.is_none() {
             return Err(Error::rejected("context filter requires installation"));
         }
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let mut stmt = conn.prepare("SELECT effect_id FROM app_effect_authorizations WHERE (? IS NULL OR install_id=?) AND (? IS NULL OR context_id=?) ORDER BY effect_id LIMIT 100")?;
         let ids = stmt
             .query_map(params![install, install, context, context], |r| {

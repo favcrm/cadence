@@ -329,7 +329,7 @@ impl Store {
     }
 
     pub fn tasks_for_job(&self, job_id: &str) -> Result<Vec<Task>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let mut stmt = conn.prepare("SELECT * FROM tasks WHERE job_id=? ORDER BY created")?;
         let rows = stmt.query_map([job_id], row_task)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -337,7 +337,7 @@ impl Store {
 
     /// An alias's non-terminal task assignments — derived, never stored.
     pub fn tasks_for_assignee(&self, alias: &str) -> Result<Vec<Task>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let mut stmt = conn.prepare(
             "SELECT * FROM tasks WHERE assignee=?
              AND state NOT IN ('verified','done','cancelled','failed')
@@ -348,7 +348,7 @@ impl Store {
     }
 
     pub fn verdicts_for_task(&self, task_id: &str) -> Result<Vec<Verdict>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let mut stmt =
             conn.prepare("SELECT * FROM verdicts WHERE task_id=? ORDER BY revision, seq")?;
         let rows = stmt.query_map([task_id], row_verdict)?;
@@ -358,7 +358,7 @@ impl Store {
     /// Every message attached to a task (kickoffs + `--task` sends),
     /// oldest first — `job task show`'s delivery view.
     pub fn messages_for_task(&self, task_id: &str) -> Result<Vec<Message>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let mut stmt = conn.prepare("SELECT * FROM messages WHERE task_id=? ORDER BY seq")?;
         let rows = stmt.query_map([task_id], row_message)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

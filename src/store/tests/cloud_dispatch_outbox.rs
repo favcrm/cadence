@@ -38,12 +38,14 @@ fn ordinary_local_dispatch_never_creates_a_cloud_claim_candidate() {
 #[test]
 fn a_cloud_outbox_insert_failure_does_not_rollback_local_dispatch() {
     let (_dir, s) = draft_task();
-    s.conn()
-        .execute_batch(
+    s.fixture_write(|c| {
+        c.execute_batch(
             "CREATE TRIGGER deny_cloud_outbox BEFORE INSERT ON cloud_dispatch_outbox \
              BEGIN SELECT RAISE(ABORT, 'outbox unavailable'); END;",
         )
-        .unwrap();
+        .map_err(Into::into)
+    })
+    .unwrap();
     let (_, mid, duplicate, _) = s.dispatch_task("t1", None, None, "operator").unwrap();
     assert!(!duplicate);
     assert_eq!(count(&s), 0);

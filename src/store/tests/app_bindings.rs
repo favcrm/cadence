@@ -3,9 +3,11 @@ use super::*;
 #[test]
 fn cad692_binding_configuration_cas_preserves_scope_and_never_issues_grants() {
     let (_dir, s) = store();
-    s.conn()
-        .execute_batch(crate::store::app_bindings::SCHEMA)
-        .unwrap();
+    s.fixture_write(|c| {
+        c.execute_batch(crate::store::app_bindings::SCHEMA)
+            .map_err(Into::into)
+    })
+    .unwrap();
     let config = json!({"schema":1,"install_id":"install-a","context":null,"connection_id":"builtin-local","registration_digest":"receipt-one"});
     let first = s
         .app_binding_create("install-a", None, "publication", &config, "binding-request")
@@ -136,9 +138,11 @@ fn cad743_new_version_can_bind_after_one_hundred_old_version_rows() {
 #[test]
 fn cad796_rebind_and_revoke_withdraw_approval_unchanged_resave_keeps_it() {
     let (_dir, s) = store();
-    s.conn()
-        .execute_batch(crate::store::app_bindings::SCHEMA)
-        .unwrap();
+    s.fixture_write(|c| {
+        c.execute_batch(crate::store::app_bindings::SCHEMA)
+            .map_err(Into::into)
+    })
+    .unwrap();
     let digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let approval_of = || {
         s.conn()
@@ -267,9 +271,11 @@ fn cad796_rebind_and_revoke_withdraw_approval_unchanged_resave_keeps_it() {
 #[test]
 fn cad796_credential_revoke_and_rotate_withdraw_bound_approvals() {
     let (_dir, s) = store();
-    s.conn()
-        .execute_batch(crate::store::app_bindings::SCHEMA)
-        .unwrap();
+    s.fixture_write(|c| {
+        c.execute_batch(crate::store::app_bindings::SCHEMA)
+            .map_err(Into::into)
+    })
+    .unwrap();
     let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     s.platform_enroll(
         &crate::store::CredentialRecord {
@@ -354,9 +360,11 @@ fn cad796_credential_revoke_and_rotate_withdraw_bound_approvals() {
 #[test]
 fn cad796_corrupt_grant_row_rolls_back_rebind() {
     let (_dir, s) = store();
-    s.conn()
-        .execute_batch(crate::store::app_bindings::SCHEMA)
-        .unwrap();
+    s.fixture_write(|c| {
+        c.execute_batch(crate::store::app_bindings::SCHEMA)
+            .map_err(Into::into)
+    })
+    .unwrap();
     let digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     s.app_capability_decide("install-a", digest, true).unwrap();
     s.app_grants_set(
@@ -373,12 +381,11 @@ fn cad796_corrupt_grant_row_rolls_back_rebind() {
     .unwrap();
     // A second derivation row for the same installation with malformed
     // scope JSON — the rebind must refuse rather than skip it.
-    s.conn()
-        .execute(
+    s.fixture_write(|c| c.execute(
             "INSERT INTO app_grants(app, agent, platform, account, scopes, granted_at, by, install_id) VALUES(?,?,?,?,?,?,?,?)",
             params!["project/legacy", "worker-a", "fixture", "work", "not-json", 1.0, "operator", "install-a"],
         )
-        .unwrap();
+        .map_err(Into::into)).unwrap();
     let config = json!({"schema":1,"install_id":"install-a","context":null,
         "bundle_digest":digest,"workspace_id":"ws","connection_id":"conn-a",
         "provider":"fixture","account":"work","connection_kind":"enrolled",

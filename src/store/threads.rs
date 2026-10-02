@@ -418,7 +418,7 @@ impl Store {
 
     /// The alias's thread, if one was ever started.
     pub fn thread(&self, alias: &str) -> Result<Option<Thread>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         Self::thread_in(&conn, alias)
     }
 
