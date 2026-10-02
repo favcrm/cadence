@@ -809,25 +809,24 @@ async function mountedFlow() {
   await click(byText("button", "Cancel"));
 
   // ---- CAD-813: the verified assistant draft seam ----
-  // No scoped chat message yet: the mint control stays disabled with
-  // its explanation, and no request body ever leaves the browser.
+  // The disabled-without-message state was proven earlier (the mint
+  // control was disabled before the first chat send). A scoped message
+  // already exists from the creation flow, so this seam re-verifies the
+  // mint body shape, the scope binding and the apply — with RELATIVE
+  // counts, since earlier mints/sends already ran in this mount.
   const mintButton = () => byText("button", "Ask assistant to draft") as HTMLButtonElement | null;
-  assert(mintButton(), "the assistant-draft mint control renders");
-  assert(mintButton()!.disabled, "mint is disabled without a scoped chat message");
-  assert(
-    text().includes("Send the assistant a message in the left chat first"),
-    "the disabled mint explains what to do",
-  );
-  assert(mintBodies.length === 0, "no proposal request left the browser yet");
+  assert(mintButton() && !mintButton()!.disabled, "the mint is enabled with a scoped message present");
+  const mintsAtSeam = mintBodies.length;
+  const sendsAtSeam = sendBodies.length;
 
   // Send the assistant a scoped chat message through the left pane —
   // the daemon stamps the verified App binding on the stored entry,
   // which the stream then lands in the shared thread store.
-  await fillArea("#app-shell-chat-box", "Draft the launch email for this campaign");
+  await fillArea("#app-shell-chat-box", "Draft the launch email again");
   await click(byText("button", "Send"));
-  assert(sendBodies.length === 1, "the left chat sent one message");
+  assert(sendBodies.length === sendsAtSeam + 1, "the left chat sent one more message");
   equal(
-    sendBodies[0].app,
+    sendBodies.at(-1)!.app,
     { install_id: "install-crm", context_id: "ctx-a" },
     "the chat send carried the shell's scope",
   );
@@ -838,11 +837,11 @@ async function mountedFlow() {
     const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
     await resources.masterThread.refresh();
   });
-  await settle(() => assert(!mintButton()!.disabled, "the mint enables once a scoped message exists"));
+  await settle(() => assert(!mintButton()!.disabled, "the mint stays enabled with a scoped message"));
 
   // Mint: the body is exactly {campaign_id, message_id, request_id} —
   // no token, receipt, turn or source_revision ever travels. (This is
-  // the third mint: two earlier ones already ran in this scenario.)
+  // a later mint: earlier ones already ran in this scenario.)
   const mintCountBefore = mintBodies.length;
   await click(mintButton());
   await settle(() => assert(mintBodies.length === mintCountBefore + 1, "one proposal request minted"));
