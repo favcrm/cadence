@@ -1174,31 +1174,31 @@ macro_rules! storeconn_fwd {
         fn execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
             (**self).execute_batch(sql)
         }
-        fn query_row<T>(
+        fn query_row<R>(
             &self,
             sql: &str,
             params: impl rusqlite::Params,
-            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-        ) -> rusqlite::Result<T> {
+            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<R>,
+        ) -> rusqlite::Result<R> {
             (**self).query_row(sql, params, f)
         }
-        fn query_opt<T>(
+        fn query_opt<R>(
             &self,
             sql: &str,
             params: impl rusqlite::Params,
-            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-        ) -> rusqlite::Result<Option<T>> {
+            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<R>,
+        ) -> rusqlite::Result<Option<R>> {
             (**self).query_opt(sql, params, f)
         }
         fn exists(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<bool> {
             (**self).exists(sql, params)
         }
-        fn query_vec<T>(
+        fn query_vec<R>(
             &self,
             sql: &str,
             params: impl rusqlite::Params,
-            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-        ) -> rusqlite::Result<Vec<T>> {
+            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<R>,
+        ) -> rusqlite::Result<Vec<R>> {
             (**self).query_vec(sql, params, f)
         }
         fn for_each_row(
@@ -1215,15 +1215,15 @@ macro_rules! storeconn_fwd {
         fn changes(&self) -> usize {
             (**self).changes()
         }
-        fn pragma_query_value<T, F>(
+        fn pragma_query_value<R, F>(
             &self,
             database_name: Option<rusqlite::DatabaseName<'_>>,
             pragma_name: &str,
             f: F,
-        ) -> rusqlite::Result<T>
+        ) -> rusqlite::Result<R>
         where
-            T: rusqlite::types::FromSql,
-            F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+            R: rusqlite::types::FromSql,
+            F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<R>,
         {
             (**self).pragma_query_value(database_name, pragma_name, f)
         }
