@@ -106,10 +106,11 @@ pub(crate) fn run() -> Result<i32> {
     {
         return app::run_dev(name, source, *port, host, allow_host);
     }
-    let state_dir = match &cli.state_dir {
-        Some(dir) => dir.clone(),
-        None => client::state_dir()?,
-    };
+    let (state_dir, _tracker_dir) = org::resolve(
+        cli.org.as_deref(),
+        cli.state_dir.clone(),
+        std::env::var_os("CADENCE_PM_DIR").map(PathBuf::from),
+    )?;
     // CAD-310: a sandbox's state dir decides its profile and tracker,
     // not the caller's env. `sandbox` verbs resolve their own roots.
     if !matches!(cli.command, Commands::Sandbox { .. }) {
@@ -528,6 +529,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::Job { action } => job::run(state_dir, action),
         Commands::Thread { action } => thread::run(state_dir, action),
         Commands::Monitor { action } => monitor::run(state_dir, action),
+        Commands::Org { action } => org::run(action),
         Commands::Issue { action } => issue::run(state_dir, action),
         Commands::Connection { action } => connection::run(state_dir, action),
         Commands::Platform { action } => platform::run(state_dir, action),

@@ -40,6 +40,7 @@ mod memory;
 mod message;
 mod milestone;
 mod monitor;
+mod org;
 mod overview;
 mod plan;
 mod platform;
@@ -137,6 +138,11 @@ pub(crate) struct Cli {
     /// Runtime state directory (socket, database, logs).
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
+    /// Organization/connection to run this command under (CAD-1019). Wins
+    /// over `CADENCE_ORG` and the saved default; a managed caller cannot
+    /// use it.
+    #[arg(long, global = true)]
+    org: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }

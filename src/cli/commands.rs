@@ -27,6 +27,13 @@ pub(crate) enum Commands {
         #[arg(long)]
         auth_dir: Option<PathBuf>,
     },
+    /// Select an organization/connection preference (CAD-1019). The saved
+    /// default is a pointer only — running work stays pinned to where it
+    /// started, and a managed caller (`CADENCE_ALIAS`) cannot move it.
+    Org {
+        #[command(subcommand)]
+        action: crate::cli::org::OrgAction,
+    },
     /// Inspect or remove local AgenticOS credentials.
     Auth {
         #[command(subcommand)]
