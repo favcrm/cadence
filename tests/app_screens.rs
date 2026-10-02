@@ -74,17 +74,21 @@ fn sha256_of(body: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
 }
 
-/// A VALID workflow template — the exact schema `app::validate_texts` and
-/// `LocalWorkflow::validate_template` accept (title/goal/inputs frontmatter
-/// + `## Task` sections + `agent:`/`size:`/`### Acceptance` lines). Mirrors
-/// the tested `workspace.rs` `WORKFLOW` fixture, trimmed to one task.
-const WORKFLOW: &str = "---\ntitle: \"Do {{topic}}\"\ngoal: \"Do {{topic}}\"\n\
-inputs:\n  topic: { ask: \"What?\" }\n---\n\nWhy.\n\n## Do {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance\n- [ ] done\n";
+/// A VALID + APPROVABLE workflow — mirrors the tested `apps/local-content`
+/// `workflows/draft.md` schema: `title`/`goal`/`inputs`/`distinct`
+/// frontmatter, then a `local.text.produce` producer step and a
+/// `local.text.review` step (a DIFFERENT agent, `depends_on: 1`). The
+/// approval gate (`app_local_install_approve`) requires explicit supported
+/// action steps — an agent-only template installs but never approves.
+const WORKFLOW: &str = "---\ntitle: \"Do {{subject}}\"\ngoal: \"Do {{subject}}\"\n\
+label: Do\ninputs:\n  subject: { ask: \"What?\" }\n  writer: { ask: \"writer\" }\n  reviewer: { ask: \"reviewer\" }\n\
+distinct: [writer, reviewer]\n---\n\nBody.\n\n## Draft {{subject}}\nagent: {{writer}}\nsize: S\naction: local.text.produce\n\nDraft {{subject}}.\n\n### Acceptance\n- [ ] drafted\n\n## Review {{subject}}\nagent: {{reviewer}}\nsize: S\ndepends_on: 1\naction: local.text.review\n\nReview the draft.\n\n### Acceptance\n- [ ] reviewed\n";
 
-/// The v2 variant for the upgrade path — same valid schema, distinct bytes
-/// so the bundle digest changes.
-const WORKFLOW_V2: &str = "---\ntitle: \"Do {{topic}} v2\"\ngoal: \"Do {{topic}} v2\"\n\
-inputs:\n  topic: { ask: \"What?\" }\n---\n\nWhy v2.\n\n## Do {{topic}}\nagent: dev-1\nsize: S\n\nDo it again.\n\n### Acceptance\n- [ ] done twice\n";
+/// The v2 variant for the upgrade path — same approvable schema, distinct
+/// bytes so the bundle digest changes.
+const WORKFLOW_V2: &str = "---\ntitle: \"Do {{subject}} v2\"\ngoal: \"Do {{subject}} v2\"\n\
+label: Do\ninputs:\n  subject: { ask: \"What?\" }\n  writer: { ask: \"writer\" }\n  reviewer: { ask: \"reviewer\" }\n\
+distinct: [writer, reviewer]\n---\n\nBody v2.\n\n## Draft {{subject}}\nagent: {{writer}}\nsize: S\naction: local.text.produce\n\nDraft {{subject}} again.\n\n### Acceptance\n- [ ] drafted twice\n\n## Review {{subject}}\nagent: {{reviewer}}\nsize: S\ndepends_on: 1\naction: local.text.review\n\nReview the draft.\n\n### Acceptance\n- [ ] reviewed twice\n";
 
 /// The full 10-file UTF-8 bundle map — `app.md` + one workflow + the
 /// `screens/main/` package (screens.json, client.js, styles.css + flat
