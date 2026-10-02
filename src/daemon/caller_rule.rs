@@ -411,6 +411,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection (CAD-608)"),
     ),
     ("app_workspace_migration_recover", Rule::Handler("operator_connection (CAD-667)")),
+    ("app_screen_mint", Rule::Handler("operator_connection (CAD-1006)")),
+    // The frame-GET peer: authority is the burned one-use nonce, not a
+    // connection class — the handler binds it to the consuming session.
+    ("app_screen_consume", Rule::Handler("operator_connection + burned one-use frame capability + stored-session liveness (CAD-1006)")),
     ("project_work_approvals", Rule::Read),
     ("app_local_install_approve", Rule::Handler("operator_connection (CAD-631)")),
     ("app_local_install_revoke", Rule::Handler("operator_connection (CAD-631)")),

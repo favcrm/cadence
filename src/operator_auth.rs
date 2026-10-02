@@ -961,6 +961,17 @@ impl Auth {
         Ok(gone)
     }
 
+    /// Whether a live session with this display `id` exists right now.
+    /// CAD-1006: the frame-capability consume path proves the consuming
+    /// request's session resolves to the id the mint was bound to — a
+    /// revoked session id fails closed. `now` is the operator clock.
+    pub fn live_session_id(&mut self, id: &str, now: i64) -> Result<bool> {
+        if self.prune(now) {
+            self.persist()?;
+        }
+        Ok(self.sessions.iter().any(|r| r.id() == id))
+    }
+
     /// The live sessions, oldest first.
     pub fn list(&mut self, now: i64) -> Result<Vec<SessionView>> {
         if self.prune(now) {

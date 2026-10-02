@@ -167,6 +167,46 @@ fn bundle_digest(files: &BTreeMap<String, String>) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
+/// The lexical grammar a journaled bundle member's rel-path must satisfy
+/// — the flat `app.md`/`workflows/<tag>.md`/`rubrics|templates/<leaf>`
+/// plus CAD-1006's `screens/<tag>/<leaf>` (the one depth-3 member: a
+/// tag-named package dir holding `screens.json` or a
+/// `<stem>.<js|css|svg|json>` leaf). `Path::components` already drops
+/// `.`/`..`/slashes, so a member that survives the components grammar is
+/// normal by construction.
+fn member_path_ok(name: &str) -> bool {
+    let path = Path::new(name);
+    let parts: Vec<_> = path.components().collect();
+    let normal = |i: usize| -> Option<&str> {
+        match parts.get(i) {
+            Some(std::path::Component::Normal(n)) => n.to_str(),
+            _ => None,
+        }
+    };
+    if name == "app.md" {
+        return true;
+    }
+    match (parts.len(), normal(0)) {
+        (2, Some(top)) if matches!(top, "workflows" | "rubrics" | "templates") => {
+            normal(1).is_some_and(|leaf| {
+                !leaf.starts_with('.')
+                    && (top != "workflows"
+                        || (leaf.ends_with(".md")
+                            && model::valid_tag(leaf.trim_end_matches(".md"))))
+            })
+        }
+        // screens/<tag>/<leaf> — tag-validated dir + package leaf grammar.
+        (3, Some("screens")) => {
+            normal(1).is_some_and(model::valid_tag)
+                && normal(2).is_some_and(|leaf| {
+                    !leaf.starts_with('.')
+                        && crate::issue::app_screen_pkg::leaf_ok(leaf)
+                })
+        }
+        _ => false,
+    }
+}
+
 fn validate_source_transport(source: &str) -> Result<()> {
     if Path::new(source).is_absolute() {
         return Ok(());
@@ -255,6 +295,34 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
             continue;
         }
         match root.kind(&path)? {
+            // CAD-1006: screens/<tag>/<leaf> — the one nested level. The
+            // `<tag>` is a tag-named package dir; each leaf is `screens.json`
+            // or a `<stem>.<js|css|svg|json>` file per the package grammar.
+            Some(libc::S_IFDIR) if name.as_str() == "screens" => {
+                for tag in root.list(&path, &mut budget)? {
+                    if tag.starts_with('.') || !model::valid_tag(&tag) {
+                        return Err(Error::rejected(
+                            "a screen package is a tag-named screens/<tag>/ directory",
+                        ));
+                    }
+                    let tagdir = path.join(&tag);
+                    if root.kind(&tagdir)? != Some(libc::S_IFDIR) {
+                        return Err(Error::rejected(
+                            "screens/<tag> must be a directory",
+                        ));
+                    }
+                    for leaf in root.list(&tagdir, &mut budget)? {
+                        if leaf.starts_with('.')
+                            || !crate::issue::app_screen_pkg::leaf_ok(&leaf)
+                        {
+                            return Err(Error::rejected(
+                                "a screen asset is <stem>.<js|css|svg|json>, or screens.json",
+                            ));
+                        }
+                        add(format!("screens/{tag}/{leaf}"), tagdir.join(leaf))?;
+                    }
+                }
+            }
             Some(libc::S_IFDIR)
                 if matches!(name.as_str(), "workflows" | "rubrics" | "templates") =>
             {
@@ -627,13 +695,7 @@ fn apply_upgrade(pm: &Pm, root: &Root, journal: &UpgradeJournal) -> Result<Vec<S
         return Err(Error::rejected("upgrade manifest changes app identity"));
     }
     for (name, text) in &journal.files {
-        let path = Path::new(name);
-        let parts: Vec<_> = path.components().collect();
-        let valid = name == "app.md"
-            || (parts.len() == 2
-                && matches!(parts[0], std::path::Component::Normal(n) if n=="workflows" || n=="rubrics" || n=="templates")
-                && matches!(parts[1], std::path::Component::Normal(n) if n.to_str().is_some_and(|leaf| !leaf.starts_with('.') && (!name.starts_with("workflows/") || (leaf.ends_with(".md") && model::valid_tag(leaf.trim_end_matches(".md")))))));
-        if !valid || text.len() as u64 > crate::issue::plan::MAX_PLAN_BYTES as u64 {
+        if !member_path_ok(name) || text.len() as u64 > crate::issue::plan::MAX_PLAN_BYTES as u64 {
             return Err(Error::rejected(
                 "unsafe or oversized upgrade journal bundle file",
             ));
@@ -807,13 +869,7 @@ fn apply(pm: &Pm, root: &Root, journal: &InstallJournal) -> Result<Vec<String>> 
         ));
     }
     for (name, text) in &journal.files {
-        let path = Path::new(name);
-        let components: Vec<_> = path.components().collect();
-        let valid = name == "app.md"
-            || (components.len() == 2
-                && matches!(components[0],std::path::Component::Normal(n) if n=="workflows" || n=="rubrics" || n=="templates")
-                && matches!(components[1],std::path::Component::Normal(n) if n.to_str().is_some_and(|leaf| !leaf.starts_with('.') && (!name.starts_with("workflows/") || (leaf.ends_with(".md") && model::valid_tag(leaf.trim_end_matches(".md")))))));
-        if !valid || text.len() as u64 > crate::issue::plan::MAX_PLAN_BYTES as u64 {
+        if !member_path_ok(name) || text.len() as u64 > crate::issue::plan::MAX_PLAN_BYTES as u64 {
             return Err(Error::rejected("unsafe or oversized journal bundle file"));
         }
     }
@@ -828,15 +884,10 @@ fn apply(pm: &Pm, root: &Root, journal: &InstallJournal) -> Result<Vec<String>> 
         pm.dir.join(base.join("record.yaml")),
     ];
     for (name, text) in &journal.files {
-        let path = Path::new(name);
-        let components: Vec<_> = path.components().collect();
-        let valid = name == "app.md"
-            || (components.len() == 2
-                && matches!(components[0], std::path::Component::Normal(n) if n=="workflows" || n=="rubrics" || n=="templates")
-                && matches!(components[1], std::path::Component::Normal(_)));
-        if !valid || text.len() as u64 > CATALOG_CAP {
+        if !member_path_ok(name) || text.len() as u64 > CATALOG_CAP {
             return Err(Error::rejected("unsafe or oversized journal bundle file"));
         }
+        let path = Path::new(name);
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             root.mkdir(&bundle.join(parent))?;
         }

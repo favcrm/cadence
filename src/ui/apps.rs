@@ -204,8 +204,60 @@ fn upload_path_ok(path: &str) -> bool {
         ["app.md"] => true,
         ["workflows", leaf] => leaf_ok(leaf, true),
         ["rubrics", leaf] | ["templates", leaf] => leaf_ok(leaf, false),
+        // CAD-1006: screens/<tag>/<leaf> — the one depth-2 entry: a
+        // tag-named package dir holding `screens.json` or a
+        // `<stem>.<js|css|svg|json>` leaf per the validator grammar.
+        ["screens", tag, leaf] => {
+            crate::issue::model::valid_tag(tag)
+                && crate::issue::app_screen_pkg::leaf_ok(leaf)
+        }
         _ => false,
     }
+}
+
+/// Stage a validated `{files}` map to a server-derived temp dir OUTSIDE
+/// the PM tracker and return its absolute path as the `source` string.
+/// The `TempDir` is removed on every drop path; it is provenance
+/// (`Source::Path`) only — a one-shot, not a reusable update URL. Shared
+/// by `workspace_upload` (install) and the CAD-1006 upgrade transport.
+fn stage_files(files: &[(String, String)]) -> Result<(tempfile::TempDir, String), HttpResp> {
+    let staging = match tempfile::tempdir() {
+        Ok(t) => t,
+        Err(e) => return Err(err_response(500, &format!("staging dir failed: {e}"))),
+    };
+    for (path, text) in files {
+        let dest = staging.path().join(path);
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Err(err_response(500, &format!("staging mkdir failed: {e}")));
+            }
+        }
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.custom_flags(libc::O_NOFOLLOW);
+        }
+        let wrote = open
+            .open(&dest)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
+        if let Err(e) = wrote {
+            return Err(err_response(500, &format!("staging write failed: {e}")));
+        }
+    }
+    let source = staging.path().to_string_lossy().to_string();
+    Ok((staging, source))
+}
+
+/// A `{files}` map for the upgrade transport — the same strict visitor
+/// (`UploadBody`) the install upload uses, parsed out of a body that
+/// also carries the upgrade pins. Returns `(files, extra)` where `extra`
+/// is the non-`files` fields for the caller's own schema gate.
+fn files_map(value: &Value) -> Option<Vec<(String, String)>> {
+    let files = value.get("files")?;
+    let map: FilesMap = serde_json::from_value(files.clone()).ok()?;
+    Some(map.0)
 }
 
 /// Stage the validated file-map to a server-derived temp dir OUTSIDE the PM
@@ -243,48 +295,101 @@ pub(super) fn workspace_upload(request: &mut Request, state: &std::path::Path) -
             return err_response(400, "bundle exceeds its aggregate byte cap");
         }
     }
-    // Stage into a server-derived external temp dir. `tempfile::tempdir` is
-    // mode-0700 and under the process temp root — never under `pm.dir`.
-    let staging = match tempfile::tempdir() {
-        Ok(t) => t,
-        Err(e) => return err_response(500, &format!("staging dir failed: {e}")),
+    // Stage into a server-derived external temp dir (mode-0700, under the
+    // process temp root — never under `pm.dir`), then hand its absolute path
+    // to the unchanged path-source installer. `staging` is removed on drop.
+    let (_staging, source) = match stage_files(&body.files) {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
     };
-    for (path, text) in &body.files {
-        let dest = staging.path().join(path);
-        if let Some(parent) = dest.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return err_response(500, &format!("staging mkdir failed: {e}"));
-            }
-        }
-        // Refuse to follow a pre-existing or symlinked staging target: the
-        // strict raw-key grammar already makes every `path` unique, so an
-        // existing `dest` (or a planted link) is a defect/attack, never an
-        // overwrite. `create_new(true)` is O_EXCL and `O_NOFOLLOW` refuses a
-        // symlinked leaf at open — no TOCTOU between check and write.
-        if dest.symlink_metadata().is_ok() {
-            return err_response(400, &format!("staging path '{path}' collides"));
-        }
-        let mut open = std::fs::OpenOptions::new();
-        open.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            open.custom_flags(libc::O_NOFOLLOW);
-        }
-        let wrote = open
-            .open(&dest)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
-        if let Err(e) = wrote {
-            return err_response(500, &format!("staging write failed: {e}"));
-        }
-    }
-    let source = staging.path().to_string_lossy().to_string();
     // The daemon re-validates and journals the staged dir as a Source::Path;
     // `installed_by`/`approved` come from the proven operator connection, never
     // the body. `staging` (a TempDir) is removed on drop, success or failure.
     match client::rpc(state, "app_workspace_install", json!({"source": source})) {
         Ok(value) => json_response(value),
         Err(error) => home::rpc_err(&error, "app_workspace_install"),
+    }
+}
+
+/// CAD-1006 upgrade transport. The new bundle's content arrives EITHER
+/// as a `{files}` map (server-staged to a tempdir whose path becomes the
+/// derived `source`) OR as the legacy `source` path/URL the caller names
+/// — never both, and never neither. `files` mode keeps the board from
+/// ever trusting a caller-controlled path; `source` mode preserves the
+/// existing CLI/git transport unchanged. Returns `(params, staging)` —
+/// `staging` is `Some` only for `files` mode and must outlive the RPC.
+pub(super) fn workspace_upgrade_transport(
+    method: &str,
+    id: &str,
+    mut fields: serde_json::Map<String, Value>,
+) -> std::result::Result<(Value, Option<tempfile::TempDir>), HttpResp> {
+    let files_val = fields.remove("files");
+    let source_val = fields.remove("source");
+    if files_val.is_some() && source_val.is_some() {
+        return Err(err_response(
+            400,
+            "upgrade body must carry `files` or `source`, never both",
+        ));
+    }
+    if files_val.is_none() && source_val.is_none() {
+        return Err(err_response(
+            400,
+            "upgrade body requires a `files` map or a `source`",
+        ));
+    }
+    let expected: &[&str] = if method == "app_workspace_upgrade" {
+        &["expected_digest", "expected_generation", "expected_new_digest", "request_id"]
+    } else {
+        &["expected_digest", "expected_generation"]
+    };
+    if fields.len() != expected.len()
+        || fields.keys().any(|key| !expected.contains(&key.as_str()))
+        || expected.iter().any(|key| {
+            fields
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        })
+    {
+        return Err(err_response(400, "upgrade body has missing or unsupported fields"));
+    }
+    if let Some(files_val) = files_val {
+        // `{files}` mode — server-derived `source` via secure staging.
+        let Some(files) = files_map(&json!({"files": files_val})) else {
+            return Err(err_response(400, "upgrade files must be a {{path: text}} map"));
+        };
+        let mut total: u64 = 0;
+        for (path, text) in &files {
+            if !upload_path_ok(path) {
+                return Err(err_response(
+                    400,
+                    &format!("bundle path '{path}' is not an allowed flat entry"),
+                ));
+            }
+            if text.len() as u64 > crate::issue::plan::MAX_PLAN_BYTES as u64 {
+                return Err(err_response(400, "a bundle file exceeds its byte cap"));
+            }
+            total += text.len() as u64;
+        }
+        if total > UPLOAD_TOTAL_BYTES {
+            return Err(err_response(400, "bundle exceeds its aggregate byte cap"));
+        }
+        let (staging, source) = stage_files(&files)?;
+        let mut params = Value::Object(fields);
+        params["source"] = json!(source);
+        params["install_id"] = json!(id);
+        Ok((params, Some(staging)))
+    } else {
+        // Legacy `source` mode — the validated path/URL passes through
+        // unchanged; no staging, the daemon re-checks it natively.
+        let source = source_val.unwrap();
+        if source.as_str().map(str::is_empty).unwrap_or(true) {
+            return Err(err_response(400, "upgrade source must be a non-empty string"));
+        }
+        let mut params = Value::Object(fields);
+        params["source"] = source;
+        params["install_id"] = json!(id);
+        Ok((params, None))
     }
 }
 
@@ -810,10 +915,44 @@ pub(super) fn workspace(
     method: &str,
     id: Option<&str>,
 ) -> HttpResp {
+    // CAD-1006: when the upgrade body carries a `{files}` map, the
+    // staging TempDir must outlive the `client::rpc` below — bind it
+    // here so it drops only AFTER the complete response. `None` when the
+    // caller used the legacy `source` transport (no staging) or another
+    // method entirely.
+    let mut _upgrade_staging: Option<tempfile::TempDir> = None;
     let params = if matches!(
         method,
-        "app_workspace_upgrade" | "app_workspace_upgrade_check" | "app_workspace_upgrade_recover"
+        "app_workspace_upgrade" | "app_workspace_upgrade_check"
     ) {
+        // The new bundle arrives EITHER as a server-staged `{files}` map
+        // (CAD-1006) OR as the legacy `source` path/URL — never both.
+        // `files` carries the whole bundle inline, so this branch reads
+        // the bounded 8 MiB upload wire cap — the 4 KiB `BODY_CAP` would
+        // refuse a real files map before the RPC ever ran.
+        let bytes = match read_body(request, UPLOAD_WIRE_CAP) {
+            Ok(bytes) => bytes,
+            Err(response) => return response,
+        };
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => return err_response(400, "upgrade body must be a JSON object"),
+        };
+        let Some(fields) = value.as_object() else {
+            return err_response(400, "upgrade body must be a JSON object");
+        };
+        let id = match id {
+            Some(id) => id,
+            None => return err_response(400, "upgrade needs an installation id"),
+        };
+        let (params, staging) =
+            match workspace_upgrade_transport(method, id, fields.clone()) {
+                Ok(pair) => pair,
+                Err(resp) => return resp,
+            };
+        _upgrade_staging = staging;
+        params
+    } else if method == "app_workspace_upgrade_recover" {
         let bytes = match read_body(request, BODY_CAP) {
             Ok(bytes) => bytes,
             Err(response) => return response,
@@ -825,27 +964,11 @@ pub(super) fn workspace(
         let Some(fields) = value.as_object() else {
             return err_response(400, "upgrade body must be a JSON object");
         };
-        let expected: &[&str] = if method == "app_workspace_upgrade" {
-            &[
-                "source",
-                "expected_digest",
-                "expected_generation",
-                "expected_new_digest",
-                "request_id",
-            ]
-        } else if method == "app_workspace_upgrade_check" {
-            &["source", "expected_digest", "expected_generation"]
-        } else {
-            &["request_id"]
-        };
-        if fields.len() != expected.len()
-            || fields.keys().any(|key| !expected.contains(&key.as_str()))
-            || expected.iter().any(|key| {
-                fields
-                    .get(*key)
-                    .and_then(Value::as_str)
-                    .is_none_or(str::is_empty)
-            })
+        if fields.len() != 1
+            || fields
+                .get("request_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
         {
             return err_response(400, "upgrade body has missing or unsupported fields");
         }

@@ -14,7 +14,7 @@ use tiny_http::{Header, Method, Request, Response, StatusCode};
 use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
-    app_audiences, app_content, app_contexts, app_records, app_release, app_runs, apps,
+    app_audiences, app_content, app_contexts, app_records, app_release, app_runs, app_screens, apps,
     connections, crm_send, crm_smtp, home, lane, operator, read_model, social_publish, stages,
     threads, updates, wiki, workflows,
 };
@@ -1127,6 +1127,16 @@ pub(crate) fn write_route(
             return;
         }
         let response = apps::workspace(&mut request, state_dir, "app_workspace_install", None);
+        send(request, response);
+        return;
+    }
+    // CAD-1006: the private screen mount mint — OperatorOnly, `{}` body.
+    if let Some((install_id, tag)) = app_screens::mount_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_screens::mount(&mut request, state_dir, opts, install_id, tag);
         send(request, response);
         return;
     }

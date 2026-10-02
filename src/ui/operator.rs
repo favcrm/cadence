@@ -198,6 +198,14 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-installations/upload",
         RouteClass::OperatorOnly,
     ),
+    // CAD-1006: the screen mint — operator-only like the install routes.
+    // Authority is the proven session credential relayed to the daemon,
+    // never a caller field; the minted nonce is the frame GET's one-use cap.
+    route(
+        "POST",
+        "/api/app-installations/*/screens/*/mount",
+        RouteClass::OperatorOnly,
+    ),
     route(
         "POST",
         "/api/app-installations/migrate",
@@ -623,6 +631,30 @@ fn cookie_name(opts: &ServeOpts, origin: Origin) -> String {
         Origin::Tailnet => format!("__Host-cadence_operator_{}", opts.port),
         Origin::Public => PUBLIC_COOKIE.to_string(),
     }
+}
+
+/// CAD-1006: the request's session origin for the screen credential
+/// relay — the `Origin` `request_origin` resolves to, or `None` when the
+/// request names no session-bearing host. Read-only; the daemon re-verifies
+/// the credential itself, this only chooses which check applies.
+pub(super) fn request_origin_kind(request: &Request, opts: &ServeOpts) -> Option<Origin> {
+    match request_origin(request, opts) {
+        ReqOrigin::Known(o) => Some(o),
+        ReqOrigin::NoSession(_) => None,
+    }
+}
+
+/// CAD-1006: the session cookie value this request presents for `origin`
+/// — the raw bearer token relayed (with the page key) to the daemon's
+/// native `check`/`check_public`, so the *daemon* proves the session and
+/// binds the frame capability to the resolved id. Never logged, never
+/// sent to the frame. `None` when the request carries no such cookie.
+pub(super) fn session_token_for(
+    request: &Request,
+    opts: &ServeOpts,
+    origin: Origin,
+) -> Option<String> {
+    session_cookie(request, opts, origin)
 }
 
 /// The session token the request presents for `origin`, if any.
