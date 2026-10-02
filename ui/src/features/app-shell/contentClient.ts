@@ -233,18 +233,13 @@ export const contentClient = {
     assertClean(body, APPROVE_KEYS, "approve");
     return post(contentPaths.approvePath(scope, campaignId), body);
   },
-  /** `POST …/proposals/<id>/render` — the host renders the inert draft's
-   *  own subject/preheader/blocks (never a save, never a send) so the
-   *  operator reviews the real Visual/HTML/Text body before Apply. */
-  proposalRender(
-    scope: ContentScope,
-    proposalId: string,
-    opts?: { sampleFirstName?: string },
-  ): Promise<unknown> {
-    const body: Record<string, unknown> = {};
-    if (opts?.sampleFirstName !== undefined) body.sample_first_name = opts.sampleFirstName;
-    assertClean(body, RENDER_KEYS, "proposal render");
-    return post(contentPaths.proposalRenderPath(scope, proposalId), body);
+  /** `GET …/proposals/<id>/render` — read transport (the proposal id is
+   *  the only selector; a body is refused). The host renders the inert
+   *  draft's own subject/preheader/blocks — never a save, never a send —
+   *  returning proposal_id/source_revision/preview_only:true/send_ready:
+   *  false (no saved `revision` — a proposal is unsaved by definition). */
+  proposalRender(scope: ContentScope, proposalId: string): Promise<unknown> {
+    return get(contentPaths.proposalRenderPath(scope, proposalId));
   },
   testPrepare(
     scope: ContentScope,

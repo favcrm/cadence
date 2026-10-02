@@ -242,6 +242,61 @@ export function parseRender(value: unknown): ContentRender {
   };
 }
 
+/** CAD-1016: the before-Apply preview of a pending assistant draft —
+ *  `app_content_proposal_render` renders the inert proposal's own
+ *  subject/preheader/blocks through the same safe renderer, bound to
+ *  `proposal_id`/`source_revision` (the draft's stamp, never a saved
+ *  revision), `preview_only:true`/`send_ready:false` always. Carries
+ *  no `revision` — a proposal is unsaved by definition. */
+export interface ProposalRenderDoc {
+  proposalId: string;
+  sourceRevision: number;
+  state: string;
+  html: string;
+  text: string;
+  previewOnly: boolean;
+  sendReady: boolean;
+  sender: { name: string; address: string };
+  unsubscribeUrl: string;
+  bindingId: string;
+  contentDigest: string;
+}
+
+export function parseProposalRender(value: unknown): ProposalRenderDoc {
+  const render = (value as { render?: unknown } | null)?.render;
+  if (!render || typeof render !== "object") {
+    throw new ApiError("The server returned an invalid proposal render receipt", 502);
+  }
+  const row = render as Record<string, unknown>;
+  const sender = (row.sender as Record<string, unknown> | null) ?? {};
+  if (
+    typeof row.proposal_id !== "string" ||
+    typeof row.source_revision !== "number" ||
+    typeof row.state !== "string" ||
+    typeof row.html !== "string" ||
+    typeof row.text !== "string" ||
+    typeof sender.name !== "string" ||
+    typeof sender.address !== "string" ||
+    typeof row.unsubscribe_url !== "string"
+  ) {
+    throw new ApiError("The server returned an invalid proposal render receipt", 502);
+  }
+  const binding = (row.binding as Record<string, unknown> | null) ?? {};
+  return {
+    proposalId: row.proposal_id,
+    sourceRevision: row.source_revision,
+    state: row.state,
+    html: row.html,
+    text: row.text,
+    previewOnly: row.preview_only === true,
+    sendReady: row.send_ready === true,
+    sender: { name: sender.name, address: sender.address },
+    unsubscribeUrl: row.unsubscribe_url,
+    bindingId: typeof binding.binding_id === "string" ? binding.binding_id : "preview",
+    contentDigest: typeof row.content_digest === "string" ? row.content_digest : "",
+  };
+}
+
 /** CAD-813: the host-stamped assistant provenance on a proposal.
  *  Every field is server-typed from the durable receipt — the
  *  assistant's claim is never the authority. */

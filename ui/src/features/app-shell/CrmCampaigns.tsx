@@ -17,11 +17,13 @@ import {
   parseContentDoc,
   parseContentList,
   parseProposalList,
+  parseProposalRender,
   parseRender,
   type CampaignBlock,
   type ContentDoc,
   type ContentRender,
   type ProposalDoc,
+  type ProposalRenderDoc,
 } from "./campaignGrammar";
 import { contentClient } from "./contentClient";
 import { resources } from "../../lib/resources";
@@ -2810,7 +2812,7 @@ function ProposalRow({
 }) {
   const [pending, setPending] = useState<"apply" | "discard" | null>(null);
   const [showBody, setShowBody] = useState(false);
-  const [bodyRender, setBodyRender] = useState<ContentRender | null>(null);
+  const [bodyRender, setBodyRender] = useState<ProposalRenderDoc | null>(null);
   const [bodyPending, setBodyPending] = useState(false);
   const [bodyError, setBodyError] = useState<string | null>(null);
   const [bodyTab, setBodyTab] = useState<"visual" | "html" | "text">("visual");
@@ -2829,7 +2831,7 @@ function ProposalRow({
     setBodyError(null);
     contentClient
       .proposalRender(scope, proposal.proposalId)
-      .then((value) => setBodyRender(parseRender(value)))
+      .then((value) => setBodyRender(parseProposalRender(value)))
       .catch((e: unknown) => setBodyError(friendlyCampaignError(e)))
       .finally(() => setBodyPending(false));
   };

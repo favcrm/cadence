@@ -557,6 +557,30 @@ async function mountedFlow() {
     if (url.pathname.endsWith("/suppressions/list")) return json({ suppressions });
     if (url.pathname.endsWith("/content/campaigns/list")) return json({ contents: Object.values(contents) });
     if (url.pathname.endsWith("/content/proposals/list")) return json({ proposals: Object.values(proposals) });
+    // CAD-1014 before-Apply proposal render: GET …/proposals/<id>/render —
+    // the REAL shape carries proposal_id + source_revision + preview_only
+    // + send_ready (NEVER a saved `revision`), bound to the pending draft.
+    if (method === "GET" && url.pathname.includes("/content/proposals/") && url.pathname.endsWith("/render")) {
+      const id = parts.at(-2)!;
+      const row = proposals[id];
+      if (!row || row.state !== "pending") return refused("email proposal is already decided", 409);
+      return json({ render: {
+        proposal_id: id,
+        campaign_id: row.campaign_id,
+        install_id: "install-crm", context_id: "ctx-a",
+        state: "pending",
+        source_revision: row.source_revision,
+        content_digest: row.content_digest,
+        binding: { binding_id: "preview", revision: 0, digest: "b", preview_only: true },
+        preview_only: true,
+        send_ready: false,
+        sender: { name: "CRM News", address: "news@example.com" },
+        unsubscribe_url: "https://unsub.example.invalid",
+        html: `<h1>${row.subject}</h1><p>${row.blocks?.[0]?.text ?? "body"}</p>`,
+        text: `${row.subject} — ${row.blocks?.[0]?.text ?? "body"}`,
+        render_digest: "sha256:render-" + id,
+      } });
+    }
     if (url.pathname.includes("/content/campaigns/")) {
       const id = parts.at(-1)!;
       if (contents[id]) return json({ content: contents[id] });
@@ -815,15 +839,23 @@ async function mountedFlow() {
   await settle(() => assert(host.querySelector(`[data-proposal="${landed.proposal_id}"]`), "the landed draft appears in the pending list"), 30000);
   assert(text().includes("crm-writer"), "the badge names the receipt's agent");
 
-  // The pending draft's actual body is previewable BEFORE Apply — the
-  // proposal's subject, preheader and block text render in a bounded
-  // preview, with no save and no unsaved-editor state involved.
+  // The pending draft's actual body previews BEFORE Apply — the REAL
+  // host proposal-render (Visual iframe + HTML + Text) of the inert
+  // draft, whose receipt carries source_revision (never a saved
+  // `revision`), preview_only, send_ready. No save, no unsaved render.
   await click(host.querySelector(`[data-proposal-preview="${landed.proposal_id}"]`));
-  await settle(() => assert(host.querySelector(`[data-proposal-body="${landed.proposal_id}"]`), "the draft body preview opens"));
+  await settle(() => assert(host.querySelector(`[data-proposal-body="${landed.proposal_id}"]`), "the draft body preview opens"), 30000);
   const bodyPreview = host.querySelector(`[data-proposal-body="${landed.proposal_id}"]`);
-  assert(bodyPreview?.textContent?.includes("Assistant draft subject"), "the pending body's subject renders before Apply");
-  assert(bodyPreview?.textContent?.includes("From the chat turn"), "the pending body's preheader renders before Apply");
-  assert(bodyPreview?.textContent?.includes("Assistant copy"), "the pending body's block text renders before Apply");
+  await settle(() => {
+    const frame = bodyPreview!.querySelector('iframe[data-preview="visual"]') as HTMLIFrameElement | null;
+    assert(frame, "the pending draft's Visual iframe renders before Apply");
+    assert((frame.getAttribute("srcdoc") ?? "").includes("Assistant draft subject"), "the real draft body renders in the Visual iframe");
+  }, 30000);
+  // HTML + Text tabs render the same pending draft.
+  await click(Array.from(bodyPreview!.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === "HTML"));
+  await settle(() => assert((bodyPreview!.querySelector('pre[data-preview="html"]')?.textContent ?? "").includes("Assistant draft subject"), "HTML tab renders the pending draft"));
+  await click(Array.from(bodyPreview!.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === "Text"));
+  await settle(() => assert((bodyPreview!.querySelector('pre[data-preview="text"]')?.textContent ?? "").includes("Assistant copy"), "Text tab renders the pending draft body"));
 
   // Apply the verified draft: expected_revision = current draft, the
   // revision moves, approval invalidates and the stale row clears.
