@@ -901,6 +901,43 @@ const appsLinks = (hostEl: HTMLElement) =>
   unbound.remove();
 }
 
+// CAD-1009: the app writes `?crm=customers&record=cust-…` after Create/Open.
+// A reload of that scopeless link resolves to the only active context in
+// single-company mode and keeps the record; a genuinely ambiguous
+// (multi-context) link is still refused, as a compact notice.
+{
+  win.sessionStorage.clear();
+  const sole = document.createElement("div");
+  document.body.append(sole);
+  const soleRoot = createRoot(sole);
+  history.pushState(null, "", "/app-installations/install-crm?crm=customers&record=cust-0123456789ab");
+  await React.act(async () => {
+    soleRoot.render(React.createElement(AppShell, { installId: "install-crm", viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert(location.search.includes("ctx=ctx-a"), "a scopeless record link resolves to the sole active context"));
+  assert(location.search.includes("record=cust-0123456789ab"), "the record survives resolution");
+  assert(!(sole.textContent ?? "").includes("does not say which scope"), "single-company mode shows no refusal");
+  assert(!sole.querySelector("[data-link-notice]"), "single-company mode shows no notice at all");
+  await React.act(async () => { soleRoot.unmount(); });
+  sole.remove();
+
+  win.sessionStorage.clear();
+  const ambiguous = document.createElement("div");
+  document.body.append(ambiguous);
+  const ambiguousRoot = createRoot(ambiguous);
+  history.pushState(null, "", "/app-installations/install-crm-multi?crm=customers&record=cust-0123456789ab");
+  await React.act(async () => {
+    ambiguousRoot.render(React.createElement(AppShell, { installId: "install-crm-multi", viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert((ambiguous.textContent ?? "").includes("does not say which scope"), "a multi-context scopeless link is still refused"));
+  assert(!location.search.includes("record="), "the refused record is stripped");
+  const notice = ambiguous.querySelector("[data-link-notice]");
+  assert(notice, "the refusal renders as a link notice");
+  assert(!notice!.className.includes("card") && notice!.className.includes("py-1.5"), "the refusal is a compact notice, not a card");
+  await React.act(async () => { ambiguousRoot.unmount(); });
+  ambiguous.remove();
+}
+
 console.log("app shell checks passed");
 }
 void main();

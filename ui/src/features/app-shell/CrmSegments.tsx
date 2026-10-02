@@ -4,6 +4,7 @@ import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
 import Field from "./shared/Field";
+import { ErrorNotice } from "./shared/States";
 import { useDrawerClose } from "./shared/useDrawerClose";
 import {
   audienceClient,
@@ -230,10 +231,9 @@ function SegmentList({
         Segments
       </h3>
       <div className="crm-toolbar mb-4">
-        <p className="text-secondary text-ink-300">
+        <p className="crm-toolbar-lede text-secondary text-ink-300">
           Saved rules over customer tags, source, consent and email domain.
         </p>
-        <span className="flex-1" />
         {canWrite && (
           <Button variant="primary" size="sm" onClick={onNew}>
             New segment
@@ -261,12 +261,7 @@ function SegmentList({
         </p>
       )}
       {scope.contextId !== "" && viewer.operator && error !== null && !loading && (
-        <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
-          {error}{" "}
-          <button type="button" className="lnk" onClick={() => setRetry((count) => count + 1)}>
-            Retry
-          </button>
-        </p>
+        <ErrorNotice onRetry={() => setRetry((count) => count + 1)}>{error}</ErrorNotice>
       )}
       {scope.contextId !== "" && viewer.operator && error === null && !loading && segments.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400" data-empty="segments" role="status">
@@ -295,7 +290,7 @@ function SegmentList({
             </thead>
             <tbody>
               {segments.map((segment) => (
-                <tr key={segment.id}>
+                <tr key={segment.id} data-record-id={segment.id}>
                   <td className="text-ink-100">
                     {segment.name}
                     <span className="num text-micro text-ink-500"> · {segment.id}</span>
@@ -625,14 +620,9 @@ function SegmentDrawer({
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewToken, setPreviewToken] = useState(0);
   const headRef = useRef<HTMLHeadingElement | null>(null);
-  const opener = useRef<Element | null>(null);
 
   useEffect(() => {
-    opener.current = document.activeElement;
     headRef.current?.focus();
-    return () => {
-      if (opener.current instanceof HTMLElement) opener.current.focus();
-    };
   }, []);
   const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
   useEffect(() => {

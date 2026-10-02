@@ -274,7 +274,10 @@ export default function AppShell({
       }
     }
     const staleCtx = urlCtx !== null && !activeIds.includes(urlCtx);
-    const scopelessRecord = urlCtx === null && urlRecord !== null && !badRecord;
+    // Single-company mode: with exactly one active context a scopeless
+    // record link is unambiguous, so it resolves to that context.
+    const soleContext = urlCtx === null && urlRecord !== null && !badRecord && activeIds.length === 1;
+    const scopelessRecord = urlCtx === null && urlRecord !== null && !badRecord && !soleContext;
     if (staleCtx) {
       setContextId(fallbackContext());
       setLinkNotice(
@@ -282,6 +285,10 @@ export default function AppShell({
           ? "This link names a scope that is not active in this CRM installation, so nothing was opened. Ask an administrator to review the installation's CRM setup."
           : "The linked context is not active in this installation — the selection was cleared.",
       );
+    } else if (soleContext) {
+      setContextId(activeIds[0]);
+      rememberContext(installId, activeIds[0]);
+      setLinkNotice(null);
     } else if (scopelessRecord) {
       // A record link without scope is ambiguous: refuse it with a
       // notice rather than guessing which context it names.
@@ -309,12 +316,12 @@ export default function AppShell({
     // handled mark leaves the surviving ctx adoptable on the next
     // pass — but adoption already ran on it above, so no second
     // effect turn is needed and the URL settles in a single replace.
-    if (badCrm || badRecord || staleCtx || scopelessRecord) {
+    if (badCrm || badRecord || staleCtx || scopelessRecord || soleContext) {
       writeQuery(
         {
+          ctx: soleContext ? activeIds[0] : staleCtx ? null : undefined,
           crm: badCrm ? null : undefined,
           record: badRecord || staleCtx || scopelessRecord ? null : undefined,
-          ctx: staleCtx ? null : undefined,
           appview: staleCtx ? null : undefined,
         },
         { replace: true },
@@ -571,7 +578,7 @@ export default function AppShell({
                 </nav>
               )}
               {linkNotice && (
-                <p className="card px-4 py-3 text-label text-warn border-warn/40" role="alert">
+                <p className="self-start rounded border border-warn/40 px-3 py-1.5 text-label text-warn" role="alert" data-link-notice>
                   {linkNotice}
                 </p>
               )}

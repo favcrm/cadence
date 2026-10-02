@@ -699,6 +699,8 @@ async function mountedFlow() {
   // manual mint.
   assert(!byText("button", "Ask assistant to draft"), "no manual assistant-draft mint control renders");
   assert(text().includes("Ask the assistant in the left chat"), "the agent-first hint renders pre-save");
+  const proposalsText = host.querySelector('section[aria-label="Assistant proposals"]')?.textContent ?? "";
+  equal(proposalsText.split("Ask the assistant in the left chat").length - 1, 1, "the Proposals card says it once, not twice");
   await fillArea("#app-shell-chat-box", "Draft the launch email for this campaign");
   await click(byText("button", "Send"));
   assert(sendBodies.length === 1, "the scoped chat message was sent");
@@ -711,7 +713,14 @@ async function mountedFlow() {
   const firstLi = host.querySelector('[data-proposal^="prop-asst-"]');
   assert(firstLi, "the verified proposal row exists");
   await click(Array.from(firstLi!.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Apply")));
-  await settle(() => assert(text().includes("Applied as revision 1"), "the verified proposal creates revision 1"));
+  // CAD-1009: the first save makes the campaign a saved record — the
+  // URL moves to record=<id>, the page stops saying "New campaign", and
+  // the Freeze ID default derives from the saved id (not a stale one).
+  await settle(() => assert(location.search.includes(`record=${unsavedCampaignId}`), "the first save moves the URL to record=<campaign_id>"));
+  assert(!location.search.includes("appview=new"), "the saved campaign leaves the New view");
+  await settle(() => assert(host.querySelector('input[value$="-freeze-1"]'), "the detail renders its freeze default"));
+  assert(!text().includes("New campaign"), "a saved campaign no longer says New campaign");
+  equal((host.querySelector("#cmp-detail-freeze") as HTMLInputElement).value, `${unsavedCampaignId}-freeze-1`, "the Freeze ID default derives from the saved campaign id");
   const openDoc = () => contents[(host.querySelector("#cmp-id") as HTMLInputElement | null)?.value ?? ""]
     ?? Object.values(contents).at(-1);
   assert(openDoc().revision === 1, "revision 1 exists after the assistant apply");
@@ -888,11 +897,17 @@ async function mountedFlow() {
     ),
   );
 
-  // Open the full detail directly: the saved campaign renders in the
+  // The first save already landed on the full detail (CAD-1009): the saved campaign renders in the
   // CAD-1008 task order — Content+Preview → approval → Audience/freeze
   // → Sender → Test → Proposals → Final send — and the saved revision
   // renders in the preview without a manual render click.
-  await click(byText("button", "Open campaign detail →"));
+  assert(!byText("button", "Open campaign detail →"), "no New-page hand-off remains after the first save");
+  // Re-open the saved campaign from its record URL (a fresh mount): the
+  // preview auto-renders on open, not on the earlier tab choice.
+  const savedCampaignId = openDoc().campaign_id as string;
+  await openPage("customers");
+  await React.act(async () => { navigate(`${location.pathname}?ctx=ctx-a&crm=campaigns&record=${savedCampaignId}`); });
+  await flush();
   await settle(() => assert(host.querySelector('section[aria-label="Frozen audience"]'), "detail names its freeze panel"));
   await settle(() => {
     const frame = host.querySelector('iframe[data-preview="visual"]') as HTMLIFrameElement;

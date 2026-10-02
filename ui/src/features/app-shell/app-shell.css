@@ -327,6 +327,14 @@
   min-width: 0;
 }
 
+/* The lede takes the free width and wraps; the header action stays on
+   the same row, right-aligned, in every CRM section. */
+.crm-toolbar-lede {
+  flex: 1 1 14rem;
+  min-width: 0;
+  margin: 0;
+}
+
 .crm-search {
   flex: 1 1 14rem;
   min-width: 0;

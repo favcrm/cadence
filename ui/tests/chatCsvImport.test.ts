@@ -198,6 +198,35 @@ async function main() {
     await m.unmount();
   }
 
+  // ---- Error rows show the server's reason (CAD-1009), never a blank cell ----
+  {
+    const m = await mount({
+      previewResponse: () =>
+        new Response(
+          JSON.stringify({
+            preview_token: "sha256:" + "b".repeat(64),
+            row_count: 2,
+            summary: { create: 0, update: 0, skip: 0, needs_revision: 0, error: 2 },
+            rows: [
+              { row: 1, record_id: "", decision: "error", expected_revision: null, current_revision: null, profile: null, errors: ["invalid email", "invalid tags"], reason: null, duplicate_of: null },
+              { row: 2, record_id: "rec-2", decision: "error", expected_revision: null, current_revision: null, profile: null, errors: [], reason: "record ID already used by another record", duplicate_of: null },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    });
+    await m.fillCsv(CSV);
+    await m.click(m.byText("button", "Preview plan"));
+    await settle(() => assert(m.host.querySelector('[data-plan-row="1"]'), "the error rows render"));
+    const row1 = m.host.querySelector('[data-plan-row="1"]')!.textContent ?? "";
+    const row2 = m.host.querySelector('[data-plan-row="2"]')!.textContent ?? "";
+    assert(row1.includes("invalid email · invalid tags"), "row errors are joined into the row");
+    assert(row1.includes("no record id"), "a blank record id is labelled, not left empty");
+    assert(row2.includes("record ID already used by another record"), "a reason shows when there are no per-row errors");
+    assert(!row1.includes("fix the row") && !row2.includes("fix the row"), "the generic text no longer hides the reason");
+    await m.unmount();
+  }
+
   // ---- Cancel: no confirm posts, nothing imported ----
   {
     const m = await mount({});

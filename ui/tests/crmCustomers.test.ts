@@ -333,6 +333,7 @@ assert(!location.search.includes("crm="), "customers is the default route");
 
 // Drawer: profile, consent trail, keyboard close with focus restoration.
 const openBeta = Array.from(host.querySelectorAll("button.lnk")).find((el) => el.textContent === "Open" && el.closest("tr")?.textContent?.includes("Beta"));
+(openBeta as HTMLElement).focus(); // real browsers focus the pressed button
 await click(openBeta);
 await settle(() => assert(host.querySelector('[data-drawer="customer"]'), "drawer opens"));
 assert(text().includes("beta-two@example.com"), "drawer shows the profile");
@@ -351,6 +352,37 @@ await React.act(async () => {
 await React.act(async () => { await sleep(400); });
 await settle(() => assert(!host.querySelector('[data-drawer="customer"]'), "Escape closes the drawer"));
 assert(!location.search.includes("record="), "closing clears the record scope");
+// CAD-1009: closing returns focus to the row's Open button, not <body>.
+assert(
+  document.activeElement?.tagName === "BUTTON" && document.activeElement.closest("tr")?.textContent?.includes("Beta"),
+  "Escape returns focus to the Open button that opened the drawer",
+);
+
+// CAD-1009: an expired hosted session (the records fetch is redirected
+// cross-origin, so fetch throws; or a 401 whose body is an object) reads
+// as a human sentence with Reload — never "[object Object]".
+{
+  const sessionFetch = globalThis.fetch;
+  for (const failure of [
+    () => { throw new TypeError("Failed to fetch"); },
+    () => new Response(JSON.stringify({ error: { code: "unauthorized" } }), { status: 401 }),
+    () => { throw { type: "opaqueredirect" }; },
+  ]) {
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (new URL(String(input), "http://localhost").pathname.endsWith("/records")) return failure();
+      return sessionFetch(input as RequestInfo | URL, init);
+    }) as typeof fetch;
+    await fill("#crm-customer-search", "expired-" + Math.random().toString(36).slice(2, 7));
+    await React.act(async () => { await sleep(400); });
+    await settle(() => assert(text().includes("session expired"), "an expired session says so: " + text().slice(0, 400)));
+    assert(!text().includes("[object"), "no object is ever stringified into the list error");
+    assert(Array.from(host.querySelectorAll("button")).some((el) => el.textContent === "Reload"), "an expired session offers Reload");
+  }
+  globalThis.fetch = sessionFetch;
+  await fill("#crm-customer-search", "");
+  await React.act(async () => { await sleep(400); });
+  await settle(() => assert(text().includes("Search Alpha One"), "the list recovers"));
+}
 
 // New customer: invalid email blocks before the wire; valid posts exact grammar.
 await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "New customer"));

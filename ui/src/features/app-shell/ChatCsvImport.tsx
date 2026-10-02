@@ -236,7 +236,7 @@ export default function ChatCsvImport({
                   const view = row.profile !== null ? viewProfile(row.profile) : null;
                   return (
                     <>
-                      {row.recordId}
+                      {row.recordId !== "" ? row.recordId : <span className="text-ink-500">no record id</span>}
                       {view !== null && <span className="text-ink-100"> — {view.displayName}</span>}
                     </>
                   );
@@ -281,7 +281,9 @@ export default function ChatCsvImport({
                 cell: (row) => {
                   const choice = choices.get(row.row) ?? csvPlanChoice(row);
                   return row.decision === "error" ? (
-                    <span className="text-label text-ink-500">skipped — fix the row</span>
+                    <span className="text-label text-ink-500">
+                      skipped — {row.errors.length > 0 ? row.errors.join(" · ") : (row.reason ?? "fix the row")}
+                    </span>
                   ) : (
                     <Select
                       id={`chat-csv-choice-${row.row}`}

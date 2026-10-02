@@ -1,4 +1,5 @@
 import { ApiError } from "../../lib/api";
+import { hostErrorText } from "./shared/hostErrors";
 import type { HostRecord } from "./hostActions";
 
 /**
@@ -257,7 +258,7 @@ export function consentEntries(record: HostRecord): ConsentEntry[] {
  * value never appears here.
  */
 export function friendlyError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = hostErrorText(error, "The customer request was refused — retry.");
   if (/stale|expected_revision|expected record revision/i.test(message)) {
     return `${message} — someone else saved this record first. Reload and reapply your change.`;
   }

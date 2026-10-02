@@ -298,6 +298,7 @@ function CustomerList({
             wrapClassName="crm-table-wrap"
             tableClassName="crm-table"
             rowKey={(record) => record.id}
+            rowProps={(record) => ({ "data-record-id": record.id })}
             columns={[
               {
                 key: "name",
@@ -607,16 +608,11 @@ function CustomerDrawer({
   const [pending, setPending] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const headRef = useRef<HTMLHeadingElement | null>(null);
-  const opener = useRef<Element | null>(null);
 
+  // Land on the drawer heading; useDrawerClose returns focus to the
+  // opener (or the list heading) when the drawer closes.
   useEffect(() => {
-    // Focus restoration: remember the opener, land on the drawer
-    // heading, and return focus when the drawer unmounts.
-    opener.current = document.activeElement;
     headRef.current?.focus();
-    return () => {
-      if (opener.current instanceof HTMLElement) opener.current.focus();
-    };
   }, []);
   const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
   useEffect(() => {

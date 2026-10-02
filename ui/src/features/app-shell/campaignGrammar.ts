@@ -1,4 +1,5 @@
 import { ApiError } from "../../lib/api";
+import { hostErrorText } from "./shared/hostErrors";
 
 /**
  * Campaign content grammar mirrors (CAD-782 bounds, CAD-784 screens).
@@ -439,7 +440,5 @@ export function parseProposalList(value: unknown): ProposalDoc[] {
 
 /** Server refusals stay generic; transport failures name the retry. */
 export function friendlyCampaignError(error: unknown): string {
-  if (error instanceof ApiError) return error.message;
-  if (error instanceof TypeError) return "The host did not answer — retry.";
-  return "The campaign request was refused — retry.";
+  return hostErrorText(error, "The campaign request was refused — retry.");
 }

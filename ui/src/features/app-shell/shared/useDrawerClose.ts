@@ -19,11 +19,42 @@ export function useDrawerClose(onClose: () => void): {
   const [closing, setClosing] = useState(false);
   const timer = useRef<number | null>(null);
   const done = useRef(false);
-
+  // The element that held focus when the drawer mounted is the opener
+  // (the row's "Open" button): closing hands focus back to it, or to the
+  // list heading when the opener is gone, never to `<body>`.
+  const opener = useRef<Element | null>(typeof document === "undefined" ? null : document.activeElement);
+  // A list that reloads while the drawer is open replaces the opener's
+  // node: the row it sat in (`data-record-id`) finds its replacement.
+  const openerRow = useRef<string | null>(
+    opener.current instanceof Element
+      ? (opener.current.closest("[data-record-id]")?.getAttribute("data-record-id") ?? null)
+      : null,
+  );
   const finish = useCallback(() => {
     if (done.current) return;
     done.current = true;
     onClose();
+    window.setTimeout(() => {
+      let back = opener.current;
+      if (!(back instanceof HTMLElement) || !back.isConnected || back === document.body) {
+        const row = openerRow.current;
+        back =
+          row === null
+            ? null
+            : (Array.from(document.querySelectorAll("[data-record-id]"))
+                .find((el) => el.getAttribute("data-record-id") === row)
+                ?.querySelector<HTMLElement>("button, a") ?? null);
+      }
+      if (back instanceof HTMLElement && back.isConnected) {
+        back.focus();
+        return;
+      }
+      const heading = document.querySelector<HTMLElement>("[data-outlet-heading]");
+      if (heading !== null) {
+        if (!heading.hasAttribute("tabindex")) heading.setAttribute("tabindex", "-1");
+        heading.focus();
+      }
+    }, 0);
   }, [onClose]);
 
   const requestClose = useCallback(() => {

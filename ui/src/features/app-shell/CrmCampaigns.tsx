@@ -50,6 +50,8 @@ import {
 import { PreviewPanel, parsePreview, type AudiencePreview } from "./CrmSegments";
 import { friendlyAudienceError, newAudienceId } from "./segmentGrammar";
 import Field from "./shared/Field";
+import { isGenericRefusal } from "./shared/hostErrors";
+import { ErrorNotice } from "./shared/States";
 
 /**
  * Campaign screens inside the trusted CRM shell (CAD-784 over the
@@ -229,11 +231,10 @@ function CampaignList({
         Campaigns
       </h3>
       <div className="crm-toolbar mb-4">
-        <p className="text-secondary text-ink-300">
+        <p className="crm-toolbar-lede text-secondary text-ink-300">
           Versioned email content with content-only approval. Audience freezes and test-send
           receipts live on each campaign's page.
         </p>
-        <span className="flex-1" />
         {canWrite && (
           <Button variant="primary" size="sm" onClick={onNew}>
             New campaign
@@ -261,12 +262,7 @@ function CampaignList({
         </p>
       )}
       {scope.contextId !== "" && viewer.operator && error !== null && !loading && (
-        <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
-          {error}{" "}
-          <button type="button" className="lnk" onClick={() => setRetry((count) => count + 1)}>
-            Retry
-          </button>
-        </p>
+        <ErrorNotice onRetry={() => setRetry((count) => count + 1)}>{error}</ErrorNotice>
       )}
       {scope.contextId !== "" && viewer.operator && error === null && !loading && campaigns.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400" data-empty="campaigns" role="status">
@@ -2120,7 +2116,7 @@ function CampaignWorkspace({
         // expectedRevision conflict: keep the operator's local text edits
         // open and ask for a reload — never overwrite an agent's newer draft.
         setFormError(
-          friendlyCampaignError(err) +
+          (isGenericRefusal(err) ? "" : friendlyCampaignError(err)) +
             " The draft moved since you started editing — reload it to retry, or Cancel to keep browsing.",
         );
       })
@@ -2658,9 +2654,8 @@ function CampaignWorkspace({
         <section aria-label="Assistant proposals" className="card px-4 py-4 grid gap-3">
           <h4 className="text-cardtitle font-medium text-ink-100">Proposals — Apply or Discard</h4>
           <p className="text-label text-ink-400">
-            Ask the assistant in the left chat to draft this email — its draft appears here
-            for review. Only Apply changes the saved version (approval invalidates); Discard
-            is non-mutating. Nothing proposes, edits or sends silently.
+            Only Apply changes the saved version (approval invalidates); Discard is
+            non-mutating. Nothing proposes, edits or sends silently.
           </p>
           {proposalsError && (
             <p className="text-label text-fail" role="alert">
@@ -3091,10 +3086,20 @@ function CampaignNew({
   useEffect(() => {
     headRef.current?.focus();
   }, []);
+  // The Freeze ID default follows the campaign ID until the operator
+  // types their own, so it never keeps a stale generated id.
+  const freezeTouched = useRef(false);
   useEffect(() => {
-    setFreezeId((prev) => (prev === "" ? `${campaignId}-freeze-1` : prev));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (!freezeTouched.current) setFreezeId(`${campaignId}-freeze-1`);
   }, [campaignId]);
+  // The first save makes the campaign a saved record: the page moves to
+  // its detail (`record=<id>`) instead of staying a "New campaign".
+  const savedId = doc?.campaignId ?? null;
+  const onCreatedRef = useRef(onCreated);
+  onCreatedRef.current = onCreated;
+  useEffect(() => {
+    if (savedId !== null) onCreatedRef.current(savedId);
+  }, [savedId]);
   return (
     <section aria-label="New campaign" className="grid gap-3">
       <div>
@@ -3161,7 +3166,10 @@ function CampaignNew({
                       id="cmp-freeze-id"
                       className="field"
                       value={freezeId}
-                      onChange={(e) => setFreezeId(e.target.value)}
+                      onChange={(e) => {
+                        freezeTouched.current = true;
+                        setFreezeId(e.target.value);
+                      }}
                       maxLength={128}
                       autoComplete="off"
                       disabled={freezePending}

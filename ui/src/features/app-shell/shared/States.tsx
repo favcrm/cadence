@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { SESSION_EXPIRED_TEXT } from "./hostErrors";
 
 /**
  * Shared record/form state blocks (CAD-866): the loading, error,
@@ -89,12 +90,19 @@ export function ErrorNotice({
       role="alert"
     >
       {children}
-      {onRetry ? (
+      {onRetry || children === SESSION_EXPIRED_TEXT ? (
         <>
           {" "}
-          <button type="button" className="lnk" onClick={onRetry}>
-            {retryLabel}
-          </button>
+          {children === SESSION_EXPIRED_TEXT ? (
+            // A top-level navigation re-authenticates; a retried fetch cannot.
+            <button type="button" className="lnk" onClick={() => window.location.reload()}>
+              Reload
+            </button>
+          ) : (
+            <button type="button" className="lnk" onClick={onRetry}>
+              {retryLabel}
+            </button>
+          )}
         </>
       ) : null}
     </p>
