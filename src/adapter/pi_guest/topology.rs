@@ -1,16 +1,20 @@
 //! The protected topology — an openat2 verify-only walk of the
-//! pre-provisioned tree. Every node the launch depends on is opened relative
-//! to a pinned `/` dirfd with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` and
-//! `fstat`-checked (kind, owner, group, mode, `nlink`). The source never
-//! creates a privileged node and never chowns: a missing or mis-owned slot
-//! refuses outright. `openat2` is the only traversal — an `ENOSYS`/`EPERM`/
-//! `EINVAL`/`EOPNOTSUPP` answer means the syscall is unavailable and the walk
-//! fails closed rather than silently downgrade.
+//! pre-provisioned tree. The trusted root `/` is opened once as an
+//! `O_DIRECTORY` dirfd; every node the launch depends on is then resolved by
+//! walking its path **component by component**, each `openat2` made *relative
+//! to the previous hop's held dirfd* with `RESOLVE_BENEATH |
+//! RESOLVE_NO_SYMLINKS`. Per-hop `fstat` checks owner/group/mode before the
+//! next component opens, so a writable intermediate can never let an attacker
+//! swap a child the leaf-check would bless — `RESOLVE_NO_SYMLINKS` alone does
+//! not stop a rename under a writable parent.
+//!
+//! The source never creates a privileged node and never chowns: a missing or
+//! mis-owned component refuses outright. `openat2` is the only traversal — an
+//! `ENOSYS`/`EPERM`/`EINVAL`/`EOPNOTSUPP` answer means the syscall is absent
+//! and the walk fails closed rather than silently downgrade.
 
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString};
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
@@ -51,61 +55,147 @@ fn sys_openat2(dirfd: RawFd, path: &CStr, how: &OpenHow) -> Result<RawFd> {
     }
 }
 
-/// `openat2`-relative open of an absolute `path` beneath a pinned `/` dirfd.
-/// `O_NOFOLLOW` semantics are folded into `RESOLVE_NO_SYMLINKS` atomically —
-/// any symlink component refuses the open. Non-Linux (the cross-build) and an
-/// absent syscall both refuse.
-pub(crate) fn open_at2(path: &Path, kind: OpenKind) -> Result<OwnedFd> {
-    #[cfg(target_os = "linux")]
-    {
-        if !path.is_absolute() {
-            return Err(Error::rejected("protected path must be absolute"));
-        }
-        let c = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| Error::rejected("protected path carries NUL"))?;
-        let mut flags = libc::O_RDONLY as u64;
-        match kind {
-            OpenKind::Dir => flags |= libc::O_DIRECTORY as u64 | libc::O_CLOEXEC as u64,
-            OpenKind::ExecFile => flags |= libc::O_CLOEXEC as u64,
-            OpenKind::DataInherit => {} // preserved across the next exec
-        }
-        let how = OpenHow {
-            flags,
-            mode: 0,
-            resolve: libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS,
-        };
-        let root = open_root()?;
-        match sys_openat2(root.as_raw_fd(), &c, &how) {
-            Ok(fd) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
-            Err(e) => Err(open_refusal(path, &e)),
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (path, kind);
-        Err(Error::rejected(
-            "protected managed-Pi launch is Linux-only (openat2 unavailable)",
-        ))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn open_refusal(path: &Path, e: &Error) -> Error {
-    Error::rejected(format!("{}: {}", path.display(), e))
-}
-
-/// The pinned `/` dirfd the whole walk hangs from.
+/// Open the trusted root `/` as a held dirfd. It carries no untrusted
+/// segments — `O_DIRECTORY | O_CLOEXEC` (and `O_NOFOLLOW`, though `/` is
+/// never a symlink) — so it is a stable anchor for the per-hop relative walk.
+/// `RESOLVE_BENEATH` is *not* applied here: beneath `/` it is meaningless and
+/// `openat2` rejects an absolute operand under it with `EXDEV` regardless.
 #[cfg(target_os = "linux")]
 fn open_root() -> Result<OwnedFd> {
     let c = CString::new("/").unwrap();
     let how = OpenHow {
-        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
         mode: 0,
-        resolve: libc::RESOLVE_BENEATH,
+        resolve: 0,
     };
     let fd = sys_openat2(libc::AT_FDCWD, &c, &how)
         .map_err(|e| Error::rejected(format!("cannot open the pinned root dirfd: {e}")))?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The openat2 resolve flags for every hop *beneath* the held root.
+#[cfg(target_os = "linux")]
+const RESOLVE: u64 = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS;
+
+/// Split a canonical absolute path into its single-level relative segments.
+/// Refuses an empty component, `.`/`..`, a trailing/leading slash, and any
+/// non-canonical spell — a path like `//`, `/a//b`, `/a/./b` or `/a/../b`
+/// cannot reach the walker.
+#[cfg(target_os = "linux")]
+fn relative_segments(path: &str) -> Result<Vec<String>> {
+    let s = path
+        .strip_prefix('/')
+        .ok_or_else(|| Error::rejected(format!("{path}: protected path must be absolute")))?;
+    if s.is_empty() {
+        return Err(Error::rejected(format!(
+            "{path}: protected path is the root itself — refusing"
+        )));
+    }
+    let mut out = Vec::new();
+    for seg in s.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err(Error::rejected(format!(
+                "{path}: non-canonical or traversal segment '{seg}'"
+            )));
+        }
+        out.push(seg.to_string());
+    }
+    Ok(out)
+}
+
+/// Walk `path` one component at a time beneath the held `root` dirfd, opening
+/// each hop *relative to the previous dirfd* with `RESOLVE`. `check_hop` is
+/// applied to each intermediate (directory) hop before the next component
+/// opens, so a writable or mis-owned ancestor fails the walk rather than
+/// letting a child be substituted beneath it. The leaf is opened with `kind`
+/// flags and returned; intermediates use `O_DIRECTORY`.
+#[cfg(target_os = "linux")]
+fn open_walk<F>(root: &OwnedFd, path: &str, kind: OpenKind, check_hop: F) -> Result<OwnedFd>
+where
+    F: Fn(&std::fs::Metadata, &str) -> Result<()>,
+{
+    let segs = relative_segments(path)?;
+    let mut dirfd = root
+        .try_clone()
+        .map_err(|e| Error::internal(format!("clone root dirfd: {e}")))?;
+    let mut walked = String::new();
+    let last = segs.len() - 1;
+    for (i, seg) in segs.iter().enumerate() {
+        walked.push('/');
+        walked.push_str(seg);
+        let c = CString::new(seg.as_str())
+            .map_err(|_| Error::rejected(format!("{walked}: segment carries NUL")))?;
+        let leaf = i == last;
+        let mut flags = libc::O_RDONLY as u64 | libc::O_CLOEXEC as u64;
+        if leaf {
+            match kind {
+                OpenKind::Dir => flags |= libc::O_DIRECTORY as u64,
+                // `O_NONBLOCK` on the exec file: a fifo must not block the
+                // open before `fstat` can reject it — `O_RDONLY` alone would
+                // wait for a writer forever.
+                OpenKind::ExecFile => flags |= libc::O_NONBLOCK as u64,
+                OpenKind::DataInherit => flags &= !(libc::O_CLOEXEC as u64),
+            }
+        } else {
+            flags |= libc::O_DIRECTORY as u64;
+        }
+        let how = OpenHow {
+            flags,
+            mode: 0,
+            resolve: RESOLVE,
+        };
+        let fd = match sys_openat2(dirfd.as_raw_fd(), &c, &how) {
+            Ok(fd) => fd,
+            Err(e) => return Err(open_refusal(&walked, &e)),
+        };
+        let newfd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let meta = fd_metadata(&newfd)?;
+        if leaf {
+            return Ok(newfd);
+        }
+        if !meta.is_dir() {
+            return Err(Error::rejected(format!("{walked}: not a directory")));
+        }
+        check_hop(&meta, &walked)?;
+        dirfd = newfd;
+    }
+    unreachable!("relative_segments guarantees a non-empty path")
+}
+
+/// `openat2`-relative open of a canonical absolute `path`, walking each
+/// component beneath the pinned `/` dirfd with per-hop directory checks.
+/// Intermediates must be directories; the leaf is opened with `kind` flags.
+/// This is the single-component convenience form used where the caller only
+/// needs the leaf verified (every ancestor still must be a non-symlink dir,
+/// but its owner/mode is the caller's `verify_skeleton`/`verify_view` job via
+/// `check`). Non-Linux refuses.
+pub(crate) fn open_at2(path: &Path, kind: OpenKind) -> Result<OwnedFd> {
+    open_walk_kind(path.to_string_lossy().as_ref(), kind, |_, _| Ok(()))
+}
+
+#[cfg(target_os = "linux")]
+fn open_walk_kind<F>(path: &str, kind: OpenKind, check_hop: F) -> Result<OwnedFd>
+where
+    F: Fn(&std::fs::Metadata, &str) -> Result<()>,
+{
+    let root = open_root()?;
+    open_walk(&root, path, kind, check_hop)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_walk_kind<F>(path: &str, kind: OpenKind, _check_hop: F) -> Result<OwnedFd>
+where
+    F: Fn(&std::fs::Metadata, &str) -> Result<()>,
+{
+    let _ = (path, kind);
+    Err(Error::rejected(
+        "protected managed-Pi launch is Linux-only (openat2 unavailable)",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn open_refusal(path: &str, e: &Error) -> Error {
+    Error::rejected(format!("{path}: {e}"))
 }
 
 /// What a topology node must look like — owner/group resolved from NSS names,
@@ -120,16 +210,34 @@ struct Node {
 }
 
 /// The verified protected topology. Construction resolves the NSS ids and
-/// walks+checks every fixed node; a missing or mis-owned node refuses.
+/// walks+checks every fixed node; a missing or mis-owned node refuses. Holds
+/// the pinned `/` dirfd the per-hop walks ride on.
 pub(crate) struct ProtectedTopology {
     /// Resolved ids, retained for the view check.
     supervisor: u32,
+    supervisor_gid: u32,
     guest: u32,
+    guest_gid: u32,
     shared: u32,
-    #[allow(dead_code)]
-    launch: u32,
     /// Pinned `/` dirfd the per-node opens ride on.
     root: OwnedFd,
+}
+
+/// The owner/mode expected at each hop of a node path, longest first — built
+/// by the verifier so the per-hop `check_hop` can look up the policy that
+/// covers an intermediate. Only fixed nodes appear here; a hop with no entry
+/// uses the default "directory, not world-writable" rule.
+struct HopPolicy {
+    map: Vec<(String, u32, u32, u32)>, // (path, uid, gid, mode)
+}
+
+impl HopPolicy {
+    fn lookup(&self, path: &str) -> Option<(u32, u32, u32)> {
+        self.map
+            .iter()
+            .find(|(p, _, _, _)| p == path)
+            .map(|(_, u, g, m)| (*u, *g, *m))
+    }
 }
 
 impl ProtectedTopology {
@@ -138,9 +246,13 @@ impl ProtectedTopology {
     /// uid and may not be 0 or the supervisor.
     pub(crate) fn verify(agent_uid: u32) -> Result<Self> {
         let supervisor = resolve_uid(acct::SUPERVISOR)?;
+        let supervisor_gid = resolve_primary_gid(acct::SUPERVISOR)?;
         let guest = resolve_uid(acct::GUEST)?;
-        let launch = resolve_gid(acct::LAUNCH_GROUP)?;
+        let guest_gid = resolve_primary_gid(acct::GUEST)?;
         let shared = resolve_gid(acct::SHARED_GROUP)?;
+        // `cadence-launch` is the helper's group — verify it resolves so the
+        // exec pin's expected gid can be checked (execfd consumes it).
+        let _launch = resolve_gid(acct::LAUNCH_GROUP)?;
         if agent_uid == 0 || agent_uid == supervisor || agent_uid != guest {
             return Err(Error::rejected(format!(
                 "agent_uid {agent_uid} is not the provisioned guest {} (uid {})",
@@ -151,9 +263,10 @@ impl ProtectedTopology {
         let root = open_root()?;
         let topo = Self {
             supervisor,
+            supervisor_gid,
             guest,
+            guest_gid,
             shared,
-            launch,
             root,
         };
         topo.verify_skeleton()?;
@@ -163,7 +276,32 @@ impl ProtectedTopology {
     /// The fixed skeleton nodes — owner/mode/kind verified per node, in the
     /// exact pre-provisioned shape. A missing node refuses; never created.
     fn verify_skeleton(&self) -> Result<()> {
-        let nodes = [
+        let nodes = self.node_table();
+        for n in &nodes {
+            self.check_node(n)?;
+        }
+        Ok(())
+    }
+
+    /// The static node table — every protected ancestor is listed so the
+    /// per-hop walk can verify each intermediate's owner/mode, not just the
+    /// leaf.
+    fn node_table(&self) -> Vec<Node> {
+        vec![
+            Node {
+                path: "/opt",
+                owner: 0,
+                group: 0,
+                mode: 0o755,
+                is_dir: true,
+            },
+            Node {
+                path: "/opt/cadence",
+                owner: 0,
+                group: 0,
+                mode: 0o755,
+                is_dir: true,
+            },
             Node {
                 path: "/opt/cadence/libexec",
                 owner: 0,
@@ -179,6 +317,13 @@ impl ProtectedTopology {
                 is_dir: true,
             },
             Node {
+                path: "/srv",
+                owner: 0,
+                group: 0,
+                mode: 0o755,
+                is_dir: true,
+            },
+            Node {
                 path: "/srv/cadence",
                 owner: 0,
                 group: 0,
@@ -188,14 +333,14 @@ impl ProtectedTopology {
             Node {
                 path: "/srv/cadence/protected",
                 owner: self.supervisor,
-                group: self.supervisor_gid()?,
+                group: self.supervisor_gid,
                 mode: 0o700,
                 is_dir: true,
             },
             Node {
                 path: "/srv/cadence/protected/state",
                 owner: self.supervisor,
-                group: self.supervisor_gid()?,
+                group: self.supervisor_gid,
                 mode: 0o700,
                 is_dir: true,
             },
@@ -204,6 +349,20 @@ impl ProtectedTopology {
                 owner: self.supervisor,
                 group: self.shared,
                 mode: 0o750,
+                is_dir: true,
+            },
+            Node {
+                path: "/var",
+                owner: 0,
+                group: 0,
+                mode: 0o755,
+                is_dir: true,
+            },
+            Node {
+                path: "/var/lib",
+                owner: 0,
+                group: 0,
+                mode: 0o755,
                 is_dir: true,
             },
             Node {
@@ -234,87 +393,184 @@ impl ProtectedTopology {
                 mode: 0o770,
                 is_dir: true,
             },
-        ];
-        for n in &nodes {
-            self.check_node(n)?;
-        }
-        Ok(())
+        ]
     }
 
-    fn supervisor_gid(&self) -> Result<u32> {
-        resolve_primary_gid(acct::SUPERVISOR)
+    /// The hop-policy map for the skeleton — every node's expected owner/mode
+    /// keyed by its absolute path, so a `check` walk verifies each ancestor
+    /// against the exact policy that covers it.
+    fn skeleton_policy(&self) -> HopPolicy {
+        HopPolicy {
+            map: self
+                .node_table()
+                .iter()
+                .map(|n| (n.path.to_string(), n.owner, n.group, n.mode))
+                .collect(),
+        }
     }
 
     /// Verify the per-alias view slots exist in the exact pre-provisioned
     /// shape. `…/<alias-sha256>` and its `durable` + `<generation>` parents are
     /// supervisor:cadence 0750; the guest leaf dirs under them are
     /// guest:guest 0700. A missing or mis-owned slot refuses — the source
-    /// never creates a privileged node.
+    /// never creates a privileged node. Every ancestor on the way to a leaf
+    /// is checked against the view policy.
     pub(crate) fn verify_view(&self, segs: &Segments, _role: Role) -> Result<()> {
         let base = format!("/srv/cadence/guest-views/{}", segs.alias_hex());
         let gen = segs.generation_hex();
+        // Expected owner/mode per hop, longest-path first for the leaf lookup.
+        let mut map = self.skeleton_policy().map;
+        for (p, u, g, m) in [
+            (base.clone(), self.supervisor, self.shared, 0o750u32),
+            (
+                format!("{base}/durable"),
+                self.supervisor,
+                self.shared,
+                0o750,
+            ),
+            (format!("{base}/{gen}"), self.supervisor, self.shared, 0o750),
+            (
+                format!("{base}/durable/sessions"),
+                self.guest,
+                self.guest_gid,
+                0o700,
+            ),
+            (
+                format!("{base}/{gen}/briefing"),
+                self.supervisor,
+                self.shared,
+                0o750,
+            ),
+        ] {
+            map.push((p, u, g, m));
+        }
+        for leaf in ["home", "config", "cache", "tmp", "no-forge"] {
+            map.push((
+                format!("{base}/{gen}/{leaf}"),
+                self.guest,
+                self.guest_gid,
+                0o700,
+            ));
+        }
+        let policy = HopPolicy { map };
         // supervisor-owned parents
         for (path, mode) in [
             (base.clone(), 0o750u32),
             (format!("{base}/durable"), 0o750),
             (format!("{base}/{gen}"), 0o750),
         ] {
-            self.check(&path, self.supervisor, self.shared, mode, true)?;
+            self.check_with(&path, self.supervisor, self.shared, mode, true, &policy)?;
         }
         // guest-owned leaves (0700 guest:guest) — all pre-provisioned
-        let guest_gid = resolve_primary_gid(acct::GUEST)?;
         for leaf in ["home", "config", "cache", "tmp", "no-forge"] {
-            self.check(
+            self.check_with(
                 &format!("{base}/{gen}/{leaf}"),
                 self.guest,
-                guest_gid,
+                self.guest_gid,
                 0o700,
                 true,
+                &policy,
             )?;
         }
-        self.check(
+        self.check_with(
             &format!("{base}/durable/sessions"),
             self.guest,
-            guest_gid,
+            self.guest_gid,
             0o700,
             true,
+            &policy,
         )?;
-        self.check(
+        self.check_with(
             &format!("{base}/{gen}/briefing"),
             self.supervisor,
             self.shared,
             0o750,
             true,
+            &policy,
         )?;
         Ok(())
     }
 
-    /// Open a single expected node and `fstat` it.
+    /// Open a single expected node and `fstat` it — walking every ancestor
+    /// through the skeleton policy so a mis-owned intermediate refuses.
     fn check_node(&self, n: &Node) -> Result<OwnedFd> {
-        self.check(n.path, n.owner, n.group, n.mode, n.is_dir)
+        let policy = self.skeleton_policy();
+        self.check_with(n.path, n.owner, n.group, n.mode, n.is_dir, &policy)
     }
 
     fn check(&self, path: &str, uid: u32, gid: u32, mode: u32, is_dir: bool) -> Result<OwnedFd> {
-        let fd = open_at2(Path::new(path), OpenKind::Dir)
-            .map_err(|e| Error::rejected(format!("protected node {path}: {e}")))?;
-        let meta = fd_metadata(&fd)?;
-        if is_dir && !meta.is_dir() {
-            return Err(Error::rejected(format!("{path}: not a directory")));
+        let policy = self.skeleton_policy();
+        self.check_with(path, uid, gid, mode, is_dir, &policy)
+    }
+
+    /// Walk `path` component-by-component beneath the held root, checking each
+    /// intermediate's owner/mode against `policy` (a hop absent from the map
+    /// must still be a non-world-writable directory), then `fstat` the leaf.
+    fn check_with(
+        &self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        is_dir: bool,
+        policy: &HopPolicy,
+    ) -> Result<OwnedFd> {
+        #[cfg(target_os = "linux")]
+        {
+            let hop_ok = |meta: &std::fs::Metadata, walked: &str| -> Result<()> {
+                match policy.lookup(walked) {
+                    Some((u, g, m)) => {
+                        if meta.uid() != u || meta.gid() != g || meta.mode() & 0o7777 != m {
+                            return Err(Error::rejected(format!(
+                                "{walked}: ancestor owned {}:{:o} mode {:04o}, expected \
+                                 {u}:{g} mode {m:04o}",
+                                meta.uid(),
+                                meta.gid(),
+                                meta.mode() & 0o7777
+                            )));
+                        }
+                    }
+                    None => {
+                        // No policy row: still must be a dir that a guest or
+                        // world writer cannot reshape — refuse world-writable.
+                        if meta.mode() & 0o002 != 0 {
+                            return Err(Error::rejected(format!(
+                                "{walked}: ancestor is world-writable — refusing to walk \
+                                 beneath a reshapeable intermediate"
+                            )));
+                        }
+                    }
+                }
+                Ok(())
+            };
+            let fd = open_walk(&self.root, path, OpenKind::Dir, hop_ok)
+                .map_err(|e| Error::rejected(format!("protected node {path}: {e}")))?;
+            let meta = fd_metadata(&fd)?;
+            if is_dir && !meta.is_dir() {
+                return Err(Error::rejected(format!("{path}: not a directory")));
+            }
+            if meta.uid() != uid || meta.gid() != gid {
+                return Err(Error::rejected(format!(
+                    "{path}: owned {}:{} not {uid}:{gid}",
+                    meta.uid(),
+                    meta.gid()
+                )));
+            }
+            if meta.mode() & 0o7777 != mode {
+                return Err(Error::rejected(format!(
+                    "{path}: mode {:04o} not {mode:04o}",
+                    meta.mode() & 0o7777
+                )));
+            }
+            Ok(fd)
         }
-        if meta.uid() != uid || meta.gid() != gid {
-            return Err(Error::rejected(format!(
-                "{path}: owned {}:{} not {uid}:{gid}",
-                meta.uid(),
-                meta.gid()
-            )));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (path, uid, gid, mode, is_dir, policy);
+            Err(Error::rejected(
+                "protected managed-Pi launch is Linux-only (openat2 unavailable)",
+            ))
         }
-        if meta.mode() & 0o7777 != mode {
-            return Err(Error::rejected(format!(
-                "{path}: mode {:04o} not {mode:04o}",
-                meta.mode() & 0o7777
-            )));
-        }
-        Ok(fd)
     }
 
     /// Open the per-launch view dirfd for `layer` — verified, not created.
@@ -354,6 +610,12 @@ fn resolve_uid(name: &str) -> Result<u32> {
     Ok(unsafe { (*pw).pw_uid })
 }
 
+/// NSS group resolution exposed to `execfd` for the exec pin's expected-gid
+/// check — same rule: by name, never a hardcoded number or caller value.
+pub(crate) fn resolve_gid_pub(name: &str) -> Result<u32> {
+    resolve_gid(name)
+}
+
 fn resolve_gid(name: &str) -> Result<u32> {
     let c = CString::new(name).map_err(|_| Error::rejected("group name NUL"))?;
     let gr = unsafe { libc::getgrnam(c.as_ptr()) };
@@ -372,4 +634,100 @@ fn resolve_primary_gid(user: &str) -> Result<u32> {
         )));
     }
     Ok(unsafe { (*pw).pw_gid })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A held dirfd anchored at a tempdir stands in for the pinned `/` so the
+    /// per-hop `open_walk` runs against an ordinary-uid tree — no privileged
+    /// provisioning needed.
+    fn anchor(dir: &std::path::Path) -> OwnedFd {
+        std::fs::File::open(dir).unwrap().into()
+    }
+
+    /// Positive traversal: build `a/b/c` under a tempdir anchor and walk it
+    /// relative to the anchor fd — each hop opens beneath the previous dirfd.
+    /// This is the fix for the absolute-path-with-RESOLVE_BENEATH defect:
+    /// `/a/b/c` under BENEATH would EXDEV; the walker strips to segments.
+    #[test]
+    fn positive_openat2_traversal_under_held_anchor() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("a/b/c")).unwrap();
+        let root = anchor(base.path());
+        // `open_walk` wants an absolute *logical* path; feed it one whose
+        // segments map under the anchor by passing the anchor dirfd directly.
+        let leaf = open_walk(&root, "/a/b/c", OpenKind::Dir, |meta, walked| {
+            assert!(meta.is_dir(), "{walked} must be a dir");
+            Ok(())
+        })
+        .unwrap();
+        assert!(fd_metadata(&leaf).unwrap().is_dir());
+    }
+
+    /// A relative path built from a canonical absolute string must refuse any
+    /// `..`, `.`, empty, or double-slash segment before it ever reaches a
+    /// syscall.
+    #[test]
+    fn noncanonical_and_traversal_segments_refuse() {
+        for bad in [
+            "",
+            "/",
+            "//a",
+            "/a//b",
+            "/a/./b",
+            "/a/../b",
+            "/a/b/",
+            "relative/path",
+        ] {
+            assert!(relative_segments(bad).is_err(), "{bad}");
+        }
+        assert_eq!(relative_segments("/a/b/c").unwrap(), vec!["a", "b", "c"]);
+    }
+
+    /// Writable-intermediate refusal: an ancestor the walker has no policy row
+    /// for that is world-writable must refuse — `RESOLVE_NO_SYMLINKS` does not
+    /// stop a rename under a writable parent, so the per-hop check must.
+    #[test]
+    fn world_writable_intermediate_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let w = base.path().join("a");
+        std::fs::create_dir_all(w.join("b")).unwrap();
+        // Make the intermediate world-writable.
+        std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let root = anchor(base.path());
+        // Policy with no row for /a -> default rule refuses world-writable.
+        let policy = HopPolicy { map: vec![] };
+        let hop_ok = |meta: &std::fs::Metadata, walked: &str| -> Result<()> {
+            if policy.lookup(walked).is_none() && meta.mode() & 0o002 != 0 {
+                return Err(Error::rejected(format!(
+                    "{walked}: ancestor is world-writable"
+                )));
+            }
+            Ok(())
+        };
+        let e = open_walk(&root, "/a/b", OpenKind::Dir, hop_ok).unwrap_err();
+        assert!(e.to_string().contains("world-writable"), "{e}");
+    }
+
+    /// A fifo must NOT hang the exec-file open: `O_NONBLOCK` lets `open` return
+    /// so `fstat` can reject it. Without O_NONBLOCK a fifo open waits for a
+    /// writer forever — this test proves the open returns at all.
+    #[test]
+    fn fifo_exec_open_does_not_hang() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("a")).unwrap();
+        // A fifo as the leaf under a dir we can anchor-walk to.
+        let fifopath = base.path().join("a").join("f");
+        let c = CString::new(fifopath.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let root = anchor(base.path());
+        // open_walk with ExecFile kind must return promptly — O_NONBLOCK —
+        // and yield a fifo fd the caller's fstat then rejects.
+        let fd = open_walk(&root, "/a/f", OpenKind::ExecFile, |_, _| Ok(())).unwrap();
+        let meta = fd_metadata(&fd).unwrap();
+        assert!(!meta.is_file(), "a fifo is not a regular exec target");
+    }
 }

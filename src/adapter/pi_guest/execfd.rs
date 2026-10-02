@@ -41,11 +41,16 @@ const ET_DYN: u16 = 3;
 /// A source-owned executable pin. `sha256` is compiled in and bound to the
 /// measured release artifact — never caller-supplied argv/env, never a
 /// placeholder, never the target's self-attestation. `canon` is the canonical
-/// absolute path the fd must resolve under; `owner`/`mode` are asserted on
-/// the opened inode.
+/// absolute path the fd must resolve under; `owner`/`group`/`mode` are
+/// asserted on the opened inode. The setuid helper is group `cadence-launch`
+/// — only members of that group may exec it, which is why the pin checks the
+/// gid, not just uid+mode.
 pub(crate) struct ExecPin {
     pub canon: &'static str,
     pub owner: u32,
+    /// Expected gid — `acct::LAUNCH_GROUP` (`cadence-launch`) for the helper,
+    /// resolved at bind time from NSS, never hardcoded.
+    pub group: Option<&'static str>,
     pub mode: u32,
     pub sha256: Option<[u8; 32]>,
 }
@@ -59,12 +64,14 @@ pub(crate) const EXEC_PINS: &[ExecPin] = &[
     ExecPin {
         canon: "/opt/cadence/libexec/cadence-agent-exec",
         owner: 0,
+        group: Some(super::acct::LAUNCH_GROUP),
         mode: 0o4750,
         sha256: None,
     },
     ExecPin {
         canon: "/opt/cadence/pi/node",
         owner: 0,
+        group: None,
         mode: 0o755,
         sha256: None,
     },
@@ -229,6 +236,19 @@ pub(crate) fn open_bound(pin: &ExecPin) -> Result<BoundExec> {
             pin.canon,
             meta.nlink()
         )));
+    }
+    // The expected group is part of the pin — e.g. the helper is group
+    // `cadence-launch` so only that group may exec the setuid helper.
+    if let Some(group) = pin.group {
+        let want_gid = super::topology::resolve_gid_pub(group)?;
+        if meta.gid() != want_gid {
+            return Err(Error::rejected(format!(
+                "{}: group {} not the pinned {} ({want_gid})",
+                pin.canon,
+                meta.gid(),
+                group
+            )));
+        }
     }
     // First-two-bytes `#!` is the cheap tell, then the real ELF claim: a
     // bound exec object must be a host-arch 64-bit ELF executable/PIE —
@@ -621,6 +641,7 @@ mod tests {
         let pin = ExecPin {
             canon: "/nonexistent/helper",
             owner: 0,
+            group: None,
             mode: 0o4750,
             sha256: None,
         };
