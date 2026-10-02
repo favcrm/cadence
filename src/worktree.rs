@@ -134,6 +134,15 @@ cd "$top" || exit 1
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX GIT_QUARANTINE_PATH
 tmp="$gd/cadence-pre-push-receipt.tmp"
 out="$gd/cadence-pre-push-receipt"
+# A worktree without scripts/pre-push (a fixture, a sparse lane, a repo that
+# never carried the script) has no gate to run — record that and let the push
+# through rather than blocking on a script that isn't there.
+if [ ! -x scripts/pre-push ]; then
+    printf 'head=%s lane=%s kind=none steps=skipped:no-pre-push rc=0 at=%s\n' \
+        "$(git rev-parse HEAD 2>/dev/null || echo '?')" \
+        "${CADENCE_ALIAS:-$USER}" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
+    exit 0
+fi
 line=$(scripts/pre-push --receipt ${PRE_PUSH_TESTS:+--tests})
 rc=$?
 printf '%s\n' "$line" > "$tmp" && mv "$tmp" "$out"

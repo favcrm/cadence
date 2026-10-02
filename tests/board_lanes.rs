@@ -2145,3 +2145,38 @@ fn lane_push_blocks_on_failed_pre_push_and_allows_on_pass() {
     let (_, landed) = git(&bare, &["branch", "--list", "x-lands"]);
     assert!(landed.contains("x-lands"), "{landed}");
 }
+
+/// A lane whose checkout lacks `scripts/pre-push` (a fixture, a sparse repo)
+/// must not be blocked by the gate — the hook records a skipped receipt and
+/// lets the push through rather than fail on a script that isn't there.
+#[test]
+fn lane_push_allowed_when_repo_has_no_pre_push_script() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "new", "No Script", "--project", "demo"]
+        )
+        .0
+    );
+    let (_, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    let wt = PathBuf::from(out["worktree"].as_str().unwrap());
+    // The fixture repo has no scripts/pre-push — the hook must not block it.
+    assert!(!wt.join("scripts/pre-push").exists());
+    let bare = repo.parent().unwrap().join("origin.git");
+    assert!(git(&repo, &["init", "--bare", "-q", bare.to_str().unwrap()]).0);
+    assert!(git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]).0);
+    let (pushed, out2) = git(&wt, &["push", "origin", "HEAD:x-no-script"]);
+    assert!(
+        pushed,
+        "push blocked although scripts/pre-push is absent: {out2}"
+    );
+    let receipt = wt_git_dir(&wt).join("cadence-pre-push-receipt");
+    assert!(receipt.is_file(), "no receipt written");
+    let text = std::fs::read_to_string(&receipt).unwrap();
+    assert!(text.contains("skipped:no-pre-push"), "{text}");
+    assert!(text.contains("rc=0"), "{text}");
+    let (_, landed) = git(&bare, &["branch", "--list", "x-no-script"]);
+    assert!(landed.contains("x-no-script"), "{landed}");
+}
