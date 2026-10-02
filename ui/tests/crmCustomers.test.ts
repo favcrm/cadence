@@ -344,8 +344,12 @@ assert(!location.search.includes("beta-two"), "no customer content in the URL");
 await React.act(async () => {
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
 });
-await flush();
-assert(!host.querySelector('[data-drawer="customer"]'), "Escape closes the drawer");
+// CAD-1013: Escape now plays the close transition and unmounts on
+// transitionend, or on the 320ms fallback timer. happy-dom fires no real
+// transitionend, so the unmount only lands after that fallback — wait it
+// out (sleep > 320) inside act, then settle to confirm the drawer is gone.
+await React.act(async () => { await sleep(400); });
+await settle(() => assert(!host.querySelector('[data-drawer="customer"]'), "Escape closes the drawer"));
 assert(!location.search.includes("record="), "closing clears the record scope");
 
 // New customer: invalid email blocks before the wire; valid posts exact grammar.

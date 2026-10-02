@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import type { Connection } from "../../lib/types";
 import { smtpSummary } from "../settings/connectionsView";
 import Button from "../../ui/Button";
@@ -11,26 +11,23 @@ import {
   type AudienceScope,
 } from "./audienceClient";
 import {
-  BLOCK_TYPES,
   checkCampaignId,
   checkContent,
   friendlyCampaignError,
-  isBlockType,
-  newRequestId,
   parseContentDoc,
   parseContentList,
-  parseProposal,
   parseProposalList,
-  parseProposalRequest,
+  parseProposalRender,
   parseRender,
-  withToken,
   type CampaignBlock,
   type ContentDoc,
   type ContentRender,
   type ProposalDoc,
-  type ProposalRequestDoc,
+  type ProposalRenderDoc,
 } from "./campaignGrammar";
 import { contentClient } from "./contentClient";
+import { resources } from "../../lib/resources";
+import { useQuery } from "../../lib/useResource";
 import {
   DELIVERY_CLAIM,
   friendlySendError,
@@ -91,7 +88,6 @@ import Field from "./shared/Field";
 
 export default function CrmCampaigns({
   scope,
-  scopedChatMessage,
   viewer,
   view,
   recordId,
@@ -100,10 +96,6 @@ export default function CrmCampaigns({
   onRecordCreated,
 }: {
   scope: AudienceScope;
-  /** CAD-813: the operator's newest left-chat message daemon-stamped
-   *  with this exact install/context — the mint's `message_id`.
-   *  Threaded down from the shell, never read from a global. */
-  scopedChatMessage?: string | null;
   viewer: Viewer;
   view: "list" | "new";
   recordId: string | null;
@@ -116,7 +108,6 @@ export default function CrmCampaigns({
       {recordId !== null ? (
         <CampaignDetail
           scope={scope}
-          scopedChatMessage={scopedChatMessage ?? null}
           viewer={viewer}
           campaignId={recordId}
           onBack={() => onSelect(null)}
@@ -131,7 +122,6 @@ export default function CrmCampaigns({
       ) : (
         <CampaignNew
           scope={scope}
-          scopedChatMessage={scopedChatMessage ?? null}
           viewer={viewer}
           onCreated={(id) => {
             if (onRecordCreated) onRecordCreated(id);
@@ -161,6 +151,7 @@ function CampaignList({
   const canWrite = viewer.operator && !viewer.readOnly;
   const [campaigns, setCampaigns] = useState<ContentDoc[]>([]);
   const [sends, setSends] = useState<SendListEntry[]>([]);
+  const [pendingDrafts, setPendingDrafts] = useState<ProposalDoc[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
@@ -180,6 +171,28 @@ function CampaignList({
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reloadToken]);
+
+  // CAD-1016: pending assistant drafts are discoverable here even when
+  // the campaign has no saved content yet — a scoped-chat assistant draft
+  // lands `pending` under a campaign_id the content list does not know.
+  // Proposals are scope-partitioned already; failure to load them is
+  // advisory and never blocks the saved-content list.
+  useEffect(() => {
+    if (scope.contextId === "" || !viewer.operator) return;
+    const controller = new AbortController();
+    contentClient
+      .proposalList(scope)
+      .then((value) => {
+        if (!controller.signal.aborted) {
+          setPendingDrafts(parseProposalList(value).filter((row) => row.state === "pending"));
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setPendingDrafts([]);
       });
     return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -352,6 +365,46 @@ function CampaignList({
           </table>
         </div>
       )}
+      {(() => {
+        // Campaigns that exist only as a pending assistant draft — no
+        // saved content yet. Opening one shows the proposal and its
+        // Visual/HTML/Text preview before Apply (source_revision 0
+        // creates revision 1); the missing saved-content 404 is the
+        // expected pending-only state, not an error.
+        const savedIds = new Set(campaigns.map((row) => row.campaignId));
+        const draftOnly = pendingDrafts.filter((row) => !savedIds.has(row.campaignId));
+        if (scope.contextId === "" || !viewer.operator || error !== null || draftOnly.length === 0) {
+          return null;
+        }
+        return (
+          <div className="card px-4 py-4 mt-4" data-pending-drafts>
+            <h4 className="text-cardtitle font-medium text-ink-100">
+              Assistant drafts awaiting review
+            </h4>
+            <p className="text-secondary text-ink-400">
+              The assistant drafted these emails from your chat. Nothing is saved until you
+              open one and Apply.
+            </p>
+            <ul className="grid gap-2 mt-2">
+              {draftOnly.map((proposal) => (
+                <li key={proposal.proposalId} className="flex items-center gap-3">
+                  <span className="text-ink-100 flex-1">
+                    {proposal.subject !== "" ? proposal.subject : <em>Untitled draft</em>}
+                    <span className="num text-micro text-ink-500"> · {proposal.campaignId}</span>
+                  </span>
+                  <button
+                    type="button"
+                    className="lnk"
+                    onClick={() => onSelect(proposal.campaignId)}
+                  >
+                    Review draft
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      })()}
     </section>
   );
 }
@@ -1802,7 +1855,6 @@ function FinalSendPanel({
 
 function CampaignWorkspace({
   scope,
-  scopedChatMessage,
   viewer,
   campaignId,
   doc,
@@ -1812,7 +1864,6 @@ function CampaignWorkspace({
   audienceSlot,
 }: {
   scope: AudienceScope;
-  scopedChatMessage: string | null;
   viewer: Viewer;
   campaignId: string;
   doc: ContentDoc | null;
@@ -1831,7 +1882,13 @@ function CampaignWorkspace({
   const [subject, setSubject] = useState(doc?.subject ?? "");
   const [preheader, setPreheader] = useState(doc?.preheader ?? "");
   const [blocks, setBlocks] = useState<EditorBlock[]>(() => blocksFromDoc(doc));
-  const [fallback, setFallback] = useState("Friend");
+  // CAD-1013 pinned inline edit: the revision the operator began editing
+  // against. `save` sends it as expectedRevision so a concurrent agent
+  // Apply/newer draft can never be silently overwritten — a drift is a
+  // conflict, not a merge. `staleEdit` flags that a newer doc landed
+  // while editing so the local text is preserved, not clobbered.
+  const [editSourceRevision, setEditSourceRevision] = useState<number | null>(null);
+  const [staleEdit, setStaleEdit] = useState(false);
   const [pending, setPending] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [savedNote, setSavedNote] = useState<string | null>(null);
@@ -1855,25 +1912,27 @@ function CampaignWorkspace({
   const [proposals, setProposals] = useState<ProposalDoc[]>([]);
   const [proposalsError, setProposalsError] = useState<string | null>(null);
   const [proposalToken, setProposalToken] = useState(0);
-  const [proposalPending, setProposalPending] = useState(false);
   const [proposalError, setProposalError] = useState<string | null>(null);
   const [proposalNote, setProposalNote] = useState<string | null>(null);
-  // CAD-813: the minted request's host stamp, plus the bounded poll
-  // that watches for the assistant's turn to redeem it.
-  const [minted, setMinted] = useState<ProposalRequestDoc | null>(null);
-  const [mintPending, setMintPending] = useState(false);
-  const [mintWatching, setMintWatching] = useState(false);
-  const mintPoll = useRef<{ deadline: number; requestId: string } | null>(null);
 
   // The doc is the saved truth: editor follows a newly saved revision
-  // (create, Apply) but never clobbers typing mid-draft.
+  // (create, Apply) but never clobbers typing mid-draft. While editing,
+  // a newer doc marks the edit stale instead — the operator's text stays
+  // put and the save keeps the pinned editSourceRevision, so a conflict
+  // refuses rather than overwriting an agent's newer draft.
   const docIdentity = doc === null ? "none" : `${doc.revision}:${doc.contentDigest}`;
   useEffect(() => {
     if (doc === null) return;
+    if (editing) {
+      // A new saved revision landed mid-edit: keep local text, flag it.
+      setStaleEdit(true);
+      return;
+    }
     setSubject(doc.subject);
     setPreheader(doc.preheader);
     setBlocks(blocksFromDoc(doc));
     setTestReceipt(null);
+    setStaleEdit(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docIdentity]);
 
@@ -1965,8 +2024,32 @@ function CampaignWorkspace({
   }, [scope.installId, scope.contextId, viewer.operator, bindingToken]);
 
   const proposalsKey = `${scope.installId}:${scope.contextId}:${campaignId}:${proposalToken}`;
+  // CAD-1016: refresh pending drafts on the agent's actual completion —
+  // a new non-operator entry landing in the scoped thread (the assistant's
+  // reply after the operator's ask), not merely the operator's send.
+  // `useQuery` subscribes to the live thread store the SSE stream feeds.
+  const thread = useQuery(resources.masterThread);
+  const lastAssistantSeq = (() => {
+    const entries = thread.data?.entries ?? [];
+    let max = 0;
+    for (const e of entries) {
+      if (e.role !== "operator" && e.seq > max) max = e.seq;
+    }
+    return max;
+  })();
+  const seenAssistantSeq = useRef(0);
   useEffect(() => {
-    if (doc === null || !viewer.operator) {
+    if (lastAssistantSeq > seenAssistantSeq.current) {
+      seenAssistantSeq.current = lastAssistantSeq;
+      setProposalToken((count) => count + 1);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastAssistantSeq]);
+  useEffect(() => {
+    // CAD-1013: proposals must be listed even before revision 1 exists —
+    // the assistant-apply path is the creation route now, so a verified
+    // proposal at source_revision 0 has to surface here for Apply.
+    if (!viewer.operator) {
       setProposals([]);
       return;
     }
@@ -1986,69 +2069,10 @@ function CampaignWorkspace({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [proposalsKey]);
 
-  // Bounded post-mint watch: after a proposal request lands, poll the
-  // list every 3s until the assistant's receipt names it, the request
-  // is spent, or two minutes pass — then stop. No busy loop, and the
-  // watch dies with the workspace.
-  useEffect(() => {
-    if (!mintWatching || minted === null) return;
-    const timer = setInterval(() => {
-      const watch = mintPoll.current;
-      if (watch === null || watch.requestId !== minted.requestId || Date.now() >= watch.deadline) {
-        setMintWatching(false);
-        return;
-      }
-      contentClient
-        .proposalList(scope)
-        .then((value) => {
-          const matched = parseProposalList(value).some(
-            (row) =>
-              row.campaignId === campaignId &&
-              row.assistantReceipt?.requestId === watch.requestId,
-          );
-          if (matched) {
-            mintPoll.current = null;
-            setMintWatching(false);
-            setProposalToken((count) => count + 1);
-            setProposalNote(
-              `Verified assistant draft landed for request ${watch.requestId} — review and Apply or Discard below.`,
-            );
-            return;
-          }
-          setProposalToken((count) => count + 1);
-        })
-        .catch(() => {
-          /* a transient read failure retries on the next tick */
-        });
-    }, 3000);
-    return () => clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mintWatching, minted?.requestId]);
-
-  const mintRequest = () => {
-    if (scopedChatMessage === null || doc === null) return;
-    setMintPending(true);
-    setProposalError(null);
-    setProposalNote(null);
-    const requestId = newRequestId();
-    void contentClient
-      .proposalRequest(scope, {
-        campaignId,
-        messageId: scopedChatMessage,
-        requestId,
-      })
-      .then((value) => {
-        const request = parseProposalRequest(value);
-        setMinted(request);
-        mintPoll.current = { deadline: Date.now() + 120_000, requestId: request.requestId };
-        setMintWatching(true);
-        setProposalNote(
-          `Request ${request.requestId} minted against chat message ${request.messageId} — the assistant's next turn can attach one draft to it.`,
-        );
-      })
-      .catch((err: unknown) => setProposalError(friendlyCampaignError(err)))
-      .finally(() => setMintPending(false));
-  };
+  // CAD-1016: no manual proposal-request mint — an ordinary scoped chat
+  // message invokes the CAD-1014 assistant-draft turn, which lands an
+  // inert `pending` proposal on this campaign. The drafts list below
+  // refreshes to surface it; there is no request id to mint or poll.
 
   const grammarBlocks = (): CampaignBlock[] => blocksToGrammar(blocks);
 
@@ -2070,18 +2094,36 @@ function CampaignWorkspace({
         subject,
         preheader,
         blocks: grammarBlocks(),
-        ...(doc === null ? {} : { expectedRevision: doc.revision }),
+        // CAD-1013 pinned edit: expectedRevision is the revision the
+        // operator began editing against, not whatever doc is current —
+        // a concurrent agent Apply must refuse as a conflict, never be
+        // silently overwritten.
+        ...(editSourceRevision === null || editSourceRevision === 0
+          ? {}
+          : { expectedRevision: editSourceRevision }),
       })
       .then((value) => {
         const next = parseContentDoc(value);
         onDoc(next);
+        setRender(null);
+        setTestReceipt(null);
+        setEditing(false);
+        setEditSourceRevision(null);
+        setStaleEdit(false);
         setSavedNote(
           doc === null
             ? `Created revision ${next.revision} — earlier content approval does not exist yet.`
             : `Saved revision ${next.revision} — content approval invalidated.`,
         );
       })
-      .catch((err: unknown) => setFormError(friendlyCampaignError(err)))
+      .catch((err: unknown) => {
+        // expectedRevision conflict: keep the operator's local text edits
+        // open and ask for a reload — never overwrite an agent's newer draft.
+        setFormError(
+          friendlyCampaignError(err) +
+            " The draft moved since you started editing — reload it to retry, or Cancel to keep browsing.",
+        );
+      })
       .finally(() => setPending(false));
   };
 
@@ -2107,7 +2149,8 @@ function CampaignWorkspace({
   const previewBody =
     doc === null ? (
       <p className="text-label text-ink-400" data-preview="unsaved">
-        Save your draft to preview the email.
+        No saved email yet. Ask the assistant in the left chat to draft this campaign&apos;s
+        email, then Apply its verified proposal below to create revision 1.
       </p>
     ) : (
       <>
@@ -2219,248 +2262,203 @@ function CampaignWorkspace({
     </section>
   );
 
+  // CAD-1013 preview-first: the manual block composer is replaced by a
+  // read-oriented content card. The email is created/refined by the
+  // assistant proposal flow (Proposals section); the only operator edit
+  // here is a bounded inline text correction of saved subject, preheader
+  // and the text of existing blocks — never block structure, URLs or
+  // token tooling. Corrections go through the same revisioned save path
+  // (expectedRevision) so a conflict never overwrites an agent draft.
+  const [editing, setEditing] = useState(false);
+  const startEdit = () => {
+    setSubject(doc?.subject ?? "");
+    setPreheader(doc?.preheader ?? "");
+    setBlocks(blocksFromDoc(doc));
+    setEditSourceRevision(doc === null ? 0 : doc.revision);
+    setStaleEdit(false);
+    setFormError(null);
+    setEditing(true);
+  };
+  const cancelEdit = () => {
+    setBlocks(blocksFromDoc(doc));
+    setSubject(doc?.subject ?? "");
+    setPreheader(doc?.preheader ?? "");
+    setEditSourceRevision(null);
+    setStaleEdit(false);
+    setFormError(null);
+    setEditing(false);
+  };
   const contentForm = (
-      <form className="card px-4 py-4 grid gap-3" aria-label="Email content" onSubmit={save}>
+      <div className="card px-4 py-4 grid gap-3" aria-label="Email content">
         <h4 className="text-cardtitle font-medium text-ink-100">
-          Content {doc === null ? "— unsaved draft" : ""}
+          Content {doc === null ? "— not drafted yet" : `— revision ${doc.revision}`}
         </h4>
-        <div className="crm-field-row">
-          <Field
-            label="Subject"
-            id="cmp-subject"
-            hint="Plain text"
-            required
-            disabled={!canWrite || pending}
-            className="crm-field"
-          >
-            {(c) => (
-              <input
-                {...c}
-                className="field"
-                value={subject}
-                onChange={(e) => setSubject(e.target.value)}
-                maxLength={150}
-                autoComplete="off"
-              />
-            )}
-          </Field>
-          <Field
-            label="Preheader"
-            id="cmp-preheader"
-            hint="Optional, plain text"
-            disabled={!canWrite || pending}
-            className="crm-field"
-          >
-            {(c) => (
-              <input
-                {...c}
-                className="field"
-                value={preheader}
-                onChange={(e) => setPreheader(e.target.value)}
-                maxLength={200}
-                autoComplete="off"
-              />
-            )}
-          </Field>
-        </div>
-        <div className="crm-field-row">
-          <Field
-            label="First-name fallback for the token"
-            id="cmp-fallback"
-            disabled={!canWrite || pending}
-            className="crm-field"
-          >
-            {(c) => (
-              <input
-                {...c}
-                className="field"
-                value={fallback}
-                onChange={(e) => setFallback(e.target.value)}
-                maxLength={40}
-                autoComplete="off"
-              />
-            )}
-          </Field>
-          <p className="text-micro text-ink-500">
-            The only approved personalization is {"{{first_name|Fallback}}"}. Paste carrying HTML,
-            scripts or other merge fields is refused and nothing is mutated.
+        {doc === null && (
+          <p className="text-label text-ink-400" data-state="no-draft">
+            No email draft yet. Ask the assistant in the left chat to draft this campaign&apos;s
+            email, then Apply its verified proposal below to create revision 1 — or use the
+            inline editor after a draft exists.
           </p>
-        </div>
-        <ol className="crm-history" aria-label="Content blocks">
-          {blocks.map((block, index) => (
-            <li key={block.key} className="card px-3 py-3">
-              <div className="crm-field-row">
-                <Field
-                  label={`Block ${index + 1} type`}
-                  id={`cmp-block-type-${block.key}`}
-                  disabled={!canWrite || pending}
-                  className="crm-field"
-                >
-                  {(c) => (
-                    <Select
-                      id={c.id}
-                      value={block.kind}
-                      onChange={(value) =>
-                        isBlockType(value) && updateBlock(block.key, { kind: value })
-                      }
-                      options={BLOCK_TYPES.map((entry) => ({ value: entry.value, label: entry.label }))}
-                      aria-label={`Block ${index + 1} type`}
-                      disabled={c.disabled}
-                      full
-                    />
-                  )}
-                </Field>
-                {block.kind === "button" ? (
-                  <Field
-                    label="Button label"
-                    id={`cmp-block-label-${block.key}`}
-                    disabled={!canWrite || pending}
-                    className="crm-field"
-                  >
-                    {(c) => (
-                      <input
-                        {...c}
-                        className="field"
-                        value={block.label}
-                        onChange={(e) => updateBlock(block.key, { label: e.target.value })}
-                        maxLength={60}
-                        autoComplete="off"
-                      />
-                    )}
-                  </Field>
-                ) : (
-                  <div className="crm-field">
-                    <span className="text-label text-ink-300" id={`cmp-block-token-${block.key}`}>
-                      First-name personalization
-                    </span>
-                    <div
-                      className="crm-toolbar"
-                      role="group"
-                      aria-labelledby={`cmp-block-token-${block.key}`}
-                    >
-                      <Button
-                        type="button"
-                        size="sm"
-                        disabled={!canWrite || pending}
-                        title={`Append {{first_name|${fallback.trim() === "" ? "Friend" : fallback.trim()}}} to this block`}
-                        onClick={() =>
-                          updateBlock(block.key, { text: withToken(block.text, fallback) })
-                        }
-                      >
-                        Add to block
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        disabled={!canWrite || pending}
-                        title={`Append {{first_name|${fallback.trim() === "" ? "Friend" : fallback.trim()}}} to the subject`}
-                        onClick={() => setSubject((prev) => withToken(prev, fallback))}
-                      >
-                        Add to subject
-                      </Button>
-                    </div>
-                  </div>
-                )}
+        )}
+        {!editing ? (
+          <>
+            {doc !== null && (
+              <dl className="sdetail" data-content-summary>
+                <div>
+                  <dt>Subject</dt>
+                  <dd>{doc.subject}</dd>
+                </div>
+                <div>
+                  <dt>Preheader</dt>
+                  <dd>{doc.preheader === "" ? "—" : doc.preheader}</dd>
+                </div>
+                <div>
+                  <dt>Blocks</dt>
+                  <dd>
+                    {doc.blocks.length} block{doc.blocks.length === 1 ? "" : "s"} ·{" "}
+                    {doc.contentDigest.slice(0, 18)}…
+                  </dd>
+                </div>
+              </dl>
+            )}
+            {canWrite && doc !== null && (
+              <div className="crm-toolbar">
+                <Button type="button" size="sm" onClick={startEdit}>
+                  Edit subject / text
+                </Button>
+                <span className="text-micro text-ink-500">
+                  Text corrections save a new revision and invalidate the current approval.
+                </span>
               </div>
-              {block.kind === "button" ? (
-                <Field
-                  label="Button URL"
-                  id={`cmp-block-url-${block.key}`}
-                  hint="https only"
-                  disabled={!canWrite || pending}
-                  className="crm-field mt-2"
-                >
-                  {(c) => (
-                    <input
-                      {...c}
-                      className="field"
-                      value={block.url}
-                      onChange={(e) => updateBlock(block.key, { url: e.target.value })}
-                      maxLength={500}
-                      autoComplete="off"
-                      placeholder="https://example.com/offer"
-                    />
-                  )}
-                </Field>
-              ) : (
-                <Field
-                  label={block.kind === "heading" ? "Heading text" : "Paragraph text"}
-                  id={`cmp-block-text-${block.key}`}
-                  disabled={!canWrite || pending}
-                  className="crm-field mt-2"
-                >
-                  {(c) => (
-                    <textarea
-                      {...c}
-                      className="field"
-                      rows={block.kind === "heading" ? 2 : 4}
-                      value={block.text}
-                      onChange={(e) => updateBlock(block.key, { text: e.target.value })}
-                      maxLength={block.kind === "heading" ? 120 : 2000}
-                      autoComplete="off"
-                    />
-                  )}
-                </Field>
-              )}
-              {blocks.length > 1 && canWrite && (
-                <p className="mt-2">
-                  <button
-                    type="button"
-                    className="lnk text-label"
-                    disabled={pending}
-                    onClick={() => setBlocks((prev) => prev.filter((row) => row.key !== block.key))}
-                  >
-                    Remove block {index + 1}
-                  </button>
-                </p>
-              )}
-            </li>
-          ))}
-        </ol>
-        {canWrite && blocks.length < 12 && (
-          <p className="crm-toolbar" aria-label="Add block">
-            {BLOCK_TYPES.map((entry) => (
-              <Button
-                key={entry.value}
-                type="button"
-                size="sm"
-                disabled={pending}
-                onClick={() =>
-                  isBlockType(entry.value) &&
-                  setBlocks((prev) => [
-                    ...prev,
-                    { key: editorKey++, kind: entry.value, text: "", label: "", url: "" },
-                  ])
-                }
+            )}
+            {doc !== null && !canWrite && (
+              <p className="text-label text-ink-400" data-state="read-only">
+                Read-only view. A verified operator saves content revisions.
+              </p>
+            )}
+          </>
+        ) : (
+          <form className="grid gap-3" aria-label="Correct email text" onSubmit={save}>
+            {staleEdit && (
+              <p className="text-label text-warn" role="status" data-stale-edit>
+                A newer revision was saved while you were editing — your text is kept, but
+                saving now is pinned to revision {editSourceRevision}. If it conflicts, reload
+                the draft or Cancel — your newer text is never overwritten silently.
+              </p>
+            )}
+            <div className="crm-field-row">
+              <Field
+                label="Subject"
+                id="cmp-subject"
+                hint="Plain text"
+                required
+                disabled={!canWrite || pending}
+                className="crm-field"
               >
-                + {entry.label}
+                {(c) => (
+                  <input
+                    {...c}
+                    className="field"
+                    value={subject}
+                    onChange={(e) => setSubject(e.target.value)}
+                    maxLength={150}
+                    autoComplete="off"
+                  />
+                )}
+              </Field>
+              <Field
+                label="Preheader"
+                id="cmp-preheader"
+                hint="Optional, plain text"
+                disabled={!canWrite || pending}
+                className="crm-field"
+              >
+                {(c) => (
+                  <input
+                    {...c}
+                    className="field"
+                    value={preheader}
+                    onChange={(e) => setPreheader(e.target.value)}
+                    maxLength={200}
+                    autoComplete="off"
+                  />
+                )}
+              </Field>
+            </div>
+            <ol className="crm-history" aria-label="Block text">
+              {blocks.map((block, index) => (
+                <li key={block.key} className="card px-3 py-3">
+                  <p className="text-micro text-ink-500">
+                    Block {index + 1} — {block.kind}
+                    {block.kind === "button" ? " (URL unchanged)" : ""}
+                  </p>
+                  {block.kind === "button" ? (
+                    <Field
+                      label="Button label"
+                      id={`cmp-block-label-${block.key}`}
+                      disabled={!canWrite || pending}
+                      className="crm-field mt-2"
+                    >
+                      {(c) => (
+                        <input
+                          {...c}
+                          className="field"
+                          value={block.label}
+                          onChange={(e) => updateBlock(block.key, { label: e.target.value })}
+                          maxLength={60}
+                          autoComplete="off"
+                        />
+                      )}
+                    </Field>
+                  ) : (
+                    <Field
+                      label={block.kind === "heading" ? "Heading text" : "Paragraph text"}
+                      id={`cmp-block-text-${block.key}`}
+                      disabled={!canWrite || pending}
+                      className="crm-field mt-2"
+                    >
+                      {(c) => (
+                        <textarea
+                          {...c}
+                          className="field"
+                          rows={block.kind === "heading" ? 2 : 4}
+                          value={block.text}
+                          onChange={(e) => updateBlock(block.key, { text: e.target.value })}
+                          maxLength={block.kind === "heading" ? 120 : 2000}
+                          autoComplete="off"
+                        />
+                      )}
+                    </Field>
+                  )}
+                </li>
+              ))}
+            </ol>
+            {formError && (
+              <p className="text-label text-fail" role="alert">
+                {formError}
+              </p>
+            )}
+            {savedNote && (
+              <p className="text-label text-ok" role="status">
+                {savedNote}
+              </p>
+            )}
+            <div className="crm-toolbar">
+              <Button type="submit" variant="primary" loading={pending} disabled={pending}>
+                Save text corrections (new revision)
               </Button>
-            ))}
-            <span className="num text-micro text-ink-500">{blocks.length}/12</span>
-          </p>
+              <Button type="button" disabled={pending} onClick={cancelEdit}>
+                Cancel
+              </Button>
+            </div>
+          </form>
         )}
-        {formError && (
-          <p className="text-label text-fail" role="alert">
-            {formError}
-          </p>
-        )}
-        {savedNote && (
+        {!editing && savedNote && (
           <p className="text-label text-ok" role="status">
             {savedNote}
           </p>
         )}
-        {!canWrite ? (
-          <p className="text-label text-ink-400" data-state="read-only">
-            Read-only view. A verified operator saves content revisions.
-          </p>
-        ) : (
-          <div>
-            <Button type="submit" variant="primary" loading={pending} disabled={pending}>
-              {doc === null ? "Create campaign (revision 1)" : "Save draft"}
-            </Button>
-          </div>
-        )}
-      </form>
+      </div>
   );
 
   const approvalSection = doc !== null && (
@@ -2653,14 +2651,16 @@ function CampaignWorkspace({
         </section>
   );
 
-  const proposalsSection = doc !== null && (
+  // CAD-1013: proposals stay available before revision 1 — the assistant
+  // mint/apply path is the creation route now that the manual composer is
+  // gone. expectedRevision is 0 for an unsaved campaign (source_revision=0).
+  const proposalsSection = (
         <section aria-label="Assistant proposals" className="card px-4 py-4 grid gap-3">
           <h4 className="text-cardtitle font-medium text-ink-100">Proposals — Apply or Discard</h4>
           <p className="text-label text-ink-400">
-            The left chat assistant drafts copy when the operator asks it to: mint one proposal
-            request below, then its live turn answers with a host-verified draft. Only Apply
-            changes the draft revision (approval invalidates); Discard is non-mutating. Nothing
-            proposes, edits or sends silently.
+            Ask the assistant in the left chat to draft this email — its draft appears here
+            for review. Only Apply changes the saved version (approval invalidates); Discard
+            is non-mutating. Nothing proposes, edits or sends silently.
           </p>
           {proposalsError && (
             <p className="text-label text-fail" role="alert">
@@ -2681,84 +2681,17 @@ function CampaignWorkspace({
             </p>
           )}
           {canWrite && (
-            <div className="grid gap-2" data-assistant-mint>
-              <div className="crm-toolbar">
-                <Button
-                  size="sm"
-                  variant="primary"
-                  loading={mintPending}
-                  disabled={mintPending || scopedChatMessage === null}
-                  title={
-                    scopedChatMessage === null
-                      ? "Send the assistant a message in the left chat first"
-                      : `Mint a one-time proposal request on chat message ${scopedChatMessage}`
-                  }
-                  onClick={mintRequest}
-                >
-                  Ask assistant to draft
-                </Button>
-                {scopedChatMessage === null && (
-                  <span className="text-label text-ink-500" data-mint-hint>
-                    Send the assistant a message in the left chat first
-                  </span>
-                )}
-                {mintWatching && (
-                  <span className="text-label text-ink-400" role="status" data-mint-watching>
-                    Watching for the assistant's draft…
-                  </span>
-                )}
-              </div>
-              {minted !== null && (
-                <p className="num text-micro text-ink-500" data-minted-request>
-                  Request {minted.requestId} · campaign {minted.campaignId} · stamped source r
-                  {minted.sourceRevision} · draft r{doc.revision} ·{" "}
-                  {minted.state === "open" ? "awaiting the assistant's turn" : minted.state}
-                  {minted.usedBy !== null ? ` by ${minted.usedBy}` : ""}
-                </p>
-              )}
-            </div>
-          )}
-          {canWrite && (
-            <div>
-              <Button
-                size="sm"
-                loading={proposalPending}
-                disabled={proposalPending}
-                title="Submit the editor's copy as an operator-submitted proposal (not assistant-authored)"
-                onClick={() => {
-                  setProposalError(null);
-                  setProposalNote(null);
-                  let grammar: CampaignBlock[];
-                  try {
-                    grammar = grammarBlocks();
-                    checkContent(subject, preheader, grammar);
-                  } catch (err: unknown) {
-                    setProposalError(friendlyCampaignError(err));
-                    return;
-                  }
-                  setProposalPending(true);
-                  void contentClient
-                    .propose(scope, {
-                      campaignId,
-                      proposalId: newAudienceId("prop"),
-                      subject,
-                      preheader,
-                      blocks: grammar,
-                    })
-                    .then((value) => {
-                      const created = parseProposal(value);
-                      setProposalToken((count) => count + 1);
-                      setProposalNote(
-                        `Operator-submitted proposal ${created.proposalId} recorded against r${created.sourceRevision} — still inert until Apply.`,
-                      );
-                    })
-                    .catch((err: unknown) => setProposalError(friendlyCampaignError(err)))
-                    .finally(() => setProposalPending(false));
-                }}
+            <p className="text-label text-ink-500" data-assistant-hint>
+              Ask the assistant in the left chat to draft this email — its
+              proposal appears below for review.{" "}
+              <button
+                type="button"
+                className="lnk"
+                onClick={() => setProposalToken((count) => count + 1)}
               >
-                Submit editor as proposal (operator-submitted)
-              </Button>
-            </div>
+                Refresh drafts
+              </button>
+            </p>
           )}
           {proposals.filter((row) => row.state === "pending").length === 0 ? (
             <p className="text-label text-ink-400" data-empty="proposals">
@@ -2773,7 +2706,7 @@ function CampaignWorkspace({
                     key={row.proposalId}
                     scope={scope}
                     proposal={row}
-                    expectedRevision={doc.revision}
+                    expectedRevision={doc === null ? 0 : doc.revision}
                     canWrite={canWrite}
                     onApplied={(next) => {
                       onDoc(next);
@@ -2787,7 +2720,9 @@ function CampaignWorkspace({
                     onDiscarded={(id) => {
                       setProposalToken((count) => count + 1);
                       setProposalNote(
-                        `Proposal ${id} discarded — draft unchanged at r${doc.revision} (${doc.contentDigest.slice(0, 18)}…).`,
+                        doc === null
+                          ? `Proposal ${id} discarded — still no saved revision.`
+                          : `Proposal ${id} discarded — draft unchanged at r${doc.revision} (${doc.contentDigest.slice(0, 18)}…).`,
                       );
                     }}
                     onError={setProposalError}
@@ -2876,9 +2811,30 @@ function ProposalRow({
   onError: (message: string | null) => void;
 }) {
   const [pending, setPending] = useState<"apply" | "discard" | null>(null);
+  const [showBody, setShowBody] = useState(false);
+  const [bodyRender, setBodyRender] = useState<ProposalRenderDoc | null>(null);
+  const [bodyPending, setBodyPending] = useState(false);
+  const [bodyError, setBodyError] = useState<string | null>(null);
+  const [bodyTab, setBodyTab] = useState<"visual" | "html" | "text">("visual");
   const verified = proposal.actor === "assistant" && proposal.assistantReceipt !== null;
   const stale = proposal.sourceRevision !== expectedRevision;
   const receipt = proposal.assistantReceipt;
+
+  // CAD-1016: the real Visual/HTML/Text preview of the pending draft —
+  // the host renders the proposal's own inert subject/preheader/blocks
+  // (proposal-render); no save, no send. Falls back to the escaped
+  // structured body if the host render is unavailable.
+  const openBody = () => {
+    setShowBody(true);
+    if (bodyRender !== null || bodyPending) return;
+    setBodyPending(true);
+    setBodyError(null);
+    contentClient
+      .proposalRender(scope, proposal.proposalId)
+      .then((value) => setBodyRender(parseProposalRender(value)))
+      .catch((e: unknown) => setBodyError(friendlyCampaignError(e)))
+      .finally(() => setBodyPending(false));
+  };
   return (
     <li className="card px-3 py-3" data-proposal={proposal.proposalId}>
       <p className="text-label text-ink-200">
@@ -2889,13 +2845,12 @@ function ProposalRow({
           <span
             className="chip"
             data-badge="verified-assistant"
-            title="Host-verified: the daemon stamped this draft's agent, request, campaign and source revision — the browser's copy is never the authority"
+            title="Host-verified: the assistant produced this draft on this campaign — the browser's copy is never the authority"
           >
             Verified assistant draft
           </span>{" "}
           <span className="num text-micro text-ink-500">
-            agent {receipt.agent} · request {receipt.requestId} · campaign {receipt.campaignId} ·
-            source r{receipt.sourceRevision}
+            {receipt.agent} · campaign {receipt.campaignId} · source r{receipt.sourceRevision}
           </span>
         </p>
       ) : (
@@ -2912,10 +2867,112 @@ function ProposalRow({
           </span>
         </p>
       )}
+      {/* CAD-1016: the pending draft's real body previews BEFORE Apply —
+          the host-rendered Visual/HTML/Text of the proposal's own inert
+          subject/preheader/blocks (proposal-render), never a save or an
+          unsaved-editor render. Falls back to the escaped structured
+          body if the host render is unavailable. */}
+      <button
+        type="button"
+        className="lnk text-label mt-1"
+        aria-expanded={showBody}
+        data-proposal-preview={proposal.proposalId}
+        onClick={() => (showBody ? setShowBody(false) : openBody())}
+      >
+        {showBody ? "Hide preview" : "Preview draft"}
+      </button>
+      {showBody && (
+        <div className="crm-proposal-body mt-2" data-proposal-body={proposal.proposalId}>
+          {bodyPending && (
+            <p className="text-label text-ink-500" role="status" data-preview="loading">
+              Rendering the draft preview…
+            </p>
+          )}
+          {bodyError !== null && (
+            <p className="text-label text-fail" role="alert">
+              {bodyError}
+            </p>
+          )}
+          {bodyRender !== null ? (
+            <>
+              <p className="text-label text-ink-300">
+                <span className="chip" title="Preview-only sender material — host-locked">
+                  preview-only
+                </span>{" "}
+                <span className="num">
+                  {bodyRender.sender.name} · {bodyRender.sender.address}
+                </span>
+              </p>
+              <div className="app-outlet-tabs" role="tablist" aria-label="Draft preview format">
+                {(
+                  [
+                    ["visual", "Visual"],
+                    ["html", "HTML"],
+                    ["text", "Text"],
+                  ] as const
+                ).map(([key, label]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    className="app-outlet-tab"
+                    role="tab"
+                    aria-selected={bodyTab === key}
+                    onClick={() => setBodyTab(key)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {bodyTab === "visual" && (
+                <iframe
+                  title="Draft email preview"
+                  sandbox=""
+                  srcDoc={bodyRender.html}
+                  className="crm-preview-frame"
+                  data-preview="visual"
+                />
+              )}
+              {bodyTab !== "visual" && (
+                <pre className="crm-preview" data-preview={bodyTab}>
+                  {bodyTab === "html" ? bodyRender.html : bodyRender.text}
+                </pre>
+              )}
+            </>
+          ) : (
+            bodyError === null && !bodyPending ? null : (
+              <>
+                <p className="text-label text-ink-200">
+                  <span className="text-ink-500">Subject:</span> {proposal.subject}
+                </p>
+                {proposal.preheader !== "" && (
+                  <p className="text-label text-ink-400">
+                    <span className="text-ink-500">Preheader:</span> {proposal.preheader}
+                  </p>
+                )}
+                <ol className="grid gap-1 mt-1" aria-label="Draft body blocks">
+                  {proposal.blocks.map((block, index) => (
+                    <li key={index} className="text-label text-ink-300">
+                      {block.type === "heading" ? (
+                        <strong className="text-ink-100">{block.text}</strong>
+                      ) : block.type === "button" ? (
+                        <span className="chip" data-block="button">
+                          Button: {block.label}
+                        </span>
+                      ) : (
+                        block.text
+                      )}
+                    </li>
+                  ))}
+                </ol>
+              </>
+            )
+          )}
+        </div>
+      )}
       {stale && proposal.state === "pending" && (
         <p className="text-label text-warn mt-1" data-state="stale">
-          Needs review (stale) — stamped against source r{proposal.sourceRevision}, the draft is
-          now r{expectedRevision}. Re-review its text before re-minting a request.
+          Needs review (stale) — drafted against r{proposal.sourceRevision}, the saved version is
+          now r{expectedRevision}. Re-review its text before asking the assistant to draft again.
         </p>
       )}
       {canWrite && (
@@ -2933,8 +2990,18 @@ function ProposalRow({
             onClick={() => {
               onError(null);
               setPending("apply");
+              // CAD-1013: an unsaved campaign applies a source_revision=0
+              // proposal to CREATE revision 1 — there is no revision to pin,
+              // so omit expected_revision entirely (the daemon treats the
+              // absent check as the create path, exactly like the content
+              // save CAS). Sending expected_revision:0 would be a stale
+              // pin on a doc that does not exist yet.
               void contentClient
-                .proposalApply(scope, proposal.proposalId, expectedRevision)
+                .proposalApply(
+                  scope,
+                  proposal.proposalId,
+                  expectedRevision === 0 ? undefined : expectedRevision,
+                )
                 .then((value) => onApplied(parseContentDoc(value)))
                 .catch((err: unknown) => onError(friendlyCampaignError(err)))
                 .finally(() => setPending(null));
@@ -3002,13 +3069,11 @@ function SenderPanel({ render }: { render: ContentRender }) {
 
 function CampaignNew({
   scope,
-  scopedChatMessage,
   viewer,
   onCreated,
   onCancel,
 }: {
   scope: AudienceScope;
-  scopedChatMessage: string | null;
   viewer: Viewer;
   onCreated: (campaignId: string) => void;
   onCancel: () => void;
@@ -3172,7 +3237,6 @@ function CampaignNew({
           />
           <CampaignWorkspace
             scope={scope}
-            scopedChatMessage={scopedChatMessage}
             viewer={viewer}
             campaignId={campaignId}
             doc={doc}
@@ -3194,13 +3258,11 @@ function CampaignNew({
 
 function CampaignDetail({
   scope,
-  scopedChatMessage,
   viewer,
   campaignId,
   onBack,
 }: {
   scope: AudienceScope;
-  scopedChatMessage: string | null;
   viewer: Viewer;
   campaignId: string;
   onBack: () => void;
@@ -3209,6 +3271,11 @@ function CampaignDetail({
   const [doc, setDoc] = useState<ContentDoc | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // CAD-1016: a campaign that exists only as a pending assistant draft
+  // has no saved content — the show 404 is the expected pending-only
+  // state, not an error. True when a pending proposal names this
+  // campaign and the saved content reads back absent.
+  const [pendingOnly, setPendingOnly] = useState(false);
   const [pick, setPick] = useState<AudiencePick>({ base: { mode: "all" }, exclusionListId: null });
   const [, setAudiencePreview] = useState<AudiencePreview | null>(null);
   const [freezeId, setFreezeId] = useState(`${campaignId}-freeze-1`);
@@ -3231,13 +3298,34 @@ function CampaignDetail({
     const controller = new AbortController();
     setLoading(true);
     setError(null);
+    setPendingOnly(false);
     contentClient
       .show(scope, campaignId)
       .then((value) => {
         if (!controller.signal.aborted) setDoc(parseContentDoc(value));
       })
       .catch((e: unknown) => {
-        if (!controller.signal.aborted) setError(friendlyCampaignError(e));
+        if (controller.signal.aborted) return;
+        // A missing saved content doc is the expected pending-only state
+        // when an assistant draft names this campaign — check before
+        // surfacing it as an error.
+        if (e instanceof ApiError && e.status === 404) {
+          contentClient
+            .proposalList(scope)
+            .then((value) => {
+              if (controller.signal.aborted) return;
+              const hasPending = parseProposalList(value).some(
+                (row) => row.campaignId === campaignId && row.state === "pending",
+              );
+              setPendingOnly(hasPending);
+              if (!hasPending) setError(friendlyCampaignError(e));
+            })
+            .catch(() => {
+              if (!controller.signal.aborted) setError(friendlyCampaignError(e));
+            });
+        } else {
+          setError(friendlyCampaignError(e));
+        }
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
@@ -3320,11 +3408,16 @@ function CampaignDetail({
           </button>
         </p>
       )}
-      {!loading && error === null && doc !== null && (
+      {!loading && error === null && (doc !== null || pendingOnly) && (
         <>
+          {pendingOnly && doc === null && (
+            <p className="card px-4 py-3 text-label text-ink-300" data-pending-only>
+              This campaign exists only as a pending assistant draft — no content is saved yet.
+              Review it below and Apply to save the first revision, or Discard it.
+            </p>
+          )}
           <CampaignWorkspace
             scope={scope}
-            scopedChatMessage={scopedChatMessage}
             viewer={viewer}
             campaignId={campaignId}
             doc={doc}

@@ -11,6 +11,7 @@ import Detail from "./shared/Detail";
 import DataTable from "./shared/DataTable";
 import Field from "./shared/Field";
 import { EmptyState, ErrorNotice, Loading, Notice } from "./shared/States";
+import { useDrawerClose } from "./shared/useDrawerClose";
 import {
   buildCustomerProfile,
   consentEntries,
@@ -43,7 +44,6 @@ import { hostActions, type HostRecord, type HostScope } from "./hostActions";
  */
 export default function CrmShell({
   scope,
-  scopedChatMessage,
   viewer,
   view,
   recordId,
@@ -55,7 +55,6 @@ export default function CrmShell({
   scope: HostScope;
   /** CAD-813: the operator's newest chat message daemon-stamped with
    *  this scope — passed through to Campaigns untouched. */
-  scopedChatMessage?: string | null;
   viewer: Viewer;
   view: "list" | "new";
   recordId: string | null;
@@ -90,7 +89,6 @@ export default function CrmShell({
       {section === "campaigns" && (
         <CrmCampaigns
           scope={scope}
-          scopedChatMessage={scopedChatMessage ?? null}
           viewer={viewer}
           view={view}
           recordId={recordId}
@@ -620,13 +618,14 @@ function CustomerDrawer({
       if (opener.current instanceof HTMLElement) opener.current.focus();
     };
   }, []);
+  const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") requestClose();
     };
     addEventListener("keydown", onKey);
     return () => removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [requestClose]);
 
   const reloadToken = `${scope.installId}:${scope.contextId}:${recordId}`;
   useEffect(() => {
@@ -660,12 +659,14 @@ function CustomerDrawer({
       aria-modal="false"
       aria-label="Customer details"
       data-drawer="customer"
+      data-closing={closing || undefined}
+      onTransitionEnd={onTransitionEnd}
     >
       <div className="crm-drawer-head">
         <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1}>
           {loading ? "Customer details" : (view?.displayName ?? "Customer details")}
         </h3>
-        <Button size="sm" onClick={onClose} aria-label="Close customer details">
+        <Button size="sm" onClick={requestClose} aria-label="Close customer details">
           Close
         </Button>
       </div>

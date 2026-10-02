@@ -23,6 +23,56 @@ import {
 import { connectionLabel } from "../../lib/connections";
 
 /**
+ * CAD-1013 safe enrollment errors. A provider/daemon refusal can carry
+ * raw downstream text that echoes the credential the operator just
+ * typed (SMTP host/password in a TLS or auth error). The UI never
+ * renders `ApiError.message` on this path — it renders a stable, typed
+ * `code` mapped to a safe reason + recovery, and falls back to a
+ * generic message when the code is absent or unknown. New typed codes
+ * land here as the backend (CAD-1014) supplies them; anything else is
+ * deliberately non-specific.
+ */
+const ENROLL_ERROR: Record<string, string> = {
+  // The only stable code the daemon actually emits on this path
+  // (platform_rpc enroll): custody_unprotected. It can truthfully say
+  // nothing was stored — the daemon refused before custody took the
+  // credential. Invented codes for non-emitted paths would only mask a
+  // future fix under a false specific; the generic fallback below is the
+  // honest answer until the backend emits a real code.
+  custody_unprotected:
+    "The daemon cannot isolate this credential from agents using the same system account, so it refused to store it — nothing was stored. To save it anyway, tick the storage-consent box below, then retry — it is never pre-selected.",
+};
+
+/**
+ * CAD-1013: the scopes an SMTP sender must enroll — exactly the reviewed
+ * send-capability scopes on the provider descriptor, never the union of
+ * every provider permission. Falls back to the reviewed-union hint only
+ * when no send capability is declared (kept narrow, still reviewed).
+ */
+function smtpRequiredScopes(provider: ConnectionProvider | null): string[] {
+  const caps = provider?.descriptor?.capabilities ?? [];
+  // Only the reviewed send-capability scopes — a provider that declares
+  // none cannot express an SMTP enrollment, so return empty rather than
+  // falling back to the union of every permission it happens to list.
+  const seen = new Set<string>();
+  for (const cap of caps) {
+    if (cap.effect === "send") for (const scope of cap.scopes ?? []) seen.add(scope);
+  }
+  return [...seen].sort();
+}
+
+function enrollErrorMessage(e: unknown): string {
+  const err = e instanceof ApiError ? e : null;
+  const code = err?.code;
+  if (code !== undefined && code in ENROLL_ERROR) return ENROLL_ERROR[code];
+  // Unknown or absent code: never surface the raw downstream text — it
+  // can echo the credential. The network outcome may be uncertain (the
+  // daemon can commit before a lost response), so do not claim 'nothing
+  // was saved' — ask the operator to confirm before retrying instead.
+  return "Could not confirm the connection was added. Refresh connections before retrying.";
+}
+
+/**
  * Settings → Connections (CAD-585): the operator's view of exact
  * provider accounts — the reviewed providers, the always-present Local
  * outbox, enrolled credentials and their local configuration check,
@@ -425,7 +475,9 @@ function RotateForm({
         onDone();
         onClose();
       })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      // CAD-1013: rotate also carries the fresh SMTP password — same
+      // typed-code safe reason, never the raw downstream message.
+      .catch((e: ApiError) => setError(enrollErrorMessage(e)))
       .finally(() => {
         // The credential crossed this one request into daemon custody.
         // It must not survive in the form, whatever the outcome.
@@ -587,7 +639,7 @@ function RevokeConfirm({
 }
 
 /** Enroll a scoped token for a supported provider. The token clears on settle. */
-function AddConnection({
+export function AddConnection({
   providers,
   existing,
   onClose,
@@ -613,6 +665,7 @@ function AddConnection({
   const [scopes, setScopes] = useState("");
   const [token, setToken] = useState("");
   const [acceptRisk, setAcceptRisk] = useState(false);
+  const [riskNeeded, setRiskNeeded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const chosen = providers.find((p) => p.provider === provider) ?? null;
@@ -624,10 +677,29 @@ function AddConnection({
 
   const submit = () => {
     if (busy) return;
+    setRiskNeeded(false);
     const cleanedAccount = account.trim();
-    const wanted = scopes.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+    // CAD-1013 SMTP simplification: an SMTP sender enrolls exactly the
+    // send capability's reviewed scope — not operator-typed, and never
+    // the union of every provider permission. Token providers still take
+    // an explicit scope list.
+    const wanted = smtpShape
+      ? smtpRequiredScopes(chosen)
+      : scopes.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+    if (smtpShape && wanted.length === 0) {
+      // No reviewed send capability on this provider — SMTP enrollment is
+      // unsupported here; do not widen the grant to unrelated permissions.
+      setError(
+        "This provider does not offer SMTP sending — it has no reviewed send permission to enroll.",
+      );
+      return;
+    }
     if (!provider || cleanedAccount === "" || wanted.length === 0) {
-      setError("Choose a provider and fill in the account and at least one scope.");
+      setError(
+        smtpShape
+          ? "Name this email account and fill in the SMTP details below."
+          : "Choose a provider and fill in the account and at least one scope.",
+      );
       return;
     }
     if (smtpShape) {
@@ -662,7 +734,13 @@ function AddConnection({
           ...(acceptRisk ? { accept_same_uid_risk: true } : {}),
         })
         .then((out) => onAdded(out.connection.id))
-        .catch((e: ApiError) => setError(e.message ?? String(e)))
+        // CAD-1013: typed-code safe reason — never the raw downstream
+        // message, which can echo the SMTP host/password just typed.
+        // custody_unprotected surfaces the risk toggle near Save.
+        .catch((e: ApiError) => {
+          setRiskNeeded(e instanceof ApiError && e.code === "custody_unprotected");
+          setError(enrollErrorMessage(e));
+        })
         .finally(() => {
           // The password crossed this one request into daemon
           // custody. It must not survive in the form, whatever the
@@ -688,7 +766,11 @@ function AddConnection({
         ...(acceptRisk ? { accept_same_uid_risk: true } : {}),
       })
       .then((out) => onAdded(out.connection.id))
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      // CAD-1013: typed-code safe reason — never raw downstream text.
+      .catch((e: ApiError) => {
+        setRiskNeeded(e instanceof ApiError && e.code === "custody_unprotected");
+        setError(enrollErrorMessage(e));
+      })
       .finally(() => {
         // The credential crossed this one request into daemon custody.
         // It must not survive in the form, whatever the outcome.
@@ -735,7 +817,7 @@ function AddConnection({
           </div>
           <div>
             <label htmlFor={accountId} className="text-label font-medium text-ink-200">
-              Account
+              {smtpShape ? "Email account name" : "Account"}
             </label>
             <input
               id={accountId}
@@ -744,7 +826,13 @@ function AddConnection({
               spellCheck={false}
               value={account}
               onChange={(e) => setAccount(e.target.value)}
-              placeholder={provider === "agenticos_external" ? "ws_…" : "account name"}
+              placeholder={
+                provider === "agenticos_external"
+                  ? "ws_…"
+                  : smtpShape
+                    ? "newsletter"
+                    : "account name"
+              }
               className="field w-full mt-1"
               disabled={busy}
             />
@@ -755,59 +843,59 @@ function AddConnection({
               </p>
             )}
           </div>
-          <div>
-            <label htmlFor={scopesId} className="text-label font-medium text-ink-200">
-              Scopes
-            </label>
-            <input
-              id={scopesId}
-              type="text"
-              autoComplete="off"
-              spellCheck={false}
-              value={scopes}
-              onChange={(e) => setScopes(e.target.value)}
-              placeholder={hint.length > 0 ? hint.join(", ") : "scope names"}
-              className="field w-full mt-1"
-              disabled={busy}
-            />
-            {hint.length > 0 && (
-              <p className="text-micro text-ink-500 mt-1 break-words">
-                Reviewed scopes for this provider: <span className="num">{hint.join(", ")}</span>.
-                Declare only the scopes granted at the provider&apos;s consent screen.
-              </p>
-            )}
-          </div>
+          {!smtpShape && (
+            <div>
+              <label htmlFor={scopesId} className="text-label font-medium text-ink-200">
+                Scopes
+              </label>
+              <input
+                id={scopesId}
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={scopes}
+                onChange={(e) => setScopes(e.target.value)}
+                placeholder={hint.length > 0 ? hint.join(", ") : "scope names"}
+                className="field w-full mt-1"
+                disabled={busy}
+              />
+              {hint.length > 0 && (
+                <p className="text-micro text-ink-500 mt-1 break-words">
+                  Reviewed scopes for this provider: <span className="num">{hint.join(", ")}</span>.
+                  Declare only the scopes granted at the provider&apos;s consent screen.
+                </p>
+              )}
+            </div>
+          )}
           {smtpShape ? (
             <fieldset className="space-y-2">
               <legend className="text-label font-medium text-ink-200">
-                SMTP sender — authenticated encrypted submission only
+                SMTP server — encrypted submission only
               </legend>
               <p className="text-micro text-ink-500 break-words">
-                Port 465 with implicit TLS, or port 587 with mandatory STARTTLS. The
-                daemon verifies the certificate and refuses plaintext, downgrades and
-                unverifiable hosts before sending.
+                The daemon verifies the server certificate and refuses plaintext, downgrades
+                and unverifiable hosts before sending. Choose the security your provider
+                expects — port and TLS move together.
               </p>
-              {["host", "port", "username", "sender", "sender_name"].map((field) => (
-                <div key={field}>
-                  <label htmlFor={`${tokenId}-${field}`} className="text-label text-ink-300">
-                    {field === "sender" ? "verified sender address" : field === "sender_name" ? "sender name (optional)" : field}
-                  </label>
-                  <input
-                    id={`${tokenId}-${field}`}
-                    type="text"
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={smtp[field as keyof typeof smtp]}
-                    onChange={(e) => setSmtp((cur) => ({ ...cur, [field]: e.target.value }))}
-                    placeholder={field === "host" ? "mail.example.com" : field === "sender" ? "news@example.com" : ""}
-                    className="field w-full mt-1"
-                    disabled={busy}
-                  />
-                </div>
-              ))}
+              <div>
+                <label htmlFor={`${tokenId}-host`} className="text-label text-ink-300">
+                  Server host
+                </label>
+                <input
+                  id={`${tokenId}-host`}
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={smtp.host}
+                  onChange={(e) => setSmtp((cur) => ({ ...cur, host: e.target.value }))}
+                  placeholder="mail.example.com"
+                  className="field w-full mt-1"
+                  disabled={busy}
+                />
+              </div>
               <div>
                 <label htmlFor={`${tokenId}-tls`} className="text-label text-ink-300">
-                  TLS mode
+                  Port &amp; security
                 </label>
                 <select
                   id={`${tokenId}-tls`}
@@ -820,13 +908,28 @@ function AddConnection({
                   className="field w-full mt-1"
                   disabled={busy}
                 >
-                  <option value="implicit">implicit TLS (port 465)</option>
-                  <option value="starttls">STARTTLS (port 587)</option>
+                  <option value="implicit">465 — implicit TLS</option>
+                  <option value="starttls">587 — STARTTLS</option>
                 </select>
               </div>
               <div>
+                <label htmlFor={`${tokenId}-username`} className="text-label text-ink-300">
+                  Username
+                </label>
+                <input
+                  id={`${tokenId}-username`}
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={smtp.username}
+                  onChange={(e) => setSmtp((cur) => ({ ...cur, username: e.target.value }))}
+                  className="field w-full mt-1"
+                  disabled={busy}
+                />
+              </div>
+              <div>
                 <label htmlFor={tokenId} className="text-label font-medium text-ink-200">
-                  SMTP password
+                  Password
                 </label>
                 <input
                   id={tokenId}
@@ -843,6 +946,37 @@ function AddConnection({
                   cleared from this form afterwards. Never paste a credential anywhere else
                   on this board.
                 </p>
+              </div>
+              <div>
+                <label htmlFor={`${tokenId}-sender`} className="text-label text-ink-300">
+                  Sender address (verified)
+                </label>
+                <input
+                  id={`${tokenId}-sender`}
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={smtp.sender}
+                  onChange={(e) => setSmtp((cur) => ({ ...cur, sender: e.target.value }))}
+                  placeholder="news@example.com"
+                  className="field w-full mt-1"
+                  disabled={busy}
+                />
+              </div>
+              <div>
+                <label htmlFor={`${tokenId}-sender_name`} className="text-label text-ink-300">
+                  Sender name (optional)
+                </label>
+                <input
+                  id={`${tokenId}-sender_name`}
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={smtp.sender_name}
+                  onChange={(e) => setSmtp((cur) => ({ ...cur, sender_name: e.target.value }))}
+                  className="field w-full mt-1"
+                  disabled={busy}
+                />
               </div>
             </fieldset>
           ) : (
@@ -866,11 +1000,41 @@ function AddConnection({
               </p>
             </div>
           )}
-          <details className="text-label">
-            <summary className="cursor-pointer select-none text-ink-400">
-              Advanced: custody risk acceptance
-            </summary>
-            <label className="flex items-start gap-2 text-ink-300 mt-2">
+          {/* CAD-1013: the storage consent stays collapsed while it is
+             optional. When the daemon reports custody_unprotected it
+             moves inline above Save so the required consent is visible
+             at the point of action — and it is never pre-selected. */}
+          {!riskNeeded && (
+            <details className="text-label">
+              <summary className="cursor-pointer select-none text-ink-400">
+                Advanced: custody risk acceptance
+              </summary>
+              <label className="flex items-start gap-2 text-ink-300 mt-2">
+                <input
+                  type="checkbox"
+                  checked={acceptRisk}
+                  onChange={(e) => setAcceptRisk(e.target.checked)}
+                  disabled={busy}
+                  className="mt-0.5"
+                />
+                <span>
+                  This server cannot isolate saved credentials from agents using the same
+                  system account. I accept storing this credential here. Leave this off
+                  unless you knowingly accept it — it is never pre-selected.
+                </span>
+              </label>
+            </details>
+          )}
+          {error && (
+            <p className="text-label text-fail break-words" role="alert">
+              {error}
+            </p>
+          )}
+          {riskNeeded && (
+            <label
+              className="flex items-start gap-2 text-ink-200 border border-warn/40 rounded px-3 py-2 bg-warn/10"
+              data-risk-needed
+            >
               <input
                 type="checkbox"
                 checked={acceptRisk}
@@ -879,16 +1043,11 @@ function AddConnection({
                 className="mt-0.5"
               />
               <span>
-                Accept the existing same-user custody risk, when the daemon reports the
-                enrollment as unprotected. Only choose this when you accept that existing
-                risk.
+                <strong>Storage consent required:</strong> this server cannot isolate saved
+                SMTP passwords from agents using the same system account. I accept storing
+                this password here. This is never pre-selected.
               </span>
             </label>
-          </details>
-          {error && (
-            <p className="text-label text-fail break-words" role="alert">
-              {error}
-            </p>
           )}
           <div className="flex flex-wrap gap-2">
             <Button variant="primary" size="sm" type="submit" loading={busy}>

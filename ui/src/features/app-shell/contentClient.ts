@@ -128,6 +128,8 @@ export const contentPaths = {
     `${scopePath(scope)}/proposals/${proposalId}/apply`,
   proposalDiscardPath: (scope: ContentScope, proposalId: string) =>
     `${scopePath(scope)}/proposals/${proposalId}/discard`,
+  proposalRenderPath: (scope: ContentScope, proposalId: string) =>
+    `${scopePath(scope)}/proposals/${proposalId}/render`,
   bindingSavePath: (scope: ContentScope) => `${scopePath(scope)}/sender-bindings`,
   bindingListPath: (scope: ContentScope) => `${scopePath(scope)}/sender-bindings/list`,
   bindingPath: (scope: ContentScope, bindingId: string) =>
@@ -230,6 +232,14 @@ export const contentClient = {
     const body: Record<string, unknown> = { expected_revision: expectedRevision };
     assertClean(body, APPROVE_KEYS, "approve");
     return post(contentPaths.approvePath(scope, campaignId), body);
+  },
+  /** `GET …/proposals/<id>/render` — read transport (the proposal id is
+   *  the only selector; a body is refused). The host renders the inert
+   *  draft's own subject/preheader/blocks — never a save, never a send —
+   *  returning proposal_id/source_revision/preview_only:true/send_ready:
+   *  false (no saved `revision` — a proposal is unsaved by definition). */
+  proposalRender(scope: ContentScope, proposalId: string): Promise<unknown> {
+    return get(contentPaths.proposalRenderPath(scope, proposalId));
   },
   testPrepare(
     scope: ContentScope,

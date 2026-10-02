@@ -1,0 +1,48 @@
+/* CAD-1013 CRM detail-drawer motion — CRM-owned, deliberately kept out
+   of the shared app-shell.css while the Social team sole-authors that
+   file (root coordination). The .crm-drawer selector and its fixed
+   positioning live in app-shell.css; this sheet layers only the open/
+   close motion on top, so removing it leaves the drawer working with an
+   instant mount/unmount.
+
+   The host (shared/useDrawerClose) marks the drawer `data-closing`,
+   lets the exit transition run, then unmounts on transitionend — or on
+   a fallback timer when no transition plays (reduced-motion, missing
+   CSS). Open and close both slide the sheet. Reduced-motion removes the
+   transition entirely; the timer still unmounts, so it can never stick.
+   Single chat/draft instance and focus/escape restoration are owned by
+   the drawer components and are unchanged by this sheet. */
+
+.crm-drawer {
+  transform: translateX(0);
+  transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* Entrance: slide in from the right on mount. */
+@media (prefers-reduced-motion: no-preference) {
+  .crm-drawer {
+    animation: crm-drawer-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+}
+
+/* Exit: data-closing slides the sheet out; the host unmounts it after
+   the transition ends (or on the fallback timer). */
+.crm-drawer[data-closing] {
+  transform: translateX(105%);
+}
+
+@keyframes crm-drawer-in {
+  from {
+    transform: translateX(105%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .crm-drawer {
+    animation: none;
+    transition: none;
+  }
+}

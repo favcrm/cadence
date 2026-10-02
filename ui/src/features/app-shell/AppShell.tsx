@@ -20,6 +20,7 @@ import type { Viewer } from "../projects/work";
 import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
+import ChatCsvImport from "./ChatCsvImport";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
@@ -389,7 +390,7 @@ export default function AppShell({
   // shell state — read back from the shared master-thread store,
   // never a global — so a message bound to another install or
   // context can never mint here.
-  const scopedChatMessage = useScopedChatMessage(scope);
+
   const title = installation?.title || installation?.name || "App";
   const isSocial = installation !== null && installation.name === "social-content";
 
@@ -450,6 +451,7 @@ export default function AppShell({
             viewer={viewer}
             contextLabel={isSocial ? null : contextLabel(contexts, contextId)}
             binding={binding}
+            crm={installation !== null && installation.name === "crm"}
           />
         </div>
         <section className="app-shell-outlet" aria-label={`${title} workspace`}>
@@ -584,7 +586,6 @@ export default function AppShell({
                 <CrmOutlet
                   key={`${installId}:${contextId}`}
                   scope={scope}
-                  scopedChatMessage={scopedChatMessage}
                   installationTitle={title}
                   appKind={installation.name === "crm" ? "crm" : "generic"}
                   view={view}
@@ -707,20 +708,6 @@ export function latestScopedChatMessage(
   return null;
 }
 
-/** Live view of [`latestScopedChatMessage`] over the shared store. */
-function useScopedChatMessage(scope: HostScope): string | null {
-  const thread = useQuery(resources.masterThread);
-  const [found, setFound] = useState<string | null>(() =>
-    latestScopedChatMessage(thread.data, scope),
-  );
-  const key = `${scope.installId}:${scope.contextId}`;
-  useEffect(() => {
-    setFound(latestScopedChatMessage(thread.data, scope));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, thread.data]);
-  return found;
-}
-
 /**
  * The actual master conversation in compact form: the same
  * `resources.masterThread` store Home reads and writes, streamed live
@@ -735,10 +722,12 @@ function ChatPane({
   viewer,
   contextLabel,
   binding,
+  crm,
 }: {
   viewer: Viewer;
   contextLabel: string | null;
   binding: ChatBinding;
+  crm?: boolean;
 }) {
   const thread = useQuery(resources.masterThread);
   const [draft, setDraft] = useState("");
@@ -820,6 +809,31 @@ function ChatPane({
         <p className="text-label text-fail" role="alert">
           {sendError}
         </p>
+      )}
+      {crm === true && binding.scope !== null && (
+        <details className="app-chat-import">
+          <summary className="text-label text-ink-300">Import a customer list</summary>
+          <ChatCsvImport
+            // CAD-1016: a context change remounts the import — a pending
+            // plan/preview/choices from the prior scope can never bleed
+            // into the new one.
+            key={`${binding.scope.install_id}:${binding.scope.context_id}`}
+            scope={{ installId: binding.scope.install_id, contextId: binding.scope.context_id }}
+            canWrite={canSend}
+            onSendIntent={async (intent) => {
+              const message = newMessageId();
+              const body = JSON.stringify(intent);
+              try {
+                await api.threadSend(MASTER, body, message, undefined, binding.scope ?? undefined);
+                void resources.masterThread.refresh();
+                void resources.masterState.refresh();
+                return null;
+              } catch (e: unknown) {
+                return e instanceof ApiError ? e.message : String(e);
+              }
+            }}
+          />
+        </details>
       )}
       <form
         className="app-chat-form"

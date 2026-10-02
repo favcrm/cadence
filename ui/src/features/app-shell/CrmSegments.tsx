@@ -4,6 +4,7 @@ import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
 import Field from "./shared/Field";
+import { useDrawerClose } from "./shared/useDrawerClose";
 import {
   audienceClient,
   type AudienceScope,
@@ -633,13 +634,14 @@ function SegmentDrawer({
       if (opener.current instanceof HTMLElement) opener.current.focus();
     };
   }, []);
+  const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") requestClose();
     };
     addEventListener("keydown", onKey);
     return () => removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [requestClose]);
 
   const reloadToken = `${scope.installId}:${scope.contextId}:${segmentId}`;
   useEffect(() => {
@@ -691,12 +693,14 @@ function SegmentDrawer({
       aria-modal="false"
       aria-label="Segment details"
       data-drawer="segment"
+      data-closing={closing || undefined}
+      onTransitionEnd={onTransitionEnd}
     >
       <div className="crm-drawer-head">
         <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1}>
           {loading ? "Segment details" : (segment?.name ?? "Segment details")}
         </h3>
-        <Button size="sm" onClick={onClose} aria-label="Close segment details">
+        <Button size="sm" onClick={requestClose} aria-label="Close segment details">
           Close
         </Button>
       </div>
