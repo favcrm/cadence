@@ -118,6 +118,38 @@ async function signOutCase() {
   done();
 }
 
+async function guardCases() {
+  const ro = { ...signedIn, read_only: true } as unknown as Meta;
+  {
+    const { host, done } = mount(menu(ro));
+    act(() => trigger(host).click());
+    const text = panel(host).textContent as string;
+    assert(!text.includes("Sign out") && !text.includes("Writes commit"), "read-only board: no sign out, no writes line");
+    assert(text.includes("Fable Chen") && host.querySelector("[aria-pressed]"), "read-only board keeps identity and theme");
+    done();
+  }
+  {
+    calls.length = 0;
+    const { host, done } = mount(menu(signedIn));
+    act(() => trigger(host).click());
+    const out = Array.from(panel(host).querySelectorAll("button")).find((b: any) => b.textContent === "Sign out") as HTMLButtonElement;
+    await act(async () => { out.click(); out.click(); });
+    assert(calls.filter((c) => c === "/api/session/logout").length === 1, "double click signs out once");
+    done();
+  }
+  {
+    const realFetch = globalThis.fetch;
+    Object.defineProperty(globalThis, "fetch", { configurable: true, value: async () => { throw new Error("down"); } });
+    let changed = 0;
+    const { host, done } = mount(menu(signedIn, {}, () => { changed += 1; }));
+    act(() => trigger(host).click());
+    const out = Array.from(panel(host).querySelectorAll("button")).find((b: any) => b.textContent === "Sign out") as HTMLButtonElement;
+    await act(async () => { out.click(); });
+    assert(changed === 1, "closeSession rejects: onChange still runs once");
+    Object.defineProperty(globalThis, "fetch", { configurable: true, value: realFetch });
+    done();
+  }
+}
 function rest() {
 // Signed out: no account menu, the SignIn disclosure stays.
 {
@@ -132,4 +164,4 @@ function rest() {
   done();
 }
 }
-signOutCase().then(() => { rest(); console.log("account menu checks passed"); }, (e) => { console.error(e); require("process").exit(1); });
+signOutCase().then(guardCases).then(() => { rest(); console.log("account menu checks passed"); }, (e) => { console.error(e); require("process").exit(1); });

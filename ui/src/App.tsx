@@ -32,6 +32,7 @@ import ProjectFilter from "./ui/ProjectFilter";
 import SectionTabs from "./ui/SectionTabs";
 import StatusChips from "./ui/StatusChips";
 import AccountMenu from "./ui/AccountMenu";
+import ThemeToggle from "./ui/ThemeToggle";
 import BuildUpdateNotice from "./ui/BuildUpdateNotice";
 import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
@@ -649,8 +650,8 @@ export default function App() {
                 <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
               )}
             </StatusChips>
-            {/* CAD-1033 moves the desktop trigger to the sidebar footer; until then it shows at all widths. */}
-            <AccountMenu
+            {/* CAD-1033 moves the desktop trigger to the sidebar footer; until then it shows at all widths. Signed-out viewers keep the one-click theme button. */}
+            {meta?.signed_in === true ? <AccountMenu
               meta={meta}
               actor={actor}
               mayWrite={!readOnly}
@@ -658,7 +659,7 @@ export default function App() {
               trigger="avatar"
               placement="below-end"
               settingsHref={hrefFor({ screen: "settings", section: "models" })}
-            />
+            /> : <ThemeToggle />}
           </div>
         </header>
 

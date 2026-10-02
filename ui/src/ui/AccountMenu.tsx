@@ -47,6 +47,7 @@ export default function AccountMenu({
   const panelId = useId();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const signingOut = useRef(false);
   const [theme, setTheme] = useState<ThemePref>(appliedTheme);
   const rootRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -84,14 +85,19 @@ export default function AccountMenu({
     }
   };
   const signOut = () => {
+    if (signingOut.current) return;
+    signingOut.current = true;
     setBusy(true);
     closeSession()
       .catch(() => undefined)
       .finally(() => {
+        signingOut.current = false;
         setBusy(false);
         onChange();
       });
   };
+  // A read-only board shows nothing that writes: the logout route skips the read-only guard.
+  const canWrite = !meta.read_only;
   const avatar = trigger === "avatar";
   return (
     <div ref={rootRef} className="relative shrink-0" data-account-menu onKeyDown={onKeyDown}>
@@ -124,7 +130,7 @@ export default function AccountMenu({
             {user?.email && user.email !== name && <p className="text-micro text-ink-500 break-all">{user.email}</p>}
             {user?.role && <span className="chip bg-ink-800 text-ink-400 mt-1">{user.role}</span>}
           </div>
-          {mayWrite && (
+          {mayWrite && canWrite && (
             <p className="px-2 py-1.5 text-micro text-ink-500">
               Writes commit to the tracker as <span className="num text-ink-300 break-all">{actor}</span>
             </p>
@@ -154,9 +160,9 @@ export default function AccountMenu({
               Settings
             </Link>
           )}
-          <button type="button" role="menuitem" disabled={busy} onClick={signOut} className="block w-full rounded px-2 py-1.5 text-left text-label text-ink-200 hover:bg-ink-800 disabled:opacity-60">
+          {canWrite && (<button type="button" role="menuitem" disabled={busy} onClick={signOut} className="block w-full rounded px-2 py-1.5 text-left text-label text-ink-200 hover:bg-ink-800 disabled:opacity-60">
             Sign out
-          </button>
+          </button>)}
           {footer}
         </div>
       )}
