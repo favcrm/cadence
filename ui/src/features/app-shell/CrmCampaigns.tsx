@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api } from "../../lib/api";
+import { ApiError } from "../../lib/api";
 import type { Connection } from "../../lib/types";
 import { smtpSummary } from "../settings/connectionsView";
 import Button from "../../ui/Button";
@@ -86,7 +86,6 @@ import Field from "./shared/Field";
 
 export default function CrmCampaigns({
   scope,
-  scopedChatMessage,
   viewer,
   view,
   recordId,
@@ -95,10 +94,6 @@ export default function CrmCampaigns({
   onRecordCreated,
 }: {
   scope: AudienceScope;
-  /** CAD-813: the operator's newest left-chat message daemon-stamped
-   *  with this exact install/context — the mint's `message_id`.
-   *  Threaded down from the shell, never read from a global. */
-  scopedChatMessage?: string | null;
   viewer: Viewer;
   view: "list" | "new";
   recordId: string | null;
@@ -111,7 +106,6 @@ export default function CrmCampaigns({
       {recordId !== null ? (
         <CampaignDetail
           scope={scope}
-          scopedChatMessage={scopedChatMessage ?? null}
           viewer={viewer}
           campaignId={recordId}
           onBack={() => onSelect(null)}
@@ -126,7 +120,6 @@ export default function CrmCampaigns({
       ) : (
         <CampaignNew
           scope={scope}
-          scopedChatMessage={scopedChatMessage ?? null}
           viewer={viewer}
           onCreated={(id) => {
             if (onRecordCreated) onRecordCreated(id);
@@ -1860,7 +1853,6 @@ function FinalSendPanel({
 
 function CampaignWorkspace({
   scope,
-  scopedChatMessage,
   viewer,
   campaignId,
   doc,
@@ -1870,7 +1862,6 @@ function CampaignWorkspace({
   audienceSlot,
 }: {
   scope: AudienceScope;
-  scopedChatMessage: string | null;
   viewer: Viewer;
   campaignId: string;
   doc: ContentDoc | null;
@@ -3076,13 +3067,11 @@ function SenderPanel({ render }: { render: ContentRender }) {
 
 function CampaignNew({
   scope,
-  scopedChatMessage,
   viewer,
   onCreated,
   onCancel,
 }: {
   scope: AudienceScope;
-  scopedChatMessage: string | null;
   viewer: Viewer;
   onCreated: (campaignId: string) => void;
   onCancel: () => void;
@@ -3246,7 +3235,6 @@ function CampaignNew({
           />
           <CampaignWorkspace
             scope={scope}
-            scopedChatMessage={scopedChatMessage}
             viewer={viewer}
             campaignId={campaignId}
             doc={doc}
@@ -3268,13 +3256,11 @@ function CampaignNew({
 
 function CampaignDetail({
   scope,
-  scopedChatMessage,
   viewer,
   campaignId,
   onBack,
 }: {
   scope: AudienceScope;
-  scopedChatMessage: string | null;
   viewer: Viewer;
   campaignId: string;
   onBack: () => void;
@@ -3430,7 +3416,6 @@ function CampaignDetail({
           )}
           <CampaignWorkspace
             scope={scope}
-            scopedChatMessage={scopedChatMessage}
             viewer={viewer}
             campaignId={campaignId}
             doc={doc}

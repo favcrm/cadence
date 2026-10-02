@@ -390,7 +390,7 @@ export default function AppShell({
   // shell state — read back from the shared master-thread store,
   // never a global — so a message bound to another install or
   // context can never mint here.
-  const scopedChatMessage = useScopedChatMessage(scope);
+
   const title = installation?.title || installation?.name || "App";
   const isSocial = installation !== null && installation.name === "social-content";
 
@@ -586,7 +586,6 @@ export default function AppShell({
                 <CrmOutlet
                   key={`${installId}:${contextId}`}
                   scope={scope}
-                  scopedChatMessage={scopedChatMessage}
                   installationTitle={title}
                   appKind={installation.name === "crm" ? "crm" : "generic"}
                   view={view}
@@ -707,20 +706,6 @@ export function latestScopedChatMessage(
     }
   }
   return null;
-}
-
-/** Live view of [`latestScopedChatMessage`] over the shared store. */
-function useScopedChatMessage(scope: HostScope): string | null {
-  const thread = useQuery(resources.masterThread);
-  const [found, setFound] = useState<string | null>(() =>
-    latestScopedChatMessage(thread.data, scope),
-  );
-  const key = `${scope.installId}:${scope.contextId}`;
-  useEffect(() => {
-    setFound(latestScopedChatMessage(thread.data, scope));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, thread.data]);
-  return found;
 }
 
 /**
