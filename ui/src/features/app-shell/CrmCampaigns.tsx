@@ -2307,8 +2307,8 @@ function CampaignWorkspace({
                 <div>
                   <dt>Blocks</dt>
                   <dd>
-                    {doc.blocks.length} block{doc.blocks.length === 1 ? "" : "s"} · actor{" "}
-                    {doc.actor} · {doc.contentDigest.slice(0, 18)}…
+                    {doc.blocks.length} block{doc.blocks.length === 1 ? "" : "s"} ·{" "}
+                    {doc.contentDigest.slice(0, 18)}…
                   </dd>
                 </div>
               </dl>

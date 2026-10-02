@@ -654,7 +654,7 @@ function RevokeConfirm({
 }
 
 /** Enroll a scoped token for a supported provider. The token clears on settle. */
-function AddConnection({
+export function AddConnection({
   providers,
   existing,
   onClose,
