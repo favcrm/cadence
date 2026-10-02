@@ -409,7 +409,10 @@
 }
 
 /* Right detail drawer: a fixed sheet on desktop, a full overlay at
-   narrow widths. Non-modal — the list stays usable behind it. */
+   narrow widths. Non-modal — the list stays usable behind it.
+   CAD-1013: open and close both slide the sheet; the host defers the
+   unmount one transition so the close can play, and reduced-motion
+   removes it entirely (the timer fallback still unmounts). */
 .crm-drawer {
   position: fixed;
   top: 0;
@@ -421,6 +424,37 @@
   border-left: 1px solid var(--color-ink-700);
   padding: 1rem 1.1rem 2rem;
   overflow-y: auto;
+  transform: translateX(0);
+  transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* Entrance: slide in from the right on mount. */
+@media (prefers-reduced-motion: no-preference) {
+  .crm-drawer {
+    animation: crm-drawer-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+}
+
+/* Exit: the host sets data-closing, the sheet slides out, then the
+   transitionend (or a fallback timer) unmounts it. */
+.crm-drawer[data-closing] {
+  transform: translateX(105%);
+}
+
+@keyframes crm-drawer-in {
+  from {
+    transform: translateX(105%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .crm-drawer {
+    animation: none;
+    transition: none;
+  }
 }
 
 .crm-drawer-head {

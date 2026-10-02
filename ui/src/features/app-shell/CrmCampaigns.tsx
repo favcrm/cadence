@@ -11,19 +11,15 @@ import {
   type AudienceScope,
 } from "./audienceClient";
 import {
-  BLOCK_TYPES,
   checkCampaignId,
   checkContent,
   friendlyCampaignError,
-  isBlockType,
   newRequestId,
   parseContentDoc,
   parseContentList,
-  parseProposal,
   parseProposalList,
   parseProposalRequest,
   parseRender,
-  withToken,
   type CampaignBlock,
   type ContentDoc,
   type ContentRender,
@@ -1831,7 +1827,6 @@ function CampaignWorkspace({
   const [subject, setSubject] = useState(doc?.subject ?? "");
   const [preheader, setPreheader] = useState(doc?.preheader ?? "");
   const [blocks, setBlocks] = useState<EditorBlock[]>(() => blocksFromDoc(doc));
-  const [fallback, setFallback] = useState("Friend");
   const [pending, setPending] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [savedNote, setSavedNote] = useState<string | null>(null);
@@ -1855,7 +1850,6 @@ function CampaignWorkspace({
   const [proposals, setProposals] = useState<ProposalDoc[]>([]);
   const [proposalsError, setProposalsError] = useState<string | null>(null);
   const [proposalToken, setProposalToken] = useState(0);
-  const [proposalPending, setProposalPending] = useState(false);
   const [proposalError, setProposalError] = useState<string | null>(null);
   const [proposalNote, setProposalNote] = useState<string | null>(null);
   // CAD-813: the minted request's host stamp, plus the bounded poll
@@ -1966,7 +1960,10 @@ function CampaignWorkspace({
 
   const proposalsKey = `${scope.installId}:${scope.contextId}:${campaignId}:${proposalToken}`;
   useEffect(() => {
-    if (doc === null || !viewer.operator) {
+    // CAD-1013: proposals must be listed even before revision 1 exists —
+    // the assistant-apply path is the creation route now, so a verified
+    // proposal at source_revision 0 has to surface here for Apply.
+    if (!viewer.operator) {
       setProposals([]);
       return;
     }
@@ -2025,8 +2022,11 @@ function CampaignWorkspace({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mintWatching, minted?.requestId]);
 
+  // CAD-1013: the assistant can mint a request even before revision 1
+  // exists — the host stamps source_revision=0 and Apply creates the
+  // first revision, so the preview-first flow never strands creation.
   const mintRequest = () => {
-    if (scopedChatMessage === null || doc === null) return;
+    if (scopedChatMessage === null) return;
     setMintPending(true);
     setProposalError(null);
     setProposalNote(null);
@@ -2075,13 +2075,23 @@ function CampaignWorkspace({
       .then((value) => {
         const next = parseContentDoc(value);
         onDoc(next);
+        setRender(null);
+        setTestReceipt(null);
+        setEditing(false);
         setSavedNote(
           doc === null
             ? `Created revision ${next.revision} — earlier content approval does not exist yet.`
             : `Saved revision ${next.revision} — content approval invalidated.`,
         );
       })
-      .catch((err: unknown) => setFormError(friendlyCampaignError(err)))
+      .catch((err: unknown) => {
+        // expectedRevision conflict: keep the operator's local text edits
+        // open and ask for a reload — never overwrite an agent's newer draft.
+        setFormError(
+          friendlyCampaignError(err) +
+            " Reload the draft to retry against the newer revision.",
+        );
+      })
       .finally(() => setPending(false));
   };
 
@@ -2107,7 +2117,8 @@ function CampaignWorkspace({
   const previewBody =
     doc === null ? (
       <p className="text-label text-ink-400" data-preview="unsaved">
-        Save your draft to preview the email.
+        No saved email yet. Ask the assistant in the left chat to draft this campaign&apos;s
+        email, then Apply its verified proposal below to create revision 1.
       </p>
     ) : (
       <>
@@ -2219,248 +2230,192 @@ function CampaignWorkspace({
     </section>
   );
 
+  // CAD-1013 preview-first: the manual block composer is replaced by a
+  // read-oriented content card. The email is created/refined by the
+  // assistant proposal flow (Proposals section); the only operator edit
+  // here is a bounded inline text correction of saved subject, preheader
+  // and the text of existing blocks — never block structure, URLs or
+  // token tooling. Corrections go through the same revisioned save path
+  // (expectedRevision) so a conflict never overwrites an agent draft.
+  const [editing, setEditing] = useState(false);
+  const startEdit = () => {
+    setSubject(doc?.subject ?? "");
+    setPreheader(doc?.preheader ?? "");
+    setBlocks(blocksFromDoc(doc));
+    setFormError(null);
+    setEditing(true);
+  };
+  const cancelEdit = () => {
+    setBlocks(blocksFromDoc(doc));
+    setSubject(doc?.subject ?? "");
+    setPreheader(doc?.preheader ?? "");
+    setFormError(null);
+    setEditing(false);
+  };
   const contentForm = (
-      <form className="card px-4 py-4 grid gap-3" aria-label="Email content" onSubmit={save}>
+      <div className="card px-4 py-4 grid gap-3" aria-label="Email content">
         <h4 className="text-cardtitle font-medium text-ink-100">
-          Content {doc === null ? "— unsaved draft" : ""}
+          Content {doc === null ? "— not drafted yet" : `— revision ${doc.revision}`}
         </h4>
-        <div className="crm-field-row">
-          <Field
-            label="Subject"
-            id="cmp-subject"
-            hint="Plain text"
-            required
-            disabled={!canWrite || pending}
-            className="crm-field"
-          >
-            {(c) => (
-              <input
-                {...c}
-                className="field"
-                value={subject}
-                onChange={(e) => setSubject(e.target.value)}
-                maxLength={150}
-                autoComplete="off"
-              />
-            )}
-          </Field>
-          <Field
-            label="Preheader"
-            id="cmp-preheader"
-            hint="Optional, plain text"
-            disabled={!canWrite || pending}
-            className="crm-field"
-          >
-            {(c) => (
-              <input
-                {...c}
-                className="field"
-                value={preheader}
-                onChange={(e) => setPreheader(e.target.value)}
-                maxLength={200}
-                autoComplete="off"
-              />
-            )}
-          </Field>
-        </div>
-        <div className="crm-field-row">
-          <Field
-            label="First-name fallback for the token"
-            id="cmp-fallback"
-            disabled={!canWrite || pending}
-            className="crm-field"
-          >
-            {(c) => (
-              <input
-                {...c}
-                className="field"
-                value={fallback}
-                onChange={(e) => setFallback(e.target.value)}
-                maxLength={40}
-                autoComplete="off"
-              />
-            )}
-          </Field>
-          <p className="text-micro text-ink-500">
-            The only approved personalization is {"{{first_name|Fallback}}"}. Paste carrying HTML,
-            scripts or other merge fields is refused and nothing is mutated.
+        {doc === null && (
+          <p className="text-label text-ink-400" data-state="no-draft">
+            No email draft yet. Ask the assistant in the left chat to draft this campaign&apos;s
+            email, then Apply its verified proposal below to create revision 1 — or use the
+            inline editor after a draft exists.
           </p>
-        </div>
-        <ol className="crm-history" aria-label="Content blocks">
-          {blocks.map((block, index) => (
-            <li key={block.key} className="card px-3 py-3">
-              <div className="crm-field-row">
-                <Field
-                  label={`Block ${index + 1} type`}
-                  id={`cmp-block-type-${block.key}`}
-                  disabled={!canWrite || pending}
-                  className="crm-field"
-                >
-                  {(c) => (
-                    <Select
-                      id={c.id}
-                      value={block.kind}
-                      onChange={(value) =>
-                        isBlockType(value) && updateBlock(block.key, { kind: value })
-                      }
-                      options={BLOCK_TYPES.map((entry) => ({ value: entry.value, label: entry.label }))}
-                      aria-label={`Block ${index + 1} type`}
-                      disabled={c.disabled}
-                      full
-                    />
-                  )}
-                </Field>
-                {block.kind === "button" ? (
-                  <Field
-                    label="Button label"
-                    id={`cmp-block-label-${block.key}`}
-                    disabled={!canWrite || pending}
-                    className="crm-field"
-                  >
-                    {(c) => (
-                      <input
-                        {...c}
-                        className="field"
-                        value={block.label}
-                        onChange={(e) => updateBlock(block.key, { label: e.target.value })}
-                        maxLength={60}
-                        autoComplete="off"
-                      />
-                    )}
-                  </Field>
-                ) : (
-                  <div className="crm-field">
-                    <span className="text-label text-ink-300" id={`cmp-block-token-${block.key}`}>
-                      First-name personalization
-                    </span>
-                    <div
-                      className="crm-toolbar"
-                      role="group"
-                      aria-labelledby={`cmp-block-token-${block.key}`}
-                    >
-                      <Button
-                        type="button"
-                        size="sm"
-                        disabled={!canWrite || pending}
-                        title={`Append {{first_name|${fallback.trim() === "" ? "Friend" : fallback.trim()}}} to this block`}
-                        onClick={() =>
-                          updateBlock(block.key, { text: withToken(block.text, fallback) })
-                        }
-                      >
-                        Add to block
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        disabled={!canWrite || pending}
-                        title={`Append {{first_name|${fallback.trim() === "" ? "Friend" : fallback.trim()}}} to the subject`}
-                        onClick={() => setSubject((prev) => withToken(prev, fallback))}
-                      >
-                        Add to subject
-                      </Button>
-                    </div>
-                  </div>
-                )}
+        )}
+        {!editing ? (
+          <>
+            {doc !== null && (
+              <dl className="sdetail" data-content-summary>
+                <div>
+                  <dt>Subject</dt>
+                  <dd>{doc.subject}</dd>
+                </div>
+                <div>
+                  <dt>Preheader</dt>
+                  <dd>{doc.preheader === "" ? "—" : doc.preheader}</dd>
+                </div>
+                <div>
+                  <dt>Blocks</dt>
+                  <dd>
+                    {doc.blocks.length} block{doc.blocks.length === 1 ? "" : "s"} · actor{" "}
+                    {doc.actor} · {doc.contentDigest.slice(0, 18)}…
+                  </dd>
+                </div>
+              </dl>
+            )}
+            {canWrite && doc !== null && (
+              <div className="crm-toolbar">
+                <Button type="button" size="sm" onClick={startEdit}>
+                  Edit subject / text
+                </Button>
+                <span className="text-micro text-ink-500">
+                  Text corrections save a new revision and invalidate the current approval.
+                </span>
               </div>
-              {block.kind === "button" ? (
-                <Field
-                  label="Button URL"
-                  id={`cmp-block-url-${block.key}`}
-                  hint="https only"
-                  disabled={!canWrite || pending}
-                  className="crm-field mt-2"
-                >
-                  {(c) => (
-                    <input
-                      {...c}
-                      className="field"
-                      value={block.url}
-                      onChange={(e) => updateBlock(block.key, { url: e.target.value })}
-                      maxLength={500}
-                      autoComplete="off"
-                      placeholder="https://example.com/offer"
-                    />
-                  )}
-                </Field>
-              ) : (
-                <Field
-                  label={block.kind === "heading" ? "Heading text" : "Paragraph text"}
-                  id={`cmp-block-text-${block.key}`}
-                  disabled={!canWrite || pending}
-                  className="crm-field mt-2"
-                >
-                  {(c) => (
-                    <textarea
-                      {...c}
-                      className="field"
-                      rows={block.kind === "heading" ? 2 : 4}
-                      value={block.text}
-                      onChange={(e) => updateBlock(block.key, { text: e.target.value })}
-                      maxLength={block.kind === "heading" ? 120 : 2000}
-                      autoComplete="off"
-                    />
-                  )}
-                </Field>
-              )}
-              {blocks.length > 1 && canWrite && (
-                <p className="mt-2">
-                  <button
-                    type="button"
-                    className="lnk text-label"
-                    disabled={pending}
-                    onClick={() => setBlocks((prev) => prev.filter((row) => row.key !== block.key))}
-                  >
-                    Remove block {index + 1}
-                  </button>
-                </p>
-              )}
-            </li>
-          ))}
-        </ol>
-        {canWrite && blocks.length < 12 && (
-          <p className="crm-toolbar" aria-label="Add block">
-            {BLOCK_TYPES.map((entry) => (
-              <Button
-                key={entry.value}
-                type="button"
-                size="sm"
-                disabled={pending}
-                onClick={() =>
-                  isBlockType(entry.value) &&
-                  setBlocks((prev) => [
-                    ...prev,
-                    { key: editorKey++, kind: entry.value, text: "", label: "", url: "" },
-                  ])
-                }
+            )}
+            {doc !== null && !canWrite && (
+              <p className="text-label text-ink-400" data-state="read-only">
+                Read-only view. A verified operator saves content revisions.
+              </p>
+            )}
+          </>
+        ) : (
+          <form className="grid gap-3" aria-label="Correct email text" onSubmit={save}>
+            <div className="crm-field-row">
+              <Field
+                label="Subject"
+                id="cmp-subject"
+                hint="Plain text"
+                required
+                disabled={!canWrite || pending}
+                className="crm-field"
               >
-                + {entry.label}
+                {(c) => (
+                  <input
+                    {...c}
+                    className="field"
+                    value={subject}
+                    onChange={(e) => setSubject(e.target.value)}
+                    maxLength={150}
+                    autoComplete="off"
+                  />
+                )}
+              </Field>
+              <Field
+                label="Preheader"
+                id="cmp-preheader"
+                hint="Optional, plain text"
+                disabled={!canWrite || pending}
+                className="crm-field"
+              >
+                {(c) => (
+                  <input
+                    {...c}
+                    className="field"
+                    value={preheader}
+                    onChange={(e) => setPreheader(e.target.value)}
+                    maxLength={200}
+                    autoComplete="off"
+                  />
+                )}
+              </Field>
+            </div>
+            <ol className="crm-history" aria-label="Block text">
+              {blocks.map((block, index) => (
+                <li key={block.key} className="card px-3 py-3">
+                  <p className="text-micro text-ink-500">
+                    Block {index + 1} — {block.kind}
+                    {block.kind === "button" ? " (URL unchanged)" : ""}
+                  </p>
+                  {block.kind === "button" ? (
+                    <Field
+                      label="Button label"
+                      id={`cmp-block-label-${block.key}`}
+                      disabled={!canWrite || pending}
+                      className="crm-field mt-2"
+                    >
+                      {(c) => (
+                        <input
+                          {...c}
+                          className="field"
+                          value={block.label}
+                          onChange={(e) => updateBlock(block.key, { label: e.target.value })}
+                          maxLength={60}
+                          autoComplete="off"
+                        />
+                      )}
+                    </Field>
+                  ) : (
+                    <Field
+                      label={block.kind === "heading" ? "Heading text" : "Paragraph text"}
+                      id={`cmp-block-text-${block.key}`}
+                      disabled={!canWrite || pending}
+                      className="crm-field mt-2"
+                    >
+                      {(c) => (
+                        <textarea
+                          {...c}
+                          className="field"
+                          rows={block.kind === "heading" ? 2 : 4}
+                          value={block.text}
+                          onChange={(e) => updateBlock(block.key, { text: e.target.value })}
+                          maxLength={block.kind === "heading" ? 120 : 2000}
+                          autoComplete="off"
+                        />
+                      )}
+                    </Field>
+                  )}
+                </li>
+              ))}
+            </ol>
+            {formError && (
+              <p className="text-label text-fail" role="alert">
+                {formError}
+              </p>
+            )}
+            {savedNote && (
+              <p className="text-label text-ok" role="status">
+                {savedNote}
+              </p>
+            )}
+            <div className="crm-toolbar">
+              <Button type="submit" variant="primary" loading={pending} disabled={pending}>
+                Save text corrections (new revision)
               </Button>
-            ))}
-            <span className="num text-micro text-ink-500">{blocks.length}/12</span>
-          </p>
+              <Button type="button" disabled={pending} onClick={cancelEdit}>
+                Cancel
+              </Button>
+            </div>
+          </form>
         )}
-        {formError && (
-          <p className="text-label text-fail" role="alert">
-            {formError}
-          </p>
-        )}
-        {savedNote && (
+        {!editing && savedNote && (
           <p className="text-label text-ok" role="status">
             {savedNote}
           </p>
         )}
-        {!canWrite ? (
-          <p className="text-label text-ink-400" data-state="read-only">
-            Read-only view. A verified operator saves content revisions.
-          </p>
-        ) : (
-          <div>
-            <Button type="submit" variant="primary" loading={pending} disabled={pending}>
-              {doc === null ? "Create campaign (revision 1)" : "Save draft"}
-            </Button>
-          </div>
-        )}
-      </form>
+      </div>
   );
 
   const approvalSection = doc !== null && (
@@ -2653,7 +2608,10 @@ function CampaignWorkspace({
         </section>
   );
 
-  const proposalsSection = doc !== null && (
+  // CAD-1013: proposals stay available before revision 1 — the assistant
+  // mint/apply path is the creation route now that the manual composer is
+  // gone. expectedRevision is 0 for an unsaved campaign (source_revision=0).
+  const proposalsSection = (
         <section aria-label="Assistant proposals" className="card px-4 py-4 grid gap-3">
           <h4 className="text-cardtitle font-medium text-ink-100">Proposals — Apply or Discard</h4>
           <p className="text-label text-ink-400">
@@ -2711,53 +2669,11 @@ function CampaignWorkspace({
               {minted !== null && (
                 <p className="num text-micro text-ink-500" data-minted-request>
                   Request {minted.requestId} · campaign {minted.campaignId} · stamped source r
-                  {minted.sourceRevision} · draft r{doc.revision} ·{" "}
+                  {minted.sourceRevision} · draft r{doc === null ? 0 : doc.revision} ·{" "}
                   {minted.state === "open" ? "awaiting the assistant's turn" : minted.state}
                   {minted.usedBy !== null ? ` by ${minted.usedBy}` : ""}
                 </p>
               )}
-            </div>
-          )}
-          {canWrite && (
-            <div>
-              <Button
-                size="sm"
-                loading={proposalPending}
-                disabled={proposalPending}
-                title="Submit the editor's copy as an operator-submitted proposal (not assistant-authored)"
-                onClick={() => {
-                  setProposalError(null);
-                  setProposalNote(null);
-                  let grammar: CampaignBlock[];
-                  try {
-                    grammar = grammarBlocks();
-                    checkContent(subject, preheader, grammar);
-                  } catch (err: unknown) {
-                    setProposalError(friendlyCampaignError(err));
-                    return;
-                  }
-                  setProposalPending(true);
-                  void contentClient
-                    .propose(scope, {
-                      campaignId,
-                      proposalId: newAudienceId("prop"),
-                      subject,
-                      preheader,
-                      blocks: grammar,
-                    })
-                    .then((value) => {
-                      const created = parseProposal(value);
-                      setProposalToken((count) => count + 1);
-                      setProposalNote(
-                        `Operator-submitted proposal ${created.proposalId} recorded against r${created.sourceRevision} — still inert until Apply.`,
-                      );
-                    })
-                    .catch((err: unknown) => setProposalError(friendlyCampaignError(err)))
-                    .finally(() => setProposalPending(false));
-                }}
-              >
-                Submit editor as proposal (operator-submitted)
-              </Button>
             </div>
           )}
           {proposals.filter((row) => row.state === "pending").length === 0 ? (
@@ -2773,7 +2689,7 @@ function CampaignWorkspace({
                     key={row.proposalId}
                     scope={scope}
                     proposal={row}
-                    expectedRevision={doc.revision}
+                    expectedRevision={doc === null ? 0 : doc.revision}
                     canWrite={canWrite}
                     onApplied={(next) => {
                       onDoc(next);
@@ -2787,7 +2703,9 @@ function CampaignWorkspace({
                     onDiscarded={(id) => {
                       setProposalToken((count) => count + 1);
                       setProposalNote(
-                        `Proposal ${id} discarded — draft unchanged at r${doc.revision} (${doc.contentDigest.slice(0, 18)}…).`,
+                        doc === null
+                          ? `Proposal ${id} discarded — still no saved revision.`
+                          : `Proposal ${id} discarded — draft unchanged at r${doc.revision} (${doc.contentDigest.slice(0, 18)}…).`,
                       );
                     }}
                     onError={setProposalError}

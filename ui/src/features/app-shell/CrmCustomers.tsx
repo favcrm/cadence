@@ -11,6 +11,7 @@ import Detail from "./shared/Detail";
 import DataTable from "./shared/DataTable";
 import Field from "./shared/Field";
 import { EmptyState, ErrorNotice, Loading, Notice } from "./shared/States";
+import { useDrawerClose } from "./shared/useDrawerClose";
 import {
   buildCustomerProfile,
   consentEntries,
@@ -620,13 +621,14 @@ function CustomerDrawer({
       if (opener.current instanceof HTMLElement) opener.current.focus();
     };
   }, []);
+  const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") requestClose();
     };
     addEventListener("keydown", onKey);
     return () => removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [requestClose]);
 
   const reloadToken = `${scope.installId}:${scope.contextId}:${recordId}`;
   useEffect(() => {
@@ -660,12 +662,14 @@ function CustomerDrawer({
       aria-modal="false"
       aria-label="Customer details"
       data-drawer="customer"
+      data-closing={closing || undefined}
+      onTransitionEnd={onTransitionEnd}
     >
       <div className="crm-drawer-head">
         <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1}>
           {loading ? "Customer details" : (view?.displayName ?? "Customer details")}
         </h3>
-        <Button size="sm" onClick={onClose} aria-label="Close customer details">
+        <Button size="sm" onClick={requestClose} aria-label="Close customer details">
           Close
         </Button>
       </div>

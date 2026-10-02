@@ -668,7 +668,7 @@ async function mountedFlow() {
 
   // New campaign: audience preview counts render live without a save.
   await click(byText("button", "New campaign"));
-  await settle(() => assert(host.querySelector("#cmp-subject"), "new campaign page opens"));
+  await settle(() => assert(host.querySelector('[data-state="no-draft"]'), "new campaign page opens in the no-draft preview-first state"));
   await React.act(async () => { await sleep(700); });
   await settle(() => assert(text().includes("Final recipients"), "audience preview counts render pre-save"));
   // Suppression add refreshes the suppression counts.
@@ -681,17 +681,43 @@ async function mountedFlow() {
   await settle(() => assert(text().includes("Frozen") && text().includes("5 recipients"), "freeze receipt reports"));
 
   // Content save unlocks preview, test-send and proposals in place.
-  await fillInput("#cmp-subject", "Launch");
-  await fillArea('form[aria-label="Email content"] textarea', "Hi there {{first_name|Friend}}");
-  await click(byText("button", "Create campaign (revision 1)"));
-  await settle(() => assert(text().includes("Created revision 1"), "first save reports its revision"));
-  const createdId = new URLSearchParams(location.search).get("record");
-  void createdId;
+  // CAD-1013 preview-first: there is no manual composer — the campaign
+  // starts with "No email draft yet" and is created by the assistant
+  // proposal path, never a bare Content form.
+  assert(host.querySelector('[data-state="no-draft"]'), "unsaved campaign shows the no-draft state, not a composer");
+  assert(!host.querySelector('form[aria-label="Email content"]'), "no manual block editor renders");
+  assert(!byText("button", "Submit editor as proposal (operator-submitted)"), "the operator proposal shortcut is gone");
+  assert(!host.querySelector("#cmp-subject"), "no manual subject input until a draft exists");
+
+  // Initial creation is not stranded: send the assistant a scoped chat
+  // message, mint a proposal request (source r0), redeem it, Apply —
+  // that creates revision 1 through the verified assistant path.
+  const mintButton0 = () => byText("button", "Ask assistant to draft") as HTMLButtonElement | null;
+  assert(mintButton0(), "the assistant-draft mint control renders pre-save");
+  assert(mintButton0()!.disabled, "mint is disabled without a scoped chat message");
+  await fillArea("#app-shell-chat-box", "Draft the launch email for this campaign");
+  await click(byText("button", "Send"));
+  await React.act(async () => {
+    const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
+    await resources.masterThread.refresh();
+  });
+  await settle(() => assert(!mintButton0()!.disabled, "mint enables once a scoped message exists"));
+  await click(mintButton0());
+  await settle(() => assert(mintBodies.length === 1, "one proposal request minted pre-save"));
+  assert(mintBodies[0].campaign_id, "mint names the campaign");
+  redeem(mintBodies[0].request_id as string);
+  await settle(() => assert(text().includes("Verified assistant draft"), "the verified proposal lands pre-save"), 30000);
+  const firstLi = host.querySelector('[data-proposal^="prop-asst-"]');
+  assert(firstLi, "the verified proposal row exists");
+  await click(Array.from(firstLi!.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Apply")));
+  await settle(() => assert(text().includes("Applied as revision 1"), "the verified proposal creates revision 1"));
+  const openDoc = () => contents[(host.querySelector("#cmp-id") as HTMLInputElement | null)?.value ?? ""]
+    ?? Object.values(contents).at(-1);
+  assert(openDoc().revision === 1, "revision 1 exists after the assistant apply");
 
   // Host-rendered preview (CAD-1008): the saved revision renders
-  // automatically on save — no Render button — with the visual frame
-  // beside the content form. A manual Refresh re-renders the same
-  // saved version with the current sample name.
+  // automatically — Visual default, HTML/Text tabs — beside the content
+  // summary card. A manual Refresh re-renders the same saved version.
   await settle(() => {
     const frame = host.querySelector('iframe[data-preview="visual"]') as HTMLIFrameElement;
     assert(frame && (frame.getAttribute("srcdoc") ?? "").includes("HTML form"), "the saved revision auto-rendered");
@@ -705,42 +731,41 @@ async function mountedFlow() {
   await flush();
   assert((host.querySelector('pre[data-preview="text"]')?.textContent ?? "").includes("TEXT form"), "text tab shows the host text form");
   assert(text().includes("noreply@cadence.invalid"), "preview-only sender material renders");
-  assert(!text().includes("locked until"), "no send control is locked-copy anymore");
 
-  // Approval is content-only; proposals Apply (new revision, approval
-  // invalidated) or Discard (non-mutating) with honest attribution.
-  await click(byText("button", "Approve r1 (content-only)"));
-  await settle(() => assert(text().includes("Approved r1"), "approval lands content-only"));
-  await click(byText("button", "Submit editor as proposal (operator-submitted)"));
-  await settle(() => assert(text().includes("operator-direct"), "proposal shows honest attribution"));
-  assert(text().includes("Operator-submitted"), "an operator proposal is never labelled assistant");
-  assert(!text().includes("Verified assistant draft"), "no assistant badge without a receipt");
-  await click(byText("button", "Apply (new revision)"));
-  await settle(() => assert(text().includes("approval invalidated"), "apply bumps the revision and invalidates approval"));
-  assert(applyBodies.at(-1)?.expected_revision === 1, "Apply sends the current draft revision as expected_revision");
-  assert(!text().includes("Approved r2"), "no approval survives a content change");
-  await click(byText("button", "Submit editor as proposal (operator-submitted)"));
-  await settle(() => assert(byText("button", "Discard"), "second proposal pends"));
-  const openDoc = () => contents[(host.querySelector("#cmp-id") as HTMLInputElement | null)?.value ?? ""]
-    ?? Object.values(contents).find((row) => row.subject === "Launch" || row.subject === "Launch v3")
-    ?? Object.values(contents).at(-1);
-  const digestBeforeDiscard = openDoc().content_digest;
-  await click(byText("button", "Discard"));
-  await settle(() => assert(text().includes("draft unchanged at r2"), "discard is non-mutating"));
-  assert(openDoc().content_digest === digestBeforeDiscard, "discard left the draft digest untouched");
-  // A proposal whose source drifted behind the draft refuses as stale:
-  // submit at r2, save r3, then Apply must not silently merge — and the
-  // UI itself renders it stale with Apply disabled.
-  await click(byText("button", "Submit editor as proposal (operator-submitted)"));
-  await settle(() => assert(byText("button", "Discard"), "drifted proposal pends"));
-  await fillInput("#cmp-subject", "Launch v3");
-  await click(byText("button", "Save draft"));
-  await settle(() => assert(text().includes("Saved revision 3"), "draft moves to r3"));
-  await settle(() => assert(text().includes("Needs review (stale)"), "drifted proposal renders stale"));
+  // Bounded inline text correction: Edit subject / text opens the only
+  // operator edit — subject, preheader and existing block text, never
+  // block type, URL, token tooling or add/remove — and saves a new
+  // revision through expectedRevision (a conflict keeps local text).
+  await click(byText("button", "Edit subject / text"));
+  await settle(() => assert(host.querySelector("#cmp-subject"), "inline edit reveals subject"));
+  assert(!host.querySelector('[aria-label="Add block"]'), "no add-block control in inline edit");
+  await fillInput("#cmp-subject", "Assistant draft subject v2");
+  await click(byText("button", "Save text corrections (new revision)"));
+  await settle(() => assert(text().includes("Saved revision 2"), "the text correction saved a new revision"));
+
+  // Approval is content-only; a proposal Apply invalidates it and a
+  // stale-source proposal refuses with Apply disabled.
+  await click(byText("button", "Approve r2 (content-only)"));
+  await settle(() => assert(text().includes("Approved r2"), "approval lands content-only"));
+  // Mint a second assistant proposal at r2, then save r3 via a text
+  // correction so the proposal drifts stale.
+  await click(mintButton0());
+  await settle(() => assert(mintBodies.length === 2, "a second proposal request mints"));
+  redeem(mintBodies[1].request_id as string);
+  await settle(() => assert(host.querySelectorAll('[data-proposal]').length > 0, "second proposal pends"), 30000);
+  await click(byText("button", "Edit subject / text"));
+  await settle(() => assert(host.querySelector("#cmp-subject"), "inline edit reopens"));
+  await fillInput("#cmp-subject", "Assistant draft subject v3");
+  await click(byText("button", "Save text corrections (new revision)"));
+  await settle(() => assert(text().includes("Saved revision 3"), "the correction saved r3"));
+  await settle(() => assert(text().includes("Needs review (stale)"), "the drifted proposal renders stale"));
   const staleApply = Array.from(host.querySelectorAll('[data-proposal]'))
     .map((li) => li.querySelector("button"))
     .find((b) => (b?.textContent ?? "").includes("Apply"));
   assert(staleApply && (staleApply as HTMLButtonElement).disabled, "stale proposal's Apply is disabled");
+  // Discard clears it non-mutating.
+  await click(byText("button", "Discard"));
+  await settle(() => assert(text().includes("draft unchanged at r3"), "discard is non-mutating"));
 
   // ---- CAD-813: the verified assistant draft seam ----
   // No scoped chat message yet: the mint control stays disabled with
@@ -775,21 +800,24 @@ async function mountedFlow() {
   await settle(() => assert(!mintButton()!.disabled, "the mint enables once a scoped message exists"));
 
   // Mint: the body is exactly {campaign_id, message_id, request_id} —
-  // no token, receipt, turn or source_revision ever travels.
+  // no token, receipt, turn or source_revision ever travels. (This is
+  // the third mint: two earlier ones already ran in this scenario.)
+  const mintCountBefore = mintBodies.length;
   await click(mintButton());
-  await settle(() => assert(mintBodies.length === 1, "one proposal request minted"));
+  await settle(() => assert(mintBodies.length === mintCountBefore + 1, "one proposal request minted"));
+  const minted = mintBodies.at(-1)!;
   equal(
-    Object.keys(mintBodies[0]).sort(),
+    Object.keys(minted).sort(),
     ["campaign_id", "message_id", "request_id"],
     "the mint body carries exactly the three ids",
   );
   const openCampaignId = openDoc().campaign_id as string;
-  assert(mintBodies[0].campaign_id === openCampaignId, "mint names the open campaign");
-  assert(mintBodies[0].message_id === sendBodies[0].message, "mint names the scoped chat message");
-  assert(/^req-[0-9a-f]{24}$/.test(mintBodies[0].request_id), "request id is identifier-safe");
+  assert(minted.campaign_id === openCampaignId, "mint names the open campaign");
+  assert(minted.message_id === sendBodies.at(-1)?.message, "mint names the scoped chat message");
+  assert(/^req-[0-9a-f]{24}$/.test(minted.request_id), "request id is identifier-safe");
   await settle(() =>
     assert(
-      text().includes("stamped source r3") && text().includes("draft r3"),
+      text().includes(`stamped source r${openDoc().revision}`) && text().includes(`draft r${openDoc().revision}`),
       "the minted request's host stamp renders beside the draft revision",
     ),
   );
@@ -798,7 +826,7 @@ async function mountedFlow() {
   // The assistant's live turn redeems the request (daemon socket —
   // this fixture's `redeem` plays the store-side part the browser
   // can never reach): the next poll lands the verified proposal.
-  const mintedId = mintBodies[0].request_id as string;
+  const mintedId = minted.request_id as string;
   redeem(mintedId);
   await settle(() => assert(text().includes("Verified assistant draft"), "the verified badge renders on the receipted proposal"), 30000);
   assert(text().includes("crm-writer"), "the badge names the receipt's agent");
@@ -846,7 +874,7 @@ async function mountedFlow() {
   });
   {
     const labels = [
-      'form[aria-label="Email content"]',
+      'div[aria-label="Email content"]',
       'section[aria-label="Email preview"]',
       'section[aria-label="Content approval"]',
       'section[aria-label="Frozen audience"]',
@@ -901,8 +929,10 @@ async function mountedFlow() {
   await settle(() => assert(heldRender !== null, "the refresh render is in flight"));
   const heldRevision = renderDoc().revision;
   // Save a newer revision while the stale render is outstanding.
-  await fillInput("#cmp-subject", "Launch v4");
-  await click(byText("button", "Save draft"));
+  await click(byText("button", "Edit subject / text"));
+  await settle(() => assert(host.querySelector("#cmp-subject"), "inline edit opens for the stale-render save"));
+  await fillInput("#cmp-subject", "Assistant draft subject v4");
+  await click(byText("button", "Save text corrections (new revision)"));
   await settle(() => assert(renderDoc().revision === heldRevision + 1, "the newer revision saved while the stale render was in flight"));
   // Release the stale answer now that the saved revision has moved on.
   const release = heldRender!;
