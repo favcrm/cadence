@@ -1028,6 +1028,81 @@ stress_pattern = ["wait_"]
     assert_eq!(r["suggested_verdict"], json!("blocked"));
 }
 
+/// CAD-799: a failing `src/` unit test has no file under
+/// `test_globs` — with `test_command_lib` the equal-conditions
+/// compare still runs it by name. `ghost_test` fails identically on
+/// the gated tree and the base, so it classifies `pre-existing`
+/// instead of `inconclusive`; every other row is unchanged.
+#[test]
+fn review_verb_isolates_unit_tests_via_test_command_lib() {
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    // The base head's recipe declares the lib-isolation template and
+    // the fake runner fails `ghost_test` on every tree.
+    std::fs::write(
+        f.repo.join("cadence-review.toml"),
+        r#"prepare = ["echo prepared >> \"$GATE_LOG\""]
+gates = ["echo gate1 >> \"$GATE_LOG\"", "sh gate_fail.sh"]
+full_suite = "sh suite.sh"
+test_globs = ["tests/**"]
+test_command = "sh one_test.sh {test}"
+test_command_lib = "sh lib_test.sh {test}"
+stress_pattern = ["wait_"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        f.repo.join("lib_test.sh"),
+        "case \"$1\" in\n ghost_test) exit 1;;\n *) exit 0;;\nesac\n",
+    )
+    .unwrap();
+    review_git(&f.repo, &["commit", "-qam", "base config: lib isolation"]);
+    review_git(&f.repo, &["push", "-q", "origin", "main"]);
+
+    let out = review_cmd(&f).arg("7").output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = review_report(&f, 7);
+    let fails = r["failures"].as_array().unwrap();
+    assert_eq!(fails.len(), 3, "{fails:?}");
+
+    // `ghost_test` now runs through the lib template: fails on the
+    // gated tree and identically on the base — pre-existing, not
+    // inconclusive.
+    let ghost = fails.iter().find(|c| c["test"] == "ghost_test").unwrap();
+    assert_eq!(
+        ghost["isolated_gated"]["outcome"],
+        json!("fail"),
+        "{ghost:?}"
+    );
+    assert_eq!(
+        ghost["isolated_base"]["outcome"],
+        json!("fail"),
+        "{ghost:?}"
+    );
+    assert_eq!(ghost["verdict"], json!("pre-existing"), "{ghost:?}");
+    assert!(
+        ghost["cmd"].as_str().unwrap().contains("lib_test.sh"),
+        "{ghost:?}"
+    );
+
+    // The forged name is still never executed, and the real tests/
+    // test still runs the `--test` template.
+    let bad = fails.iter().find(|c| c["test"] == "bad;touch_pwn").unwrap();
+    assert_eq!(bad["verdict"], json!("inconclusive"));
+    assert!(bad.get("cmd").is_none(), "{bad:?}");
+    let nf = fails.iter().find(|c| c["test"] == "new_flaky").unwrap();
+    assert!(
+        nf["cmd"].as_str().unwrap().contains("one_test.sh"),
+        "{nf:?}"
+    );
+    assert_eq!(nf["verdict"], json!("regression"));
+}
+
 #[test]
 fn review_verb_gates_with_the_base_config_when_the_pr_rewrites_it() {
     let base = TempDir::new().unwrap();
