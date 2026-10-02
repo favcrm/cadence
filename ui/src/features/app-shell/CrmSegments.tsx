@@ -5,7 +5,7 @@ import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
 import Field from "./shared/Field";
 import { ErrorNotice } from "./shared/States";
-import { useDrawerClose } from "./shared/useDrawerClose";
+import DrawerShell, { type DrawerTab } from "./shared/DrawerShell";
 import {
   audienceClient,
   type AudienceScope,
@@ -615,24 +615,11 @@ function SegmentDrawer({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
+  const [editPending, setEditPending] = useState(false);
   const [preview, setPreview] = useState<AudiencePreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(true);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewToken, setPreviewToken] = useState(0);
-  const headRef = useRef<HTMLHeadingElement | null>(null);
-
-  useEffect(() => {
-    headRef.current?.focus();
-  }, []);
-  const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") requestClose();
-    };
-    addEventListener("keydown", onKey);
-    return () => removeEventListener("keydown", onKey);
-  }, [requestClose]);
-
   const reloadToken = `${scope.installId}:${scope.contextId}:${segmentId}`;
   useEffect(() => {
     const controller = new AbortController();
@@ -676,124 +663,139 @@ function SegmentDrawer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [segment?.id, segment?.revision, previewToken]);
 
+  const reload = () => {
+    setError(null);
+    setLoading(true);
+    audienceClient
+      .segmentShow(scope, segmentId)
+      .then((value) => setSegment(parseSegment(value)))
+      .catch((e: unknown) => setError(friendlyAudienceError(e)))
+      .finally(() => setLoading(false));
+  };
+  const ready = !loading && error === null && segment !== null;
+
+  const tabs: DrawerTab[] =
+    ready && segment !== null
+      ? [
+          {
+            id: "overview",
+            label: "Overview",
+            panel: (
+              <>
+                <section aria-label="Segment rules">
+                  <h4 className="text-label font-medium text-ink-200">Rules ({segment.predicates.length})</h4>
+                  <ol className="crm-history">
+                    {segment.predicates.map((rule, index) => (
+                      <li key={index} className="text-label text-ink-300">
+                        {describeRule(rule)}
+                      </li>
+                    ))}
+                  </ol>
+                </section>
+                <section aria-label="Current matches" className="mt-3">
+                  <h4 className="text-label font-medium text-ink-200">Current matches</h4>
+                  <div className="mt-1">
+                    <PreviewPanel
+                      preview={preview}
+                      loading={previewLoading}
+                      error={previewError}
+                      onRetry={() => setPreviewToken((count) => count + 1)}
+                      label="Current matches"
+                    />
+                  </div>
+                </section>
+              </>
+            ),
+          },
+          {
+            id: "details",
+            label: "Details",
+            panel: (
+              <section aria-label="Record diagnostics">
+                <p className="num text-micro text-ink-500">
+                  Segment <span className="num">{segmentId}</span> · scope{" "}
+                  <span className="num">{scope.contextId || "none"}</span> · revision r{segment.revision} · digest{" "}
+                  {segment.digest.slice(0, 18)}…
+                </p>
+              </section>
+            ),
+          },
+        ]
+      : [];
+
   return (
-    <div
-      className="crm-drawer"
-      role="dialog"
-      aria-modal="false"
-      aria-label="Segment details"
-      data-drawer="segment"
-      data-closing={closing || undefined}
-      onTransitionEnd={onTransitionEnd}
-    >
-      <div className="crm-drawer-head">
-        <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1}>
-          {loading ? "Segment details" : (segment?.name ?? "Segment details")}
-        </h3>
-        <Button size="sm" onClick={requestClose} aria-label="Close segment details">
-          Close
-        </Button>
-      </div>
-      <details className="crm-diag">
-        <summary className="text-micro text-ink-500">Record diagnostics</summary>
-        <p className="num text-micro text-ink-500 mt-1">
-          Segment <span className="num">{segmentId}</span> · scope{" "}
-          <span className="num">{scope.contextId || "none"}</span>
-          {segment !== null && (
-            <>
-              {" "}· revision r{segment.revision} · digest {segment.digest.slice(0, 18)}…
-            </>
-          )}
-        </p>
-      </details>
-      {loading && (
-        <p className="text-secondary text-ink-400 mt-2" role="status">
-          Reading the segment…
-        </p>
-      )}
-      {error !== null && !loading && (
-        <p className="card px-4 py-3 mt-2 text-label text-fail border-fail/40" role="alert">
-          {error}{" "}
-          <button
-            type="button"
-            className="lnk"
-            onClick={() => {
-              setError(null);
-              setLoading(true);
-              audienceClient
-                .segmentShow(scope, segmentId)
-                .then((value) => setSegment(parseSegment(value)))
-                .catch((e: unknown) => setError(friendlyAudienceError(e)))
-                .finally(() => setLoading(false));
-            }}
-          >
-            Retry
-          </button>
-        </p>
-      )}
-      {!loading && error === null && segment !== null && (
-        <>
-          <section aria-label="Segment rules" className="mt-3">
-            <h4 className="text-label font-medium text-ink-200">Rules ({segment.predicates.length})</h4>
-            <ol className="crm-history">
-              {segment.predicates.map((rule, index) => (
-                <li key={index} className="text-label text-ink-300">
-                  {describeRule(rule)}
-                </li>
-              ))}
-            </ol>
-          </section>
-          <section aria-label="Current matches" className="mt-3">
-            <h4 className="text-label font-medium text-ink-200">Current matches</h4>
-            <div className="mt-1">
-              <PreviewPanel
-                preview={preview}
-                loading={previewLoading}
-                error={previewError}
-                onRetry={() => setPreviewToken((count) => count + 1)}
-                label="Current matches"
-              />
-            </div>
-          </section>
-          {canWrite ? (
-            editing ? (
-              <SegmentEdit
-                scope={scope}
-                segment={segment}
-                onSaved={(next) => {
-                  setSegment(next);
-                  setEditing(false);
-                }}
-                onCancel={() => setEditing(false)}
-              />
-            ) : (
-              <p className="mt-3">
-                <Button size="sm" onClick={() => setEditing(true)}>
-                  Edit rules
-                </Button>
-              </p>
-            )
-          ) : (
-            <p className="text-label text-ink-400 mt-3" data-state="read-only">
-              Read-only view. {viewer.operator ? "Edits are disabled on this board." : "Sign in as the operator to edit."}
-            </p>
-          )}
-        </>
-      )}
-    </div>
+    <DrawerShell
+      kind="segment"
+      label="Segment details"
+      title={loading ? "Segment details" : (segment?.name ?? "Segment details")}
+      avatar="◎"
+      subtitle={segment ? `${segment.predicates.length} rule${segment.predicates.length === 1 ? "" : "s"}` : undefined}
+      tabs={tabs}
+      state={
+        loading ? (
+          <p className="text-secondary text-ink-400" role="status">
+            Reading the segment…
+          </p>
+        ) : error !== null ? (
+          <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
+            {error}{" "}
+            <button type="button" className="lnk" onClick={reload}>
+              Retry
+            </button>
+          </p>
+        ) : undefined
+      }
+      edit={
+        editing && canWrite && ready && segment !== null
+          ? {
+              formId: "crm-segment-edit",
+              title: "Edit rules — saving is refused if the segment changed since you opened it",
+              pending: editPending,
+              onCancel: () => setEditing(false),
+              body: (
+                <SegmentEdit
+                  formId="crm-segment-edit"
+                  scope={scope}
+                  segment={segment}
+                  onPending={setEditPending}
+                  onSaved={(next) => {
+                    setSegment(next);
+                    setEditing(false);
+                  }}
+                />
+              ),
+            }
+          : null
+      }
+      primary={
+        ready && canWrite ? (
+          <Button size="sm" variant="primary" onClick={() => setEditing(true)}>
+            Edit rules
+          </Button>
+        ) : undefined
+      }
+      note={
+        ready && !canWrite
+          ? `Read-only view. ${viewer.operator ? "Edits are disabled on this board." : "Sign in as the operator to edit."}`
+          : undefined
+      }
+      onClose={onClose}
+    />
   );
 }
 
 function SegmentEdit({
+  formId,
   scope,
   segment,
+  onPending,
   onSaved,
-  onCancel,
 }: {
+  formId: string;
   scope: AudienceScope;
   segment: SegmentDoc;
+  onPending: (pending: boolean) => void;
   onSaved: (segment: SegmentDoc) => void;
-  onCancel: () => void;
 }) {
   const [name, setName] = useState(segment.name);
   const [rules, setRules] = useState<RuleDraft[]>(() =>
@@ -803,7 +805,8 @@ function SegmentEdit({
   const [formError, setFormError] = useState<string | null>(null);
   return (
     <form
-      className="card px-4 py-4 mt-3 grid gap-3"
+      id={formId}
+      className="grid gap-3"
       onSubmit={(e) => {
         e.preventDefault();
         setFormError(null);
@@ -818,6 +821,7 @@ function SegmentEdit({
           return;
         }
         setPending(true);
+        onPending(true);
         void audienceClient
           .segmentSave(scope, {
             segmentId: segment.id,
@@ -827,12 +831,12 @@ function SegmentEdit({
           })
           .then((value) => onSaved(parseSegment(value)))
           .catch((err: unknown) => setFormError(friendlyAudienceError(err)))
-          .finally(() => setPending(false));
+          .finally(() => {
+            setPending(false);
+            onPending(false);
+          });
       }}
     >
-      <h4 className="text-label font-medium text-ink-200">
-        Edit — saving is refused if the segment changed since you opened it
-      </h4>
       <Field label="Segment name" id="seg-edit-name" required disabled={pending} className="crm-field">
         {(c) => (
           <input
@@ -864,14 +868,6 @@ function SegmentEdit({
           before retrying.
         </p>
       )}
-      <div className="crm-toolbar">
-        <Button type="submit" variant="primary" loading={pending} disabled={pending}>
-          Save changes
-        </Button>
-        <button type="button" className="lnk text-label" onClick={onCancel}>
-          Discard edit
-        </button>
-      </div>
     </form>
   );
 }

@@ -337,9 +337,13 @@ const openBeta = Array.from(host.querySelectorAll("button.lnk")).find((el) => el
 await click(openBeta);
 await settle(() => assert(host.querySelector('[data-drawer="customer"]'), "drawer opens"));
 assert(text().includes("beta-two@example.com"), "drawer shows the profile");
-assert(text().includes("Consent history"), "drawer shows the consent trail");
-assert(text().includes("Revision history"), "drawer shows revision history");
 assert(text().includes("chat context only"), "drawer names the selection contract");
+// CAD-1052: history lives under Activity, diagnostics under Details.
+await click(Array.from(host.querySelectorAll('[role="tab"]')).find((el) => el.textContent === "Activity"));
+assert(text().includes("Consent history"), "Activity tab shows the consent trail");
+assert(text().includes("Revision history"), "Activity tab shows revision history");
+await click(Array.from(host.querySelectorAll('[role="tab"]')).find((el) => el.textContent === "Details"));
+assert(text().includes("customer-s2") && text().includes("revision r"), "Details tab holds the record diagnostics");
 assert(location.search.includes("record=customer-s2"), "direct record route deep-links");
 assert(!location.search.includes("beta-two"), "no customer content in the URL");
 await React.act(async () => {
