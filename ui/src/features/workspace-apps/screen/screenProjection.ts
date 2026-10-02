@@ -1,13 +1,13 @@
 import type { Installation, AppContext, WorkspaceRun, AppEffect } from "../workspaceApps";
-import type { PublishIntent } from "../socialPublish";
-import { INTENT_ROWS_MAX, type ScreenIntent, type ScreenIntents, type ScreenPush } from "./screenProtocol";
+import { PUBLISH_LIST_CAP, type PublishIntent } from "../socialPublish";
+import { type ScreenIntent, type ScreenIntents, type ScreenPush } from "./screenProtocol";
 
 /** The verified `socialPublish.list` read, tagged with the scope it was
  *  issued for. A read for any other install/context is never pushed. */
 export interface IntentRead {
   installId: string;
   contextId: string;
-  status: "loading" | "ok" | "unavailable";
+  status: "ok" | "unavailable";
   intents: PublishIntent[];
 }
 const ID_MAX = 128;
@@ -25,7 +25,7 @@ function scopedIntents(read: IntentRead | undefined, installId: string, contextI
   if (!read || read.installId !== installId || read.contextId !== contextId)
     return { status: "loading", withheld: 0, rows: [] };
   if (read.status !== "ok") return { status: read.status, withheld: 0, rows: [] };
-  if (read.intents.length > INTENT_ROWS_MAX) throw new Error("The screen projection exceeds its read-only limit");
+  if (read.intents.length > PUBLISH_LIST_CAP) throw new Error("The screen projection exceeds its read-only limit");
   const uses = new Map<string, number>();
   for (const intent of read.intents) uses.set(intent.intent_id, (uses.get(intent.intent_id) ?? 0) + 1);
   const rows: ScreenIntent[] = [];
@@ -40,7 +40,7 @@ function scopedIntents(read: IntentRead | undefined, installId: string, contextI
       run_id: intent.run_id, effect_id: intent.effect_id, state: intent.state, channel: intent.channel,
       destination_id: intent.destination_id, due_epoch: intent.due_epoch, timezone: intent.timezone });
   }
-  return { status: read.intents.length >= INTENT_ROWS_MAX ? "truncated" : "ok",
+  return { status: read.intents.length >= PUBLISH_LIST_CAP ? "truncated" : "ok",
     withheld: read.intents.length - rows.length, rows };
 }
 

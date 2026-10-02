@@ -1,4 +1,6 @@
 import { screenProjection, screenTag } from "../src/features/workspace-apps/screen/screenProjection";
+import type { PublishIntent } from "../src/features/workspace-apps/socialPublish";
+import { legacyPush } from "../src/features/workspace-apps/screen/screenProtocol";
 import type { Installation, AppContext, WorkspaceRun, AppEffect } from "../src/features/workspace-apps/workspaceApps";
 function check(value: unknown, message: string) { if (!value) throw new Error(message); }
 const installation = { install_id: "our", digest: "sha256:a", name: "portable", title: "App", version: "1", summary: "summary", files: ["screens/main/screens.json"], approved: true, executable: true } as Installation;
@@ -22,8 +24,6 @@ try { screenProjection(installation, "main", "brand", [context], Array.from({len
 check(refused, "aggregate message size fails closed before transfer");
 
 // CAD-1025 publish-intents.v1: same-scope verified intents only, bounded, no secrets.
-import type { PublishIntent } from "../src/features/workspace-apps/socialPublish";
-import { legacyPush } from "../src/features/workspace-apps/screen/screenProtocol";
 const intent = (over: Partial<PublishIntent>): PublishIntent => ({ intent_id: "i1", install_id: "our", context_id: "brand",
   run_id: "run", effect_id: "effect", state: "queued", channel: "instagram", destination_id: "dest-a", caption_digest: "c".repeat(64),
   image_digest: null, frozen_digest: "f".repeat(64), idempotency_key: "PRIVATE KEY", due_epoch: 1_790_000_000,

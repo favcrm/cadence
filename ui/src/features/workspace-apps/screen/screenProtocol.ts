@@ -55,8 +55,6 @@ export type ChildToHost =
  *  `{v:1, op:"ready", accepts:["publish-intents.v1"]}`; a child that sends
  *  the bare `ready` keeps receiving the exact CAD-1006 v1 shape. */
 export const PUBLISH_INTENTS_V1 = "publish-intents.v1";
-/** Mirrors the daemon list cap (`ScheduleCalendar` LIST_CAP). */
-export const INTENT_ROWS_MAX = 100;
 
 /** One verified publish intent, read-only. Every field is required; there is
  *  no grant, approval, idempotency key, receipt, upstream evidence, caption or
