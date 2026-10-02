@@ -1,276 +1,229 @@
 # Design contract: CAD-1019 remote CLI — login maps the org; allowlisted commands on the remote daemon
 
 Phase-1 contract for the remote CLI transport. No implementation is in this
-PR. Authority chain: `cadence login` device grant (CAD-539) → org registry
-record (CAD-657) → remote command transport over the board host (this
-contract). CAD-913 (wiki) is the intended second consumer of the same
-transport, not a parallel one.
+PR. Revised per PM direction: login rides the **hosted-cadence device grant**
+(`hcd_`/`hct_`, the AOS-76 owner-consent flow already implemented in
+`src/remote_enrollment.rs`), and remote calls go through AOS-128's
+`POST /__platform/cli/call` — the generalization of AOS-122's
+`/__platform/wiki/{authorize,call}` envelope proxy. CAD-913 (wiki) shares this
+transport rather than duplicating it.
 
-## Evidence answers to the phase-1 questions
+## Evidence answers to the phase-1 questions (revised)
 
-**Q1 — can the CLI reuse the board's device sign-in?** The board routes
-`POST /api/session/device/{code,poll}` (`src/ui/operator.rs`, WRITE_ROUTES at
-`src/ui/operator.rs:352-353`; handlers `device_code` at `:1445` and
-`device_poll` at `:1541`) are deliberately *not* reusable by a non-browser CLI:
-`device_origin` (`operator.rs:1390`) refuses `Origin::Public`, so the routes
-never serve on `<slug>.cadencecloud.app`; `device_attribution`
-(`operator.rs:1414`) runs process attribution on the TCP peer and refuses any
-caller it cannot attribute, which a remote client can never satisfy; and the
-result is a cookie + `X-Cadence-Session` page key meant for a same-origin
-browser. The reusable piece is the *issuer-side* flow, already implemented
-twice for two surfaces (`src/remote_auth.rs` for `cadence login`,
-`src/device_login.rs` for the board): `POST /v1/device/code`,
-`POST /v1/device/token` (RFC 8628 flat shape), `GET /v1/runtime/session`
-bearer verify — all on AgenticOS `origin/main`
-(`apps/api/src/index.ts:236-237` mounts `createDeviceGrantRoutes` /
-`createRuntimeRoutes`; `apps/api/src/device.ts:725`+ implements
-`/v1/runtime/session`). `DEVICE_GRANT_ENABLED` gates the routes
-(`device.ts:140`, flag at `apps/api/src/env.ts:226`); staging/prod switch-on
-is the AOS dependency, not new code.
+**Q1 — which sign-in does the CLI reuse?** Not the board's
+`/api/session/device/*` routes (they refuse `Origin::Public` at
+`src/ui/operator.rs:1390` and run `/proc` peer attribution at `:1414` — a
+remote caller can never satisfy either). And not the plain `agc_` tools grant:
+the PM direction and the AOS-122 precedent both point to the **hosted-cadence
+device grant** — `POST /v1/hosted-cadence/device/{code,token}` with PKCE,
+owner-only approval, minting an `hct_` bridge credential
+(`apps/api/src/hosted-cadence/device.ts`, on `origin/cadence/aos-122-wiki-authority`
+head `62f6ad0`; Cadence's client already exists as
+`src/remote_enrollment.rs::enroll_browser`, `:1136`). Login no longer means
+the 30-day `agc_` contract; see "Credential lifetime" below.
 
-**Q2 — does the ingress admit a non-browser client?** Partially, and that is
-the design hinge. On `*.cadencecloud.app` the worker's catch-all
-(`apps/api/src/board/routes.ts` final `app.all("*")`) forwards **only**
-requests carrying a `__Host-aos-board-session` cookie; anything else gets a
-`302` to `/v2/board/authorize`, which requires a better-auth *browser*
-session and answers `403` HTML to non-members — a non-browser bearer client
-cannot pass. `POST /__platform/session` is the only non-cookie admission, and
-it demands a platform-signed Ed25519 assertion (`aud` = board host, `exp ≤
-iat+60s`, single-use `jti`); the AOS-49 `agc_` device credential is **not** an
-assertion and mints nothing today — no route on AOS `main` turns `agc_` into a
-board assertion (`git grep mintBoardAssertion` shows only
-`board/routes.ts` `boardAuthorize`). Forwarded traffic is constrainted by the
-relay: only `RELAY_FORWARD_HEADERS` survive — which **includes
-`authorization`, `cookie`, `x-cadence-session`, `x-cadence-board`, `origin`**
-(`apps/api/src/board/relay-proof.ts:5-18`, mirrored in
-`infra/runtime-image/board-relay.mjs:5-18`) — plus a 16 MiB body cap
-(`relay-proof.ts:25`) and a per-request signed relay proof bound to
-method+target+headers+body (`board-relay.mjs:120-160`). No Cloudflare Access
-gate exists on board hosts in the inspected tree (`git grep CF-Access` on
-`origin/main` is empty); CAD-729's opt-in `access-issuer.json` speaks only to
-the *issuer* origin. So: a bearer-token CLI needs **one new board-host
-admission route** on the AOS worker; everything after the cookie check
-(transport of `Authorization`, the body cap, the container relay) already
-works.
+**Q2 — does the ingress admit a non-browser client?** Yes for the new shape.
+AOS-122 adds board-host routes that never consult the cookie:
+`POST /__platform/wiki/authorize` (bridge bearer → signed `wikienv_` actor
+envelope) and `POST /__platform/wiki/call` (envelope + still-live bearer →
+forward to `/api/wiki/<action>` inside the awake container)
+— `apps/api/src/board/routes.ts` on the AOS-122 branch, `:1245-1400`. AOS-128
+generalizes the second hop to `/__platform/cli/call` carrying a **cli actor
+envelope** and a verb name; no feature flag. The worker performs auth *before*
+any runtime resolution (`checkWikiCall` model,
+`hosted-cadence/wiki.ts:439-560`): signature vs `loadBoardKeys`, `aud` =
+public board host, `organization_id` = the slug's workspace, the action
+inside granted scopes, and the presenting bearer still resolving to the exact
+issuing credential — so a revoked or sibling credential never reaches a
+container. The container relay already forwards `authorization` and caps
+bodies at 16 MiB (`board/relay-proof.ts:5-25`). Wake semantics change: the
+wiki `/call` is awake-only (`runtime_unavailable` 503 otherwise); the PM
+notes AOS-128 specifies a `503` + `Retry-After` *waking* reply the CLI waits
+on — details land with AOS-128.
 
-**Q3 — do the board HTTP APIs cover the launch verbs?** Coverage is partial
-and the shapes differ, so a CLI↔board adapter is needed anyway:
+**Q3 — do the board HTTP APIs cover the launch verbs?** Same answer as
+before, and the transport now absorbs it: verbs map to a `cli.call`-style
+server dispatch, not per-verb REST. The verb table (server-side, inside the
+container) names each allowed command and maps it to the read-model or
+daemon-RPC call the local CLI would make (`issue ls` is a tracker read —
+`src/issue/cli.rs:682` opens `Pm::open_default` — so the remote equivalent is
+the board read-model's board slice, `serve.rs:1180`; `agent list` →
+`GET /api/agents` data, `serve.rs:1244`; writes like `issue new`/`comment`
+→ the existing `AgentAllowed` routes' handlers, `operator.rs:216-225`).
 
-| CLI verb | Board route today | Caller rule today |
-|---|---|---|
-| `issue ls` | `GET /api/issues` (query filters, `serve.rs:1180`+) | any session |
-| `issue show` | `GET /api/issues/<id>` (`serve.rs:1570`+ `strip_prefix`) | any session |
-| `issue new` | `POST /api/issues` | `AgentAllowed` (`operator.rs:216`) |
-| `issue comment` | `POST /api/issues/*/comments` | `AgentAllowed` (`operator.rs:224`) |
-| `message send` | `POST /api/threads/*/messages` | `OperatorOnly` (`operator.rs:244`) — semantics differ from the daemon's `message_send` |
-| `message inbox` | none | — |
-| `agent list` | `GET /api/agents` (`serve.rs:1244`) | any session |
+**Q4 — login→org mapping.** The hosted device grant pins `organization_id`,
+`organization_slug` and `audience` (the board origin) server-side at approve
+time (`hosted-cadence/device.ts:300-330` — the bridge insert joins
+`workspaces.slug` and refuses a mismatch). `cadence login` therefore records
+into CAD-657's registry (`src/cli/org.rs` `Destination::Remote{endpoint,
+org_id}`, inert until this work): `org_id = organization_id`,
+`endpoint = <audience>` (which is `https://<slug>.cadencecloud.app`), plus
+the enrollment record reference. The slug comes only from the issuer's grant,
+never derived from `org_id` — same rule as `platform_account.rs`. Select as
+default only when none exists or `--use` is passed.
 
-Two gaps matter: several CLI verbs are tracker-file operations (`issue ls`
-reads `board::load_all` on `Pm::open_default()` — `src/issue/cli.rs:682`,
-`src/issue/mod.rs:204`), not daemon RPCs, so "remote `issue ls`" needs a
-server-side read the board read-model already computes; and `message
-send`/`agent` verbs have no one-to-one board route. Rather than teach the CLI
-two protocols (board REST + local RPC), the transport is a single
-allowlisted **CLI-command relay** (§Invariants): the board answers a new
-family of routes that map each allowlisted verb to exactly the read-model or
-daemon-RPC call the local CLI would make, reusing the existing caller classes
-as the gate.
+## Credential lifetime (revised — load-bearing)
 
-**Q4 — login→org mapping.** `GET /v1/runtime/session` on AOS `main` returns
-`data.workspace` via `toWireWorkspace` (`apps/api/src/workspace.ts:65-70`),
-which includes **`slug`**. `cadence login` therefore records, per org:
-`org_id = workspace.id`, `endpoint = https://<slug>.cadencecloud.app`,
-issuer, credential reference, subject id. It writes into CAD-657's
-`Registry`/`Connection` model (PR #415, head
-`5e5a4c6a26ecc68de1719a77320868c04c20219c`: `src/cli/org.rs` —
-`Destination::Remote{endpoint, org_id}` already exists and is deliberately
-inert) — **no second registry**. `org switch`/`--org`/`CADENCE_ORG`
-precedence and the "remote fails before local fallback" refusal are already
-shaped in `org.rs::select`/`resolve`; this contract adds the remote arm to
-`resolve`. Default selection rule from the ticket: select on login only when
-no default exists or `--use` is passed; a second workspace login adds an org
-without moving the default.
+The browser-minted `hct_` bridge expires at `min(now + 300s, owner-session
+expiry)` (`hosted-cadence/device.ts:288-296`) and `enroll_browser`'s child
+inherits that bound — a 5-minute credential cannot serve a persistent CLI
+login. Two consequences:
+
+- **The stored credential is the cli envelope chain, not the bridge.** Login
+  = `hcd_` device grant → `hct_` bridge → enroll a `cli`-client child (the
+  `enroll` step `remote_enrollment.rs` already runs for the result sender,
+  with `requested_capabilities` = the CLI set) → each remote call mints a
+  ≤300 s `cli actor envelope` at `/__platform/cli/authorize`. What persists
+  locally is the enrollment record (`remote_enrollment.rs`'s `Sealed`
+  hygiene: 0700 dir, 0600 record, checksum, lock). When the bridge expires,
+  CLI commands fail with "re-login" — renewal is CAD-740's scope, and this
+  contract does not extend the bridge TTL.
+- **That expiry is a design risk to flag in review**: 5-minute login means
+  remote CLI is effectively per-operation unless AOS-128 also defines a
+  longer-lived grant for interactive use (a "cli session" capability or a
+  longer bridge TTL under the owner session's bound). The contract holds
+  either way; the acceptance smoke test will pin which.
 
 ## Invariants
 
-- I1: A remote command carries exactly one credential — the stored `agc_`
-  device bearer for the resolved org — to exactly one destination:
-  `https://<workspace.slug>.cadencecloud.app`, the slug taken verbatim from
-  the issuer's `/v1/runtime/session` answer at login. The slug is never
-  derived from `workspace.id`, never read from a redirect `Location`, and
-  never recomputed per request.
-- I2: The remote surface is a verb allowlist, not an RPC tunnel. The server
-  side dispatches only the named verbs; anything else — including every
-  operator-only daemon verb — is refused remotely with the same refusal the
-  daemon gives, and no request field names a caller, org, or destination.
-- I3: No fallback. Wrong audience, expired/revoked token, unknown org, a
-  redirect, an unavailable remote, or a refused verb ends the command with an
-  error; it never silently re-resolves to local or another org.
-- I4: Destination resolution is pinned once per command. `org switch` during
-  a running command cannot move it; `CADENCE_ALIAS`-bound managed callers
-  keep CAD-657's rule (inherited pins win; `--org` conflicts, never
-  overrides).
-- I5: Login never changes an existing default org without `--use`, and
-  refuses to overwrite a stored credential for a different issuer/org
-  (existing `remote_auth::save` rule).
-- I6: Status/inspect output shows org, endpoint, mode and credential
-  presence — never token material.
-
-## Chosen transport
-
-**Reuse the board session + board API, minus the cookie.** The AOS-49 device
-credential already carries `read draft` scopes and workspace binding; what it
-lacks is admission to the board host. One new worker route admits it:
-
-- `POST https://<slug>.cadencecloud.app/__platform/cli/session` — body
-  `{agc_token}` is wrong; instead the **token travels as
-  `Authorization: Bearer <agc_>`** (the relay already forwards that header),
-  the worker resolves slug → workspace, verifies the `agc_` against the
-  issuer's `/v1/runtime/session` equivalent check *inside the API worker*
-  (it owns D1 — `resolveDeviceCredential` in `apps/api/src/device.ts:96`
-  already maps bearer → `{userId, workspaceId, scopes}`), binds
-  `workspaceId == slug's workspace`, requires `read` scope, mints a
-  **short-lived CLI session** (server-side row, e.g. 12 h idle / 24 h
-  absolute like `REMOTE_*` in `device_login.rs:26-28`), and returns it as a
-  JSON body field (not `Set-Cookie` — the worker's outbound filter drops
-  non-`__Host-` cookies, and a CLI holding a JSON token is simpler than
-  faking cookie semantics). Alternatively the mint happens inside the
-  container; see AOS asks below — the contract only fixes that the token is
-  verified by the API worker's own store, scoped to the slug's workspace, and
-  never forwarded elsewhere.
-- Every subsequent CLI call:
-  `POST https://<slug>.cadencecloud.app/__platform/cli/v1/<verb>` with
-  `Authorization: Bearer <cli-session>` (or, per implementation choice, the
-  `agc_` re-verified per call — trading session state for verification cost;
-  decide in review). The worker checks the CLI session's workspace binding
-  against the slug and forwards. Cadence's board then authenticates the
-  request **without** a cookie on a dedicated `Origin::PublicCli`-style
-  origin arm, attributes it to the named principal (a `Caller::Named`
-  variant), and applies the allowlist below.
-
-Why not reuse `/__platform/session` assertions: the assertion mint lives on
-the app origin behind a browser session; minting assertions for a device
-credential would need a new mint anyway, plus JWKS handling for a 60-second
-credential on every CLI call — strictly more machinery for the same binding.
-
-Why not a cookie session: the device-*board* routes refuse `Origin::Public`
-by construction, and correctly so — they mint operator-class cookies gated
-by local attribution. The remote CLI session is a `Named`-class credential
-(member/owner role from the issuer), never the operator loopback session.
+- I1: A remote command carries exactly one credential — the cli actor
+  envelope (plus its `hct_` issuer underneath, sent as the call's bearer per
+  the AOS-122 revalidation pattern) — to exactly one destination: the
+  `audience`/endpoint the issuer recorded at login. The host is never
+  derived from `org_id`, never taken from a redirect `Location`, never
+  recomputed per request.
+- I2: `/__platform/cli/call` is a verb allowlist, not an RPC tunnel. The
+  worker refuses a verb outside the granted capabilities before resolving a
+  runtime; Cadence's handler refuses anything its table doesn't name; no
+  request field names a caller, org or destination (forbidden-field refusal,
+  the `checkWikiCall` `forbidden` list pattern at `wiki.ts:478`).
+- I3: No fallback. Wrong audience, expired/revoked credential, wrong-org
+  envelope, a redirect, an unavailable or waking remote, or a refused verb
+  ends the command with an error; it never re-resolves to local or another
+  org. A `503` waking reply with `Retry-After` is waited on per AOS-128's
+  rule — bounded, counted, and still fails closed after the bound.
+- I4: Destination resolution is pinned once per command; `org switch` during
+  a running command cannot move it; `CADENCE_ALIAS`-bound callers keep
+  CAD-657's rule (inherited pins win; `--org` conflicts, never overrides).
+- I5: Login never changes an existing default org without `--use`; a second
+  workspace login adds an org and leaves the default untouched; concurrent
+  logins for different orgs cannot clobber each other's records (existing
+  `enrollment.lock` + registry lock).
+- I6: Status/inspect show org, endpoint, mode, enrollment expiry and login
+  state — never `hcd_`/`hct_`/envelope material.
 
 ## Verb allowlist (v1)
 
 Reads: `issue ls`, `issue show`, `issue history`, `agent list`,
 `agent show`, `message read`, `message inbox`, `team list`, `status`.
-Writes: `issue new`, `issue comment`, `issue set` (fields only — no
-`start`, no `dispatch`), `message send` (to a named alias; lands as a
-`Named` caller, so an agent recipient sees a member, not "operator").
+Writes: `issue new`, `issue comment`, `issue set` (fields only), and
+`message send` (to a named alias — lands as the cli actor's derived handle,
+never "operator").
 
-Refused remotely (non-exhaustive, default-deny): every operator-only daemon
-verb (`agent join/stop/resume`, `daemon *`, `operator_*`, `rollout`,
-`master/*` decisions, `approve`, `merge`, `secrets`), every verb that names
-a local path (`issue init`, `attach`, wiki `put` under CAD-913's separate
-chunked contract), and `issue start`/`dispatch` (they mint worktrees and
-claim ownership — local-machine semantics). Operator-only verbs reachable in
-v2 need the remote operator proof designed with CAD-657's source-authority
-decision — out of scope here.
+Refused remotely (default-deny): every operator-only daemon verb
+(`agent join/stop/resume`, `daemon *`, `operator_*`, `rollout`, `master/*`,
+`approve`, `merge`, secrets), verbs naming local paths (`issue init`,
+`attach`, chunked wiki `put` — CAD-913's own envelope contract), and
+`issue start`/`dispatch` (worktree + ownership semantics are local).
+Operator-only verbs need the remote operator proof tied to CAD-657's
+source-authority decision — out of scope for v1.
 
 ## Auth chain
 
-`cadence login --issuer <api-origin>` (existing `remote_auth`) → device grant
-→ `agc_` + `/v1/runtime/session` → record `{org_id: workspace.id, slug:
-workspace.slug, endpoint: https://<slug>.cadencecloud.app}` in the CAD-657
-registry + credential in the existing `credential.json` hygiene (0600, dir
-0700, no symlink, per-org file or keyed record). Remote call: resolve org →
-load credential → `POST /__platform/cli/session` (bearer `agc_`) if no live
-CLI session → `POST /__platform/cli/v1/<verb>` (bearer CLI session) → Cadence
-board admits on a new origin arm → handler runs the verb's existing
-daemon-RPC/read-model path with `Caller::Named`. Every refusal is a fixed
-string; issuer bodies and tokens are never echoed anywhere (existing
-`remote_auth`/`device_login` rule).
+`cadence login --issuer <api-origin> --org <workspace-id>` →
+`/v1/hosted-cadence/device/code` (PKCE, `requested_capabilities` = the CLI
+set) → owner approves on the app → `/v1/hosted-cadence/device/token` → `hct_`
+bridge + minted cli-actor enrollment record (locally sealed) → each command:
+`POST https://<slug>.cadencecloud.app/__platform/cli/authorize` (bridge
+bearer → envelope, ≤300 s, `aud` = board host, `organization_id` = slug's
+workspace) → `POST …/__platform/cli/call` `{envelope, verb, arguments}`
+with the same bearer → worker verifies signature + live credential rebind +
+verb scope, wakes/peeks runtime per AOS-128, forwards the allowlisted verb to
+the container's `/api/cli/<verb>` (or equivalent dispatch) with the envelope
+as bearer → Cadence re-verifies the envelope (JWKS via the configured
+issuer), derives the named actor, runs the verb's existing daemon/read-model
+call, refuses operator-class work. `Set-Cookie` plays no part; the relay's
+header allowlist already passes `authorization`.
 
 ## Refusal cases (acceptance-bound)
 
-- Token for workspace A sent to B's host: worker binds bearer → workspaceId ≠
-  slug's workspace → 403, no forward.
-- Wrong audience/revoked/expired `agc_`: session mint refused 401/403; an
-  expired *stored* credential fails before any request
-  (`remote_auth::status`-style check) with a re-login pointer.
-- Redirect (3xx) anywhere in the chain: refused; the client follows none
-  (existing `max_redirects(0)` + explicit 3xx refusal).
-- Unavailable remote / unknown slug / sleeping container that the route
-  cannot wake: bounded-timeout error; **no** local fallback (I3). Note for
-  implementation: the CLI route needs a wake rule — either reuse
-  `wakeBoardRuntime` on a verified credential, or document that the remote
-  CLI requires an awake board (container cold-start latency is a UX cost,
-  not a security decision — flag for review).
-- Verb not on the allowlist: `404`/`403` fixed refusal, server-side, before
-  dispatch — a forged `verb` field or a path smuggle (`<verb>` containing
-  `/`, `%2f`, `..`) fails routing.
-- Agent-tied or unattributable TCP peer at the board: existing attribution
-  keeps running *under* the new origin arm — a CLI session cannot launder an
-  agent's writes into `Named` (the session header is checked only after
-  attribution, and an agent peer presenting one is refused
-  `session_from_agent`, same as today).
+- Envelope for workspace A at B's host: `aud`/org mismatch fails the
+  worker's `checkWikiCall`-equivalent **and** the container's own verify —
+  two independent gates, no forward.
+- Revoked/rotated/expired `hct_`: the worker's live rebind (`resolveBearer`)
+  refuses before wake; a stolen envelope alone is useless because its
+  `credential_id` no longer resolves.
+- Redirects: none followed; the CLI's ureq agent keeps `max_redirects(0)`
+  and treats 3xx as failure (existing `remote_auth`/`remote_enrollment`
+  rule).
+- Unavailable remote, unknown slug, `runtime_unavailable` past the
+  `Retry-After` bound: fixed-string error, no local fallback (I3).
+- Unallowlisted verb, or a verb field carrying `/`, `%2f`, `..`, or a
+  forbidden identity key: refused at the schema before any runtime touch.
+- Agent-tied TCP peer presenting a cli session at the board: refused —
+  attribution still runs under the new arm; the envelope names a principal,
+  and a pane's socket identity can't mint one (container-side check).
 
-## What AgenticOS must change (AOS ticket to file)
+## What AgenticOS must change (AOS-128)
 
-1. `POST /__platform/cli/session` on board hosts: verify
-   `Authorization: Bearer <agc_>` via `resolveDeviceCredential`, require
-   `read` scope and `principal.workspaceId == workspaceIdForSlug(host)`,
-   throttle like the device endpoints, mint/return a bounded CLI session
-   (or forward a verified request to the container mint — either side, but
-   the *worker* must reject cross-workspace tokens itself so a wrong-host
-   token never reaches a container).
-2. Admit `/__platform/cli/*` in the board-host dispatcher for requests
-   carrying that CLI session (a `Cookie`-free path, so `hasBoardSession`
-   stays untouched); forwarded requests keep the relay header allowlist —
-   `authorization` already passes.
-3. Production/staging switch-on of `DEVICE_GRANT_ENABLED` (flag exists).
-4. Document the CLI surface's wake policy (see open question above).
+1. `POST /__platform/cli/authorize` on board hosts — `hct_`/`hcs_` bridge
+   bearer → signed cli actor envelope; same verify-then-mint shape as
+   `wiki/authorize` (`resolveWikiBearer` → `authorizeWikiActor`), with a
+   `cli.*` capability vocabulary instead of `wiki.*` prefixes.
+2. `POST /__platform/cli/call` — envelope + verb + arguments; live bearer
+   rebind; verb allowlist enforced before runtime resolution; forwards to
+   the container's CLI dispatch (new Cadence-side route family, its own
+   handler — not the wiki one). No feature flag per the PM note.
+3. Wake semantics: `503` + `Retry-After` on a sleeping-but-wakeable runtime;
+   the exact envelope/wait contract lands with AOS-128 (PM note). The
+   cookie catch-all is untouched.
+4. Production switch-on of the hosted-cadence device grant flags
+   (`HOSTED_CADENCE_DEVICE_ENABLED`, `HOSTED_CADENCE_GATEWAY_ENABLED` —
+   `hosted-cadence/device.ts:174-185`) and the CLI capability vocabulary in
+   `HOSTED_CADENCE_CAPABILITIES` (`contracts/src/hosted-cadence-auth.ts:7-18`).
 
 ## Adversarial tests
 
 | Test name | Proves | Guard | Fails without the guard because |
 |---|---|---|---|
-| `remote_verb_allowlist_refuses_unlisted` | I2 | server-side verb table | a forged `verb=shutdown`/`operator_secret_rotate` dispatches |
-| `remote_agent_caller_cannot_mint_or_use_cli_session` | I2 | attribution before session check | an agent peer's writes land as `Named` |
-| `remote_detached_child_no_ambient_authority` | I4 | caller binding from connection, not env | a `setsid` child inherits a pin it never had |
-| `cross_workspace_token_refused` | I1 | worker slug↔workspace bind | workspace-A token reads B's board |
-| `redirect_never_followed_token_never_forwarded` | I3 | `max_redirects(0)` + 3xx refusal | bearer rides to `Location` host |
-| `unavailable_remote_no_local_fallback` | I3 | resolve-once + explicit error | command silently opens the local tracker |
-| `second_login_keeps_default` | I5 | select-once rule | workspace B login moves the default |
-| `default_switch_mid_command_noop` | I4 | pinned destination per invocation | `org switch` mid-`message send` reroutes the send |
-| `forged_session_field_refused` | I2 | `deny_unknown_fields`/verb schema | a body field names org/caller/destination |
-| `concurrent_logins_different_orgs_keep_both` | I5 | existing credential lock + registry lock | one login clobbers the other |
+| `cli_verb_allowlist_refuses_unlisted` | I2 | server verb table | `verb=shutdown`/`operator_secret_rotate` dispatches |
+| `cli_envelope_cross_workspace_refused` | I1 | `aud`/org check at worker AND container | A's envelope reads B's board |
+| `cli_revoked_bridge_kills_envelope` | I3 | live bearer rebind at call | a stolen envelope outlives its credential |
+| `cli_redirect_never_followed` | I3 | `max_redirects(0)` + 3xx refusal | bearer rides to `Location` |
+| `cli_unavailable_no_local_fallback` | I3 | resolve-once + error | command opens the local tracker instead |
+| `cli_second_login_keeps_default` | I5 | select-once rule | workspace B login moves the default |
+| `cli_switch_mid_command_noop` | I4 | pinned destination per invocation | `org switch` mid-send reroutes it |
+| `cli_forged_verb_field_refused` | I2 | strict schema + forbidden keys | a body field names actor/org/destination |
+| `cli_agent_peer_cannot_mint` | I2 | container-side attribution | a pane's socket identity mints a `Named` call |
+| `cli_concurrent_logins_keep_both_orgs` | I5 | enrollment + registry locks | one login clobbers the other's record |
+| `cli_waking_respects_retry_after_bound` | I3 | bounded wait, counted retries | a sleeping remote hangs or spins forever |
 
 ## Live probes this design still needs (none taken)
 
-Phase 1 was code-reading only — no requests were made to any live or staging
-host (`demo-company.cadencecloud.app`, tailnet 9460/9461, CDP 9222 are owned
-elsewhere). The contract rests on static evidence; the following live probes
-remain unverified and are listed for the PM to arrange ownership:
+Phase 1 was code-reading only — no requests to any live or staging host
+(`demo-company.cadencecloud.app`, tailnet 9460/9461, CDP 9222 are owned
+elsewhere). Unverified, listed for PM-arranged ownership:
 
-- `GET {issuer}/.well-known/agenticos-board-jwks.json` reachable from a CLI
-  network — the contract assumes the JWKS endpoint is public per contract §6,
-  unverified against the deployed worker.
-- `DEVICE_GRANT_ENABLED` state on staging/prod — code shows the flag gates
-  `/v1/device/*` and `/v1/runtime/*`; the deployed value was not probed.
-- Whether a board-host request carrying `Authorization` but no cookie is
-  answered by the worker's redirect without touching the container — inferred
-  from `hasBoardSession` in `app.all("*")`; a probe would confirm no edge
-  rule (e.g. Cloudflare config outside the repo) alters it.
-- `POST /__platform/cli/session` end-to-end mint — cannot exist until the AOS
-  change lands; the acceptance smoke test is that probe, deferred to
+- `HOSTED_CADENCE_DEVICE_ENABLED`/`HOSTED_CADENCE_GATEWAY_ENABLED` state on
+  staging — flag-gated routes; deployed values not probed.
+- `GET {issuer}/.well-known/agenticos-board-jwks.json` reachability for the
+  container-side envelope verify (AOS-122's `WIKI_ACTOR_JWKS_PATH` pattern —
+  hosted deployments resolve `http://api.internal` internally; the public
+  path is an alias).
+- Whether AOS-128's `cli/call` wakes on a sleeping runtime (PM note says
+  503 + `Retry-After`) vs the wiki contract's refuse — read only; the smoke
+  test exercises it.
+- `POST /__platform/cli/{authorize,call}` end-to-end — cannot exist until
+  AOS-128 lands; the acceptance smoke test is that probe, deferred to
   implementation and a designated staging slot.
-- Redirect behaviour of the board host on expired/missing session (302 →
-  authorize) — read from code, not exercised.
+- Envelope TTL/refresh behavior on a real bridge — confirmed ≤300 s in code;
+  no live check.
 
 ## Out of scope
 
-Renewal (CAD-740), multi-org UX beyond CAD-657, operator-only verbs over the
-remote path, generic RPC passthrough (CAD-913's stance kept), wiki chunking
-(CAD-913 itself), container wake policy details (flagged above),
-`DEVICE_GRANT_ENABLED` rollout approval (AOS-side ops decision), and all live
-probing (listed above for PM-arranged ownership).
+Renewal and any bridge-TTL extension (CAD-740 / an AOS decision — the
+5-minute login bound is flagged above as the design risk review must weigh),
+multi-org UX beyond CAD-657, operator-only verbs over the remote path,
+generic RPC passthrough (CAD-913's stance kept), the wiki actions themselves
+(CAD-913), container-side CLI dispatch internals (phase 2), all live probing
+(above).
