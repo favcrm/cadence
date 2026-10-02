@@ -83,7 +83,13 @@ mod seal;
 pub(crate) use schema::open_read_only;
 pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
 pub use seal::OpenMode;
-pub(crate) use seal::{preflight_writer_guard, StoreConn, WriteTxn};
+// `WriteTxn` is `pub` so the `ShutdownEntriesHook` test seam (a `pub`
+// `ServeOptions` field) can name it — it is an opaque facade to external
+// callers: every method is `pub(crate)` except the read/DML verbs
+// `execute`/`execute_batch`/`query_row`/`query_map` a hook legitimately
+// needs, and there is no `commit`/`rollback`/`Connection` escape.
+pub use seal::WriteTxn;
+pub(crate) use seal::{preflight_writer_guard, StoreConn};
 #[cfg(test)]
 mod tests;
 
@@ -154,9 +160,10 @@ pub struct Store {
 /// attempt's live transaction; the hook may write through it or return
 /// a synthetic sqlite error, so rollback, retry bound and
 /// retryable-classification are provable without wedging the store.
-// The test-seam hook type — `pub(crate)` (not `pub`) so it does not
-// leak the crate-internal `WriteTxn` facade into the public surface.
-pub(crate) type ShutdownEntriesHook =
+// The test-seam hook type. `WriteTxn` is `pub` but opaque — every
+// method on it is `pub(crate)`, so the public facade exposes nothing
+// usable (no prepare/execute/Connection escape) to an outside caller.
+pub type ShutdownEntriesHook =
     Arc<dyn Fn(&WriteTxn<'_>) -> rusqlite::Result<()> + Send + Sync>;
 
 /// Terminal task states — verdicts/acceptance/cancellation are closed
@@ -193,7 +200,12 @@ impl Store {
     /// `Transaction` rolls back on drop — so recover the guard, clear
     /// the poison, roll back anything a raw `BEGIN` left open, and
     /// record one `store_poisoned` event on the daemon stream.
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    ///
+    /// The returned guard is DISARMED — the authorizer denies every
+    /// write/DML/DDL/tx-boundary it attempts, so test/fixture read
+    /// probes (`s.conn().query_row`) are safe: this is a read surface,
+    /// never a producer path.
+    pub(super) fn conn(&self) -> MutexGuard<'_, Connection> {
         match self.conn.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {

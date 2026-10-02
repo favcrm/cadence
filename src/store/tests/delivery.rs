@@ -43,28 +43,28 @@
         // the adjacent f64 when it is serialized and parsed again. Recreate
         // that harmless presentation drift in the queued binding; the exact
         // created_bits proof must still admit the original recipient.
-        let (seq, payload): (i64, String) = {
-            let conn = s.fixture_conn().unwrap();
-            conn.query_row(
-                "SELECT seq,payload FROM events
-                 WHERE alias='w1' AND kind='queued' ORDER BY seq DESC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap()
-        };
+        let (seq, payload): (i64, String) = s
+            .fixture_write(|conn| {
+                conn.query_row(
+                    "SELECT seq,payload FROM events
+                     WHERE alias='w1' AND kind='queued' ORDER BY seq DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
         let mut payload: Value = serde_json::from_str(&payload).unwrap();
         let created = payload["recipient_identity"]["created"].as_f64().unwrap();
         payload["recipient_identity"]["created"] =
             json!(f64::from_bits(created.to_bits().wrapping_add(1)));
-        {
-            let conn = s.fixture_conn().unwrap();
+        s.fixture_write(|conn| {
             conn.execute(
                 "UPDATE events SET payload=? WHERE seq=?",
                 rusqlite::params![payload.to_string(), seq],
             )
-            .unwrap();
-        }
+            .map(|_| ())
+        })
+        .unwrap();
 
         let m = match s.take_queued("w1").unwrap() {
             Take::Message(m) => m,
@@ -754,17 +754,16 @@
             s.fixture_write(|c| c.execute("UPDATE messages SET state=? WHERE id=?", params![state, id])
                 .map_err(Into::into)).unwrap();
         }
-        let c = s.fixture_conn().unwrap();
-        c.execute("UPDATE agents SET enabled=1 WHERE alias='enabled'", [])
-            .unwrap();
-        c.execute(
-            "UPDATE agents SET updated=? WHERE alias='young'",
-            params![now() - 2.0 * 86_400.0],
-        )
+        s.fixture_write(|c| {
+            c.execute("UPDATE agents SET enabled=1 WHERE alias='enabled'", [])?;
+            c.execute(
+                "UPDATE agents SET updated=? WHERE alias='young'",
+                params![now() - 2.0 * 86_400.0],
+            )?;
+            c.execute("UPDATE agents SET endpoint='sock' WHERE alias='live'", [])?;
+            Ok(())
+        })
         .unwrap();
-        c.execute("UPDATE agents SET endpoint='sock' WHERE alias='live'", [])
-            .unwrap();
-        drop(c);
 
         let mut removed = Vec::new();
         for agent in s.gc_candidates(Some(week)).unwrap() {

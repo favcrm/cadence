@@ -71,22 +71,20 @@ fn approval<'a>(id: &'a str, source: &'a str, head: &'a str, pr: u64) -> NewAppr
 
 /// `(kind, approval_id)` rows on the approval stream, in order.
 fn approval_rows(s: &Store) -> Vec<(String, String)> {
-    let conn = s.fixture_conn().unwrap();
-    let mut stmt = conn
-        .prepare("SELECT kind, payload FROM events WHERE alias=? ORDER BY seq")
-        .unwrap();
-    let rows = stmt
-        .query_map([APPROVAL_STREAM], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })
-        .unwrap()
-        .map(|r| {
-            let (kind, raw) = r.unwrap();
-            let v: Value = serde_json::from_str(&raw).unwrap();
-            (kind, v["approval_id"].as_str().unwrap().to_string())
-        })
-        .collect();
-    rows
+    s.fixture_write(|conn| {
+        conn.query_map(
+            "SELECT kind, payload FROM events WHERE alias=? ORDER BY seq",
+            [APPROVAL_STREAM],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+    })
+    .unwrap()
+    .into_iter()
+    .map(|(kind, raw)| {
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        (kind, v["approval_id"].as_str().unwrap().to_string())
+    })
+    .collect()
 }
 
 fn operator_by() -> Value {

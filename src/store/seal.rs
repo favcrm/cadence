@@ -1071,15 +1071,25 @@ impl Store {
             .map(|_| ())
     }
 
-    /// Test/fixture write scope: seeds schema or fixture rows under the
-    /// owner arm. Gated to test/fixture code — never a production writer.
-    /// Runs `f` with the conn mutex held and `Owner`+`TxControl` armed so
-    /// fixture DDL/DML are authorized; the latch is still honored (a sealed
-    /// store refuses).
+    /// Test/fixture write scope: seeds schema or fixture rows on the
+    /// restricted [`WriteTxn`] facade under the owner arm — fixture
+    /// DDL/DML are authorized, the latch is still honored (a sealed
+    /// store refuses), and the callback never reaches a `Connection`/
+    /// `Statement`/tx-boundary. Test/seam only — never a production
+    /// writer.
     #[cfg(any(test, feature = "test-seam"))]
     #[allow(dead_code)]
-    pub(crate) fn fixture_write<R>(&self, f: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
-        self.with_owner_tx(f)
+    pub(crate) fn fixture_write<R>(
+        &self,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
+    ) -> Result<R>
+    where
+        R: 'static,
+    {
+        // Owner arm so fixture DDL (CREATE/ALTER) is authorized; the
+        // restricted WriteTxn facade still forbids a tx boundary or a
+        // latch-table write at phase=Callback.
+        self.sealed_tx(GuardState::OWNER, false, f)
     }
 
     /// The conn-`lock()` poison recovery: write the `store_poisoned`
@@ -1516,7 +1526,7 @@ storeconn_impl!(&&mut WriteTxn<'_>, |g| -> &Connection { &**g.tx });
 /// `Transaction` borrow that outlives the closure. `rusqlite`-typed
 /// methods preserve the raw error so callers classify a BUSY/constraint
 /// at the source; the crate-`Error` variants flatten for prose callers.
-pub(crate) struct WriteTxn<'t> {
+pub struct WriteTxn<'t> {
     tx: &'t Transaction<'t>,
     /// The shared arm/phase cells — carried so `savepoint` can open the
     /// owner's `TxControl` window. `'t`-bound; never escape the closure.
@@ -1534,20 +1544,24 @@ impl<'t> WriteTxn<'t> {
     ) -> rusqlite::Result<usize> {
         self.tx.execute(sql, params)
     }
-    pub(crate) fn execute(&self, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
+    /// `execute` — `pub` so external `tests/` hooks can drive DML on the
+    /// restricted facade; the facade itself still forbids tx-boundary/
+    /// `commit`/`rollback`/`Connection` escape at `phase=Callback`.
+    pub fn execute(&self, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
         self.execute_raw(sql, params).map_err(Into::into)
     }
-    /// DML batch on the live tx — the authorizer still denies any
-    /// tx-boundary/DDL the batch tries to sneak in (a `COMMIT`/`BEGIN`
-    /// inside `sql` is denied at `phase=Callback`).
-    pub(crate) fn execute_batch(&self, sql: &str) -> Result<()> {
+    /// DML batch on the live tx — `pub` for test hooks; the authorizer
+    /// still denies any tx-boundary/DDL the batch tries to sneak in (a
+    /// `COMMIT`/`BEGIN` inside `sql` is denied at `phase=Callback`).
+    pub fn execute_batch(&self, sql: &str) -> Result<()> {
         self.tx.execute_batch(sql).map_err(Into::into)
     }
     /// Raw-error `execute_batch` for callers that classify sqlite errors.
     pub(crate) fn execute_batch_raw(&self, sql: &str) -> rusqlite::Result<()> {
         self.tx.execute_batch(sql)
     }
-    pub(crate) fn query_row<T>(
+    /// `query_row` — `pub` for test hooks that probe the tx.
+    pub fn query_row<T>(
         &self,
         sql: &str,
         params: impl rusqlite::Params,
@@ -1572,9 +1586,9 @@ impl<'t> WriteTxn<'t> {
     {
         self.tx.prepare(sql)
     }
-    /// `query_map` returning the mapped iterator — `'s`-bound to the
-    /// statement, which is `'t`-bound to the closure.
-    pub(crate) fn query_map<T>(
+    /// `query_map` returning the collected Vec — `pub` for test hooks;
+    /// the `Statement` borrow stays inside the impl so none escapes.
+    pub fn query_map<T>(
         &self,
         sql: &str,
         params: impl rusqlite::Params,

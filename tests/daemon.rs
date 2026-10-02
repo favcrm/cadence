@@ -3317,7 +3317,7 @@ fn shutdown_entries_retries_a_busy_once_then_records_one_refusal() {
     let attempts = Arc::clone(&attempted);
     let opts = daemon::ServeOptions {
         stop: Some(Arc::clone(&stop)),
-        shutdown_entries_hook: Some(Arc::new(move |conn: &rusqlite::Connection| {
+        shutdown_entries_hook: Some(Arc::new(move |conn: &cadence_agent::store::WriteTxn<'_>| {
             if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 // Mutate inside the doomed transaction, then fail it:
                 // rollback discards this write, and the retry re-reads
@@ -3389,7 +3389,7 @@ fn shutdown_entries_stops_at_first_nonretryable_fault() {
     let attempts = Arc::clone(&attempted);
     let opts = daemon::ServeOptions {
         stop: Some(Arc::clone(&stop)),
-        shutdown_entries_hook: Some(Arc::new(move |_conn| {
+        shutdown_entries_hook: Some(Arc::new(move |_conn: &cadence_agent::store::WriteTxn<'_>| {
             attempts.fetch_add(1, Ordering::SeqCst);
             Err(injected_sqlite_err(rusqlite::ffi::SQLITE_FULL))
         })),
@@ -3426,7 +3426,7 @@ fn shutdown_entries_retries_sqlite_locked_then_records_one_refusal() {
     let attempts = Arc::clone(&attempted);
     let opts = daemon::ServeOptions {
         stop: Some(Arc::clone(&stop)),
-        shutdown_entries_hook: Some(Arc::new(move |_conn| {
+        shutdown_entries_hook: Some(Arc::new(move |_conn: &cadence_agent::store::WriteTxn<'_>| {
             if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 Err(injected_sqlite_err(rusqlite::ffi::SQLITE_LOCKED))
             } else {
@@ -3491,7 +3491,7 @@ fn cad694_failed_shutdown_fences_the_restart_verdict() {
         let stamps = std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
         let stamped = std::sync::Arc::clone(&stamps);
         let d = TestDaemon::start_opts(daemon::ServeOptions {
-            shutdown_entries_hook: Some(std::sync::Arc::new(move |_conn| {
+            shutdown_entries_hook: Some(std::sync::Arc::new(move |_conn: &cadence_agent::store::WriteTxn<'_>| {
                 stamped.lock().unwrap().push(std::time::Instant::now());
                 match pending.lock().unwrap().pop_front() {
                     Some(code) => Err(injected_sqlite_err(code)),
@@ -3611,7 +3611,7 @@ fn cad694_offline_restart_still_fences_a_failed_drain() {
     let stop_flag = std::sync::Arc::clone(&stop);
     let mut d = TestDaemon::start_opts(daemon::ServeOptions {
         stop: Some(stop_flag),
-        shutdown_entries_hook: Some(std::sync::Arc::new(move |_conn| {
+        shutdown_entries_hook: Some(std::sync::Arc::new(move |_conn: &cadence_agent::store::WriteTxn<'_>| {
             match pending.lock().unwrap().pop_front() {
                 Some(code) => Err(injected_sqlite_err(code)),
                 None => Ok(()),
