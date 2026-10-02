@@ -8,6 +8,10 @@
 .app-shell {
   padding: 1rem 1rem 2.25rem;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
 }
 
 @media (min-width: 1024px) {
@@ -30,7 +34,8 @@
   display: grid;
   gap: 1rem;
   grid-template-columns: minmax(0, 1fr);
-  align-items: start;
+  flex: 1;
+  min-height: 0;
 }
 
 @media (min-width: 1024px) {
@@ -51,7 +56,13 @@
   background: var(--color-ink-900);
   border-right: 1px solid var(--color-ink-700);
   padding: 0.9rem;
-  overflow-y: auto;
+  /* Bounded column: the drawer is a fixed-height flex container, so
+     the chat list scrolls internally and the composer stays pinned
+     above the viewport instead of dropping below it on long threads. */
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   transform: translateX(-105%);
   visibility: hidden;
   transition: transform 0.2s ease, visibility 0.2s;
@@ -67,14 +78,16 @@
     position: sticky;
     top: 4.5rem;
     width: auto;
+    height: 100%;
     z-index: auto;
     background: transparent;
     border-right: 0;
     padding: 0;
-    overflow-y: visible;
+    overflow-y: auto;
     transform: none;
     visibility: visible;
     transition: none;
+    max-height: none;
   }
 }
 
@@ -125,30 +138,31 @@
 
 .app-shell-outlet {
   min-width: 0;
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 0.75rem;
-  align-content: start;
-}
-
-.app-shell-context {
-  display: grid;
-  gap: 0.35rem;
+  flex: 1;
+  min-height: 0;
 }
 
 /* Compact master thread pane. */
 .app-chat {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 0.5rem;
   border: 1px solid var(--color-ink-700);
   border-radius: 0.5rem;
   background: var(--color-ink-875);
   padding: 0.75rem;
+  flex: 1;
+  min-height: 0;
 }
 
 .app-chat-list {
   display: grid;
   gap: 0.5rem;
-  max-height: 24rem;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   list-style: none;
   margin: 0;
@@ -184,13 +198,16 @@
 
 /* Generic outlet tabs + detail drawer. */
 .app-outlet {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 0.75rem;
-  align-content: start;
-  /* A grid item defaults to min-width: auto: without this, a wide
-     descendant (e.g. a customer table) forces the whole document
-     past narrow viewports instead of scrolling internally (CAD-781 F2). */
+  /* A wide descendant (e.g. a customer table) can force the whole
+     document past narrow viewports; min-width:0 keeps scrolling
+     internal (CAD-781 F2). flex column + min-height:0 let a table
+     view fill the outlet's remaining height. */
   min-width: 0;
+  flex: 1;
+  min-height: 0;
 }
 
 .app-outlet-tabs {
@@ -261,10 +278,16 @@
 }
 
 .crm-list {
-  display: grid;
+  /* Bounded flex column: inside the flex outlet the list fills the
+     remaining height so the customer table below can grow and scroll
+     internally rather than stopping mid-pane. Children keep natural
+     height; only the table wrap grows. */
+  display: flex;
+  flex-direction: column;
   gap: 0.75rem;
-  align-content: start;
   min-width: 0;
+  flex: 1;
+  min-height: 0;
 }
 
 .crm-toolbar {
@@ -273,6 +296,20 @@
   gap: 0.75rem;
   flex-wrap: wrap;
   min-width: 0;
+}
+
+/* Narrow toolbar actions (CAD-910 token refinement): below the 720px
+   form breakpoint toolbar buttons keep the board's 44px narrow-context
+   tap target — the same 2.75rem floor `.section-nav-link` and
+   checkpoint links already use — with label-size text. `min-height`
+   grows the fixed-height `.btn`/`.btn-sm` box without touching its
+   inline-flex centring; at ≥720px the Button sm/md contract is
+   unchanged and no nav/chat button is affected. */
+@media (width < 720px) {
+  .crm-toolbar .btn {
+    min-height: 2.75rem;
+    font-size: var(--text-label);
+  }
 }
 
 .crm-search {
@@ -285,7 +322,13 @@
 }
 
 .crm-table-wrap {
+  /* Flex-growing scroll region inside .crm-list: fills leftover
+     height so the customer table reaches the pane bottom, scrolling
+     on both axes inside the wrap instead of growing the document. */
+  flex: 1;
+  min-height: 0;
   overflow-x: auto;
+  overflow-y: auto;
   max-width: 100%;
   /* Paint/layout containment keeps the wide table's ink inside the
      wrap while it scrolls internally; the document never grows past
@@ -315,7 +358,9 @@
 .crm-table th,
 .crm-table td {
   text-align: left;
-  padding: 0.55rem 0.75rem;
+  /* Equal block/inline padding (12px scale): rows breathe enough to
+     scan without losing the compact density (CAD-910). */
+  padding: 0.75rem;
   border-bottom: 1px solid var(--color-ink-700);
   vertical-align: top;
   /* Long unbreakable tokens (emails, digests) wrap instead of
@@ -325,10 +370,22 @@
 }
 
 .crm-table thead th {
-  font-size: var(--text-micro);
+  /* Label-size caps at secondary weight: readable at table density,
+     a step quieter than the body text below them (CAD-910). */
+  font-size: var(--text-label);
+  font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--color-ink-500);
+  color: var(--color-ink-400);
+  /* A header band one step below the wrap surface separates the
+     column labels from the first row. */
+  background: var(--color-ink-875);
+}
+
+/* Quiet row tint for scanning; hover adds ink only — no pointer
+   cursor, no click affordance (CAD-910). */
+.crm-table tbody tr:hover {
+  background: var(--color-ink-875);
 }
 
 .crm-table tbody tr:last-child th,
@@ -346,7 +403,9 @@
 
 .crm-field {
   display: grid;
-  gap: 0.3rem;
+  /* Same gap as the shared .sfield owner below so a hand-rolled
+     .crm-field block and a real Field land identically (CAD-910). */
+  gap: 0.5rem;
   min-width: 0;
 }
 
@@ -421,6 +480,35 @@
   list-style: none;
   margin: 0.35rem 0 0;
   padding: 0;
+}
+
+/* CAD-1008: the email content form and its saved-version preview sit
+   side by side on wide viewports — the operator writes and sees the
+   rendered email in one glance. Narrow viewports stack them so the
+   preview lands immediately after the content card, before approval. */
+.crm-compose {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  align-items: start;
+}
+
+@media (min-width: 1100px) {
+  .crm-compose {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+/* Diagnostic record metadata (ids, revisions, digests, workspace)
+   collapses behind this details block instead of leading the page. */
+.crm-diag summary {
+  cursor: pointer;
+  list-style: disclosure-closed;
+}
+
+.crm-diag[open] summary {
+  list-style: disclosure-open;
 }
 
 /* Campaign email preview: source/text forms scroll internally so a
@@ -517,11 +605,213 @@
   margin-left: 0.5rem;
 }
 
-.av {
+/* Scoped entry: the unselected multi-context state lists each active
+   context as an explicit `?ctx=` link — a real URL write, never a
+   hidden default. Replaces the removed header picker without
+   silently binding a client. */
+.app-shell-scope {
   display: grid;
-  gap: 0.75rem;
-  align-content: start;
+  gap: 0.6rem;
+  max-width: 28rem;
+}
+
+.app-shell-scope-list {
+  display: grid;
+  gap: 0.35rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.app-shell-scope-list .lnk {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2rem;
+}
+
+/* Bound scope: the same links stay reachable as a compact inline
+   switch — never a second picker, and never a card on every view. */
+.app-shell-switch {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.9rem;
   min-width: 0;
+}
+
+.app-shell-switch > p {
+  margin: 0;
+}
+
+.app-shell-switch-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.1rem 0.9rem;
+}
+
+/* The bound context stays in the switch list (aria-current) so the
+   current scope is announced without becoming a dead control. */
+.app-shell-scope-list .lnk[aria-current] {
+  color: var(--color-ink-100);
+  font-weight: 600;
+}
+
+/* WCAG 2.5.5 target size at pointer-coarse widths: the 2rem desktop
+   row grows to a 44px target on touch/narrow screens. */
+@media (max-width: 1023.98px) {
+  .app-shell-scope-list .lnk {
+    min-height: 2.75rem;
+  }
+}
+
+/* The app-views surface is a bounded flex column so a table view can
+   fill the outlet's remaining height. `flex:1; min-height:0` lets the
+   .av chain grow inside the flex outlet; children keep natural height
+   (align-items:stretch is horizontal) — only .av-table-wrap grows. */
+.av {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-width: 0;
+  flex: 1;
+  min-height: 0;
+}
+
+/* CAD-866 shared host primitives. These generic classes carry the same
+   canonical tokens the CRM (`crm-*`) and app-views (`av-*`) shapes used;
+   consumers keep their legacy class as an extra hook for tests/QA while
+   the field/table/detail/state chrome now lives here once. */
+.sfield {
+  display: grid;
+  /* Label/hint/error sit as one unit (8px spacing scale); control
+     heights, rows-driven textareas and required/error/readonly
+     semantics are untouched (CAD-910). */
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.sfield .field,
+.sfield > input:not([type="file"]),
+.sfield > textarea,
+.sfield > select {
+  width: 100%;
+  max-width: 100%;
+}
+
+.sfield-label {
+  /* Mid weight lifts the label above its hint without reaching the
+     semibold reserved for selected tabs/headings (CAD-910). */
+  font-weight: 500;
+}
+
+/* Shared hint typography overrides the compact utilities emitted by Field. */
+p.sfield-hint {
+  margin: 0;
+  font-size: var(--text-label);
+  line-height: 1.5;
+  color: var(--color-ink-400);
+}
+
+.sfield-error {
+  margin: 0;
+}
+
+.stable-wrap {
+  overflow: auto;
+  max-width: 100%;
+  /* Inside a bounded flex column this is the only flex-growing region:
+     it fills the leftover height and scrolls the table internally
+     instead of letting the document grow past the fold. */
+  flex: 1;
+  min-height: 0;
+  contain: layout paint;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-850);
+}
+
+.stable-wrap:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.stable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-table);
+}
+
+.stable th,
+.stable td {
+  text-align: left;
+  /* Same 12px block/inline padding as .crm-table: both owners read
+     identically wherever DataTable or a bare table renders (CAD-910). */
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--color-ink-700);
+  vertical-align: top;
+  /* Long unbreakable tokens wrap; horizontal scrolling stays inside
+     `.stable-wrap`, never the document. */
+  overflow-wrap: anywhere;
+}
+
+.stable thead th {
+  font-size: var(--text-label);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-ink-400);
+  background: var(--color-ink-875);
+}
+
+.stable tbody tr:hover {
+  background: var(--color-ink-875);
+}
+
+.stable tbody tr:last-child td,
+.stable tbody tr:last-child th {
+  border-bottom: 0;
+}
+
+.sdetail {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+}
+
+.sdetail > div {
+  display: grid;
+  grid-template-columns: 8rem minmax(0, 1fr);
+  gap: 0.5rem;
+  align-items: baseline;
+}
+
+.sdetail dt {
+  font-size: var(--text-label);
+  color: var(--color-ink-500);
+}
+
+.sdetail dd {
+  margin: 0;
+  font-size: var(--text-secondary);
+  color: var(--color-ink-200);
+  overflow-wrap: anywhere;
+}
+
+.snotice,
+.sempty,
+.serror {
+  margin: 0;
+}
+
+.sloading {
+  margin: 0;
+}
+
+/* A nested app-views section (the preview's AppView inside the outer
+   .av wrapper) must also grow so its table reaches the wrap's flex. */
+.av .av {
+  flex: 1;
+  min-height: 0;
 }
 
 .av-head {
@@ -549,8 +839,13 @@
 }
 
 .av-table-wrap {
-  overflow-x: auto;
+  overflow: auto;
   max-width: 100%;
+  /* Inside the bounded .av column this is the only flex-growing
+     region: it fills the leftover height and scrolls the table
+     internally instead of letting the document grow past the fold. */
+  flex: 1;
+  min-height: 0;
   contain: layout paint;
   border: 1px solid var(--color-ink-700);
   border-radius: 0.5rem;
@@ -633,12 +928,23 @@
 
 .av-input {
   width: 100%;
-  background: transparent;
+  font-family: var(--font-sans);
+  font-size: var(--text-secondary);
   color: var(--color-ink-100);
+  background: var(--color-ink-875);
   border: 1px solid var(--color-ink-700);
   border-radius: 0.375rem;
-  padding: 0.5rem;
-  font-size: var(--text-secondary);
+  padding: 0.5rem 0.75rem;
+  transition: border-color 0.15s ease;
+}
+
+.av-input:focus-visible {
+  border-color: var(--color-accent);
+  outline: none;
+}
+
+.av-input::placeholder {
+  color: var(--color-ink-500);
 }
 
 .av-input:disabled {

@@ -1,4 +1,7 @@
 import { useId } from "react";
+import DataTable from "../shared/DataTable";
+import Detail from "../shared/Detail";
+import Field from "../shared/Field";
 import {
   cellText,
   type AppViewCell,
@@ -111,36 +114,18 @@ function TableView({ view, rows }: { view: AppViewView; rows: AppViewRow[] }) {
       No fixture rows declared for this view — the preview stays empty rather than inventing data.
     </p>
   ) : (
-    <div className="av-table-wrap" tabIndex={0} role="region" aria-label={`${view.title} rows`}>
-      <table className="av-table">
-        <thead>
-          <tr>
-            {columns.map((c) => {
-              const field = fields.get(c.field)!;
-              return (
-                <th key={c.field} scope="col">
-                  {c.label ?? field.label}
-                </th>
-              );
-            })}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row, i) => (
-            <tr key={i}>
-              {columns.map((c) => {
-                const field = fields.get(c.field)!;
-                return (
-                  <td key={c.field}>
-                    <Cell field={field} value={row[c.field]} />
-                  </td>
-                );
-              })}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <DataTable<AppViewRow>
+      label={`${view.title} rows`}
+      wrapClassName="av-table-wrap"
+      tableClassName="av-table"
+      rowKey={(_row, index) => index}
+      columns={columns.map((c) => ({
+        key: c.field,
+        header: c.label ?? fields.get(c.field)!.label,
+        cell: (row) => <Cell field={fields.get(c.field)!} value={row[c.field]} />,
+      }))}
+      rows={rows}
+    />
   );
 }
 
@@ -148,16 +133,15 @@ function DetailView({ view, rows }: { view: AppViewView; rows: AppViewRow[] }) {
   const fields = view.fields ?? [];
   const row = rows[0] ?? {};
   return (
-    <dl className="av-detail" aria-label={`${view.title} fields`}>
-      {fields.map((field) => (
-        <div key={field.id}>
-          <dt>{field.label}</dt>
-          <dd>
-            <Cell field={field} value={row[field.id]} />
-          </dd>
-        </div>
-      ))}
-    </dl>
+    <Detail
+      className="av-detail"
+      label={`${view.title} fields`}
+      items={fields.map((field) => ({
+        key: field.id,
+        term: field.label,
+        value: <Cell field={field} value={row[field.id]} />,
+      }))}
+    />
   );
 }
 
@@ -177,20 +161,22 @@ function FormView({ view }: { view: AppViewView }) {
       aria-label={`${view.title} preview`}
       onSubmit={(e) => e.preventDefault()}
     >
-      {fields.map((field) => {
-        const id = `${uid}-${field.id}`;
-        return (
-          <div key={field.id} className="av-field">
-            <label className="text-label text-ink-300" htmlFor={id}>
-              {field.label}
-            </label>
-            {field.format === "enum" ? (
-              <select id={id} className="av-input" disabled aria-label={field.label}>
+      {fields.map((field) => (
+        <Field
+          key={field.id}
+          id={`${uid}-${field.id}`}
+          label={field.label}
+          disabled
+          className="av-field"
+        >
+          {(c) =>
+            field.format === "enum" ? (
+              <select id={c.id} className="av-input" disabled aria-label={field.label}>
                 <option value="">{field.values?.join(" / ") ?? "—"}</option>
               </select>
             ) : field.kind === "list" || field.format === "tags" ? (
               <textarea
-                id={id}
+                id={c.id}
                 className="av-input"
                 rows={2}
                 disabled
@@ -199,17 +185,17 @@ function FormView({ view }: { view: AppViewView }) {
               />
             ) : (
               <input
-                id={id}
+                id={c.id}
                 className="av-input"
                 disabled
                 aria-label={field.label}
                 autoComplete="off"
                 inputMode={field.format === "number" ? "decimal" : undefined}
               />
-            )}
-          </div>
-        );
-      })}
+            )
+          }
+        </Field>
+      ))}
       <div className="av-form-foot">
         <button
           type="submit"
