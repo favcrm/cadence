@@ -1,6 +1,6 @@
 # CAD-1015: owned native-session / inbox probes
 
-These are **manual, opt-in real-runtime experiments**, not automatic CI tests and not evidence that CAD-1015's new delivery feature is implemented. They make real model calls using the operator's existing credentials. Run providers sequentially on the shared host.
+These are **manual, opt-in real-runtime experiments**, not automatic CI gates or proof that every CAD-1015 acceptance item is satisfied. The native-steering mode tests the lane implementation; the default inbox mode retains the installed-binary baseline. They make real model calls using the operator's existing credentials. Run providers sequentially on the shared host.
 
 ## Native protocol probe
 
@@ -48,6 +48,37 @@ The Pi idle-steer experiment returned `success:true`, disposition `queued`, then
 
 Initial failed attempts were fixture/admission issues, retained in the ticket evidence: missing temporary Pi model allowlist; Claude `allowed_tools` passed as a string rather than a list; then an RPC registration used an object where Cadence expects serialized `params`. None justified bypassing a permission gate. The corrected Claude test used `params` containing serialized JSON with an explicit allowed-tools array.
 
+## Lane-native steering validation
+
+```sh
+node --test tests/manual/native_inbox/pi_guard.test.mjs
+CAD1015_DOGFOOD=1 python3 tests/manual/native_inbox/pi_guard_probe.py
+CAD1015_DOGFOOD=1 CAD1015_NATIVE_STEERING=1 \
+  CAD1015_BINARY=/absolute/lane/target/debug/cadence \
+  python3 tests/manual/native_inbox/cadence_probe.py
+```
+
+The guard probe verifies real Pi idle/stale/foreign-token refusal, an awaited
+turn-end listener race, duplicate deduplication, cancellation cleanup and
+model-context projection with no old guidance or additional request in the
+successor. It is direct-runtime evidence, not the daemon integration test.
+
+The native Cadence mode checks accepted Pi/Codex guidance while the original
+kickoff remains running, broker deduplication, public parent-message correlation,
+original-run amended output, idle skips, separate normal follow-ups and inbox
+peek/ack. Claude must explicitly refuse strict native steering while its ordinary
+queued follow-up and inbox behavior still pass. Each provider has a separate
+observer inbox so a failed case cannot contaminate the next provider's evidence.
+Active turn tokens may be redacted; do not defeat that policy to test correlation.
+
+See `docs/NATIVE_MESSAGING.md` for the delivery contract and limitations.
+
 ## Remaining CAD-1015 work
 
-Design runtime-side turn/session preconditions for Pi and Claude, write adversarial and completion-vs-send race tests first, then extend the existing registry/adapters and Cadence concurrent-control path. Do not replace the actor's serialized task queue or classify native acceptance/idle as task success. End-to-end validation of the **new** live-delivery feature and exact-head independent reviews are still pending.
+Complete admitted deterministic/security/regression gates and objective/criteria,
+approval, disconnect/reconnect and HTTP authorization cases before declaring the
+feature ready. Focused Rust unit-test and clippy recipes are not currently
+available to this external caller. The available admitted recipe compiles the
+lane and has a runner-identity failure in one existing operator-only fixture;
+that failure is preserved, not skipped. Independent exact-head reviews and
+operator approval are still pending. No PR/merge/production rollout yet.

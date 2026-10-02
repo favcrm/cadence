@@ -16,6 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,7 +28,7 @@ use super::stdio::{EnvScrub, StdioAdapter};
 use super::ws::WsAdapter;
 use super::{
     AdapterHooks, Identity, InterruptOutcome, ProviderAdapter, ProviderEnv, ProviderRequest,
-    TurnResult,
+    SteerOutcome, TurnResult,
 };
 use crate::error::{Error, Result};
 use crate::store::Agent;
@@ -161,6 +162,18 @@ const DEFAULT_TURN_IDLE: Duration = Duration::from_secs(900);
 const QUOTA_DEADLINE: Duration = Duration::from_secs(5);
 const SANDBOX_PROBE_DEADLINE: Duration = Duration::from_secs(10);
 const SANDBOX_PROBE_OUTPUT_LIMIT: usize = 2048;
+/// `turn/steer` joins an already-running turn, so a long wait would only
+/// ever mean the request is lost — the provider answers it at once.
+const STEER_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Initialize's userAgent carries the server version, not clientInfo.version.
+/// Experimental exact-turn semantics must be revalidated on an upgrade.
+fn verified_steering_runtime(reply: &Value) -> bool {
+    reply
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .is_some_and(|agent| agent.split_whitespace().next() == Some("cadence-agent/0.160.0"))
+}
 
 const ENV_SCRUB: &[&str] = &[
     "CODEX_THREAD_ID",
@@ -604,6 +617,59 @@ struct Shared {
     /// The last provider-owned rate-limit snapshot. It remains raw JSON;
     /// the store adds Cadence identity and timestamps before exposure.
     quota: Mutex<Option<Value>>,
+    native_ready: AtomicBool,
+}
+
+/// CAD-1015: the provider's own `turn/steer` on exactly `turn_id`.
+/// `expectedTurnId` is the server-side precondition — the app-server
+/// rejects the request when `turn_id` is not the currently active turn,
+/// so a stale id can never reach a successor and no host-side fallback
+/// (`turn/start`, `inject_items`) is needed or attempted.
+///
+/// Snapshot identifiers, then release reader-shared locks before waiting
+/// for the RPC reply. Quota notifications also acquire `thread_id`; holding
+/// it here would deadlock the sole reader before it could resolve the reply.
+/// `expectedTurnId`, not a host mutex, enforces the runtime precondition.
+///
+/// `Queued` is claimed only when the reply carries the expected
+/// `turnId`: a reply without it (or naming another turn) acknowledged
+/// the request but proves nothing, so the outcome is `unknown` — the
+/// input may have been accepted, never a silent success or a retry.
+fn steer_shared(
+    shared: &Shared,
+    transport: &Transport,
+    turn_id: &str,
+    text: &str,
+    client_message_id: &str,
+) -> Result<SteerOutcome> {
+    if shared.active_turn.lock().unwrap().as_deref() != Some(turn_id) {
+        return Ok(SteerOutcome::NotRunning);
+    }
+    // The frame carries this immutable thread/turn pair even if the host
+    // observes completion before the write; the server then refuses it.
+    let thread = shared
+        .thread_id
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| Error::provider("Codex thread is not open"))?;
+    let reply = transport.request_bounded(
+        "turn/steer",
+        json!({
+            "threadId": thread,
+            "expectedTurnId": turn_id,
+            "input": [{"type": "text", "text": text}],
+            "clientUserMessageId": client_message_id,
+        }),
+        STEER_DEADLINE,
+    )?;
+    match reply.get("turnId").and_then(Value::as_str) {
+        Some(accepted) if accepted == turn_id => Ok(SteerOutcome::Queued),
+        other => Err(Error::unknown(format!(
+            "Codex turn/steer reply has turn id {other:?} for expected {turn_id}; \
+             the provider outcome is uncertain"
+        ))),
+    }
 }
 
 fn shared_state(hooks: AdapterHooks) -> Arc<Shared> {
@@ -618,6 +684,7 @@ fn shared_state(hooks: AdapterHooks) -> Arc<Shared> {
         idle_window: Mutex::new(DEFAULT_TURN_IDLE),
         max_turn: Mutex::new(None),
         quota: Mutex::new(None),
+        native_ready: AtomicBool::new(false),
     })
 }
 
@@ -961,10 +1028,15 @@ impl ProviderAdapter for CodexAdapter {
         // Everything after launch is guarded: any failure closes the
         // transport so no owned provider process is left behind.
         let opened = (|| -> Result<Identity> {
-            self.transport.request(
+            self.shared.native_ready.store(false, Ordering::SeqCst);
+            let hello = self.transport.request(
                 "initialize",
-                json!({"clientInfo": {"name": "cadence-agent", "version": "0.1.0"}}),
+                json!({"clientInfo": {"name": "cadence-agent", "version": "0.1.0"},
+                       "capabilities": {"experimentalApi": true}}),
             )?;
+            self.shared
+                .native_ready
+                .store(verified_steering_runtime(&hello), Ordering::SeqCst);
             self.transport
                 .send(json!({"method": "initialized", "params": {}}))?;
             // `approval_policy` rides params so resume replays it
@@ -1282,6 +1354,36 @@ impl ProviderAdapter for CodexAdapter {
         Ok(InterruptOutcome::Delivered)
     }
 
+    /// Only the initialized, verified runtime receives this experimental
+    /// capability. Other versions retain ordinary queued work, not steering.
+    fn native_turn_steering(&self) -> bool {
+        self.shared.native_ready.load(Ordering::SeqCst)
+            && !self.transport.disconnected()
+            && !self.transport.disconnected()
+    }
+
+    /// Queue `text` into exactly `turn_id` while it runs. Only the
+    /// provider's own precondition makes this safe; a refusal (stale or
+    /// non-steerable turn) surfaces as the provider's error, never as a
+    /// queued claim or a `turn/start`/`inject_items` fallback.
+    fn steer_turn(
+        &self,
+        turn_id: &str,
+        text: &str,
+        client_message_id: &str,
+    ) -> Result<SteerOutcome> {
+        if !self.native_turn_steering() {
+            return Err(Error::rejected("Codex runtime has no verified exact-turn input capability (validated server: 0.160.0)"));
+        }
+        steer_shared(
+            &self.shared,
+            &self.transport,
+            turn_id,
+            text,
+            client_message_id,
+        )
+    }
+
     /// CAD-551: `stop` (the daemon's interrupt path) is the only session
     /// verb Codex's app-server protocol answers for the board.
     fn session_commands(&self) -> &'static [&'static str] {
@@ -1293,6 +1395,198 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn close(&self) {
+        self.shared.native_ready.store(false, Ordering::SeqCst);
         self.transport.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! CAD-1015 adversarial seam tests for `steer_turn`. The transport
+    //! is a real [`StdioAdapter`] over a scripted child that answers
+    //! JSON-RPC by request id, so every test exercises the actual
+    //! `request_bounded` wire path — a scripted refusal proves no
+    //! steering frame was accepted, a scripted reply with the wrong or
+    //! a missing `turnId` proves the adapter never claims `Queued`.
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn steering_requires_the_verified_initialize_version() {
+        assert!(verified_steering_runtime(
+            &json!({"userAgent": "cadence-agent/0.160.0 (Linux; x86_64)"})
+        ));
+        for reply in [
+            json!({}),
+            json!({"userAgent": "cadence-agent/0.159.0"}),
+            json!({"userAgent": "cadence-agent/0.160.0-dev"}),
+            json!({"serverInfo": {"version": "0.160.0"}}),
+        ] {
+            assert!(!verified_steering_runtime(&reply), "{reply}");
+        }
+    }
+
+    fn hooks() -> AdapterHooks {
+        AdapterHooks {
+            on_event: Box::new(|_, _| {}),
+            on_request: Box::new(|_| {}),
+        }
+    }
+
+    /// A JSON-RPC peer that replies to `turn/steer` per `reply` —
+    /// `"ok"` echoes the request's `expectedTurnId` back as `turnId`,
+    /// `"wrong"` returns a different turn id, `"missing"` omits it,
+    /// `"error"` answers with a JSON-RPC error (the provider's refusal),
+    /// anything else never responds (a steer that must time out).
+    fn fake_server(reply: &str) -> (CodexAdapter, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stderr.log");
+        let script = dir.path().join("app_server.sh");
+        let mut file = std::fs::File::create(&script).unwrap();
+        write!(
+            file,
+            "#!/bin/sh\n\
+             # One response per line; id is the first integer in the frame.\n\
+             while IFS= read -r line; do\n\
+             id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\"[ ]*:[ ]*\\([0-9]*\\).*/\\1/p')\n\
+             [ -z \"$id\" ] && continue\n\
+             case {mode} in\n\
+             ok) printf '{{\"id\":%s,\"result\":{{\"turnId\":\"%s\"}}}}\\n' \"$id\" $(printf '%s' \"$line\" | sed -n 's/.*\"expectedTurnId\"[ ]*:[ ]*\"\\([^\"]*\\)\".*/\\1/p');;\n\
+             wrong) printf '{{\"id\":%s,\"result\":{{\"turnId\":\"turn-other\"}}}}\\n' \"$id\";;\n\
+             missing) printf '{{\"id\":%s,\"result\":{{}}}}\\n' \"$id\";;\n\
+             error) printf '{{\"id\":%s,\"error\":{{\"code\":-32000,\"message\":\"active turn mismatch\"}}}}\\n' \"$id\";;\n\
+             *) :;;\n\
+             esac\n\
+             done\n",
+            mode = reply
+        )
+        .unwrap();
+        drop(file);
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o700);
+        }
+        std::fs::set_permissions(&script, perms).unwrap();
+        let shared = shared_state(hooks());
+        // This seam simulates an already-verified initialize handshake.
+        shared.native_ready.store(true, Ordering::SeqCst);
+        let adapter = CodexAdapter {
+            transport: Transport::Stdio(StdioAdapter::new(
+                &[script.to_str().unwrap().to_string()],
+                EnvScrub::names(&[]),
+                Box::new(|_| {}),
+                Box::new(|| {}),
+            )),
+            shared,
+            log_path: log,
+            sandbox_command: vec![],
+        };
+        // Launch the peer by hand — `open` is a full provider
+        // handshake; the steer seam needs only the transport.
+        if let Transport::Stdio(a) = &adapter.transport {
+            a.launch("/tmp", &adapter.log_path, &[]).unwrap();
+        }
+        (adapter, dir)
+    }
+
+    fn open_thread(adapter: &CodexAdapter, thread: &str, turn: &str) {
+        *adapter.shared.thread_id.lock().unwrap() = Some(thread.to_string());
+        *adapter.shared.active_turn.lock().unwrap() = Some(turn.to_string());
+    }
+
+    /// The guard runs before the wire: a steer at a turn that is not
+    /// `active_turn` is `NotRunning` and sends nothing — a stale id can
+    /// never leak into a successor run.
+    #[test]
+    fn steer_wrong_turn_is_not_running_before_wire() {
+        let (adapter, _dir) = fake_server("ok");
+        open_thread(&adapter, "thread-1", "turn-live");
+        let outcome = adapter
+            .steer_turn("turn-stale", "steer text", "msg-1")
+            .unwrap();
+        assert_eq!(outcome, SteerOutcome::NotRunning);
+        // No `active_turn` at all is the same answer: nothing in flight
+        // means the target cannot be running.
+        *adapter.shared.active_turn.lock().unwrap() = None;
+        let outcome = adapter
+            .steer_turn("turn-live", "steer text", "msg-2")
+            .unwrap();
+        assert_eq!(outcome, SteerOutcome::NotRunning);
+        adapter.transport.close();
+    }
+
+    /// `active_turn` names the target but the thread is not open: a
+    /// provider error before the wire — a steer never targets a
+    /// thread-less endpoint.
+    #[test]
+    fn steer_without_thread_is_provider_error() {
+        let (adapter, _dir) = fake_server("ok");
+        *adapter.shared.active_turn.lock().unwrap() = Some("turn-1".to_string());
+        let error = adapter.steer_turn("turn-1", "text", "msg").unwrap_err();
+        assert!(matches!(error, Error::Provider(_)), "{error:?}");
+        adapter.transport.close();
+    }
+
+    /// The provider accepted exactly this turn: `Queued` is the reply's
+    /// `turnId` matching `expectedTurnId`, nothing else.
+    #[test]
+    fn steer_accepted_is_queued() {
+        let (adapter, _dir) = fake_server("ok");
+        open_thread(&adapter, "thread-1", "turn-1");
+        let outcome = adapter.steer_turn("turn-1", "amendment", "msg-1").unwrap();
+        assert_eq!(outcome, SteerOutcome::Queued);
+        adapter.transport.close();
+    }
+
+    /// A reply that names another turn acknowledged the request but
+    /// proves nothing — the outcome is `unknown`, never `Queued`.
+    #[test]
+    fn steer_reply_for_other_turn_is_unknown() {
+        let (adapter, _dir) = fake_server("wrong");
+        open_thread(&adapter, "thread-1", "turn-1");
+        let error = adapter
+            .steer_turn("turn-1", "amendment", "msg-1")
+            .unwrap_err();
+        assert!(matches!(error, Error::OutcomeUnknown(_)), "{error:?}");
+        adapter.transport.close();
+    }
+
+    /// A reply with no `turnId` leaves delivery uncertain — the input
+    /// may have been accepted; the caller sees `unknown`, not success.
+    #[test]
+    fn steer_reply_without_turn_id_is_unknown() {
+        let (adapter, _dir) = fake_server("missing");
+        open_thread(&adapter, "thread-1", "turn-1");
+        let error = adapter
+            .steer_turn("turn-1", "amendment", "msg-1")
+            .unwrap_err();
+        assert!(matches!(error, Error::OutcomeUnknown(_)), "{error:?}");
+        adapter.transport.close();
+    }
+
+    /// The provider's exact-turn refusal (stale or non-steerable
+    /// `expectedTurnId`) surfaces as its own error — never `Queued`,
+    /// never a `turn/start` fallback.
+    #[test]
+    fn steer_provider_refusal_is_provider_error() {
+        let (adapter, _dir) = fake_server("error");
+        open_thread(&adapter, "thread-1", "turn-stale");
+        let error = adapter
+            .steer_turn("turn-stale", "amendment", "msg-1")
+            .unwrap_err();
+        assert!(matches!(error, Error::Provider(_)), "{error:?}");
+        adapter.transport.close();
+    }
+
+    /// No `steer_turn` frame leaves before the active-turn guard. A
+    /// peer that would time out any request still gets `NotRunning`.
+    #[test]
+    fn steer_silent_peer_with_wrong_turn_is_not_running() {
+        let (adapter, _dir) = fake_server("silent");
+        open_thread(&adapter, "thread-1", "turn-live");
+        let outcome = adapter.steer_turn("turn-stale", "text", "msg").unwrap();
+        assert_eq!(outcome, SteerOutcome::NotRunning);
+        adapter.transport.close();
     }
 }
