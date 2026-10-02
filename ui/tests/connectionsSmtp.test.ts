@@ -12,6 +12,7 @@
  *  - token providers and other providers are unchanged.
  */
 declare function require(name: string): any;
+import type { ConnectionProvider } from "../src/lib/types";
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`assert: ${msg}`);
@@ -21,7 +22,7 @@ function equal(a: unknown, e: unknown, msg: string) {
     throw new Error(`${msg}: expected ${JSON.stringify(e)}, got ${JSON.stringify(a)}`);
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-let act: (typeof import("react"))["act"];
+let act: (fn: () => Promise<unknown>) => Promise<void>;
 async function settle(fn: () => void, ms = 12000) {
   const end = Date.now() + ms;
   for (;;) {
@@ -35,7 +36,9 @@ async function settle(fn: () => void, ms = 12000) {
   }
 }
 
-function smtpProvider(): import("../src/lib/types").ConnectionProvider {
+
+
+function smtpProvider(): ConnectionProvider {
   return {
     provider: "smtp",
     descriptor_available: true,
@@ -59,7 +62,7 @@ function smtpProvider(): import("../src/lib/types").ConnectionProvider {
     },
   };
 }
-function tokenProvider(): import("../src/lib/types").ConnectionProvider {
+function tokenProvider(): ConnectionProvider {
   return {
     provider: "agenticos_external",
     descriptor_available: true,
