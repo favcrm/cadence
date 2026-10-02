@@ -138,10 +138,10 @@ pub(crate) struct Cli {
     /// Runtime state directory (socket, database, logs).
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
-    /// Organization/connection to run this command under (CAD-1019). Wins
-    /// over `CADENCE_ORG` and the saved default; a managed caller cannot
-    /// use it.
-    #[arg(long, global = true)]
+    /// Select an org for this command — pins the destination once. Conflicts
+    /// with an explicit `--state-dir` or an inherited local binding; a
+    /// managed caller (`CADENCE_ALIAS`) cannot use it.
+    #[arg(long, global = true, value_name = "ORG")]
     org: Option<String>,
     #[command(subcommand)]
     command: Commands,

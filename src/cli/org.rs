@@ -342,30 +342,31 @@ fn ensure_local(state_dir: &Path, tracker_dir: &Path) -> Result<()> {
     file.write(&registry)
 }
 
-/// Resolve this invocation's destination once. `org` is `--org`; a managed
-/// caller keeps its ambient binding and never consults the registry.
-/// `state`/`tracker` are explicit `--state-dir`/tracker pins — either wins
-/// over the registry and refuses `--org`.
+/// Resolve this invocation's daemon state dir once. `org` is `--org`; a
+/// managed caller keeps its ambient binding and never consults the
+/// registry. `state`/`tracker` are explicit pins — either wins over the
+/// registry and refuses `--org`. Returns the state dir; a local-org
+/// selection also exports `CADENCE_PM_DIR` so the tracker lands on the
+/// org's root. Never resolves the tracker for a managed, pinned or
+/// ambient caller — those never needed it (the CAD-313 `ui login`
+/// residual runs with no `HOME`).
 pub(super) fn resolve(
     org: Option<&str>,
     state: Option<PathBuf>,
     tracker: Option<PathBuf>,
-) -> Result<(PathBuf, PathBuf)> {
-    // Inherited pins always win over a saved preference — a managed caller
-    // cannot be retargeted by a default the operator changed mid-run.
+) -> Result<PathBuf> {
+    // A managed caller's inherited binding always wins over a saved
+    // preference — it cannot be retargeted by a default the operator
+    // changed mid-run, and it never reads the registry at all.
     if std::env::var_os("CADENCE_ALIAS").is_some() {
         if org.is_some() {
             return Err(Error::rejected(
                 "managed callers cannot override their destination with --org",
             ));
         }
-        let state = state
+        return state
             .map(Ok)
-            .unwrap_or_else(cadence_agent::client::state_dir)?;
-        let tracker = tracker
-            .map(Ok)
-            .unwrap_or_else(cadence_agent::issue::default_dir)?;
-        return Ok((state, tracker));
+            .unwrap_or_else(cadence_agent::client::state_dir);
     }
     // An explicit flag or inherited binding is a pin; it conflicts with
     // `--org` rather than mixing roots.
@@ -386,13 +387,9 @@ pub(super) fn resolve(
                  use a clean operator shell",
             ));
         }
-        let state = state
+        return state
             .map(Ok)
-            .unwrap_or_else(cadence_agent::client::state_dir)?;
-        let tracker = tracker
-            .map(Ok)
-            .unwrap_or_else(cadence_agent::issue::default_dir)?;
-        return Ok((state, tracker));
+            .unwrap_or_else(cadence_agent::client::state_dir);
     }
     let org_env = std::env::var("CADENCE_ORG").ok();
     let org = org.or(org_env.as_deref());
@@ -410,9 +407,7 @@ pub(super) fn resolve(
         None => None,
     };
     let Some(conn) = selection else {
-        let state = cadence_agent::client::state_dir()?;
-        let tracker = cadence_agent::issue::default_dir()?;
-        return Ok((state, tracker));
+        return cadence_agent::client::state_dir();
     };
     match conn.destination {
         Destination::Local {
@@ -426,7 +421,7 @@ pub(super) fn resolve(
                 conn.selection.org,
                 state_dir.display()
             );
-            Ok((state_dir, tracker_dir))
+            Ok(state_dir)
         }
         Destination::Remote { endpoint, org_id } => Err(Error::rejected(format!(
             "org '{}' selects remote endpoint {endpoint} (org {org_id}) but remote \
@@ -440,6 +435,7 @@ pub(super) fn resolve(
 #[derive(clap::Subcommand)]
 pub(crate) enum OrgAction {
     /// Show registered orgs — destination and selection, never a credential.
+    #[command(alias = "ls")]
     List,
     /// Change the saved default org. Refused under a managed caller.
     Switch {

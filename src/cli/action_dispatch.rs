@@ -106,7 +106,7 @@ pub(crate) fn run() -> Result<i32> {
     {
         return app::run_dev(name, source, *port, host, allow_host);
     }
-    let (state_dir, _tracker_dir) = org::resolve(
+    let state_dir = org::resolve(
         cli.org.as_deref(),
         cli.state_dir.clone(),
         std::env::var_os("CADENCE_PM_DIR").map(PathBuf::from),
