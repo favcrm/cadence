@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ApiError } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import type { Connection } from "../../lib/types";
 import { smtpSummary } from "../settings/connectionsView";
 import Button from "../../ui/Button";
