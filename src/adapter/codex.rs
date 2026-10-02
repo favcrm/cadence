@@ -1357,9 +1357,7 @@ impl ProviderAdapter for CodexAdapter {
     /// Only the initialized, verified runtime receives this experimental
     /// capability. Other versions retain ordinary queued work, not steering.
     fn native_turn_steering(&self) -> bool {
-        self.shared.native_ready.load(Ordering::SeqCst)
-            && !self.transport.disconnected()
-            && !self.transport.disconnected()
+        self.shared.native_ready.load(Ordering::SeqCst) && !self.transport.disconnected()
     }
 
     /// Queue `text` into exactly `turn_id` while it runs. Only the
