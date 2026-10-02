@@ -6430,7 +6430,7 @@ fn cad561_update_refuses_a_dropped_alias_claiming_the_operator() {
 #[test]
 fn native_nudge_selects_only_the_verified_runtime_path() {
     let d = TestDaemon::start();
-    let mut owner = LaneShell::spawn(d.dir.path());
+    let owner = LaneShell::spawn(d.dir.path());
     plant_pane(&d, "pty1", owner.pid());
     cad162_sql(&d, "UPDATE agents SET enabled=1 WHERE alias='pty1'", &[]);
     let allowed = d
@@ -6478,24 +6478,23 @@ fn native_nudge_refuses_unproven_peer_self_and_forged_binding() {
     let d = TestDaemon::start();
     let _pi = d.mock_pi("normal");
     let upstream = json!({"model": "fake/model-1", "upstream": "pm"}).to_string();
-    let owner = register_pcp(
-        &d,
+    let owner = d.register_pcp(
         "w-native",
         "pi",
         "managed",
         d.dir.path().to_str().unwrap(),
         &upstream,
     );
-    assert_eq!(owner["alias"], "w-native", "{owner}");
+    assert_eq!(owner.unwrap()["alias"], "w-native");
     d.wait_agent("w-native", "idle", 10);
 
     // A planted pane has a real process identity, while the seeded
     // `upstream` is deliberately provider params, not a durable PM
     // row: this caller is a peer identity, not the steer owner.
     let home = TempDir::new().unwrap();
-    let mut pm_pane = LaneShell::spawn(&home);
+    let mut pm_pane = LaneShell::spawn(home.path());
     plant_pane(&d, "pm", pm_pane.pid());
-    let mut peer = LaneShell::spawn(&home);
+    let mut peer = LaneShell::spawn(home.path());
     plant_pane(&d, "peer", peer.pid());
     // A planted caller that shares the provider's params text still has
     // only its own enrolled endpoint identity. The params value cannot
@@ -6557,7 +6556,7 @@ fn native_nudge_refuses_unproven_peer_self_and_forged_binding() {
             .operator_rpc(
                 "agent_send",
                 json!({"alias": "w-native", "text": "steer", "nudge": true,
-                       "message": format!("n-forge-{i}"), field: "invented"}),
+                       "message": format!("n-forge-{i}"), *field: "invented"}),
             )
             .unwrap_err()
             .to_string();
