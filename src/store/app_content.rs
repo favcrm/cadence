@@ -819,6 +819,17 @@ struct ResolvedBinding {
     view: BindingView,
 }
 
+/// A stored assistant-draft proposal row read back for idempotent
+/// replay — campaign, source revision, content digest and the
+/// message/agent receipt it was claimed under (CAD-1014).
+struct PriorDraft {
+    campaign_id: String,
+    source_revision: i64,
+    content_digest: String,
+    receipt_message: Option<String>,
+    receipt_agent: Option<String>,
+}
+
 impl RecordStore {
     fn content_row(
         &self,
@@ -1931,20 +1942,28 @@ impl RecordStore {
             .unwrap_or(0);
         // Idempotent replay of the same proposal id on the same
         // message+agent+identical bytes returns the stored proposal.
-        let existing: Option<(String, i64, String, Option<String>, Option<String>)> = tx
+        let existing: Option<PriorDraft> = tx
             .query_row(
                 "SELECT campaign_id,source_revision,content_digest,receipt_message,receipt_agent FROM app_content_proposals WHERE context_id=? AND proposal_id=?",
                 params![context, proposal_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| {
+                    Ok(PriorDraft {
+                        campaign_id: r.get(0)?,
+                        source_revision: r.get(1)?,
+                        content_digest: r.get(2)?,
+                        receipt_message: r.get(3)?,
+                        receipt_agent: r.get(4)?,
+                    })
+                },
             )
             .optional()
             .map_err(|e| Error::internal(e.to_string()))?;
         if let Some(stored) = existing {
-            if stored.0 == campaign
-                && stored.1 == source_revision
-                && stored.2 == digest
-                && stored.3.as_deref() == Some(message)
-                && stored.4.as_deref() == Some(agent)
+            if stored.campaign_id == campaign
+                && stored.source_revision == source_revision
+                && stored.content_digest == digest
+                && stored.receipt_message.as_deref() == Some(message)
+                && stored.receipt_agent.as_deref() == Some(agent)
             {
                 drop(tx);
                 drop(conn);

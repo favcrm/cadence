@@ -1451,6 +1451,16 @@ fn plan_row_json(row: &PlanRow) -> Value {
     receipt
 }
 
+/// A stored CSV import receipt row — context, byte token, stored
+/// result JSON, state and the confirmed decisions digest (CAD-1014).
+struct CsvReceipt {
+    context_id: String,
+    preview_token: String,
+    result: String,
+    state: String,
+    decisions_digest: String,
+}
+
 impl RecordStore {
     /// Normalized-email conflict check inside an open write
     /// transaction: any OTHER live row in this context holding the
@@ -1499,14 +1509,19 @@ impl RecordStore {
         Ok(())
     }
 
-    fn import_receipt_in(
-        conn: &Connection,
-        request_id: &str,
-    ) -> Result<Option<(String, String, String, String, String)>> {
+    fn import_receipt_in(conn: &Connection, request_id: &str) -> Result<Option<CsvReceipt>> {
         conn.query_row(
             "SELECT context_id,preview_token,result,state,decisions_digest FROM app_record_csv_imports WHERE request_id=?",
             [request_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| {
+                Ok(CsvReceipt {
+                    context_id: r.get(0)?,
+                    preview_token: r.get(1)?,
+                    result: r.get(2)?,
+                    state: r.get(3)?,
+                    decisions_digest: r.get(4)?,
+                })
+            },
         )
         .optional()
         .map_err(|e| Error::internal(e.to_string()))
@@ -1523,14 +1538,17 @@ impl RecordStore {
     /// receipt written before that column, which only matches a call
     /// carrying the same empty digest (the operator's direct path).
     fn replay_or_refuse(
-        stored: (String, String, String, String, String),
+        stored: CsvReceipt,
         context: &str,
         preview_token: &str,
         decisions_digest: &str,
     ) -> Result<Value> {
-        if stored.0 == context && stored.1 == preview_token && stored.4 == decisions_digest {
-            if stored.3.as_str() == "complete" {
-                let mut result: Value = serde_json::from_str(&stored.2)
+        if stored.context_id == context
+            && stored.preview_token == preview_token
+            && stored.decisions_digest == decisions_digest
+        {
+            if stored.state.as_str() == "complete" {
+                let mut result: Value = serde_json::from_str(&stored.result)
                     .map_err(|_| Error::rejected("customer CSV receipt is unavailable"))?;
                 result["replayed"] = Value::Bool(true);
                 return Ok(result);
@@ -1973,10 +1991,10 @@ impl RecordStore {
         let conn = self.conn();
         Ok(match Self::import_receipt_in(&conn, request_id)? {
             Some(stored) => {
-                stored.0 == context
-                    && stored.1 == preview_token
-                    && stored.4 == decisions_digest
-                    && stored.3 == "complete"
+                stored.context_id == context
+                    && stored.preview_token == preview_token
+                    && stored.decisions_digest == decisions_digest
+                    && stored.state == "complete"
             }
             None => false,
         })
@@ -2197,7 +2215,9 @@ impl RecordStore {
             ) {
                 Ok(_) => {}
                 Err(_) => match Self::import_receipt_in(&tx, request_id)? {
-                    Some(winner) if winner.0 == context && winner.1 == preview_token => {
+                    Some(winner)
+                        if winner.context_id == context && winner.preview_token == preview_token =>
+                    {
                         drop(tx);
                         return Self::replay_or_refuse(winner, context, preview_token, &decisions_digest);
                     }
