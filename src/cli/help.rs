@@ -77,6 +77,7 @@ const OPERATOR: &[&str] = &[
     "sandbox",
     "session",
     "staging",
+    "org",
 ];
 
 /// Visible verbs that are neither core nor operator.

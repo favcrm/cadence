@@ -32,6 +32,13 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Select an organization/connection preference (CAD-1019). The saved
+    /// default is a pointer only — running work stays pinned to where it
+    /// started, and a managed caller (`CADENCE_ALIAS`) cannot move it.
+    Org {
+        #[command(subcommand)]
+        action: crate::cli::org::OrgAction,
+    },
     /// Check environment, storage and provider CLIs. `--host` instead
     /// runs the read-only host watchdog — disk free, provider store and
     /// WAL growth, per-user pipe pressure, orphaned processes from
