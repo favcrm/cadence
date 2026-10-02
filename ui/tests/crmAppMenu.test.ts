@@ -159,7 +159,7 @@ assert(
 );
 // Apps > CRM > children: the verified group nests immediately under
 // the Apps item, ahead of the next top-level item (Agents).
-const primaryNav = () => host.querySelector('aside > nav[aria-label="Primary"]');
+const primaryNav = () => host.querySelector('aside nav[aria-label="Primary"]');
 assert(primaryNav(), "desktop primary nav renders");
 const primaryKids = () => Array.from(primaryNav()?.children ?? []);
 const appsIdx = primaryKids().findIndex(
