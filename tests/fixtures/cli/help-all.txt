@@ -268,6 +268,7 @@ All commands (one line per path):
     staging delegate
     staging revoke
     staging delegations
+    staging refresh
   org            Select an organization/connection preference (CAD-1019)
     org list
     org switch
