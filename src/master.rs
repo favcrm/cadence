@@ -1541,7 +1541,7 @@ mod tests {
             "inst-1",
             "ctx-1",
             "msg-1",
-            "pi-1-0123456789abcdef",
+            "pi-1-fake-tok",
             Path::new("/s/master/tmp"),
         )
     }
@@ -1589,10 +1589,10 @@ mod tests {
     #[test]
     fn scoped_reference_has_real_ids_predicates_and_a_size_bound() {
         let text = sample_reference();
-        for real in ["inst-1", "ctx-1", "msg-1", "pi-1-0123456789abcdef"] {
+        for real in ["inst-1", "ctx-1", "msg-1", "pi-1-fake-tok"] {
             assert!(text.contains(real), "{real}");
         }
-        assert!(text.contains("--message msg-1 --token pi-1-0123456789abcdef"));
+        assert!(text.contains("--message msg-1 --token pi-1-fake-tok"));
         assert!(text.contains("/s/master/tmp/preds.json"));
         let fields: Vec<&str> = PREDICATE_EXAMPLES.iter().map(|(f, _)| *f).collect();
         assert_eq!(
