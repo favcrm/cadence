@@ -1,4 +1,4 @@
-import { parseChild, parseInit, type ScreenPush } from "./screenProtocol";
+import { parseChild, parseInit, shapeFor, type ScreenPush } from "./screenProtocol";
 
 export type MountReceipt = { mount: string; bridge_nonce: string; generation: number; tag: string };
 export function parseMount(value: unknown, tag: string): MountReceipt | null {
@@ -16,6 +16,8 @@ export function parseMount(value: unknown, tag: string): MountReceipt | null {
 export class ScreenChannel {
   private port: MessagePort | null = null;
   private ready = false;
+  /** Set once, by the child's `ready`: whether it opted into publish-intents.v1. */
+  private intents = false;
   private closed = false;
   private initialized = false;
   private loads = 0;
@@ -41,8 +43,9 @@ export class ScreenChannel {
       if (child.op === "ready") {
         if (this.ready) { this.close(true); return; }
         this.ready = true;
-        this.port?.postMessage(this.projection);
-        this.onReady();
+        this.intents = child.accepts !== undefined;
+        this.send();
+        if (!this.closed) this.onReady();
       }
       // Opaque local draft state is deliberately not persisted in the first release.
     };
@@ -56,7 +59,13 @@ export class ScreenChannel {
       this.close(true); return;
     }
     this.projection = projection;
-    if (this.ready) this.port?.postMessage(projection);
+    if (this.ready) this.send();
+  }
+  /** Send the negotiated shape, or close when it cannot be sent within bounds. */
+  private send(): void {
+    const push = shapeFor(this.projection, this.intents);
+    if (!push) { this.close(true); return; }
+    this.port?.postMessage(push);
   }
   load(): void { if (++this.loads > 1) this.close(true); }
   close(report = false): void {
