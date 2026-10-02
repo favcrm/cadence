@@ -191,6 +191,13 @@ impl Shared {
                 "request_id",
             ],
             "app_content_proposal_show" => &["install_id", "context_id", "proposal_id"],
+            "app_content_proposal_render" => &[
+                "install_id",
+                "context_id",
+                "proposal_id",
+                "sample_first_name",
+                "binding_id",
+            ],
             "app_content_proposal_list" => &["install_id", "context_id", "campaign_id"],
             "app_content_proposal_apply" => &[
                 "install_id",
@@ -240,6 +247,7 @@ impl Shared {
                 | "app_content_render"
                 | "app_content_proposal_show"
                 | "app_content_proposal_list"
+                | "app_content_proposal_render"
                 | "app_sender_binding_show"
                 | "app_sender_binding_list"
         );
@@ -342,6 +350,19 @@ impl Shared {
             }
             "app_content_proposal_show" => {
                 records.app_content_proposal_show(context, required_str(params, "proposal_id")?)
+            }
+            // CAD-1014: the operator's before-Apply preview of a pending
+            // proposal — the SAME safe render_html/text the saved-content
+            // path uses, over the stored proposal draft. Pure read; no
+            // apply/save/approve/send, send_ready always false.
+            "app_content_proposal_render" => {
+                let (_, sample) = content_render_scope(params)?;
+                records.app_content_proposal_render(
+                    context,
+                    required_str(params, "proposal_id")?,
+                    sample.as_deref(),
+                    content_binding(params)?,
+                )
             }
             "app_content_proposal_list" => {
                 let campaign = match params.get("campaign_id") {

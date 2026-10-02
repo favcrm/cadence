@@ -744,4 +744,27 @@ fn cad1014_scoped_chat_segment_preview_and_draft_discoverable() {
     );
     assert_eq!(shown["ok"], true, "{shown}");
     assert_eq!(shown["result"]["proposal"]["state"], "pending");
+
+    // The operator's BEFORE-APPLY preview renders the pending proposal
+    // through the same safe render_html/text — inert, preview-only,
+    // send_ready always false. No apply/save/approve/send ran.
+    let rendered: Value = w
+        .daemon
+        .operator_rpc(
+            "app_content_proposal_render",
+            json!({"install_id": install, "context_id": context_id, "proposal_id": "prop-1014-e9"}),
+        )
+        .unwrap();
+    let render = &rendered["render"];
+    assert_eq!(render["proposal_id"], "prop-1014-e9");
+    assert_eq!(render["state"], "pending");
+    assert_eq!(render["send_ready"], false);
+    assert_eq!(render["preview_only"], true);
+    // The proposal body text made it into the render — the operator
+    // reads exactly what they'd apply.
+    assert!(
+        render["html"].as_str().unwrap_or("").contains("Hello")
+            || render["text"].as_str().unwrap_or("").contains("Hello"),
+        "render dropped the proposal body: {render}"
+    );
 }

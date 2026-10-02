@@ -3001,6 +3001,7 @@ impl Shared {
             }
             "app_content_assistant_draft" => self.rpc_app_content_assistant_draft(params, peer_pid),
             "app_content_proposal_show" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_render" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_list" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_apply" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_discard" => self.rpc_app_content(method, params, peer_pid),

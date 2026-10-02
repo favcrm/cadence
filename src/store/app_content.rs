@@ -1488,6 +1488,81 @@ impl RecordStore {
         }}))
     }
 
+    /// CAD-1014: render a STORED proposal (the assistant's inert pending
+    /// draft) through the exact same `render_html`/`render_text` the
+    /// saved-content path uses — the operator's before-Apply preview.
+    /// Pure read: no apply/save/approve/send, no doc write, no freeze.
+    /// `send_ready:false`/`preview_only` always; the render carries the
+    /// proposal id, its state and the source revision it was drafted
+    /// against so the UI labels it as a proposal, never as live content.
+    /// A proposal that is not `pending` refuses — only an unapplied draft
+    /// has a preview to render.
+    pub fn app_content_proposal_render(
+        &self,
+        context: &str,
+        proposal_id: &str,
+        sample_first_name: Option<&str>,
+        binding_id: Option<&str>,
+    ) -> Result<Value> {
+        if let Some(name) = sample_first_name {
+            if !sample_name_valid(name) {
+                return Err(Error::rejected(
+                    "email sample name exceeds its supported shape or bounds",
+                ));
+            }
+        }
+        let conn = self.conn();
+        let row = self.proposal_row(&conn, context, proposal_id)?;
+        if row.state != "pending" {
+            return Err(Error::rejected(
+                "only a pending proposal has a before-apply preview",
+            ));
+        }
+        let raw: Value = serde_json::from_str(&row.blocks).unwrap_or(Value::Null);
+        let blocks = raw
+            .as_array()
+            .cloned()
+            .ok_or_else(|| Error::rejected("email proposal blocks are not an array"))?;
+        let draft = Draft::parse(&row.subject, &row.preheader, &blocks)?;
+        let binding = self.resolve_binding(&conn, context, binding_id)?;
+        let html = render_html(&draft, sample_first_name, &binding.view);
+        let text = render_text(&draft, sample_first_name, &binding.view);
+        let render_digest = material_digest(&json!({
+            "domain": "cadence-app-content-render-v1",
+            "content_digest": row.digest,
+            "binding_digest": binding.digest,
+            "proposal_id": proposal_id,
+            "html": html,
+            "text": text,
+        }));
+        let unsubscribe = unsubscribe_url(&binding.view);
+        Ok(json!({
+            "render": {
+                "proposal_id": proposal_id,
+                "campaign_id": row.campaign,
+                "install_id": self.install(),
+                "context_id": context,
+                "state": row.state,
+                "source_revision": row.source_revision,
+                "content_digest": row.digest,
+                "sample_first_name": sample_first_name,
+                "binding": {
+                    "binding_id": binding.binding_id,
+                    "revision": binding.revision,
+                    "digest": binding.digest,
+                    "preview_only": binding.preview_only,
+                },
+                "preview_only": true,
+                "send_ready": false,
+                "sender": {"name": binding.view.sender_name, "address": binding.view.sender_address},
+                "unsubscribe_url": unsubscribe,
+                "html": html,
+                "text": text,
+                "render_digest": render_digest,
+            },
+        }))
+    }
+
     /// CAD-813: mint a one-time, host-stamped proposal request.
     /// The daemon proved the chat message carries the server-verified
     /// App binding for this installation and context before calling

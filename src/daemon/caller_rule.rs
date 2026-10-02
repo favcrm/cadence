@@ -495,6 +495,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_content_assistant_proposals", Rule::Handler("active assigned scoped chat turn and verified App binding (CAD-1014); read-only proposal list, no claim")),
     ("app_content_assistant_proposal_show", Rule::Handler("active assigned scoped chat turn and verified App binding (CAD-1014); read-only proposal show, no claim")),
     ("app_content_proposal_show", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_proposal_render", Rule::Handler("operator_connection (CAD-782); before-Apply preview read (CAD-1014)")),
     ("app_content_proposal_list", Rule::Handler("operator_connection (CAD-782)")),
     ("app_content_proposal_apply", Rule::Handler("operator_connection (CAD-782)")),
     ("app_content_proposal_discard", Rule::Handler("operator_connection (CAD-782)")),
