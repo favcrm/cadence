@@ -10,6 +10,7 @@ use board_common::*;
 use serde_json::json;
 use serde_json::Value;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -1991,4 +1992,191 @@ fn dispatch_respects_claims() {
         "{d2}"
     );
     assert_eq!(messages("w1"), 2);
+}
+
+// ---------- CAD-1021 slice 1: per-worktree pre-push hook ----------
+
+/// The worktree's own git dir (`.git/worktrees/<name>`) — where the hook
+/// and its config.worktree live.
+fn wt_git_dir(wt: &Path) -> PathBuf {
+    PathBuf::from(git(wt, &["rev-parse", "--absolute-git-dir"]).1)
+}
+
+#[test]
+fn issue_start_installs_per_worktree_pre_push_hook() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "new", "Hooked", "--project", "demo"]
+        )
+        .0
+    );
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let wt = PathBuf::from(out["worktree"].as_str().unwrap());
+    // The hook sits under the worktree's OWN git dir, executable.
+    let hook = wt_git_dir(&wt).join("cadence-hooks/pre-push");
+    assert!(hook.is_file(), "hook missing at {}", hook.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(hook.metadata().unwrap().permissions().mode() & 0o111, 0o111);
+    }
+    let body = std::fs::read_to_string(&hook).unwrap();
+    assert!(body.contains("scripts/pre-push"), "{body}");
+    assert!(body.contains("cadence-pre-push-receipt"), "{body}");
+    // Per-worktree config: hooksPath lands in config.worktree, never the
+    // shared config or the shared .git/hooks dir.
+    let (_g, hooks_path) = git(&wt, &["config", "--worktree", "core.hooksPath"]);
+    assert_eq!(
+        hooks_path,
+        wt_git_dir(&wt).join("cadence-hooks").to_str().unwrap()
+    );
+    assert!(!repo.join(".git/hooks/pre-push").exists());
+    let shared = git(&repo, &["config", "core.hooksPath"]);
+    assert!(!shared.1.contains("cadence-hooks"), "shared config touched");
+}
+
+#[test]
+fn issue_start_hook_is_idempotent_on_reuse() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "new", "Reheal", "--project", "demo"]
+        )
+        .0
+    );
+    let (_, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    let wt = PathBuf::from(out["worktree"].as_str().unwrap());
+    let hook = wt_git_dir(&wt).join("cadence-hooks/pre-push");
+    assert!(hook.is_file());
+    // Simulate a lane whose git dir was wiped: remove the hook dir, then
+    // re-start (the CAD-274 reuse path) must re-heal it.
+    std::fs::remove_dir_all(wt_git_dir(&wt).join("cadence-hooks")).unwrap();
+    git(&wt, &["config", "--worktree", "--unset", "core.hooksPath"]);
+    let (ok, out2) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out2}");
+    assert!(hook.is_file(), "re-start did not re-heal the hook");
+    let (_g, hp) = git(&wt, &["config", "--worktree", "core.hooksPath"]);
+    assert!(hp.contains("cadence-hooks"));
+    let _ = repo; // fixture anchor
+}
+
+#[test]
+fn main_checkout_never_gets_the_hook() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "new", "Main Clean", "--project", "demo"]
+        )
+        .0
+    );
+    let (ok, _) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok);
+    // The shared hooks dir is untouched, and the main checkout's own
+    // core.hooksPath is not the lane's.
+    assert!(!repo.join(".git/hooks/pre-push").exists());
+    let (_, hp) = git(&repo, &["config", "--local", "core.hooksPath"]);
+    assert!(
+        !hp.contains("cadence-hooks"),
+        "main checkout got the hook: {hp}"
+    );
+    // The worktree flag landed but main has no hooksPath of its own.
+    let (_ok2, ext) = git(&repo, &["config", "extensions.worktreeConfig"]);
+    assert_eq!(ext, "true");
+}
+
+/// Point the worktree's `scripts/pre-push` at a stub that exits `rc` and
+/// records its run, so a push can be driven through the real git hook
+/// without a cargo build. Returns the stub's log path.
+fn stub_pre_push(wt: &Path, rc: &str, log: &Path) {
+    let script = format!(
+        "#!/bin/sh\necho ran >> \"{}\"\necho \"head=x lane=y kind=check steps=fmt:0 rc={} at=1\"\nexit {}\n",
+        log.display(),
+        rc,
+        rc
+    );
+    std::fs::create_dir_all(wt.join("scripts")).unwrap();
+    let p = wt.join("scripts/pre-push");
+    std::fs::write(&p, &script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[test]
+fn lane_push_blocks_on_failed_pre_push_and_allows_on_pass() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Gate", "--project", "demo"]).0);
+    let (_, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    let wt = PathBuf::from(out["worktree"].as_str().unwrap());
+    // `git push` needs a remote — a bare sibling repo takes the ref.
+    let bare = repo.parent().unwrap().join("origin.git");
+    assert!(git(&repo, &["init", "--bare", "-q", bare.to_str().unwrap()]).0);
+    assert!(git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]).0);
+    // Fetch once so origin/HEAD exists for the worktree's push base.
+    assert!(git(&repo, &["fetch", "origin", "-q"]).0);
+    let log = repo.join("pp.log");
+    // A failing pre-push blocks the push (git runs our hook).
+    stub_pre_push(&wt, "1", &log);
+    let (pushed, out_err) = git(&wt, &["push", "origin", "HEAD:x-does-not-land"]);
+    assert!(
+        !pushed,
+        "push went through despite failing pre-push: {out_err}"
+    );
+    // A passing one allows it and writes the receipt.
+    stub_pre_push(&wt, "0", &log);
+    let (pushed2, out2) = git(&wt, &["push", "origin", "HEAD:x-lands"]);
+    assert!(pushed2, "passing pre-push still blocked the push: {out2}");
+    let receipt = wt_git_dir(&wt).join("cadence-pre-push-receipt");
+    assert!(receipt.is_file(), "no receipt written");
+    let text = std::fs::read_to_string(&receipt).unwrap();
+    assert!(text.contains("kind=check"), "{text}");
+    assert!(std::fs::read_to_string(&log).unwrap().lines().count() >= 1);
+    // And the push actually landed the ref on the remote (a bare repo).
+    let (_, landed) = git(&bare, &["branch", "--list", "x-lands"]);
+    assert!(landed.contains("x-lands"), "{landed}");
+}
+
+/// A lane whose checkout lacks `scripts/pre-push` (a fixture, a sparse repo)
+/// must not be blocked by the gate — the hook records a skipped receipt and
+/// lets the push through rather than fail on a script that isn't there.
+#[test]
+fn lane_push_allowed_when_repo_has_no_pre_push_script() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "new", "No Script", "--project", "demo"]
+        )
+        .0
+    );
+    let (_, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    let wt = PathBuf::from(out["worktree"].as_str().unwrap());
+    // The fixture repo has no scripts/pre-push — the hook must not block it.
+    assert!(!wt.join("scripts/pre-push").exists());
+    let bare = repo.parent().unwrap().join("origin.git");
+    assert!(git(&repo, &["init", "--bare", "-q", bare.to_str().unwrap()]).0);
+    assert!(git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]).0);
+    let (pushed, out2) = git(&wt, &["push", "origin", "HEAD:x-no-script"]);
+    assert!(
+        pushed,
+        "push blocked although scripts/pre-push is absent: {out2}"
+    );
+    let receipt = wt_git_dir(&wt).join("cadence-pre-push-receipt");
+    assert!(receipt.is_file(), "no receipt written");
+    let text = std::fs::read_to_string(&receipt).unwrap();
+    assert!(text.contains("skipped:no-pre-push"), "{text}");
+    assert!(text.contains("rc=0"), "{text}");
+    let (_, landed) = git(&bare, &["branch", "--list", "x-no-script"]);
+    assert!(landed.contains("x-no-script"), "{landed}");
 }
