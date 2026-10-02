@@ -48,6 +48,10 @@
 
 #![allow(dead_code)]
 
+// `AsRawFd` is only used by the Linux cfg'd peer/exe/listener paths; guarding
+// the import keeps macOS (and other unix targets) free of an unused-import
+// `-D warnings` failure while Linux still gets it.
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 
 use crate::error::{Error, Result};
@@ -196,15 +200,18 @@ const MAX_EXE_BYTES: u64 = 128 * 1024 * 1024;
 /// A stable `(ino, size, mtime_ns, ctime_ns)` fingerprint of the exe fd — the
 /// binary must not change under the read.
 #[cfg(target_os = "linux")]
+// NOTE: `st_nlink` is u64 on x86_64/most ABIs but u32 on some 32-bit/arm
+// targets, and `st_uid`/`st_mode` widths also vary — keep the stability
+// fingerprint to the inode/size/timestamps (the fields that must not change
+// under the read). Ownership + link-count + writability are checked against
+// the raw `libc::stat` in `peer_exe_digest`, not folded into the equality
+// fingerprint (avoids a cross-ABI widening/cast lint trap).
 #[derive(PartialEq, Eq)]
 struct ExeStat {
     ino: u64,
     size: u64,
     mtime_ns: i128,
     ctime_ns: i128,
-    mode: u32,
-    uid: u32,
-    nlink: u64,
 }
 #[cfg(target_os = "linux")]
 fn exe_stat(m: &libc::stat) -> ExeStat {
@@ -213,9 +220,6 @@ fn exe_stat(m: &libc::stat) -> ExeStat {
         size: m.st_size as u64,
         mtime_ns: (m.st_mtime as i128) * 1_000_000_000 + m.st_mtime_nsec as i128,
         ctime_ns: (m.st_ctime as i128) * 1_000_000_000 + m.st_ctime_nsec as i128,
-        mode: m.st_mode,
-        uid: m.st_uid,
-        nlink: m.st_nlink,
     }
 }
 
@@ -252,18 +256,19 @@ fn peer_exe_digest(pid: u32) -> Result<[u8; 32]> {
         )));
     }
     let before = exe_stat(&st);
-    // Must be a regular file (not a fifo/dir/symlink), root-owned, and not
-    // group/other-writable — the installed helper binary's custody.
-    if before.mode & libc::S_IFMT != libc::S_IFREG {
+    // Must be a regular file (not a fifo/dir/symlink), root-owned, not
+    // group/other-writable, and linked — the installed helper binary's
+    // custody. Read these off the raw stat (widths vary across ABIs).
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(Error::rejected("/proc/<pid>/exe is not a regular file"));
     }
-    if before.uid != 0 {
+    if st.st_uid != 0 {
         return Err(Error::rejected("installer binary is not root-owned"));
     }
-    if before.mode & 0o022 != 0 {
+    if st.st_mode & 0o022 != 0 {
         return Err(Error::rejected("installer binary is group/other-writable"));
     }
-    if before.nlink < 1 {
+    if st.st_nlink < 1 {
         return Err(Error::rejected("installer binary has zero links"));
     }
     if before.size > MAX_EXE_BYTES {
