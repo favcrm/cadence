@@ -411,17 +411,25 @@ impl PreparedExec {
     ///
     /// `setsid` runs first and is error-checked; `execveat` `-1` maps to
     /// `last_os_error` immediately (the return value is not the errno).
-    #[cfg(target_os = "linux")]
-    pub(crate) fn attach(self, cmd: &mut std::process::Command) {
-        use std::os::unix::process::CommandExt;
-        let args = ExecArgs {
+    /// Consume the plan into the owned `ExecArgs` carrier — the single
+    /// canonical "move every backing + the fd into the closure" step. The
+    /// `PreparedExec` is destructured *into* `args`, so no owner is dropped
+    /// while a pointer array still references it (the use-after-free shape).
+    fn into_exec_args(self) -> ExecArgs {
+        ExecArgs {
             helper_fd: self.helper_fd,
             argv_c: self.argv_c,
             envp_c: self.envp_c,
             empty_path: &EMPTY_PATH_NUL as *const u8 as *const libc::c_char,
             argv_p: self.argv_p,
             envp_p: self.envp_p,
-        };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn attach(self, cmd: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        let args = self.into_exec_args();
         unsafe {
             // `move` on the whole `ExecArgs` forces whole-struct capture so the
             // closure is Send/Sync (Edition-2021 disjoint field capture would
@@ -563,30 +571,54 @@ mod tests {
         let plan = PreparedExec::assemble(&segs(), &["pi".to_string()], env)
             .unwrap()
             .with_bound(bound(&path));
+        assert_plan_pointers_resolve(&plan.argv_c, &plan.argv_p);
+        assert_plan_pointers_resolve(&plan.envp_c, &plan.envp_p);
+    }
+
+    /// The reviewer's exact defect was a destructure that dropped `argv_c`/
+    /// `envp_c` while `argv_p`/`envp_p` were read post-fork — a use-after-free.
+    /// The fix moves the backings *into* the closure via `ExecArgs`. This test
+    /// builds the carrier the same way `attach` does and asserts the pointers
+    /// resolve through the carrier's *owned* backings: drop the `PreparedExec`
+    /// first, then read the pointers — they must still resolve, because the
+    /// memory lives in `args`, not the dropped plan.
+    #[test]
+    fn exec_args_carrier_owns_backings_after_plan_is_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h");
+        std::fs::write(&path, b"x").unwrap();
+        let env = vec![CString::new("K=V").unwrap()];
+        let plan = PreparedExec::assemble(&segs(), &["pi".to_string()], env)
+            .unwrap()
+            .with_bound(bound(&path));
+        // Consume the plan into the same owned carrier `attach` uses — every
+        // field (fd + CString backings + pointer arrays) moves into `args`.
+        // The plan value is gone; `args` alone owns the memory the pointers
+        // index, and it is what the pre_exec closure carries across the fork.
+        let args = plan.into_exec_args();
+        assert_plan_pointers_resolve(&args.argv_c, &args.argv_p);
+        assert_plan_pointers_resolve(&args.envp_c, &args.envp_p);
+        // The fd is still owned by the carrier, not the consumed plan.
+        assert!(args.helper_fd.as_raw_fd() > 0);
+    }
+
+    /// Dereference a pointer array against its owned backing: each pointer is
+    /// a live NUL-terminated `CStr` equal to the corresponding `CString`, and
+    /// the array is NULL-terminated after the last entry.
+    fn assert_plan_pointers_resolve(backing: &[CString], ptrs: &[*const libc::c_char]) {
         unsafe {
-            // argv_p is NULL-terminated after the real args.
             let mut i = 0usize;
             loop {
-                let p = plan.argv_p[i];
+                let p = ptrs[i];
                 if p.is_null() {
                     break;
                 }
                 let s = std::ffi::CStr::from_ptr(p).to_string_lossy();
-                assert_eq!(s, plan.argv_c[i].to_string_lossy());
+                assert_eq!(s, backing[i].to_string_lossy());
                 i += 1;
             }
-            assert_eq!(i, plan.argv_c.len());
-            let mut j = 0usize;
-            loop {
-                let p = plan.envp_p[j];
-                if p.is_null() {
-                    break;
-                }
-                let s = std::ffi::CStr::from_ptr(p).to_string_lossy();
-                assert_eq!(s, plan.envp_c[j].to_string_lossy());
-                j += 1;
-            }
-            assert_eq!(j, plan.envp_c.len());
+            assert_eq!(i, backing.len());
+            assert!(ptrs[i].is_null(), "pointer array must be NULL-terminated");
         }
     }
 
