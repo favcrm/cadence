@@ -20,6 +20,57 @@
 
 use super::*;
 use crate::store::app_runs::material_digest;
+use uuid::Uuid;
+
+/// A SQLite constraint violation is a lost claim/confirm race, never a
+/// crash. Callers map it to the bounded already-used/already-claimed
+/// refusal — same classifier as `app_content::is_claim_conflict`, kept
+/// local so the record store does not reach across store modules.
+/// CAD-1014: the canonical digest of a CSV `decisions` array that the
+/// host-bound confirm receipt binds. Both the operator's
+/// `app_record_csv_confirm` mint and the assistant import's redeem
+/// compute it over the SAME normalized JSON — `[{row, action,
+/// expected_revision?}]` — so a confirmed plan can never drift from what
+/// the assistant applies. Absent/empty decisions digest `[]`.
+pub fn csv_decisions_digest(decisions: &Value) -> Result<String> {
+    let list = match decisions {
+        Value::Null => Vec::new(),
+        Value::Array(items) => items.clone(),
+        _ => {
+            return Err(Error::rejected(
+                "customer CSV decisions digest source must be an array",
+            ))
+        }
+    };
+    let mut normalized = Vec::with_capacity(list.len());
+    for item in &list {
+        let fields = item
+            .as_object()
+            .ok_or_else(|| Error::rejected("customer CSV decision must be an object"))?;
+        let row = fields
+            .get("row")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| Error::rejected("customer CSV decision needs a numeric row"))?;
+        let action = fields
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("customer CSV decision needs an action"))?;
+        let mut entry = json!({"row": row, "action": action});
+        if let Some(rev) = fields.get("expected_revision").and_then(Value::as_i64) {
+            entry["expected_revision"] = json!(rev);
+        }
+        normalized.push(entry);
+    }
+    Ok(material_digest(&Value::Array(normalized)))
+}
+
+fn record_claim_conflict(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(error, _)
+            if error.code == rusqlite::ffi::ErrorCode::ConstraintViolation
+    )
+}
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -180,6 +231,13 @@ CREATE TABLE IF NOT EXISTS app_assistant_claims(
  action TEXT NOT NULL, request_id TEXT, agent TEXT NOT NULL,
  created REAL NOT NULL,
  PRIMARY KEY(context_id, message_id));
+CREATE TABLE IF NOT EXISTS app_csv_confirms(
+ context_id TEXT NOT NULL, request_id TEXT NOT NULL,
+ preview_token TEXT NOT NULL, decisions_digest TEXT NOT NULL,
+ nonce TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('open','used')),
+ created REAL NOT NULL, decided REAL,
+ PRIMARY KEY(context_id, request_id));
 ";
 
 /// The record file for an installation. The identifier grammar
@@ -648,7 +706,14 @@ impl RecordStore {
                  context_id TEXT NOT NULL, message_id TEXT NOT NULL,\
                  action TEXT NOT NULL, request_id TEXT, agent TEXT NOT NULL,\
                  created REAL NOT NULL,\
-                 PRIMARY KEY(context_id, message_id))",
+                 PRIMARY KEY(context_id, message_id));\
+                 CREATE TABLE IF NOT EXISTS app_csv_confirms(\
+                 context_id TEXT NOT NULL, request_id TEXT NOT NULL,\
+                 preview_token TEXT NOT NULL, decisions_digest TEXT NOT NULL,\
+                 nonce TEXT NOT NULL,\
+                 state TEXT NOT NULL CHECK(state IN ('open','used')),\
+                 created REAL NOT NULL, decided REAL,\
+                 PRIMARY KEY(context_id, request_id))",
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
         }
@@ -1809,6 +1874,28 @@ impl RecordStore {
         }))
     }
 
+    /// Whether a completed CSV import receipt already exists for
+    /// `(context, request_id)` — read-only. The assistant redeem uses
+    /// this to let an identical replay (same request id + bytes)
+    /// short-circuit to the stored receipt WITHOUT spending a fresh
+    /// confirm nonce; a new request id still needs the operator's
+    /// confirm.
+    pub fn app_record_csv_receipt_exists(
+        &self,
+        context: &str,
+        request_id: &str,
+        preview_token: &str,
+    ) -> Result<bool> {
+        crate::proto::identifier(context, "context ID")?;
+        let conn = self.conn();
+        Ok(match Self::import_receipt_in(&conn, request_id)? {
+            Some(stored) => {
+                stored.0 == context && stored.1 == preview_token && stored.3 == "complete"
+            }
+            None => false,
+        })
+    }
+
     /// Explicit import of a previewed CSV. The token must bind these
     /// exact bytes; `request_id` is reserved as a pending receipt before
     /// any row mutates. A repeat with the same bytes replays the stored
@@ -2047,6 +2134,142 @@ impl RecordStore {
             }
         }
         Ok(result)
+    }
+
+    /// CAD-1014: mint the host-bound confirm receipt for one previewed
+    /// CSV import. OPERATOR PATH ONLY — the daemon RPC gates this to the
+    /// operator connection. The mint stamps the byte-binding
+    /// `preview_token`, the request id, the exact `decisions` digest and
+    /// a fresh one-use nonce the agent cannot mint or forge (it is a
+    /// server-generated uuid, never derivable from the CSV bytes or the
+    /// preview token). An identical re-confirm replays the minted row.
+    /// A genuine scoped chat message is NOT the confirmation — this
+    /// nonce, minted by the operator's confirm action, is.
+    pub fn app_record_csv_confirm(
+        &self,
+        context: &str,
+        request_id: &str,
+        preview_token: &str,
+        decisions_digest: &str,
+    ) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(request_id, "request ID")?;
+        if preview_token.len() > 128 || !preview_token.starts_with("sha256:") {
+            return Err(Error::rejected(
+                "customer CSV preview token is out of bounds",
+            ));
+        }
+        if decisions_digest.len() > 128 || !decisions_digest.starts_with("sha256:") {
+            return Err(Error::rejected(
+                "customer CSV decisions digest is out of bounds",
+            ));
+        }
+        let conn = self.conn();
+        if let Some((stored_nonce, stored_state)) = conn
+            .query_row(
+                "SELECT nonce,state FROM app_csv_confirms WHERE context_id=? AND request_id=?",
+                params![context, request_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?
+        {
+            // Idempotent re-confirm of the SAME bound plan returns the
+            // same nonce; a different plan under this request id refuses.
+            let bound: (String, String) = conn
+                .query_row(
+                    "SELECT preview_token,decisions_digest FROM app_csv_confirms WHERE context_id=? AND request_id=?",
+                    params![context, request_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            if bound.0 == preview_token && bound.1 == decisions_digest {
+                return Ok(
+                    json!({"confirm_token": stored_nonce, "state": stored_state, "request_id": request_id}),
+                );
+            }
+            return Err(Error::rejected(
+                "customer CSV confirm request id is bound to a different plan",
+            ));
+        }
+        let nonce = format!("confirm-{}", Uuid::new_v4().simple());
+        conn.execute(
+            "INSERT INTO app_csv_confirms(context_id,request_id,preview_token,decisions_digest,nonce,state,created) VALUES(?,?,?,?,?,'open',?)",
+            params![context, request_id, preview_token, decisions_digest, nonce, now()],
+        )
+        .map_err(|e| {
+            if record_claim_conflict(&e) {
+                Error::rejected("customer CSV confirm request id is already used")
+            } else {
+                Error::internal(e.to_string())
+            }
+        })?;
+        Ok(json!({"confirm_token": nonce, "state": "open", "request_id": request_id}))
+    }
+
+    /// CAD-1014: consume the operator-minted confirm for one assistant
+    /// CSV import. Called by the assistant redeem after the scoped-chat
+    /// and claim gates, before any row mutates. The redeem supplies the
+    /// `confirm_token` nonce; it must match an `open` row whose bound
+    /// preview_token, request id and decisions digest ALL equal the
+    /// call's — then the row is spent (`used`) in the same transaction.
+    /// A forged, cross-scope, stale or already-spent nonce refuses and
+    /// writes nothing.
+    pub fn app_record_csv_redeem_confirm(
+        &self,
+        context: &str,
+        request_id: &str,
+        preview_token: &str,
+        decisions_digest: &str,
+        confirm_token: &str,
+    ) -> Result<()> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(request_id, "request ID")?;
+        if confirm_token.is_empty() || confirm_token.len() > 128 {
+            return Err(Error::rejected("customer CSV confirm token is malformed"));
+        }
+        let conn = self.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| Error::internal(e.to_string()))?;
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT preview_token,decisions_digest,nonce,state FROM app_csv_confirms WHERE context_id=? AND request_id=?",
+                params![context, request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?
+            .map(|(pt, dd)| (pt, dd));
+        // Bind nonce, token and digest together in one probe — an
+        // over-broad lookup would let a mismatched bound pass.
+        let confirmed: Option<(String,)> = tx
+            .query_row(
+                "SELECT state FROM app_csv_confirms WHERE context_id=? AND request_id=? AND preview_token=? AND decisions_digest=? AND nonce=?",
+                params![context, request_id, preview_token, decisions_digest, confirm_token],
+                |r| Ok((r.get(0)?,)),
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let Some((state,)) = confirmed else {
+            return Err(Error::rejected(
+                "customer CSV import needs the operator's confirm of this exact previewed plan",
+            ));
+        };
+        if state != "open" {
+            return Err(Error::rejected("customer CSV confirm is already spent"));
+        }
+        let _ = row; // bound fields already proved by the keyed lookup
+        let spent = tx
+            .execute(
+                "UPDATE app_csv_confirms SET state='used',decided=? WHERE context_id=? AND request_id=? AND state='open'",
+                params![now(), context, request_id],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if spent != 1 {
+            return Err(Error::rejected("customer CSV confirm is already spent"));
+        }
+        tx.commit().map_err(|e| Error::internal(e.to_string()))
     }
 }
 

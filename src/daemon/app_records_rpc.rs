@@ -151,6 +151,13 @@ impl Shared {
                 "request_id",
                 "decisions",
             ],
+            "app_record_csv_confirm" => &[
+                "install_id",
+                "context_id",
+                "preview_token",
+                "request_id",
+                "decisions_digest",
+            ],
             _ => return Err(Error::rejected("unknown app record method")),
         };
         let fields = params
@@ -165,7 +172,10 @@ impl Shared {
         let pm = self.pm_at(&self.pm_dir()?)?;
         let write = matches!(
             method,
-            "app_record_create" | "app_record_update" | "app_record_csv_import"
+            "app_record_create"
+                | "app_record_update"
+                | "app_record_csv_import"
+                | "app_record_csv_confirm"
         );
         // The installation snapshot and (for writes) the live context
         // proof come from core; the record file opens after, in
@@ -207,6 +217,18 @@ impl Shared {
                 required_str(params, "preview_token")?,
                 required_str(params, "request_id")?,
                 csv_decisions(params)?,
+            ),
+            // CAD-1014: the operator's explicit confirm of the exact
+            // byte-bound plan — mints the host-held one-use nonce the
+            // assistant import redeems. `decisions_digest` is the
+            // material digest of the confirmed decisions array
+            // (`sha256:`); the confirm binds token + scope + request +
+            // decisions, never agent text.
+            "app_record_csv_confirm" => records.app_record_csv_confirm(
+                context,
+                required_str(params, "request_id")?,
+                required_str(params, "preview_token")?,
+                required_str(params, "decisions_digest")?,
             ),
             _ => Err(Error::rejected("unknown app record method")),
         }?;

@@ -2951,11 +2951,17 @@ impl Shared {
             "app_record_update" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_preview" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_import" => self.rpc_app_record(method, params, peer_pid),
+            "app_record_csv_confirm" => self.rpc_app_record(method, params, peer_pid),
             "app_segment_save" => self.rpc_app_audience(method, params, peer_pid),
             "app_record_csv_assistant_import" => {
                 self.rpc_app_record_csv_assistant_import(params, peer_pid)
             }
             "app_segment_assistant_save" => self.rpc_app_segment_assistant_save(params, peer_pid),
+            "app_segment_assistant_list"
+            | "app_segment_assistant_show"
+            | "app_record_csv_assistant_preview" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
             "app_segment_show" => self.rpc_app_audience(method, params, peer_pid),
             "app_segment_list" => self.rpc_app_audience(method, params, peer_pid),
             "app_exclusion_save" => self.rpc_app_audience(method, params, peer_pid),

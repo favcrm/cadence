@@ -167,6 +167,12 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     // revision-checked segment save — never the operator verbs.
     "Bash(cadence app record csv-assistant-import *)",
     "Bash(cadence app audience segment-assistant-save *)",
+    // The scoped-chat reads behind the commits: segment revision/
+    // membership and the CSV preview. Read-only — they never claim the
+    // message. `csv-confirm` is the operator's verb, not the agent's.
+    "Bash(cadence app audience segment-assistant-ls *)",
+    "Bash(cadence app audience segment-assistant-show *)",
+    "Bash(cadence app record csv-assistant-preview *)",
 ];
 
 /// The only built-in tool the master's Claude session has (`--tools`):

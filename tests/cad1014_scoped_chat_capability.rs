@@ -156,6 +156,24 @@ impl Crm {
             )
             .unwrap()
     }
+
+    /// The operator's explicit host-side confirm of the exact previewed
+    /// plan — mints the one-use `confirm_token` the assistant import
+    /// redeems. `decisions_digest` binds the confirmed decision set
+    /// (empty array = the default preview plan).
+    fn confirm(&self, install: &str, context: &str, preview_token: &str, request: &str) -> String {
+        self.daemon
+            .operator_rpc(
+                "app_record_csv_confirm",
+                json!({"install_id": install, "context_id": context, "preview_token": preview_token,
+                       "request_id": request,
+                       "decisions_digest": cadence_agent::store::app_records::csv_decisions_digest(&json!([])).unwrap()}),
+            )
+            .unwrap()["confirm_token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
 }
 
 /// RED: a scoped chat turn's delegated CSV import — the operator's own
@@ -179,30 +197,50 @@ fn cad1014_scoped_chat_csv_import_redeems_scope_once() {
     plant_member_pane(&w.daemon, "crm-chat", "claude", None, lane.pid());
     let token = w.chat_turn("crm-chat", install, context_id, "chat-1014-1");
 
-    // The redeem verb (proposed name): scope from the stamped message,
-    // bytes bound by the existing preview token. Refused today.
+    // WITHOUT the operator's confirm the import MUST refuse: a scoped
+    // chat message alone is not confirmation — the agent cannot mint or
+    // hash-forge the host-side confirm receipt.
+    let unconfirmed: Value = lane.rpc(
+        &w.daemon.state,
+        "app_record_csv_assistant_import",
+        json!({"install_id": install, "context_id": context_id,
+               "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-1",
+               "confirm_token": "confirm-forged", "message": "chat-1014-1", "token": token}),
+    );
+    assert_eq!(
+        unconfirmed["ok"], false,
+        "assistant import ran without a host-minted confirm: {unconfirmed}"
+    );
+
+    // The operator confirms the exact previewed plan (host side); the
+    // agent redeems the minted nonce.
+    let confirm_token = w.confirm(install, context_id, &token_preview, "req-1014-1");
     let redeem: Value = lane.rpc(
         &w.daemon.state,
         "app_record_csv_assistant_import",
         json!({"install_id": install, "context_id": context_id,
                "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-1",
-               "message": "chat-1014-1", "token": token}),
+               "confirm_token": confirm_token, "message": "chat-1014-1", "token": token}),
     );
     // GREEN post-guard: the stamped scoped chat message redeems one
-    // byte-bound import under the verified scope.
+    // byte-bound, operator-confirmed import under the verified scope.
     assert_eq!(redeem["ok"], true, "{redeem}");
     let applied = redeem["result"]["summary"]["applied"]
         .as_i64()
         .unwrap_or(-1);
     assert_eq!(applied, 1, "expected one imported record: {redeem}");
-    // Replay with the identical request id is idempotent; a fresh id on
-    // the same message is refused as already claimed.
+    // Replay with the identical request id is idempotent — the claim
+    // row matches action+request, and the spent confirm is re-proved
+    // (redeem_confirm tolerates the already-'used' state for a replay
+    // of the SAME request id is NOT re-redeemed: the import's own
+    // receipt replay returns before confirm is consulted — see the
+    // claim/dedupe ordering). We assert the replay reads back.
     let replay: Value = lane.rpc(
         &w.daemon.state,
         "app_record_csv_assistant_import",
         json!({"install_id": install, "context_id": context_id,
                "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-1",
-               "message": "chat-1014-1", "token": token}),
+               "confirm_token": confirm_token, "message": "chat-1014-1", "token": token}),
     );
     assert_eq!(replay["ok"], true, "identical replay refused: {replay}");
     let second: Value = lane.rpc(
@@ -210,7 +248,7 @@ fn cad1014_scoped_chat_csv_import_redeems_scope_once() {
         "app_record_csv_assistant_import",
         json!({"install_id": install, "context_id": context_id,
                "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-2",
-               "message": "chat-1014-1", "token": token}),
+               "confirm_token": confirm_token, "message": "chat-1014-1", "token": token}),
     );
     assert_eq!(
         second["ok"], false,
@@ -285,12 +323,27 @@ fn cad1014_scoped_chat_refusals_are_closed() {
     // A second scoped message to context B exists; its binding must never
     // lend scope to a context-A call.
     let _other = w.chat_turn("crm-chat", install, &ctx_b, "chat-1014-3b");
+    // The operator confirms the exact ctx-A plan; the probes below must
+    // each refuse for their OWN reason, not merely for a missing confirm.
+    let confirm_token = w.confirm(install, &ctx_a, &token_preview, "req-1014-3");
 
     let base = || {
         json!({"install_id": install, "context_id": ctx_a,
                "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-3",
-               "message": "chat-1014-3a", "token": token})
+               "confirm_token": confirm_token, "message": "chat-1014-3a", "token": token})
     };
+    // An agent can never mint its own confirm receipt (operator-only).
+    let agent_mint: Value = lane.rpc(
+        &w.daemon.state,
+        "app_record_csv_confirm",
+        json!({"install_id": install, "context_id": ctx_a,
+               "preview_token": token_preview, "request_id": "req-forged-mint",
+               "decisions_digest": cadence_agent::store::app_records::csv_decisions_digest(&json!([])).unwrap()}),
+    );
+    assert_eq!(
+        agent_mint["ok"], false,
+        "agent minted its own CSV confirm: {agent_mint}"
+    );
     // Forged identity/receipt/routing fields are not transport fields.
     for params in [
         {

@@ -92,6 +92,11 @@ pub const MASTER_ALLOWED: &[&str] = &[
     // delegated writes, never the operator verbs or a generic app write.
     "app_record_csv_assistant_import",
     "app_segment_assistant_save",
+    // CAD-1014(b): the scoped-chat reads behind the commits — segment
+    // revision/membership and the CSV preview. Read-only, no claim.
+    "app_segment_assistant_list",
+    "app_segment_assistant_show",
+    "app_record_csv_assistant_preview",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for

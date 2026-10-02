@@ -539,6 +539,7 @@ impl Shared {
             "preview_token",
             "request_id",
             "decisions",
+            "confirm_token",
             "message",
             "token",
         ];
@@ -557,12 +558,44 @@ impl Shared {
             Some(required_str(params, "request_id")?),
             &scoped.caller,
         )?;
+        // Explicit host-side confirm, not chat prose: the operator's
+        // `app_record_csv_confirm` minted a one-use nonce bound to the
+        // preview_token + request id + decisions digest. The agent
+        // supplies the nonce; it cannot mint or hash-forge it (server
+        // uuid). The decisions digest pins the confirmed row plan.
+        let decisions = csv_decisions(params)?;
+        // Identical replay (same request id + bytes, already completed)
+        // returns the stored receipt WITHOUT spending a confirm — the
+        // claim above already bound action+request, so a completed
+        // receipt means this import's confirm was spent legitimately.
+        let already = records.app_record_csv_receipt_exists(
+            &scoped.context,
+            required_str(params, "request_id")?,
+            required_str(params, "preview_token")?,
+        )?;
+        if !already {
+            // Explicit host-side confirm, not chat prose: the operator's
+            // `app_record_csv_confirm` minted a one-use nonce bound to
+            // preview_token + request id + decisions digest. The agent
+            // supplies the nonce; it cannot mint or hash-forge it
+            // (server uuid). The digest pins the confirmed row plan.
+            let decisions_digest = crate::store::app_records::csv_decisions_digest(
+                params.get("decisions").unwrap_or(&Value::Null),
+            )?;
+            records.app_record_csv_redeem_confirm(
+                &scoped.context,
+                required_str(params, "request_id")?,
+                required_str(params, "preview_token")?,
+                &decisions_digest,
+                required_str(params, "confirm_token")?,
+            )?;
+        }
         let result = records.app_record_csv_import(
             &scoped.context,
             &csv_text(params)?,
             required_str(params, "preview_token")?,
             required_str(params, "request_id")?,
-            csv_decisions(params)?,
+            decisions,
         )?;
         self.store.note_app_record_csv_import(
             &scoped.install,
@@ -639,6 +672,48 @@ impl Shared {
         );
         self.wake();
         Ok(result)
+    }
+
+    /// CAD-1014(b): scoped-chat read/preview verbs — the agent's read of
+    /// the stamped install/context. Same redeem gate (connection-derived
+    /// agent, live turn, re-proved scope) but NO claim: reads and
+    /// inert previews do not consume the message. Agent-supplied
+    /// install/context must equal the stamp; a foreign scope refuses.
+    pub(super) fn rpc_app_assistant_read(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("app assistant read payload must be an object"))?;
+        const ALLOWED: &[&str] = &[
+            "install_id",
+            "context_id",
+            "segment_id",
+            "csv_text",
+            "message",
+            "token",
+        ];
+        if fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+            return Err(Error::rejected(
+                "app assistant read payload has unsupported fields",
+            ));
+        }
+        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant read")?;
+        let records = RecordStore::open(&self.state_dir, &scoped.install)?;
+        // Reads only — no claim, no mutation, no audit write.
+        match method {
+            "app_segment_assistant_list" => records.app_segment_list(&scoped.context),
+            "app_segment_assistant_show" => {
+                records.app_segment_show(&scoped.context, required_str(params, "segment_id")?)
+            }
+            "app_record_csv_assistant_preview" => {
+                records.app_record_csv_preview(&scoped.context, &csv_text(params)?)
+            }
+            _ => Err(Error::rejected("unknown app assistant read method")),
+        }
     }
 }
 

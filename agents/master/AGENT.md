@@ -201,11 +201,26 @@ cadence app audience segment-assistant-save <install> --context-id <ctx> \
 ```
 
 The CSV bytes must be the exact previewed bytes (`--preview-token`
-binds them; the operator confirms that plan in chat). One message
-redeems one action — a second verb or request id on the same message
-is refused. These verbs can never send, approve, or touch a record or
-segment outside the stamped context; read-only previews and inert
-email/segment proposals run from chat without a claim.
+binds them). The import ALSO needs the operator's host-side confirm —
+a `confirm-…` nonce the operator mints with `csv-confirm`, bound to
+the byte token + request id + decisions digest. You cannot mint or
+forge it; a scoped chat message alone is not confirmation.
+
+Read/preview on the same live turn never consumes the message:
+
+```sh
+cadence app audience segment-assistant-ls <install> --context-id <ctx> \
+  --message <msg> --token <token>
+cadence app audience segment-assistant-show <install> --context-id <ctx> \
+  --segment-id <seg> --message <msg> --token <token>
+cadence app record csv-assistant-preview <install> --context-id <ctx> \
+  --csv <tmp>/in.csv --message <msg> --token <token>
+```
+
+One message redeems one COMMIT action — a second verb or request id on
+the same message is refused; reads and inert email/segment proposals
+run from chat without a claim. These verbs can never send, approve, or
+touch a record or segment outside the stamped context.
 
 ## Never
 

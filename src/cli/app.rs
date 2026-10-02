@@ -320,6 +320,43 @@ pub(crate) enum RecordAction {
         /// The live turn token for that message.
         #[arg(long, requires = "message")]
         token: String,
+        /// The host-minted confirm receipt nonce from `csv-confirm`
+        /// (the operator's explicit confirm of this exact plan).
+        #[arg(long)]
+        confirm_token: String,
+    },
+    /// CAD-1014: the operator's explicit, host-side confirm of an exact
+    /// previewed CSV import plan — mints the one-use confirm receipt the
+    /// assistant import redeems. Prints the `confirm_token` nonce.
+    CsvConfirm {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// Preview token from `csv-preview` over the confirmed bytes.
+        #[arg(long)]
+        preview_token: String,
+        /// Idempotency key the later import must reuse.
+        #[arg(long)]
+        request_id: String,
+        /// JSON array of `{row, action, expected_revision?}` decisions
+        /// whose digest the confirm binds (omit for the default plan).
+        #[arg(long)]
+        decisions: Option<PathBuf>,
+    },
+    /// CAD-1014: read-only CSV preview on the live scoped chat turn —
+    /// the agent's read of the stamped context. Writes nothing, claims
+    /// nothing; the `--message`/`--token` are the turn identity.
+    CsvAssistantPreview {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// CSV file (bounded to 256KiB, 500 rows).
+        #[arg(long)]
+        csv: PathBuf,
+        #[arg(long, requires = "token")]
+        message: String,
+        #[arg(long, requires = "message")]
+        token: String,
     },
 }
 
@@ -365,6 +402,30 @@ pub(crate) enum AudienceAction {
         #[arg(long, requires = "token")]
         message: String,
         /// The live turn token for that message.
+        #[arg(long, requires = "message")]
+        token: String,
+    },
+    /// CAD-1014: list the stamped context's segments on the live scoped
+    /// chat turn (read-only — revision/membership for the agent).
+    SegmentAssistantLs {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long, requires = "token")]
+        message: String,
+        #[arg(long, requires = "message")]
+        token: String,
+    },
+    /// CAD-1014: show one segment (revision/membership) on the live
+    /// scoped chat turn (read-only).
+    SegmentAssistantShow {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        segment_id: String,
+        #[arg(long, requires = "token")]
+        message: String,
         #[arg(long, requires = "message")]
         token: String,
     },
@@ -716,13 +777,46 @@ fn record_params(action: &RecordAction) -> Result<(&'static str, serde_json::Val
             decisions,
             message,
             token,
+            confirm_token,
         } => {
-            let mut params = json!({"install_id": install_id, "context_id": context_id, "csv_text": read_record_csv(csv)?, "preview_token": preview_token, "request_id": request_id, "message": message, "token": token});
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "csv_text": read_record_csv(csv)?, "preview_token": preview_token, "request_id": request_id, "message": message, "token": token, "confirm_token": confirm_token});
             if let Some(path) = decisions {
                 params["decisions"] = read_csv_decisions(path)?;
             }
             ("app_record_csv_assistant_import", params)
         }
+        RecordAction::CsvConfirm {
+            install_id,
+            context_id,
+            preview_token,
+            request_id,
+            decisions,
+        } => {
+            // The digest binds the exact confirmed decision set; the
+            // assistant import recomputes it from its own `decisions`
+            // param and the daemon refuses on mismatch.
+            let decisions_digest = match decisions {
+                Some(path) => {
+                    let list = read_csv_decisions(path)?;
+                    cadence_agent::store::app_records::csv_decisions_digest(&list)?
+                }
+                None => cadence_agent::store::app_records::csv_decisions_digest(&json!([]))?,
+            };
+            (
+                "app_record_csv_confirm",
+                json!({"install_id": install_id, "context_id": context_id, "preview_token": preview_token, "request_id": request_id, "decisions_digest": decisions_digest}),
+            )
+        }
+        RecordAction::CsvAssistantPreview {
+            install_id,
+            context_id,
+            csv,
+            message,
+            token,
+        } => (
+            "app_record_csv_assistant_preview",
+            json!({"install_id": install_id, "context_id": context_id, "csv_text": read_record_csv(csv)?, "message": message, "token": token}),
+        ),
     })
 }
 
@@ -777,6 +871,25 @@ fn audience_params(action: &AudienceAction) -> Result<(&'static str, serde_json:
             }
             ("app_segment_assistant_save", params)
         }
+        AudienceAction::SegmentAssistantLs {
+            install_id,
+            context_id,
+            message,
+            token,
+        } => (
+            "app_segment_assistant_list",
+            json!({"install_id": install_id, "context_id": context_id, "message": message, "token": token}),
+        ),
+        AudienceAction::SegmentAssistantShow {
+            install_id,
+            context_id,
+            segment_id,
+            message,
+            token,
+        } => (
+            "app_segment_assistant_show",
+            json!({"install_id": install_id, "context_id": context_id, "segment_id": segment_id, "message": message, "token": token}),
+        ),
         AudienceAction::SegmentShow {
             install_id,
             context_id,
