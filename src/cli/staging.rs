@@ -177,6 +177,6 @@ fn staging_refresh(
         .unwrap_or(json!(false)));
     print_json(&out);
     body?;
-    release.map(|_| ()).map_err(|e| e)?;
+    release.map(|_| ())?;
     Ok(0)
 }
