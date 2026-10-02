@@ -196,7 +196,7 @@ async function contentGrammar() {
   // AND a parsed receipt; anything else is operator-submitted.
   const receipted = grammar.parseProposal({ proposal: {
     proposal_id: "prop-a", campaign_id: "launch-1", source_revision: 1,
-    subject: "S", state: "pending", actor: "assistant", origin: "assistant-receipt",
+    subject: "S", preheader: "", blocks: [], state: "pending", actor: "assistant", origin: "assistant-receipt",
     assistant_receipt: {
       message_id: "m-scoped", agent: "crm-writer", request_id: "req-1",
       install_id: "install-crm", context_id: "ctx-a", campaign_id: "launch-1",
@@ -207,13 +207,13 @@ async function contentGrammar() {
   equal(receipted.assistantReceipt?.requestId, "req-1", "receipt parses its request id");
   const noReceipt = grammar.parseProposal({ proposal: {
     proposal_id: "prop-o", campaign_id: "launch-1", source_revision: 1,
-    subject: "S", state: "pending", actor: "assistant", origin: "assistant-receipt",
+    subject: "S", preheader: "", blocks: [], state: "pending", actor: "assistant", origin: "assistant-receipt",
     assistant_receipt: null,
   } });
   equal(noReceipt.assistantReceipt, null, "a null receipt stays null — never assistant-badged");
   const malformedReceipt = grammar.parseProposal({ proposal: {
     proposal_id: "prop-m", campaign_id: "launch-1", source_revision: 1,
-    subject: "S", state: "pending", actor: "assistant", origin: "assistant-receipt",
+    subject: "S", preheader: "", blocks: [], state: "pending", actor: "assistant", origin: "assistant-receipt",
     assistant_receipt: { agent: "crm-writer" },
   } });
   equal(malformedReceipt.assistantReceipt, null, "a malformed receipt drops to no-provenance");
