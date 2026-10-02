@@ -313,30 +313,57 @@ pub(crate) struct PreparedExec {
     /// the closure at `attach`.
     helper_fd: OwnedFd,
     /// Owned C strings; moved into the closure so `argv_p`/`envp_p` stay
-    /// valid — the pointer arrays index this backing.
-    argv_c: Vec<CString>,
-    envp_c: Vec<CString>,
+    /// valid — the pointer arrays index this backing. A `Box<[CString]>` is
+    /// used (not a growable `Vec`) so the backing can never be reallocated
+    /// after `argv_p`/`envp_p` materialize its element addresses — the
+    /// pointer-stability invariant is enforced by the type, not by discipline.
+    argv_c: Box<[CString]>,
+    envp_c: Box<[CString]>,
     argv_p: Vec<*const libc::c_char>,
     envp_p: Vec<*const libc::c_char>,
 }
 
 /// A `Send`/`Sync`-able carrier for the whole spawn plan handed to `pre_exec`.
-/// It owns the `OwnedFd` and both `CString` backings, so the raw pointers in
-/// `argv_p`/`envp_p` and the fd stay valid for the life of the closure.
-/// Raw pointers are not `Send`; the wrapper asserts they may cross the fork.
-/// Soundness: every pointer addresses memory this struct owns and outlives
-/// (the `Vec`s and `OwnedFd` move *into* the closure); the child reads that
-/// copy-on-write memory only to hand it to `execveat`, never to mutate, and
-/// nothing else holds a reference.
+/// It owns the `OwnedFd` and both `Box<[CString]>` backings, so the raw
+/// pointers in `argv_p`/`envp_p` and the fd stay valid for the life of the
+/// closure.
+///
+/// # Soundness of the unsafe Send/Sync impls
+/// `*const c_char` is `!Send`/`!Sync`, so the impls are `unsafe`. They are
+/// justified, not blanket, because every raw pointer satisfies all of:
+///   * **Ownership** — each `argv_p`/`envp_p` element addresses bytes inside a
+///     `CString` that this struct *owns* (`Box<[CString]>`); ownership moves
+///     with the struct into the closure, so the memory is never freed while a
+///     pointer to it can be read. There is no shared/borrowed buffer.
+///   * **Address stability** — the pointer arrays are built from
+///     `CString::as_ptr()` once, in `assemble`, *after* the `Box<[CString]>`
+///     is sealed. A `Box<[T]>` never reallocates (it cannot grow or shrink),
+///     so the element addresses the pointers captured cannot move. The only
+///     later move is of the `Box`/`Vec` *header* (ptr/cap/len) across the
+///     fork — the heap elements stay put, so the recorded addresses stay
+///     valid.
+///   * **Read-only in the child** — the `pre_exec` closure runs post-fork,
+///     pre-exec: it reads `argv_p`/`envp_p`/`helper_fd` only to pass them to
+///     `execveat`. No mutation, no aliasing with another thread, no access
+///     from the parent while the child runs (the values are copy-on-write
+///     snapshots the kernel took at fork).
+///
+/// `empty_path` points at the `static EMPTY_PATH_NUL` — `'static`, immortal,
+/// shared safely across threads.
 struct ExecArgs {
     helper_fd: OwnedFd,
-    argv_c: Vec<CString>,
-    envp_c: Vec<CString>,
+    argv_c: Box<[CString]>,
+    envp_c: Box<[CString]>,
     /// `execveat`'s empty-path operand — a stable pointer to a static NUL.
     empty_path: *const libc::c_char,
     argv_p: Vec<*const libc::c_char>,
     envp_p: Vec<*const libc::c_char>,
 }
+// Safety: see the struct-level note — every raw pointer addresses memory this
+// struct exclusively owns (`Box<[CString]>`), captured after the boxes are
+// sealed so the addresses are stable, read-only in the post-fork child, with
+// no aliasing. That makes the carrier safe to move/send and to share for the
+// brief pre-exec window.
 unsafe impl Send for ExecArgs {}
 unsafe impl Sync for ExecArgs {}
 
@@ -374,12 +401,19 @@ impl PreparedExec {
         for a in provider_argv {
             push(&mut argv, a)?;
         }
-        let argv_p: Vec<*const libc::c_char> = argv
+        // Seal both string tables into `Box<[CString]>` BEFORE taking element
+        // addresses: a `Box<[T]>` can never reallocate, so the `as_ptr()`s the
+        // pointer arrays capture below are permanently stable. Building the
+        // pointers first and boxing after could dangle them if `Vec -> Box`
+        // reallocated.
+        let argv_c: Box<[CString]> = argv.into_boxed_slice();
+        let envp_c: Box<[CString]> = env.into_boxed_slice();
+        let argv_p: Vec<*const libc::c_char> = argv_c
             .iter()
             .map(|c| c.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
             .collect();
-        let envp_p: Vec<*const libc::c_char> = env
+        let envp_p: Vec<*const libc::c_char> = envp_c
             .iter()
             .map(|c| c.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
@@ -388,8 +422,8 @@ impl PreparedExec {
         // in. A plan must never be built without one; keep a sentinel owner.
         Ok(Self {
             helper_fd: empty_helper_fd()?,
-            argv_c: argv,
-            envp_c: env,
+            argv_c,
+            envp_c,
             argv_p,
             envp_p,
         })
@@ -600,6 +634,46 @@ mod tests {
         assert_plan_pointers_resolve(&args.envp_c, &args.envp_p);
         // The fd is still owned by the carrier, not the consumed plan.
         assert!(args.helper_fd.as_raw_fd() > 0);
+    }
+
+    /// Pointer-array entries are the *exact* addresses of the boxed backing's
+    /// elements — `argv_p[i] == argv_c[i].as_ptr()` — captured after the
+    /// `Box<[CString]>` was sealed. If anyone rebuilt the pointers before
+    /// boxing (a `Vec -> Box` realloc would move them) or grew a `Vec`
+    /// afterwards, this address equality would fail. The `Box` (non-growable)
+    /// type makes the post-seal mutation impossible.
+    #[test]
+    fn pointer_array_entries_are_the_boxed_backing_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h");
+        std::fs::write(&path, b"x").unwrap();
+        let env = vec![CString::new("A=B").unwrap()];
+        let plan = PreparedExec::assemble(&segs(), &["pi".to_string()], env)
+            .unwrap()
+            .with_bound(bound(&path));
+        for (i, c) in plan.argv_c.iter().enumerate() {
+            assert_eq!(
+                plan.argv_p[i],
+                c.as_ptr(),
+                "argv_p[{i}] must address argv_c[{i}]"
+            );
+        }
+        for (i, c) in plan.envp_c.iter().enumerate() {
+            assert_eq!(
+                plan.envp_p[i],
+                c.as_ptr(),
+                "envp_p[{i}] must address envp_c[{i}]"
+            );
+        }
+        // And the equality survives the consume-into-carrier move — the heap
+        // elements do not move when the struct is moved.
+        let args = plan.into_exec_args();
+        for (i, c) in args.argv_c.iter().enumerate() {
+            assert_eq!(args.argv_p[i], c.as_ptr(), "post-move argv_p[{i}]");
+        }
+        for (i, c) in args.envp_c.iter().enumerate() {
+            assert_eq!(args.envp_p[i], c.as_ptr(), "post-move envp_p[{i}]");
+        }
     }
 
     /// Dereference a pointer array against its owned backing: each pointer is
