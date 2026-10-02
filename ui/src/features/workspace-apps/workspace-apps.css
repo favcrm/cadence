@@ -92,12 +92,6 @@
   border-bottom: 2px solid transparent;
   font-size: var(--text-label);
 }
-/* Host App view / Native controls tabs line up with the workspace's own
-   tabs, which sit inside the .workspace-app padding. */
-.wa-screen-view {
-  flex: none;
-  margin-inline: 2rem;
-}
 .wa-tab[aria-current="page"] {
   color: var(--color-accent);
   border-color: var(--color-accent);
@@ -473,9 +467,6 @@ textarea.wa-prompt-input {
 @media (max-width: 639px) {
   .workspace-app {
     padding: 1rem;
-  }
-  .wa-screen-view {
-    margin-inline: 1rem;
   }
   .wa-fields {
     grid-template-columns: 1fr;
