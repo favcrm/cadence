@@ -252,7 +252,7 @@ pub(super) fn with_legacy_migration_tx<R>(
 ) -> Result<R> {
     with_owner_tx_control(state, || {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        crate::rollout::require_legacy_writer_tx(&tx)?;
+        require_legacy_writer_tx(&tx)?;
         match f(&tx) {
             Ok(value) => {
                 tx.commit()?;
