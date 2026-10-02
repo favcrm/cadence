@@ -167,6 +167,24 @@ fn bundle_digest(files: &BTreeMap<String, String>) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
+/// Create `dir`'s parent chain under `root`, one validated prefix at a
+/// time — `Root::mkdir` is descriptor-relative `mkdirat` and only makes a
+/// leaf, so a nested member like `screens/<tag>/<leaf>` needs `screens/`
+/// then `screens/<tag>/` created first. Each intermediate is itself
+/// created through `Root::mkdir` (O_NOFOLLOW descriptor-relative), never
+/// `create_dir_all` — a symlinked or non-dir prefix refuses at `dir()`.
+fn mkdir_parents(root: &Root, dir: &Path) -> Result<()> {
+    let mut cur = PathBuf::new();
+    for part in dir.components() {
+        let std::path::Component::Normal(_) = part else {
+            continue;
+        };
+        cur.push(part);
+        root.mkdir(&cur)?;
+    }
+    Ok(())
+}
+
 /// The lexical grammar a journaled bundle member's rel-path must satisfy
 /// — the flat `app.md`/`workflows/<tag>.md`/`rubrics|templates/<leaf>`
 /// plus CAD-1006's `screens/<tag>/<leaf>` (the one depth-3 member: a
@@ -730,7 +748,7 @@ fn apply_upgrade(pm: &Pm, root: &Root, journal: &UpgradeJournal) -> Result<Vec<S
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            root.mkdir(&bundle.join(parent))?;
+            mkdir_parents(root, &bundle.join(parent))?;
         }
         let target = bundle.join(path);
         match root.read(&target, CATALOG_CAP)? {
@@ -889,7 +907,7 @@ fn apply(pm: &Pm, root: &Root, journal: &InstallJournal) -> Result<Vec<String>> 
         }
         let path = Path::new(name);
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            root.mkdir(&bundle.join(parent))?;
+            mkdir_parents(root, &bundle.join(parent))?;
         }
         let target = bundle.join(path);
         match root.read(&target, CATALOG_CAP)? {

@@ -899,3 +899,54 @@ fn cad1006_cap_ttl_expires() {
         "expired cap accepted: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// E2 — the nested `screens/<tag>/` install path: a bundle whose members sit
+// two levels deep installs cleanly (descriptor-relative `mkdir_parents`
+// creates `screens/` then `screens/<tag>/`), and a `screens/<tag>` that is a
+// SYMLINK in the staged source refuses before any byte lands.
+// ---------------------------------------------------------------------------
+#[test]
+fn cad1006_nested_screen_dir_installs_and_symlink_parent_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let pm = Pm::init(&root.path().join("pm")).unwrap();
+    let opts = daemon_opts();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
+    let daemon = TestDaemon::start_opts(opts);
+
+    // Positive: the staged bundle with the nested screens/main/ tree installs.
+    let src = stage_bundle(root.path());
+    let installed = daemon
+        .operator_rpc("app_workspace_install", json!({"source": src}))
+        .expect("nested screens/<tag>/ install refused");
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    // The nested member landed under the installed bundle.
+    let installed_dir = pm
+        .dir
+        .join(format!(".apps/installations/{id}/bundle"));
+    assert!(
+        installed_dir.join("screens/main/client.js").is_file(),
+        "nested screens/main/client.js not installed"
+    );
+    assert!(installed_dir.join("screens/main").is_dir());
+
+    // Negative: a `screens/<tag>` that is a symlink in the STAGED source
+    // refuses at the installer's own snapshot — never reaches the mkdir.
+    let bad = root.path().join("bad-src");
+    let bad_screens = bad.join("screens");
+    std::fs::create_dir_all(&bad_screens).unwrap();
+    std::fs::write(
+        bad.join("app.md"),
+        "---\napp: crm\ntitle: CRM\nversion: '1'\n---\nGuide.\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(bad.join("workflows")).unwrap();
+    std::fs::write(bad.join("workflows/do.md"), WORKFLOW).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target.path(), bad_screens.join("main")).unwrap();
+    let refused = daemon
+        .operator_rpc("app_workspace_install", json!({"source": bad.canonicalize().unwrap().to_string_lossy()}));
+    assert!(refused.is_err(), "symlinked screens/<tag> dir admitted");
+}
