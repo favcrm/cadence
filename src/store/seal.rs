@@ -2142,11 +2142,11 @@ mod tests {
         // A WAL reader must not acquire the other connection's write lock.
         assert_eq!(
             store
-                .read_tx(|tx| tx.query_row(
+                .read_tx(|tx| Ok(tx.query_row(
                     "SELECT COUNT(*) FROM events WHERE alias LIKE 'read-%'",
                     [],
                     |row| row.get::<_, i64>(0)
-                ))
+                )?))
                 .unwrap(),
             0
         );
@@ -2178,11 +2178,11 @@ mod tests {
             }).is_err());
             assert_eq!(
                 store
-                    .read_tx(|tx| tx.query_row(
+                    .read_tx(|tx| Ok(tx.query_row(
                         "SELECT COUNT(*) FROM events WHERE alias LIKE 'read-%'",
                         [],
                         |row| row.get::<_, i64>(0)
-                    ))
+                    )?))
                     .unwrap(),
                 0
             );
