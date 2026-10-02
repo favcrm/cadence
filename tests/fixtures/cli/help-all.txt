@@ -195,8 +195,15 @@ All commands (one line per path):
     app record set
     app record csv-preview
     app record csv-import
+    app record csv-assistant-import
+    app record csv-confirm
+    app record csv-assistant-preview
     app audience
     app audience segment-save
+    app audience segment-assistant-save
+    app audience segment-assistant-ls
+    app audience segment-assistant-show
+    app audience segment-assistant-preview
     app audience segment-show
     app audience segment-ls
     app audience exclusion-save
@@ -208,6 +215,10 @@ All commands (one line per path):
     app audience preview
     app audience prepare
     app audience freeze-show
+    app content
+    app content assistant-draft
+    app content assistant-proposals
+    app content assistant-proposal-show
     app catalog
     app catalog approve
     app catalog revoke
