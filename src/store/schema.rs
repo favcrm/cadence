@@ -911,6 +911,11 @@ impl Store {
             shutdown_entries_hook: None,
             shutdown_backoff_ms: 50,
             seal_state,
+            // CAD-1011: record the open mode so hook registration and
+            // protected-path behavior fail closed if a protected open
+            // ever becomes reachable (today `preflight` refuses it, so
+            // this is always `false`).
+            protected_open: matches!(mode, super::seal::OpenMode::Protected),
             // CAD-1011: bind owner-maintenance permits to this exact db —
             // the canonicalized path is the identity a permit is issued
             // against; a missing/noncanonical path still yields a stable
@@ -1459,7 +1464,16 @@ impl Store {
         // Test seam (CAD-694): the hook runs inside this attempt's
         // transaction AFTER its production writes — a synthetic error
         // here discards them too, so rollback coverage is the real
-        // shape, not just pre-write faults. Never set in production.
+        // shape, not just pre-write faults. Never set in production,
+        // and never on a protected-mode store: the hook is not producer
+        // authority (it only gets the restricted `WriteTxn` facade), and
+        // a protected db's authority is external — refuse execution even
+        // if a hook was somehow set.
+        if self.protected_open {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                Error::rejected("shutdown_entries hook is unavailable on a protected-mode store"),
+            )));
+        }
         if let Some(hook) = &self.shutdown_entries_hook {
             hook(tx)?;
         }

@@ -117,10 +117,21 @@ pub struct Store {
     /// until it finishes ([`Store::thread_hold_running`], CAD-320).
     thread_held: Mutex<std::collections::HashMap<String, Vec<threads::HeldText>>>,
     /// Test seam (CAD-694): invoked inside every `shutdown_entries`
-    /// transaction with that attempt's live tx — a test can mutate rows
-    /// or return a synthetic sqlite error to prove rollback and retry.
-    /// Production leaves it unset.
-    pub(crate) shutdown_entries_hook: Option<ShutdownEntriesHook>,
+    /// transaction with that attempt's live [`WriteTxn`] — a test can
+    /// mutate rows or return a synthetic sqlite error to prove rollback
+    /// and retry. The hook is NOT producer authority: it receives only
+    /// the restricted `WriteTxn` facade (no `commit`/`rollback`/`Connection`
+    /// escape). Production leaves it unset; a protected-mode store
+    /// refuses registration (see [`Self::set_shutdown_entries_hook`]).
+    /// Never set directly — registration goes through the setter so the
+    /// protected-mode refusal applies.
+    shutdown_entries_hook: Option<ShutdownEntriesHook>,
+    /// CAD-1011: true only when the store was opened under
+    /// `OpenMode::Protected`. A protected open is unreachable today
+    /// (`preflight` refuses it), so this is always false — recorded so a
+    /// future protected path fails closed: `set_shutdown_entries_hook`
+    /// and `shutdown_entries`' hook execution refuse when set.
+    protected_open: bool,
     /// Test seam (CAD-694): the `shutdown_entries` retry backoff
     /// multiplier in milliseconds — production 50; tests set 0 so the
     /// retry bound is proven without wall-clock sleeps.
@@ -143,7 +154,9 @@ pub struct Store {
 /// attempt's live transaction; the hook may write through it or return
 /// a synthetic sqlite error, so rollback, retry bound and
 /// retryable-classification are provable without wedging the store.
-pub type ShutdownEntriesHook =
+// The test-seam hook type — `pub(crate)` (not `pub`) so it does not
+// leak the crate-internal `WriteTxn` facade into the public surface.
+pub(crate) type ShutdownEntriesHook =
     Arc<dyn Fn(&WriteTxn<'_>) -> rusqlite::Result<()> + Send + Sync>;
 
 /// Terminal task states — verdicts/acceptance/cancellation are closed
@@ -283,6 +296,30 @@ impl Store {
     /// after open, only when a lease was acquired.
     pub fn install_write_fence(&self, fence: Arc<crate::lease::Fence>) {
         let _ = self.write_fence.set(fence);
+    }
+
+    /// Register the CAD-694 `shutdown_entries` test hook. An arbitrary
+    /// hook is not producer authority — it runs inside the sealed write
+    /// tx on the restricted `WriteTxn` facade only. Refuses on a
+    /// protected-mode store: a protected db's maintenance authority is
+    /// external, and a daemon-side hook must never stand in for it.
+    ///
+    /// A `Protected` open is unreachable today (`preflight` returns
+    /// `Unknown`), so `protected_open` is always false — the refusal is
+    /// written so the hook path fails closed the day a protected open
+    /// becomes reachable, not because one exists now.
+    pub(crate) fn set_shutdown_entries_hook(
+        &mut self,
+        hook: Option<ShutdownEntriesHook>,
+    ) -> Result<()> {
+        if self.protected_open && hook.is_some() {
+            return Err(Error::rejected(
+                "shutdown_entries hook cannot be registered on a \
+                 protected-mode store",
+            ));
+        }
+        self.shutdown_entries_hook = hook;
+        Ok(())
     }
 
     /// Trip the fence, then wait out the writer in flight — after this
