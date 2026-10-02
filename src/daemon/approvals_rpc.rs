@@ -41,7 +41,9 @@ impl Shared {
     /// must be registered staging. Admits nothing — PR-3 adds the caller.
     pub(super) fn rpc_staging_delegate(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("staging delegate", params, peer_pid)?;
-        let alias = required_str(params, "alias")?;
+        // `alias` is a reserved connection-bound field (OPERATOR_FIELDS) —
+        // the grantee arrives as `agent`, never `alias`.
+        let alias = required_str(params, "agent")?;
         let ops = optional_strs(params, "ops")?;
         let ttl_secs = params
             .get("ttl_secs")
@@ -60,7 +62,7 @@ impl Shared {
     /// Operator only.
     pub(super) fn rpc_staging_revoke(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("staging revoke", params, peer_pid)?;
-        crate::rollout::staging_revoke(&self.state_dir, required_str(params, "alias")?, "operator")
+        crate::rollout::staging_revoke(&self.state_dir, required_str(params, "agent")?, "operator")
     }
 
     /// `staging_delegations` (CAD-1024) — the live grants here. Read-only.

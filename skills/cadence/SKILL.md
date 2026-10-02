@@ -391,6 +391,27 @@ ownership quality, implementation/resource practice, QA misses or false alarms,
 and acceptance gaps only where evidence warrants it. Do not generate a generic
 checklist report for every trivial edit or spend model turns on empty retros.
 
+## Refresh a delegated staging instance
+
+An operator can grant an agent a scoped, expiring delegation over a
+registered dev/demo staging instance (CAD-1024). If your pane's
+`CADENCE_ALIAS` has a live grant, you refresh the instance yourself — the
+grant is the authority, no operator proof needed.
+
+```bash
+cadence --state-dir <staging> staging refresh --as delegate:<you> --to <sha>
+```
+
+`staging refresh` claims the rollout lease, restarts the daemon and the
+board (`--no-ui` skips the board bounce), and releases the lease — one
+round-trip under your `delegate:<alias>` identity. Each step is admitted
+only by a live `staging_grants` row for that op on that dir, so a revoked
+or expired grant, a dir that is not registered staging, or a `--as` whose
+alias does not match your pane's `CADENCE_ALIAS` is refused. Your pane
+cannot widen the grant and cannot act as another agent. Operator runbook
+(register → delegate → refresh → revoke) is in
+`docs/design/staging-delegation.md`.
+
 ## Stress a flaky test in CI
 
 Do not loop a flaky test on the shared host (more than 10 local iterations

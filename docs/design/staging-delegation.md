@@ -282,7 +282,57 @@ alias/ancestry check), shown red, then restored.
   Follow-up ticket to be filed.
 - Tailnet mapping changes and any op outside the v1 ops allowlist — stay
   operator-only.
-- `cadence staging refresh` as a single supported command — a later ticket;
-  v1 admits the individual ops the script already runs.
 - Broadening `operator_proof` to admit enrolled endpoints as operator —
   explicitly rejected; the grant is the authority, not a relaxed proof.
+
+## Operator runbook (PR-4)
+
+`cadence staging` is the whole loop. The four operator verbs touch the
+grant store (`staging_instances`/`staging_grants`, registered in
+`ensure_lease_tables`); `refresh` is the agent-facing round-trip.
+
+```
+# 1. Register a dev/demo state dir as a staging instance (operator, once).
+#    --board-port is the board's port and must be in 3110–3199. The
+#    production state/PM dirs and port 3010 can never be registered.
+cadence --state-dir <staging> staging register --board-port 3150
+
+# 2. Grant an agent the ops the refresh needs, for a bounded TTL.
+#    --op repeats; any of rollout_claim daemon_start daemon_stop
+#    ui_start ui_stop. The grant is scoped to this dir's canonical path.
+cadence --state-dir <staging> staging delegate --alias w1 \
+    --op rollout_claim --op daemon_start --op daemon_stop \
+    --op ui_start --op ui_stop --ttl 12h --reason "9460 swap"
+
+# 3. The delegate refreshes. `w1` runs this inside its own pane
+#    (CADENCE_ALIAS=w1). Every step — claim, daemon stop/start, ui
+#    stop/start, release — is admitted only by w1's live grant for that
+#    op on this dir. `--to` records the intended build on the lease.
+cadence --state-dir <staging> staging refresh --as delegate:w1 --to <sha>
+
+# 4. Inspect / end the grants (operator).
+cadence --state-dir <staging> staging delegations
+cadence --state-dir <staging> staging revoke --alias w1
+```
+
+The delegate needs nothing else on PATH — `refresh` composes the five ops
+so the agent never hand-rolls claim/stop/start/release. Operator mode and
+Gate0 are byte-identical: a non-`delegate:` `--as` is refused by
+`resolve_caller`/`require_operator_proof` exactly as before, and
+`refresh` under `--as operator:x` runs the same steps under that identity.
+
+### How the external swap script calls it
+
+`/tmp/crm-plugin-pm-0930/combined-9460-swap.sh` is **not** in this repo —
+this only records its call site. Where the script today runs the operator
+`rollout claim` + `daemon restart` + `ui restart` sequence against a
+registered staging dir, it instead runs, as the delegated agent:
+
+```
+cadence --state-dir "$STAGING_STATE_DIR" \
+    staging refresh --as "delegate:${CADENCE_ALIAS}" --to "$TARGET_SHA"
+```
+
+with the operator having run steps 1–2 for that dir and agent first. The
+script keeps its own up-front checks (the right build, the right dir); it
+no longer needs the operator identity for the refresh itself.
