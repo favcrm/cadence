@@ -31,7 +31,7 @@ for (const role of ["member", "operator"]) {
   const meta = { ...base, session: { id: "safe-session", origin: "public", user: { name: "Fable Chen", email: "fable@example.com", role } } } as unknown as Meta;
   act(() => root.render(createElement(AccountMenu, { meta, actor: "x", mayWrite: true, onChange: () => undefined, trigger: "avatar", placement: "below-end" })));
   act(() => { host.querySelector("button")?.click(); });
-  const panel = host.querySelector("[role=menu]");
+  const panel = host.querySelector("[role=dialog]");
   assert(panel?.textContent?.includes("Fable Chen"), "account menu must name the person");
   assert(panel?.textContent?.includes("fable@example.com") && panel.textContent.includes(role), "account menu must show email and mapped role");
   if (role === "member") assert(!panel?.textContent?.includes("operator"), "member must never be labelled operator");

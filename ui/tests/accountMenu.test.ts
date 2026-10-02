@@ -44,8 +44,8 @@ function mount(node: unknown) {
 }
 const menu = (meta: Meta | null, extra: object = {}, onChange: () => void = () => undefined) =>
   createElement(AccountMenu, { meta, actor: "Fable (board)", mayWrite: true, onChange, trigger: "avatar", placement: "below-end", ...extra });
-const trigger = (host: any) => host.querySelector("button[aria-haspopup=menu]") as HTMLButtonElement;
-const panel = (host: any) => host.querySelector("[role=menu]");
+const trigger = (host: any) => host.querySelector("button[aria-haspopup=dialog]") as HTMLButtonElement;
+const panel = (host: any) => host.querySelector("[role=dialog]");
 const pointerDown = (target: any) => act(() => { target.dispatchEvent(new win.Event("pointerdown", { bubbles: true })); });
 
 // Open and close: click, Escape, outside click; focus returns to the trigger.
@@ -161,6 +161,11 @@ function rest() {
 {
   const { host, done } = mount(createElement("div", null, menu(signedIn), createElement(SignIn, { meta: signedIn, onChange: () => undefined })));
   assert(host.querySelector("[data-account-menu]") && !host.querySelector("details"), "signed in: menu, no SignIn chip");
+  done();
+}
+{
+  const { host, done } = mount(createElement(SignIn, { meta: signedIn, onChange: () => undefined }));
+  assert(host.innerHTML === "" && !/sign out/i.test(host.textContent ?? ""), "SignIn renders nothing when signed in");
   done();
 }
 }

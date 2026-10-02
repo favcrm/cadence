@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { closeSession } from "../features/auth/session";
 import { setThemePref, type ThemePref } from "../lib/theme";
 import type { Meta } from "../lib/types";
@@ -71,7 +71,7 @@ export default function AccountMenu({
     triggerRef.current?.focus();
   };
   const focusables = () => Array.from(panelRef.current?.querySelectorAll<HTMLElement>("button:not(:disabled), a[href]") ?? []);
-  const onKeyDown = (event: React.KeyboardEvent) => {
+  const onKeyDown = (event: KeyboardEvent) => {
     if (event.key === "Escape" && open) {
       event.stopPropagation();
       close();
@@ -100,20 +100,20 @@ export default function AccountMenu({
   const canWrite = !meta.read_only;
   const avatar = trigger === "avatar";
   return (
-    <div ref={rootRef} className="relative shrink-0" data-account-menu onKeyDown={onKeyDown}>
+    <div ref={rootRef} className={avatar ? "header-control-wrap shrink-0" : "relative shrink-0"} data-account-menu onKeyDown={onKeyDown}>
       <button
         ref={triggerRef}
         type="button"
-        aria-haspopup="menu"
+        aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls={open ? panelId : undefined}
         aria-label={`Account menu, signed in as ${name}`}
         onClick={() => setOpen((value) => !value)}
         className={avatar
-          ? "grid h-7 w-7 place-items-center rounded-full bg-accent/15 text-label font-medium uppercase text-accent"
+          ? "header-icon"
           : "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-label text-ink-200 hover:bg-ink-800"}
       >
-        <span aria-hidden className={avatar ? undefined : "grid h-7 w-7 shrink-0 place-items-center rounded-full bg-accent/15 font-medium uppercase text-accent"}>
+        <span aria-hidden className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-accent/15 text-label font-medium uppercase text-accent">
           {name.trim().charAt(0)}
         </span>
         {!avatar && <span className="min-w-0 truncate">{name}</span>}
@@ -122,7 +122,8 @@ export default function AccountMenu({
         <div
           id={panelId}
           ref={panelRef}
-          role="menu"
+          role="dialog"
+          aria-label="Account"
           className={`absolute z-50 card w-64 p-1.5 shadow-xl ${placement === "below-end" ? "right-0 top-full mt-2" : "left-0 bottom-full mb-2"}`}
         >
           <div className="px-2 py-1.5" title={meta.session ? `session ${meta.session.id}` : undefined}>
@@ -156,11 +157,11 @@ export default function AccountMenu({
             </div>
           </div>
           {settingsHref && (
-            <Link href={settingsHref} role="menuitem" onClick={() => setOpen(false)} className="block rounded px-2 py-1.5 text-label text-ink-200 hover:bg-ink-800">
+            <Link href={settingsHref} onClick={() => setOpen(false)} className="block rounded px-2 py-1.5 text-label text-ink-200 hover:bg-ink-800">
               Settings
             </Link>
           )}
-          {canWrite && (<button type="button" role="menuitem" disabled={busy} onClick={signOut} className="block w-full rounded px-2 py-1.5 text-left text-label text-ink-200 hover:bg-ink-800 disabled:opacity-60">
+          {canWrite && (<button type="button" disabled={busy} onClick={signOut} className="block w-full rounded px-2 py-1.5 text-left text-label text-ink-200 hover:bg-ink-800 disabled:opacity-60">
             Sign out
           </button>)}
           {footer}
