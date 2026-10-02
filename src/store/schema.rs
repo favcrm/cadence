@@ -1387,18 +1387,15 @@ impl Store {
         let mut attempt = 0u32;
         loop {
             // `write_tx_raw` refuses the write on the lease fence by
-            // wrapping `Error::Rejected` in `ToSqlConversionFailure` —
-            // that refusal is the one typed-fenced cause. A genuine
+            // wrapping a private `LeaseFenceRefusal` marker — closure
+            // refusals and callback rejections never carry it. A genuine
             // sqlite fault (BUSY/LOCKED, …) stays `rusqlite`-typed so the
             // retry classifier sees it unchanged.
             let result: rusqlite::Result<Vec<AdoptEntry>> =
                 match self.write_tx_raw(|tx| self.shutdown_entries_tx(tx, facts)) {
                     Ok(v) => Ok(v),
                     Err(rusqlite::Error::ToSqlConversionFailure(b))
-                        if matches!(
-                            b.downcast_ref::<crate::Error>(),
-                            Some(crate::Error::Rejected(_))
-                        ) =>
+                        if b.downcast_ref::<super::seal::LeaseFenceRefusal>().is_some() =>
                     {
                         return Err(ShutdownDrainError::Fenced(crate::Error::rejected(
                             b.to_string(),
@@ -1501,12 +1498,14 @@ impl Store {
         // authority (it only gets the restricted `WriteTxn` facade), and
         // a protected db's authority is external — refuse execution even
         // if a hook was somehow set.
-        if self.protected_open {
-            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                Error::rejected("shutdown_entries hook is unavailable on a protected-mode store"),
-            )));
-        }
         if let Some(hook) = &self.shutdown_entries_hook {
+            if self.protected_open {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    Error::internal(
+                        "shutdown_entries hook is unavailable on a protected-mode store",
+                    ),
+                )));
+            }
             hook(tx)?;
         }
         // The sealed facade commits `tx` after this returns Ok — a

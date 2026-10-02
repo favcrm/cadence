@@ -33,6 +33,26 @@ use std::sync::Arc;
 
 use super::Store;
 
+/// Raw SQLite callers must distinguish a lease refusal from a closure
+/// refusal or a callback rejection. Only this module can construct the
+/// marker, at the actual lease check; classifiers may inspect its type.
+#[derive(Debug)]
+pub(super) struct LeaseFenceRefusal(Error);
+
+impl std::fmt::Display for LeaseFenceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for LeaseFenceRefusal {}
+
+fn raw_lease_refusal(reason: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(LeaseFenceRefusal(Error::rejected(format!(
+        "store write refused — the daemon's hosted lease is lost: {reason}"
+    )))))
+}
+
 /// Highest reviewed schema the guard understands. A newer/unknown
 /// protected schema is `Unknown`, never default-open.
 #[allow(dead_code)]
@@ -956,11 +976,7 @@ impl Store {
         let state = &*self.seal_state;
         if let Some(fence) = fence.as_ref() {
             if let Some(reason) = fence() {
-                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                    Error::rejected(format!(
-                        "store write refused — the daemon's hosted lease is lost: {reason}"
-                    )),
-                )));
+                return Err(raw_lease_refusal(reason));
             }
         }
         let _armed = ArmGuard::enter(state, arm);
@@ -972,11 +988,7 @@ impl Store {
             if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(rb)));
             }
-            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                Error::rejected(format!(
-                    "store write refused — the daemon's hosted lease is lost: {reason}"
-                )),
-            )));
+            return Err(raw_lease_refusal(reason));
         }
         if !on_sealed {
             if let Err(e) = Self::check_closed_tx(&tx) {
@@ -996,11 +1008,7 @@ impl Store {
                     if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
                         return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(rb)));
                     }
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        Error::rejected(format!(
-                            "store write refused — the daemon's hosted lease is lost: {reason}"
-                        )),
-                    )));
+                    return Err(raw_lease_refusal(reason));
                 }
                 let _ctrl = ControlPhase::enter(state);
                 tx.commit()?;
@@ -2177,6 +2185,62 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn shutdown_post_callback_lease_loss_is_fenced_and_rolls_back() {
+        let dir = TempDir::new().unwrap();
+        let (_, mut store) = open_legacy(&dir);
+        let fence = Arc::new(crate::lease::Fence::default());
+        store.install_write_fence(Arc::clone(&fence));
+        store.set_shutdown_entries_hook(Some(Arc::new(move |tx| {
+            tx.execute_raw("INSERT INTO events(alias,kind,payload,at) VALUES('shutdown-lease','probe','{}',0)", [])?;
+            fence.trip("lease lost after shutdown writes");
+            Ok(())
+        }))).unwrap();
+        let err = store
+            .shutdown_entries(&std::collections::HashMap::new())
+            .unwrap_err();
+        assert!(
+            err.is_fenced(),
+            "actual lease refusal must remain fenced: {err}"
+        );
+        let conn = store.conn();
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE alias='shutdown-lease'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn shutdown_protected_hook_guard_only_rejects_an_actual_hook() {
+        let dir = TempDir::new().unwrap();
+        let (_, mut store) = open_legacy(&dir);
+        // This toggles only the dormant hook guard; it does not qualify
+        // or construct a production Protected store (which still refuses).
+        store.protected_open = true;
+        assert!(store
+            .shutdown_entries(&std::collections::HashMap::new())
+            .is_ok());
+        assert!(store
+            .set_shutdown_entries_hook(Some(Arc::new(|_| panic!("hook must not run"))))
+            .is_err());
+        // Simulate corrupted registration to prove execution also refuses.
+        store.shutdown_entries_hook = Some(Arc::new(|_| panic!("hook must not run")));
+        let err = store
+            .shutdown_entries(&std::collections::HashMap::new())
+            .unwrap_err();
+        assert!(
+            !err.is_fenced(),
+            "hook policy failure is not lease loss: {err}"
+        );
+        assert!(store.conn().is_autocommit());
     }
 
     #[test]

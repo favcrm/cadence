@@ -1986,13 +1986,15 @@ impl Store {
         digest: &str,
         created: bool,
     ) {
-        let _ = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
+        if let Err(e) = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
             if created {
                 "app_record_created"
             } else {
                 "app_record_updated"
             },
-            json!({"record_id": record, "install_id": install, "context_id": context, "revision": revision, "digest": digest, "actor": "operator"}),));
+            json!({"record_id": record, "install_id": install, "context_id": context, "revision": revision, "digest": digest, "actor": "operator"}),)) {
+            eprintln!("store: best-effort app record audit failed: {e}");
+        }
     }
 
     /// Best-effort audit event for a CSV import that already committed
@@ -2008,9 +2010,11 @@ impl Store {
         skipped: i64,
         failed: i64,
     ) {
-        let _ = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
+        if let Err(e) = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
             "app_record_csv_imported",
-            json!({"install_id": install, "context_id": context, "request_id": request, "applied": applied, "skipped": skipped, "failed": failed, "actor": "operator"}),));
+            json!({"install_id": install, "context_id": context, "request_id": request, "applied": applied, "skipped": skipped, "failed": failed, "actor": "operator"}),)) {
+            eprintln!("store: best-effort app record audit failed: {e}");
+        }
     }
 }
 
