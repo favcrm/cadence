@@ -972,10 +972,15 @@ fn every_git_step_has_a_finite_deadline() {
         );
         std::fs::write(&git, script.replace("argv = sys.argv[1:]", &stall)).unwrap();
         let timeout_log = f._dir.path().join("timeout-argv.jsonl");
+        // Only the stalled step gets the test-short 0.75s budget; the other
+        // steps keep a load-tolerant (still finite) 120s so a slow clone
+        // under CI load reaches the targeted phase instead of timing out
+        // early. Production's argv is still asserted verbatim above.
         let timeout_script = format!(
-            "#!{python}\nimport json, os, sys\nargv = sys.argv[1:]\nwith open({log}, 'a') as fh:\n    fh.write(json.dumps(argv) + '\\n')\nassert argv[:3] == ['--kill-after=10', '120', 'git'], argv\nos.execv({real}, [{real}, '--kill-after=0.1', '0.75'] + argv[2:])\n",
+            "#!{python}\nimport json, os, sys\nfull = sys.argv[1:]\nwith open({log}, 'a') as fh:\n    fh.write(json.dumps(full) + '\\n')\nassert full[:3] == ['--kill-after=10', '120', 'git'], full\nargv = full[3:]\nbudget = '0.75' if ({predicate}) else '120'\nos.execv({real}, [{real}, '--kill-after=0.1', budget] + full[2:])\n",
             log = serde_json::to_string(&timeout_log.to_str().unwrap()).unwrap(),
             real = serde_json::to_string(&real_timeout).unwrap(),
+            predicate = predicate,
         );
         let timeout = f.bin.join("timeout");
         std::fs::write(&timeout, timeout_script).unwrap();
