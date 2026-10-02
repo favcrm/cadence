@@ -483,6 +483,9 @@ async function mountedFlow() {
       if (doc && row.source_revision !== doc.revision) return refused("email proposal source revision is stale");
       const revision = (doc?.revision ?? 0) + 1;
       contents[row.campaign_id] = {
+        // The create path has no prior doc to spread — the ids must be set
+        // explicitly or parseContentDoc refuses the receipt.
+        campaign_id: row.campaign_id, install_id: "install-crm", context_id: "ctx-a",
         ...doc, revision, subject: row.subject, preheader: row.preheader, blocks: row.blocks,
         content_digest: `content-digest-${revision}`,
         approval: { revision: null, digest: null, valid: false, scope: "content-only" },

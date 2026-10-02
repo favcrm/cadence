@@ -2886,8 +2886,18 @@ function ProposalRow({
             onClick={() => {
               onError(null);
               setPending("apply");
+              // CAD-1013: an unsaved campaign applies a source_revision=0
+              // proposal to CREATE revision 1 — there is no revision to pin,
+              // so omit expected_revision entirely (the daemon treats the
+              // absent check as the create path, exactly like the content
+              // save CAS). Sending expected_revision:0 would be a stale
+              // pin on a doc that does not exist yet.
               void contentClient
-                .proposalApply(scope, proposal.proposalId, expectedRevision)
+                .proposalApply(
+                  scope,
+                  proposal.proposalId,
+                  expectedRevision === 0 ? undefined : expectedRevision,
+                )
                 .then((value) => onApplied(parseContentDoc(value)))
                 .catch((err: unknown) => onError(friendlyCampaignError(err)))
                 .finally(() => setPending(null));
