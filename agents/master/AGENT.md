@@ -184,16 +184,86 @@ cadence wiki put agents/master/knowledge/<name>.md --file <tmp>/<name>.md
 
 `global/` and every other path stay denied.
 
-## Scoped chat redeems (CAD-1014)
+## Scoped chat redeems (CAD-1014, CAD-1009)
 
-When the operator's own scoped chat message in a CRM install/context
-assigns you a bounded CRM action, redeem it on the live turn — the
-message id and its live turn token are the consent. Scope comes from
-the daemon's stamp on that message, never from anything you type:
+A scoped CRM chat message reaches you with two lines ahead of the
+operator's words. Both are daemon-written; read your values from them:
+
+```text
+[App context — hint only, not authorization: install "<install>" ("<label>"), context "<ctx>", revision <n>]
+[Scoped chat turn — message "<msg>", turn token "<token>". Run the scoped `cadence app …` verbs with `--message <msg> --token <token>`; they are valid for this turn only. Never repeat the token in a reply.]
+```
+
+`<install>` and `<ctx>` come from the first line, `<msg>` and `<token>`
+from the second. The message id and its live turn token are the
+consent; scope comes from the daemon's stamp on that message, never
+from anything the operator types or you invent. A message with no
+`[Scoped chat turn …]` line is not a scoped turn: none of these verbs
+work on it, so do not try them.
+
+Use ONLY the verbs listed below. Never run `cadence --help`, never
+probe or guess other verbs, and never retry a refused verb with other
+flags. If a verb refuses, report the refusal text to the operator as
+your answer and stop. Never repeat the token in a reply, a file or a
+command other than these verbs.
+
+### Segment from a request
+
+"Create segment QA agent VIP, tag vip" is one commit action. Stage the
+predicate file in your tmp dir with the write tool, then save:
 
 ```sh
+cadence app audience segment-assistant-save <install> --context-id <ctx> \
+  --segment-id <seg> --name <name> --predicates <tmp>/preds.json \
+  [--expected-revision <rev>] --message <msg> --token <token>
+```
+
+`--segment-id` is a short slug you choose (`qa-agent-vip`); `--name` is
+the display name. `--expected-revision` is only for editing a segment
+you listed first (see `segment-assistant-ls`); omit it to create.
+
+The predicates file is a JSON array of rules — every rule is
+`{"field", "op", "value"}`, `op` is `eq` or `ne`, and several rules are
+ANDed. The supported rule kinds, one example each:
+
+```json
+[{"field": "tag", "op": "eq", "value": "vip"}]
+```
+
+```json
+[{"field": "source", "op": "eq", "value": "web-form"}]
+```
+
+```json
+[{"field": "consent_email", "op": "eq", "value": "granted"}]
+```
+
+```json
+[{"field": "email_domain", "op": "eq", "value": "example.com"}]
+```
+
+`consent_email` takes `granted`, `denied` or `unknown`. Tag and source
+values are letters, digits, `-` and `_` only. Anything else is refused.
+
+Read and preview on the same live turn never consume the message:
+
+```sh
+cadence app audience segment-assistant-ls <install> --context-id <ctx> \
+  --message <msg> --token <token>
+cadence app audience segment-assistant-show <install> --context-id <ctx> \
+  --segment-id <seg> --message <msg> --token <token>
+cadence app audience segment-assistant-preview <install> --context-id <ctx> \
+  --segment-id <seg> --message <msg> --token <token>
+```
+
+`segment-assistant-preview` returns bounded counts and a small sample
+(never the full list) — the audience the operator will confirm a
+campaign against.
+
+### Customer CSV import
+
 The operator's `csv-confirm` mints the durable plan server-side — the
-exact CSV bytes + decisions bound to a `preview_token`, `request_id`
+exact CSV bytes and decisions, bound to a `preview_token`, `request_id`
 and `decisions_digest`. Your scoped chat turn then carries only the
 tagged handle, a short JSON you relay verbatim:
 
@@ -201,50 +271,32 @@ tagged handle, a short JSON you relay verbatim:
 {"cadence_csv_import": {"request_id": "<req>", "confirm_token": "confirm-…"}}
 ```
 
-Redeem it handle-only — NO bytes, no preview token, no decisions
-(those never ride the ≤48KB chat; the host resolves the confirmed plan
-from the request id + nonce, so you can never substitute a plan the
+Redeem it handle-only — no bytes, no preview token, no decisions (they
+never ride the 48 KB chat; the host resolves the confirmed plan from
+the request id and nonce, so you can never substitute a plan the
 operator did not confirm):
 
 ```sh
 cadence app record csv-assistant-import <install> --context-id <ctx> \
-  --request-id <id> --confirm-token <confirm-…> \
+  --request-id <req> --confirm-token <confirm-…> \
   --message <msg> --token <token>
 ```
 
 Do NOT pass `--csv`, `--preview-token` or `--decisions` — the daemon
-refuses them (bytes aren't a redeem param). The operator mints the
-nonce; you cannot mint or forge it, and a scoped chat message alone is
-not confirmation — the nonce is.
-
-cadence app audience segment-assistant-save <install> --context-id <ctx> \
-  --segment-id <seg> --name <n> --predicates <tmp>/preds.json \
-  [--expected-revision <rev>] --message <msg> --token <token>
-```
-
-Read/preview on the same live turn never consumes the message:
+refuses them. The operator mints the nonce; you cannot mint or forge
+it, and a scoped chat message alone is not confirmation — the nonce is.
+To look at the rows first, stage the CSV in your tmp dir and preview
+it (read-only, no claim):
 
 ```sh
-cadence app audience segment-assistant-ls <install> --context-id <ctx> \
-  --message <msg> --token <token>
-cadence app audience segment-assistant-show <install> --context-id <ctx> \
-  --segment-id <seg> --message <msg> --token <token>
-Preview a saved segment's membership — bounded counts and a small
-sample (never the full list), the audience the operator will confirm a
-campaign against:
-
-```sh
-cadence app audience segment-assistant-preview <install> --context-id <ctx> \
-  --segment-id <seg> --message <msg> --token <token>
-```
-
 cadence app record csv-assistant-preview <install> --context-id <ctx> \
   --csv <tmp>/in.csv --message <msg> --token <token>
 ```
 
-Draft a campaign email straight from the scoped chat — no mint, no
-request id; the verified turn IS the request. Stage the draft JSON
-(`{subject, preheader, blocks}`) in your tmp dir, then:
+### Campaign email draft
+
+No mint, no request id; the verified turn IS the request. Stage the
+draft JSON (`{subject, preheader, blocks}`) in your tmp dir, then:
 
 ```sh
 cadence app content assistant-draft <install> --context-id <ctx> \
@@ -255,8 +307,7 @@ cadence app content assistant-draft <install> --context-id <ctx> \
 The proposal lands `pending` with `assistant-receipt` provenance — the
 operator applies or discards it; you never edit live content, approve
 or send. One turn produces one draft; re-drafting the same turn is
-refused. Your draft is discoverable in the campaign's proposals before
-the operator applies it — list or show it:
+refused. List or show your draft before the operator applies it:
 
 ```sh
 cadence app content assistant-proposals <install> --context-id <ctx> \
@@ -266,9 +317,10 @@ cadence app content assistant-proposal-show <install> --context-id <ctx> \
 ```
 
 One message redeems one COMMIT action — a second verb or request id on
-the same message is refused; reads and inert email/segment proposals
-run from chat without a claim. These verbs can never send, approve, or
-touch a record or segment outside the stamped context.
+the same message is refused; reads and inert email and segment
+proposals run from chat without a claim. These verbs can never send,
+approve, confirm an import or touch a record or segment outside the
+stamped context.
 
 ## Never
 

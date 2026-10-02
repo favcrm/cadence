@@ -1416,6 +1416,36 @@ mod tests {
         }
     }
 
+    /// CAD-1009: the scoped-chat section of AGENT.md matches what the
+    /// daemon delivers and what the segment grammar accepts — the
+    /// token line it quotes is exactly `adapter::scoped_turn_line`,
+    /// every supported predicate field has an example, the fences
+    /// balance, and the "never `--help`, report a refusal" rule is
+    /// present. A drift in any of these fails here.
+    #[test]
+    fn briefing_scoped_chat_section_matches_the_delivered_envelope() {
+        assert_eq!(
+            AGENT_TEMPLATE.matches("```").count() % 2,
+            0,
+            "unbalanced fences"
+        );
+        let line = crate::adapter::scoped_turn_line("<msg>", "<token>");
+        assert!(AGENT_TEMPLATE.contains(&line), "{line}");
+        for field in ["tag", "source", "consent_email", "email_domain"] {
+            assert!(
+                AGENT_TEMPLATE.contains(&format!("[{{\"field\": \"{field}\", \"op\": \"eq\"")),
+                "no predicate example for {field}"
+            );
+        }
+        for rule in [
+            "Never run `cadence --help`",
+            "report the refusal text",
+            "Use ONLY the verbs listed below",
+        ] {
+            assert!(AGENT_TEMPLATE.contains(rule), "missing `{rule}`");
+        }
+    }
+
     /// CAD-439: the master's confinement names the system trees, the
     /// Claude CLI's own state and the master's own dirs — never `$HOME`,
     /// the state dir, `/tmp`, `/proc` or `/dev` whole.
