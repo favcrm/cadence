@@ -20,6 +20,7 @@ import type { Viewer } from "../projects/work";
 import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
+import ChatCsvImport from "./ChatCsvImport";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
@@ -450,6 +451,7 @@ export default function AppShell({
             viewer={viewer}
             contextLabel={isSocial ? null : contextLabel(contexts, contextId)}
             binding={binding}
+            crm={installation !== null && installation.name === "crm"}
           />
         </div>
         <section className="app-shell-outlet" aria-label={`${title} workspace`}>
@@ -735,10 +737,12 @@ function ChatPane({
   viewer,
   contextLabel,
   binding,
+  crm,
 }: {
   viewer: Viewer;
   contextLabel: string | null;
   binding: ChatBinding;
+  crm?: boolean;
 }) {
   const thread = useQuery(resources.masterThread);
   const [draft, setDraft] = useState("");
@@ -820,6 +824,27 @@ function ChatPane({
         <p className="text-label text-fail" role="alert">
           {sendError}
         </p>
+      )}
+      {crm === true && binding.scope !== null && (
+        <details className="app-chat-import">
+          <summary className="text-label text-ink-300">Import a customer list</summary>
+          <ChatCsvImport
+            scope={{ installId: binding.scope.install_id, contextId: binding.scope.context_id }}
+            canWrite={canSend}
+            onSendIntent={async (intent) => {
+              const message = newMessageId();
+              const body = JSON.stringify(intent);
+              try {
+                await api.threadSend(MASTER, body, message, undefined, binding.scope ?? undefined);
+                void resources.masterThread.refresh();
+                void resources.masterState.refresh();
+                return null;
+              } catch (e: unknown) {
+                return e instanceof ApiError ? e.message : String(e);
+              }
+            }}
+          />
+        </details>
       )}
       <form
         className="app-chat-form"

@@ -25,6 +25,10 @@ import { assertCleanBody, assertScope, listPath, type HostScope } from "./hostAc
 /** Body keys the HTTP peer accepts per verb. Everything else is forged. */
 const PREVIEW_KEYS = ["csv_text"] as const;
 const IMPORT_KEYS = ["csv_text", "preview_token", "request_id", "decisions"] as const;
+// CAD-1016: the operator's explicit confirm of the byte-bound previewed
+// plan — mints the one-use confirm receipt the assistant import redeems.
+// Strict body: only the three bound ids, never credentials or scope.
+const CONFIRM_KEYS = ["request_id", "preview_token", "decisions_digest"] as const;
 
 /** The daemon's bounds for this surface (CSV_TEXT_BYTES / CSV_ROWS_MAX /
  *  body caps): refuse early, before the wire. */
@@ -101,6 +105,14 @@ export interface CsvImportReceipt {
   replayed: boolean;
   summary: { applied: number; skipped: number; failed: number };
   rows: CsvImportRow[];
+}
+
+/** The host-minted one-use confirm receipt the assistant import redeems
+ *  (`csv-confirm` returns `confirm_token`/`state`/`request_id`). */
+export interface CsvConfirmReceipt {
+  confirmToken: string;
+  state: string;
+  requestId: string;
 }
 
 /** The operator's per-row import choice. `update` rows carry the
@@ -303,6 +315,46 @@ export const csvActions = {
           reason: typeof row.reason === "string" ? row.reason : null,
         };
       }),
+    };
+  },
+
+  /** `POST …/records/csv-confirm` — the operator's explicit, host-side
+   *  confirm of the exact previewed plan. Mints the one-use
+   *  `confirm_token` nonce the agent's scoped turn redeems via
+   *  csv-assistant-import. `decisionsDigest` is the material digest the
+   *  daemon recomputes over its own normalized decisions — a mismatch
+   *  refuses, so a confirmed plan can never drift from what the
+   *  assistant applies. Writes nothing to records itself. */
+  async confirm(
+    scope: HostScope,
+    previewToken: string,
+    requestId: string,
+    decisionsDigest: string,
+  ): Promise<CsvConfirmReceipt> {
+    assertScope(scope);
+    if (!TOKEN_PATTERN.test(previewToken)) {
+      throw new ApiError("the CSV preview token is missing or malformed — preview again", 400);
+    }
+    if (!identifier(requestId)) {
+      throw new ApiError("the import request id is out of bounds", 400);
+    }
+    if (!TOKEN_PATTERN.test(decisionsDigest)) {
+      throw new ApiError("the CSV decisions digest is missing or malformed", 400);
+    }
+    const body: Record<string, unknown> = {
+      request_id: requestId,
+      preview_token: previewToken,
+      decisions_digest: decisionsDigest,
+    };
+    assertCleanBody(body, CONFIRM_KEYS);
+    const value = await post<Record<string, unknown>>(`${listPath(scope)}/csv-confirm`, body);
+    if (typeof value.confirm_token !== "string" || typeof value.request_id !== "string") {
+      throw new ApiError("The server returned an invalid CSV confirm receipt", 502);
+    }
+    return {
+      confirmToken: value.confirm_token,
+      state: typeof value.state === "string" ? value.state : "unknown",
+      requestId: value.request_id,
     };
   },
 };

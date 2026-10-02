@@ -24,6 +24,8 @@ import {
   type ProposalDoc,
 } from "./campaignGrammar";
 import { contentClient } from "./contentClient";
+import { resources } from "../../lib/resources";
+import { useQuery } from "../../lib/useResource";
 import {
   DELIVERY_CLAIM,
   friendlySendError,
@@ -2029,13 +2031,27 @@ function CampaignWorkspace({
   }, [scope.installId, scope.contextId, viewer.operator, bindingToken]);
 
   const proposalsKey = `${scope.installId}:${scope.contextId}:${campaignId}:${proposalToken}`;
-  // CAD-1016: a scoped-chat message lands the assistant's draft turn —
-  // refresh pending proposals when the operator's scoped message changes
-  // (the agent's answer arrives on the live turn that followed it).
+  // CAD-1016: refresh pending drafts on the agent's actual completion —
+  // a new non-operator entry landing in the scoped thread (the assistant's
+  // reply after the operator's ask), not merely the operator's send.
+  // `useQuery` subscribes to the live thread store the SSE stream feeds.
+  const thread = useQuery(resources.masterThread);
+  const lastAssistantSeq = (() => {
+    const entries = thread.data?.entries ?? [];
+    let max = 0;
+    for (const e of entries) {
+      if (e.role !== "operator" && e.seq > max) max = e.seq;
+    }
+    return max;
+  })();
+  const seenAssistantSeq = useRef(0);
   useEffect(() => {
-    if (scopedChatMessage !== null) setProposalToken((count) => count + 1);
+    if (lastAssistantSeq > seenAssistantSeq.current) {
+      seenAssistantSeq.current = lastAssistantSeq;
+      setProposalToken((count) => count + 1);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scopedChatMessage]);
+  }, [lastAssistantSeq]);
   useEffect(() => {
     // CAD-1013: proposals must be listed even before revision 1 exists —
     // the assistant-apply path is the creation route now, so a verified
