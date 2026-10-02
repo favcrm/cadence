@@ -130,6 +130,11 @@ pub struct Store {
     /// driven under `conn`'s mutex so a prepared write can never step
     /// outside the armed window.
     seal_state: std::sync::Arc<seal::GuardState>,
+    /// CAD-1011: this store's bound identity — the canonicalized database
+    /// path recorded at open. `OwnerMaintenancePermit::database_id` must
+    /// equal it, so a permit issued for one store can never authorize
+    /// owner maintenance on another.
+    db_identity: String,
 }
 
 /// The `shutdown_entries` test seam (CAD-694): called with each
@@ -214,7 +219,17 @@ impl Store {
                 // or a verified rollback) gets the forensic row.
                 let clean = !matches!(recovery, seal::PoisonRecovery::Unverified);
                 let fenced = self.write_fence.get().is_some_and(|f| f.check().is_some());
-                if !fenced && clean {
+                // CAD-1011: a sealed or Protected-unknown store must
+                // never write the recovery event — a forensic write into
+                // a closed latch would both fail the authorizer's
+                // latch-table deny and mislabel a sealed store's state.
+                // `preflight_read` is a plain read (allowed even while
+                // disarmed); only an unsealed store may record the row.
+                let sealed = matches!(
+                    super::seal::preflight_read(&guard),
+                    Ok(super::seal::Preflight::Sealed)
+                );
+                if !fenced && !sealed && clean {
                     // CAD-1011: the forensic recovery event is an
                     // owner-maintenance write — armed so the authorizer
                     // permits it while the caller's lane is still disarmed.

@@ -966,23 +966,20 @@ impl Store {
     pub fn record_running_build(&self, commit: &str) -> Result<()> {
         // CAD-1011: rollout schema + daemon-build upsert are owner
         // maintenance (DDL + guard-table writes), not business DML.
-        self.with_owner_conn(|conn| {
-            crate::rollout::upsert_daemon_build(conn, commit, crate::rollout::unix_now())
-        })
+        self.owner_record_running_build(commit)
     }
 
     /// Refuse to keep running when this binary's commit is not the one
     /// the daemon last recorded, unless the caller holds the lease.
     pub fn enforce_running_build(&self) -> Result<()> {
-        self.with_owner_conn(|conn| crate::rollout::enforce_running_build(conn))
+        self.owner_enforce_running_build()
     }
 
     /// Fold a refused migration's side log into the daemon event stream.
     /// The refusal itself cannot be inserted into the database it is
     /// refusing to modify.
     pub fn ingest_rollout_gate(&self, state_dir: &Path) -> Result<()> {
-        self.with_owner_conn(|conn| crate::rollout::ingest_gate_log(state_dir, conn))
-            .map(|_| ())
+        self.owner_ingest_rollout_gate(state_dir)
     }
 
     /// Event log page for the `events` API; cursor is the last seq seen.

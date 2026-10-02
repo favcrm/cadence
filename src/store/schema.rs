@@ -911,6 +911,15 @@ impl Store {
             shutdown_entries_hook: None,
             shutdown_backoff_ms: 50,
             seal_state,
+            // CAD-1011: bind owner-maintenance permits to this exact db —
+            // the canonicalized path is the identity a permit is issued
+            // against; a missing/noncanonical path still yields a stable
+            // string so a permit can never silently match.
+            db_identity: path
+                .canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .to_string_lossy()
+                .into_owned(),
         };
         let outcome = if recover {
             Some(store.recover(marker.as_ref())?)
