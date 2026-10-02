@@ -2029,6 +2029,13 @@ function CampaignWorkspace({
   }, [scope.installId, scope.contextId, viewer.operator, bindingToken]);
 
   const proposalsKey = `${scope.installId}:${scope.contextId}:${campaignId}:${proposalToken}`;
+  // CAD-1016: a scoped-chat message lands the assistant's draft turn —
+  // refresh pending proposals when the operator's scoped message changes
+  // (the agent's answer arrives on the live turn that followed it).
+  useEffect(() => {
+    if (scopedChatMessage !== null) setProposalToken((count) => count + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopedChatMessage]);
   useEffect(() => {
     // CAD-1013: proposals must be listed even before revision 1 exists —
     // the assistant-apply path is the creation route now, so a verified
@@ -2642,10 +2649,10 @@ function CampaignWorkspace({
         <section aria-label="Assistant proposals" className="card px-4 py-4 grid gap-3">
           <h4 className="text-cardtitle font-medium text-ink-100">Proposals — Apply or Discard</h4>
           <p className="text-label text-ink-400">
-            The left chat assistant drafts copy when the operator asks it to: mint one proposal
-            request below, then its live turn answers with a host-verified draft. Only Apply
-            changes the draft revision (approval invalidates); Discard is non-mutating. Nothing
-            proposes, edits or sends silently.
+            The left chat assistant drafts copy when the operator asks it to: a scoped message
+            invokes the assistant-draft turn, which lands an inert pending proposal here. Only
+            Apply changes the draft revision (approval invalidates); Discard is non-mutating.
+            Nothing proposes, edits or sends silently.
           </p>
           {proposalsError && (
             <p className="text-label text-fail" role="alert">
@@ -2668,7 +2675,14 @@ function CampaignWorkspace({
           {canWrite && (
             <p className="text-label text-ink-500" data-assistant-hint>
               Ask the assistant in the left chat to draft this email — its
-              proposal appears below for review.
+              proposal appears below for review.{" "}
+              <button
+                type="button"
+                className="lnk"
+                onClick={() => setProposalToken((count) => count + 1)}
+              >
+                Refresh drafts
+              </button>
             </p>
           )}
           {proposals.filter((row) => row.state === "pending").length === 0 ? (

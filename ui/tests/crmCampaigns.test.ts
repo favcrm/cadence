@@ -312,35 +312,33 @@ async function mountedFlow() {
     },
   };
   const proposals: Record<string, any> = {};
-  const proposalRequests: Record<string, any> = {};
-  const mintBodies: any[] = [];
   const applyBodies: any[] = [];
   const sendBodies: any[] = [];
   let propSeq = 0;
-  // The assistant's turn lands later than the mint: `redeem` plays the
-  // daemon-side redemption (the socket-only verb a browser can never
-  // reach) so the list starts answering with a receipted proposal.
-  const redeem = (requestId: string) => {
-    const request = proposalRequests[requestId];
-    assert(request && request.state === "open", `redeem needs an open request: ${requestId}`);
+  // CAD-1016: no manual mint — a scoped chat turn lands the assistant's
+  // inert pending proposal on the campaign directly. `landAssistantDraft`
+  // plays that store-side verb (assistant-draft) the browser can never
+  // reach: the proposal names the campaign, source_revision is the current
+  // saved revision (0 for an unsaved campaign), provenance is the receipt.
+  const landAssistantDraft = (campaignId: string, opts?: { subject?: string }) => {
     propSeq += 1;
     const id = `prop-asst-${propSeq}`;
+    const sourceRevision = contents[campaignId]?.revision ?? 0;
+    const messageId = sendBodies.at(-1)?.message as string | undefined;
     proposals[id] = {
       proposal_id: id, install_id: "install-crm", context_id: "ctx-a",
-      campaign_id: request.campaign_id, source_revision: request.source_revision,
-      subject: "Assistant draft subject", preheader: "From the chat turn",
+      campaign_id: campaignId, source_revision: sourceRevision,
+      subject: opts?.subject ?? "Assistant draft subject", preheader: "From the chat turn",
       blocks: [{ type: "paragraph", text: "Assistant copy {{first_name|Friend}}" }],
       content_digest: `proposal-digest-asst-${propSeq}`, actor: "assistant",
       origin: "assistant-receipt",
       assistant_receipt: {
-        message_id: request.message_id, agent: "crm-writer", request_id: request.request_id,
+        message_id: messageId ?? "chat-1", agent: "crm-writer", request_id: `req-${propSeq}`,
         install_id: "install-crm", context_id: "ctx-a",
-        campaign_id: request.campaign_id, source_revision: request.source_revision,
+        campaign_id: campaignId, source_revision: sourceRevision,
       },
       state: "pending", created: 1759286400, decided: null,
     };
-    request.state = "used";
-    request.used_by = id;
     return proposals[id];
   };
   const suppressions: { kind: string; key: string; reason: string }[] = [];
@@ -429,32 +427,11 @@ async function mountedFlow() {
         payload_digest: "payload-digest-1",
       } });
     }
-    // CAD-813: the one-time proposal-request mint — the body names
-    // only campaign/message/request ids; the host stamps the source
-    // revision and binds the chat message's verified scope.
+    // CAD-1016: there is no operator proposal-request mint — the agent's
+    // scoped turn lands the proposal via assistant-draft. Any browser POST
+    // to the removed mint route must never reach a handler.
     if (method === "POST" && url.pathname.endsWith("/content/proposal-requests")) {
-      const body = JSON.parse(String(init!.body));
-      mintBodies.push(body);
-      const entry = threadEntries.find((row) => row.message === body.message_id);
-      const bound = entry?.payload?.app;
-      if (!entry || bound?.install_id !== "install-crm" || bound?.context_id !== "ctx-a") {
-        return refused("proposal request scope does not match its verified chat message", 409);
-      }
-      const request = proposalRequests[body.request_id];
-      if (request) {
-        if (request.campaign_id === body.campaign_id && request.message_id === body.message_id) {
-          return json({ request });
-        }
-        return refused("email proposal request ID is already used", 409);
-      }
-      proposalRequests[body.request_id] = {
-        request_id: body.request_id, install_id: "install-crm", context_id: "ctx-a",
-        campaign_id: body.campaign_id,
-        source_revision: contents[body.campaign_id]?.revision ?? 0,
-        message_id: body.message_id, state: "open", used_by: null,
-        created: 1759286400, decided: null,
-      };
-      return json({ request: proposalRequests[body.request_id] });
+      return refused("the proposal-request mint is gone — the assistant drafts on a scoped chat turn", 404);
     }
     if (method === "POST" && url.pathname.endsWith("/content/proposals")) {
       const body = JSON.parse(String(init!.body));
@@ -693,23 +670,20 @@ async function mountedFlow() {
   assert(!host.querySelector("#cmp-subject"), "no manual subject input until a draft exists");
 
   // Initial creation is not stranded: send the assistant a scoped chat
-  // message, mint a proposal request (source r0), redeem it, Apply —
-  // that creates revision 1 through the verified assistant path.
-  const mintButton0 = () => byText("button", "Ask assistant to draft") as HTMLButtonElement | null;
-  assert(mintButton0(), "the assistant-draft mint control renders pre-save");
-  assert(mintButton0()!.disabled, "mint is disabled without a scoped chat message");
+  // message, the agent's turn lands an inert pending draft (source r0),
+  // Apply creates revision 1 through the verified assistant path — no
+  // manual mint.
+  assert(!byText("button", "Ask assistant to draft"), "no manual assistant-draft mint control renders");
+  assert(text().includes("Ask the assistant in the left chat"), "the agent-first hint renders pre-save");
   await fillArea("#app-shell-chat-box", "Draft the launch email for this campaign");
   await click(byText("button", "Send"));
-  await React.act(async () => {
-    const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
-    await resources.masterThread.refresh();
-  });
-  await settle(() => assert(!mintButton0()!.disabled, "mint enables once a scoped message exists"));
-  await click(mintButton0());
-  await settle(() => assert(mintBodies.length === 1, "one proposal request minted pre-save"));
-  assert(mintBodies[0].campaign_id, "mint names the campaign");
-  redeem(mintBodies[0].request_id as string);
-  await settle(() => assert(text().includes("Verified assistant draft"), "the verified proposal lands pre-save"), 30000);
+  assert(sendBodies.length === 1, "the scoped chat message was sent");
+  equal(sendBodies.at(-1)!.app, { install_id: "install-crm", context_id: "ctx-a" }, "the send carried the scope");
+  const unsavedCampaignId = (host.querySelector("#cmp-id") as HTMLInputElement | null)?.value
+    ?? Object.keys(contents).at(-1) as string;
+  landAssistantDraft(unsavedCampaignId);
+  await click(byText("button", "Refresh drafts"));
+  await settle(() => assert(host.querySelector('[data-proposal^="prop-asst-"]'), "the pending draft lands pre-save"), 30000);
   const firstLi = host.querySelector('[data-proposal^="prop-asst-"]');
   assert(firstLi, "the verified proposal row exists");
   await click(Array.from(firstLi!.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Apply")));
@@ -750,11 +724,10 @@ async function mountedFlow() {
   // stale-source proposal refuses with Apply disabled.
   await click(byText("button", "Approve r2 (content-only)"));
   await settle(() => assert(text().includes("Approved r2"), "approval lands content-only"));
-  // Mint a second assistant proposal at r2, then save r3 via a text
-  // correction so the proposal drifts stale.
-  await click(mintButton0());
-  await settle(() => assert(mintBodies.length === 2, "a second proposal request mints"));
-  redeem(mintBodies[1].request_id as string);
+  // A second assistant draft lands at r2 (scoped chat turn), then save
+  // r3 via a text correction so the proposal drifts stale.
+  landAssistantDraft(openDoc().campaign_id as string, { subject: "Assistant draft subject v2 draft" });
+  await click(byText("button", "Refresh drafts"));
   await settle(() => assert(host.querySelectorAll('[data-proposal]').length > 0, "second proposal pends"), 30000);
   await click(byText("button", "Edit subject / text"));
   await settle(() => assert(host.querySelector("#cmp-subject"), "inline edit reopens"));
@@ -779,11 +752,10 @@ async function mountedFlow() {
   await settle(() => assert(host.querySelector("#cmp-subject"), "inline edit opens for the pinned test"));
   const pinnedBase = openDoc().revision as number;
   await fillInput("#cmp-subject", "My kept local correction");
-  // A concurrent assistant proposal lands and applies → doc r(N+1).
-  const mintsBefore = mintBodies.length;
-  await click(mintButton0());
-  await settle(() => assert(mintBodies.length === mintsBefore + 1, "a fresh request minted mid-edit"), 15000);
-  redeem(mintBodies.at(-1)!.request_id as string);
+  // A concurrent assistant draft lands (scoped chat turn) and applies
+  // → doc r(N+1).
+  landAssistantDraft(openDoc().campaign_id as string, { subject: "Concurrent assistant draft" });
+  await click(byText("button", "Refresh drafts"));
   await settle(() => assert(host.querySelectorAll('[data-proposal]').length > 0, "a fresh proposal pends"), 30000);
   const freshLi = Array.from(host.querySelectorAll('[data-proposal]')).at(-1)!;
   await click(Array.from(freshLi.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Apply")));
@@ -808,30 +780,20 @@ async function mountedFlow() {
   );
   await click(byText("button", "Cancel"));
 
-  // ---- CAD-813: the verified assistant draft seam ----
-  // Isolate the precondition for real: the creation flow already sent a
-  // scoped chat message in this mount, so this seam clears the shared
-  // thread store to a genuine no-scoped-message state — the assertion
-  // (mint disabled until a message exists) is kept, not weakened.
-  const mintButton = () => byText("button", "Ask assistant to draft") as HTMLButtonElement | null;
-  const mintsAtSeam = mintBodies.length;
+  // ---- CAD-1016: the verified assistant-draft seam (no manual mint) ----
+  // The mint control is gone: an ordinary scoped chat message invokes the
+  // assistant-draft turn, which lands an inert pending proposal. Isolate a
+  // real no-scoped-message state first, assert there is no mint control and
+  // no proposal request can leave the browser, then send a scoped message
+  // and land the agent's draft → the verified proposal appears and Apply
+  // bumps the revision + invalidates approval.
+  assert(!byText("button", "Ask assistant to draft"), "no manual mint control renders");
   const sendsAtSeam = sendBodies.length;
-  // Isolate the precondition for real: the resource merges incremental
-  // reads onto its cached data, so clearing the fake array alone leaves
-  // the sent message cached. write() the store to the empty thread — a
-  // genuine no-scoped-message state — before asserting the disabled mint.
   await React.act(async () => {
     const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
     const { EMPTY_THREAD } = require("../src/features/home/thread") as typeof import("../src/features/home/thread");
     resources.masterThread.write(() => EMPTY_THREAD);
   });
-  await settle(() => assert(mintButton()!.disabled, "mint is disabled once the scoped message is gone"));
-  assert(
-    text().includes("Send the assistant a message in the left chat first"),
-    "the disabled mint explains what to do",
-  );
-  assert(mintBodies.length === mintsAtSeam, "no proposal request leaves the browser while disabled");
-
   // Send the assistant a scoped chat message through the left pane —
   // the daemon stamps the verified App binding on the stored entry,
   // which the stream then lands in the shared thread store.
@@ -843,50 +805,20 @@ async function mountedFlow() {
     { install_id: "install-crm", context_id: "ctx-a" },
     "the chat send carried the shell's scope",
   );
-  await React.act(async () => {
-    const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
-    await resources.masterThread.refresh();
-  });
-  await settle(() => assert(!mintButton()!.disabled, "the mint enables once a scoped message exists"));
 
-  // Mint: the body is exactly {campaign_id, message_id, request_id} —
-  // no token, receipt, turn or source_revision ever travels. (This is
-  // a later mint: earlier ones already ran in this scenario.)
-  const mintCountBefore = mintBodies.length;
-  await click(mintButton());
-  await settle(() => assert(mintBodies.length === mintCountBefore + 1, "one proposal request minted"));
-  const minted = mintBodies.at(-1)!;
-  equal(
-    Object.keys(minted).sort(),
-    ["campaign_id", "message_id", "request_id"],
-    "the mint body carries exactly the three ids",
-  );
-  const openCampaignId = openDoc().campaign_id as string;
-  assert(minted.campaign_id === openCampaignId, "mint names the open campaign");
-  assert(minted.message_id === sendBodies.at(-1)?.message, "mint names the scoped chat message");
-  assert(/^req-[0-9a-f]{24}$/.test(minted.request_id), "request id is identifier-safe");
-  await settle(() =>
-    assert(
-      text().includes(`stamped source r${openDoc().revision}`) && text().includes(`draft r${openDoc().revision}`),
-      "the minted request's host stamp renders beside the draft revision",
-    ),
-  );
-  await settle(() => assert(text().includes("Watching for the assistant's draft"), "the bounded watch starts"));
-
-  // The assistant's live turn redeems the request (daemon socket —
-  // this fixture's `redeem` plays the store-side part the browser
-  // can never reach): the next poll lands the verified proposal.
-  const mintedId = minted.request_id as string;
-  redeem(mintedId);
-  await settle(() => assert(text().includes("Verified assistant draft"), "the verified badge renders on the receipted proposal"), 30000);
+  // The agent's scoped turn lands the inert pending draft on the campaign —
+  // this fixture's landAssistantDraft plays the store-side assistant-draft
+  // verb the browser can never reach.
+  const seamCampaignId = openDoc().campaign_id as string;
+  const landed = landAssistantDraft(seamCampaignId);
+  await click(byText("button", "Refresh drafts"));
+  await settle(() => assert(host.querySelector(`[data-proposal="${landed.proposal_id}"]`), "the landed draft appears in the pending list"), 30000);
   assert(text().includes("crm-writer"), "the badge names the receipt's agent");
-  assert(text().includes(`request ${mintedId}`), "the badge names the receipt's request");
-  assert(text().includes(`Verified assistant draft landed for request ${mintedId}`), "the poll stop note reports the match");
 
   // Apply the verified draft: expected_revision = current draft, the
   // revision moves, approval invalidates and the stale row clears.
   const revisionBefore = openDoc().revision as number;
-  const verifiedLi = host.querySelector('[data-proposal^="prop-asst-"]');
+  const verifiedLi = host.querySelector(`[data-proposal="${landed.proposal_id}"]`);
   assert(verifiedLi, "the verified proposal row exists");
   await click(Array.from(verifiedLi!.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Apply")));
   await settle(() => assert(text().includes("Applied as revision"), "verified apply reports the new revision"));
@@ -894,7 +826,7 @@ async function mountedFlow() {
   assert(text().includes("approval invalidated"), "apply invalidated approval visibly");
   await settle(() =>
     assert(
-      !text().includes(`request ${mintedId}`) || !text().includes("Verified assistant draft"),
+      !host.querySelector(`[data-proposal="${landed.proposal_id}"]`),
       "the decided proposal leaves the pending list",
     ),
   );
