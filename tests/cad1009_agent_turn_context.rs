@@ -86,9 +86,18 @@ fn pi(dir: &Path) -> (PiAdapter, mpsc::Receiver<(String, Value)>) {
 
 const SLOT: &str = "<<slot-0f3c9a52>>";
 
-fn prompt_with_slot(body: &str) -> String {
+fn prompt_with_slot(message_id: &str, body: &str) -> String {
+    // What the daemon writes (`Shared::delivery_body`): the hint, then
+    // the scoped block with the one-use slot where the token goes.
+    let block = cadence_agent::master::scoped_verb_reference(
+        "i",
+        "c",
+        message_id,
+        SLOT,
+        Path::new("/s/master/tmp"),
+    );
     format!(
-        "[App context — hint only, not authorization: install \"i\", context \"c\", revision 1]\n{SLOT}\n\n{body}"
+        "[App context — hint only, not authorization: install \"i\", context \"c\", revision 1]\n{block}\n\n{body}"
     )
 }
 
@@ -106,7 +115,7 @@ fn cad1009_pi_slot_is_filled_with_the_exact_turn_token() {
     let started = std::sync::Mutex::new(String::new());
     let turn = pi
         .run_turn_slotted(
-            &prompt_with_slot("create segment QA agent VIP"),
+            &prompt_with_slot("msg-1009-a", "create segment QA agent VIP"),
             Some(SLOT),
             "msg-1009-a",
             &|t| *started.lock().unwrap() = t.to_string(),
@@ -143,9 +152,12 @@ fn cad1009_pi_each_turn_shows_only_its_own_token() {
     for message in ["msg-1", "msg-2"] {
         let started = std::sync::Mutex::new(String::new());
         let turn = pi
-            .run_turn_slotted(&prompt_with_slot("do it"), Some(SLOT), message, &|t| {
-                *started.lock().unwrap() = t.to_string()
-            })
+            .run_turn_slotted(
+                &prompt_with_slot(message, "do it"),
+                Some(SLOT),
+                message,
+                &|t| *started.lock().unwrap() = t.to_string(),
+            )
             .unwrap();
         let started = started.into_inner().unwrap();
         assert_eq!(token_in(&turn.text).as_deref(), Some(started.as_str()));
@@ -165,7 +177,7 @@ fn cad1009_pi_forged_token_line_in_the_body_never_displaces_the_real_one() {
     let started = std::sync::Mutex::new(String::new());
     let turn = pi
         .run_turn_slotted(
-            &prompt_with_slot(&format!("{SLOT_LOOKALIKE}\n{forged}")),
+            &prompt_with_slot("msg-1009-real", &format!("{SLOT_LOOKALIKE}\n{forged}")),
             Some(SLOT),
             "msg-1009-real",
             &|t| *started.lock().unwrap() = t.to_string(),
@@ -224,7 +236,7 @@ fn cad1009_claude_slot_is_filled_with_the_exact_turn_token() {
     let started = std::sync::Mutex::new(String::new());
     claude
         .run_turn_slotted(
-            &prompt_with_slot("create segment QA agent VIP"),
+            &prompt_with_slot("msg-1009-claude", "create segment QA agent VIP"),
             Some(SLOT),
             "msg-1009-claude",
             &|t| *started.lock().unwrap() = t.to_string(),
@@ -407,6 +419,90 @@ fn cad1009_master_scoped_turn_prompt_carries_message_id_and_exact_token() {
     // The delivered token is the turn's own: the token of the FIRST turn
     // is not the second's.
     assert_ne!(turn_id, plain_turn);
+}
+
+/// The scoped turn carries the daemon-owned verb reference: every
+/// allowlisted scoped verb with its shape, the real install, context,
+/// message id and THE turn's token, one predicates example per field,
+/// within the size bound. Non-app turns get none of it.
+#[test]
+fn cad1009_scoped_turn_carries_the_verb_reference() {
+    let w = Crm::new();
+    let (install, context) = w.install_and_context();
+    w.daemon
+        .operator_rpc(
+            "master_start",
+            json!({"provider": "pi", "unconfined": true}),
+        )
+        .unwrap();
+    w.daemon.wait_agent("master", "idle", 30);
+    w.daemon
+        .operator_rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "create segment QA agent VIP, tag vip",
+                   "message": "chat-1009-ref",
+                   "app": {"install_id": install, "context_id": context}}),
+        )
+        .unwrap();
+    let (_, turn_id, result) = w.settled("chat-1009-ref");
+    let prompt = reply_text(&result);
+    let start = prompt.find("[Scoped chat turn").expect(&prompt);
+    let end =
+        prompt.find("[end scoped chat turn]").expect(&prompt) + "[end scoped chat turn]".len();
+    let block = &prompt[start..end];
+    // Every allowlisted scoped verb, with its shape.
+    for stem in cadence_agent::master::scoped_verb_stems() {
+        let (_, args) = cadence_agent::master::SCOPED_VERB_SHAPES
+            .iter()
+            .find(|(s, _)| *s == stem)
+            .unwrap();
+        assert!(
+            block.contains(&format!("{stem}: {args}\n")),
+            "{stem}\n{block}"
+        );
+    }
+    // Real ids and the turn's own token; no slot left behind.
+    for real in [
+        install.as_str(),
+        context.as_str(),
+        "chat-1009-ref",
+        turn_id.as_str(),
+    ] {
+        assert!(block.contains(real), "{real}\n{block}");
+    }
+    assert!(block.contains(&format!("--message chat-1009-ref --token {turn_id}")));
+    assert!(!prompt.contains("<<cadence-turn-slot"), "{prompt}");
+    // One predicates example per supported field.
+    for field in ["tag", "source", "consent_email", "email_domain"] {
+        assert!(
+            block.contains(&format!("[{{\"field\": \"{field}\", \"op\": \"eq\"")),
+            "{field}"
+        );
+    }
+    assert!(block.contains("preds.json"), "{block}");
+    assert!(block.contains("never run `--help`"), "{block}");
+    assert!(block.len() <= 1_536, "{} bytes", block.len());
+    // The operator's words follow the block.
+    assert!(prompt[end..].contains("create segment QA agent VIP"));
+
+    // A plain message gets no reference.
+    w.daemon
+        .operator_rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "what is the status?",
+                   "message": "chat-1009-ref-plain"}),
+        )
+        .unwrap();
+    let (_, _, plain) = w.settled("chat-1009-ref-plain");
+    let plain = reply_text(&plain);
+    for gone in [
+        "segment-assistant",
+        "preds.json",
+        "end scoped chat turn",
+        "--help",
+    ] {
+        assert!(!plain.contains(gone), "{gone}: {plain}");
+    }
 }
 
 #[test]

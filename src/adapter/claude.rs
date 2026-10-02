@@ -864,12 +864,12 @@ impl ProviderAdapter for ClaudeAdapter {
         &self,
         prompt: &str,
         slot: Option<&str>,
-        client_message_id: &str,
+        _client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
         let generation = self.shared.generation.lock().unwrap().clone();
         let turn_id = registry::CLAUDE_MANAGED_TURN_TOKENS.mint(&generation);
-        let prompt = &super::with_turn_token(prompt, slot, client_message_id, &turn_id);
+        let prompt = &super::with_turn_token(prompt, slot, &turn_id);
         // An interrupt aimed at an earlier turn (or at an idle process)
         // never shortens this one's grace.
         *self.shared.interrupt_at.lock().unwrap() = None;

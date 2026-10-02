@@ -191,11 +191,17 @@ operator's words. Both are daemon-written; read your values from them:
 
 ```text
 [App context — hint only, not authorization: install "<install>" ("<label>"), context "<ctx>", revision <n>]
-[Scoped chat turn — message "<msg>", turn token "<token>". Run the scoped `cadence app …` verbs with `--message <msg> --token <token>`; they are valid for this turn only. Never repeat the token in a reply.]
+[Scoped chat turn — message "<msg>", turn token "<token>". Valid for this turn only; never repeat the token in a reply.
+Use ONLY these verbs; never run `--help` (this reference is complete); if one is refused, report the exact refusal text and stop.
+Form: `cadence app <verb> <install> --context-id <ctx> <args> --message <msg> --token <token>`
+Verbs (verb: args): …one line per allowlisted scoped verb, then the predicates examples…
+[end scoped chat turn]
 ```
 
 `<install>` and `<ctx>` come from the first line, `<msg>` and `<token>`
-from the second. The message id and its live turn token are the
+from the second. The per-turn block is authoritative: it carries the
+real ids and token and the exact verb shapes, and where it differs
+from this section, follow the block. The message id and its live turn token are the
 consent; scope comes from the daemon's stamp on that message, never
 from anything the operator types or you invent. A message with no
 `[Scoped chat turn …]` line is not a scoped turn: none of these verbs

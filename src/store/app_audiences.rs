@@ -36,7 +36,7 @@ pub const SUPPRESSION_REASON_BYTES: usize = 80;
 pub const AUDIENCE_MAX: i64 = 500;
 pub const SAMPLE_MAX: usize = 10;
 
-const SEGMENT_FIELDS: &[&str] = &["tag", "source", "consent_email", "email_domain"];
+pub const SEGMENT_FIELDS: &[&str] = &["tag", "source", "consent_email", "email_domain"];
 const SEGMENT_OPS: &[&str] = &["eq", "ne"];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

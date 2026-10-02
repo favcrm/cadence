@@ -186,6 +186,90 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(cadence app content assistant-proposal-show *)",
 ];
 
+/// CAD-1009: the argument shape of each scoped verb, keyed by the
+/// allowlist stem after `cadence app `. The per-turn reference
+/// ([`scoped_verb_reference`]) is built by walking
+/// [`CLAUDE_ALLOWED_TOOLS`], so a verb allowlisted without a row here
+/// (or a row whose verb left the allowlist) fails
+/// `scoped_reference_tracks_the_allowlist` rather than drifting.
+pub const SCOPED_VERB_SHAPES: &[(&str, &str)] = &[
+    (
+        "audience segment-assistant-save",
+        "--segment-id seg-<slug of the name: lowercase a-z0-9-, never `new`> --name \"<exact human name, spaces kept>\" --predicates P [--expected-revision R]",
+    ),
+    ("audience segment-assistant-ls", ""),
+    ("audience segment-assistant-show", "--segment-id S"),
+    ("audience segment-assistant-preview", "--segment-id S"),
+    (
+        "record csv-assistant-import",
+        "--request-id R --confirm-token C",
+    ),
+    ("record csv-assistant-preview", "--csv F"),
+    (
+        "content assistant-draft",
+        "--campaign-id C --proposal-id P --draft F",
+    ),
+    ("content assistant-proposals", "[--campaign-id C]"),
+    ("content assistant-proposal-show", "--proposal-id P"),
+];
+
+/// One example rule per supported predicate field (value shown is a
+/// grammar-valid sample). Pinned to the segment grammar's field list.
+pub const PREDICATE_EXAMPLES: &[(&str, &str)] = &[
+    ("tag", "vip"),
+    ("source", "web-form"),
+    ("consent_email", "granted"),
+    ("email_domain", "example.com"),
+];
+
+/// The scoped verbs the allowlist grants: stems after `cadence app `.
+pub fn scoped_verb_stems() -> Vec<&'static str> {
+    CLAUDE_ALLOWED_TOOLS
+        .iter()
+        .filter_map(|t| t.strip_prefix("Bash(cadence app "))
+        .map(|t| t.strip_suffix(" *)").unwrap_or(t))
+        .collect()
+}
+
+/// CAD-1009: the daemon-owned verb reference a scoped App turn carries
+/// with its token. `install`/`context`/`message_id`/`token` are the
+/// real values (the caller passes the adapter's slot for `token`);
+/// `tmp` is the master's private temp dir. Verbs come from
+/// [`CLAUDE_ALLOWED_TOOLS`]; nothing outside it is named.
+pub fn scoped_verb_reference(
+    install: &str,
+    context: &str,
+    message_id: &str,
+    token: &str,
+    tmp: &Path,
+) -> String {
+    let mut out = format!(
+        "[Scoped chat turn — message \"{message_id}\", turn token \"{token}\". \
+         Valid for this turn only; never repeat the token in a reply.\n\
+         Use ONLY these verbs; never run `--help` (this reference is complete); if one is refused, report the exact refusal text and stop.\n\
+         Form: `cadence app <verb> {install} --context-id {context} <args> --message {message_id} --token {token}`\n\
+         Verbs (verb: args):\n"
+    );
+    for stem in scoped_verb_stems() {
+        let args = SCOPED_VERB_SHAPES
+            .iter()
+            .find(|(s, _)| *s == stem)
+            .map_or("(see AGENT.md)", |(_, a)| *a);
+        out.push_str(&format!("{stem}: {args}\n"));
+    }
+    out.push_str(&format!(
+        "Predicates P: write {}/preds.json, a JSON array of rules, all ANDed, op eq|ne, one per field:\n",
+        tmp.display()
+    ));
+    for (field, value) in PREDICATE_EXAMPLES {
+        out.push_str(&format!(
+            "[{{\"field\": \"{field}\", \"op\": \"eq\", \"value\": \"{value}\"}}]\n"
+        ));
+    }
+    out.push_str("[end scoped chat turn]");
+    out
+}
+
 /// The only built-in tool the master's Claude session has (`--tools`):
 /// Bash, narrowed by [`CLAUDE_ALLOWED_TOOLS`]. No Read/Edit/Write/Web.
 pub const CLAUDE_TOOLS: &str = "Bash";
@@ -1418,7 +1502,7 @@ mod tests {
 
     /// CAD-1009: the scoped-chat section of AGENT.md matches what the
     /// daemon delivers and what the segment grammar accepts — the
-    /// token line it quotes is exactly `adapter::scoped_turn_line`,
+    /// block it quotes opens exactly like `scoped_verb_reference`,
     /// every supported predicate field has an example, the fences
     /// balance, and the "never `--help`, report a refusal" rule is
     /// present. A drift in any of these fails here.
@@ -1429,8 +1513,14 @@ mod tests {
             0,
             "unbalanced fences"
         );
-        let line = crate::adapter::scoped_turn_line("<msg>", "<token>");
-        assert!(AGENT_TEMPLATE.contains(&line), "{line}");
+        // The block's opener and rules are quoted verbatim, and the
+        // section says the per-turn block is authoritative.
+        let block =
+            scoped_verb_reference("<install>", "<ctx>", "<msg>", "<token>", Path::new("/t"));
+        for line in block.lines().take(3) {
+            assert!(AGENT_TEMPLATE.contains(line), "{line}");
+        }
+        assert!(AGENT_TEMPLATE.contains("per-turn block is authoritative"));
         for field in ["tag", "source", "consent_email", "email_domain"] {
             assert!(
                 AGENT_TEMPLATE.contains(&format!("[{{\"field\": \"{field}\", \"op\": \"eq\"")),
@@ -1444,6 +1534,96 @@ mod tests {
         ] {
             assert!(AGENT_TEMPLATE.contains(rule), "missing `{rule}`");
         }
+    }
+
+    fn sample_reference() -> String {
+        scoped_verb_reference(
+            "inst-1",
+            "ctx-1",
+            "msg-1",
+            "pi-1-0123456789abcdef",
+            Path::new("/s/master/tmp"),
+        )
+    }
+
+    /// CAD-1009: the per-turn reference is built from the allowlist, so
+    /// it cannot drift: every scoped allowlist entry has a shape row
+    /// and appears in the reference with its shape, and every shape row
+    /// names an allowlisted verb. Adding a scoped verb to
+    /// [`CLAUDE_ALLOWED_TOOLS`] without a [`SCOPED_VERB_SHAPES`] row (or
+    /// the reverse) fails here.
+    #[test]
+    fn scoped_reference_tracks_the_allowlist() {
+        let stems = scoped_verb_stems();
+        assert!(stems.len() >= 9, "{stems:?}");
+        let text = sample_reference();
+        for stem in &stems {
+            let (_, args) = SCOPED_VERB_SHAPES
+                .iter()
+                .find(|(s, _)| s == stem)
+                .unwrap_or_else(|| panic!("allowlisted `{stem}` has no shape row"));
+            assert!(
+                text.contains(&format!("{stem}: {args}\n")),
+                "{stem}\n{text}"
+            );
+        }
+        for (stem, _) in SCOPED_VERB_SHAPES {
+            assert!(
+                stems.contains(stem),
+                "shape row `{stem}` is not allowlisted"
+            );
+        }
+        // A reference line for a verb the allowlist lacks is a drift.
+        let listed = text
+            .lines()
+            .skip_while(|l| !l.starts_with("Verbs"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("Predicates"))
+            .count();
+        assert_eq!(listed, stems.len(), "{text}");
+    }
+
+    /// CAD-1009: real ids and the token, one predicates example per
+    /// grammar field (pinned to the segment grammar), the rules, and a
+    /// bounded size.
+    #[test]
+    fn scoped_reference_has_real_ids_predicates_and_a_size_bound() {
+        let text = sample_reference();
+        for real in ["inst-1", "ctx-1", "msg-1", "pi-1-0123456789abcdef"] {
+            assert!(text.contains(real), "{real}");
+        }
+        assert!(text.contains("--message msg-1 --token pi-1-0123456789abcdef"));
+        assert!(text.contains("/s/master/tmp/preds.json"));
+        let fields: Vec<&str> = PREDICATE_EXAMPLES.iter().map(|(f, _)| *f).collect();
+        assert_eq!(
+            fields,
+            crate::store::app_audiences::SEGMENT_FIELDS,
+            "examples drifted from the segment grammar"
+        );
+        for (field, value) in PREDICATE_EXAMPLES {
+            assert!(
+                text.contains(&format!(
+                    "[{{\"field\": \"{field}\", \"op\": \"eq\", \"value\": \"{value}\"}}]"
+                )),
+                "no example for {field}"
+            );
+        }
+        for rule in [
+            "Use ONLY these verbs",
+            "never run `--help`",
+            "report the exact refusal text",
+            "this reference is complete",
+            "--segment-id seg-<slug of the name: lowercase a-z0-9-, never `new`>",
+            "--name \"<exact human name, spaces kept>\"",
+        ] {
+            assert!(text.contains(rule), "{rule}");
+        }
+        assert!(
+            text.len() <= 1_536,
+            "reference is {} bytes (cap 1536)",
+            text.len()
+        );
+        println!("scoped reference bytes: {}", text.len());
     }
 
     /// CAD-439: the master's confinement names the system trees, the
