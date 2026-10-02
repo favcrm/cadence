@@ -2141,41 +2141,6 @@ mod tests {
         }
         offenders
     }
-                    let mut present: Vec<&str> = MARKERS
-                        .iter()
-                        .copied()
-                        .filter(|m| text.contains(m))
-                        .collect();
-                    present.sort_unstable();
-                    present.dedup();
-                    if present.is_empty() {
-                        continue; // writer-free file
-                    }
-                    match EXPECTED.iter().find(|(f, _)| *f == rel) {
-                        // A file outside the domain with a marker is a
-                        // brand-new unclassified writer.
-                        None => offenders.push(format!("{rel}: unclassified writer file")),
-                        // A file in the domain whose marker set is not
-                        // exactly its cleared signature gained (or lost)
-                        // a callsite class.
-                        Some((_, allowed)) => {
-                            let mut want: Vec<&str> = allowed.to_vec();
-                            want.sort_unstable();
-                            want.dedup();
-                            for m in &present {
-                                if !want.contains(m) {
-                                    offenders.push(format!(
-                                        "{rel}: unclassified callsite marker {m}"
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        offenders
-    }
 
     /// CAD-1011 writer census: the recursive scan over `src/` must find
     /// only the classified owners above — a new file with a write marker,
