@@ -142,15 +142,25 @@ impl Crm {
 
     /// The operator's explicit host-side confirm of the exact previewed
     /// plan — mints the one-use `confirm_token` the assistant import
-    /// redeems. `decisions_digest` binds the confirmed decision set
-    /// (empty array = the default preview plan).
-    fn confirm(&self, install: &str, context: &str, preview_token: &str, request: &str) -> String {
+    /// redeems AND stores the confirmed `csv_text`+`decisions` as the
+    /// durable plan the agent resolves by request id + nonce (the bytes
+    /// never ride the text-only chat). `decisions_digest` binds the
+    /// confirmed decision set (empty array = the default preview plan).
+    fn confirm(
+        &self,
+        install: &str,
+        context: &str,
+        csv: &str,
+        decisions: &Value,
+        preview_token: &str,
+        request: &str,
+    ) -> String {
         self.daemon
             .operator_rpc(
                 "app_record_csv_confirm",
                 json!({"install_id": install, "context_id": context, "preview_token": preview_token,
-                       "request_id": request,
-                       "decisions_digest": cadence_agent::store::app_records::csv_decisions_digest(&json!([])).unwrap()}),
+                       "request_id": request, "csv_text": csv, "decisions": decisions,
+                       "decisions_digest": cadence_agent::store::app_records::csv_decisions_digest(decisions).unwrap()}),
             )
             .unwrap()["confirm_token"]
             .as_str()
@@ -187,8 +197,8 @@ fn cad1014_scoped_chat_csv_import_redeems_scope_once() {
         &w.daemon.state,
         "app_record_csv_assistant_import",
         json!({"install_id": install, "context_id": context_id,
-               "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-1",
-               "confirm_token": "confirm-forged", "message": "chat-1014-1", "token": token}),
+               "request_id": "req-1014-1", "confirm_token": "confirm-forged",
+               "message": "chat-1014-1", "token": token}),
     );
     assert_eq!(
         unconfirmed["ok"], false,
@@ -215,13 +225,23 @@ fn cad1014_scoped_chat_csv_import_redeems_scope_once() {
         "agent preview token differs from operator's: {preview}"
     );
 
-    let confirm_token = w.confirm(install, context_id, &token_preview, "req-1014-1");
+    // The operator's confirm mints the durable plan (bytes + decisions
+    // stored host-side); the agent redeems it by request id + nonce only
+    // — the CSV bytes never ride the chat or the redeem call.
+    let confirm_token = w.confirm(
+        install,
+        context_id,
+        CSV,
+        &json!([]),
+        &token_preview,
+        "req-1014-1",
+    );
     let redeem: Value = lane.rpc(
         &w.daemon.state,
         "app_record_csv_assistant_import",
         json!({"install_id": install, "context_id": context_id,
-               "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-1",
-               "confirm_token": confirm_token, "message": "chat-1014-1", "token": token}),
+               "request_id": "req-1014-1", "confirm_token": confirm_token,
+               "message": "chat-1014-1", "token": token}),
     );
     // GREEN post-guard: the stamped scoped chat message redeems one
     // byte-bound, operator-confirmed import under the verified scope.
@@ -240,16 +260,18 @@ fn cad1014_scoped_chat_csv_import_redeems_scope_once() {
         &w.daemon.state,
         "app_record_csv_assistant_import",
         json!({"install_id": install, "context_id": context_id,
-               "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-1",
-               "confirm_token": confirm_token, "message": "chat-1014-1", "token": token}),
+               "request_id": "req-1014-1", "confirm_token": confirm_token,
+               "message": "chat-1014-1", "token": token}),
     );
     assert_eq!(replay["ok"], true, "identical replay refused: {replay}");
+    // A second request id under the same message is a second intent —
+    // refused even though the message+nonce are reused.
     let second: Value = lane.rpc(
         &w.daemon.state,
         "app_record_csv_assistant_import",
         json!({"install_id": install, "context_id": context_id,
-               "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-2",
-               "confirm_token": confirm_token, "message": "chat-1014-1", "token": token}),
+               "request_id": "req-1014-2", "confirm_token": confirm_token,
+               "message": "chat-1014-1", "token": token}),
     );
     assert_eq!(
         second["ok"], false,
@@ -281,14 +303,21 @@ fn cad1014_scoped_chat_csv_failed_row_keeps_intent() {
     let mut lane = LaneShell::spawn(w._root.path());
     plant_member_pane(&w.daemon, "crm-chat", "claude", None, lane.pid());
     let token = w.chat_turn("crm-chat", install, context_id, "chat-1014-5");
-    let confirm = w.confirm(install, context_id, &token_preview, "req-1014-5");
+    let confirm = w.confirm(
+        install,
+        context_id,
+        bad_csv,
+        &json!([]),
+        &token_preview,
+        "req-1014-5",
+    );
 
     let first: Value = lane.rpc(
         &w.daemon.state,
         "app_record_csv_assistant_import",
         json!({"install_id": install, "context_id": context_id,
-               "csv_text": bad_csv, "preview_token": token_preview, "request_id": "req-1014-5",
-               "confirm_token": confirm, "message": "chat-1014-5", "token": token}),
+               "request_id": "req-1014-5", "confirm_token": confirm,
+               "message": "chat-1014-5", "token": token}),
     );
     assert_eq!(first["ok"], true, "partial import refused: {first}");
     // The bad row drops as skipped/"row error" — a partial import, not
@@ -304,27 +333,36 @@ fn cad1014_scoped_chat_csv_failed_row_keeps_intent() {
         &w.daemon.state,
         "app_record_csv_assistant_import",
         json!({"install_id": install, "context_id": context_id,
-               "csv_text": bad_csv, "preview_token": token_preview, "request_id": "req-1014-5",
-               "confirm_token": confirm, "message": "chat-1014-5", "token": token}),
+               "request_id": "req-1014-5", "confirm_token": confirm,
+               "message": "chat-1014-5", "token": token}),
     );
     assert_eq!(retry["ok"], true, "same-request replay refused: {retry}");
-    // A CHANGED CSV under the spent claim+request is a different intent
-    // — refused even though request id and message match.
+    // A DIFFERENT confirmed plan (other request id + its own nonce)
+    // under the SAME spent message is a second intent — refused even
+    // though the message matches. The claim binds the resolved plan.
     let other_csv = "record_id,display_name,email\ncust-2,Other,o@example.invalid\n";
     let other_token = w.preview(install, context_id, other_csv)["preview_token"]
         .as_str()
         .unwrap()
         .to_string();
+    let other_confirm = w.confirm(
+        install,
+        context_id,
+        other_csv,
+        &json!([]),
+        &other_token,
+        "req-1014-9",
+    );
     let changed: Value = lane.rpc(
         &w.daemon.state,
         "app_record_csv_assistant_import",
         json!({"install_id": install, "context_id": context_id,
-               "csv_text": other_csv, "preview_token": other_token, "request_id": "req-1014-5",
-               "confirm_token": confirm, "message": "chat-1014-5", "token": token}),
+               "request_id": "req-1014-9", "confirm_token": other_confirm,
+               "message": "chat-1014-5", "token": token}),
     );
     assert_eq!(
         changed["ok"], false,
-        "changed payload under a spent claim admitted: {changed}"
+        "a second plan under a spent message admitted: {changed}"
     );
 }
 
@@ -413,12 +451,22 @@ fn cad1014_scoped_chat_refusals_are_closed() {
     let _other = w.chat_turn("crm-chat", install, &ctx_b, "chat-1014-3b");
     // The operator confirms the exact ctx-A plan; the probes below must
     // each refuse for their OWN reason, not merely for a missing confirm.
-    let confirm_token = w.confirm(install, &ctx_a, &token_preview, "req-1014-3");
+    let confirm_token = w.confirm(
+        install,
+        &ctx_a,
+        CSV,
+        &json!([]),
+        &token_preview,
+        "req-1014-3",
+    );
 
+    // The durable plan resolves bytes host-side: the redeem names only
+    // request_id + confirm_token; csv_text/preview_token/decisions are
+    // never on the wire.
     let base = || {
         json!({"install_id": install, "context_id": ctx_a,
-               "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-3",
-               "confirm_token": confirm_token, "message": "chat-1014-3a", "token": token})
+               "request_id": "req-1014-3", "confirm_token": confirm_token,
+               "message": "chat-1014-3a", "token": token})
     };
     // An agent can never mint its own confirm receipt (operator-only).
     let agent_mint: Value = lane.rpc(
@@ -426,6 +474,7 @@ fn cad1014_scoped_chat_refusals_are_closed() {
         "app_record_csv_confirm",
         json!({"install_id": install, "context_id": ctx_a,
                "preview_token": token_preview, "request_id": "req-forged-mint",
+               "csv_text": CSV, "decisions": [],
                "decisions_digest": cadence_agent::store::app_records::csv_decisions_digest(&json!([])).unwrap()}),
     );
     assert_eq!(
@@ -477,7 +526,16 @@ fn cad1014_scoped_chat_refusals_are_closed() {
         },
         {
             let mut p = base();
-            p["preview_token"] = json!("sha256:forged");
+            // A forged nonce field is a transport field now; the field
+            // name itself is allowed but a wrong nonce refuses.
+            p["confirm_token"] = json!("confirm-forged");
+            p
+        },
+        {
+            let mut p = base();
+            // csv_text is no longer an assistant field — carrying it is
+            // an unsupported-fields refusal (bytes never ride the wire).
+            p["csv_text"] = json!(CSV);
             p
         },
     ] {
@@ -501,7 +559,7 @@ fn cad1014_scoped_chat_refusals_are_closed() {
             .operator_rpc(
                 "app_record_csv_assistant_import",
                 json!({"install_id": install, "context_id": ctx_a,
-                       "csv_text": CSV, "preview_token": token_preview, "request_id": "req-op",
+                       "request_id": "req-op", "confirm_token": confirm_token,
                        "message": "chat-1014-3a", "token": token}),
             )
             .is_err(),

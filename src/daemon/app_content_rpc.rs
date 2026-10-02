@@ -535,10 +535,7 @@ impl Shared {
         const ALLOWED: &[&str] = &[
             "install_id",
             "context_id",
-            "csv_text",
-            "preview_token",
             "request_id",
-            "decisions",
             "confirm_token",
             "message",
             "token",
@@ -548,37 +545,44 @@ impl Shared {
         }
         let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant CSV import")?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
+        let request_id = required_str(params, "request_id")?;
+        let confirm_token = required_str(params, "confirm_token")?;
+        // The durable server-held plan IS the intent: the agent names
+        // only request_id + the operator's one-use nonce; the host
+        // resolves the confirmed csv_text + decisions + their digests
+        // from the confirm row. Bytes/decisions/preview_token are never
+        // on the wire — the agent can never substitute a plan the
+        // operator did not confirm (CSV runs to 256KiB, the chat ≤48KB;
+        // bytes can't and don't ride the message).
+        let (csv_text, decisions_value, decisions_digest, preview_token) =
+            records.app_record_csv_confirm_plan(&scoped.context, request_id, confirm_token)?;
         // One stamped message redeems one action across all request ids
-        // (CAD-1014). The claim binds the normalized payload (byte token
-        // + request id + decisions) so a changed payload under a spent
+        // (CAD-1014). The claim binds the resolved plan handle (request
+        // id + the plan's own digests) so a changed plan under a spent
         // claim refuses as a second intent, never a replay.
         let payload_digest = crate::store::app_runs::material_digest(&json!({
             "domain": "cadence-app-csv-assistant-import-v1",
-            "preview_token": required_str(params, "preview_token")?,
-            "request_id": required_str(params, "request_id")?,
-            "decisions": params.get("decisions").cloned().unwrap_or(Value::Null),
+            "request_id": request_id,
+            "preview_token": preview_token,
+            "decisions_digest": decisions_digest,
         }));
         records.app_assistant_claim(
             &scoped.context,
             &scoped.message_id,
             "app_record_csv_assistant_import",
-            Some(required_str(params, "request_id")?),
+            Some(request_id),
             &payload_digest,
             &scoped.caller,
         )?;
-        let decisions = csv_decisions(params)?;
-        // The confirm-bound decisions digest (raw `decisions` JSON — the
-        // same normalized array the operator's confirm digested).
-        let decisions_digest = crate::store::app_records::csv_decisions_digest(
-            params.get("decisions").unwrap_or(&Value::Null),
-        )?;
+        // Reuse the strict decisions parser over the stored array.
+        let decisions = csv_decisions(&json!({"decisions": decisions_value}))?;
         // Identical replay (same request id + bytes + confirmed digest,
         // already completed) returns the stored receipt WITHOUT spending
-        // a confirm — the claim bound this exact payload.
+        // a confirm — the claim bound this exact plan.
         let already = records.app_record_csv_receipt_exists(
             &scoped.context,
-            required_str(params, "request_id")?,
-            required_str(params, "preview_token")?,
+            request_id,
+            &preview_token,
             &decisions_digest,
         )?;
         // The operator's confirm is spent atomically inside the import's
@@ -588,16 +592,13 @@ impl Shared {
         let confirm = if already {
             None
         } else {
-            Some((
-                required_str(params, "confirm_token")?,
-                decisions_digest.as_str(),
-            ))
+            Some((confirm_token, decisions_digest.as_str()))
         };
         let result = records.app_record_csv_import(
             &scoped.context,
-            &csv_text(params)?,
-            required_str(params, "preview_token")?,
-            required_str(params, "request_id")?,
+            &csv_text,
+            &preview_token,
+            request_id,
             decisions,
             confirm,
         )?;
