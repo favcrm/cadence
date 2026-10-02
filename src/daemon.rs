@@ -978,7 +978,13 @@ impl Shared {
     /// false never-rendered fences (CAD-520, F26). The body itself
     /// stays durable on the message row; non-pty endpoints still take
     /// it whole.
-    fn delivery_body(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
+    fn delivery_body(
+        &self,
+        alias: &str,
+        endpoint_kind: &str,
+        message: &Message,
+        slot: Option<&str>,
+    ) -> String {
         if endpoint_kind != "pty" {
             // CAD-802: the verified App hint rides ahead of the body
             // for the provider turn. The stored text is untouched —
@@ -986,7 +992,13 @@ impl Shared {
             let mut body = message.body.clone();
             if let Ok(Some(hint)) = self.store.message_app(&message.id) {
                 if let Some(envelope) = app_hint_envelope(&hint) {
-                    body = format!("{envelope}\n\n{body}");
+                    // CAD-1009: the turn-token slot follows the hint on
+                    // its own line; the adapter fills it with the token
+                    // it mints for this very turn.
+                    body = match slot {
+                        Some(slot) => format!("{envelope}\n{slot}\n\n{body}"),
+                        None => format!("{envelope}\n\n{body}"),
+                    };
                 }
             }
             return body;
@@ -1032,6 +1044,42 @@ impl Shared {
         )
     }
 
+    /// CAD-1009: the one-use slot a scoped App turn's prompt carries for
+    /// the turn token. The Pi/Claude adapters mint the token inside
+    /// `run_turn`, after the prompt text is fixed, so the daemon leaves
+    /// this random slot after the App hint and the adapter replaces it
+    /// with a line naming the message id and the exact token it minted
+    /// (`adapter::scoped_turn_line`). A slot exists only for an App
+    /// message whose stamp still re-proves (the same condition that
+    /// puts the hint in the prompt) on an endpoint that can redeem: a
+    /// turn-token scheme and not a pty paste. The master (the only
+    /// caller of the scoped verbs) runs managed Pi or Claude; pty,
+    /// Codex and cloud endpoints get the hint only. The slot is fresh
+    /// per call and never stored — the message body cannot contain it.
+    fn turn_slot(&self, agent: &Agent, message: &Message) -> Option<String> {
+        if agent.endpoint_kind == "pty"
+            || registry::spec_opt(&agent.provider, &agent.endpoint_kind)
+                .and_then(|spec| spec.turn_token)
+                .is_none()
+        {
+            return None;
+        }
+        // The id rides inside a quoted prompt line: a grammar the daemon
+        // already enforces on its own ids, re-checked here.
+        if message.id.is_empty()
+            || message.id.len() > 128
+            || !message
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        {
+            return None;
+        }
+        let hint = self.store.message_app(&message.id).ok().flatten()?;
+        app_hint_envelope(&hint)?;
+        Some(format!("<<cadence-turn-slot:{}>>", Uuid::new_v4().simple()))
+    }
+
     /// CAD-324: the prompt for `message` — its body, preceded by a
     /// continuity pack when one is due for `alias` and the endpoint takes
     /// one. Due-ness is consumed here, delivered or not: a pack goes with
@@ -1044,8 +1092,21 @@ impl Shared {
     /// CAD-565: for a pty endpoint the "body" the prompt carries is the
     /// one-line delivery notice (see [`Self::delivery_body`]); the full
     /// text is pulled, not pasted.
+    #[cfg(test)]
     fn continuity_prompt(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
-        let body = self.delivery_body(alias, endpoint_kind, message);
+        self.continuity_prompt_slotted(alias, endpoint_kind, message, None)
+    }
+
+    /// CAD-1009: [`Self::continuity_prompt`] with the scoped-turn token
+    /// `slot` (see [`Self::turn_slot`]) after the App hint.
+    fn continuity_prompt_slotted(
+        &self,
+        alias: &str,
+        endpoint_kind: &str,
+        message: &Message,
+        slot: Option<&str>,
+    ) -> String {
+        let body = self.delivery_body(alias, endpoint_kind, message, slot);
         // A new or lost session is decided at open (in memory: the next
         // open decides again); a compaction is a thread note, pending
         // until a pack note follows it.
@@ -1704,10 +1765,23 @@ impl Shared {
                     // so a later user message cannot inherit the flag.
                     let nudge = message.is_nudge();
                     // CAD-324: a nudge owns no turn and carries no pack.
+                    // CAD-1009: a scoped App turn's token slot (None for
+                    // a nudge, a plain message or an endpoint that
+                    // cannot redeem).
+                    let slot = if nudge {
+                        None
+                    } else {
+                        self.turn_slot(&agent, &message)
+                    };
                     let prompt = if nudge {
                         message.body.clone()
                     } else {
-                        self.continuity_prompt(alias, &agent.endpoint_kind, &message)
+                        self.continuity_prompt_slotted(
+                            alias,
+                            &agent.endpoint_kind,
+                            &message,
+                            slot.as_deref(),
+                        )
                     };
                     adapter.set_unclaimed_ok(message.is_routed() || nudge);
                     // CAD-520: a nudge may also enter through a busy
@@ -1723,16 +1797,21 @@ impl Shared {
                         .admit_app_submission(&message)
                         .and_then(|()| adapter.check_body(&message.body))
                         .and_then(|()| {
-                            adapter.run_turn(&prompt, &message.id, &move |turn| {
-                                // CAD-250: a nudge owns no turn — it never
-                                // becomes `running`, and its paste is not the
-                                // held turn's proof of life.
-                                if !nudge {
-                                    let _ = shared.store.mark_running(&started_id, turn);
-                                    watch.bump_activity();
-                                }
-                                shared.wake();
-                            })
+                            adapter.run_turn_slotted(
+                                &prompt,
+                                slot.as_deref(),
+                                &message.id,
+                                &move |turn| {
+                                    // CAD-250: a nudge owns no turn — it never
+                                    // becomes `running`, and its paste is not the
+                                    // held turn's proof of life.
+                                    if !nudge {
+                                        let _ = shared.store.mark_running(&started_id, turn);
+                                        watch.bump_activity();
+                                    }
+                                    shared.wake();
+                                },
+                            )
                         });
                     adapter.set_unclaimed_ok(false);
                     adapter.set_steer_ok(false);
@@ -3647,6 +3726,129 @@ mod app_hint_tests {
             assert!(app_hint_envelope(&hint).is_none(), "{hint}");
             assert!(app_hint_notice(&hint).is_none(), "{hint}");
         }
+    }
+
+    /// CAD-1009: a scoped App turn on a master-capable endpoint (managed
+    /// Pi / Claude — the only providers `master::PROVIDERS` launches)
+    /// carries a slot after the hint; the adapter fills it with the
+    /// turn's own token. Plain messages, a hint that no longer re-proves,
+    /// pty panes and endpoints that mint no turn token carry no slot —
+    /// nothing a model could mistake for a credential.
+    #[test]
+    fn scoped_app_turn_slots_a_token_only_where_it_can_redeem() {
+        use crate::store::app_contexts::ContextConfig;
+        use crate::store::NewAgent;
+        use crate::store::Steer;
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ServeOptions::default();
+        let no_pm = dir.path().join("no-pm");
+        opts.provider_env
+            .set("CADENCE_PM_DIR", no_pm.to_str().unwrap());
+        let shared = Shared::new(dir.path(), &opts).unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        let config = ContextConfig::new("Client", BTreeMap::new()).unwrap();
+        let created = shared
+            .store
+            .app_context_create("install-1", &config, "req-1")
+            .unwrap();
+        let context = created["context"]["id"].as_str().unwrap().to_string();
+        let (_, proof) = shared
+            .store
+            .app_context_proof("install-1", &context)
+            .unwrap();
+        let stamp = json!({
+            "install_id": "install-1", "context_id": context, "verified": true,
+            "context_revision": proof.revision, "context_digest": proof.digest,
+        });
+        let mut n = 0;
+        let mut send = |alias: &str, kind: &str, provider: &str, app: bool| -> (Agent, Message) {
+            n += 1;
+            if shared.store.agent(alias).is_err() {
+                shared
+                    .store
+                    .register_agent(&NewAgent {
+                        alias,
+                        provider,
+                        endpoint_kind: kind,
+                        role: "worker",
+                        cwd: &cwd,
+                        sandbox: "read-only",
+                        instructions: None,
+                        params: None,
+                        team_role: None,
+                        model_policy: None,
+                    })
+                    .unwrap();
+            }
+            shared
+                .store
+                .enqueue_steered(
+                    alias,
+                    "create segment QA agent VIP",
+                    None,
+                    &format!("m-{n}"),
+                    "user",
+                    None,
+                    None,
+                    None,
+                    &store::Sender::OperatorChat,
+                    &Steer::NONE,
+                    None,
+                    app.then_some(&stamp),
+                )
+                .unwrap();
+            let Take::Message(message) = shared.store.take_queued(alias).unwrap() else {
+                panic!("nothing queued for {alias}");
+            };
+            (shared.store.agent(alias).unwrap(), *message)
+        };
+        for (alias, provider, kind) in
+            [("m-pi", "pi", "managed"), ("m-claude", "claude", "managed")]
+        {
+            let (agent, message) = send(alias, kind, provider, true);
+            let slot = shared
+                .turn_slot(&agent, &message)
+                .unwrap_or_else(|| panic!("{alias}: no slot"));
+            let prompt = shared.continuity_prompt_slotted(alias, kind, &message, Some(&slot));
+            let hint = prompt.find("[App context").unwrap();
+            let at = prompt
+                .find(&slot)
+                .unwrap_or_else(|| panic!("{alias}: {prompt}"));
+            let words = prompt.find("create segment").unwrap();
+            assert!(hint < at && at < words, "{alias}: {prompt}");
+            assert_eq!(prompt.matches(&slot).count(), 1, "{alias}: {prompt}");
+            // The message body (stored, durable) never holds the slot.
+            assert!(!message.body.contains(&slot));
+            // A fresh slot per call: no value to replay between turns.
+            let (agent2, message2) = send(alias, kind, provider, true);
+            assert_ne!(shared.turn_slot(&agent2, &message2).unwrap(), slot);
+        }
+        // Not an App message: no slot, prompt unchanged.
+        let (agent, message) = send("m-pi", "managed", "pi", false);
+        assert_eq!(shared.turn_slot(&agent, &message), None);
+        assert_eq!(
+            shared.continuity_prompt_slotted("m-pi", "managed", &message, None),
+            "create segment QA agent VIP"
+        );
+        // Endpoints that cannot redeem (pty paste; no turn-token scheme).
+        for (alias, provider, kind) in [
+            ("p-claude", "claude", "pty"),
+            ("p-devin", "devin", "pty"),
+            ("w-codex", "codex", "managed"),
+            ("c-devin", "devin", "cloud"),
+        ] {
+            let (agent, message) = send(alias, kind, provider, true);
+            assert_eq!(shared.turn_slot(&agent, &message), None, "{alias}");
+        }
+        // The stamp stops re-proving (context revised): no hint, no slot.
+        let (agent, message) = send("m-pi", "managed", "pi", true);
+        let renamed = ContextConfig::new("Renamed", BTreeMap::new()).unwrap();
+        shared
+            .store
+            .app_context_update("install-1", &context, proof.revision, &renamed)
+            .unwrap();
+        assert_eq!(shared.turn_slot(&agent, &message), None);
     }
 }
 
