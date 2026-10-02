@@ -74,6 +74,22 @@ fn sha256_of(body: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
 }
 
+/// A VALID + APPROVABLE workflow — mirrors the tested `apps/local-content`
+/// `workflows/draft.md` schema: `title`/`goal`/`inputs`/`distinct`
+/// frontmatter, then a `local.text.produce` producer step and a
+/// `local.text.review` step (a DIFFERENT agent, `depends_on: 1`). The
+/// approval gate (`app_local_install_approve`) requires explicit supported
+/// action steps — an agent-only template installs but never approves.
+const WORKFLOW: &str = "---\ntitle: \"Do {{subject}}\"\ngoal: \"Do {{subject}}\"\n\
+label: Do\ninputs:\n  subject: { ask: \"What?\" }\n  writer: { ask: \"writer\" }\n  reviewer: { ask: \"reviewer\" }\n\
+distinct: [writer, reviewer]\n---\n\nBody.\n\n## Draft {{subject}}\nagent: {{writer}}\nsize: S\naction: local.text.produce\n\nDraft {{subject}}.\n\n### Acceptance\n- [ ] drafted\n\n## Review {{subject}}\nagent: {{reviewer}}\nsize: S\ndepends_on: 1\naction: local.text.review\n\nReview the draft.\n\n### Acceptance\n- [ ] reviewed\n";
+
+/// The v2 variant for the upgrade path — same approvable schema, distinct
+/// bytes so the bundle digest changes.
+const WORKFLOW_V2: &str = "---\ntitle: \"Do {{subject}} v2\"\ngoal: \"Do {{subject}} v2\"\n\
+label: Do\ninputs:\n  subject: { ask: \"What?\" }\n  writer: { ask: \"writer\" }\n  reviewer: { ask: \"reviewer\" }\n\
+distinct: [writer, reviewer]\n---\n\nBody v2.\n\n## Draft {{subject}}\nagent: {{writer}}\nsize: S\naction: local.text.produce\n\nDraft {{subject}} again.\n\n### Acceptance\n- [ ] drafted twice\n\n## Review {{subject}}\nagent: {{reviewer}}\nsize: S\ndepends_on: 1\naction: local.text.review\n\nReview the draft.\n\n### Acceptance\n- [ ] reviewed twice\n";
+
 /// The full 10-file UTF-8 bundle map — `app.md` + one workflow + the
 /// `screens/main/` package (screens.json, client.js, styles.css + flat
 /// metadata leaves). Exact bytes; no fabricated manifest.
@@ -92,7 +108,10 @@ fn screen_bundle() -> Vec<(String, String)> {
     let decl = screens_decl("crm", assets);
     let mut files: Vec<(String, String)> = vec![
         ("app.md".into(), "---\napp: crm\ntitle: CRM\nversion: '1'\n---\nGuide.\n".into()),
-        ("workflows/do.md".into(), "---\nworkflow: do\n---\nbody\n".into()),
+        // A valid workflow per the tested schema (title/goal/inputs
+        // frontmatter + `## Task` section + `agent:`/`### Acceptance`):
+        // mirrors the workspace.rs WORKFLOW fixture exactly.
+        ("workflows/do.md".into(), WORKFLOW.to_string()),
         (format!("screens/{TAG}/screens.json"), decl),
     ];
     for (name, body) in assets {
@@ -378,9 +397,13 @@ fn cad1006_frame_get_renders_csp_and_exact_bytes() {
     // The frame GET is headerless — the nonce in the path is the sole
     // authority; the daemon's `operator_connection` peer guard denies a
     // registered-agent/detached caller even without a cookie.
-    let req = format!(
-        "GET {mount} HTTP/1.0\r\nHost: {host}\r\n\r\n",
-        host = session.host,
+    // The GET stays cookie/key-free — the nonce is the sole authority;
+    // on a seam-armed fixture it carries ONLY the CAD-482 caller
+    // assertion so the board's in-process peer proof resolves `operator`.
+    let req = common::op::assert_as(
+        format!("GET {mount} HTTP/1.0\r\nHost: {host}\r\n\r\n", host = session.host),
+        &s.daemon.state,
+        "operator",
     );
     let (code, head, body) = common::op::raw(port, &req);
     assert_eq!(code, 200, "frame GET refused: {code} {head}");
@@ -421,8 +444,10 @@ fn cad1006_frame_origin_uses_trusted_host_not_forged() {
     let mint = s.mint(&token, &session.key, "loopback", 1).unwrap();
     let mount = mint["mount"].as_str().unwrap();
     // A forged/arbitrary Host must not become the trusted parent_origin.
-    let req = format!(
-        "GET {mount} HTTP/1.0\r\nHost: evil.example\r\n\r\n",
+    let req = common::op::assert_as(
+        format!("GET {mount} HTTP/1.0\r\nHost: evil.example\r\n\r\n"),
+        &s.daemon.state,
+        "operator",
     );
     let (_, _, body) = common::op::raw(port, &req);
     assert!(
@@ -484,21 +509,22 @@ fn cad1006_screen_package_bounds() {
     );
 
     // The declared screen `app` must equal the installed manifest app —
-    // a package that claims a different app refuses at `extract`.
+    // a package that claims a different app refuses at the mount's
+    // `screen_package_checked` (declared app vs installed app). Use a
+    // legal lowercase tag ("other") so the package validates, then prove
+    // its declared app is recovered verbatim — the mismatch refusal is
+    // exercised at the mint/digest recheck, not here.
     let js = "x()";
-    let decl_wrong_app = json!({"contract":"app-screens/v1","app":"OTHER","entry":"client.js",
+    let decl_wrong_app = json!({"contract":"app-screens/v1","app":"other","entry":"client.js",
         "assets":[{"name":"client.js","media_type":"text/javascript","sha256":sha(js),"size":js.len()}],
         "provenance":{"source_digest":sha("s"),"sdk_digest":sha("k"),"toolchain_digest":sha("t")},
         "may":[]}).to_string();
     let mut files = std::collections::BTreeMap::new();
     files.insert(format!("screens/{TAG}/screens.json"), decl_wrong_app);
     files.insert(format!("screens/{TAG}/client.js"), js.to_string());
-    // `extract` itself only checks the package vs its own declaration; the
-    // app==manifest-app guard lives in `screen_package_checked`. Here we at
-    // least prove the package's declared app is recovered verbatim (the
-    // mismatch assertion belongs to the mint/digest recheck).
     let pkg = app_screen_pkg::extract(&files, TAG).unwrap();
-    assert_eq!(pkg.app, "OTHER");
+    assert_eq!(pkg.app, "other", "declared app not recovered verbatim");
+    assert_ne!(pkg.app, "crm", "declared app must differ from install app crm");
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +643,7 @@ fn upgrade_files_map(new_version: &str) -> Value {
         "may":[]}).to_string();
     let mut files = Map::new();
     files.insert("app.md".into(), json!(format!("---\napp: crm\ntitle: CRM\nversion: '{new_version}'\n---\nGuide v{new_version}.\n")));
-    files.insert("workflows/do.md".into(), json!("---\nworkflow: do\n---\nbody v2\n"));
+    files.insert("workflows/do.md".into(), json!(WORKFLOW_V2));
     files.insert(format!("screens/{TAG}/screens.json"), json!(decl));
     for (name, body) in assets {
         files.insert(format!("screens/{TAG}/{name}"), json!(body));
@@ -656,7 +682,7 @@ fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
             .unwrap()["catalog_generation"].as_str().unwrap().to_string()
     };
 
-    let check_path = format!("/api/app-installations/{install_id}/upgrade-check");
+    let check_path = format!("/api/app-installations/{install_id}/upgrade/check");
     let up_path = format!("/api/app-installations/{install_id}/upgrade");
 
     // ---- NEGATIVES against the SAME valid files map ----
@@ -882,4 +908,55 @@ fn cad1006_cap_ttl_expires() {
         err.to_string().contains("expired") || err.to_string().contains("spent or unknown"),
         "expired cap accepted: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// E2 — the nested `screens/<tag>/` install path: a bundle whose members sit
+// two levels deep installs cleanly (descriptor-relative `mkdir_parents`
+// creates `screens/` then `screens/<tag>/`), and a `screens/<tag>` that is a
+// SYMLINK in the staged source refuses before any byte lands.
+// ---------------------------------------------------------------------------
+#[test]
+fn cad1006_nested_screen_dir_installs_and_symlink_parent_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let pm = Pm::init(&root.path().join("pm")).unwrap();
+    let opts = daemon_opts();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
+    let daemon = TestDaemon::start_opts(opts);
+
+    // Positive: the staged bundle with the nested screens/main/ tree installs.
+    let src = stage_bundle(root.path());
+    let installed = daemon
+        .operator_rpc("app_workspace_install", json!({"source": src}))
+        .expect("nested screens/<tag>/ install refused");
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    // The nested member landed under the installed bundle.
+    let installed_dir = pm
+        .dir
+        .join(format!(".apps/installations/{id}/bundle"));
+    assert!(
+        installed_dir.join("screens/main/client.js").is_file(),
+        "nested screens/main/client.js not installed"
+    );
+    assert!(installed_dir.join("screens/main").is_dir());
+
+    // Negative: a `screens/<tag>` that is a symlink in the STAGED source
+    // refuses at the installer's own snapshot — never reaches the mkdir.
+    let bad = root.path().join("bad-src");
+    let bad_screens = bad.join("screens");
+    std::fs::create_dir_all(&bad_screens).unwrap();
+    std::fs::write(
+        bad.join("app.md"),
+        "---\napp: crm\ntitle: CRM\nversion: '1'\n---\nGuide.\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(bad.join("workflows")).unwrap();
+    std::fs::write(bad.join("workflows/do.md"), WORKFLOW).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target.path(), bad_screens.join("main")).unwrap();
+    let refused = daemon
+        .operator_rpc("app_workspace_install", json!({"source": bad.canonicalize().unwrap().to_string_lossy()}));
+    assert!(refused.is_err(), "symlinked screens/<tag> dir admitted");
 }
