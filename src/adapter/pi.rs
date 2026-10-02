@@ -1433,6 +1433,10 @@ pub struct PiAdapter {
     log_path: PathBuf,
     state_dir: PathBuf,
     env: ProviderEnv,
+    /// The split-mode guest uid (`agent_uid`) when the daemon runs split —
+    /// `Some` selects the protected launch seam (`pi_guest`), which fails
+    /// closed until the external prerequisites are satisfied (CAD-1012).
+    agent_uid: Option<u32>,
 }
 
 /// Identity evidence must include an actual namespace and model id;
@@ -1453,7 +1457,12 @@ fn resolved_pi_model(state: &Value) -> Option<(String, &str)> {
 }
 
 impl PiAdapter {
-    pub fn new(hooks: AdapterHooks, log_path: &Path, env: &ProviderEnv) -> Self {
+    pub fn new(
+        hooks: AdapterHooks,
+        log_path: &Path,
+        env: &ProviderEnv,
+        agent_uid: Option<u32>,
+    ) -> Self {
         let shared = Arc::new(Shared {
             hooks,
             pending: Pending::new(),
@@ -1490,6 +1499,7 @@ impl PiAdapter {
                 .and_then(|p| p.parent())
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| PathBuf::from(".")),
+            agent_uid,
         }
     }
 
@@ -1969,6 +1979,17 @@ impl ProviderAdapter for PiAdapter {
     /// Pi silently falls back on an unsupported level.
     fn open(&self, agent: &Agent) -> Result<Identity> {
         refuse_confined_devin_agent(agent)?;
+        // CAD-1012: a split daemon (`agent_uid.is_some()`) launches Pi through
+        // the protected seam. The external prerequisites — sealed-helper pin,
+        // namespace policy, pre-start restore lineage — are unavailable this
+        // batch, so this refuses closed before any spawn is constructed. No
+        // guest boolean, restored marker, or refreshed flag satisfies it.
+        if self.agent_uid.is_some() {
+            super::pi_guest::protected_prereqs_satisfied()?;
+            // Construction continues only when the gate above ever passes;
+            // today it never does. The unreachable seam is exercised by the
+            // module's own tests.
+        }
         let master = crate::master::is_master(&agent.alias);
         let params = agent.params.clone().unwrap_or(Value::Null);
         // CAD-559: pi launches only on an explicit model the operator

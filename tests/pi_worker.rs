@@ -82,7 +82,12 @@ fn adapter(mode: &str, state: &Path, own: &[(&str, String)]) -> PiAdapter {
         on_event: Box::new(|_, _| {}),
         on_request: Box::new(|_| {}),
     };
-    PiAdapter::new(hooks, &state.join("agents").join("w.provider.log"), &env)
+    PiAdapter::new(
+        hooks,
+        &state.join("agents").join("w.provider.log"),
+        &env,
+        None,
+    )
 }
 
 /// The fake-pi launch record for `alias` — argv tail + env NAMES.
