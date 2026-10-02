@@ -726,6 +726,10 @@ impl Shared {
         // delivered; never resent) and a worker respawns for the
         // still-`queued` rest.
         shared.reconcile_crm_sends();
+        // CAD-1015: a `submitting` native nudge means the daemon died
+        // between the durable bind and the provider reply — it may have
+        // landed, so it closes non-fencing `unknown`, never replayed.
+        let _ = shared.store.orphan_submitting_nudges("crash");
         Ok(shared)
     }
 

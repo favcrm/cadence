@@ -68,9 +68,11 @@ correlation; do not expose tokens through differently named fields.
 `skipped_inactive` is cancelled/non-applied; a definite refusal is failed; a
 missing or ambiguous receipt is non-fencing `unknown`. Unknown nudges are never
 automatically replayed. Stop/restart can win over an in-flight attempt; a late
-provider answer is recorded without overwriting that terminal evidence.
-Events are `native_steer_submitting`, `native_steer_disposition`, and the existing
-`nudge_cancelled`. The disposition event's `recorded` flag describes a database
+provider answer is recorded without overwriting that terminal evidence. A daemon
+crash between the durable bind and the provider's reply leaves the row
+`submitting`; the boot sweep closes it non-fencing `unknown` (`crash_unconfirmed`)
+— maybe applied, never replayed. Events are `native_steer_submitting`,
+`native_steer_disposition`, and the existing `nudge_cancelled`. The disposition event's `recorded` flag describes a database
 update, never model application. Original kickoff completion still comes from
 its own matching provider result.
 
@@ -92,7 +94,10 @@ was accepted just before cancellation.
 Codex validates `expectedTurnId` inside the app-server. Wrong or missing turn ids
 in a successful reply are unknown, not accepted. The adapter releases
 reader-shared locks before waiting, so a quota notification cannot block receipt
-processing. There is no steer-to-start/follow-up fallback.
+processing. There is no steer-to-start/follow-up fallback. Between the provider's
+`turn/start` acknowledgement and the durable `running` write the daemon sees no
+steerable turn, so a nudge landing in that gap closes `skipped_inactive` — the
+turn was live but the window is conservative, never a silent queue.
 
 Claude's tested stream input can amend busy work, but lacks an atomic
 expected-turn predicate. Its cross-session socket queues messages for later

@@ -434,3 +434,68 @@
         let err = s.finish_native_nudge("k-w1", "queued", None).unwrap_err();
         assert!(err.to_string().contains("source"), "{err}");
     }
+
+    /// A `submitting` nudge at boot is a crash orphan: the provider may
+    /// have applied it before the daemon died, so it must close
+    /// non-fencing `unknown` (`crash_unconfirmed`) — never `queued`
+    /// (replayable), never `running` (fencing), never left `submitting`
+    /// where `take_queued`/TTL/sweeps all ignore it. Queued nudges are
+    /// untouched (the TTL owns them); the running kickoff is untouched.
+    #[test]
+    fn boot_sweep_closes_a_crash_orphaned_submitting_nudge() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let agent = live_agent(&s, "w1", &cwd, "turn-1");
+        s.begin_native_nudge(
+            &agent,
+            "steer",
+            "n1",
+            &Sender::Unattributed,
+            &caller_steer(),
+        )
+        .unwrap();
+        // A still-queued nudge is the TTL's job — the boot sweep must
+        // not pre-empt it. Plant one by hand on a second live agent.
+        let other = live_agent(&s, "w2", &cwd, "turn-2");
+        let (dup, _, _) = s
+            .begin_native_nudge(
+                &other,
+                "steer",
+                "n2",
+                &Sender::Unattributed,
+                &caller_steer(),
+            )
+            .unwrap();
+        assert!(!dup);
+        // Force n2 back to `queued` so it looks like a pre-bind orphan
+        // (TTL's lane), leaving n1 `submitting` (the crash orphan).
+        rusqlite::Connection::open(dir.path().join("t.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE messages SET state='queued',turn_id=NULL,started=NULL,result=NULL \
+                 WHERE id='n2'",
+                [],
+            )
+            .unwrap();
+        let closed = s.orphan_submitting_nudges("crash").unwrap();
+        assert_eq!(closed, [("n1".to_string(), "w1".to_string())]);
+        let n1 = s.message("n1").unwrap().unwrap();
+        assert_eq!(n1.state, "unknown");
+        assert_eq!(n1.result.as_ref().unwrap()["via"], "crash_unconfirmed");
+        // The queued row is untouched — still waiting on the TTL lane.
+        assert_eq!(s.message("n2").unwrap().unwrap().state, "queued");
+        // The running kickoff it steered beside is untouched.
+        assert_eq!(s.message("k-w1").unwrap().unwrap().state, "running");
+        // The orphan's event names the crash, not a replay.
+        let event = s
+            .last_event_of("w1", &["nudge_cancelled"])
+            .unwrap()
+            .expect("the cancel event must exist");
+        assert_eq!(event.payload["message"], "n1");
+        assert_eq!(event.payload["was"], "submitting");
+        assert_eq!(event.payload["state"], "unknown");
+        // The sweep cannot fence: a `nudge` source never reaches the
+        // fencing `unknown` filter anyway, and unknown nudges do not
+        // hold the queue.
+        assert!(!s.has_unknown("w1").unwrap());
+    }

@@ -298,6 +298,46 @@ impl Store {
         Ok(closed)
     }
 
+    /// CAD-1015: daemon boot sweep. A `submitting` nudge means the daemon
+    /// died between `begin_native_nudge`'s commit and `finish_native_nudge`
+    /// — the provider may or may not have applied it, so the row goes
+    /// non-fencing `unknown` (`crash_unconfirmed`), never replayed and
+    /// never left non-terminal. Unlike `cancel_nudges_for` this is not
+    /// alias-scoped: a crashed daemon's orphan could name any agent.
+    pub fn orphan_submitting_nudges(&self, reason: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let stale: Vec<(String, String)> = tx
+            .prepare(
+                "SELECT id, alias FROM messages
+                 WHERE source='nudge' AND state='submitting'",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut closed = Vec::new();
+        for (id, alias) in stale {
+            let result = json!({"status": "unknown", "via": format!("{reason}_unconfirmed"),
+                                "reason": format!("{reason} — a nudge is never replayed")});
+            let n = tx.execute(
+                "UPDATE messages SET state='unknown',result=?,completed=?
+                 WHERE id=? AND state='submitting' AND source='nudge'",
+                params![result.to_string(), now(), id],
+            )?;
+            if n == 1 {
+                Self::event(
+                    &tx,
+                    &alias,
+                    "nudge_cancelled",
+                    json!({"message": id, "was": "submitting", "state": "unknown",
+                           "reason": reason}),
+                )?;
+                closed.push((id, alias));
+            }
+        }
+        tx.commit()?;
+        Ok(closed)
+    }
+
     /// CAD-250: finish a turn from its worker's `message result` — only
     /// while it is still `running`, checked in the same transaction as the
     /// write. `Ok(None)` when it is not (the report bound or a reconcile
