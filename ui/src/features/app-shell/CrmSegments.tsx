@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
-import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
+import Field from "./shared/Field";
 import {
   audienceClient,
   type AudienceScope,
@@ -20,6 +20,14 @@ import {
   SEGMENT_OPS,
 } from "./segmentGrammar";
 
+/** Human-readable predicate: the same labels the rule form offers.
+ *  Unknown stored values fall back to the raw tokens, never hide. */
+export function describeRule(rule: SegmentPredicate): string {
+  const field = SEGMENT_FIELDS.find((f) => f.value === rule.field)?.label ?? rule.field;
+  const op = SEGMENT_OPS.find((o) => o.value === rule.op)?.label ?? rule.op;
+  return `${field} ${op} ${rule.value}`;
+}
+
 /**
  * Saved-rule segment screens inside the trusted CRM shell (CAD-784
  * over the CAD-780 audience engine). List, separate New page and a
@@ -32,6 +40,10 @@ import {
  * action addresses a saved rule, so Create lands atomically on the
  * detail drawer where the exact counts, suppression breakdown and
  * bounded sample render.
+ *
+ * The shell's own header row is the single Apps → App breadcrumb and
+ * title; the section renders its own real heading instead of a
+ * second crumb (CAD-863 release correction).
  */
 
 export interface SegmentDoc {
@@ -139,23 +151,6 @@ export default function CrmSegments({
 }) {
   return (
     <div className="crm-list" data-section="segments">
-      <nav className="crm-crumb" aria-label="Breadcrumb">
-        <Link href="/apps" className="lnk text-label">
-          Apps
-        </Link>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="text-label text-ink-300">CRM</span>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="text-label text-ink-100" aria-current="page">
-          Segments{view === "new" ? " / New" : ""}
-          {recordId !== null ? " / Details" : ""}
-        </span>
-      </nav>
-
       {view === "list" && (
         <SegmentList
           scope={scope}
@@ -229,8 +224,11 @@ function SegmentList({
   }, [reloadToken]);
 
   return (
-    <section aria-label="Segments list">
-      <div className="crm-toolbar">
+    <section aria-label="Segments list" className="crm-list">
+      <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
+        Segments
+      </h3>
+      <div className="crm-toolbar mb-4">
         <p className="text-secondary text-ink-300">
           Saved rules over customer tags, source, consent and email domain.
         </p>
@@ -253,7 +251,7 @@ function SegmentList({
       )}
       {scope.contextId === "" && viewer.operator && (
         <p className="card px-4 py-3 text-label text-ink-400">
-          Pick an App context above to list its segments.
+          Administrator CRM setup is required before segments open.
         </p>
       )}
       {scope.contextId !== "" && viewer.operator && loading && (
@@ -271,7 +269,7 @@ function SegmentList({
       )}
       {scope.contextId !== "" && viewer.operator && error === null && !loading && segments.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400" data-empty="segments" role="status">
-          <p className="font-medium text-ink-200">No segments yet in this context</p>
+          <p className="font-medium text-ink-200">No segments yet</p>
           <p className="mt-1">
             Create the first saved rule with New segment. Only real server rows appear here.
           </p>
@@ -289,7 +287,6 @@ function SegmentList({
               <tr>
                 <th scope="col">Name</th>
                 <th scope="col">Rules</th>
-                <th scope="col">Rev</th>
                 <th scope="col">
                   <span className="sr-only">Open</span>
                 </th>
@@ -305,7 +302,6 @@ function SegmentList({
                   <td className="num text-ink-300">
                     {segment.predicates.length} rule{segment.predicates.length === 1 ? "" : "s"}
                   </td>
-                  <td className="num text-ink-500">r{segment.revision}</td>
                   <td>
                     <button type="button" className="lnk" onClick={() => onSelect(segment.id)}>
                       Open
@@ -348,50 +344,52 @@ function RuleRows({
       {rules.map((rule, index) => (
         <li key={index} className="card px-3 py-3">
           <div className="crm-field-row">
-            <div className="crm-field">
-              <label className="text-label text-ink-300" htmlFor={`seg-rule-field-${index}`}>
-                Field {index + 1}
-              </label>
-              <Select
-                id={`seg-rule-field-${index}`}
-                value={rule.field}
-                onChange={(value) => isSegmentField(value) && set(index, { field: value })}
-                options={SEGMENT_FIELDS.map((entry) => ({ value: entry.value, label: entry.label }))}
-                aria-label={`Rule ${index + 1} field`}
-                disabled={disabled}
-                full
-              />
-            </div>
-            <div className="crm-field">
-              <label className="text-label text-ink-300" htmlFor={`seg-rule-op-${index}`}>
-                Operator {index + 1}
-              </label>
-              <Select
-                id={`seg-rule-op-${index}`}
-                value={rule.op}
-                onChange={(value) => isSegmentOp(value) && set(index, { op: value })}
-                options={SEGMENT_OPS.map((entry) => ({ value: entry.value, label: entry.label }))}
-                aria-label={`Rule ${index + 1} operator`}
-                disabled={disabled}
-                full
-              />
-            </div>
+            <Field label={`Field ${index + 1}`} id={`seg-rule-field-${index}`} className="crm-field">
+              {(c) => (
+                <Select
+                  id={c.id}
+                  value={rule.field}
+                  onChange={(value) => isSegmentField(value) && set(index, { field: value })}
+                  options={SEGMENT_FIELDS.map((entry) => ({ value: entry.value, label: entry.label }))}
+                  aria-label={`Rule ${index + 1} field`}
+                  disabled={disabled}
+                  full
+                />
+              )}
+            </Field>
+            <Field label={`Operator ${index + 1}`} id={`seg-rule-op-${index}`} className="crm-field">
+              {(c) => (
+                <Select
+                  id={c.id}
+                  value={rule.op}
+                  onChange={(value) => isSegmentOp(value) && set(index, { op: value })}
+                  options={SEGMENT_OPS.map((entry) => ({ value: entry.value, label: entry.label }))}
+                  aria-label={`Rule ${index + 1} operator`}
+                  disabled={disabled}
+                  full
+                />
+              )}
+            </Field>
           </div>
-          <div className="crm-field mt-2">
-            <label className="text-label text-ink-300" htmlFor={`seg-rule-value-${index}`}>
-              Value {index + 1} — {ruleHint(rule.field)}
-            </label>
-            <input
-              id={`seg-rule-value-${index}`}
-              className="field"
-              value={rule.value}
-              onChange={(e) => set(index, { value: e.target.value })}
-              maxLength={120}
-              autoComplete="off"
-              disabled={disabled}
-              placeholder={rule.field === "consent_email" ? "granted" : rule.field === "email_domain" ? "example.com" : "vip"}
-            />
-          </div>
+          <Field
+            label={`Value ${index + 1}`}
+            id={`seg-rule-value-${index}`}
+            hint={ruleHint(rule.field)}
+            disabled={disabled}
+            className="crm-field mt-2"
+          >
+            {(c) => (
+              <input
+                {...c}
+                className="field"
+                value={rule.value}
+                onChange={(e) => set(index, { value: e.target.value })}
+                maxLength={120}
+                autoComplete="off"
+                placeholder={rule.field === "consent_email" ? "granted" : rule.field === "email_domain" ? "example.com" : "vip"}
+              />
+            )}
+          </Field>
           {rules.length > 1 && !disabled && (
             <p className="mt-2">
               <button
@@ -438,8 +436,7 @@ function SegmentNew({
         <button type="button" className="lnk" onClick={onCancel}>
           ← Segments
         </button>{" "}
-        · Context {scope.contextId || "none"} — exact host preview counts render on the detail
-        after Create.
+        — exact recipient counts render on the detail after Create.
       </p>
       {!canWrite ? (
         <p className="card px-4 py-3 mt-2 text-label text-ink-400" data-state="read-only">
@@ -447,7 +444,7 @@ function SegmentNew({
         </p>
       ) : scope.contextId === "" ? (
         <p className="card px-4 py-3 mt-2 text-label text-ink-400">
-          Pick an App context above before creating a segment.
+          Administrator CRM setup is required before creating a segment.
         </p>
       ) : (
         <form
@@ -477,20 +474,18 @@ function SegmentNew({
               .finally(() => setPending(false));
           }}
         >
-          <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="seg-name">
-              Segment name (required)
-            </label>
-            <input
-              id="seg-name"
-              className="field"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              maxLength={80}
-              autoComplete="off"
-              required
-            />
-          </div>
+          <Field label="Segment name" id="seg-name" required className="crm-field">
+            {(c) => (
+              <input
+                {...c}
+                className="field"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                maxLength={80}
+                autoComplete="off"
+              />
+            )}
+          </Field>
           <RuleRows rules={rules} disabled={pending} onChange={setRules} />
           {rules.length < 8 && (
             <p>
@@ -705,9 +700,18 @@ function SegmentDrawer({
           Close
         </Button>
       </div>
-      <p className="num text-micro text-ink-500">
-        {segmentId} · {scope.contextId || "no context"}
-      </p>
+      <details className="crm-diag">
+        <summary className="text-micro text-ink-500">Record diagnostics</summary>
+        <p className="num text-micro text-ink-500 mt-1">
+          Segment <span className="num">{segmentId}</span> · scope{" "}
+          <span className="num">{scope.contextId || "none"}</span>
+          {segment !== null && (
+            <>
+              {" "}· revision r{segment.revision} · digest {segment.digest.slice(0, 18)}…
+            </>
+          )}
+        </p>
+      </details>
       {loading && (
         <p className="text-secondary text-ink-400 mt-2" role="status">
           Reading the segment…
@@ -735,20 +739,12 @@ function SegmentDrawer({
       )}
       {!loading && error === null && segment !== null && (
         <>
-          <dl className="crm-detail mt-2">
-            <div>
-              <dt>Revision</dt>
-              <dd className="num">
-                r{segment.revision} · <span title="Server rule digest">{segment.digest.slice(0, 18)}…</span>
-              </dd>
-            </div>
-          </dl>
           <section aria-label="Segment rules" className="mt-3">
             <h4 className="text-label font-medium text-ink-200">Rules ({segment.predicates.length})</h4>
             <ol className="crm-history">
               {segment.predicates.map((rule, index) => (
-                <li key={index} className="num text-label text-ink-300">
-                  {rule.field} {rule.op} {rule.value}
+                <li key={index} className="text-label text-ink-300">
+                  {describeRule(rule)}
                 </li>
               ))}
             </ol>
@@ -841,23 +837,20 @@ function SegmentEdit({
       }}
     >
       <h4 className="text-label font-medium text-ink-200">
-        Edit — expected revision r{segment.revision}
+        Edit — saving is refused if the segment changed since you opened it
       </h4>
-      <div className="crm-field">
-        <label className="text-label text-ink-300" htmlFor="seg-edit-name">
-          Segment name
-        </label>
-        <input
-          id="seg-edit-name"
-          className="field"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          maxLength={80}
-          autoComplete="off"
-          disabled={pending}
-          required
-        />
-      </div>
+      <Field label="Segment name" id="seg-edit-name" required disabled={pending} className="crm-field">
+        {(c) => (
+          <input
+            {...c}
+            className="field"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            maxLength={80}
+            autoComplete="off"
+          />
+        )}
+      </Field>
       <RuleRows rules={rules} disabled={pending} onChange={setRules} />
       {rules.length < 8 && (
         <p>
@@ -873,13 +866,13 @@ function SegmentEdit({
       )}
       {formError && (
         <p className="text-label text-fail" role="alert">
-          {formError} A stale revision means another operator saved first — close and reopen to
-          review their rules before retrying.
+          {formError} If another operator saved first, close and reopen to review their rules
+          before retrying.
         </p>
       )}
       <div className="crm-toolbar">
         <Button type="submit" variant="primary" loading={pending} disabled={pending}>
-          {`Save as r${segment.revision + 1}`}
+          Save changes
         </Button>
         <button type="button" className="lnk text-label" onClick={onCancel}>
           Discard edit
