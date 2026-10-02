@@ -6423,6 +6423,153 @@ fn cad561_update_refuses_a_dropped_alias_claiming_the_operator() {
     assert_eq!(status["held"], false, "{status}");
 }
 
+/// CAD-1015: the same `send --nudge` input picks the durable pane claim
+/// on a pty endpoint but refuses a mocked old managed Pi runtime that
+/// carries no exact-turn command resources. Nothing falls back to a
+/// normal queued turn or starts a second broker.
+#[test]
+fn native_nudge_selects_only_the_verified_runtime_path() {
+    let d = TestDaemon::start();
+    let mut owner = LaneShell::spawn(d.dir.path());
+    plant_pane(&d, "pty1", owner.pid());
+    cad162_sql(&d, "UPDATE agents SET enabled=1 WHERE alias='pty1'", &[]);
+    let allowed = d
+        .operator_rpc(
+            "agent_send",
+            json!({"alias": "pty1", "text": "hold", "message": "npty", "nudge": true}),
+        )
+        .unwrap();
+    assert_eq!(allowed["delivery"], Value::Null, "{allowed}");
+    assert_eq!(allowed["state"], "queued", "{allowed}");
+
+    let _pi = d.mock_pi("normal");
+    d.register_pi("pi-old", json!({"model": "fake/model-1"}));
+    let agent = d.wait_agent("pi-old", "idle", 10);
+    assert_eq!(agent["capabilities"]["native_turn_steering"], true);
+    assert_eq!(agent["native_turn_steering_enabled"], false);
+    let error = d
+        .operator_rpc(
+            "agent_send",
+            json!({"alias": "pi-old", "text": "steer", "message": "npi", "nudge": true}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("no verified native exact-turn input guard"),
+        "{error}"
+    );
+    let show = d.rpc("agent_show", json!({"alias": "pi-old"})).unwrap();
+    assert!(
+        show["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["id"] != "npi"),
+        "an unverified runtime admitted or queued the strict nudge: {show}"
+    );
+}
+
+/// CAD-1015: native steering inherits the one connection-derived Steer
+/// rule and rejects every caller-supplied runtime/sender field. The
+/// caller's own PM name is inert provider params — only proc-enrolled
+/// ancestry decides who the connection is.
+#[test]
+fn native_nudge_refuses_unproven_peer_self_and_forged_binding() {
+    let d = TestDaemon::start();
+    let _pi = d.mock_pi("normal");
+    let upstream = json!({"model": "fake/model-1", "upstream": "pm"}).to_string();
+    let owner = register_pcp(
+        &d,
+        "w-native",
+        "pi",
+        "managed",
+        d.dir.path().to_str().unwrap(),
+        &upstream,
+    );
+    assert_eq!(owner["alias"], "w-native", "{owner}");
+    d.wait_agent("w-native", "idle", 10);
+
+    // A planted pane has a real process identity, while the seeded
+    // `upstream` is deliberately provider params, not a durable PM
+    // row: this caller is a peer identity, not the steer owner.
+    let home = TempDir::new().unwrap();
+    let mut pm_pane = LaneShell::spawn(&home);
+    plant_pane(&d, "pm", pm_pane.pid());
+    let mut peer = LaneShell::spawn(&home);
+    plant_pane(&d, "peer", peer.pid());
+    // A planted caller that shares the provider's params text still has
+    // only its own enrolled endpoint identity. The params value cannot
+    // promote the planted `pm` pane into a PM agent row or authority.
+    for (who, frame) in [
+        (
+            "peer",
+            peer.rpc(
+                &d.state,
+                "agent_send",
+                json!({"alias": "w-native", "text": "steer", "message": "n-peer", "nudge": true}),
+            ),
+        ),
+        (
+            "self-named-params",
+            pm_pane.rpc(
+                &d.state,
+                "agent_send",
+                json!({"alias": "w-native", "text": "steer", "message": "n-self", "nudge": true}),
+            ),
+        ),
+        (
+            "unproven",
+            unprovable_rpc(
+                &d,
+                "agent_send",
+                json!({"alias": "w-native", "text": "steer", "message": "n-detached", "nudge": true}),
+            ),
+        ),
+    ] {
+        assert_eq!(frame["ok"], false, "{who}: {frame}");
+        let error = frame_err(&frame);
+        assert!(
+            error.contains("steering rule") || error.contains("not provably the operator"),
+            "{who}: {error}"
+        );
+    }
+
+    // Runtime identities are derived from the live row and the running
+    // turn, never callable JSON. The old runtime refuses before a
+    // durable row exists — every forged identity/binding field fails
+    // closed instead of being silently ignored.
+    for (i, field) in [
+        "by",
+        "sender",
+        "from",
+        "session_id",
+        "thread_id",
+        "generation",
+        "turn_id",
+        "expectedTurnId",
+        "expected_turn_id",
+        "endpoint",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let error = d
+            .operator_rpc(
+                "agent_send",
+                json!({"alias": "w-native", "text": "steer", "nudge": true,
+                       "message": format!("n-forge-{i}"), field: "invented"}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not accepted"), "{field}: {error}");
+    }
+    let show = d.rpc("agent_show", json!({"alias": "w-native"})).unwrap();
+    assert!(
+        show["messages"].as_array().unwrap().is_empty(),
+        "unauthorized/native-forgery sends left durable rows: {show}"
+    );
+}
+
 /// CAD-628: detaching and forging an operator label cannot reach the
 /// updater's new cold-start route through the rollback entry point.
 #[test]
