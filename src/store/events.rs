@@ -119,7 +119,7 @@ pub(crate) struct EventStoreStats {
 
 /// Read-only counts for doctor over an already-open connection.
 pub(crate) fn event_store_stats(
-    conn: &Connection,
+    conn: &dyn super::StoreConn,
     cutoff: f64,
 ) -> rusqlite::Result<EventStoreStats> {
     let events = conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
@@ -243,22 +243,31 @@ impl Event {
 }
 
 impl Store {
-    pub(super) fn event(conn: &Connection, alias: &str, kind: &str, payload: Value) -> Result<()> {
-        Self::event_scoped(conn, alias, kind, payload, None, None)
+    /// CAD-1011: event inserts are business writes — they run on the
+    /// restricted [`super::StoreConn`] surface (a sealed [`super::WriteTxn`]
+    /// inside `BEGIN IMMEDIATE`, or an owner `Connection`/`Transaction`),
+    /// never a raw unguarded producer connection.
+    pub(super) fn event(
+        tx: &dyn super::StoreConn,
+        alias: &str,
+        kind: &str,
+        payload: Value,
+    ) -> Result<()> {
+        Self::event_scoped(tx, alias, kind, payload, None, None)
     }
 
     /// Event insert that additionally records the job/task the event
     /// was caused by — the `job events` view is one indexed query
     /// across these rows.
     pub(super) fn event_scoped(
-        conn: &Connection,
+        tx: &dyn super::StoreConn,
         alias: &str,
         kind: &str,
         payload: Value,
         job_id: Option<&str>,
         task_id: Option<&str>,
     ) -> Result<()> {
-        Self::event_scoped_raw(conn, alias, kind, &payload, job_id, task_id)?;
+        Self::event_scoped_raw(tx, alias, kind, &payload, job_id, task_id)?;
         Ok(())
     }
 
@@ -266,14 +275,14 @@ impl Store {
     /// inside a transaction can classify a BUSY-family failure instead
     /// of losing the code to the crate error's flattening.
     pub(super) fn event_scoped_raw(
-        conn: &Connection,
+        tx: &dyn super::StoreConn,
         alias: &str,
         kind: &str,
         payload: &Value,
         job_id: Option<&str>,
         task_id: Option<&str>,
     ) -> rusqlite::Result<()> {
-        conn.execute(
+        tx.sql_execute(
             "INSERT INTO events(alias,kind,payload,job_id,task_id,at)
              VALUES(?,?,?,?,?,?)",
             params![alias, kind, payload.to_string(), job_id, task_id, now()],
@@ -285,15 +294,17 @@ impl Store {
     /// (`payload.message`) — e.g. the daemon's `master_dispatched`
     /// record of a master kickoff (CAD-323).
     pub fn event_names_message(&self, alias: &str, kind: &str, message_id: &str) -> Result<bool> {
-        let conn = self.write_conn()?;
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind=?2 \
-             AND json_extract(payload,'$.message')=?3",
-            params![alias, kind, message_id],
-            |row| row.get(0),
-        )?;
-        Ok(n > 0)
-    }
+        return self.write_tx(|conn| {
+
+                    let n: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind=?2 \
+                         AND json_extract(payload,'$.message')=?3",
+                        params![alias, kind, message_id],
+                        |row| row.get(0),
+                    )?;
+                    Ok(n > 0)
+        });
+        }
 
     /// CAD-405: record the operator's approval of a project's work gate
     /// keys (`project`, `digest`, `by`, `at`, …) on [`APPROVAL_STREAM`]
@@ -308,89 +319,92 @@ impl Store {
     /// bounded; returns the number folded — `limit` means more may
     /// remain.
     pub fn roll_up_delivery_events(&self, cutoff: f64, limit: usize) -> Result<usize> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let mut rows: Vec<(i64, String, String, f64)> = {
-            let mut st = tx.prepare(&format!(
-                "SELECT e.seq, e.alias, e.kind, e.at FROM events e WHERE {} \
-                 ORDER BY e.seq LIMIT ?2",
-                rollable_events_where()
-            ))?;
-            let rows = st.query_map(params![cutoff, limit as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        // Per-alias runs, each in seq order, for the fold below.
-        rows.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-        let kinds_sql = ROLLABLE_EVENT_KINDS
-            .iter()
-            .map(|k| format!("'{k}'"))
-            .collect::<Vec<_>>()
-            .join(",");
-        for batch in rows.chunk_by(|a, b| a.1 == b.1) {
-            let alias = &batch[0].1;
-            let existing: Option<(i64, String)> = tx
-                .query_row(
-                    "SELECT seq, payload FROM events WHERE alias=?1 AND kind=?2 \
-                     ORDER BY seq LIMIT 1",
-                    params![alias, DELIVERY_ROLLUP_EVENT],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let mut summary = match &existing {
-                Some((_, payload)) => serde_json::from_str::<Value>(payload).map_err(|e| {
-                    Error::internal(format!("{DELIVERY_ROLLUP_EVENT} payload: {e}"))
-                })?,
-                None => json!({
-                    "counts": ROLLABLE_EVENT_KINDS
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let mut rows: Vec<(i64, String, String, f64)> = {
+                        let mut st = tx.prepare(&format!(
+                            "SELECT e.seq, e.alias, e.kind, e.at FROM events e WHERE {} \
+                             ORDER BY e.seq LIMIT ?2",
+                            rollable_events_where()
+                        ))?;
+                        let rows = st.query_map(params![cutoff, limit as i64], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                        })?;
+                        rows.collect::<rusqlite::Result<_>>()?
+                    };
+                    // Per-alias runs, each in seq order, for the fold below.
+                    rows.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+                    let kinds_sql = ROLLABLE_EVENT_KINDS
                         .iter()
-                        .map(|k| (k.to_string(), json!(0)))
-                        .collect::<serde_json::Map<_, _>>(),
-                }),
-            };
-            for (_, _, kind, at) in batch {
-                let count = summary["counts"][kind.as_str()].as_u64().unwrap_or(0);
-                summary["counts"][kind.as_str()] = json!(count + 1);
-                let first = summary["first_at"].as_f64().map_or(*at, |f| f.min(*at));
-                let last = summary["last_at"].as_f64().map_or(*at, |l| l.max(*at));
-                summary["first_at"] = json!(first);
-                summary["last_at"] = json!(last);
-            }
-            let folded = match existing {
-                Some((seq, _)) => {
-                    tx.execute(
-                        "UPDATE events SET payload=?1 WHERE seq=?2 AND kind=?3",
-                        params![summary.to_string(), seq, DELIVERY_ROLLUP_EVENT],
-                    )?;
-                    batch
-                }
-                None => {
-                    tx.execute(
-                        &format!(
-                            "UPDATE events SET kind=?1, payload=?2 \
-                             WHERE seq=?3 AND kind IN ({kinds_sql})"
-                        ),
-                        params![DELIVERY_ROLLUP_EVENT, summary.to_string(), batch[0].0],
-                    )?;
-                    &batch[1..]
-                }
-            };
-            let mut delete = tx.prepare(&format!(
-                "DELETE FROM events WHERE seq=?1 AND kind IN ({kinds_sql})"
-            ))?;
-            for (seq, ..) in folded {
-                delete.execute([seq])?;
-            }
+                        .map(|k| format!("'{k}'"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    for batch in rows.chunk_by(|a, b| a.1 == b.1) {
+                        let alias = &batch[0].1;
+                        let existing: Option<(i64, String)> = tx
+                            .query_row(
+                                "SELECT seq, payload FROM events WHERE alias=?1 AND kind=?2 \
+                                 ORDER BY seq LIMIT 1",
+                                params![alias, DELIVERY_ROLLUP_EVENT],
+                                |r| Ok((r.get(0)?, r.get(1)?)),
+                            )
+                            .optional()?;
+                        let mut summary = match &existing {
+                            Some((_, payload)) => serde_json::from_str::<Value>(payload).map_err(|e| {
+                                Error::internal(format!("{DELIVERY_ROLLUP_EVENT} payload: {e}"))
+                            })?,
+                            None => json!({
+                                "counts": ROLLABLE_EVENT_KINDS
+                                    .iter()
+                                    .map(|k| (k.to_string(), json!(0)))
+                                    .collect::<serde_json::Map<_, _>>(),
+                            }),
+                        };
+                        for (_, _, kind, at) in batch {
+                            let count = summary["counts"][kind.as_str()].as_u64().unwrap_or(0);
+                            summary["counts"][kind.as_str()] = json!(count + 1);
+                            let first = summary["first_at"].as_f64().map_or(*at, |f| f.min(*at));
+                            let last = summary["last_at"].as_f64().map_or(*at, |l| l.max(*at));
+                            summary["first_at"] = json!(first);
+                            summary["last_at"] = json!(last);
+                        }
+                        let folded = match existing {
+                            Some((seq, _)) => {
+                                tx.execute(
+                                    "UPDATE events SET payload=?1 WHERE seq=?2 AND kind=?3",
+                                    params![summary.to_string(), seq, DELIVERY_ROLLUP_EVENT],
+                                )?;
+                                batch
+                            }
+                            None => {
+                                tx.execute(
+                                    &format!(
+                                        "UPDATE events SET kind=?1, payload=?2 \
+                                         WHERE seq=?3 AND kind IN ({kinds_sql})"
+                                    ),
+                                    params![DELIVERY_ROLLUP_EVENT, summary.to_string(), batch[0].0],
+                                )?;
+                                &batch[1..]
+                            }
+                        };
+                        let mut delete = tx.prepare(&format!(
+                            "DELETE FROM events WHERE seq=?1 AND kind IN ({kinds_sql})"
+                        ))?;
+                        for (seq, ..) in folded {
+                            delete.execute([seq])?;
+                        }
+                    }
+                    Ok(rows.len())
+        });
         }
-        tx.commit()?;
-        Ok(rows.len())
-    }
 
     pub fn record_work_approval(&self, payload: Value) -> Result<()> {
-        let conn = self.write_conn()?;
-        Self::event(&conn, APPROVAL_STREAM, WORK_APPROVED_EVENT, payload)
-    }
+        return self.write_tx(|conn| {
+
+                    Self::event(&conn, APPROVAL_STREAM, WORK_APPROVED_EVENT, payload)
+        });
+        }
 
     /// CAD-487: record the operator's approval of a workflow's gate
     /// keys (`project`, `name`, `digest`, `by`, `at`) on
@@ -398,9 +412,11 @@ impl Store {
     /// `"<project>/<name>"` so a project approval and a workflow
     /// approval never share a row.
     pub fn record_workflow_approval(&self, payload: Value) -> Result<()> {
-        let conn = self.write_conn()?;
-        Self::event(&conn, APPROVAL_STREAM, WORKFLOW_APPROVED_EVENT, payload)
-    }
+        return self.write_tx(|conn| {
+
+                    Self::event(&conn, APPROVAL_STREAM, WORKFLOW_APPROVED_EVENT, payload)
+        });
+        }
 
     /// CAD-487: the latest workflow approval per `"<project>/<name>"`.
     pub fn workflow_approvals(&self) -> Result<std::collections::HashMap<String, Value>> {
@@ -430,9 +446,11 @@ impl Store {
     /// workflow approvals — a separate event kind, so a workflow named
     /// `a` and an app named `a` never share a row.
     pub fn record_app_approval(&self, payload: Value) -> Result<()> {
-        let conn = self.write_conn()?;
-        Self::event(&conn, APPROVAL_STREAM, APP_APPROVED_EVENT, payload)
-    }
+        return self.write_tx(|conn| {
+
+                    Self::event(&conn, APPROVAL_STREAM, APP_APPROVED_EVENT, payload)
+        });
+        }
 
     /// CAD-547: the latest app approval per `"<project>/<name>"`.
     pub fn app_approvals(&self) -> Result<std::collections::HashMap<String, Value>> {
@@ -459,9 +477,11 @@ impl Store {
     /// CAD-449: record a verdict `report_verdict` accepted (`issue`,
     /// `verdict`, `sha`, `reviewer`, `report`) on [`VERDICT_STREAM`].
     pub fn record_review_verdict(&self, payload: Value) -> Result<()> {
-        let conn = self.write_conn()?;
-        Self::event(&conn, VERDICT_STREAM, VERDICT_RECORDED_EVENT, payload)
-    }
+        return self.write_tx(|conn| {
+
+                    Self::event(&conn, VERDICT_STREAM, VERDICT_RECORDED_EVENT, payload)
+        });
+        }
 
     /// CAD-449: did `report_verdict` record exactly this verdict — the
     /// same issue, verdict, sha, reviewer and report?
@@ -535,33 +555,37 @@ impl Store {
 
     /// CAD-405: the latest work-gate approval per project.
     pub fn work_approvals(&self) -> Result<std::collections::HashMap<String, Value>> {
-        let conn = self.write_conn()?;
-        let mut stmt =
-            conn.prepare("SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq")?;
-        let mut rows = stmt.query(params![APPROVAL_STREAM, WORK_APPROVED_EVENT])?;
-        let mut out = std::collections::HashMap::new();
-        while let Some(row) = rows.next()? {
-            let raw: String = row.get(0)?;
-            let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
-                continue;
-            };
-            if let Some(project) = payload["project"].as_str() {
-                out.insert(project.to_string(), payload.clone());
-            }
+        return self.write_tx(|conn| {
+
+                    let mut stmt =
+                        conn.prepare("SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq")?;
+                    let mut rows = stmt.query(params![APPROVAL_STREAM, WORK_APPROVED_EVENT])?;
+                    let mut out = std::collections::HashMap::new();
+                    while let Some(row) = rows.next()? {
+                        let raw: String = row.get(0)?;
+                        let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+                            continue;
+                        };
+                        if let Some(project) = payload["project"].as_str() {
+                            out.insert(project.to_string(), payload.clone());
+                        }
+                    }
+                    Ok(out)
+        });
         }
-        Ok(out)
-    }
 
     /// Standalone event insert for runtime/daemon bookkeeping.
     pub fn event_public(&self, alias: &str, kind: &str, payload: Value) -> Result<()> {
-        let conn = self.write_conn()?;
-        Self::event(&conn, alias, kind, payload)
-    }
+        return self.write_tx(|conn| {
+
+                    Self::event(&conn, alias, kind, payload)
+        });
+        }
 
     /// The first approval event of `kind` naming approval `id` on
     /// [`APPROVAL_STREAM`]. The stream is not a mailbox, so deleting or
     /// cancelling a message can neither remove nor revoke an approval.
-    fn approval_event(conn: &Connection, kind: &str, id: &str) -> Result<Option<Value>> {
+    fn approval_event(conn: &dyn super::StoreConn, kind: &str, id: &str) -> Result<Option<Value>> {
         let mut stmt =
             conn.prepare("SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq")?;
         let mut rows = stmt.query(params![APPROVAL_STREAM, kind])?;
@@ -601,56 +625,57 @@ impl Store {
             None => default_approval_id(a.action, a.pr, a.head_sha),
         };
         identifier(&base, "Approval id")?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        for n in 1..=1000u32 {
-            let id = if n == 1 {
-                base.clone()
-            } else {
-                format!("{base}-{n}")
-            };
-            identifier(&id, "Approval id")?;
-            let evidence = json!({
-                "approval_id": id,
-                "source": a.source,
-                "action": a.action,
-                "head_sha": a.head_sha,
-                "scope": {"repo": a.repo, "pr": a.pr},
-            });
-            let Some(old) = Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, &id)? else {
-                let mut payload = evidence;
-                payload["recorded_via"] = json!(recorded_via);
-                Self::event(&tx, APPROVAL_STREAM, APPROVAL_RECORDED_EVENT, payload)?;
-                tx.commit()?;
-                return Ok((true, id));
-            };
-            let same = ["source", "action", "head_sha", "scope"]
-                .iter()
-                .all(|k| old[k] == evidence[k]);
-            let revoked = Self::approval_event(&tx, APPROVAL_REVOKED_EVENT, &id)?.is_some();
-            match (a.id.is_some(), revoked, same) {
-                (_, false, true) => return Ok((false, id)),
-                (true, true, _) => {
-                    return Err(Error::rejected(format!(
-                        "Approval id '{id}' was revoked — an approval id is never \
-                         reused; pass a new --id, or omit --id for a fresh default id"
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    for n in 1..=1000u32 {
+                        let id = if n == 1 {
+                            base.clone()
+                        } else {
+                            format!("{base}-{n}")
+                        };
+                        identifier(&id, "Approval id")?;
+                        let evidence = json!({
+                            "approval_id": id,
+                            "source": a.source,
+                            "action": a.action,
+                            "head_sha": a.head_sha,
+                            "scope": {"repo": a.repo, "pr": a.pr},
+                        });
+                        let Some(old) = Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, &id)? else {
+                            let mut payload = evidence;
+                            payload["recorded_via"] = json!(recorded_via);
+                            Self::event(&tx, APPROVAL_STREAM, APPROVAL_RECORDED_EVENT, payload)?;
+                            return Ok((true, id));
+                        };
+                        let same = ["source", "action", "head_sha", "scope"]
+                            .iter()
+                            .all(|k| old[k] == evidence[k]);
+                        let revoked = Self::approval_event(&tx, APPROVAL_REVOKED_EVENT, &id)?.is_some();
+                        match (a.id.is_some(), revoked, same) {
+                            (_, false, true) => return Ok((false, id)),
+                            (true, true, _) => {
+                                return Err(Error::rejected(format!(
+                                    "Approval id '{id}' was revoked — an approval id is never \
+                                     reused; pass a new --id, or omit --id for a fresh default id"
+                                )))
+                            }
+                            (true, false, false) => {
+                                return Err(Error::rejected(format!(
+                                    "Approval id '{id}' already names different evidence"
+                                )))
+                            }
+                            (false, _, _) => continue,
+                        }
+                    }
+                    Err(Error::rejected(format!(
+                        "Approval id '{base}': no free default id — pass --id"
                     )))
-                }
-                (true, false, false) => {
-                    return Err(Error::rejected(format!(
-                        "Approval id '{id}' already names different evidence"
-                    )))
-                }
-                (false, _, _) => continue,
-            }
+        });
         }
-        Err(Error::rejected(format!(
-            "Approval id '{base}': no free default id — pass --id"
-        )))
-    }
 
     /// Every approval-stream event, oldest first: `(kind, payload, at)`.
-    fn approval_stream(conn: &Connection) -> Result<Vec<(String, Value, f64)>> {
+    fn approval_stream(conn: &dyn super::StoreConn) -> Result<Vec<(String, Value, f64)>> {
         let mut stmt =
             conn.prepare("SELECT kind, payload, at FROM events WHERE alias=? ORDER BY seq")?;
         let rows = stmt.query_map(params![APPROVAL_STREAM], |r| {
@@ -665,7 +690,7 @@ impl Store {
     /// Append an approval record whose id is `base`, or the first free
     /// `<base>-<n>`: ids are never reused.
     fn append_approval(
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         stream: &[(String, Value, f64)],
         base: &str,
         mut payload: Value,
@@ -720,55 +745,56 @@ impl Store {
         approval_source(a.source)?;
         approval_head(a.head_sha)?;
         approval_repo(a.repo)?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let stream = Self::approval_stream(&tx)?;
-        let scope = json!({"repo": a.repo, "pr": a.pr});
-        let head = json!(a.head_sha);
-        let standing = Self::standing(&stream, a.action, &[("scope", &scope), ("head_sha", &head)]);
-        if let Some(id) = standing {
-            return Ok((false, id));
-        }
-        // A revoke sticks: once a delegated approval of this head was
-        // withdrawn, only the operator approves it.
-        let revoked = Self::revoked_ids(&stream);
-        let mine =
-            |p: &Value| p["action"] == a.action && p["scope"] == scope && p["head_sha"] == head;
-        let recorded = |(k, _, _): &&(String, Value, f64)| k == APPROVAL_RECORDED_EVENT;
-        if stream.iter().filter(recorded).any(|(_, p, _)| {
-            mine(p)
-                && p["approval_id"]
-                    .as_str()
-                    .is_some_and(|id| revoked.contains(id))
-        }) {
-            return Err(Error::rejected(
-                "a delegated approval of this head was revoked — only the operator can \
-                 approve it now",
-            ));
-        }
-        // A scope pre-approval is single-use.
-        if let Some(scope_id) = d.scope_approval {
-            if stream
-                .iter()
-                .filter(recorded)
-                .any(|(_, p, _)| p["action"] == a.action && p["scope_approval"] == scope_id)
-            {
-                return Err(Error::rejected(format!(
-                    "scope pre-approval '{scope_id}' was already consumed by a delegated approval"
-                )));
-            }
-        }
-        let payload = json!({
-            "source": a.source, "action": a.action, "head_sha": a.head_sha,
-            "scope": scope, "approver": d.approver, "verdicts": d.verdicts,
-            "verdict_sha256": d.verdict_sha256, "reviewers": d.reviewers,
-            "scope_approval": d.scope_approval, "recorded_via": d.approver,
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let stream = Self::approval_stream(&tx)?;
+                    let scope = json!({"repo": a.repo, "pr": a.pr});
+                    let head = json!(a.head_sha);
+                    let standing = Self::standing(&stream, a.action, &[("scope", &scope), ("head_sha", &head)]);
+                    if let Some(id) = standing {
+                        return Ok((false, id));
+                    }
+                    // A revoke sticks: once a delegated approval of this head was
+                    // withdrawn, only the operator approves it.
+                    let revoked = Self::revoked_ids(&stream);
+                    let mine =
+                        |p: &Value| p["action"] == a.action && p["scope"] == scope && p["head_sha"] == head;
+                    let recorded = |(k, _, _): &&(String, Value, f64)| k == APPROVAL_RECORDED_EVENT;
+                    if stream.iter().filter(recorded).any(|(_, p, _)| {
+                        mine(p)
+                            && p["approval_id"]
+                                .as_str()
+                                .is_some_and(|id| revoked.contains(id))
+                    }) {
+                        return Err(Error::rejected(
+                            "a delegated approval of this head was revoked — only the operator can \
+                             approve it now",
+                        ));
+                    }
+                    // A scope pre-approval is single-use.
+                    if let Some(scope_id) = d.scope_approval {
+                        if stream
+                            .iter()
+                            .filter(recorded)
+                            .any(|(_, p, _)| p["action"] == a.action && p["scope_approval"] == scope_id)
+                        {
+                            return Err(Error::rejected(format!(
+                                "scope pre-approval '{scope_id}' was already consumed by a delegated approval"
+                            )));
+                        }
+                    }
+                    let payload = json!({
+                        "source": a.source, "action": a.action, "head_sha": a.head_sha,
+                        "scope": scope, "approver": d.approver, "verdicts": d.verdicts,
+                        "verdict_sha256": d.verdict_sha256, "reviewers": d.reviewers,
+                        "scope_approval": d.scope_approval, "recorded_via": d.approver,
+                    });
+                    let base = default_approval_id(a.action, a.pr, a.head_sha);
+                    let id = Self::append_approval(&tx, &stream, &base, payload)?;
+                    Ok((true, id))
         });
-        let base = default_approval_id(a.action, a.pr, a.head_sha);
-        let id = Self::append_approval(&tx, &stream, &base, payload)?;
-        tx.commit()?;
-        Ok((true, id))
-    }
+        }
 
     /// CAD-918: the operator pre-approved the scope of `issue` at ticket
     /// time, bound to `digest` (its body). A live identical record dedupes.
@@ -780,44 +806,47 @@ impl Store {
         recorded_via: &str,
     ) -> Result<(bool, String)> {
         approval_source(source)?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let stream = Self::approval_stream(&tx)?;
-        let scope = json!({"issue": issue, "digest": digest});
-        let standing = Self::standing(
-            &stream,
-            crate::delegation::SCOPE_ACTION,
-            &[("scope", &scope)],
-        );
-        if let Some(id) = standing {
-            return Ok((false, id));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let stream = Self::approval_stream(&tx)?;
+                    let scope = json!({"issue": issue, "digest": digest});
+                    let standing = Self::standing(
+                        &stream,
+                        crate::delegation::SCOPE_ACTION,
+                        &[("scope", &scope)],
+                    );
+                    if let Some(id) = standing {
+                        return Ok((false, id));
+                    }
+                    let payload = json!({"source": source, "action": crate::delegation::SCOPE_ACTION,
+                                         "scope": scope, "recorded_via": recorded_via});
+                    let base = format!("scope-{}-{}", issue.to_ascii_lowercase(), &digest[..12]);
+                    let id = Self::append_approval(&tx, &stream, &base, payload)?;
+                    Ok((true, id))
+        });
         }
-        let payload = json!({"source": source, "action": crate::delegation::SCOPE_ACTION,
-                             "scope": scope, "recorded_via": recorded_via});
-        let base = format!("scope-{}-{}", issue.to_ascii_lowercase(), &digest[..12]);
-        let id = Self::append_approval(&tx, &stream, &base, payload)?;
-        tx.commit()?;
-        Ok((true, id))
-    }
 
     /// A live (unrevoked) scope pre-approval by id: `(issue, digest)`.
     pub fn scope_approval(&self, id: &str) -> Result<Option<(String, String)>> {
-        let conn = self.write_conn()?;
-        let stream = Self::approval_stream(&conn)?;
-        if Self::revoked_ids(&stream).contains(id) {
-            return Ok(None);
+        return self.write_tx(|conn| {
+
+                    let stream = Self::approval_stream(&conn)?;
+                    if Self::revoked_ids(&stream).contains(id) {
+                        return Ok(None);
+                    }
+                    Ok(stream.iter().find_map(|(k, p, _)| {
+                        (k == APPROVAL_RECORDED_EVENT
+                            && p["approval_id"] == id
+                            && p["action"] == crate::delegation::SCOPE_ACTION
+                            && p["recorded_via"] == "operator-connection")
+                            .then(|| {
+                                let text = |f: &str| p["scope"][f].as_str().unwrap_or_default().to_string();
+                                (text("issue"), text("digest"))
+                            })
+                    }))
+        });
         }
-        Ok(stream.iter().find_map(|(k, p, _)| {
-            (k == APPROVAL_RECORDED_EVENT
-                && p["approval_id"] == id
-                && p["action"] == crate::delegation::SCOPE_ACTION
-                && p["recorded_via"] == "operator-connection")
-                .then(|| {
-                    let text = |f: &str| p["scope"][f].as_str().unwrap_or_default().to_string();
-                    (text("issue"), text("digest"))
-                })
-        }))
-    }
 
     /// CAD-918: designate (`active`) or undesignate `alias` for
     /// `project`. Answers whether the state changed.
@@ -832,33 +861,34 @@ impl Store {
     ) -> Result<bool> {
         identifier(alias, "Designated alias")?;
         approval_source(source)?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        // An active designation that predates the agent's current
-        // registration counts for nothing, so designating again writes.
-        let in_force = Self::designations_in(&tx)?
-            .into_iter()
-            .find(|d| d["alias"] == alias && d["project"] == project);
-        let now_active = in_force.is_some_and(|d| {
-            d["active"] == true
-                && registered.is_none_or(|c| d["at"].as_f64().is_some_and(|at| c <= at))
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    // An active designation that predates the agent's current
+                    // registration counts for nothing, so designating again writes.
+                    let in_force = Self::designations_in(&tx)?
+                        .into_iter()
+                        .find(|d| d["alias"] == alias && d["project"] == project);
+                    let now_active = in_force.is_some_and(|d| {
+                        d["active"] == true
+                            && registered.is_none_or(|c| d["at"].as_f64().is_some_and(|at| c <= at))
+                    });
+                    if now_active == active {
+                        return Ok(false);
+                    }
+                    let payload = json!({"alias": alias, "project": project, "active": active,
+                                         "source": source, "recorded_via": recorded_via});
+                    Self::event(&tx, APPROVAL_STREAM, DESIGNATION_EVENT, payload)?;
+                    Ok(true)
         });
-        if now_active == active {
-            return Ok(false);
         }
-        let payload = json!({"alias": alias, "project": project, "active": active,
-                             "source": source, "recorded_via": recorded_via});
-        Self::event(&tx, APPROVAL_STREAM, DESIGNATION_EVENT, payload)?;
-        tx.commit()?;
-        Ok(true)
-    }
 
     /// The designation in force per `(alias, project)`, with its time.
     pub fn designations(&self) -> Result<Vec<Value>> {
         Self::designations_in(&self.conn())
     }
 
-    fn designations_in(conn: &Connection) -> Result<Vec<Value>> {
+    fn designations_in(conn: &dyn super::StoreConn) -> Result<Vec<Value>> {
         let mut latest: std::collections::BTreeMap<(String, String), Value> = Default::default();
         for (k, p, at) in Self::approval_stream(conn)? {
             if k != DESIGNATION_EVENT || p["recorded_via"] != "operator-connection" {
@@ -889,30 +919,31 @@ impl Store {
         approval_source(source)?;
         approval_text(reason, "Approval revocation reason", 256)?;
         let evidence = json!({"approval_id": id, "source": source, "reason": reason});
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        if Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, id)?.is_none() {
-            return Err(Error::rejected(format!(
-                "Approval id '{id}' has no recorded approval to revoke"
-            )));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    if Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, id)?.is_none() {
+                        return Err(Error::rejected(format!(
+                            "Approval id '{id}' has no recorded approval to revoke"
+                        )));
+                    }
+                    if let Some(old) = Self::approval_event(&tx, APPROVAL_REVOKED_EVENT, id)? {
+                        let same = ["approval_id", "source", "reason"]
+                            .iter()
+                            .all(|k| old[k] == evidence[k]);
+                        if same {
+                            return Ok(false);
+                        }
+                        return Err(Error::rejected(format!(
+                            "Approval id '{id}' already names different revocation evidence"
+                        )));
+                    }
+                    let mut payload = evidence;
+                    payload["recorded_via"] = json!(recorded_via);
+                    Self::event(&tx, APPROVAL_STREAM, APPROVAL_REVOKED_EVENT, payload)?;
+                    Ok(true)
+        });
         }
-        if let Some(old) = Self::approval_event(&tx, APPROVAL_REVOKED_EVENT, id)? {
-            let same = ["approval_id", "source", "reason"]
-                .iter()
-                .all(|k| old[k] == evidence[k]);
-            if same {
-                return Ok(false);
-            }
-            return Err(Error::rejected(format!(
-                "Approval id '{id}' already names different revocation evidence"
-            )));
-        }
-        let mut payload = evidence;
-        payload["recorded_via"] = json!(recorded_via);
-        Self::event(&tx, APPROVAL_STREAM, APPROVAL_REVOKED_EVENT, payload)?;
-        tx.commit()?;
-        Ok(true)
-    }
 
     /// `event_public` with job/task scope — the stall watch uses it so
     /// `turn_stalled`/`turn_resumed` surface in `job events`, not only
@@ -925,32 +956,32 @@ impl Store {
         job_id: Option<&str>,
         task_id: Option<&str>,
     ) -> Result<()> {
-        let conn = self.write_conn()?;
-        Self::event_scoped(&conn, alias, kind, payload, job_id, task_id)
-    }
+        return self.write_tx(|conn| {
+
+                    Self::event_scoped(&conn, alias, kind, payload, job_id, task_id)
+        });
+        }
 
     /// Record the build commit this daemon process is running.
     pub fn record_running_build(&self, commit: &str) -> Result<()> {
         // CAD-1011: rollout schema + daemon-build upsert are owner
         // maintenance (DDL + guard-table writes), not business DML.
-        let conn = self.owner_conn()?;
-        crate::rollout::upsert_daemon_build(&conn, commit, crate::rollout::unix_now())
+        self.with_owner_conn(|conn| {
+            crate::rollout::upsert_daemon_build(conn, commit, crate::rollout::unix_now())
+        })
     }
 
     /// Refuse to keep running when this binary's commit is not the one
     /// the daemon last recorded, unless the caller holds the lease.
     pub fn enforce_running_build(&self) -> Result<()> {
-        let conn = self.owner_conn()?;
-        crate::rollout::enforce_running_build(&conn)
+        self.with_owner_conn(|conn| crate::rollout::enforce_running_build(conn))
     }
 
     /// Fold a refused migration's side log into the daemon event stream.
     /// The refusal itself cannot be inserted into the database it is
     /// refusing to modify.
     pub fn ingest_rollout_gate(&self, state_dir: &Path) -> Result<()> {
-        let conn = self.owner_conn()?;
-        crate::rollout::ingest_gate_log(state_dir, &conn)?;
-        Ok(())
+        self.with_owner_conn(|conn| crate::rollout::ingest_gate_log(state_dir, conn))
     }
 
     /// Event log page for the `events` API; cursor is the last seq seen.
@@ -970,7 +1001,7 @@ impl Store {
     /// accepts it; sends still require a registered alias.
     pub const DAEMON_STREAM: &str = "daemon";
 
-    fn events_alias_in(&self, conn: &Connection, alias: &str) -> Result<()> {
+    fn events_alias_in(&self, conn: &dyn super::StoreConn, alias: &str) -> Result<()> {
         if alias == Self::DAEMON_STREAM {
             return Ok(());
         }

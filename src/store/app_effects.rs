@@ -91,7 +91,7 @@ fn validate_child(row: &EffectRow, authority: &Value) -> Result<()> {
     Ok(())
 }
 
-fn child_in(conn: &Connection, id: &str) -> Result<(EffectRow, Value, String)> {
+fn child_in(conn: &dyn super::StoreConn, id: &str) -> Result<(EffectRow, Value, String)> {
     let row = conn
         .query_row(
             "SELECT * FROM platform_effects WHERE effect_id=?",
@@ -161,7 +161,7 @@ pub fn read_execution_permit(path: &Path, effect_id: &str) -> Result<AppEffectPe
 
 impl Store {
     pub(super) fn app_effect_invalidate_in(
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         install: &str,
         context: Option<&str>,
         binding: Option<&str>,
@@ -208,7 +208,7 @@ impl Store {
     /// Retiring those endpoints does not alter their recorded acceptance.
     /// The installation, context and binding are nevertheless current here.
     pub(crate) fn app_publication_material_in(
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         id: &str,
         artifact: &str,
         bundle: &str,
@@ -339,10 +339,12 @@ impl Store {
     }
 
     pub fn app_effect_show(&self, id: &str) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let (row, authority, digest) = child_in(&conn, id)?;
-        Ok(envelope(&row, &authority, &digest))
-    }
+        return self.write_tx(|conn| {
+
+                    let (row, authority, digest) = child_in(&conn, id)?;
+                    Ok(envelope(&row, &authority, &digest))
+        });
+        }
 
     /// A provider may have committed even when its confirmation failed.
     /// Persist that distinction, independently of read-back, without replay.
@@ -353,90 +355,94 @@ impl Store {
         {
             return Err(Error::rejected("invalid uncertain app artifact outcome"));
         }
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let (row, authority, digest) = child_in(&tx, id)?;
-        if row.state != "executing" {
-            return Err(Error::rejected("app effect is not executing"));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let (row, authority, digest) = child_in(&tx, id)?;
+                    if row.state != "executing" {
+                        return Err(Error::rejected("app effect is not executing"));
+                    }
+                    let changed = tx.execute(
+                        "UPDATE platform_effects SET state='reconcile',outcome=?,needs_you=1,updated_at=? WHERE effect_id=? AND state='executing' AND authorization_kind='app_artifact'",
+                        params![outcome.to_string(), now(), id],
+                    )?;
+                    if changed != 1 {
+                        return Err(Error::rejected("app effect uncertainty claim changed"));
+                    }
+                    Self::event(
+                        &tx,
+                        platform::PLATFORM_STREAM,
+                        EFFECT_NEEDS_YOU_EVENT,
+                        json!({"effect_id":id,"authorization_kind":"app_artifact","reason":"app artifact completion is uncertain — reconcile","verified":outcome["verified"]}),
+                    )?;
+                    let (row, _, _) = child_in(&tx, id)?;
+                    let result = envelope(&row, &authority, &digest);
+                    Ok(result)
+        });
         }
-        let changed = tx.execute(
-            "UPDATE platform_effects SET state='reconcile',outcome=?,needs_you=1,updated_at=? WHERE effect_id=? AND state='executing' AND authorization_kind='app_artifact'",
-            params![outcome.to_string(), now(), id],
-        )?;
-        if changed != 1 {
-            return Err(Error::rejected("app effect uncertainty claim changed"));
-        }
-        Self::event(
-            &tx,
-            platform::PLATFORM_STREAM,
-            EFFECT_NEEDS_YOU_EVENT,
-            json!({"effect_id":id,"authorization_kind":"app_artifact","reason":"app artifact completion is uncertain — reconcile","verified":outcome["verified"]}),
-        )?;
-        let (row, _, _) = child_in(&tx, id)?;
-        let result = envelope(&row, &authority, &digest);
-        tx.commit()?;
-        Ok(result)
-    }
 
     /// Operator resolution changes bookkeeping only. The exact historical
     /// child and digest survive, including when its installation is gone.
     pub fn app_effect_resolve(&self, id: &str, digest: &str, resolution: &str) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let (row, authority, stored_digest) = child_in(&tx, id)?;
-        if digest != stored_digest {
-            return Err(Error::rejected("app effect release digest changed"));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let (row, authority, stored_digest) = child_in(&tx, id)?;
+                    if digest != stored_digest {
+                        return Err(Error::rejected("app effect release digest changed"));
+                    }
+                    let changed = match resolution {
+                        "close" if row.state == "reconcile" => tx.execute(
+                            "UPDATE platform_effects SET state='closed',close_reason='operator_reconciled',needs_you=0,updated_at=? WHERE effect_id=? AND state='reconcile' AND authorization_kind='app_artifact'",
+                            params![now(), id],
+                        )?,
+                        "acknowledge" if matches!(row.state.as_str(), "done" | "failed") && row.needs_you => tx.execute(
+                            "UPDATE platform_effects SET needs_you=0,updated_at=? WHERE effect_id=? AND state IN ('done','failed') AND needs_you=1 AND authorization_kind='app_artifact'",
+                            params![now(), id],
+                        )?,
+                        "close" | "acknowledge" => {
+                            return Err(Error::rejected("app effect is not eligible for this resolution"));
+                        }
+                        _ => return Err(Error::rejected("app effect resolution must be close or acknowledge")),
+                    };
+                    if changed != 1 {
+                        return Err(Error::rejected("app effect resolution state changed"));
+                    }
+                    Self::event(
+                        &tx,
+                        platform::PLATFORM_STREAM,
+                        if resolution == "close" {
+                            EFFECT_CANCELLED_EVENT
+                        } else {
+                            "effect_acknowledged"
+                        },
+                        json!({"effect_id":id,"authorization_kind":"app_artifact","resolution":resolution,"digest":digest}),
+                    )?;
+                    let (resolved, _, _) = child_in(&tx, id)?;
+                    let result = envelope(&resolved, &authority, &stored_digest);
+                    Ok(result)
+        });
         }
-        let changed = match resolution {
-            "close" if row.state == "reconcile" => tx.execute(
-                "UPDATE platform_effects SET state='closed',close_reason='operator_reconciled',needs_you=0,updated_at=? WHERE effect_id=? AND state='reconcile' AND authorization_kind='app_artifact'",
-                params![now(), id],
-            )?,
-            "acknowledge" if matches!(row.state.as_str(), "done" | "failed") && row.needs_you => tx.execute(
-                "UPDATE platform_effects SET needs_you=0,updated_at=? WHERE effect_id=? AND state IN ('done','failed') AND needs_you=1 AND authorization_kind='app_artifact'",
-                params![now(), id],
-            )?,
-            "close" | "acknowledge" => {
-                return Err(Error::rejected("app effect is not eligible for this resolution"));
-            }
-            _ => return Err(Error::rejected("app effect resolution must be close or acknowledge")),
-        };
-        if changed != 1 {
-            return Err(Error::rejected("app effect resolution state changed"));
-        }
-        Self::event(
-            &tx,
-            platform::PLATFORM_STREAM,
-            if resolution == "close" {
-                EFFECT_CANCELLED_EVENT
-            } else {
-                "effect_acknowledged"
-            },
-            json!({"effect_id":id,"authorization_kind":"app_artifact","resolution":resolution,"digest":digest}),
-        )?;
-        let (resolved, _, _) = child_in(&tx, id)?;
-        let result = envelope(&resolved, &authority, &stored_digest);
-        tx.commit()?;
-        Ok(result)
-    }
     pub fn app_effect_list(&self, install: Option<&str>, context: Option<&str>) -> Result<Value> {
         if context.is_some() && install.is_none() {
             return Err(Error::rejected("context filter requires installation"));
         }
-        let conn = self.write_conn()?;
-        let mut stmt = conn.prepare("SELECT effect_id FROM app_effect_authorizations WHERE (? IS NULL OR install_id=?) AND (? IS NULL OR context_id=?) ORDER BY effect_id LIMIT 100")?;
-        let ids = stmt
-            .query_map(params![install, install, context, context], |r| {
-                r.get::<_, String>(0)
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut list = Vec::new();
-        for id in ids {
-            let (row, authority, digest) = child_in(&conn, &id)?;
-            list.push(envelope(&row, &authority, &digest)["effect"].clone());
+        return self.write_tx(|conn| {
+
+                    let mut stmt = conn.prepare("SELECT effect_id FROM app_effect_authorizations WHERE (? IS NULL OR install_id=?) AND (? IS NULL OR context_id=?) ORDER BY effect_id LIMIT 100")?;
+                    let ids = stmt
+                        .query_map(params![install, install, context, context], |r| {
+                            r.get::<_, String>(0)
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    let mut list = Vec::new();
+                    for id in ids {
+                        let (row, authority, digest) = child_in(&conn, &id)?;
+                        list.push(envelope(&row, &authority, &digest)["effect"].clone());
+                    }
+                    Ok(json!({"effects":list}))
+        });
         }
-        Ok(json!({"effects":list}))
-    }
     pub fn app_effect_is_child(&self, id: &str) -> Result<bool> {
         Ok(self
             .conn()
@@ -453,52 +459,52 @@ impl Store {
     /// authority and presentation, not merely matching provider arguments.
     pub fn app_effect_stage(&self, row: &EffectRow, authority: &Value) -> Result<Value> {
         validate_child(row, authority)?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let existing = tx
-            .query_row(
-                "SELECT effect_id FROM platform_effects WHERE request=?",
-                [&row.request],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?;
-        if let Some(id) = existing {
-            let (existing, stored, digest) = child_in(&tx, &id)?;
-            if release_digest(row, authority) != digest || stored != *authority {
-                return Err(Error::rejected(
-                    "app release request already names different approved material",
-                ));
-            }
-            tx.commit()?;
-            return Ok(envelope(&existing, &stored, &digest));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let existing = tx
+                        .query_row(
+                            "SELECT effect_id FROM platform_effects WHERE request=?",
+                            [&row.request],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    if let Some(id) = existing {
+                        let (existing, stored, digest) = child_in(&tx, &id)?;
+                        if release_digest(row, authority) != digest || stored != *authority {
+                            return Err(Error::rejected(
+                                "app release request already names different approved material",
+                            ));
+                        }
+                        return Ok(envelope(&existing, &stored, &digest));
+                    }
+                    let digest = release_digest(row, authority);
+                    tx.execute("INSERT INTO platform_effects(effect_id,request,agent,platform,account,tool,label,input,input_summary,preview,source_name,source_hash,scopes,task,state,staged_at,updated_at,authorization_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'waiting',?,?,'app_artifact')",
+                        params![row.effect_id,row.request,row.agent,row.platform,row.account,row.tool,row.label,row.input.to_string(),row.input_summary,row.preview,row.source_name,row.source_hash,serde_json::to_string(&row.scopes)?,row.task,now(),now()])?;
+                    tx.execute(
+                        "INSERT INTO app_effect_authorizations VALUES(?,?,?,?,?,?,?,?,?)",
+                        params![
+                            row.effect_id,
+                            authority["install_id"].as_str(),
+                            authority["context"]["id"].as_str(),
+                            authority["run_id"].as_str(),
+                            authority["artifact_id"].as_str(),
+                            authority.to_string(),
+                            authority_digest(authority),
+                            input_digest(&row.input),
+                            digest
+                        ],
+                    )?;
+                    Self::event(
+                        &tx,
+                        platform::PLATFORM_STREAM,
+                        EFFECT_REQUESTED_EVENT,
+                        json!({"effect_id":row.effect_id,"request":row.request,"authorization_kind":"app_artifact","install_id":authority["install_id"],"digest":digest}),
+                    )?;
+                    let (stored, authority, digest) = child_in(&tx, &row.effect_id)?;
+                    Ok(envelope(&stored, &authority, &digest))
+        });
         }
-        let digest = release_digest(row, authority);
-        tx.execute("INSERT INTO platform_effects(effect_id,request,agent,platform,account,tool,label,input,input_summary,preview,source_name,source_hash,scopes,task,state,staged_at,updated_at,authorization_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'waiting',?,?,'app_artifact')",
-            params![row.effect_id,row.request,row.agent,row.platform,row.account,row.tool,row.label,row.input.to_string(),row.input_summary,row.preview,row.source_name,row.source_hash,serde_json::to_string(&row.scopes)?,row.task,now(),now()])?;
-        tx.execute(
-            "INSERT INTO app_effect_authorizations VALUES(?,?,?,?,?,?,?,?,?)",
-            params![
-                row.effect_id,
-                authority["install_id"].as_str(),
-                authority["context"]["id"].as_str(),
-                authority["run_id"].as_str(),
-                authority["artifact_id"].as_str(),
-                authority.to_string(),
-                authority_digest(authority),
-                input_digest(&row.input),
-                digest
-            ],
-        )?;
-        Self::event(
-            &tx,
-            platform::PLATFORM_STREAM,
-            EFFECT_REQUESTED_EVENT,
-            json!({"effect_id":row.effect_id,"request":row.request,"authorization_kind":"app_artifact","install_id":authority["install_id"],"digest":digest}),
-        )?;
-        let (stored, authority, digest) = child_in(&tx, &row.effect_id)?;
-        tx.commit()?;
-        Ok(envelope(&stored, &authority, &digest))
-    }
 
     /// Eligibility and the exactly-one claim share a transaction. A caller
     /// must hold the daemon release lock until provider commit/readback;
@@ -512,28 +518,29 @@ impl Store {
     where
         F: FnOnce(&Connection, &Value) -> Result<bool>,
     {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let (row, authority, stored_digest) = child_in(&tx, id)?;
-        if digest != stored_digest {
-            return Err(Error::rejected("app effect release digest changed"));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let (row, authority, stored_digest) = child_in(&tx, id)?;
+                    if digest != stored_digest {
+                        return Err(Error::rejected("app effect release digest changed"));
+                    }
+                    if row.state != "decided" || !eligible(&tx, &authority)? {
+                        return Ok(None);
+                    }
+                    let count = tx.execute("UPDATE platform_effects SET state='executing',updated_at=? WHERE effect_id=? AND state='decided' AND authorization_kind='app_artifact'",params![now(),id])?;
+                    if count != 1 {
+                        return Ok(None);
+                    }
+                    let mut claimed = row;
+                    claimed.state = "executing".into();
+                    Ok(Some(claimed))
+        });
         }
-        if row.state != "decided" || !eligible(&tx, &authority)? {
-            return Ok(None);
-        }
-        let count = tx.execute("UPDATE platform_effects SET state='executing',updated_at=? WHERE effect_id=? AND state='decided' AND authorization_kind='app_artifact'",params![now(),id])?;
-        if count != 1 {
-            return Ok(None);
-        }
-        let mut claimed = row;
-        claimed.state = "executing".into();
-        tx.commit()?;
-        Ok(Some(claimed))
-    }
 }
 
 fn historical_step_receipt(
-    conn: &Connection,
+    conn: &dyn super::StoreConn,
     run: &Value,
     step: &str,
     message: &str,

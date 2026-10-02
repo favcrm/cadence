@@ -433,6 +433,33 @@ pub enum SealError {
     /// Missing/uninitialized/malformed/non-WAL/foreign — never default-open.
     Unknown(String),
 }
+/// Read-only latch check for sibling writers that open `cadence.sqlite3`
+/// outside the `Store` (rollout `connect`/`immediate`, backup
+/// copy-transform sources). Refuses when the file carries a closure
+/// latch — sealed *or* open-latch — or when it can't be read. A
+/// latch-absent legacy db and a non-existent path pass, so scratch
+/// copies and pre-init files are untouched.
+pub(crate) fn preflight_writer_guard(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let ro = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| SealError::Unknown(format!("writer-guard open: {e}")))?;
+    ro.busy_timeout(super::BUSY_TIMEOUT)
+        .map_err(|e| SealError::Unknown(format!("writer-guard busy_timeout: {e}")))?;
+    match preflight_read(&ro).map_err(|e| SealError::Unknown(format!("writer-guard read: {e}")))? {
+        Preflight::LatchAbsent => Ok(()),
+        Preflight::Sealed => Err(SealError::Closed(
+            "producer closure latch is set — writes refused".into(),
+        )
+        .into()),
+        Preflight::LatchOpen | Preflight::Malformed => Err(SealError::Unknown(
+            "closure latch present on a sibling-writer path — refusing the write".into(),
+        )
+        .into()),
+    }
+}
+
 impl From<SealError> for Error {
     fn from(e: SealError) -> Self {
         match e {
@@ -538,18 +565,63 @@ impl Store {
         }
     }
 
-    /// The ONLY producer write entry point. Callers land in CAD-1011's
-    /// producer-writer conversion; kept here so the sealed-tx path is
-    /// exercised by the seal tests before producers are migrated.
-    #[allow(dead_code)]
-    fn with_sealed_tx<R>(&self, f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>) -> Result<R>
+    /// The ONLY producer write entry point. Takes the conn mutex, opens
+    /// `BEGIN IMMEDIATE`, re-checks the durable closure latch *inside*
+    /// that tx, then hands the callback a restricted [`WriteTxn`] —
+    /// closure-check and every DML are one SQLite writer critical
+    /// section. A sealed store refuses before `f` runs; a callback error
+    /// or panic rolls back inside the guard's private `TxControl` window
+    /// (a bare `Transaction` drop would be denied by the authorizer).
+    pub(crate) fn with_sealed_tx<R>(
+        &self,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
+    ) -> Result<R>
     where
         R: 'static,
     {
         self.sealed_tx(GuardState::BUSINESS, false, f)
     }
 
-    #[allow(dead_code)]
+    /// [`Self::with_sealed_tx`] plus a fence re-check inside the held
+    /// conn mutex — a writer fenced while waiting on the lock is refused
+    /// before the arm and before `BEGIN`, so the fence/latch/DML decision
+    /// is one serialized critical section. `fence` yields the refusal
+    /// reason when the lease is lost; `|| None` passes always-armed.
+    pub(crate) fn with_sealed_tx_fenced<R>(
+        &self,
+        fence: impl FnOnce() -> Option<String>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
+    ) -> Result<R>
+    where
+        R: 'static,
+    {
+        self.sealed_tx_fenced(GuardState::BUSINESS, false, Some(fence), f)
+    }
+
+    /// Raw-error variant of [`Self::with_sealed_tx_fenced`].
+    pub(crate) fn with_sealed_tx_fenced_raw<T>(
+        &self,
+        fence: impl FnOnce() -> Option<String>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T>
+    where
+        T: 'static,
+    {
+        self.sealed_tx_fenced_raw(GuardState::BUSINESS, false, Some(fence), f)
+    }
+
+    /// Raw-error variant of [`Self::with_sealed_tx`] for callers that
+    /// classify sqlite errors (e.g. `shutdown_entries`' BUSY retry).
+    pub(crate) fn with_sealed_tx_raw<T>(
+        &self,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T>
+    where
+        T: 'static,
+    {
+        self.sealed_tx_raw(GuardState::BUSINESS, false, f)
+    }
+
     fn sealed_tx<R>(
         &self,
         arm: u8,
@@ -559,9 +631,34 @@ impl Store {
     where
         R: 'static,
     {
+        self.sealed_tx_fenced(arm, on_sealed, None::<fn() -> Option<String>>, f)
+    }
+
+    fn sealed_tx_fenced<R>(
+        &self,
+        arm: u8,
+        on_sealed: bool,
+        fence: Option<impl FnOnce() -> Option<String>>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
+    ) -> Result<R>
+    where
+        R: 'static,
+    {
         let guard = self.conn();
         let state = &*self.seal_state;
+        // Re-check the hosted-lease fence INSIDE the held mutex — a
+        // writer fenced while waiting on the lock is refused before the
+        // arm and before `BEGIN`, so fence/latch/DML serialize together.
+        if let Some(fence) = fence {
+            if let Some(reason) = fence() {
+                return Err(Error::rejected(format!(
+                    "store write refused — the daemon's hosted lease is lost: {reason}"
+                )));
+            }
+        }
         let _armed = ArmGuard::enter(state, arm);
+        // `begin` runs in the guard's TxControl window so the authorizer
+        // permits the tx boundary.
         let tx = {
             let _ctrl = ControlPhase::enter(state);
             Transaction::new_unchecked(&guard, TransactionBehavior::Immediate)
@@ -572,50 +669,131 @@ impl Store {
         // passes `on_sealed` and verifies the latch itself inside `f`.
         if !on_sealed {
             if let Err(e) = Self::check_closed_tx(&tx) {
-                let _ctrl = ControlPhase::enter(state);
-                drop(tx);
+                Self::rollback_tx(state, tx);
                 return Err(e);
             }
         }
-        // (fall through)
-        let mut facade = WriteTxn { tx: &tx };
-        let out = match f(&mut facade) {
-            Ok(v) => v,
-            Err(e) => {
-                // Rollback must run in the guard's TxControl window — a
-                // callback-dropped Transaction would otherwise be denied.
-                let _ctrl = ControlPhase::enter(state);
-                drop(tx);
-                return Err(e);
-            }
+        // (fall through) `f` runs with phase=Callback — the facade can
+        // issue DML/read but no tx boundary; a panic is caught so the
+        // rollback runs under TxControl, not a denied Transaction drop.
+        // The facade borrow is scoped to the closure call so `tx` is
+        // free to move/rollback/commit once it ends.
+        let outcome = {
+            let mut facade = WriteTxn { tx: &tx, state };
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut facade)))
         };
-        {
-            let _ctrl = ControlPhase::enter(state);
-            tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+        match outcome {
+            Ok(Ok(v)) => {
+                let _ctrl = ControlPhase::enter(state);
+                tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+                Ok(v)
+            }
+            Ok(Err(e)) => {
+                Self::rollback_tx(state, tx);
+                Err(e)
+            }
+            Err(payload) => {
+                Self::rollback_tx(state, tx);
+                std::panic::resume_unwind(payload);
+            }
         }
-        Ok(out)
     }
 
-    /// The sealed write connection: takes the conn mutex, arms `Business`
-    /// for the guard's whole lifetime, and evaluates the durable latch
-    /// under the lock before returning — so the caller's write is checked
-    /// and armed as one critical section. Used by `write_conn`.
-    pub(super) fn write_conn_sealed(&self) -> Result<WriteConn<'_>> {
+    /// `sealed_tx` with the rusqlite error channel preserved end-to-end —
+    /// the callback and the boundary calls return `rusqlite::Result` so a
+    /// caller classifies BUSY/constraint at the source.
+    fn sealed_tx_raw<T>(
+        &self,
+        arm: u8,
+        on_sealed: bool,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T>
+    where
+        T: 'static,
+    {
+        self.sealed_tx_fenced_raw(arm, on_sealed, None::<fn() -> Option<String>>, f)
+    }
+
+    fn sealed_tx_fenced_raw<T>(
+        &self,
+        arm: u8,
+        on_sealed: bool,
+        fence: Option<impl FnOnce() -> Option<String>>,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T>
+    where
+        T: 'static,
+    {
         let guard = self.conn();
         let state = &*self.seal_state;
-        let armed = ArmGuard::enter(state, GuardState::BUSINESS);
-        // The latch is checked while the lock is held; the caller's
-        // transaction then opens (armed) and runs against the same conn.
+        if let Some(fence) = fence {
+            if let Some(reason) = fence() {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    Error::rejected(format!(
+                        "store write refused — the daemon's hosted lease is lost: {reason}"
+                    )),
+                )));
+            }
+        }
+        let _armed = ArmGuard::enter(state, arm);
+        let tx = {
+            let _ctrl = ControlPhase::enter(state);
+            Transaction::new_unchecked(&guard, TransactionBehavior::Immediate)?
+        };
+        if !on_sealed {
+            if let Err(e) = Self::check_closed_tx(&tx) {
+                Self::rollback_tx(state, tx);
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
+            }
+        }
+        let outcome = {
+            let mut facade = WriteTxn { tx: &tx, state };
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut facade)))
+        };
+        match outcome {
+            Ok(Ok(v)) => {
+                let _ctrl = ControlPhase::enter(state);
+                tx.commit()?;
+                Ok(v)
+            }
+            Ok(Err(e)) => {
+                Self::rollback_tx(state, tx);
+                Err(e)
+            }
+            Err(payload) => {
+                Self::rollback_tx(state, tx);
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    /// Roll the live `BEGIN IMMEDIATE` back inside the guard's private
+    /// `TxControl` window — the authorizer denies a `ROLLBACK` issued at
+    /// `phase=Callback`, so the owner performs it here, never the
+    /// callback's own `Transaction` drop (which would be refused and
+    /// leave the connection inside a tx). Takes the `Transaction` by
+    /// value; dropping it issues `ROLLBACK`.
+    fn rollback_tx(state: &GuardState, tx: Transaction<'_>) {
+        let _ctrl = ControlPhase::enter(state);
+        drop(tx);
+    }
+
+    /// Owner-maintenance write scope: takes the conn mutex, checks the
+    /// durable latch, then runs `f(&Connection)` with `Owner`+`TxControl`
+    /// armed — the only scope in which DDL (`CREATE/ALTER/…`), migration
+    /// DML and the latch/witness tables are authorized. A `&Connection`
+    /// is safe to hand the *owner* lane: it is internal-only (daemon-init
+    /// schema, gate ingest, fixture seeding), never a business callback,
+    /// and the authorizer still denies the latch tables unless `Owner`.
+    /// The latch is still honored — a sealed store refuses.
+    pub(crate) fn with_owner_conn<R>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<R>,
+    ) -> Result<R> {
+        let guard = self.conn();
+        let state = &*self.seal_state;
         Self::check_closed_tx(&guard)?;
-        // The WriteConn caller drives its own transaction — the whole
-        // guard lifetime is a tx-control window (BEGIN/COMMIT allowed).
-        // This is the legacy write path; `sealed_tx`'s `WriteTxn` callback
-        // is the restricted one that keeps phase=Callback during `f`.
-        Ok(WriteConn {
-            guard,
-            _armed: armed,
-            _ctrl: Some(ControlPhase::enter(state)),
-        })
+        super::seal::with_owner_tx_control(state, || f(&guard))
     }
 
     /// Test/fixture write scope: seeds schema or fixture rows under the
@@ -626,42 +804,23 @@ impl Store {
     #[cfg(any(test, feature = "test-seam"))]
     #[allow(dead_code)]
     pub(crate) fn fixture_write<R>(&self, f: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
-        let guard = self.conn();
-        let state = &*self.seal_state;
-        Self::check_closed_tx(&guard)?;
-        super::seal::with_owner_tx_control(state, || f(&guard))
+        self.with_owner_conn(f)
     }
 
     /// Test/fixture guard: an armed-`Owner`+`TxControl` conn guard for
-    /// fixture code that binds `let conn = s.conn();` then writes — DDL,
-    /// DML and tx-boundary all authorized while held, latch still checked.
-    /// Test/seam only — never a production writer.
+    /// fixture code that binds `let conn = s.fixture_conn();` then
+    /// writes — DDL, DML and tx-boundary all authorized while held, the
+    /// latch still checked. Test/seam only — never a production writer.
     #[cfg(any(test, feature = "test-seam"))]
     #[allow(dead_code)]
-    pub(crate) fn fixture_conn(&self) -> Result<WriteConn<'_>> {
+    pub(crate) fn fixture_conn(&self) -> Result<FixtureConn<'_>> {
         let guard = self.conn();
         let state = &*self.seal_state;
         Self::check_closed_tx(&guard)?;
-        Ok(WriteConn {
+        Ok(FixtureConn {
             guard,
             _armed: ArmGuard::enter(state, GuardState::OWNER),
-            _ctrl: Some(ControlPhase::enter(state)),
-        })
-    }
-
-    /// Owner-armed conn for daemon-init maintenance — rollout schema
-    /// (`ensure_lease_tables`), daemon-build upsert, gate ingest. Like
-    /// `write_conn` it holds the mutex for the guard's lifetime, but arms
-    /// `Owner`+`TxControl` so DDL (CREATE TABLE/INDEX) passes. Internal to
-    /// `store` init paths only — a business writer never reaches it.
-    pub(super) fn owner_conn(&self) -> Result<WriteConn<'_>> {
-        let guard = self.conn();
-        let state = &*self.seal_state;
-        Self::check_closed_tx(&guard)?;
-        Ok(WriteConn {
-            guard,
-            _armed: ArmGuard::enter(state, GuardState::OWNER),
-            _ctrl: Some(ControlPhase::enter(state)),
+            _ctrl: ControlPhase::enter(state),
         })
     }
 
@@ -743,67 +902,331 @@ impl Store {
     }
 }
 
-/// The connection guard `write_conn()` hands a producer. Holds the conn
-/// mutex AND a `Business` arm for its whole lifetime — the caller's
-/// `unchecked_transaction()`/`execute` run armed, and `check_closed` was
-/// already evaluated under the lock at acquisition. `Deref`s to
-/// `Connection` so the existing `conn.execute`/`unchecked_transaction`
-/// shape is unchanged; the arm dies with the guard.
-pub(crate) struct WriteConn<'a> {
+/// Test/fixture connection guard — `fixture_conn`'s return type. Holds
+/// the conn mutex + `Owner`+`TxControl` for its lifetime and `Deref`s to
+/// `Connection` so test fixtures keep the `conn.execute`/`prepare` shape.
+/// Compiled only under `test`/`test-seam`; never a production writer.
+#[cfg(any(test, feature = "test-seam"))]
+pub(crate) struct FixtureConn<'a> {
     guard: std::sync::MutexGuard<'a, Connection>,
     _armed: ArmGuard<'a>,
-    _ctrl: Option<ControlPhase<'a>>,
+    _ctrl: ControlPhase<'a>,
 }
-impl<'a> std::ops::Deref for WriteConn<'a> {
+#[cfg(any(test, feature = "test-seam"))]
+impl<'a> std::ops::Deref for FixtureConn<'a> {
     type Target = Connection;
     fn deref(&self) -> &Connection {
         &self.guard
     }
 }
-impl<'a> std::ops::DerefMut for WriteConn<'a> {
-    fn deref_mut(&mut self) -> &mut Connection {
-        &mut self.guard
+
+/// The shared read+DML surface a `Store` helper may use — implemented by
+/// the read/owner `Connection` (and `Transaction`, which `Deref`s to it)
+/// and by the business [`WriteTxn`] facade, so a `*.._in(conn, …)` helper
+/// runs on a read guard, inside an open `Transaction`, or inside a sealed
+/// business callback through one signature. Crucially it exposes **no
+/// tx-boundary and no `&Connection` accessor** — the business facade
+/// cannot reach a `Connection`/`Transaction`/`commit`/`rollback`, only
+/// the read/DML verbs below. The authorizer still denies a boundary or
+/// DDL the SQL text sneaks in at `phase=Callback`.
+pub(crate) trait StoreConn {
+    fn sql_execute(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize>;
+    fn sql_execute_batch(&self, sql: &str) -> rusqlite::Result<()>;
+    fn sql_query_row<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T>;
+    /// Collect a `query_map` to a `Vec` — keeps the `Statement` borrow
+    /// local so the trait is object-safe.
+    fn sql_query_vec<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<Vec<T>>;
+    fn sql_last_insert_rowid(&self) -> i64;
+    fn sql_changes(&self) -> u64;
+}
+impl StoreConn for Connection {
+    fn sql_execute(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize> {
+        self.execute(sql, params)
+    }
+    fn sql_execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+        self.execute_batch(sql)
+    }
+    fn sql_query_row<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        self.query_row(sql, params, |r| f(r))
+    }
+    fn sql_query_vec<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<Vec<T>> {
+        let mut stmt = self.prepare(sql)?;
+        stmt.query_map(params, |r| f(r))?.collect()
+    }
+    fn sql_last_insert_rowid(&self) -> i64 {
+        self.last_insert_rowid()
+    }
+    fn sql_changes(&self) -> u64 {
+        self.changes()
+    }
+}
+impl StoreConn for Transaction<'_> {
+    fn sql_execute(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize> {
+        self.execute(sql, params)
+    }
+    fn sql_execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+        self.execute_batch(sql)
+    }
+    fn sql_query_row<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        self.query_row(sql, params, |r| f(r))
+    }
+    fn sql_query_vec<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<Vec<T>> {
+        let mut stmt = self.prepare(sql)?;
+        stmt.query_map(params, |r| f(r))?.collect()
+    }
+    fn sql_last_insert_rowid(&self) -> i64 {
+        self.last_insert_rowid()
+    }
+    fn sql_changes(&self) -> u64 {
+        self.changes()
+    }
+}
+impl StoreConn for &Connection {
+    fn sql_execute(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize> {
+        (**self).sql_execute(sql, params)
+    }
+    fn sql_execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+        (**self).sql_execute_batch(sql)
+    }
+    fn sql_query_row<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        (**self).sql_query_row(sql, params, f)
+    }
+    fn sql_query_vec<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<Vec<T>> {
+        (**self).sql_query_vec(sql, params, f)
+    }
+    fn sql_last_insert_rowid(&self) -> i64 {
+        (**self).sql_last_insert_rowid()
+    }
+    fn sql_changes(&self) -> u64 {
+        (**self).sql_changes()
+    }
+}
+impl StoreConn for &Transaction<'_> {
+    fn sql_execute(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize> {
+        (**self).sql_execute(sql, params)
+    }
+    fn sql_execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+        (**self).sql_execute_batch(sql)
+    }
+    fn sql_query_row<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        (**self).sql_query_row(sql, params, f)
+    }
+    fn sql_query_vec<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<Vec<T>> {
+        (**self).sql_query_vec(sql, params, f)
+    }
+    fn sql_last_insert_rowid(&self) -> i64 {
+        (**self).sql_last_insert_rowid()
+    }
+    fn sql_changes(&self) -> u64 {
+        (**self).sql_changes()
+    }
+}
+
+impl<'t> StoreConn for WriteTxn<'t> {
+    fn sql_execute(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize> {
+        self.tx.execute(sql, params)
+    }
+    fn sql_execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+        self.tx.execute_batch(sql)
+    }
+    fn sql_query_row<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        self.tx.query_row(sql, params, |r| f(r))
+    }
+    fn sql_query_vec<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<Vec<T>> {
+        let mut stmt = self.tx.prepare(sql)?;
+        stmt.query_map(params, |r| f(r))?.collect()
+    }
+    fn sql_last_insert_rowid(&self) -> i64 {
+        self.tx.last_insert_rowid()
+    }
+    fn sql_changes(&self) -> u64 {
+        self.tx.changes()
     }
 }
 
 /// The restricted write facade handed to a business callback. Wraps the
-/// live `Transaction`; exposes only DML/read and owner-managed savepoints —
-/// never `commit`/`rollback`/tx-control, and never a `Connection` or
-/// `Transaction` borrow that outlives the closure.
-pub(super) struct WriteTxn<'t> {
+/// live `Transaction`; exposes only DML/read and owner-managed savepoints
+/// — never `commit`/`rollback`/tx-boundary, and never a `Connection` or
+/// `Transaction` borrow that outlives the closure. `rusqlite`-typed
+/// methods preserve the raw error so callers classify a BUSY/constraint
+/// at the source; the crate-`Error` variants flatten for prose callers.
+pub(crate) struct WriteTxn<'t> {
     tx: &'t Transaction<'t>,
+    /// The shared arm/phase cells — carried so `savepoint` can open the
+    /// owner's `TxControl` window. `'t`-bound; never escape the closure.
+    state: &'t GuardState,
 }
 
 impl<'t> WriteTxn<'t> {
-    pub(super) fn execute(&self, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
-        self.tx
-            .execute(sql, params)
-            .map_err(|e| Error::internal(e.to_string()))
+
+    /// Raw-error `execute` — preserves `rusqlite::Error` (BUSY/constraint
+    /// classification survives; the crate `Error` would flatten it).
+    pub(crate) fn execute_raw(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> rusqlite::Result<usize> {
+        self.tx.execute(sql, params)
+    }
+    pub(crate) fn execute(&self, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
+        self.execute_raw(sql, params).map_err(Into::into)
     }
     /// DML batch on the live tx — the authorizer still denies any
-    /// tx-boundary/DDL the batch tries to sneak in.
-    pub(super) fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.tx
-            .execute_batch(sql)
-            .map_err(|e| Error::internal(e.to_string()))
+    /// tx-boundary/DDL the batch tries to sneak in (a `COMMIT`/`BEGIN`
+    /// inside `sql` is denied at `phase=Callback`).
+    pub(crate) fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.tx.execute_batch(sql).map_err(Into::into)
     }
-    pub(super) fn query_row<T>(
+    /// Raw-error `execute_batch` for callers that classify sqlite errors.
+    pub(crate) fn execute_batch_raw(&self, sql: &str) -> rusqlite::Result<()> {
+        self.tx.execute_batch(sql)
+    }
+    pub(crate) fn query_row<T>(
         &self,
         sql: &str,
         params: impl rusqlite::Params,
         f: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     ) -> Result<T> {
-        self.tx
-            .query_row(sql, params, f)
-            .map_err(|e| Error::internal(e.to_string()))
+        self.query_row_raw(sql, params, f).map_err(Into::into)
     }
-    /// A `'t`-bound statement — cannot escape the closure.
-    #[allow(dead_code)]
-    pub(super) fn prepare<'s>(&'s self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'s>>
+    /// Raw-error `query_row` — keeps `QueryReturnedNoRows`/BUSY intact.
+    pub(crate) fn query_row_raw<T>(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+        f: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        self.tx.query_row(sql, params, f)
+    }
+    /// `'t`-bound prepared statement — cannot escape the closure
+    /// (`'t`-bound; `R: 'static` forbids returning it).
+    pub(crate) fn prepare<'s>(&'s self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'s>>
     where
         't: 's,
     {
         self.tx.prepare(sql)
+    }
+    /// `query_map` returning the mapped iterator — `'s`-bound to the
+    /// statement, which is `'t`-bound to the closure.
+    pub(crate) fn query_map<T>(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<Vec<T>> {
+        let mut stmt = self.tx.prepare(sql)?;
+        let rows = stmt.query_map(params, f)?;
+        rows.collect()
+    }
+    /// Rowid of the last successful insert on this tx's connection.
+    pub(crate) fn last_insert_rowid(&self) -> i64 {
+        self.tx.last_insert_rowid()
+    }
+    /// Rows touched by the most recent DML on this tx's connection.
+    pub(crate) fn changes(&self) -> u64 {
+        self.tx.changes()
+    }
+    /// `PRAGMA` query inside the tx (read-form only reaches the
+    /// authorizer; a write-form pragma is denied at `phase=Callback`).
+    pub(crate) fn pragma_query_value<T>(
+        &self,
+        pragma: &str,
+        f: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        self.tx
+            .pragma_query_value(None, pragma, f)
+    }
+    /// An owner-scoped savepoint for a nested sub-batch — the guard
+    /// issues `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` inside its own
+    /// `TxControl` window, so a business callback never reaches a tx
+    /// boundary itself. `f` returns the sub-batch result; on `Err` the
+    /// savepoint is rolled back and released, on `Ok` released.
+    pub(crate) fn savepoint<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        let state = self.state;
+        // The name is fixed and guard-owned — the authorizer consults
+        // `phase`, not the name, so a business callback still cannot
+        // issue a boundary; this path is the owner acting on its behalf.
+        let name = "cadence_sp";
+        {
+            let _ctrl = ControlPhase::enter(state);
+            self.tx.execute_batch(&format!("SAVEPOINT {name}"))?;
+        }
+        match f() {
+            Ok(v) => {
+                let _ctrl = ControlPhase::enter(state);
+                self.tx
+                    .execute_batch(&format!("RELEASE {name}"))
+                    .map_err(Error::from)?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ctrl = ControlPhase::enter(state);
+                let _ = self
+                    .tx
+                    .execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"));
+                Err(e)
+            }
+        }
     }
 }
 

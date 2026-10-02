@@ -2022,7 +2022,15 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// CAD-1011: rollout sibling-writers must not mutate a durable-sealed
+/// `cadence.sqlite3`. Before opening for write, run the same read-only
+/// closure-latch preflight the `Store` open path runs — a latched
+/// (sealed or open-latch) file refuses; a latch-absent legacy db may
+/// proceed. This keeps a rollout `connect`/`immediate`/`connect_ensured`
+/// from silently writing a protected store through an unguarded
+/// `Connection`.
 fn connect(path: &Path) -> Result<Connection> {
+    crate::store::preflight_writer_guard(path)?;
     let conn = Connection::open(path)?;
     conn.busy_timeout(store::BUSY_TIMEOUT)?;
     Ok(conn)

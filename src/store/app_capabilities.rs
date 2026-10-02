@@ -26,7 +26,7 @@ pub const ASSET_BYTES: usize = 2 * 1024 * 1024;
 /// Return the exact immutable asset and its complete provider receipt. This
 /// works inside a finishing/release SQL transaction, so neither review nor
 /// release can observe a different row between the proof and byte read.
-pub(crate) fn asset_material_in(conn: &Connection, id: &str) -> Result<(Value, Vec<u8>)> {
+pub(crate) fn asset_material_in(conn: &dyn super::StoreConn, id: &str) -> Result<(Value, Vec<u8>)> {
     let row = conn
         .query_row(
             "SELECT run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,
@@ -144,56 +144,57 @@ impl Store {
             input_digest,
             call_id,
         } = claim;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let active: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id
-             JOIN messages m ON m.id=s.message_id WHERE s.run_id=? AND s.step_id=?
-             AND s.message_id=? AND s.state='dispatched' AND r.state='running'
-             AND r.approved_digest=r.snapshot_digest AND m.state='running' AND m.turn_id=?)",
-            params![run, step, message, turn],
-            |r| r.get(0),
-        )?;
-        if !active {
-            return Err(Error::rejected(
-                "app capability needs its active assigned turn",
-            ));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let active: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id
+                         JOIN messages m ON m.id=s.message_id WHERE s.run_id=? AND s.step_id=?
+                         AND s.message_id=? AND s.state='dispatched' AND r.state='running'
+                         AND r.approved_digest=r.snapshot_digest AND m.state='running' AND m.turn_id=?)",
+                        params![run, step, message, turn],
+                        |r| r.get(0),
+                    )?;
+                    if !active {
+                        return Err(Error::rejected(
+                            "app capability needs its active assigned turn",
+                        ));
+                    }
+                    tx.execute(
+                        "INSERT OR IGNORE INTO app_capability_claims VALUES(?,?,?,?,?,?,?,?)",
+                        params![
+                            run,
+                            slot,
+                            step,
+                            request,
+                            binding_digest,
+                            input_digest,
+                            call_id,
+                            now()
+                        ],
+                    )?;
+                    let existing: (String, String, String, String, String) = tx.query_row(
+                        "SELECT step_id,request_id,binding_digest,input_digest,call_id
+                         FROM app_capability_claims WHERE run_id=? AND slot=?",
+                        params![run, slot],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                    )?;
+                    if existing
+                        != (
+                            step.into(),
+                            request.into(),
+                            binding_digest.into(),
+                            input_digest.into(),
+                            call_id.into(),
+                        )
+                    {
+                        return Err(Error::rejected(
+                            "approved run capability slot already claimed another operation",
+                        ));
+                    }
+                    Ok(())
+        });
         }
-        tx.execute(
-            "INSERT OR IGNORE INTO app_capability_claims VALUES(?,?,?,?,?,?,?,?)",
-            params![
-                run,
-                slot,
-                step,
-                request,
-                binding_digest,
-                input_digest,
-                call_id,
-                now()
-            ],
-        )?;
-        let existing: (String, String, String, String, String) = tx.query_row(
-            "SELECT step_id,request_id,binding_digest,input_digest,call_id
-             FROM app_capability_claims WHERE run_id=? AND slot=?",
-            params![run, slot],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )?;
-        if existing
-            != (
-                step.into(),
-                request.into(),
-                binding_digest.into(),
-                input_digest.into(),
-                call_id.into(),
-            )
-        {
-            return Err(Error::rejected(
-                "approved run capability slot already claimed another operation",
-            ));
-        }
-        tx.commit()?;
-        Ok(())
-    }
 
     pub(crate) fn app_selected_source_input(
         &self,
@@ -317,90 +318,90 @@ impl Store {
             "asset":asset.map(|(kind,bytes)|json!({"media_type":kind,
                 "digest":app_runs::artifact_digest(bytes),"size":bytes.len()}))
         }));
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let active: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id
-             JOIN messages m ON m.id=s.message_id WHERE s.run_id=? AND s.step_id=?
-             AND s.message_id=? AND s.state='dispatched' AND r.state='running'
-             AND r.approved_digest=r.snapshot_digest AND m.state='running' AND m.turn_id=?)",
-            params![run, step, message, turn],
-            |r| r.get(0),
-        )?;
-        if !active {
-            return Err(Error::rejected(
-                "app capability turn ended before result was recorded",
-            ));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let active: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id
+                         JOIN messages m ON m.id=s.message_id WHERE s.run_id=? AND s.step_id=?
+                         AND s.message_id=? AND s.state='dispatched' AND r.state='running'
+                         AND r.approved_digest=r.snapshot_digest AND m.state='running' AND m.turn_id=?)",
+                        params![run, step, message, turn],
+                        |r| r.get(0),
+                    )?;
+                    if !active {
+                        return Err(Error::rejected(
+                            "app capability turn ended before result was recorded",
+                        ));
+                    }
+                    let claimed: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM app_capability_claims WHERE run_id=? AND slot=?
+                         AND step_id=? AND request_id=? AND binding_digest=? AND input_digest=? AND call_id=?)",
+                        params![run, slot, step, request, binding_digest, input_digest, id],
+                        |r| r.get(0),
+                    )?;
+                    if !claimed {
+                        return Err(Error::rejected(
+                            "app capability result has no matching pre-call claim",
+                        ));
+                    }
+                    let existing = tx.query_row(
+                        "SELECT id,step_id,request_id,binding_digest,input_digest FROM app_capability_results WHERE run_id=? AND slot=?",
+                        params![run,slot],
+                        |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)),
+                    ).optional()?;
+                    if let Some((
+                        existing_id,
+                        existing_step,
+                        existing_request,
+                        existing_binding,
+                        existing_input,
+                    )) = existing
+                    {
+                        if existing_step != step
+                            || existing_request != request
+                            || existing_binding != binding_digest
+                            || existing_input != input_digest
+                        {
+                            return Err(Error::rejected(
+                                "approved run capability slot already has its one result",
+                            ));
+                        }
+                        drop(conn);
+                        return self.app_capability_result(&existing_id);
+                    }
+                    tx.execute(
+                        "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,
+                            request_id,binding_digest,input_digest,result,result_digest,asset_type,
+                            asset_digest,asset,created,receipt_schema) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,2)",
+                        params![
+                            id,
+                            run,
+                            step,
+                            message,
+                            turn,
+                            slot,
+                            request,
+                            binding_digest,
+                            input_digest,
+                            String::from_utf8(serialized).map_err(|_| Error::internal("result encoding"))?,
+                            digest,
+                            asset.map(|(kind, _)| kind),
+                            asset_digest,
+                            asset.map(|(_, bytes)| bytes),
+                            now()
+                        ],
+                    )?;
+                    Self::event(
+                        &tx,
+                        Self::DAEMON_STREAM,
+                        "app_capability_result_recorded",
+                        json!({"run_id":run,"step_id":step,"slot":slot,"receipt_id":id,"digest":digest}),
+                    )?;
+                    drop(conn);
+                    self.app_capability_result(id)
+        });
         }
-        let claimed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM app_capability_claims WHERE run_id=? AND slot=?
-             AND step_id=? AND request_id=? AND binding_digest=? AND input_digest=? AND call_id=?)",
-            params![run, slot, step, request, binding_digest, input_digest, id],
-            |r| r.get(0),
-        )?;
-        if !claimed {
-            return Err(Error::rejected(
-                "app capability result has no matching pre-call claim",
-            ));
-        }
-        let existing = tx.query_row(
-            "SELECT id,step_id,request_id,binding_digest,input_digest FROM app_capability_results WHERE run_id=? AND slot=?",
-            params![run,slot],
-            |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)),
-        ).optional()?;
-        if let Some((
-            existing_id,
-            existing_step,
-            existing_request,
-            existing_binding,
-            existing_input,
-        )) = existing
-        {
-            if existing_step != step
-                || existing_request != request
-                || existing_binding != binding_digest
-                || existing_input != input_digest
-            {
-                return Err(Error::rejected(
-                    "approved run capability slot already has its one result",
-                ));
-            }
-            tx.commit()?;
-            drop(conn);
-            return self.app_capability_result(&existing_id);
-        }
-        tx.execute(
-            "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,
-                request_id,binding_digest,input_digest,result,result_digest,asset_type,
-                asset_digest,asset,created,receipt_schema) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,2)",
-            params![
-                id,
-                run,
-                step,
-                message,
-                turn,
-                slot,
-                request,
-                binding_digest,
-                input_digest,
-                String::from_utf8(serialized).map_err(|_| Error::internal("result encoding"))?,
-                digest,
-                asset.map(|(kind, _)| kind),
-                asset_digest,
-                asset.map(|(_, bytes)| bytes),
-                now()
-            ],
-        )?;
-        Self::event(
-            &tx,
-            Self::DAEMON_STREAM,
-            "app_capability_result_recorded",
-            json!({"run_id":run,"step_id":step,"slot":slot,"receipt_id":id,"digest":digest}),
-        )?;
-        tx.commit()?;
-        drop(conn);
-        self.app_capability_result(id)
-    }
 
     pub(crate) fn app_capability_result(&self, id: &str) -> Result<Value> {
         let conn = self.conn();
@@ -472,7 +473,7 @@ impl Store {
 /// caller must still verify the current installation/context and binding in
 /// the run-creation transaction before freezing a selected post.
 pub(super) fn source_receipt_recoverable_in(
-    conn: &Connection,
+    conn: &dyn super::StoreConn,
     run: &Value,
     receipt: &Value,
 ) -> Result<()> {

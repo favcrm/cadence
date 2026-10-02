@@ -653,7 +653,7 @@ impl RecordStore {
         }
     }
 
-    fn history_in(conn: &Connection, context: &str, id: &str) -> rusqlite::Result<Vec<Value>> {
+    fn history_in(conn: &dyn super::StoreConn, context: &str, id: &str) -> rusqlite::Result<Vec<Value>> {
         let mut stmt = conn.prepare(
             "SELECT revision,body_digest,actor,at FROM app_record_revisions WHERE context_id=? AND record_id=? ORDER BY revision",
         )?;
@@ -663,7 +663,7 @@ impl RecordStore {
         rows.collect()
     }
 
-    fn ids_in(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<Vec<String>> {
+    fn ids_in(conn: &dyn super::StoreConn, sql: &str, params: impl rusqlite::Params) -> Result<Vec<String>> {
         conn.prepare(sql)
             .map_err(|e| Error::internal(e.to_string()))?
             .query_map(params, |r| r.get::<_, String>(0))
@@ -672,7 +672,7 @@ impl RecordStore {
             .map_err(|e| Error::internal(e.to_string()))
     }
 
-    fn consent_history_in(conn: &Connection, context: &str, id: &str) -> rusqlite::Result<Value> {
+    fn consent_history_in(conn: &dyn super::StoreConn, context: &str, id: &str) -> rusqlite::Result<Value> {
         // Per-channel consent transitions derived from the attributed
         // revision bodies: each entry names the revision, channel,
         // resulting state, actor and time. Unparseable bodies are
@@ -712,7 +712,7 @@ impl RecordStore {
         Ok(Value::Array(history))
     }
 
-    fn show_in(&self, conn: &Connection, context: &str, id: &str) -> Result<Value> {
+    fn show_in(&self, conn: &dyn super::StoreConn, context: &str, id: &str) -> Result<Value> {
         let (revision, kind, body, digest): (i64, String, String, String) = conn
             .query_row(
                 "SELECT revision,kind,body,body_digest FROM app_records WHERE context_id=? AND id=?",
@@ -1351,7 +1351,7 @@ impl RecordStore {
     }
 
     fn import_receipt_in(
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         request_id: &str,
     ) -> Result<Option<(String, String, String, String)>> {
         conn.query_row(
@@ -1393,7 +1393,7 @@ impl RecordStore {
     /// duplicate and revision comparison; writes nothing.
     fn plan_csv_in(
         &self,
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         context: &str,
         csv_text: &str,
     ) -> Result<(String, Vec<PlanRow>)> {

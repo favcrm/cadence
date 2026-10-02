@@ -181,7 +181,7 @@ fn parse_json_cell(cell: Option<String>, what: &str) -> Result<Option<Value>> {
         .map_err(|_| Error::rejected(format!("social publish {what} is corrupt")))
 }
 
-fn read_row(conn: &Connection, intent_id: &str) -> Result<Value> {
+fn read_row(conn: &dyn super::StoreConn, intent_id: &str) -> Result<Value> {
     let row: (
         String,
         String,
@@ -239,79 +239,80 @@ impl Store {
         crate::proto::identifier(row.request_id, "social publish request id")?;
         let frozen = frozen_of(row);
         let digest = app_runs::material_digest(&frozen);
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        if let Some(existing) = tx
-            .query_row(
-                "SELECT intent_id,request,state,frozen,frozen_digest,receipt,upstream FROM social_publish_intents WHERE request=?",
-                [&request],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                        r.get::<_, Option<String>>(6)?,
-                    ))
-                },
-            )
-            .optional()?
-        {
-            if existing.4 != digest {
-                return Err(Error::rejected(
-                    "social publish request already names different frozen content",
-                ));
-            }
-            let frozen_value: Value = serde_json::from_str(&existing.3)?;
-            let receipt = parse_json_cell(existing.5, "receipt")?;
-            let upstream = parse_json_cell(existing.6, "upstream evidence")?;
-            tx.commit()?;
-            return Ok(envelope(
-                &existing.0,
-                &existing.1,
-                &existing.2,
-                &frozen_value,
-                &existing.4,
-                receipt.as_ref(),
-                upstream.as_ref(),
-            ));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    if let Some(existing) = tx
+                        .query_row(
+                            "SELECT intent_id,request,state,frozen,frozen_digest,receipt,upstream FROM social_publish_intents WHERE request=?",
+                            [&request],
+                            |r| {
+                                Ok((
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, String>(1)?,
+                                    r.get::<_, String>(2)?,
+                                    r.get::<_, String>(3)?,
+                                    r.get::<_, String>(4)?,
+                                    r.get::<_, Option<String>>(5)?,
+                                    r.get::<_, Option<String>>(6)?,
+                                ))
+                            },
+                        )
+                        .optional()?
+                    {
+                        if existing.4 != digest {
+                            return Err(Error::rejected(
+                                "social publish request already names different frozen content",
+                            ));
+                        }
+                        let frozen_value: Value = serde_json::from_str(&existing.3)?;
+                        let receipt = parse_json_cell(existing.5, "receipt")?;
+                        let upstream = parse_json_cell(existing.6, "upstream evidence")?;
+                        return Ok(envelope(
+                            &existing.0,
+                            &existing.1,
+                            &existing.2,
+                            &frozen_value,
+                            &existing.4,
+                            receipt.as_ref(),
+                            upstream.as_ref(),
+                        ));
+                    }
+                    let intent_id = format!("spub-{}", uuid::Uuid::new_v4().simple());
+                    tx.execute("INSERT INTO social_publish_intents(intent_id,request,install_id,context_id,run_id,effect_id,connection_id,destination_id,toolkit,caption_digest,image_digest,media_key,grant_id,approval_id,due_epoch,timezone,state,frozen,frozen_digest,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?,?)",
+                        params![intent_id,request,row.install_id,row.context_id,row.run_id,row.effect_id,row.connection_id,row.destination_id,row.toolkit,row.caption_digest,row.image_digest,row.media_key,row.grant_id,row.approval_id,row.due_epoch,row.timezone,frozen.to_string(),digest,now(),now()])?;
+                    Self::event(
+                        &tx,
+                        platform::PLATFORM_STREAM,
+                        SOCIAL_PUBLISH_SCHEDULED_EVENT,
+                        json!({"intent_id":intent_id,"request":request,"digest":digest}),
+                    )?;
+                    let result = read_row(&tx, &intent_id)?;
+                    Ok(result)
+        });
         }
-        let intent_id = format!("spub-{}", uuid::Uuid::new_v4().simple());
-        tx.execute("INSERT INTO social_publish_intents(intent_id,request,install_id,context_id,run_id,effect_id,connection_id,destination_id,toolkit,caption_digest,image_digest,media_key,grant_id,approval_id,due_epoch,timezone,state,frozen,frozen_digest,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?,?)",
-            params![intent_id,request,row.install_id,row.context_id,row.run_id,row.effect_id,row.connection_id,row.destination_id,row.toolkit,row.caption_digest,row.image_digest,row.media_key,row.grant_id,row.approval_id,row.due_epoch,row.timezone,frozen.to_string(),digest,now(),now()])?;
-        Self::event(
-            &tx,
-            platform::PLATFORM_STREAM,
-            SOCIAL_PUBLISH_SCHEDULED_EVENT,
-            json!({"intent_id":intent_id,"request":request,"digest":digest}),
-        )?;
-        let result = read_row(&tx, &intent_id)?;
-        tx.commit()?;
-        Ok(result)
-    }
 
     /// Operator cancellation before dispatch. Any other state refuses.
     pub fn social_publish_cancel(&self, intent_id: &str) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let changed = tx.execute("UPDATE social_publish_intents SET state='cancelled',updated=? WHERE intent_id=? AND state='queued'",params![now(),intent_id])?;
-        if changed != 1 {
-            return Err(Error::rejected(
-                "only a queued social publish intent can be cancelled",
-            ));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let changed = tx.execute("UPDATE social_publish_intents SET state='cancelled',updated=? WHERE intent_id=? AND state='queued'",params![now(),intent_id])?;
+                    if changed != 1 {
+                        return Err(Error::rejected(
+                            "only a queued social publish intent can be cancelled",
+                        ));
+                    }
+                    Self::event(
+                        &tx,
+                        platform::PLATFORM_STREAM,
+                        SOCIAL_PUBLISH_CANCELLED_EVENT,
+                        json!({"intent_id":intent_id}),
+                    )?;
+                    let result = read_row(&tx, intent_id)?;
+                    Ok(result)
+        });
         }
-        Self::event(
-            &tx,
-            platform::PLATFORM_STREAM,
-            SOCIAL_PUBLISH_CANCELLED_EVENT,
-            json!({"intent_id":intent_id}),
-        )?;
-        let result = read_row(&tx, intent_id)?;
-        tx.commit()?;
-        Ok(result)
-    }
 
     pub fn social_publish_show(&self, intent_id: &str) -> Result<Value> {
         read_row(&self.conn(), intent_id)
@@ -325,34 +326,38 @@ impl Store {
         if context.is_some() && install.is_none() {
             return Err(Error::rejected("context filter requires installation"));
         }
-        let conn = self.write_conn()?;
-        let mut stmt = conn.prepare("SELECT intent_id FROM social_publish_intents WHERE (? IS NULL OR install_id=?) AND (? IS NULL OR context_id=?) ORDER BY intent_id LIMIT 100")?;
-        let ids = stmt
-            .query_map(params![install, install, context, context], |r| {
-                r.get::<_, String>(0)
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut list = Vec::new();
-        for id in ids {
-            list.push(read_row(&conn, &id)?["intent"].clone());
+        return self.write_tx(|conn| {
+
+                    let mut stmt = conn.prepare("SELECT intent_id FROM social_publish_intents WHERE (? IS NULL OR install_id=?) AND (? IS NULL OR context_id=?) ORDER BY intent_id LIMIT 100")?;
+                    let ids = stmt
+                        .query_map(params![install, install, context, context], |r| {
+                            r.get::<_, String>(0)
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    let mut list = Vec::new();
+                    for id in ids {
+                        list.push(read_row(&conn, &id)?["intent"].clone());
+                    }
+                    Ok(json!({"intents":list}))
+        });
         }
-        Ok(json!({"intents":list}))
-    }
 
     /// Peek the oldest due queued intent without claiming. The dispatch
     /// RPC uses it to compare operator-supplied current authority against
     /// frozen before claiming; the claim itself re-verifies in-transaction.
     pub(crate) fn social_publish_peek_due(&self, now_epoch: i64) -> Result<Option<Value>> {
-        let conn = self.write_conn()?;
-        let next: Option<String> = conn
-            .query_row(
-                "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=? ORDER BY due_epoch,intent_id LIMIT 1",
-                [now_epoch],
-                |r| r.get(0),
-            )
-            .optional()?;
-        next.map(|id| read_row(&conn, &id)).transpose()
-    }
+        return self.write_tx(|conn| {
+
+                    let next: Option<String> = conn
+                        .query_row(
+                            "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=? ORDER BY due_epoch,intent_id LIMIT 1",
+                            [now_epoch],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    next.map(|id| read_row(&conn, &id)).transpose()
+        });
+        }
 
     /// Re-prove approved material at dispatch for artifact-frozen intents.
     /// Reloads publication material (refuses stale binding or changed
@@ -402,43 +407,42 @@ impl Store {
     where
         F: FnOnce(&Connection, &Value) -> Result<bool>,
     {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let next: Option<String> = tx
-            .query_row(
-                "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=? ORDER BY due_epoch,intent_id LIMIT 1",
-                [now_epoch],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(id) = next else {
-            return Ok(None);
-        };
-        let frozen_text: String = tx.query_row(
-            "SELECT frozen FROM social_publish_intents WHERE intent_id=?",
-            [&id],
-            |r| r.get(0),
-        )?;
-        let frozen: Value = serde_json::from_str(&frozen_text)?;
-        if !eligible(&tx, &frozen)? {
-            tx.commit()?;
-            return Ok(None);
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let next: Option<String> = tx
+                        .query_row(
+                            "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=? ORDER BY due_epoch,intent_id LIMIT 1",
+                            [now_epoch],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let Some(id) = next else {
+                        return Ok(None);
+                    };
+                    let frozen_text: String = tx.query_row(
+                        "SELECT frozen FROM social_publish_intents WHERE intent_id=?",
+                        [&id],
+                        |r| r.get(0),
+                    )?;
+                    let frozen: Value = serde_json::from_str(&frozen_text)?;
+                    if !eligible(&tx, &frozen)? {
+                        return Ok(None);
+                    }
+                    let changed = tx.execute("UPDATE social_publish_intents SET state='processing',updated=? WHERE intent_id=? AND state='queued'",params![now(),id])?;
+                    if changed != 1 {
+                        return Ok(None);
+                    }
+                    Self::event(
+                        &tx,
+                        platform::PLATFORM_STREAM,
+                        SOCIAL_PUBLISH_CLAIMED_EVENT,
+                        json!({"intent_id":id}),
+                    )?;
+                    let result = read_row(&tx, &id)?;
+                    Ok(Some(result))
+        });
         }
-        let changed = tx.execute("UPDATE social_publish_intents SET state='processing',updated=? WHERE intent_id=? AND state='queued'",params![now(),id])?;
-        if changed != 1 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        Self::event(
-            &tx,
-            platform::PLATFORM_STREAM,
-            SOCIAL_PUBLISH_CLAIMED_EVENT,
-            json!({"intent_id":id}),
-        )?;
-        let result = read_row(&tx, &id)?;
-        tx.commit()?;
-        Ok(Some(result))
-    }
 
     /// Persist daemon-observed dispatch evidence on a processing intent.
     /// The evidence must carry the provider's exact binding plus its
@@ -474,35 +478,36 @@ impl Store {
                 "dispatch evidence must carry state, ids and an opaque-or-absent payload",
             ));
         }
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let frozen_text: Option<String> = tx
-            .query_row(
-                "SELECT frozen FROM social_publish_intents WHERE intent_id=? AND state='processing'",
-                [intent_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let frozen_text = frozen_text
-            .ok_or_else(|| Error::rejected("social publish intent is not processing"))?;
-        let frozen: Value = serde_json::from_str(&frozen_text)?;
-        let field = |doc: &Value, name: &str| doc.get(name).cloned().unwrap_or(Value::Null);
-        if field(evidence, "destination_id") != field(&frozen, "destination_id")
-            || field(evidence, "caption_digest") != field(&frozen, "caption_digest")
-            || field(evidence, "image_digest") != field(&frozen, "image_digest")
-        {
-            return Err(Error::rejected(
-                "dispatch evidence does not match the frozen intent",
-            ));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let frozen_text: Option<String> = tx
+                        .query_row(
+                            "SELECT frozen FROM social_publish_intents WHERE intent_id=? AND state='processing'",
+                            [intent_id],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let frozen_text = frozen_text
+                        .ok_or_else(|| Error::rejected("social publish intent is not processing"))?;
+                    let frozen: Value = serde_json::from_str(&frozen_text)?;
+                    let field = |doc: &Value, name: &str| doc.get(name).cloned().unwrap_or(Value::Null);
+                    if field(evidence, "destination_id") != field(&frozen, "destination_id")
+                        || field(evidence, "caption_digest") != field(&frozen, "caption_digest")
+                        || field(evidence, "image_digest") != field(&frozen, "image_digest")
+                    {
+                        return Err(Error::rejected(
+                            "dispatch evidence does not match the frozen intent",
+                        ));
+                    }
+                    let changed = tx.execute("UPDATE social_publish_intents SET upstream=?1,updated=?2 WHERE intent_id=?3 AND state='processing'",params![evidence.to_string(),now(),intent_id])?;
+                    if changed != 1 {
+                        return Err(Error::rejected("social publish intent is not processing"));
+                    }
+                    let result = read_row(&tx, intent_id)?;
+                    Ok(result)
+        });
         }
-        let changed = tx.execute("UPDATE social_publish_intents SET upstream=?1,updated=?2 WHERE intent_id=?3 AND state='processing'",params![evidence.to_string(),now(),intent_id])?;
-        if changed != 1 {
-            return Err(Error::rejected("social publish intent is not processing"));
-        }
-        let result = read_row(&tx, intent_id)?;
-        tx.commit()?;
-        Ok(result)
-    }
 
     /// Record the dispatch outcome. `posted` requires a verified
     /// permalink/receipt (a bare success string is refused) AND a receipt
@@ -559,83 +564,84 @@ impl Store {
                 ));
             }
         };
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        if state == "posted" {
-            let row: Option<(String, Option<String>)> = tx
-                .query_row(
-                    "SELECT frozen,upstream FROM social_publish_intents WHERE intent_id=? AND state='processing'",
-                    [intent_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let (frozen_text, upstream_text) =
-                row.ok_or_else(|| Error::rejected("social publish intent is not processing"))?;
-            let frozen: Value = serde_json::from_str(&frozen_text)?;
-            let receipt_digest = |field: &str| receipt.get(field).unwrap_or(&Value::Null);
-            let frozen_digest = |field: &str| frozen.get(field).unwrap_or(&Value::Null);
-            if receipt_digest("destination_id") != frozen_digest("destination_id")
-                || receipt_digest("caption_digest") != frozen_digest("caption_digest")
-                || receipt_digest("image_digest") != frozen_digest("image_digest")
-            {
-                return Err(Error::rejected(
-                    "posted receipt does not match the frozen intent",
-                ));
-            }
-            // Trusted upstream verification: the reported payload must be
-            // byte-exact the bytes the daemon itself observed at dispatch.
-            // A forged receipt with matching binding fields but fabricated
-            // evidence fails closed here, and the intent stays processing.
-            let upstream: Value = upstream_text
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()
-                .map_err(|_| Error::rejected("social publish upstream evidence is corrupt"))?
-                .ok_or_else(|| {
-                    Error::rejected(
-                        "no trusted upstream evidence; reconcile before reporting posted",
-                    )
-                })?;
-            // Full receipt-to-outcome equality: payload-only comparison
-            // lets a copied payload with forged permalink or IDs pass.
-            // Every reported field must equal the daemon-observed outcome,
-            // and the outcome's own binding must equal frozen (defense in
-            // depth with the persistence-time check: no foreign evidence
-            // can satisfy a posted report).
-            let upstream_field = |name: &str| upstream.get(name).unwrap_or(&Value::Null);
-            if upstream["state"] != "posted"
-                || upstream_field("destination_id") != frozen_digest("destination_id")
-                || upstream_field("caption_digest") != frozen_digest("caption_digest")
-                || upstream_field("image_digest") != frozen_digest("image_digest")
-                || receipt["permalink"] != upstream["permalink"]
-                || receipt["provider_ids"] != upstream["provider_ids"]
-                || receipt_digest("destination_id") != frozen_digest("destination_id")
-                || receipt_digest("caption_digest") != frozen_digest("caption_digest")
-                || receipt_digest("image_digest") != frozen_digest("image_digest")
-                || receipt["provider_payload"].as_str() != upstream["provider_payload"].as_str()
-                || upstream["provider_payload"]
-                    .as_str()
-                    .is_none_or(str::is_empty)
-            {
-                return Err(Error::rejected(
-                    "posted receipt evidence does not match trusted upstream evidence",
-                ));
-            }
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    if state == "posted" {
+                        let row: Option<(String, Option<String>)> = tx
+                            .query_row(
+                                "SELECT frozen,upstream FROM social_publish_intents WHERE intent_id=? AND state='processing'",
+                                [intent_id],
+                                |r| Ok((r.get(0)?, r.get(1)?)),
+                            )
+                            .optional()?;
+                        let (frozen_text, upstream_text) =
+                            row.ok_or_else(|| Error::rejected("social publish intent is not processing"))?;
+                        let frozen: Value = serde_json::from_str(&frozen_text)?;
+                        let receipt_digest = |field: &str| receipt.get(field).unwrap_or(&Value::Null);
+                        let frozen_digest = |field: &str| frozen.get(field).unwrap_or(&Value::Null);
+                        if receipt_digest("destination_id") != frozen_digest("destination_id")
+                            || receipt_digest("caption_digest") != frozen_digest("caption_digest")
+                            || receipt_digest("image_digest") != frozen_digest("image_digest")
+                        {
+                            return Err(Error::rejected(
+                                "posted receipt does not match the frozen intent",
+                            ));
+                        }
+                        // Trusted upstream verification: the reported payload must be
+                        // byte-exact the bytes the daemon itself observed at dispatch.
+                        // A forged receipt with matching binding fields but fabricated
+                        // evidence fails closed here, and the intent stays processing.
+                        let upstream: Value = upstream_text
+                            .as_deref()
+                            .map(serde_json::from_str)
+                            .transpose()
+                            .map_err(|_| Error::rejected("social publish upstream evidence is corrupt"))?
+                            .ok_or_else(|| {
+                                Error::rejected(
+                                    "no trusted upstream evidence; reconcile before reporting posted",
+                                )
+                            })?;
+                        // Full receipt-to-outcome equality: payload-only comparison
+                        // lets a copied payload with forged permalink or IDs pass.
+                        // Every reported field must equal the daemon-observed outcome,
+                        // and the outcome's own binding must equal frozen (defense in
+                        // depth with the persistence-time check: no foreign evidence
+                        // can satisfy a posted report).
+                        let upstream_field = |name: &str| upstream.get(name).unwrap_or(&Value::Null);
+                        if upstream["state"] != "posted"
+                            || upstream_field("destination_id") != frozen_digest("destination_id")
+                            || upstream_field("caption_digest") != frozen_digest("caption_digest")
+                            || upstream_field("image_digest") != frozen_digest("image_digest")
+                            || receipt["permalink"] != upstream["permalink"]
+                            || receipt["provider_ids"] != upstream["provider_ids"]
+                            || receipt_digest("destination_id") != frozen_digest("destination_id")
+                            || receipt_digest("caption_digest") != frozen_digest("caption_digest")
+                            || receipt_digest("image_digest") != frozen_digest("image_digest")
+                            || receipt["provider_payload"].as_str() != upstream["provider_payload"].as_str()
+                            || upstream["provider_payload"]
+                                .as_str()
+                                .is_none_or(str::is_empty)
+                        {
+                            return Err(Error::rejected(
+                                "posted receipt evidence does not match trusted upstream evidence",
+                            ));
+                        }
+                    }
+                    let changed = tx.execute("UPDATE social_publish_intents SET state=?1,receipt=?2,updated=?3 WHERE intent_id=?4 AND state='processing'",params![state,receipt.to_string(),now(),intent_id])?;
+                    if changed != 1 {
+                        return Err(Error::rejected("social publish intent is not processing"));
+                    }
+                    Self::event(
+                        &tx,
+                        platform::PLATFORM_STREAM,
+                        SOCIAL_PUBLISH_REPORTED_EVENT,
+                        json!({"intent_id":intent_id,"decision":decision}),
+                    )?;
+                    let result = read_row(&tx, intent_id)?;
+                    Ok(result)
+        });
         }
-        let changed = tx.execute("UPDATE social_publish_intents SET state=?1,receipt=?2,updated=?3 WHERE intent_id=?4 AND state='processing'",params![state,receipt.to_string(),now(),intent_id])?;
-        if changed != 1 {
-            return Err(Error::rejected("social publish intent is not processing"));
-        }
-        Self::event(
-            &tx,
-            platform::PLATFORM_STREAM,
-            SOCIAL_PUBLISH_REPORTED_EVENT,
-            json!({"intent_id":intent_id,"decision":decision}),
-        )?;
-        let result = read_row(&tx, intent_id)?;
-        tx.commit()?;
-        Ok(result)
-    }
 }
 
 /// Strip the `sha256:` prefix Cadence artifact digests carry. The pinned

@@ -818,7 +818,7 @@ struct ResolvedBinding {
 impl RecordStore {
     fn content_row(
         &self,
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         context: &str,
         campaign: &str,
     ) -> Result<Option<ContentRow>> {
@@ -984,7 +984,7 @@ impl RecordStore {
 
     fn draft_at(
         &self,
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         context: &str,
         campaign: &str,
         revision: Option<i64>,
@@ -1056,7 +1056,7 @@ impl RecordStore {
     /// name a saved binding in this installation and context.
     fn resolve_binding(
         &self,
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         context: &str,
         binding_id: Option<&str>,
     ) -> Result<ResolvedBinding> {
@@ -1094,7 +1094,7 @@ impl RecordStore {
 
     fn binding_record(
         &self,
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         context: &str,
         binding_id: &str,
     ) -> Result<BindingRecord> {
@@ -1410,7 +1410,7 @@ impl RecordStore {
 
     fn proposal_row(
         &self,
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         context: &str,
         proposal_id: &str,
     ) -> Result<ProposalRow> {
@@ -1556,7 +1556,7 @@ impl RecordStore {
 
     fn proposal_request_row(
         &self,
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         context: &str,
         request_id: &str,
     ) -> Result<ProposalRequestRow> {
@@ -2006,7 +2006,7 @@ impl RecordStore {
         self.app_content_show(context, campaign)
     }
 
-    fn send_payload(&self, conn: &Connection, prep: &SendPrep) -> Result<Value> {
+    fn send_payload(&self, conn: &dyn super::StoreConn, prep: &SendPrep) -> Result<Value> {
         let context = prep.context;
         let campaign = prep.campaign;
         let kind = prep.kind;

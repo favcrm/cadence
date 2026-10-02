@@ -934,226 +934,227 @@ impl Store {
     /// again. Anything else falls back to the fence below, one
     /// `turn_adopt_refused` event per rejected entry.
     fn recover(&self, marker: Option<&ConsumedMarker>) -> Result<RecoveryOutcome> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        // Store-level qualification of every recorded entry. A refused
-        // entry still lands in the sweep below — the refusal only means
-        // "not protected", never a state skip.
-        let mut kept: Vec<&AdoptEntry> = Vec::new();
-        // Message ids refused in this transaction — the evidence check
-        // below must not read them as unproven.
-        let mut refused: Vec<String> = Vec::new();
-        if let Some(marker) = marker {
-            for e in &marker.entries {
-                let reason = marker.stale.clone().or_else(|| self.adoption_block(&tx, e));
-                match reason {
-                    None => kept.push(e),
-                    Some(reason) => {
-                        Self::event(
-                            &tx,
-                            &e.alias,
-                            "turn_adopt_refused",
-                            json!({"message": e.message_id, "turn_id": e.turn_id,
-                                   "reason": reason}),
-                        )?;
-                        refused.push(e.message_id.clone());
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    // Store-level qualification of every recorded entry. A refused
+                    // entry still lands in the sweep below — the refusal only means
+                    // "not protected", never a state skip.
+                    let mut kept: Vec<&AdoptEntry> = Vec::new();
+                    // Message ids refused in this transaction — the evidence check
+                    // below must not read them as unproven.
+                    let mut refused: Vec<String> = Vec::new();
+                    if let Some(marker) = marker {
+                        for e in &marker.entries {
+                            let reason = marker.stale.clone().or_else(|| self.adoption_block(&tx, e));
+                            match reason {
+                                None => kept.push(e),
+                                Some(reason) => {
+                                    Self::event(
+                                        &tx,
+                                        &e.alias,
+                                        "turn_adopt_refused",
+                                        json!({"message": e.message_id, "turn_id": e.turn_id,
+                                               "reason": reason}),
+                                    )?;
+                                    refused.push(e.message_id.clone());
+                                }
+                            }
+                        }
                     }
-                }
-            }
-        }
-        // One pane proof covers a whole alias list, so every entry in
-        // it must describe the SAME endpoint facts — `shutdown_entries`
-        // writes one tuple per alias, but a hand-built or corrupt
-        // marker can carry divergent records. Refuse the list as a
-        // unit: adopting `entries[0]`'s pane for a sibling recorded
-        // elsewhere would be an unverified open.
-        {
-            let mut by_alias: std::collections::HashMap<&str, Vec<usize>> =
-                std::collections::HashMap::new();
-            for (i, e) in kept.iter().enumerate() {
-                by_alias.entry(e.alias.as_str()).or_default().push(i);
-            }
-            let mut dropped: Vec<usize> = Vec::new();
-            for idxs in by_alias.values() {
-                let first = kept[idxs[0]];
-                let divergent = idxs[1..].iter().any(|&i| {
-                    kept[i].generation != first.generation
-                        || kept[i].pane_pid != first.pane_pid
-                        || kept[i].native_session != first.native_session
-                });
-                if divergent {
-                    dropped.extend_from_slice(idxs);
-                }
-            }
-            if !dropped.is_empty() {
-                dropped.sort_unstable();
-                for i in dropped.into_iter().rev() {
-                    let e = kept.remove(i);
-                    Self::event(
-                        &tx,
-                        &e.alias,
-                        "turn_adopt_refused",
-                        json!({"message": e.message_id, "turn_id": e.turn_id,
-                               "reason": "recorded pane facts disagree across the alias"}),
+                    // One pane proof covers a whole alias list, so every entry in
+                    // it must describe the SAME endpoint facts — `shutdown_entries`
+                    // writes one tuple per alias, but a hand-built or corrupt
+                    // marker can carry divergent records. Refuse the list as a
+                    // unit: adopting `entries[0]`'s pane for a sibling recorded
+                    // elsewhere would be an unverified open.
+                    {
+                        let mut by_alias: std::collections::HashMap<&str, Vec<usize>> =
+                            std::collections::HashMap::new();
+                        for (i, e) in kept.iter().enumerate() {
+                            by_alias.entry(e.alias.as_str()).or_default().push(i);
+                        }
+                        let mut dropped: Vec<usize> = Vec::new();
+                        for idxs in by_alias.values() {
+                            let first = kept[idxs[0]];
+                            let divergent = idxs[1..].iter().any(|&i| {
+                                kept[i].generation != first.generation
+                                    || kept[i].pane_pid != first.pane_pid
+                                    || kept[i].native_session != first.native_session
+                            });
+                            if divergent {
+                                dropped.extend_from_slice(idxs);
+                            }
+                        }
+                        if !dropped.is_empty() {
+                            dropped.sort_unstable();
+                            for i in dropped.into_iter().rev() {
+                                let e = kept.remove(i);
+                                Self::event(
+                                    &tx,
+                                    &e.alias,
+                                    "turn_adopt_refused",
+                                    json!({"message": e.message_id, "turn_id": e.turn_id,
+                                           "reason": "recorded pane facts disagree across the alias"}),
+                                )?;
+                                refused.push(e.message_id.clone());
+                            }
+                        }
+                    }
+                    {
+                        let mut adoptions = self.adoptions.lock().unwrap();
+                        for e in &kept {
+                            adoptions
+                                .entry(e.alias.clone())
+                                .or_default()
+                                .push((*e).clone());
+                        }
+                    }
+                    // CAD-250: a nudge is steering for the moment it was sent — it is
+                    // never replayed into a later daemon's pane.
+                    Self::cancel_nudges_in(&tx, None, "restart", None)?;
+                    // Dynamic NOT IN for the protected message ids — one UPDATE
+                    // either way, never string-interpolated values.
+                    let kept_ids: Vec<String> = kept.iter().map(|e| e.message_id.clone()).collect();
+                    // CAD-694: select the rows this recovery fences before the
+                    // UPDATE — a `failed` marker must emit each a refusal first,
+                    // and the outcome record needs the row list plus which of them
+                    // carry no refusal evidence at all. No `source` filter: this
+                    // list must equal exactly what the UPDATE below rewrites.
+                    let swept: Vec<(String, String, String)> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT alias, id, turn_id FROM messages
+                             WHERE state IN ('submitting','running')",
+                        )?;
+                        let rows = stmt
+                            .query_map([], |r| {
+                                Ok((
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, String>(1)?,
+                                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                                ))
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        drop(stmt);
+                        rows.into_iter()
+                            .filter(|(_, id, _)| !kept_ids.contains(id))
+                            .collect()
+                    };
+                    // A `failed` marker means the previous run's
+                    // `shutdown_entries` never committed — no refusal events exist
+                    // for the rows it left in flight. Emit each the same refusal a
+                    // recorded refusal carries, so a restart landing on a
+                    // now-working store cannot read this silent sweep as clean.
+                    if let Some(failed) = marker.and_then(|m| m.failed.as_deref()) {
+                        for (alias, message_id, turn_id) in &swept {
+                            if refused.contains(message_id) {
+                                continue;
+                            }
+                            Self::event(
+                                &tx,
+                                alias,
+                                "turn_adopt_refused",
+                                json!({"message": message_id, "turn_id": turn_id,
+                                       "reason":
+                                           format!("shutdown evidence failed ({failed}); the turn's fate is unproven — inspect and do not replay")}),
+                            )?;
+                            refused.push(message_id.clone());
+                        }
+                    }
+                    // Every swept row is fenced — `refused` carries this tx's
+                    // refusals and a committed drain wrote the rest. What remains
+                    // (a crash, or a drain that lost its writes entirely) is
+                    // unevidenced; the outcome reports both so a restart verdict
+                    // needing no per-alias cursor can still fail. The evidence
+                    // lookup is ONE chunked scan, not a query per row: the events
+                    // index is on job/seq, so a per-row EXISTS rescans the whole
+                    // history for every swept turn.
+                    let unprobed: Vec<&String> = swept
+                        .iter()
+                        .filter(|(_, id, _)| !refused.contains(id))
+                        .map(|(_, id, _)| id)
+                        .collect();
+                    let mut evidenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    for chunk in unprobed.chunks(500) {
+                        let marks = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                        let mut stmt = tx.prepare(&format!(
+                            "SELECT DISTINCT json_extract(payload,'$.message') FROM events
+                             WHERE kind='turn_adopt_refused'
+                               AND json_extract(payload,'$.message') IN ({marks})"
+                        ))?;
+                        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                            r.get::<_, String>(0)
+                        })?;
+                        for row in rows {
+                            evidenced.insert(row?);
+                        }
+                    }
+                    let unevidenced: Vec<(String, String)> = swept
+                        .iter()
+                        .filter(|(_, id, _)| !refused.contains(id) && !evidenced.contains(id))
+                        .map(|(alias, id, _)| (alias.clone(), id.clone()))
+                        .collect();
+                    let outcome = RecoveryOutcome {
+                        marker_instance: marker.map(|m| m.instance.clone()),
+                        stale: marker.and_then(|m| m.stale.clone()),
+                        failed: marker.and_then(|m| m.failed.clone()),
+                        fenced: swept
+                            .iter()
+                            .map(|(a, id, _)| (a.clone(), id.clone()))
+                            .collect(),
+                        unevidenced,
+                    };
+                    let placeholders = kept_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let mut sql = String::from(
+                        "UPDATE messages SET state='unknown',
+                            error='Runtime restarted during provider turn'
+                         WHERE state IN ('submitting','running')",
+                    );
+                    if !kept_ids.is_empty() {
+                        sql.push_str(&format!(" AND id NOT IN ({placeholders})"));
+                    }
+                    tx.execute(&sql, rusqlite::params_from_iter(kept_ids.iter()))?;
+                    // An `attention` row is a fence, not a liveness state — keep the
+                    // state and its recorded error intact (they are the operator's
+                    // recovery context) and clear only the dead runtime fields.
+                    // Rewriting it to `offline` here would hide the fence from the
+                    // serve loop's relaunch skip and retry a provider session the
+                    // operator has not cleared.
+                    tx.execute(
+                        "UPDATE agents SET pid=NULL, pid_start=NULL, endpoint=NULL, generation=NULL
+                         WHERE state='attention' AND endpoint_kind != 'inbox'",
+                        [],
                     )?;
-                    refused.push(e.message_id.clone());
-                }
-            }
+                    // Adopted agents lose `generation` with every other runtime
+                    // field — the token gate treats NULL as stale, so a report
+                    // landing between store open and the actor's pane proof is
+                    // rejected rather than finishing a turn whose pane may be
+                    // gone. `set_identity_adopted` writes the recorded generation
+                    // back once `open_adopted` has verified the pane, restoring
+                    // token validity. Kept aliases need the same clearing, so this
+                    // is one unconditional UPDATE — the crash path's exact shape.
+                    tx.execute(
+                        "UPDATE agents SET state='offline', pid=NULL, pid_start=NULL, endpoint=NULL,
+                            generation=NULL
+                         WHERE state NOT IN ('stopped','attention')
+                           AND endpoint_kind != 'inbox'",
+                        [],
+                    )?;
+                    // CAD-506 (ADR 0006 §5.4 step 8): a pending effect the last run
+                    // proved `decided`/`executing` but never reached an outcome may
+                    // already have fired — reconcile for a human, never re-fire.
+                    // `waiting` rows keep their state; they list from the table, so
+                    // nothing needs re-parking.
+                    self.reconcile_effects_in(&tx)?;
+                    Ok(outcome)
+        });
         }
-        {
-            let mut adoptions = self.adoptions.lock().unwrap();
-            for e in &kept {
-                adoptions
-                    .entry(e.alias.clone())
-                    .or_default()
-                    .push((*e).clone());
-            }
-        }
-        // CAD-250: a nudge is steering for the moment it was sent — it is
-        // never replayed into a later daemon's pane.
-        Self::cancel_nudges_in(&tx, None, "restart", None)?;
-        // Dynamic NOT IN for the protected message ids — one UPDATE
-        // either way, never string-interpolated values.
-        let kept_ids: Vec<String> = kept.iter().map(|e| e.message_id.clone()).collect();
-        // CAD-694: select the rows this recovery fences before the
-        // UPDATE — a `failed` marker must emit each a refusal first,
-        // and the outcome record needs the row list plus which of them
-        // carry no refusal evidence at all. No `source` filter: this
-        // list must equal exactly what the UPDATE below rewrites.
-        let swept: Vec<(String, String, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT alias, id, turn_id FROM messages
-                 WHERE state IN ('submitting','running')",
-            )?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(stmt);
-            rows.into_iter()
-                .filter(|(_, id, _)| !kept_ids.contains(id))
-                .collect()
-        };
-        // A `failed` marker means the previous run's
-        // `shutdown_entries` never committed — no refusal events exist
-        // for the rows it left in flight. Emit each the same refusal a
-        // recorded refusal carries, so a restart landing on a
-        // now-working store cannot read this silent sweep as clean.
-        if let Some(failed) = marker.and_then(|m| m.failed.as_deref()) {
-            for (alias, message_id, turn_id) in &swept {
-                if refused.contains(message_id) {
-                    continue;
-                }
-                Self::event(
-                    &tx,
-                    alias,
-                    "turn_adopt_refused",
-                    json!({"message": message_id, "turn_id": turn_id,
-                           "reason":
-                               format!("shutdown evidence failed ({failed}); the turn's fate is unproven — inspect and do not replay")}),
-                )?;
-                refused.push(message_id.clone());
-            }
-        }
-        // Every swept row is fenced — `refused` carries this tx's
-        // refusals and a committed drain wrote the rest. What remains
-        // (a crash, or a drain that lost its writes entirely) is
-        // unevidenced; the outcome reports both so a restart verdict
-        // needing no per-alias cursor can still fail. The evidence
-        // lookup is ONE chunked scan, not a query per row: the events
-        // index is on job/seq, so a per-row EXISTS rescans the whole
-        // history for every swept turn.
-        let unprobed: Vec<&String> = swept
-            .iter()
-            .filter(|(_, id, _)| !refused.contains(id))
-            .map(|(_, id, _)| id)
-            .collect();
-        let mut evidenced: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for chunk in unprobed.chunks(500) {
-            let marks = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let mut stmt = tx.prepare(&format!(
-                "SELECT DISTINCT json_extract(payload,'$.message') FROM events
-                 WHERE kind='turn_adopt_refused'
-                   AND json_extract(payload,'$.message') IN ({marks})"
-            ))?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
-                r.get::<_, String>(0)
-            })?;
-            for row in rows {
-                evidenced.insert(row?);
-            }
-        }
-        let unevidenced: Vec<(String, String)> = swept
-            .iter()
-            .filter(|(_, id, _)| !refused.contains(id) && !evidenced.contains(id))
-            .map(|(alias, id, _)| (alias.clone(), id.clone()))
-            .collect();
-        let outcome = RecoveryOutcome {
-            marker_instance: marker.map(|m| m.instance.clone()),
-            stale: marker.and_then(|m| m.stale.clone()),
-            failed: marker.and_then(|m| m.failed.clone()),
-            fenced: swept
-                .iter()
-                .map(|(a, id, _)| (a.clone(), id.clone()))
-                .collect(),
-            unevidenced,
-        };
-        let placeholders = kept_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let mut sql = String::from(
-            "UPDATE messages SET state='unknown',
-                error='Runtime restarted during provider turn'
-             WHERE state IN ('submitting','running')",
-        );
-        if !kept_ids.is_empty() {
-            sql.push_str(&format!(" AND id NOT IN ({placeholders})"));
-        }
-        tx.execute(&sql, rusqlite::params_from_iter(kept_ids.iter()))?;
-        // An `attention` row is a fence, not a liveness state — keep the
-        // state and its recorded error intact (they are the operator's
-        // recovery context) and clear only the dead runtime fields.
-        // Rewriting it to `offline` here would hide the fence from the
-        // serve loop's relaunch skip and retry a provider session the
-        // operator has not cleared.
-        tx.execute(
-            "UPDATE agents SET pid=NULL, pid_start=NULL, endpoint=NULL, generation=NULL
-             WHERE state='attention' AND endpoint_kind != 'inbox'",
-            [],
-        )?;
-        // Adopted agents lose `generation` with every other runtime
-        // field — the token gate treats NULL as stale, so a report
-        // landing between store open and the actor's pane proof is
-        // rejected rather than finishing a turn whose pane may be
-        // gone. `set_identity_adopted` writes the recorded generation
-        // back once `open_adopted` has verified the pane, restoring
-        // token validity. Kept aliases need the same clearing, so this
-        // is one unconditional UPDATE — the crash path's exact shape.
-        tx.execute(
-            "UPDATE agents SET state='offline', pid=NULL, pid_start=NULL, endpoint=NULL,
-                generation=NULL
-             WHERE state NOT IN ('stopped','attention')
-               AND endpoint_kind != 'inbox'",
-            [],
-        )?;
-        // CAD-506 (ADR 0006 §5.4 step 8): a pending effect the last run
-        // proved `decided`/`executing` but never reached an outcome may
-        // already have fired — reconcile for a human, never re-fire.
-        // `waiting` rows keep their state; they list from the table, so
-        // nothing needs re-parking.
-        self.reconcile_effects_in(&tx)?;
-        tx.commit()?;
-        Ok(outcome)
-    }
 
     /// CAD-162: `token` is current for `generation` under the alias's
     /// own endpoint scheme — [`registry::turn_token_current`] with the
     /// pair read in the caller's transaction. An alias with no agent
     /// row has no scheme, so nothing is current for it (fail closed).
-    fn turn_token_current_in(tx: &Connection, alias: &str, generation: &str, token: &str) -> bool {
+    fn turn_token_current_in(tx: &dyn super::StoreConn, alias: &str, generation: &str, token: &str) -> bool {
         tx.query_row(
             "SELECT provider, endpoint_kind FROM agents WHERE alias=?",
             [alias],
@@ -1169,7 +1170,7 @@ impl Store {
     /// level — `None` means the message may stay `running` for the
     /// actor's pane checks. Every failure maps to the plain recovery
     /// path (message `unknown`, agent fenced) for that agent only.
-    fn adoption_block(&self, tx: &Connection, e: &AdoptEntry) -> Option<String> {
+    fn adoption_block(&self, tx: &dyn super::StoreConn, e: &AdoptEntry) -> Option<String> {
         let msg = tx
             .query_row(
                 "SELECT state, turn_id FROM messages WHERE id=?",
@@ -1367,7 +1368,7 @@ impl Store {
     /// the caller can tell retryable lock contention from a dead store.
     fn shutdown_entries_tx(
         &self,
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         facts: &std::collections::HashMap<String, (String, u32, String)>,
     ) -> rusqlite::Result<Vec<AdoptEntry>> {
         // IMMEDIATE: take the write lock up front so `busy_timeout`

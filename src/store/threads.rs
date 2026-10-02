@@ -358,17 +358,18 @@ fn message_entry<'a>(
 impl Store {
     /// The alias's thread, created on first use. The agent must exist.
     pub fn ensure_thread(&self, alias: &str) -> Result<Thread> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        self.agent_in(&tx, alias)?;
-        let thread = Self::ensure_thread_in(&tx, alias)?;
-        tx.commit()?;
-        Ok(thread)
-    }
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    self.agent_in(&tx, alias)?;
+                    let thread = Self::ensure_thread_in(&tx, alias)?;
+                    Ok(thread)
+        });
+        }
 
     /// [`Self::ensure_thread`] inside the caller's transaction; the
     /// caller has already proved the agent exists.
-    fn ensure_thread_in(tx: &Connection, alias: &str) -> Result<Thread> {
+    fn ensure_thread_in(tx: &dyn super::StoreConn, alias: &str) -> Result<Thread> {
         if let Some(thread) = Self::thread_in(tx, alias)? {
             return Ok(thread);
         }
@@ -392,7 +393,7 @@ impl Store {
     /// id; the alias moves to `archived_alias` and a `system` entry marks
     /// the removal. A later registration under the alias gets a new
     /// thread.
-    pub(super) fn thread_detach_in(tx: &Connection, alias: &str) -> Result<()> {
+    pub(super) fn thread_detach_in(tx: &dyn super::StoreConn, alias: &str) -> Result<()> {
         let Some(thread) = Self::thread_in(tx, alias)? else {
             return Ok(());
         };
@@ -418,11 +419,13 @@ impl Store {
 
     /// The alias's thread, if one was ever started.
     pub fn thread(&self, alias: &str) -> Result<Option<Thread>> {
-        let conn = self.write_conn()?;
-        Self::thread_in(&conn, alias)
-    }
+        return self.write_tx(|conn| {
 
-    fn thread_in(conn: &Connection, alias: &str) -> Result<Option<Thread>> {
+                    Self::thread_in(&conn, alias)
+        });
+        }
+
+    fn thread_in(conn: &dyn super::StoreConn, alias: &str) -> Result<Option<Thread>> {
         Ok(conn
             .query_row("SELECT * FROM threads WHERE alias=?", [alias], row_thread)
             .optional()?)
@@ -431,12 +434,13 @@ impl Store {
     /// Append to the alias's thread. `Ok(None)` when it has none —
     /// agents without a chat are untouched.
     pub fn thread_append(&self, alias: &str, entry: NewEntry) -> Result<Option<i64>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let seq = Self::thread_append_in(&tx, alias, entry)?;
-        tx.commit()?;
-        Ok(seq)
-    }
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let seq = Self::thread_append_in(&tx, alias, entry)?;
+                    Ok(seq)
+        });
+        }
 
     /// [`Self::thread_append`] for managed provider output: the entry
     /// links to the alias's running message, if any.
@@ -448,26 +452,27 @@ impl Store {
         text: &str,
         payload: Option<Value>,
     ) -> Result<Option<i64>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        if Self::thread_in(&tx, alias)?.is_none() {
-            return Ok(None);
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    if Self::thread_in(&tx, alias)?.is_none() {
+                        return Ok(None);
+                    }
+                    let running = Self::running_message_in(&tx, alias)?;
+                    let seq = Self::thread_append_in(
+                        &tx,
+                        alias,
+                        NewEntry {
+                            role,
+                            kind,
+                            text,
+                            payload,
+                            message_id: running.as_deref(),
+                        },
+                    )?;
+                    Ok(seq)
+        });
         }
-        let running = Self::running_message_in(&tx, alias)?;
-        let seq = Self::thread_append_in(
-            &tx,
-            alias,
-            NewEntry {
-                role,
-                kind,
-                text,
-                payload,
-                message_id: running.as_deref(),
-            },
-        )?;
-        tx.commit()?;
-        Ok(seq)
-    }
 
     /// Agent text that the turn result may repeat — Codex `final_answer`
     /// and unphased `agentMessage` items (CAD-320). Held in memory
@@ -480,42 +485,43 @@ impl Store {
     /// appended now. A daemon restart drops what is held — the provider
     /// transcript still has it.
     pub fn thread_hold_running(&self, alias: &str, text: &str, payload: Value) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        if Self::thread_in(&tx, alias)?.is_none() {
-            return Ok(());
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    if Self::thread_in(&tx, alias)?.is_none() {
+                        return Ok(());
+                    }
+                    let Some(running) = Self::running_message_in(&tx, alias)? else {
+                        Self::thread_append_in(
+                            &tx,
+                            alias,
+                            NewEntry {
+                                role: ROLE_AGENT,
+                                kind: KIND_ASSISTANT_TEXT,
+                                text,
+                                payload: Some(payload),
+                                message_id: None,
+                            },
+                        )?;
+                        return Ok(());
+                    };
+                    self.thread_held
+                        .lock()
+                        .unwrap()
+                        .entry(running)
+                        .or_default()
+                        .push(HeldText {
+                            text: text.to_string(),
+                            payload,
+                        });
+                    Ok(())
+        });
         }
-        let Some(running) = Self::running_message_in(&tx, alias)? else {
-            Self::thread_append_in(
-                &tx,
-                alias,
-                NewEntry {
-                    role: ROLE_AGENT,
-                    kind: KIND_ASSISTANT_TEXT,
-                    text,
-                    payload: Some(payload),
-                    message_id: None,
-                },
-            )?;
-            tx.commit()?;
-            return Ok(());
-        };
-        self.thread_held
-            .lock()
-            .unwrap()
-            .entry(running)
-            .or_default()
-            .push(HeldText {
-                text: text.to_string(),
-                payload,
-            });
-        Ok(())
-    }
 
     /// The alias's in-flight turn. `submitting` counts: a provider can
     /// persist items before `on_started` marks the message `running`
     /// (Codex emits them right behind the `turn/start` reply).
-    fn running_message_in(tx: &Connection, alias: &str) -> Result<Option<String>> {
+    fn running_message_in(tx: &dyn super::StoreConn, alias: &str) -> Result<Option<String>> {
         Ok(tx
             .query_row(
                 "SELECT id FROM messages WHERE alias=?
@@ -530,7 +536,7 @@ impl Store {
     /// Transactional append — used inside enqueue and finish so an entry
     /// lands with the state change it records, or not at all.
     pub(super) fn thread_append_in(
-        tx: &Connection,
+        tx: &dyn super::StoreConn,
         alias: &str,
         entry: NewEntry,
     ) -> Result<Option<i64>> {
@@ -576,7 +582,7 @@ impl Store {
     /// The operator/system entry for a freshly queued message.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn thread_note_enqueued(
-        tx: &Connection,
+        tx: &dyn super::StoreConn,
         alias: &str,
         sender: &Sender,
         source: &str,
@@ -599,7 +605,7 @@ impl Store {
     /// The verified App binding the enqueue note for `id` recorded
     /// (CAD-802), `None` when its payload carries none — the stored
     /// side of the retry's content comparison.
-    pub(super) fn entry_app_in(tx: &Connection, id: &str) -> Result<Option<Value>> {
+    pub(super) fn entry_app_in(tx: &dyn super::StoreConn, id: &str) -> Result<Option<Value>> {
         Self::entry_payload_field_in(tx, id, "app")
     }
 
@@ -663,14 +669,14 @@ impl Store {
     /// The refs the enqueue note for `id` recorded (CAD-574), `None`
     /// when its payload carries none — the stored side of the retry's
     /// content comparison.
-    pub(super) fn entry_refs_in(tx: &Connection, id: &str) -> Result<Option<Value>> {
+    pub(super) fn entry_refs_in(tx: &dyn super::StoreConn, id: &str) -> Result<Option<Value>> {
         Self::entry_payload_field_in(tx, id, "refs")
     }
 
     /// One named field of the enqueue note's payload for `id`, `None`
     /// when the payload carries none — the stored side of the retry's
     /// content comparison.
-    fn entry_payload_field_in(tx: &Connection, id: &str, field: &str) -> Result<Option<Value>> {
+    fn entry_payload_field_in(tx: &dyn super::StoreConn, id: &str, field: &str) -> Result<Option<Value>> {
         let first: Option<Option<String>> = tx
             .query_row(
                 "SELECT payload FROM thread_entries WHERE message_id=? \
@@ -692,7 +698,7 @@ impl Store {
     /// carry lands first, as `assistant_text`.
     pub(super) fn thread_note_finished(
         &self,
-        tx: &Connection,
+        tx: &dyn super::StoreConn,
         message: &super::Message,
         status: &str,
         result: &Value,

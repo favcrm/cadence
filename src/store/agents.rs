@@ -376,7 +376,7 @@ impl Store {
         Error::Internal("sqlite: UNIQUE constraint failed: agents.alias".to_string())
     }
 
-    fn agent_alias_exists(tx: &Connection, alias: &str) -> Result<bool> {
+    fn agent_alias_exists(tx: &dyn super::StoreConn, alias: &str) -> Result<bool> {
         match tx.query_row("SELECT 1 FROM agents WHERE alias=?", [alias], |_| Ok(1i32)) {
             Ok(_) => Ok(true),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
@@ -384,7 +384,7 @@ impl Store {
         }
     }
 
-    pub(super) fn agent_in(&self, conn: &Connection, alias: &str) -> Result<Agent> {
+    pub(super) fn agent_in(&self, conn: &dyn super::StoreConn, alias: &str) -> Result<Agent> {
         conn.query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent)
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Error::rejected("Unknown managed agent"),
@@ -453,26 +453,30 @@ impl Store {
     /// `attention` / `stopped` can never be overwritten. `error` is
     /// untouched. Returns whether the row matched.
     pub fn set_agent_state_if(&self, alias: &str, to: &str, from: &str) -> Result<bool> {
-        let conn = self.write_conn()?;
-        let n = conn.execute(
-            "UPDATE agents SET state=?,updated=? WHERE alias=? AND state=?",
-            params![to, now(), alias, from],
-        )?;
-        Ok(n > 0)
-    }
+        return self.write_tx(|conn| {
+
+                    let n = conn.execute(
+                        "UPDATE agents SET state=?,updated=? WHERE alias=? AND state=?",
+                        params![to, now(), alias, from],
+                    )?;
+                    Ok(n > 0)
+        });
+        }
 
     /// Live-actor states only (`starting`, `stopping`, busy/idle
     /// transitions): the actor still owns its endpoint. Fence and
     /// terminal writes go through `set_state_detached` so the state
     /// never lands ahead of the cleared runtime fields.
     pub fn set_agent_state(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
-        let conn = self.write_conn()?;
-        conn.execute(
-            "UPDATE agents SET state=?,error=?,updated=? WHERE alias=?",
-            params![state, error, now(), alias],
-        )?;
-        Ok(())
-    }
+        return self.write_tx(|conn| {
+
+                    conn.execute(
+                        "UPDATE agents SET state=?,error=?,updated=? WHERE alias=?",
+                        params![state, error, now(), alias],
+                    )?;
+                    Ok(())
+        });
+        }
 
     /// Persist native provider identity after a successful adapter `open`.
     /// `endpoint` is the attachable transport address (`ws://…`,
@@ -528,85 +532,86 @@ impl Store {
         adopted: Option<&[AdoptEntry]>,
         quota: Option<&Value>,
     ) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let agent = self.agent_in(&tx, alias)?;
-        let quota = quota.map(|snapshot| {
-            canonical_quota(
-                alias,
-                &agent.provider,
-                &id.thread_id,
-                snapshot,
-                &quota_now_iso(),
-            )
-            .to_string()
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let agent = self.agent_in(&tx, alias)?;
+                    let quota = quota.map(|snapshot| {
+                        canonical_quota(
+                            alias,
+                            &agent.provider,
+                            &id.thread_id,
+                            snapshot,
+                            &quota_now_iso(),
+                        )
+                        .to_string()
+                    });
+                    // A fresh endpoint generation cannot claim reports for turns
+                    // submitted through the previous one — fence them as unknown.
+                    // Every adopted entry stays `running`; a plain open protects
+                    // none.
+                    let kept_ids: Vec<&str> = adopted
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|e| e.message_id.as_str())
+                        .collect();
+                    let mut sql = String::from(
+                        "UPDATE messages SET state='unknown',
+                            error='endpoint restarted during in-flight submission',
+                            completed=? WHERE alias=? AND state='running'",
+                    );
+                    if !kept_ids.is_empty() {
+                        let placeholders = kept_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                        sql.push_str(&format!(" AND id NOT IN ({placeholders})"));
+                    }
+                    let mut params: Vec<rusqlite::types::Value> = vec![now().into(), alias.to_string().into()];
+                    params.extend(kept_ids.iter().map(|k| k.to_string().into()));
+                    tx.execute(&sql, rusqlite::params_from_iter(params))?;
+                    // CAD-385: the pid is recorded WITH its process start time — on
+                    // every open, re-attach and hot-restart adoption alike, since all
+                    // of them land here — so a later process reusing the pid is told
+                    // apart from this endpoint. Read just after the adapter proved
+                    // the process its own; unreadable (a pid-less endpoint's 0, a
+                    // process already gone) records NULL, which fails closed.
+                    let pid_start = crate::peer::proc_starttime(id.pid).and_then(|s| i64::try_from(s).ok());
+                    tx.execute(
+                        "UPDATE agents SET thread_id=?,session_id=?,model=?,effort=?,pid=?,pid_start=?,
+                            endpoint=?,generation=?,quota=?,state='idle',updated=? WHERE alias=?",
+                        params![
+                            id.thread_id,
+                            id.session_id,
+                            id.model,
+                            id.effort,
+                            id.pid as i64,
+                            pid_start,
+                            id.endpoint,
+                            id.generation,
+                            quota,
+                            now(),
+                            alias
+                        ],
+                    )?;
+                    Self::event(
+                        &tx,
+                        alias,
+                        "ready",
+                        json!({"thread_id": id.thread_id, "session_id": id.session_id,
+                               "model": id.model, "effort": id.effort, "pid": id.pid,
+                               "endpoint": id.endpoint,
+                               "generation": id.generation}),
+                    )?;
+                    for e in adopted.unwrap_or_default() {
+                        Self::event(
+                            &tx,
+                            alias,
+                            "turn_adopted",
+                            json!({"message": e.message_id, "turn_id": e.turn_id,
+                                   "pane_pid": e.pane_pid}),
+                        )?;
+                    }
+                    Ok(())
         });
-        // A fresh endpoint generation cannot claim reports for turns
-        // submitted through the previous one — fence them as unknown.
-        // Every adopted entry stays `running`; a plain open protects
-        // none.
-        let kept_ids: Vec<&str> = adopted
-            .unwrap_or_default()
-            .iter()
-            .map(|e| e.message_id.as_str())
-            .collect();
-        let mut sql = String::from(
-            "UPDATE messages SET state='unknown',
-                error='endpoint restarted during in-flight submission',
-                completed=? WHERE alias=? AND state='running'",
-        );
-        if !kept_ids.is_empty() {
-            let placeholders = kept_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            sql.push_str(&format!(" AND id NOT IN ({placeholders})"));
         }
-        let mut params: Vec<rusqlite::types::Value> = vec![now().into(), alias.to_string().into()];
-        params.extend(kept_ids.iter().map(|k| k.to_string().into()));
-        tx.execute(&sql, rusqlite::params_from_iter(params))?;
-        // CAD-385: the pid is recorded WITH its process start time — on
-        // every open, re-attach and hot-restart adoption alike, since all
-        // of them land here — so a later process reusing the pid is told
-        // apart from this endpoint. Read just after the adapter proved
-        // the process its own; unreadable (a pid-less endpoint's 0, a
-        // process already gone) records NULL, which fails closed.
-        let pid_start = crate::peer::proc_starttime(id.pid).and_then(|s| i64::try_from(s).ok());
-        tx.execute(
-            "UPDATE agents SET thread_id=?,session_id=?,model=?,effort=?,pid=?,pid_start=?,
-                endpoint=?,generation=?,quota=?,state='idle',updated=? WHERE alias=?",
-            params![
-                id.thread_id,
-                id.session_id,
-                id.model,
-                id.effort,
-                id.pid as i64,
-                pid_start,
-                id.endpoint,
-                id.generation,
-                quota,
-                now(),
-                alias
-            ],
-        )?;
-        Self::event(
-            &tx,
-            alias,
-            "ready",
-            json!({"thread_id": id.thread_id, "session_id": id.session_id,
-                   "model": id.model, "effort": id.effort, "pid": id.pid,
-                   "endpoint": id.endpoint,
-                   "generation": id.generation}),
-        )?;
-        for e in adopted.unwrap_or_default() {
-            Self::event(
-                &tx,
-                alias,
-                "turn_adopted",
-                json!({"message": e.message_id, "turn_id": e.turn_id,
-                       "pane_pid": e.pane_pid}),
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
 
     /// Persist a provider notification only while it still belongs to the
     /// current provider/thread identity. Returns `false` for a stale or
@@ -619,50 +624,51 @@ impl Store {
         expected_thread_id: &str,
         snapshot: &Value,
     ) -> Result<bool> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let agent = self.agent_in(&tx, alias)?;
-        if agent.provider != provider || agent.thread_id.as_deref() != Some(expected_thread_id) {
-            return Ok(false);
-        }
-        let mut data = agent
-            .quota
-            .as_ref()
-            .and_then(|quota| quota.get("data"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let patch = snapshot.get("data").unwrap_or(snapshot);
-        merge_quota_json(&mut data, patch);
-        let merged = json!({
-            "state": "reported",
-            "source": snapshot
-                .get("source")
-                .and_then(Value::as_str)
-                .unwrap_or("account/rateLimits/updated"),
-            "data": data,
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let agent = self.agent_in(&tx, alias)?;
+                    if agent.provider != provider || agent.thread_id.as_deref() != Some(expected_thread_id) {
+                        return Ok(false);
+                    }
+                    let mut data = agent
+                        .quota
+                        .as_ref()
+                        .and_then(|quota| quota.get("data"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let patch = snapshot.get("data").unwrap_or(snapshot);
+                    merge_quota_json(&mut data, patch);
+                    let merged = json!({
+                        "state": "reported",
+                        "source": snapshot
+                            .get("source")
+                            .and_then(Value::as_str)
+                            .unwrap_or("account/rateLimits/updated"),
+                        "data": data,
+                    });
+                    let observed_at = quota_now_iso();
+                    let canonical = canonical_quota(alias, provider, expected_thread_id, &merged, &observed_at);
+                    tx.execute(
+                        "UPDATE agents SET quota=? WHERE alias=?",
+                        params![canonical.to_string(), alias],
+                    )?;
+                    Self::event(
+                        &tx,
+                        alias,
+                        "quota_updated",
+                        json!({
+                            "provider": provider,
+                            "account_id": canonical["account_id"],
+                            "thread_id": expected_thread_id,
+                            "state": canonical["state"],
+                            "source": canonical["source"],
+                            "observed_at": canonical["observed_at"],
+                        }),
+                    )?;
+                    Ok(true)
         });
-        let observed_at = quota_now_iso();
-        let canonical = canonical_quota(alias, provider, expected_thread_id, &merged, &observed_at);
-        tx.execute(
-            "UPDATE agents SET quota=? WHERE alias=?",
-            params![canonical.to_string(), alias],
-        )?;
-        Self::event(
-            &tx,
-            alias,
-            "quota_updated",
-            json!({
-                "provider": provider,
-                "account_id": canonical["account_id"],
-                "thread_id": expected_thread_id,
-                "state": canonical["state"],
-                "source": canonical["source"],
-                "observed_at": canonical["observed_at"],
-            }),
-        )?;
-        tx.commit()?;
-        Ok(true)
-    }
+        }
 
     /// Merge `patch` (a JSON object of string keys/values) into the
     /// agent's `params` — the endpoint-option bag (`auto_ready`,
@@ -670,26 +676,30 @@ impl Store {
     /// Record the model the provider reports it is running (claude's
     /// stream `system/init`) — the `model` column, never a launch param.
     pub fn set_model_reported(&self, alias: &str, model: &str) -> Result<()> {
-        let conn = self.write_conn()?;
-        conn.execute(
-            "UPDATE agents SET model=?,updated=? WHERE alias=?",
-            params![model, now(), alias],
-        )?;
-        Ok(())
-    }
+        return self.write_tx(|conn| {
+
+                    conn.execute(
+                        "UPDATE agents SET model=?,updated=? WHERE alias=?",
+                        params![model, now(), alias],
+                    )?;
+                    Ok(())
+        });
+        }
 
     /// CAD-559: a register-time gate that fills the launch model
     /// itself (pi's `[pi].models.default`) stamps the honest
     /// provenance over the `explicit` label `register_agent` derives
     /// from the merged params.
     pub fn set_model_selection(&self, alias: &str, selection: &Value) -> Result<()> {
-        let conn = self.write_conn()?;
-        conn.execute(
-            "UPDATE agents SET model_selection=?,updated=? WHERE alias=?",
-            params![selection.to_string(), now(), alias],
-        )?;
-        Ok(())
-    }
+        return self.write_tx(|conn| {
+
+                    conn.execute(
+                        "UPDATE agents SET model_selection=?,updated=? WHERE alias=?",
+                        params![selection.to_string(), now(), alias],
+                    )?;
+                    Ok(())
+        });
+        }
 
     pub fn set_params(&self, alias: &str, patch: &Value) -> Result<()> {
         self.set_params_by(alias, patch, &Value::Null)
@@ -701,120 +711,122 @@ impl Store {
     /// and each changed key with its old and new stored value (`null` =
     /// absent), written in the same transaction as the change.
     pub fn set_params_by(&self, alias: &str, patch: &Value, audit: &Value) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let agent = self.agent_in(&tx, alias)?;
-        let mut merged = agent.params.clone().unwrap_or_else(|| json!({}));
-        let target = merged
-            .as_object_mut()
-            .ok_or_else(|| Error::internal("stored params are not an object"))?;
-        let patch = patch
-            .as_object()
-            .ok_or_else(|| Error::rejected("params patch must be a JSON object"))?;
-        let model_selection = if patch.contains_key("model") {
-            if !registry::supports_model(&agent.provider, &agent.endpoint_kind) {
-                return Err(Error::invalid(
-                    "unsupported_model_setting",
-                    format!(
-                        "provider '{}' endpoint '{}' does not accept a model",
-                        agent.provider, agent.endpoint_kind
-                    ),
-                ));
-            }
-            let lookup = agent
-                .team_role
-                .clone()
-                .unwrap_or_else(|| agent.role.clone());
-            match patch.get("model") {
-                Some(Value::Null) => Some(crate::model_defaults::explicit_override_selection(
-                    &lookup, None,
-                )?),
-                Some(Value::String(model)) => {
-                    let model = crate::model_defaults::validate_model_id(model)?;
-                    Some(crate::model_defaults::explicit_override_selection(
-                        &lookup,
-                        Some(&model),
-                    )?)
-                }
-                Some(_) => {
-                    return Err(Error::invalid(
-                        "invalid_model",
-                        "model must be a non-empty string",
-                    ))
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        for (k, v) in patch {
-            if k == "model" {
-                match v {
-                    Value::Null => {
-                        target.remove(k);
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let agent = self.agent_in(&tx, alias)?;
+                    let mut merged = agent.params.clone().unwrap_or_else(|| json!({}));
+                    let target = merged
+                        .as_object_mut()
+                        .ok_or_else(|| Error::internal("stored params are not an object"))?;
+                    let patch = patch
+                        .as_object()
+                        .ok_or_else(|| Error::rejected("params patch must be a JSON object"))?;
+                    let model_selection = if patch.contains_key("model") {
+                        if !registry::supports_model(&agent.provider, &agent.endpoint_kind) {
+                            return Err(Error::invalid(
+                                "unsupported_model_setting",
+                                format!(
+                                    "provider '{}' endpoint '{}' does not accept a model",
+                                    agent.provider, agent.endpoint_kind
+                                ),
+                            ));
+                        }
+                        let lookup = agent
+                            .team_role
+                            .clone()
+                            .unwrap_or_else(|| agent.role.clone());
+                        match patch.get("model") {
+                            Some(Value::Null) => Some(crate::model_defaults::explicit_override_selection(
+                                &lookup, None,
+                            )?),
+                            Some(Value::String(model)) => {
+                                let model = crate::model_defaults::validate_model_id(model)?;
+                                Some(crate::model_defaults::explicit_override_selection(
+                                    &lookup,
+                                    Some(&model),
+                                )?)
+                            }
+                            Some(_) => {
+                                return Err(Error::invalid(
+                                    "invalid_model",
+                                    "model must be a non-empty string",
+                                ))
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    for (k, v) in patch {
+                        if k == "model" {
+                            match v {
+                                Value::Null => {
+                                    target.remove(k);
+                                }
+                                Value::String(model) => {
+                                    let model = crate::model_defaults::validate_model_id(model)?;
+                                    target.insert(k.clone(), json!(model));
+                                }
+                                _ => {
+                                    return Err(Error::invalid(
+                                        "invalid_model",
+                                        "model must be a non-empty string",
+                                    ))
+                                }
+                            }
+                        } else if v.is_null() {
+                            target.remove(k);
+                        } else {
+                            target.insert(k.clone(), v.clone());
+                        }
                     }
-                    Value::String(model) => {
-                        let model = crate::model_defaults::validate_model_id(model)?;
-                        target.insert(k.clone(), json!(model));
-                    }
-                    _ => {
+                    let stored_params = merged.to_string();
+                    if stored_params.len() > 4_000 {
                         return Err(Error::invalid(
-                            "invalid_model",
-                            "model must be a non-empty string",
-                        ))
+                            "params_too_large",
+                            "params must be a JSON object of at most 4000 characters",
+                        ));
                     }
-                }
-            } else if v.is_null() {
-                target.remove(k);
-            } else {
-                target.insert(k.clone(), v.clone());
-            }
+                    if let Some(selection) = &model_selection {
+                        tx.execute(
+                            "UPDATE agents SET params=?,model_selection=?,updated=? WHERE alias=?",
+                            params![stored_params, selection.to_string(), now(), alias],
+                        )?;
+                    } else {
+                        tx.execute(
+                            "UPDATE agents SET params=?,updated=? WHERE alias=?",
+                            params![stored_params, now(), alias],
+                        )?;
+                    }
+                    let before = agent.params.clone().unwrap_or_else(|| json!({}));
+                    let changes: Vec<Value> = patch
+                        .keys()
+                        .map(|k| {
+                            json!({"key": k,
+                                   "old": before.get(k).cloned().unwrap_or(Value::Null),
+                                   "new": merged.get(k).cloned().unwrap_or(Value::Null)})
+                        })
+                        .collect();
+                    let mut detail = json!({"patch": patch, "target": alias, "changes": changes});
+                    if let Some(extra) = audit.as_object() {
+                        for (k, v) in extra {
+                            detail[k.as_str()] = v.clone();
+                        }
+                    }
+                    Self::event(&tx, alias, "params_updated", detail)?;
+                    Ok(())
+        });
         }
-        let stored_params = merged.to_string();
-        if stored_params.len() > 4_000 {
-            return Err(Error::invalid(
-                "params_too_large",
-                "params must be a JSON object of at most 4000 characters",
-            ));
-        }
-        if let Some(selection) = &model_selection {
-            tx.execute(
-                "UPDATE agents SET params=?,model_selection=?,updated=? WHERE alias=?",
-                params![stored_params, selection.to_string(), now(), alias],
-            )?;
-        } else {
-            tx.execute(
-                "UPDATE agents SET params=?,updated=? WHERE alias=?",
-                params![stored_params, now(), alias],
-            )?;
-        }
-        let before = agent.params.clone().unwrap_or_else(|| json!({}));
-        let changes: Vec<Value> = patch
-            .keys()
-            .map(|k| {
-                json!({"key": k,
-                       "old": before.get(k).cloned().unwrap_or(Value::Null),
-                       "new": merged.get(k).cloned().unwrap_or(Value::Null)})
-            })
-            .collect();
-        let mut detail = json!({"patch": patch, "target": alias, "changes": changes});
-        if let Some(extra) = audit.as_object() {
-            for (k, v) in extra {
-                detail[k.as_str()] = v.clone();
-            }
-        }
-        Self::event(&tx, alias, "params_updated", detail)?;
-        tx.commit()?;
-        Ok(())
-    }
 
     pub fn model_defaults(&self) -> Result<ModelDefaultsSnapshot> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let snapshot = Self::read_model_defaults_tx(&tx)?;
-        tx.commit()?;
-        Ok(snapshot)
-    }
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let snapshot = Self::read_model_defaults_tx(&tx)?;
+                    Ok(snapshot)
+        });
+        }
 
     /// Replace the singleton document when `document` names the current
     /// revision. The audit event commits with the row or not at all.
@@ -826,47 +838,48 @@ impl Store {
         let write = crate::model_defaults::parse_settings_document(document)?;
         let attribution = crate::model_defaults::normalize_attribution(attribution)?;
         let stored = serde_json::to_string(&write.config)?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let current = Self::read_model_defaults_tx(&tx)?;
-        if current.revision != write.expected_revision {
-            return Err(Error::conflict(
-                current.revision,
-                format!(
-                    "model defaults revision is {}, not {}",
-                    current.revision, write.expected_revision
-                ),
-            ));
-        }
-        let next = current.revision.checked_add(1).ok_or_else(|| {
-            Error::invalid("invalid_request", "model defaults revision overflowed")
-        })?;
-        let at = now();
-        tx.execute(
-            "UPDATE model_defaults SET revision=?, document=? WHERE id=1",
-            params![next, stored],
-        )?;
-        Self::event(
-            &tx,
-            Self::DAEMON_STREAM,
-            "model_defaults_updated",
-            json!({
-                "revision": next,
-                "before": current.config,
-                "after": write.config,
-                "attribution": attribution.actor,
-                "transport": attribution.transport,
-                "at": at,
-            }),
-        )?;
-        tx.commit()?;
-        Ok(ModelDefaultsSnapshot {
-            revision: next,
-            config: write.config,
-        })
-    }
+        return self.write_tx(|conn| {
 
-    fn read_model_defaults_tx(tx: &Connection) -> Result<ModelDefaultsSnapshot> {
+                    let tx = &mut *conn;
+                    let current = Self::read_model_defaults_tx(&tx)?;
+                    if current.revision != write.expected_revision {
+                        return Err(Error::conflict(
+                            current.revision,
+                            format!(
+                                "model defaults revision is {}, not {}",
+                                current.revision, write.expected_revision
+                            ),
+                        ));
+                    }
+                    let next = current.revision.checked_add(1).ok_or_else(|| {
+                        Error::invalid("invalid_request", "model defaults revision overflowed")
+                    })?;
+                    let at = now();
+                    tx.execute(
+                        "UPDATE model_defaults SET revision=?, document=? WHERE id=1",
+                        params![next, stored],
+                    )?;
+                    Self::event(
+                        &tx,
+                        Self::DAEMON_STREAM,
+                        "model_defaults_updated",
+                        json!({
+                            "revision": next,
+                            "before": current.config,
+                            "after": write.config,
+                            "attribution": attribution.actor,
+                            "transport": attribution.transport,
+                            "at": at,
+                        }),
+                    )?;
+                    Ok(ModelDefaultsSnapshot {
+                        revision: next,
+                        config: write.config,
+                    })
+        });
+        }
+
+    fn read_model_defaults_tx(tx: &dyn super::StoreConn) -> Result<ModelDefaultsSnapshot> {
         let (revision, document): (i64, String) = tx
             .query_row(
                 "SELECT revision, document FROM model_defaults WHERE id=1",
@@ -892,41 +905,44 @@ impl Store {
     /// disposable-session endpoint proves its stored id can never
     /// resume; the next open mints a fresh session instead.
     pub fn clear_native_session(&self, alias: &str) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let agent = self.agent_in(&tx, alias)?;
-        let old = agent
-            .params
-            .as_ref()
-            .and_then(|p| p.get("session"))
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string());
-        let mut merged = agent.params.unwrap_or_else(|| json!({}));
-        if let Some(target) = merged.as_object_mut() {
-            target.remove("session");
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let agent = self.agent_in(&tx, alias)?;
+                    let old = agent
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("session"))
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string());
+                    let mut merged = agent.params.unwrap_or_else(|| json!({}));
+                    if let Some(target) = merged.as_object_mut() {
+                        target.remove("session");
+                    }
+                    tx.execute(
+                        "UPDATE agents SET params=?,thread_id=NULL,updated=? WHERE alias=?",
+                        params![merged.to_string(), now(), alias],
+                    )?;
+                    Self::event(
+                        &tx,
+                        alias,
+                        "session_cleared",
+                        json!({"session": old, "thread_id": agent.thread_id}),
+                    )?;
+                    Ok(())
+        });
         }
-        tx.execute(
-            "UPDATE agents SET params=?,thread_id=NULL,updated=? WHERE alias=?",
-            params![merged.to_string(), now(), alias],
-        )?;
-        Self::event(
-            &tx,
-            alias,
-            "session_cleared",
-            json!({"session": old, "thread_id": agent.thread_id}),
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
 
     pub fn set_enabled(&self, alias: &str, enabled: bool) -> Result<()> {
-        let conn = self.write_conn()?;
-        conn.execute(
-            "UPDATE agents SET enabled=?,updated=? WHERE alias=?",
-            params![enabled as i64, now(), alias],
-        )?;
-        Ok(())
-    }
+        return self.write_tx(|conn| {
+
+                    conn.execute(
+                        "UPDATE agents SET enabled=?,updated=? WHERE alias=?",
+                        params![enabled as i64, now(), alias],
+                    )?;
+                    Ok(())
+        });
+        }
 
     /// Publish a detached runtime state in ONE write: the state, its
     /// error and the cleared runtime fields land together so a reader
@@ -936,14 +952,16 @@ impl Store {
     /// attachable endpoint belong to the dead process regardless, so
     /// leaving them would also point `agent attach` at a stale address.
     pub fn set_state_detached(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
-        let conn = self.write_conn()?;
-        conn.execute(
-            "UPDATE agents SET state=?,error=?,pid=NULL,pid_start=NULL,endpoint=NULL,
-                generation=NULL,updated=? WHERE alias=?",
-            params![state, error, now(), alias],
-        )?;
-        Ok(())
-    }
+        return self.write_tx(|conn| {
+
+                    conn.execute(
+                        "UPDATE agents SET state=?,error=?,pid=NULL,pid_start=NULL,endpoint=NULL,
+                            generation=NULL,updated=? WHERE alias=?",
+                        params![state, error, now(), alias],
+                    )?;
+                    Ok(())
+        });
+        }
 
     /// Explicit removal of a dead agent: the registry row plus the
     /// history no job needs drop in one transaction (see
@@ -970,186 +988,187 @@ impl Store {
     /// reaching here). Returns the `reply_to` aliases a forced finish
     /// notified — the caller wakes them.
     pub fn remove_agent(&self, alias: &str, force: bool, by: &Value) -> Result<Vec<String>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let agent = self.agent_in(&tx, alias)?;
-        // Inbox rows own no process or pane — their pseudo-endpoint is
-        // permanent, so neither gate applies to them.
-        if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
-            if agent.endpoint.is_some() {
-                return Err(Error::rejected(format!(
-                    "Agent '{alias}' still has a live endpoint — \
-                     run `cadence agent stop {alias}` first"
-                )));
-            }
-            if !matches!(agent.state.as_str(), "stopped" | "attention" | "offline") {
-                return Err(Error::rejected(format!(
-                    "Agent '{alias}' is {} — only stopped, attention or offline \
-                     agents without an endpoint can be removed",
-                    agent.state
-                )));
-            }
-        }
-        let open: Vec<Message> = tx
-            .prepare(
-                "SELECT * FROM messages WHERE alias=? AND state NOT IN
-                 ('completed','failed','interrupted','cancelled') ORDER BY seq",
-            )?
-            .query_map([alias], row_message)?
-            .collect::<rusqlite::Result<_>>()?;
-        let open_messages: Vec<(String, String)> = open
-            .iter()
-            .map(|m| (m.id.clone(), m.state.clone()))
-            .collect();
-        let open_tasks: Vec<(String, String)> = tx
-            .prepare(
-                "SELECT id,state FROM tasks WHERE assignee=? AND state NOT IN
-                 ('verified','done','cancelled','failed') ORDER BY created",
-            )?
-            .query_map([alias], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        let mut notify: Vec<String> = Vec::new();
-        if !open_messages.is_empty() || !open_tasks.is_empty() {
-            let named = |kind: &str, rows: &[(String, String)]| {
-                rows.iter()
-                    .map(|(id, state)| format!("{kind} {id} ({state})"))
-                    .collect::<Vec<_>>()
-            };
-            let work = [named("message", &open_messages), named("task", &open_tasks)].concat();
-            if !force {
-                return Err(Error::rejected(format!(
-                    "Agent '{alias}' still has open work: {} — finish, cancel \
-                     or reassign it, or pass --force to remove anyway",
-                    work.join(", ")
-                )));
-            }
-            // An `unknown` outcome is never decided or discarded here:
-            // closing it would claim an outcome nobody learned, keeping
-            // it would fence a re-registered alias, deleting it would
-            // lose the evidence (CAD-284/CAD-304 S1). Reconcile first.
-            let unknown: Vec<&Message> = open.iter().filter(|m| m.state == "unknown").collect();
-            if let Some(first) = unknown.first() {
-                // `agent unfence` reconciles only fencing unknowns — an
-                // unconfirmed nudge is closed by `message reconcile` alone.
-                let unfence = if unknown.iter().any(|m| m.source != "nudge") {
-                    format!(" or `cadence agent unfence {alias} --no-resume`")
-                } else {
-                    String::new()
-                };
-                return Err(Error::rejected(format!(
-                    "--force cannot remove '{alias}' while message(s) {} are \
-                     unknown — reconcile the outcome first: `cadence message \
-                     reconcile {} --status interrupted|completed|failed`{unfence}",
-                    unknown
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let agent = self.agent_in(&tx, alias)?;
+                    // Inbox rows own no process or pane — their pseudo-endpoint is
+                    // permanent, so neither gate applies to them.
+                    if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+                        if agent.endpoint.is_some() {
+                            return Err(Error::rejected(format!(
+                                "Agent '{alias}' still has a live endpoint — \
+                                 run `cadence agent stop {alias}` first"
+                            )));
+                        }
+                        if !matches!(agent.state.as_str(), "stopped" | "attention" | "offline") {
+                            return Err(Error::rejected(format!(
+                                "Agent '{alias}' is {} — only stopped, attention or offline \
+                                 agents without an endpoint can be removed",
+                                agent.state
+                            )));
+                        }
+                    }
+                    let open: Vec<Message> = tx
+                        .prepare(
+                            "SELECT * FROM messages WHERE alias=? AND state NOT IN
+                             ('completed','failed','interrupted','cancelled') ORDER BY seq",
+                        )?
+                        .query_map([alias], row_message)?
+                        .collect::<rusqlite::Result<_>>()?;
+                    let open_messages: Vec<(String, String)> = open
                         .iter()
-                        .map(|m| m.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    first.id
-                )));
-            }
-            let error = format!("agent '{alias}' removed with --force");
-            // Non-terminal tasks are unassigned — state, revision,
-            // kickoff and history kept — so a later agent registered
-            // under this alias never inherits them (CAD-304 S4), and the
-            // job's PM hears which to reassign (review round-2 ruling).
-            let mut unassigned: Vec<String> = Vec::new();
-            for (task_id, _) in &open_tasks {
-                let task = self.task_in(&tx, task_id)?;
-                let job = self.job_in(&tx, &task.job_id)?;
-                tx.execute(
-                    "UPDATE tasks SET assignee=NULL,updated=? WHERE id=?",
-                    params![now(), task.id],
-                )?;
-                Self::event_scoped(
-                    &tx,
-                    &job.pm_alias,
-                    "task_unassigned",
-                    json!({"task": task.id, "job": job.id, "state": task.state,
-                           "revision": task.revision, "from": alias,
-                           "reason": error, "by": by["by"]}),
-                    Some(&job.id),
-                    Some(&task.id),
-                )?;
-                let told = self.route_job_event(
-                    &tx,
-                    &job,
-                    &task,
-                    &task.state,
-                    &format!("unassigned:{alias}"),
-                    &format!(
-                        "task {} ({}) is unassigned: its assignee '{alias}' was \
-                         removed with --force. Reassign it with `cadence job \
-                         dispatch {} --to <worker>`.",
-                        task.id, task.state, task.id
-                    ),
-                )?;
-                if told && !notify.contains(&job.pm_alias) {
-                    notify.push(job.pm_alias.clone());
-                }
-                unassigned.push(task.id.clone());
-            }
-            for message in &open {
-                let told = if message.state == "running" {
-                    let result = json!({"status": "interrupted", "text": "",
-                                        "error": error, "via": "agent_remove_forced",
-                                        "by": by["by"]});
-                    self.finish_in(&tx, message, "interrupted", &result, Some(&error))?
-                } else {
-                    // queued / submitting: never delivered to a live
-                    // actor (the endpoint is gone), so cancelled —
-                    // `message cancel`'s write, event and notice.
-                    let result = json!({"status": "cancelled", "via": "agent_remove_forced",
-                                        "by": by["by"], "reason": error});
-                    tx.execute(
-                        "UPDATE messages SET state='cancelled',result=?,error=?,completed=?
-                         WHERE id=?",
-                        params![result.to_string(), error, now(), message.id],
-                    )?;
+                        .map(|m| (m.id.clone(), m.state.clone()))
+                        .collect();
+                    let open_tasks: Vec<(String, String)> = tx
+                        .prepare(
+                            "SELECT id,state FROM tasks WHERE assignee=? AND state NOT IN
+                             ('verified','done','cancelled','failed') ORDER BY created",
+                        )?
+                        .query_map([alias], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    let mut notify: Vec<String> = Vec::new();
+                    if !open_messages.is_empty() || !open_tasks.is_empty() {
+                        let named = |kind: &str, rows: &[(String, String)]| {
+                            rows.iter()
+                                .map(|(id, state)| format!("{kind} {id} ({state})"))
+                                .collect::<Vec<_>>()
+                        };
+                        let work = [named("message", &open_messages), named("task", &open_tasks)].concat();
+                        if !force {
+                            return Err(Error::rejected(format!(
+                                "Agent '{alias}' still has open work: {} — finish, cancel \
+                                 or reassign it, or pass --force to remove anyway",
+                                work.join(", ")
+                            )));
+                        }
+                        // An `unknown` outcome is never decided or discarded here:
+                        // closing it would claim an outcome nobody learned, keeping
+                        // it would fence a re-registered alias, deleting it would
+                        // lose the evidence (CAD-284/CAD-304 S1). Reconcile first.
+                        let unknown: Vec<&Message> = open.iter().filter(|m| m.state == "unknown").collect();
+                        if let Some(first) = unknown.first() {
+                            // `agent unfence` reconciles only fencing unknowns — an
+                            // unconfirmed nudge is closed by `message reconcile` alone.
+                            let unfence = if unknown.iter().any(|m| m.source != "nudge") {
+                                format!(" or `cadence agent unfence {alias} --no-resume`")
+                            } else {
+                                String::new()
+                            };
+                            return Err(Error::rejected(format!(
+                                "--force cannot remove '{alias}' while message(s) {} are \
+                                 unknown — reconcile the outcome first: `cadence message \
+                                 reconcile {} --status interrupted|completed|failed`{unfence}",
+                                unknown
+                                    .iter()
+                                    .map(|m| m.id.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                first.id
+                            )));
+                        }
+                        let error = format!("agent '{alias}' removed with --force");
+                        // Non-terminal tasks are unassigned — state, revision,
+                        // kickoff and history kept — so a later agent registered
+                        // under this alias never inherits them (CAD-304 S4), and the
+                        // job's PM hears which to reassign (review round-2 ruling).
+                        let mut unassigned: Vec<String> = Vec::new();
+                        for (task_id, _) in &open_tasks {
+                            let task = self.task_in(&tx, task_id)?;
+                            let job = self.job_in(&tx, &task.job_id)?;
+                            tx.execute(
+                                "UPDATE tasks SET assignee=NULL,updated=? WHERE id=?",
+                                params![now(), task.id],
+                            )?;
+                            Self::event_scoped(
+                                &tx,
+                                &job.pm_alias,
+                                "task_unassigned",
+                                json!({"task": task.id, "job": job.id, "state": task.state,
+                                       "revision": task.revision, "from": alias,
+                                       "reason": error, "by": by["by"]}),
+                                Some(&job.id),
+                                Some(&task.id),
+                            )?;
+                            let told = self.route_job_event(
+                                &tx,
+                                &job,
+                                &task,
+                                &task.state,
+                                &format!("unassigned:{alias}"),
+                                &format!(
+                                    "task {} ({}) is unassigned: its assignee '{alias}' was \
+                                     removed with --force. Reassign it with `cadence job \
+                                     dispatch {} --to <worker>`.",
+                                    task.id, task.state, task.id
+                                ),
+                            )?;
+                            if told && !notify.contains(&job.pm_alias) {
+                                notify.push(job.pm_alias.clone());
+                            }
+                            unassigned.push(task.id.clone());
+                        }
+                        for message in &open {
+                            let told = if message.state == "running" {
+                                let result = json!({"status": "interrupted", "text": "",
+                                                    "error": error, "via": "agent_remove_forced",
+                                                    "by": by["by"]});
+                                self.finish_in(&tx, message, "interrupted", &result, Some(&error))?
+                            } else {
+                                // queued / submitting: never delivered to a live
+                                // actor (the endpoint is gone), so cancelled —
+                                // `message cancel`'s write, event and notice.
+                                let result = json!({"status": "cancelled", "via": "agent_remove_forced",
+                                                    "by": by["by"], "reason": error});
+                                tx.execute(
+                                    "UPDATE messages SET state='cancelled',result=?,error=?,completed=?
+                                     WHERE id=?",
+                                    params![result.to_string(), error, now(), message.id],
+                                )?;
+                                Self::event(
+                                    &tx,
+                                    alias,
+                                    "cancelled",
+                                    json!({"message": message.id, "by": by["by"], "reason": error}),
+                                )?;
+                                self.route_notice(&tx, message, "cancelled", &result)?
+                            };
+                            // Only recipients a notice actually reached — a
+                            // dedupe hit or a `handoff_unresolved` is not notified.
+                            if let (true, Some(reply_to)) = (told, &message.reply_to) {
+                                if !notify.contains(reply_to) {
+                                    notify.push(reply_to.clone());
+                                }
+                            }
+                        }
+                        Self::event(
+                            &tx,
+                            Self::DAEMON_STREAM,
+                            "agent_remove_forced",
+                            json!({"alias": alias, "messages": open_messages, "tasks": open_tasks,
+                                   "unassigned": unassigned, "notified": notify,
+                                   "by": by["by"], "by_kind": by["by_kind"]}),
+                        )?;
+                    }
+                    Self::prune_agent_history(&tx, alias)?;
+                    tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
                     Self::event(
                         &tx,
-                        alias,
-                        "cancelled",
-                        json!({"message": message.id, "by": by["by"], "reason": error}),
+                        Self::DAEMON_STREAM,
+                        "agent_removed",
+                        json!({"alias": alias, "force": force,
+                               "by": by["by"], "by_kind": by["by_kind"]}),
                     )?;
-                    self.route_notice(&tx, message, "cancelled", &result)?
-                };
-                // Only recipients a notice actually reached — a
-                // dedupe hit or a `handoff_unresolved` is not notified.
-                if let (true, Some(reply_to)) = (told, &message.reply_to) {
-                    if !notify.contains(reply_to) {
-                        notify.push(reply_to.clone());
-                    }
-                }
-            }
-            Self::event(
-                &tx,
-                Self::DAEMON_STREAM,
-                "agent_remove_forced",
-                json!({"alias": alias, "messages": open_messages, "tasks": open_tasks,
-                       "unassigned": unassigned, "notified": notify,
-                       "by": by["by"], "by_kind": by["by_kind"]}),
-            )?;
+                    Ok(notify)
+        });
         }
-        Self::prune_agent_history(&tx, alias)?;
-        tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
-        Self::event(
-            &tx,
-            Self::DAEMON_STREAM,
-            "agent_removed",
-            json!({"alias": alias, "force": force,
-                   "by": by["by"], "by_kind": by["by_kind"]}),
-        )?;
-        tx.commit()?;
-        Ok(notify)
-    }
 
     /// Drops a removed alias's message/event history except what job
     /// history still resolves (CAD-284): messages attached to a task or
     /// named as a task's `dispatch_message` or a verdict's `message`,
     /// and job-scoped events. Those stay in place under the old alias so
     /// `job show`/`job events`/`task show` read them unchanged.
-    fn prune_agent_history(tx: &Connection, alias: &str) -> Result<()> {
+    fn prune_agent_history(tx: &dyn super::StoreConn, alias: &str) -> Result<()> {
         tx.execute(
             "DELETE FROM messages WHERE alias=?1 AND task_id IS NULL
              AND id NOT IN (SELECT dispatch_message FROM tasks
@@ -1174,16 +1193,18 @@ impl Store {
     /// [`Store::timer_gc_remove`].
     pub fn gc_candidates(&self, older_than: Option<f64>) -> Result<Vec<Agent>> {
         let cutoff = older_than.map(|age| now() - age).unwrap_or(f64::MAX);
-        let conn = self.write_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT * FROM agents WHERE endpoint IS NULL
-             AND state IN ('attention','stopped') AND updated < ?",
-        )?;
-        let rows = stmt.query_map(params![cutoff], row_agent)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
+        return self.write_tx(|conn| {
 
-    pub(super) fn agent_opt_in(&self, conn: &Connection, alias: &str) -> Result<Option<Agent>> {
+                    let mut stmt = conn.prepare(
+                        "SELECT * FROM agents WHERE endpoint IS NULL
+                         AND state IN ('attention','stopped') AND updated < ?",
+                    )?;
+                    let rows = stmt.query_map(params![cutoff], row_agent)?;
+                    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        });
+        }
+
+    pub(super) fn agent_opt_in(&self, conn: &dyn super::StoreConn, alias: &str) -> Result<Option<Agent>> {
         match conn.query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent) {
             Ok(a) => Ok(Some(a)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1205,57 +1226,58 @@ impl Store {
     /// it was listed). Records only — frees no memory and no disk, and
     /// the removed agent can no longer be resumed.
     pub fn timer_gc_remove(&self, alias: &str, older_than: f64) -> Result<Option<Agent>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let Some(agent) = tx
-            .query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent)
-            .optional()?
-        else {
-            return Ok(None);
-        };
-        let at = now();
-        let age = at - agent.updated;
-        let open_messages: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM messages WHERE alias=? AND state NOT IN
-             ('completed','failed','interrupted','cancelled')",
-            [alias],
-            |r| r.get(0),
-        )?;
-        let eligible = agent.endpoint.is_none()
-            && matches!(agent.state.as_str(), "attention" | "stopped")
-            && !agent.enabled
-            && age > older_than
-            && open_messages == 0;
-        if !eligible {
-            return Ok(None);
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let Some(agent) = tx
+                        .query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent)
+                        .optional()?
+                    else {
+                        return Ok(None);
+                    };
+                    let at = now();
+                    let age = at - agent.updated;
+                    let open_messages: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM messages WHERE alias=? AND state NOT IN
+                         ('completed','failed','interrupted','cancelled')",
+                        [alias],
+                        |r| r.get(0),
+                    )?;
+                    let eligible = agent.endpoint.is_none()
+                        && matches!(agent.state.as_str(), "attention" | "stopped")
+                        && !agent.enabled
+                        && age > older_than
+                        && open_messages == 0;
+                    if !eligible {
+                        return Ok(None);
+                    }
+                    Self::prune_agent_history(&tx, alias)?;
+                    tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
+                    Self::event(
+                        &tx,
+                        Self::DAEMON_STREAM,
+                        "agent_gc_removed",
+                        json!({
+                            "alias": agent.alias,
+                            "provider": agent.provider,
+                            "endpoint_kind": agent.endpoint_kind,
+                            "state": agent.state,
+                            "reason": format!(
+                                "agent-gc timer: no endpoint, state {}, no open or unknown \
+                                 messages, idle {:.0}s > older_than {:.0}s",
+                                agent.state, age, older_than
+                            ),
+                            "age_secs": age.floor(),
+                            "older_than_secs": older_than,
+                            "thread_id": agent.thread_id,
+                            "session_id": agent.session_id,
+                            "records_only": true,
+                            "note": crate::daemon::AGENT_GC_RECORDS_ONLY,
+                        }),
+                    )?;
+                    Ok(Some(agent))
+        });
         }
-        Self::prune_agent_history(&tx, alias)?;
-        tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
-        Self::event(
-            &tx,
-            Self::DAEMON_STREAM,
-            "agent_gc_removed",
-            json!({
-                "alias": agent.alias,
-                "provider": agent.provider,
-                "endpoint_kind": agent.endpoint_kind,
-                "state": agent.state,
-                "reason": format!(
-                    "agent-gc timer: no endpoint, state {}, no open or unknown \
-                     messages, idle {:.0}s > older_than {:.0}s",
-                    agent.state, age, older_than
-                ),
-                "age_secs": age.floor(),
-                "older_than_secs": older_than,
-                "thread_id": agent.thread_id,
-                "session_id": agent.session_id,
-                "records_only": true,
-                "note": crate::daemon::AGENT_GC_RECORDS_ONLY,
-            }),
-        )?;
-        tx.commit()?;
-        Ok(Some(agent))
-    }
 
     /// CAD-96: per alias, the newest durable activity and the count of
     /// messages in any state but completed, failed, interrupted or

@@ -84,7 +84,7 @@ fn binding_material_same(old: &Value, new: &Value) -> bool {
     FIELDS.iter().all(|field| old[field] == new[field])
 }
 
-fn binding_in(conn: &Connection, install: &str, id: &str) -> Result<Value> {
+fn binding_in(conn: &dyn super::StoreConn, install: &str, id: &str) -> Result<Value> {
     let row = conn.query_row(
         "SELECT context_id,slot,revision,state,config,digest FROM app_bindings WHERE install_id=? AND id=?",
         params![install,id], |r| Ok((r.get::<_,Option<String>>(0)?,r.get::<_,String>(1)?,
@@ -101,7 +101,7 @@ fn binding_in(conn: &Connection, install: &str, id: &str) -> Result<Value> {
 }
 
 pub(crate) fn binding_current_in(
-    conn: &Connection,
+    conn: &dyn super::StoreConn,
     install: &str,
     context: Option<&str>,
     slot: &str,
@@ -170,7 +170,7 @@ impl Store {
     /// historical authority.
     /// Answers whether an approval was withdrawn (absent stays absent).
     pub(super) fn app_binding_approval_withdraw_in(
-        tx: &Connection,
+        tx: &dyn super::StoreConn,
         install: &str,
         reason: &str,
     ) -> Result<bool> {
@@ -212,7 +212,7 @@ impl Store {
     /// derivation (any app, any install) still covers it, so a rebind
     /// never cuts another install's grant and never keeps this one's.
     pub(super) fn app_install_grants_drop_in(
-        tx: &Connection,
+        tx: &dyn super::StoreConn,
         install_id: &str,
         by: &str,
     ) -> Result<()> {
@@ -310,7 +310,7 @@ impl Store {
     /// credential revoke/rotate transaction, so the record change and
     /// the approval withdrawal land together.
     pub(super) fn app_binding_approvals_withdraw_for_credential_in(
-        tx: &Connection,
+        tx: &dyn super::StoreConn,
         platform_name: &str,
         account: &str,
     ) -> Result<()> {
@@ -391,17 +391,19 @@ impl Store {
     /// Upgrade compatibility must inspect every configured binding, including
     /// rows intentionally hidden by the bounded operator inventory.
     pub fn app_binding_upgrade_configured(&self, install: &str) -> Result<Vec<Value>> {
-        let conn = self.write_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id FROM app_bindings WHERE install_id=? AND state='configured' ORDER BY id",
-        )?;
-        let ids = stmt
-            .query_map([install], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        ids.iter()
-            .map(|id| binding_in(&conn, install, id))
-            .collect()
-    }
+        return self.write_tx(|conn| {
+
+                    let mut stmt = conn.prepare(
+                        "SELECT id FROM app_bindings WHERE install_id=? AND state='configured' ORDER BY id",
+                    )?;
+                    let ids = stmt
+                        .query_map([install], |row| row.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    ids.iter()
+                        .map(|id| binding_in(&conn, install, id))
+                        .collect()
+        });
+        }
 
     /// Called under the PM upgrade lock before any journal write. Every
     /// declared slot must be usable in at least one scope after the upgrade.
@@ -414,37 +416,39 @@ impl Store {
         if slots.is_empty() {
             return Ok(());
         }
-        let conn = self.write_conn()?;
-        let total: i64 = conn.query_row(
-            "SELECT count(*) FROM app_bindings WHERE install_id=?",
-            [install],
-            |r| r.get(0),
-        )?;
-        let active: i64 = conn.query_row(
-            "SELECT count(*) FROM app_bindings WHERE install_id=? AND state='configured'
-             AND json_extract(config,'$.bundle_digest')=?",
-            params![install, bundle_digest],
-            |r| r.get(0),
-        )?;
-        let mut missing = 0;
-        for slot in slots {
-            let present: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND state='configured'
-                 AND json_extract(config,'$.bundle_digest')=? AND slot=?)",
-                params![install, bundle_digest, slot],
-                |r| r.get(0),
-            )?;
-            if !present {
-                missing += 1;
-            }
+        return self.write_tx(|conn| {
+
+                    let total: i64 = conn.query_row(
+                        "SELECT count(*) FROM app_bindings WHERE install_id=?",
+                        [install],
+                        |r| r.get(0),
+                    )?;
+                    let active: i64 = conn.query_row(
+                        "SELECT count(*) FROM app_bindings WHERE install_id=? AND state='configured'
+                         AND json_extract(config,'$.bundle_digest')=?",
+                        params![install, bundle_digest],
+                        |r| r.get(0),
+                    )?;
+                    let mut missing = 0;
+                    for slot in slots {
+                        let present: bool = conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND state='configured'
+                             AND json_extract(config,'$.bundle_digest')=? AND slot=?)",
+                            params![install, bundle_digest, slot],
+                            |r| r.get(0),
+                        )?;
+                        if !present {
+                            missing += 1;
+                        }
+                    }
+                    if total + missing > LIFETIME_MAX || active + missing > ACTIVE_BUNDLE_MAX {
+                        return Err(Error::rejected(
+                            "binding capacity cannot reserve the new package's declared slots; retain evidence or choose another installation",
+                        ));
+                    }
+                    Ok(())
+        });
         }
-        if total + missing > LIFETIME_MAX || active + missing > ACTIVE_BUNDLE_MAX {
-            return Err(Error::rejected(
-                "binding capacity cannot reserve the new package's declared slots; retain evidence or choose another installation",
-            ));
-        }
-        Ok(())
-    }
 
     pub fn app_binding_create(
         &self,
@@ -457,82 +461,82 @@ impl Store {
         validate_config(install, context, config)?;
         crate::proto::identifier(slot, "publication slot")?;
         crate::proto::identifier(request, "binding request id")?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let existing = tx
-            .query_row(
-                "SELECT id FROM app_bindings WHERE install_id=? AND request_id=?",
-                params![install, request],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?;
-        if let Some(id) = existing {
-            let row = binding_in(&tx, install, &id)?;
-            if row["context_id"] != json!(context)
-                || row["slot"] != slot
-                || row["config"] != *config
-            {
-                return Err(Error::rejected(
-                    "binding request id is already used for different material",
-                ));
-            }
-            tx.commit()?;
-            return Ok(json!({"binding":row}));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let existing = tx
+                        .query_row(
+                            "SELECT id FROM app_bindings WHERE install_id=? AND request_id=?",
+                            params![install, request],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    if let Some(id) = existing {
+                        let row = binding_in(&tx, install, &id)?;
+                        if row["context_id"] != json!(context)
+                            || row["slot"] != slot
+                            || row["config"] != *config
+                        {
+                            return Err(Error::rejected(
+                                "binding request id is already used for different material",
+                            ));
+                        }
+                        return Ok(json!({"binding":row}));
+                    }
+                    let total: i64 = tx.query_row(
+                        "SELECT count(*) FROM app_bindings WHERE install_id=?",
+                        [install],
+                        |r| r.get(0),
+                    )?;
+                    if total >= LIFETIME_MAX {
+                        return Err(Error::rejected(
+                            "installation has reached its lifetime binding capacity",
+                        ));
+                    }
+                    let active: i64 = tx.query_row(
+                        "SELECT count(*) FROM app_bindings WHERE install_id=? AND state='configured'
+                         AND json_extract(config,'$.bundle_digest')=?",
+                        params![install, config["bundle_digest"].as_str()],
+                        |r| r.get(0),
+                    )?;
+                    if active >= ACTIVE_BUNDLE_MAX {
+                        return Err(Error::rejected(
+                            "this package version has reached its configured binding capacity",
+                        ));
+                    }
+                    let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND coalesce(json_extract(config,'$.bundle_digest'),'')=coalesce(?,'') AND state='configured')",params![install,scope_key(context),slot,config["bundle_digest"].as_str()],|r| r.get(0))?;
+                    if occupied {
+                        return Err(Error::rejected(
+                            "this scope already has a configured binding for this slot",
+                        ));
+                    }
+                    let id = format!("binding-{}", uuid::Uuid::new_v4().simple());
+                    let digest = config_digest(install, context, slot, config);
+                    tx.execute(
+                        "INSERT INTO app_bindings VALUES(?,?,?,?,?,1,'configured',?,?,?, ?,?)",
+                        params![
+                            id,
+                            install,
+                            context,
+                            scope_key(context),
+                            slot,
+                            config.to_string(),
+                            digest,
+                            request,
+                            now(),
+                            now()
+                        ],
+                    )?;
+                    Self::event(
+                        &tx,
+                        "app_bindings",
+                        "app_binding_configured",
+                        json!({"install_id":install,"binding_id":id,"revision":1,"digest":digest}),
+                    )?;
+                    let row = binding_in(&tx, install, &id)?;
+                    Ok(json!({"binding":row}))
+        });
         }
-        let total: i64 = tx.query_row(
-            "SELECT count(*) FROM app_bindings WHERE install_id=?",
-            [install],
-            |r| r.get(0),
-        )?;
-        if total >= LIFETIME_MAX {
-            return Err(Error::rejected(
-                "installation has reached its lifetime binding capacity",
-            ));
-        }
-        let active: i64 = tx.query_row(
-            "SELECT count(*) FROM app_bindings WHERE install_id=? AND state='configured'
-             AND json_extract(config,'$.bundle_digest')=?",
-            params![install, config["bundle_digest"].as_str()],
-            |r| r.get(0),
-        )?;
-        if active >= ACTIVE_BUNDLE_MAX {
-            return Err(Error::rejected(
-                "this package version has reached its configured binding capacity",
-            ));
-        }
-        let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND coalesce(json_extract(config,'$.bundle_digest'),'')=coalesce(?,'') AND state='configured')",params![install,scope_key(context),slot,config["bundle_digest"].as_str()],|r| r.get(0))?;
-        if occupied {
-            return Err(Error::rejected(
-                "this scope already has a configured binding for this slot",
-            ));
-        }
-        let id = format!("binding-{}", uuid::Uuid::new_v4().simple());
-        let digest = config_digest(install, context, slot, config);
-        tx.execute(
-            "INSERT INTO app_bindings VALUES(?,?,?,?,?,1,'configured',?,?,?, ?,?)",
-            params![
-                id,
-                install,
-                context,
-                scope_key(context),
-                slot,
-                config.to_string(),
-                digest,
-                request,
-                now(),
-                now()
-            ],
-        )?;
-        Self::event(
-            &tx,
-            "app_bindings",
-            "app_binding_configured",
-            json!({"install_id":install,"binding_id":id,"revision":1,"digest":digest}),
-        )?;
-        let row = binding_in(&tx, install, &id)?;
-        tx.commit()?;
-        Ok(json!({"binding":row}))
-    }
 
     pub fn app_binding_update(
         &self,
@@ -541,87 +545,89 @@ impl Store {
         expected: i64,
         config: &Value,
     ) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let row = binding_in(&tx, install, id)?;
-        let revision = row["revision"]
-            .as_i64()
-            .ok_or_else(|| Error::internal("invalid binding revision"))?;
-        if revision != expected {
-            return Err(Error::conflict(revision, "binding revision changed"));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let row = binding_in(&tx, install, id)?;
+                    let revision = row["revision"]
+                        .as_i64()
+                        .ok_or_else(|| Error::internal("invalid binding revision"))?;
+                    if revision != expected {
+                        return Err(Error::conflict(revision, "binding revision changed"));
+                    }
+                    if row["state"] != "configured" {
+                        return Err(Error::rejected("revoked binding cannot be updated"));
+                    }
+                    let context = row["context_id"].as_str();
+                    validate_config(install, context, config)?;
+                    if row["config"]["bundle_digest"] != config["bundle_digest"] {
+                        return Err(Error::rejected(
+                            "a new bundle needs a new version-pinned binding; update cannot rewrite an old version",
+                        ));
+                    }
+                    // CAD-796: an unchanged re-save is a complete no-op — same
+                    // revision, open effects, standing approval. Only a material
+                    // rebind (CAD-692) bumps the incarnation and closes the waiting
+                    // effects pinned to the old one.
+                    if row["config"] == *config {
+                        return Ok(json!({"binding": row}));
+                    }
+                    let material_changed = !binding_material_same(&row["config"], config);
+                    let slot = row["slot"]
+                        .as_str()
+                        .ok_or_else(|| Error::internal("invalid binding slot"))?;
+                    let digest = config_digest(install, context, slot, config);
+                    let updated = tx.execute("UPDATE app_bindings SET config=?,digest=?,revision=revision+1,updated=? WHERE install_id=? AND id=? AND revision=? AND state='configured'",params![config.to_string(),digest,now(),install,id,expected])?;
+                    if updated != 1 {
+                        return Err(Error::rejected("binding update lost its revision claim"));
+                    }
+                    Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
+                    if material_changed {
+                        Self::app_binding_approval_withdraw_in(&tx, install, "connection_binding_changed")?;
+                        Self::app_install_grants_drop_in(&tx, install, "operator")?;
+                    }
+                    Self::event(
+                        &tx,
+                        "app_bindings",
+                        "app_binding_configured",
+                        json!({"install_id":install,"binding_id":id,"revision":revision+1,"digest":digest}),
+                    )?;
+                    let next = binding_in(&tx, install, id)?;
+                    Ok(json!({"binding":next}))
+        });
         }
-        if row["state"] != "configured" {
-            return Err(Error::rejected("revoked binding cannot be updated"));
-        }
-        let context = row["context_id"].as_str();
-        validate_config(install, context, config)?;
-        if row["config"]["bundle_digest"] != config["bundle_digest"] {
-            return Err(Error::rejected(
-                "a new bundle needs a new version-pinned binding; update cannot rewrite an old version",
-            ));
-        }
-        // CAD-796: an unchanged re-save is a complete no-op — same
-        // revision, open effects, standing approval. Only a material
-        // rebind (CAD-692) bumps the incarnation and closes the waiting
-        // effects pinned to the old one.
-        if row["config"] == *config {
-            return Ok(json!({"binding": row}));
-        }
-        let material_changed = !binding_material_same(&row["config"], config);
-        let slot = row["slot"]
-            .as_str()
-            .ok_or_else(|| Error::internal("invalid binding slot"))?;
-        let digest = config_digest(install, context, slot, config);
-        let updated = tx.execute("UPDATE app_bindings SET config=?,digest=?,revision=revision+1,updated=? WHERE install_id=? AND id=? AND revision=? AND state='configured'",params![config.to_string(),digest,now(),install,id,expected])?;
-        if updated != 1 {
-            return Err(Error::rejected("binding update lost its revision claim"));
-        }
-        Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
-        if material_changed {
-            Self::app_binding_approval_withdraw_in(&tx, install, "connection_binding_changed")?;
-            Self::app_install_grants_drop_in(&tx, install, "operator")?;
-        }
-        Self::event(
-            &tx,
-            "app_bindings",
-            "app_binding_configured",
-            json!({"install_id":install,"binding_id":id,"revision":revision+1,"digest":digest}),
-        )?;
-        let next = binding_in(&tx, install, id)?;
-        tx.commit()?;
-        Ok(json!({"binding":next}))
-    }
 
     pub fn app_binding_revoke(&self, install: &str, id: &str, expected: i64) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let row = binding_in(&tx, install, id)?;
-        let revision = row["revision"]
-            .as_i64()
-            .ok_or_else(|| Error::internal("invalid binding revision"))?;
-        if revision != expected {
-            return Err(Error::conflict(revision, "binding revision changed"));
+        return self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let row = binding_in(&tx, install, id)?;
+                    let revision = row["revision"]
+                        .as_i64()
+                        .ok_or_else(|| Error::internal("invalid binding revision"))?;
+                    if revision != expected {
+                        return Err(Error::conflict(revision, "binding revision changed"));
+                    }
+                    if row["state"] != "configured" {
+                        return Err(Error::rejected("binding is already revoked"));
+                    }
+                    let updated = tx.execute("UPDATE app_bindings SET state='revoked',revision=revision+1,updated=? WHERE install_id=? AND id=? AND revision=? AND state='configured'",params![now(),install,id,expected])?;
+                    if updated != 1 {
+                        return Err(Error::rejected("binding revoke lost its revision claim"));
+                    }
+                    Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
+                    Self::app_binding_approval_withdraw_in(&tx, install, "connection_binding_changed")?;
+                    Self::app_install_grants_drop_in(&tx, install, "operator")?;
+                    Self::event(
+                        &tx,
+                        "app_bindings",
+                        "app_binding_revoked",
+                        json!({"install_id":install,"binding_id":id,"revision":revision+1}),
+                    )?;
+                    let next = binding_in(&tx, install, id)?;
+                    Ok(json!({"binding":next}))
+        });
         }
-        if row["state"] != "configured" {
-            return Err(Error::rejected("binding is already revoked"));
-        }
-        let updated = tx.execute("UPDATE app_bindings SET state='revoked',revision=revision+1,updated=? WHERE install_id=? AND id=? AND revision=? AND state='configured'",params![now(),install,id,expected])?;
-        if updated != 1 {
-            return Err(Error::rejected("binding revoke lost its revision claim"));
-        }
-        Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
-        Self::app_binding_approval_withdraw_in(&tx, install, "connection_binding_changed")?;
-        Self::app_install_grants_drop_in(&tx, install, "operator")?;
-        Self::event(
-            &tx,
-            "app_bindings",
-            "app_binding_revoked",
-            json!({"install_id":install,"binding_id":id,"revision":revision+1}),
-        )?;
-        let next = binding_in(&tx, install, id)?;
-        tx.commit()?;
-        Ok(json!({"binding":next}))
-    }
 
     pub fn app_binding_for_slot(
         &self,

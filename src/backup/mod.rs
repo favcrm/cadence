@@ -1176,6 +1176,9 @@ fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
 /// Null the token-bearing columns, then rebuild the file so freed pages
 /// (deleted rows, old values) are not carried along.
 fn scrub(db: &Path) -> Result<Scrub> {
+    // CAD-1011: a durable-sealed or latch-carrying source must not be
+    // copy-transformed into a production-usable db — refuse at the source.
+    crate::store::preflight_writer_guard(db)?;
     let conn = Connection::open(db)?;
     // Turn tokens live on in event payloads and prose long after the
     // messages row, and a token spells out its generation. Redact every
@@ -1893,6 +1896,8 @@ fn apply_remap(db: &Path, mappings: &[Mapping]) -> Result<Vec<usize>> {
     if mappings.iter().all(|m| m.from == m.to) {
         return Ok(rows);
     }
+    // CAD-1011: refuse to remap a durable-sealed/latch-carrying source.
+    crate::store::preflight_writer_guard(db)?;
     let conn = Connection::open(db)?;
     let tx = conn.unchecked_transaction()?;
     for (table, column) in PATH_COLUMNS {

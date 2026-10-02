@@ -83,6 +83,7 @@ mod seal;
 pub(crate) use schema::open_read_only;
 pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
 pub use seal::OpenMode;
+pub(crate) use seal::{preflight_writer_guard, StoreConn, WriteTxn};
 #[cfg(test)]
 mod tests;
 
@@ -208,26 +209,45 @@ impl Store {
         }
     }
 
-    /// CAD-538: the write path's connection — [`Self::conn`] plus the
-    /// hosted-lease fence, checked while holding the lock so the check
-    /// and the write that follows it are serialized against the trip.
+    /// CAD-1011: the ONLY producer write lane. `f` runs inside
+    /// `BEGIN IMMEDIATE` on the held conn mutex after the durable
+    /// closure latch and the hosted-lease fence are both re-checked
+    /// *inside* the lock — closure-check, lease-check and every DML are
+    /// one SQLite writer critical section. A fenced or sealed store
+    /// refuses before `f` runs; a callback error/panic rolls back.
+    ///
     /// `check` covers both halves of lease loss: the detected trip and
     /// the held lease's expiry — a shutdown tail outliving the TTL
     /// cannot commit into a lease a successor already took. The
     /// heartbeat's [`Self::fence_writes`] drains the in-flight writer
     /// before it returns, so no write starts post-trip.
-    ///
-    /// CAD-1011: the returned [`seal::WriteConn`] also evaluates the
-    /// durable closure latch under the lock and arms the `Business` write
-    /// lane for the guard's lifetime — the caller's write is checked and
-    /// authorized as one critical section, and a sealed store refuses.
-    fn write_conn(&self) -> Result<seal::WriteConn<'_>> {
-        if let Some(reason) = self.write_fence.get().and_then(|f| f.check()) {
-            return Err(Error::rejected(format!(
-                "store write refused — the daemon's hosted lease is lost: {reason}"
-            )));
-        }
-        self.write_conn_sealed()
+    pub(crate) fn write_tx<R>(
+        &self,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
+    ) -> Result<R>
+    where
+        R: 'static,
+    {
+        // The fence is re-checked inside the held conn mutex by
+        // `with_sealed_tx_fenced` — a writer fenced while waiting on the
+        // lock is refused before arming or opening the tx.
+        self.with_sealed_tx_fenced(|| self.write_fence.get().and_then(|f| f.check()), f)
+    }
+
+    /// Raw-error variant of [`Self::write_tx`] — the callback returns
+    /// `rusqlite::Result` so callers classify BUSY/constraint at the
+    /// source (e.g. `shutdown_entries`' typed-retry path).
+    pub(crate) fn write_tx_raw<T>(
+        &self,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T>
+    where
+        T: 'static,
+    {
+        self.with_sealed_tx_fenced_raw(
+            || self.write_fence.get().and_then(|f| f.check()),
+            f,
+        )
     }
 
     /// Install the hosted-lease fence — the daemon calls this right

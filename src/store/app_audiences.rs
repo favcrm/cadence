@@ -247,7 +247,7 @@ struct Computation {
 }
 
 impl RecordStore {
-    fn customers_in(conn: &Connection, context: &str) -> Result<Vec<CustomerRow>> {
+    fn customers_in(conn: &dyn super::StoreConn, context: &str) -> Result<Vec<CustomerRow>> {
         let mut stmt = conn
             .prepare("SELECT id,revision,body FROM app_records WHERE context_id=? ORDER BY id")
             .map_err(|e| Error::internal(e.to_string()))?;
@@ -276,7 +276,7 @@ impl RecordStore {
     }
 
     fn suppressions_in(
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         context: &str,
     ) -> Result<(
         std::collections::HashSet<String>,
@@ -303,7 +303,7 @@ impl RecordStore {
         Ok((emails, customers))
     }
 
-    fn suppression_digest_in(conn: &Connection, context: &str) -> Result<String> {
+    fn suppression_digest_in(conn: &dyn super::StoreConn, context: &str) -> Result<String> {
         let mut stmt = conn
             .prepare("SELECT kind,key FROM app_suppressions WHERE context_id=? ORDER BY kind,key")
             .map_err(|e| Error::internal(e.to_string()))?;
@@ -322,7 +322,7 @@ impl RecordStore {
     }
 
     fn segment_in(
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         context: &str,
         segment_id: &str,
     ) -> Result<(i64, String, Vec<Predicate>, String)> {
@@ -351,7 +351,7 @@ impl RecordStore {
     }
 
     fn exclusion_in(
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         context: &str,
         list_id: &str,
     ) -> Result<(i64, String, Vec<String>, String)> {
@@ -387,7 +387,7 @@ impl RecordStore {
     /// prepare and show-verification share one computation.
     fn compute_audience(
         &self,
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         context: &str,
         base: &AudienceBase,
         exclusion_list_id: Option<&str>,
@@ -526,7 +526,7 @@ impl RecordStore {
         })
     }
 
-    fn sample_in(&self, conn: &Connection, context: &str, ids: &[String]) -> Result<Vec<Value>> {
+    fn sample_in(&self, conn: &dyn super::StoreConn, context: &str, ids: &[String]) -> Result<Vec<Value>> {
         let mut sample = Vec::new();
         for id in ids.iter().take(SAMPLE_MAX) {
             let name: String = conn
@@ -552,7 +552,7 @@ impl RecordStore {
 
     fn preview_json(
         &self,
-        conn: &Connection,
+        conn: &dyn super::StoreConn,
         context: &str,
         base: &AudienceBase,
         exclusion_list_id: Option<&str>,
