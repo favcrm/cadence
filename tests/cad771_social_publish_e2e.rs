@@ -697,7 +697,7 @@ fn freeze_params(
         "destination_id": DEST_FB, "toolkit": "facebook",
         // CAD-1027: one approval authorizes one intent — each request
         // carries its own approval identity.
-        "grant_id": GRANT_FB, "approval_id": format!("apv-{request}"),
+        "grant_id": GRANT_FB, "approval_id": approval_for(request),
         "due_epoch": due, "timezone": "Asia/Hong_Kong"})
 }
 
@@ -1992,7 +1992,7 @@ fn cad1027_one_approval_one_intent_rpc_and_http() {
             "cad_fx_apv",
             epoch_now() + 3600,
         );
-        b["approval_id"] = json!("apv-cad1027-double");
+        b["approval_id"] = json!(approval_for("cad1027-double"));
         b
     };
     // Four concurrent submits of one approval with distinct request ids.
@@ -2067,5 +2067,83 @@ fn cad1027_one_approval_one_intent_rpc_and_http() {
         intent_count(&h, &install),
         1,
         "a refused call stored an intent"
+    );
+}
+
+/// CAD-1027: a daemon-shaped approval id (`apv-` + 32 lowercase hex),
+/// distinct per seed — one approval authorizes one intent.
+fn approval_for(seed: &str) -> String {
+    use sha2::Digest as _;
+    let hex = format!("{:x}", sha2::Sha256::digest(seed.as_bytes()));
+    format!("apv-{}", &hex[..32])
+}
+
+/// CAD-1027 adversarial: the daemon accepts only the minted approval shape
+/// (`apv-` + 32 lowercase hex), so a non-UI operator client cannot choose a
+/// guessable approval id. Every other shape refuses `bad_approval` through
+/// the RPC and the HTTP relay and stores nothing.
+#[test]
+fn cad1027_daemon_refuses_unminted_approval_shape() {
+    let door = FakeDoor::start();
+    let h = resolver_only_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "apvshape");
+    let board = Board::serve(&h);
+    let hex = "0123456789abcdef0123456789abcdef";
+    for (i, approval) in [
+        "op-a".to_owned(),
+        "cad_approval_01".to_owned(),
+        format!("apv-{}", hex.to_uppercase()),
+        format!("apv-{}", &hex[..31]),
+        format!("apv-{hex}0"),
+        format!("apv-{}g", &hex[..31]),
+        format!("APV-{hex}"),
+        format!(" apv-{hex}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut params = freeze_params(
+            &context,
+            &run,
+            &bundle,
+            &install,
+            &format!("cad1027-shape-{i}"),
+            "cad_fx_apvshape",
+            epoch_now() + 3600,
+        );
+        params["approval_id"] = json!(approval);
+        let err = h
+            .daemon
+            .operator_rpc("social_publish_schedule", params.clone())
+            .expect_err(&approval)
+            .to_string();
+        assert!(err.contains("bad_approval"), "RPC {approval:?}: {err}");
+        let (code, text) = board.post(&h, "/api/social-publishes", &params);
+        assert!(
+            (400..500).contains(&code),
+            "HTTP accepted {approval:?}: {code} {text}"
+        );
+        assert!(text.contains("bad_approval"), "HTTP {approval:?}: {text}");
+    }
+    assert_eq!(
+        intent_count(&h, &install),
+        0,
+        "an unminted approval stored an intent"
+    );
+    let mut ok = freeze_params(
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1027-shape-ok",
+        "cad_fx_apvshape",
+        epoch_now() + 3600,
+    );
+    ok["approval_id"] = json!(format!("apv-{hex}"));
+    assert_eq!(
+        h.daemon
+            .operator_rpc("social_publish_schedule", ok)
+            .unwrap()["intent"]["state"],
+        "queued"
     );
 }

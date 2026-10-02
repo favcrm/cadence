@@ -186,7 +186,7 @@ fn schedule_body(
         "bundle_digest": bundle,
         "slot": "publication", "effect_id": "cad_fx_cad979",
         "destination_id": "17841400008460056", "toolkit": "instagram",
-        "grant_id": "dpq_synthetic_grant_ig", "approval_id": format!("apv-{request}"),
+        "grant_id": "dpq_synthetic_grant_ig", "approval_id": approval_for(request),
         "due_epoch": 1_750_000_000, "timezone": "Asia/Hong_Kong"});
     if let Some(key) = media_key {
         b["media_key"] = json!(key);
@@ -1483,4 +1483,12 @@ fn cad979_import_without_resolver_is_capability_unavailable() {
         err
     );
     assert_eq!(door.calls.load(Ordering::SeqCst), 0);
+}
+
+/// CAD-1027: a daemon-shaped approval id (`apv-` + 32 lowercase hex),
+/// distinct per seed — one approval authorizes one intent.
+fn approval_for(seed: &str) -> String {
+    use sha2::Digest as _;
+    let hex = format!("{:x}", sha2::Sha256::digest(seed.as_bytes()));
+    format!("apv-{}", &hex[..32])
 }

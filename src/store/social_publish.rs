@@ -668,6 +668,17 @@ fn bare_digest(prefixed: &str) -> Result<&str> {
     Ok(hex)
 }
 
+/// CAD-1027: the operator approval id the confirmation step mints —
+/// `apv-` then exactly 32 lowercase hex (128 random bits).
+pub fn valid_approval_id(raw: &str) -> bool {
+    raw.strip_prefix("apv-").is_some_and(|hex| {
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 /// Params for freezing an intent from reviewed run material instead of
 /// caller-supplied digests.
 #[allow(clippy::too_many_arguments)]
@@ -706,6 +717,13 @@ impl Store {
         &self,
         row: &FreezeFromArtifact<'_>,
     ) -> Result<Value> {
+        // CAD-1027: only the minted approval shape freezes, so the
+        // per-confirmation, unguessable approval is not a UI-only property.
+        if !valid_approval_id(row.approval_id) {
+            return Err(Error::rejected(
+                "bad_approval: approval id must be apv- followed by 32 lowercase hex",
+            ));
+        }
         let material = self.app_publication_material(
             row.run_id,
             row.artifact_id,

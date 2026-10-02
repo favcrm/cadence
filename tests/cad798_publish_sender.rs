@@ -1316,7 +1316,7 @@ fn freeze_params(
         "bundle_digest": bundle_digest,
         "slot": "publication", "effect_id": "cad_fx_798_e2e_01",
         "destination_id": DEST, "toolkit": "facebook",
-        "grant_id": grant, "approval_id": format!("apv-{request}"),
+        "grant_id": grant, "approval_id": approval_for(request),
         "due_epoch": due, "timezone": "Asia/Hong_Kong"})
 }
 
@@ -1545,4 +1545,12 @@ fn cad798_registration_accepts_explicit_config() {
     .expect("explicit config registers");
     assert!(opts.social_publish_sender.is_some());
     clear_env();
+}
+
+/// CAD-1027: a daemon-shaped approval id (`apv-` + 32 lowercase hex),
+/// distinct per seed — one approval authorizes one intent.
+fn approval_for(seed: &str) -> String {
+    use sha2::Digest as _;
+    let hex = format!("{:x}", sha2::Sha256::digest(seed.as_bytes()));
+    format!("apv-{}", &hex[..32])
 }
