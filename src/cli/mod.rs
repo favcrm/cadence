@@ -903,6 +903,7 @@ pub(crate) fn daemon_restart(
             state_dir,
             &cadence_agent::ui::UiAction::Stop {
                 tailscale_off: false,
+                as_identity: None,
             },
         )?;
         // ui.json is the source of truth now; the /proc argv is only
@@ -931,6 +932,7 @@ pub(crate) fn daemon_restart(
             &cadence_agent::ui::UiAction::Start {
                 flags,
                 reset: false,
+                as_identity: None,
             },
         )?;
         println!("ui: restarted");
