@@ -95,7 +95,7 @@ globalThis.fetch = (async (input: unknown) => {
     return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: null });
   }
   if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });
-  if (path === "/api/projects") return json({ projects: [] });
+  if (path === "/api/projects") return json({ projects: [{ key: "alpha", prefix: "ALP", components: [], repos: [], issues: 0 }] });
   if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });
   if (path === "/api/health") return json({ ok: true, pm_present: false, projects: 0, issues: 0, daemon: "stub", embedded: true });
   if (path === "/api/update/banner") return json(null);
@@ -188,6 +188,18 @@ assert(
 // The phone menu nests the same submenu with the same current state.
 await click(host.querySelector('button[aria-controls="mobile-navigation"]'));
 await settle(() => assert(host.querySelector("#mobile-navigation"), "phone menu opens"));
+// Every link and control in the open phone menu sits in a landmark.
+const unlandmarked = Array.from(host.querySelectorAll("#mobile-navigation a, #mobile-navigation button")).filter(
+  (el) => !el.closest("nav, [role=region][aria-label]"),
+);
+assert(
+  unlandmarked.length === 0,
+  `phone menu controls outside a landmark: ${unlandmarked.map((el) => (el.textContent ?? "").trim()).join(", ")}`,
+);
+assert(
+  host.querySelector('#mobile-navigation nav[aria-label="Projects"] a.proj'),
+  "phone project links sit under nav[aria-label=Projects]",
+);
 const phoneLinks = () =>
   Array.from(host.querySelectorAll("#mobile-navigation a")).filter((el) =>
     ["Customers", "Segments", "Campaigns"].includes((el.textContent ?? "").trim()),

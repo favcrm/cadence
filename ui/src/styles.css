@@ -185,6 +185,10 @@ body {
 #mobile-navigation .navlink-sub {
   min-height: 36px;
 }
+#mobile-navigation .proj {
+  min-height: 36px;
+  align-items: center;
+}
 .proj {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
