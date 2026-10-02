@@ -45,6 +45,7 @@ async function openConfirmation() {
   await flush();
 }
 let refuseSchedule = false;
+const cancelScopes: [string, string | null][] = [];
 const reviewedHex = "ab".repeat(32);
 const otherHex = "cd".repeat(32);
 let importHex = otherHex;
@@ -72,7 +73,7 @@ const stub = {
     imports.push(body);
     return { media_key: `dp1.ws.conn.${importHex.slice(0, 32)}`, image_digest: importHex };
   },
-  cancel: async (intentId: string, installId: string, contextId: string | null) => { assert(installId === "install-a" && contextId === null, "Panel cancels in its own install/context scope"); cancelled.push(intentId); intents = intents.map(value => value.intent_id === intentId ? { ...value, state: "cancelled" } : value); return { intent: intents.find(value => value.intent_id === intentId) }; },
+  cancel: async (intentId: string, installId: string, contextId: string | null) => { cancelScopes.push([installId, contextId]); cancelled.push(intentId); intents = intents.map(value => value.intent_id === intentId ? { ...value, state: "cancelled" } : value); return { intent: intents.find(value => value.intent_id === intentId) }; },
 };
 let mounts = 0;
 async function render(props: any) {
@@ -155,7 +156,9 @@ async function main() {
   assert(button("Review schedule")?.disabled, "Schedule without a due time stays gated");
   // Cancel takes two explicit presses from queued only (cancel_closed past queued).
   assert(!button("Cancel before dispatch"), "Processing intent offers no cancel");
-  intents = [{ ...intents[0], intent_id: "intent-q", state: "queued" }];
+  // An unscoped panel (contextId null) lists another context's intent; its
+  // cancel must carry that intent's own frozen install and context.
+  intents = [{ ...intents[0], intent_id: "intent-q", state: "queued", install_id: "install-a", context_id: "ctx-other" }];
   await render({ candidates: [candidate], });
   assert(button("Cancel before dispatch"), "Queued intent offers cancel");
   await React.act(async () => { button("Cancel before dispatch")?.click(); });
@@ -164,6 +167,7 @@ async function main() {
   await React.act(async () => { button("Confirm cancel")?.click(); });
   await flush(); await flush();
   assert(cancelled.includes("intent-q") && text().includes("Nothing was sent"), "Cancel closes the intent without a send");
+  assert(cancelScopes.at(-1)?.[0] === "install-a" && cancelScopes.at(-1)?.[1] === "ctx-other", "Cancel uses the intent's frozen install/context, not the panel's");
   // Every state renders its operator copy.
   intents = [
     { ...intents[0], intent_id: "i-posted", state: "posted", permalink: "https://www.instagram.com/p/fixture000/", receipt: { ok: true } },

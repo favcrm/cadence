@@ -232,11 +232,14 @@ export default function PublishPanel({
     }
   };
 
-  const cancel = async (intentId: string) => {
+  // CAD-1027: cancel in the intent's own frozen scope. An unscoped list
+  // shows every context's intents; the panel's context would refuse them.
+  const cancel = async (intent: PublishIntent) => {
+    const intentId = intent.intent_id;
     setBusy(true);
     setActionError(null);
     try {
-      await client.cancel(intentId, installId, contextId);
+      await client.cancel(intentId, intent.install_id, intent.context_id);
       setConfirmCancel(null);
       setNotice(`Cancelled ${intentId} before dispatch. Nothing was sent.`);
       statusRef.current?.focus();
@@ -329,7 +332,7 @@ export default function PublishPanel({
                 size="sm"
                 loading={busy}
                 disabled={!canWrite}
-                onClick={() => void cancel(intent.intent_id)}
+                onClick={() => void cancel(intent)}
               >
                 Confirm cancel
               </Button>
