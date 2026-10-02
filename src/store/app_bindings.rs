@@ -1,9 +1,9 @@
 //! Configured app bindings are immutable scoped receipts, never grants.
+use super::StoreConn;
 use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use super::StoreConn;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS app_bindings(
@@ -265,12 +265,11 @@ impl Store {
                     }
                     still
                 };
-                let existing: Option<String> = tx
-                    .query_opt(
-                        "SELECT scopes FROM platform_grants WHERE agent=? AND platform=? AND account=?",
-                        params![agent, plat, account],
-                        |r| r.get(0),
-                    )?;
+                let existing: Option<String> = tx.query_opt(
+                    "SELECT scopes FROM platform_grants WHERE agent=? AND platform=? AND account=?",
+                    params![agent, plat, account],
+                    |r| r.get(0),
+                )?;
                 let Some(raw) = existing else {
                     continue;
                 };
@@ -384,16 +383,16 @@ impl Store {
     /// rows intentionally hidden by the bounded operator inventory.
     pub fn app_binding_upgrade_configured(&self, install: &str) -> Result<Vec<Value>> {
         return self.write_tx(|conn| {
-                    let ids: Vec<String> = conn.query_vec(
-                        "SELECT id FROM app_bindings WHERE install_id=? AND state='configured' ORDER BY id",
-                        [install],
-                        |row| row.get::<_, String>(0),
-                    )?;
-                    ids.iter()
-                        .map(|id| binding_in(&*conn, install, id))
-                        .collect()
+            let ids: Vec<String> = conn.query_vec(
+                "SELECT id FROM app_bindings WHERE install_id=? AND state='configured' ORDER BY id",
+                [install],
+                |row| row.get::<_, String>(0),
+            )?;
+            ids.iter()
+                .map(|id| binding_in(&*conn, install, id))
+                .collect()
         });
-        }
+    }
 
     /// Called under the PM upgrade lock before any journal write. Every
     /// declared slot must be usable in at least one scope after the upgrade.
@@ -438,7 +437,7 @@ impl Store {
                     }
                     Ok(())
         });
-        }
+    }
 
     pub fn app_binding_create(
         &self,
@@ -525,7 +524,7 @@ impl Store {
                     let row = binding_in(&tx, install, &id)?;
                     Ok(json!({"binding":row}))
         });
-        }
+    }
 
     pub fn app_binding_update(
         &self,
@@ -584,7 +583,7 @@ impl Store {
                     let next = binding_in(&tx, install, id)?;
                     Ok(json!({"binding":next}))
         });
-        }
+    }
 
     pub fn app_binding_revoke(&self, install: &str, id: &str, expected: i64) -> Result<Value> {
         return self.write_tx(|conn| {
@@ -616,7 +615,7 @@ impl Store {
                     let next = binding_in(&tx, install, id)?;
                     Ok(json!({"binding":next}))
         });
-        }
+    }
 
     pub fn app_binding_for_slot(
         &self,

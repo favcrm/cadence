@@ -1,4 +1,5 @@
 //! Project-free, broker-local text runs. This is not provider tool confinement.
+use super::StoreConn;
 use super::*;
 use crate::issue::{parse, plan, workflow};
 use rusqlite::{params, OptionalExtension};
@@ -6,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use super::StoreConn;
 
 pub const ARTIFACT_BYTES: usize = 256 * 1024;
 pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -271,7 +271,7 @@ impl Store {
                         json!({"install_id":id,"epoch":epoch,"digest":digest,"approved":approve,"capabilities":["local.text.produce","local.text.review"],"outward_release":false}),
                     )
         });
-        }
+    }
 }
 
 impl Store {
@@ -596,13 +596,10 @@ impl Store {
                     )?;
                     Self::app_run_show_in(&*tx, &id)
         });
-        }
+    }
     pub fn app_run_show(&self, id: &str) -> Result<Value> {
-        return self.write_tx(|conn| {
-
-                    Self::app_run_show_in(&conn, id)
-        });
-        }
+        return self.write_tx(|conn| Self::app_run_show_in(&conn, id));
+    }
     pub(super) fn app_run_show_in(conn: &impl super::StoreConn, id: &str) -> Result<Value> {
         let mut value=conn.query_row("SELECT install_id,epoch,snapshot,snapshot_digest,project_link,state,approved_digest FROM app_runs WHERE id=?",[id],|r|Ok(json!({"id":id,"install_id":r.get::<_,String>(0)?,"epoch":r.get::<_,i64>(1)?,"snapshot":r.get::<_,String>(2)?,"snapshot_digest":r.get::<_,String>(3)?,"project_link":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"approved_digest":r.get::<_,Option<String>>(6)?}))).optional()?.ok_or_else(||Error::rejected("unknown app run"))?;
         value["snapshot"] = serde_json::from_str(value["snapshot"].as_str().unwrap())
@@ -702,13 +699,20 @@ impl Store {
                     drop(conn);
                     self.app_run_show(id)
         });
-        }
-    pub(super) fn app_current_in(conn: &impl super::StoreConn, run: &Value, bundle: &str) -> Result<()> {
+    }
+    pub(super) fn app_current_in(
+        conn: &impl super::StoreConn,
+        run: &Value,
+        bundle: &str,
+    ) -> Result<()> {
         Self::app_authority_in(conn, run, bundle, false)
     }
     /// Completed material retains its original approval epoch across package
     /// upgrades. It is never used for a new/active run or worker dispatch.
-    pub(super) fn app_completed_current_in(conn: &impl super::StoreConn, run: &Value) -> Result<()> {
+    pub(super) fn app_completed_current_in(
+        conn: &impl super::StoreConn,
+        run: &Value,
+    ) -> Result<()> {
         if !matches!(run["state"].as_str(), Some("succeeded" | "failed"))
             || run["approved_digest"] != run["snapshot_digest"]
         {
@@ -1006,17 +1010,16 @@ impl Store {
                     drop(conn);
                     self.app_run_show(id)
         });
-        }
+    }
     /// Authority loss is terminal; existing artifacts and turn receipts remain
     /// immutable. This never retries uncertain provider work.
     pub fn app_run_invalidate(&self, id: &str) -> Result<()> {
         return self.write_tx(|conn| {
-
-                    let tx = &mut *conn;
-                    self.app_run_invalidate_in(&tx, id)?;
-                    Ok(())
+            let tx = &mut *conn;
+            self.app_run_invalidate_in(&tx, id)?;
+            Ok(())
         });
-        }
+    }
     pub(super) fn app_run_invalidate_in(&self, tx: &impl super::StoreConn, id: &str) -> Result<()> {
         let changed = tx.execute("UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state IN ('awaiting_approval','approved','running')", params![now(), id])?;
         if changed != 0 {
@@ -1702,7 +1705,7 @@ impl Store {
 
                             Ok(conn.query_opt("SELECT r.id,r.install_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.message_id=?",[message],|r|Ok((r.get(0)?,r.get(1)?)))?)
             });
-            }
+        }
     }
     pub(super) fn app_message_admit_in(
         &self,
@@ -1740,11 +1743,8 @@ impl Store {
         Ok(())
     }
     pub fn app_message_admit(&self, message: &Message, bundle: &str) -> Result<()> {
-        return self.write_tx(|conn| {
-
-                    self.app_message_admit_in(&conn, message, bundle)
-        });
-        }
+        return self.write_tx(|conn| self.app_message_admit_in(&conn, message, bundle));
+    }
     pub fn reject_app_submission(&self, message: &str) -> Result<()> {
         return self.write_tx(|conn| {
 
@@ -1775,7 +1775,7 @@ impl Store {
                     }
                     Ok(())
         });
-        }
+    }
 }
 
 impl LocalWorkflow {

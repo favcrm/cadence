@@ -939,14 +939,16 @@ fn cad694_real_drain_fault_exits_err_even_when_the_lease_lapses_after() {
         flush_timeout_secs: Some(15),
     });
     opts.stop = Some(Arc::new(AtomicBool::new(true)));
-    opts.shutdown_entries_hook = Some(Arc::new(move |_conn: &cadence_agent::store::WriteTxn<'_>| {
-        let _ = entered_tx.lock().unwrap().send(());
-        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
-        Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
-            Some("injected disk full".to_string()),
-        ))
-    }));
+    opts.shutdown_entries_hook = Some(Arc::new(
+        move |_conn: &cadence_agent::store::WriteTxn<'_>| {
+            let _ = entered_tx.lock().unwrap().send(());
+            let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                Some("injected disk full".to_string()),
+            ))
+        },
+    ));
     opts.provider_deployments =
         Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
     let state_dir = state.path().to_path_buf();

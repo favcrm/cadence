@@ -1,9 +1,9 @@
 //! Server-derived accepted-artifact authorization, distinct from worker grants.
+use super::StoreConn;
 use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 use std::path::Path;
-use super::StoreConn;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS app_effect_authorizations(
@@ -338,11 +338,10 @@ impl Store {
 
     pub fn app_effect_show(&self, id: &str) -> Result<Value> {
         return self.write_tx(|conn| {
-
-                    let (row, authority, digest) = child_in(&conn, id)?;
-                    Ok(envelope(&row, &authority, &digest))
+            let (row, authority, digest) = child_in(&conn, id)?;
+            Ok(envelope(&row, &authority, &digest))
         });
-        }
+    }
 
     /// A provider may have committed even when its confirmation failed.
     /// Persist that distinction, independently of read-back, without replay.
@@ -377,7 +376,7 @@ impl Store {
                     let result = envelope(&row, &authority, &digest);
                     Ok(result)
         });
-        }
+    }
 
     /// Operator resolution changes bookkeeping only. The exact historical
     /// child and digest survive, including when its installation is gone.
@@ -420,7 +419,7 @@ impl Store {
                     let result = envelope(&resolved, &authority, &stored_digest);
                     Ok(result)
         });
-        }
+    }
     pub fn app_effect_list(&self, install: Option<&str>, context: Option<&str>) -> Result<Value> {
         if context.is_some() && install.is_none() {
             return Err(Error::rejected("context filter requires installation"));
@@ -440,7 +439,7 @@ impl Store {
                     }
                     Ok(json!({"effects":list}))
         });
-        }
+    }
     pub fn app_effect_is_child(&self, id: &str) -> Result<bool> {
         Ok(self
             .conn()
@@ -501,7 +500,7 @@ impl Store {
                     let (stored, authority, digest) = child_in(&tx, &row.effect_id)?;
                     Ok(envelope(&stored, &authority, &digest))
         });
-        }
+    }
 
     /// Eligibility and the exactly-one claim share a transaction. A caller
     /// must hold the daemon release lock until provider commit/readback;
@@ -533,7 +532,7 @@ impl Store {
                     claimed.state = "executing".into();
                     Ok(Some(claimed))
         });
-        }
+    }
 }
 
 fn historical_step_receipt(

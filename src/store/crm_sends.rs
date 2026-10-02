@@ -50,7 +50,7 @@ impl Store {
                     .map_err(|e| Error::internal(e.to_string()))?;
                     Ok(())
         });
-        }
+    }
 
     /// Transition one send's durable state. `completed` and `closed`
     /// are terminal — the reconciliation sweep reads `sending` only.
@@ -71,7 +71,7 @@ impl Store {
                     .map_err(|e| Error::internal(e.to_string()))?;
                     Ok(())
         });
-        }
+    }
 
     /// Every send whose durable intent is still live — the boot-time
     /// sweep's worklist.
@@ -90,7 +90,7 @@ impl Store {
                     }
                     Ok(out)
         });
-        }
+    }
 
     /// Record one unsubscribe token's home. `token_hash` is the
     /// token's sha256 hex — never the token — so the index itself
@@ -110,7 +110,7 @@ impl Store {
                     .map_err(|e| Error::internal(e.to_string()))?;
                     Ok(())
         });
-        }
+    }
 
     /// Where a token's suppression rows belong, if it is one of ours.
     /// Unknown hashes return `None` — the redeem path answers every
@@ -120,15 +120,14 @@ impl Store {
         token_hash: &str,
     ) -> Result<Option<(String, String)>> {
         return self.write_tx(|conn| {
-
-                    conn.query_opt(
-                        "SELECT install_id,context_id FROM crm_unsubscribe_index WHERE token_hash=?",
-                        params![token_hash],
-                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-                    )
-                    .map_err(|e| Error::internal(e.to_string()))
+            conn.query_opt(
+                "SELECT install_id,context_id FROM crm_unsubscribe_index WHERE token_hash=?",
+                params![token_hash],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .map_err(|e| Error::internal(e.to_string()))
         });
-        }
+    }
 
     /// One persisted operator setting — key/value in `crm_settings`.
     /// `None` clears it.
@@ -149,7 +148,7 @@ impl Store {
                     }
                     .map_err(|e| Error::internal(e.to_string()))
         });
-        }
+    }
 
     /// The current value of one persisted operator setting.
     pub fn crm_setting(&self, key: &str) -> Result<Option<String>> {
@@ -166,8 +165,13 @@ impl Store {
     /// Best-effort audit for the unsubscribe origin — the origin is
     /// public configuration, never a secret.
     pub fn note_crm_send_origin(&self, origin: Option<&str>) {
-        let _ = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
-            "crm_send_origin_set",
-            json!({"unsubscribe_origin": origin}),));
+        let _ = self.write_tx(|tx| {
+            Self::event(
+                &*tx,
+                Self::DAEMON_STREAM,
+                "crm_send_origin_set",
+                json!({"unsubscribe_origin": origin}),
+            )
+        });
     }
 }

@@ -18,6 +18,7 @@
 //! files are created, corrupt or foreign files are refused, never
 //! deleted).
 
+use super::StoreConn;
 use super::*;
 use crate::store::app_runs::material_digest;
 use rusqlite::{params, OptionalExtension};
@@ -25,7 +26,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use super::StoreConn;
 
 pub const RECORDS_DIR: &str = "app-records";
 /// Schema version of each per-installation record file. Backup manifests
@@ -665,18 +665,20 @@ impl RecordStore {
         f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<R>,
     ) -> Result<R> {
         let conn = self.conn();
-        let tx = rusqlite::Transaction::new_unchecked(
-            &conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| Error::internal(e.to_string()))?;
         let out = f(&tx)?;
         tx.commit().map_err(|e| Error::internal(e.to_string()))?;
         drop(conn);
         Ok(out)
     }
 
-    fn history_in(conn: &impl super::StoreConn, context: &str, id: &str) -> rusqlite::Result<Vec<Value>> {
+    fn history_in(
+        conn: &impl super::StoreConn,
+        context: &str,
+        id: &str,
+    ) -> rusqlite::Result<Vec<Value>> {
         conn.query_vec(
             "SELECT revision,body_digest,actor,at FROM app_record_revisions WHERE context_id=? AND record_id=? ORDER BY revision",
             params![context, id],
@@ -686,12 +688,20 @@ impl RecordStore {
         )
     }
 
-    fn ids_in(conn: &impl super::StoreConn, sql: &str, params: impl rusqlite::Params) -> Result<Vec<String>> {
+    fn ids_in(
+        conn: &impl super::StoreConn,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<String>> {
         conn.query_vec(sql, params, |r| r.get::<_, String>(0))
             .map_err(|e| Error::internal(e.to_string()))
     }
 
-    fn consent_history_in(conn: &impl super::StoreConn, context: &str, id: &str) -> rusqlite::Result<Value> {
+    fn consent_history_in(
+        conn: &impl super::StoreConn,
+        context: &str,
+        id: &str,
+    ) -> rusqlite::Result<Value> {
         // Per-channel consent transitions derived from the attributed
         // revision bodies: each entry names the revision, channel,
         // resulting state, actor and time. Unparseable bodies are

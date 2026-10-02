@@ -1,11 +1,11 @@
 //! Operator-owned bounded content defaults. These confer no execution authority.
+use super::StoreConn;
 use super::*;
 use crate::store::app_runs::material_digest;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use super::StoreConn;
 
 pub const CONFIG_BYTES: usize = 32 * 1024;
 pub const CONTEXT_LIMIT: i64 = 100;
@@ -71,7 +71,11 @@ pub struct ContextProof {
 }
 
 impl Store {
-    pub(super) fn app_context_show_in(conn: &impl super::StoreConn, install: &str, id: &str) -> Result<Value> {
+    pub(super) fn app_context_show_in(
+        conn: &impl super::StoreConn,
+        install: &str,
+        id: &str,
+    ) -> Result<Value> {
         let (revision,state,encoded,digest): (i64,String,String,String) = conn.query_row(
             "SELECT revision,state,config_json,config_digest FROM app_contexts WHERE id=? AND install_id=?",
             params![id,install], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
@@ -91,10 +95,9 @@ impl Store {
     pub fn app_context_show(&self, install: &str, id: &str) -> Result<Value> {
         {
             return self.write_tx(|conn| {
-
-                            Ok(json!({"context":Self::app_context_show_in(&conn,install,id)?}))
+                Ok(json!({"context":Self::app_context_show_in(&conn,install,id)?}))
             });
-            }
+        }
     }
     pub fn app_context_list(&self, install: &str) -> Result<Value> {
         return self.write_tx(|conn| {
@@ -114,31 +117,30 @@ impl Store {
                         json!({"contexts":ids.iter().map(|id|Self::app_context_show_in(&conn,install,id)).collect::<Result<Vec<_>>>()?}),
                     )
         });
-        }
+    }
     pub fn app_context_proof(
         &self,
         install: &str,
         id: &str,
     ) -> Result<(ContextConfig, ContextProof)> {
         return self.write_tx(|conn| {
-
-                    let row = Self::app_context_show_in(&conn, install, id)?;
-                    if row["state"] != "active" {
-                        return Err(Error::rejected("context is archived"));
-                    }
-                    let config = serde_json::from_value(row["config"].clone())
-                        .map_err(|_| Error::rejected("context integrity refused"))?;
-                    Ok((
-                        config,
-                        ContextProof {
-                            id: id.to_string(),
-                            install_id: install.to_string(),
-                            revision: row["revision"].as_i64().unwrap(),
-                            digest: row["digest"].as_str().unwrap().to_string(),
-                        },
-                    ))
+            let row = Self::app_context_show_in(&conn, install, id)?;
+            if row["state"] != "active" {
+                return Err(Error::rejected("context is archived"));
+            }
+            let config = serde_json::from_value(row["config"].clone())
+                .map_err(|_| Error::rejected("context integrity refused"))?;
+            Ok((
+                config,
+                ContextProof {
+                    id: id.to_string(),
+                    install_id: install.to_string(),
+                    revision: row["revision"].as_i64().unwrap(),
+                    digest: row["digest"].as_str().unwrap().to_string(),
+                },
+            ))
         });
-        }
+    }
     pub(super) fn app_context_proof_current_in(
         conn: &impl super::StoreConn,
         install: &str,
@@ -207,7 +209,7 @@ impl Store {
                     let result = json!({"context":Self::app_context_show_in(&tx,install,&id)?});
                     Ok(result)
         });
-        }
+    }
     pub fn app_context_update(
         &self,
         install: &str,
@@ -273,5 +275,5 @@ impl Store {
                     let result = json!({"context":Self::app_context_show_in(&tx,install,id)?});
                     Ok(result)
         });
-        }
+    }
 }

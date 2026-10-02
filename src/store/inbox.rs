@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 
 use super::agents::Agent;
 use super::messages::{row_message, Message};
-use super::{now, Store};
 use super::StoreConn;
+use super::{now, Store};
 
 impl Store {
     /// The alias must be a passive inbox — every `cadence inbox` verb
@@ -31,28 +31,27 @@ impl Store {
     /// deliberately does not turn it into a synthetic worker notification.
     pub fn inbox_drain(&self, alias: &str, after: i64) -> Result<Vec<Message>> {
         return self.write_tx(|conn| {
-
-                    let tx = &mut *conn;
-                    self.inbox_agent_in(&tx, alias)?;
-                    let pending = tx.query_vec(
-                        "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
+            let tx = &mut *conn;
+            self.inbox_agent_in(&tx, alias)?;
+            let pending = tx.query_vec(
+                "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
                          ORDER BY seq",
-                        params![alias, after],
-                        row_message,
-                    )?;
-                    for m in &pending {
-                        let result = json!({"status": "completed", "via": "inbox_read"});
-                        tx.execute(
-                            "UPDATE messages SET state='completed',result=?,completed=?
+                params![alias, after],
+                row_message,
+            )?;
+            for m in &pending {
+                let result = json!({"status": "completed", "via": "inbox_read"});
+                tx.execute(
+                    "UPDATE messages SET state='completed',result=?,completed=?
                              WHERE id=? AND state='queued'",
-                            params![result.to_string(), now(), m.id],
-                        )?;
-                        Self::event(&tx, alias, "inbox_read", json!({"message": m.id}))?;
-                        self.route_result(&tx, m, &result)?;
-                    }
-                    Ok(pending)
+                    params![result.to_string(), now(), m.id],
+                )?;
+                Self::event(&tx, alias, "inbox_read", json!({"message": m.id}))?;
+                self.route_result(&tx, m, &result)?;
+            }
+            Ok(pending)
         });
-        }
+    }
 
     /// Peek at an inbox agent's queue (CAD-480): every `queued` message
     /// with `seq > after`, oldest first — the same set `inbox_drain`
@@ -64,23 +63,22 @@ impl Store {
     /// line.
     pub fn inbox_peek(&self, alias: &str, after: i64, reader: &str) -> Result<Vec<Message>> {
         return self.write_tx(|conn| {
-
-                    self.inbox_agent_in(&conn, alias)?;
-                    let mut stmt = conn.prepare(
-                        "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
+            self.inbox_agent_in(&conn, alias)?;
+            let mut stmt = conn.prepare(
+                "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
                          ORDER BY seq",
-                    )?;
-                    let pending = stmt
-                        .query_map(params![alias, after], row_message)?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    drop(stmt);
-                    let parked = self.inbox_parked_in(&conn, alias, reader)?;
-                    Ok(pending
-                        .into_iter()
-                        .filter(|m| !parked.contains(&m.id))
-                        .collect())
+            )?;
+            let pending = stmt
+                .query_map(params![alias, after], row_message)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            let parked = self.inbox_parked_in(&conn, alias, reader)?;
+            Ok(pending
+                .into_iter()
+                .filter(|m| !parked.contains(&m.id))
+                .collect())
         });
-        }
+    }
 
     /// The message ids `reader` parked on this inbox (`inbox_park`
     /// events), as a set the peek filters out.
@@ -120,62 +118,61 @@ impl Store {
     /// count.
     pub fn inbox_ack(&self, alias: &str, through: i64, reader: &str, by: &str) -> Result<Value> {
         return self.write_tx(|conn| {
-
-                    let tx = &mut *conn;
-                    self.inbox_agent_in(&tx, alias)?;
-                    let tail: i64 = tx.query_row(
-                        "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE alias=?",
-                        [alias],
-                        |r| r.get(0),
-                    )?;
-                    let through = through.min(tail);
-                    let pending = tx.query_vec(
-                        "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq<=?
+            let tx = &mut *conn;
+            self.inbox_agent_in(&tx, alias)?;
+            let tail: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE alias=?",
+                [alias],
+                |r| r.get(0),
+            )?;
+            let through = through.min(tail);
+            let pending = tx.query_vec(
+                "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq<=?
                          ORDER BY seq",
-                        params![alias, through],
-                        row_message,
-                    )?;
-                    // Messages this reader parked stay queued under its own
-                    // watermark too — the ack asserts consumption, and a parked
-                    // message is precisely what the reader could not consume. The
-                    // cursor still moves past their seqs; they stay queued and
-                    // unread for the operator and other readers.
-                    let parked = self.inbox_parked_in(&tx, alias, reader)?;
-                    let pending: Vec<Message> = pending
-                        .into_iter()
-                        .filter(|m| !parked.contains(&m.id))
-                        .collect();
-                    let mut acked = Vec::with_capacity(pending.len());
-                    for m in &pending {
-                        let result =
-                            json!({"status": "completed", "via": "inbox_ack", "by": by, "reader": reader});
-                        tx.execute(
-                            "UPDATE messages SET state='completed',result=?,completed=?
+                params![alias, through],
+                row_message,
+            )?;
+            // Messages this reader parked stay queued under its own
+            // watermark too — the ack asserts consumption, and a parked
+            // message is precisely what the reader could not consume. The
+            // cursor still moves past their seqs; they stay queued and
+            // unread for the operator and other readers.
+            let parked = self.inbox_parked_in(&tx, alias, reader)?;
+            let pending: Vec<Message> = pending
+                .into_iter()
+                .filter(|m| !parked.contains(&m.id))
+                .collect();
+            let mut acked = Vec::with_capacity(pending.len());
+            for m in &pending {
+                let result =
+                    json!({"status": "completed", "via": "inbox_ack", "by": by, "reader": reader});
+                tx.execute(
+                    "UPDATE messages SET state='completed',result=?,completed=?
                              WHERE id=? AND state='queued'",
-                            params![result.to_string(), now(), m.id],
-                        )?;
-                        acked.push(m.seq);
-                        self.route_result(&tx, m, &result)?;
-                    }
-                    // The watermark event is the durable per-reader cursor — a
-                    // restart reads `inbox_readers` to resume after the last ack.
-                    // It is recorded even when nothing was queued, so a reader's
-                    // claim past the current tail is still durable.
-                    Self::event(
-                        &tx,
-                        alias,
-                        "inbox_ack",
-                        json!({"reader": reader, "through": through, "seqs": acked, "by": by}),
-                    )?;
-                    let unread: i64 = tx.query_row(
-                        "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'",
-                        [alias],
-                        |r| r.get(0),
-                    )?;
-                    Ok(json!({"acked": acked, "through": through, "reader": reader,
+                    params![result.to_string(), now(), m.id],
+                )?;
+                acked.push(m.seq);
+                self.route_result(&tx, m, &result)?;
+            }
+            // The watermark event is the durable per-reader cursor — a
+            // restart reads `inbox_readers` to resume after the last ack.
+            // It is recorded even when nothing was queued, so a reader's
+            // claim past the current tail is still durable.
+            Self::event(
+                &tx,
+                alias,
+                "inbox_ack",
+                json!({"reader": reader, "through": through, "seqs": acked, "by": by}),
+            )?;
+            let unread: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'",
+                [alias],
+                |r| r.get(0),
+            )?;
+            Ok(json!({"acked": acked, "through": through, "reader": reader,
                               "unread": unread}))
         });
-        }
+    }
 
     /// Park one still-queued message for `reader` (CAD-480): the
     /// `inbox_park` event makes that reader's peeks skip it, so a
@@ -192,43 +189,41 @@ impl Store {
         reason: &str,
     ) -> Result<Value> {
         return self.write_tx(|conn| {
-
-                    let tx = &mut *conn;
-                    self.inbox_agent_in(&tx, alias)?;
-                    let state: Option<String> = tx
-                        .query_opt(
-                            "SELECT state FROM messages WHERE alias=? AND id=?",
-                            params![alias, message],
-                            |r| r.get(0),
-                        )?;
-                    match state.as_deref() {
-                        Some("queued") => {}
-                        Some(s) => {
-                            return Err(Error::rejected(format!(
-                                "cannot park '{message}' on '{alias}': it is {s}, not queued"
-                            )))
-                        }
-                        None => {
-                            return Err(Error::rejected(format!(
-                                "cannot park '{message}': no such message on '{alias}'"
-                            )))
-                        }
-                    }
-                    Self::event(
-                        &tx,
-                        alias,
-                        "inbox_park",
-                        json!({"reader": reader, "message": message, "by": by,
+            let tx = &mut *conn;
+            self.inbox_agent_in(&tx, alias)?;
+            let state: Option<String> = tx.query_opt(
+                "SELECT state FROM messages WHERE alias=? AND id=?",
+                params![alias, message],
+                |r| r.get(0),
+            )?;
+            match state.as_deref() {
+                Some("queued") => {}
+                Some(s) => {
+                    return Err(Error::rejected(format!(
+                        "cannot park '{message}' on '{alias}': it is {s}, not queued"
+                    )))
+                }
+                None => {
+                    return Err(Error::rejected(format!(
+                        "cannot park '{message}': no such message on '{alias}'"
+                    )))
+                }
+            }
+            Self::event(
+                &tx,
+                alias,
+                "inbox_park",
+                json!({"reader": reader, "message": message, "by": by,
                                "reason": reason}),
-                    )?;
-                    let unread: i64 = tx.query_row(
-                        "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'",
-                        [alias],
-                        |r| r.get(0),
-                    )?;
-                    Ok(json!({"parked": message, "reader": reader, "unread": unread}))
+            )?;
+            let unread: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'",
+                [alias],
+                |r| r.get(0),
+            )?;
+            Ok(json!({"parked": message, "reader": reader, "unread": unread}))
         });
-        }
+    }
 
     /// Reset one reader's cursor (CAD-480): the `inbox_ack_reset` event
     /// drops the reader's watermark, so its next peek without `after`
@@ -237,18 +232,17 @@ impl Store {
     /// is lost; queued ones come back.
     pub fn inbox_ack_reset(&self, alias: &str, reader: &str, by: &str) -> Result<Value> {
         return self.write_tx(|conn| {
-
-                    let tx = &mut *conn;
-                    self.inbox_agent_in(&tx, alias)?;
-                    Self::event(
-                        &tx,
-                        alias,
-                        "inbox_ack_reset",
-                        json!({"reader": reader, "by": by}),
-                    )?;
-                    Ok(json!({"reset": reader}))
+            let tx = &mut *conn;
+            self.inbox_agent_in(&tx, alias)?;
+            Self::event(
+                &tx,
+                alias,
+                "inbox_ack_reset",
+                json!({"reader": reader, "by": by}),
+            )?;
+            Ok(json!({"reset": reader}))
         });
-        }
+    }
 
     /// Per-reader consume watermarks for an inbox (CAD-480), derived
     /// from its durable `inbox_ack` events: each reader's greatest

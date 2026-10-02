@@ -18,11 +18,11 @@
 //! bind/rebind/revoke claims refuse instead of interleave.
 
 use super::app_runs::material_digest;
+use super::StoreConn;
 use super::*;
 use crate::platform::smtp::SmtpProjection;
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
-use super::StoreConn;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS crm_smtp_links(
@@ -111,11 +111,8 @@ impl Store {
     /// Read one link row for the send/show path. `None` is "no sender
     /// is bound", never a default — the caller refuses.
     pub fn crm_smtp_link(&self, install: &str, context: &str) -> Result<Option<SmtpLink>> {
-        return self.write_tx(|conn| {
-
-                    self.crm_smtp_row(&conn, install, context)
-        });
-        }
+        return self.write_tx(|conn| self.crm_smtp_row(&conn, install, context));
+    }
 
     /// Bind one sender connection to an installation/context. At most
     /// one live link exists per pair: a live row refuses a second
@@ -205,7 +202,7 @@ impl Store {
                         .ok_or_else(|| Error::internal("SMTP sender binding vanished after bind"))?;
                     Ok(json!({"binding": link_json(install, context, &row, projection)}))
         });
-        }
+    }
 
     /// Rebind under CAS: the expected link revision must be the live
     /// one. Post-rotate rebinds (same connection, fresh authorization
@@ -262,7 +259,7 @@ impl Store {
                         .ok_or_else(|| Error::internal("SMTP sender binding vanished after rebind"))?;
                     Ok(json!({"binding": link_json(install, context, &row, projection)}))
         });
-        }
+    }
 
     /// Revoke the live link under CAS. The credential itself is
     /// untouched — this ends the installation/context binding only.
@@ -311,20 +308,25 @@ impl Store {
                     )?;
                     Ok(json!({"revoked": true, "link_revision": revision}))
         });
-        }
+    }
 
     /// Best-effort audit for a test send: digests and the SMTP
     /// verdict only — never addresses, content or secrets.
     pub fn note_crm_smtp_test(&self, install: &str, context: &str, receipt: &Value) {
-        let _ = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
-            "crm_smtp_test_sent",
-            json!({"install_id": install, "context_id": context,
+        let _ = self.write_tx(|tx| {
+            Self::event(
+                &*tx,
+                Self::DAEMON_STREAM,
+                "crm_smtp_test_sent",
+                json!({"install_id": install, "context_id": context,
                    "connection_id": receipt["connection_id"],
                    "auth_revision": receipt["auth_revision"],
                    "link_revision": receipt["link_revision"],
                    "content_digest": receipt["content_digest"],
                    "payload_digest": receipt["payload_digest"],
                    "accepted": receipt["accepted"],
-                   "smtp_code": receipt["smtp_code"]}),));
+                   "smtp_code": receipt["smtp_code"]}),
+            )
+        });
     }
 }

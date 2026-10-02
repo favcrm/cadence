@@ -3317,18 +3317,20 @@ fn shutdown_entries_retries_a_busy_once_then_records_one_refusal() {
     let attempts = Arc::clone(&attempted);
     let opts = daemon::ServeOptions {
         stop: Some(Arc::clone(&stop)),
-        shutdown_entries_hook: Some(Arc::new(move |conn: &cadence_agent::store::WriteTxn<'_>| {
-            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                // Mutate inside the doomed transaction, then fail it:
-                // rollback discards this write, and the retry re-reads
-                // the committed row.
-                conn.execute_batch("UPDATE messages SET state='failed' WHERE id='mid'")
-                    .unwrap();
-                Err(injected_sqlite_err(rusqlite::ffi::SQLITE_BUSY))
-            } else {
-                Ok(())
-            }
-        })),
+        shutdown_entries_hook: Some(Arc::new(
+            move |conn: &cadence_agent::store::WriteTxn<'_>| {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // Mutate inside the doomed transaction, then fail it:
+                    // rollback discards this write, and the retry re-reads
+                    // the committed row.
+                    conn.execute_batch("UPDATE messages SET state='failed' WHERE id='mid'")
+                        .unwrap();
+                    Err(injected_sqlite_err(rusqlite::ffi::SQLITE_BUSY))
+                } else {
+                    Ok(())
+                }
+            },
+        )),
         // CAD-809: the retry bound itself is proven once at production
         // backoff by cad694_failed_shutdown_fences_the_restart_verdict;
         // every other scenario injects a zero backoff.
@@ -3389,10 +3391,12 @@ fn shutdown_entries_stops_at_first_nonretryable_fault() {
     let attempts = Arc::clone(&attempted);
     let opts = daemon::ServeOptions {
         stop: Some(Arc::clone(&stop)),
-        shutdown_entries_hook: Some(Arc::new(move |_conn: &cadence_agent::store::WriteTxn<'_>| {
-            attempts.fetch_add(1, Ordering::SeqCst);
-            Err(injected_sqlite_err(rusqlite::ffi::SQLITE_FULL))
-        })),
+        shutdown_entries_hook: Some(Arc::new(
+            move |_conn: &cadence_agent::store::WriteTxn<'_>| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(injected_sqlite_err(rusqlite::ffi::SQLITE_FULL))
+            },
+        )),
         shutdown_backoff_ms_for_test: Some(0),
         ..daemon_opts()
     };
@@ -3426,13 +3430,15 @@ fn shutdown_entries_retries_sqlite_locked_then_records_one_refusal() {
     let attempts = Arc::clone(&attempted);
     let opts = daemon::ServeOptions {
         stop: Some(Arc::clone(&stop)),
-        shutdown_entries_hook: Some(Arc::new(move |_conn: &cadence_agent::store::WriteTxn<'_>| {
-            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(injected_sqlite_err(rusqlite::ffi::SQLITE_LOCKED))
-            } else {
-                Ok(())
-            }
-        })),
+        shutdown_entries_hook: Some(Arc::new(
+            move |_conn: &cadence_agent::store::WriteTxn<'_>| {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(injected_sqlite_err(rusqlite::ffi::SQLITE_LOCKED))
+                } else {
+                    Ok(())
+                }
+            },
+        )),
         shutdown_backoff_ms_for_test: Some(0),
         ..daemon_opts()
     };
@@ -3491,13 +3497,15 @@ fn cad694_failed_shutdown_fences_the_restart_verdict() {
         let stamps = std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
         let stamped = std::sync::Arc::clone(&stamps);
         let d = TestDaemon::start_opts(daemon::ServeOptions {
-            shutdown_entries_hook: Some(std::sync::Arc::new(move |_conn: &cadence_agent::store::WriteTxn<'_>| {
-                stamped.lock().unwrap().push(std::time::Instant::now());
-                match pending.lock().unwrap().pop_front() {
-                    Some(code) => Err(injected_sqlite_err(code)),
-                    None => Ok(()),
-                }
-            })),
+            shutdown_entries_hook: Some(std::sync::Arc::new(
+                move |_conn: &cadence_agent::store::WriteTxn<'_>| {
+                    stamped.lock().unwrap().push(std::time::Instant::now());
+                    match pending.lock().unwrap().pop_front() {
+                        Some(code) => Err(injected_sqlite_err(code)),
+                        None => Ok(()),
+                    }
+                },
+            )),
             // CAD-809: THE one bound-prover for the `shutdown_entries`
             // backoff — this test pays the production 50+100ms sleeps so
             // the real attempt schedule, not an injected one, is what
@@ -3611,12 +3619,16 @@ fn cad694_offline_restart_still_fences_a_failed_drain() {
     let stop_flag = std::sync::Arc::clone(&stop);
     let mut d = TestDaemon::start_opts(daemon::ServeOptions {
         stop: Some(stop_flag),
-        shutdown_entries_hook: Some(std::sync::Arc::new(move |_conn: &cadence_agent::store::WriteTxn<'_>| {
-            match pending.lock().unwrap().pop_front() {
+        shutdown_entries_hook: Some(std::sync::Arc::new(
+            move |_conn: &cadence_agent::store::WriteTxn<'_>| match pending
+                .lock()
+                .unwrap()
+                .pop_front()
+            {
                 Some(code) => Err(injected_sqlite_err(code)),
                 None => Ok(()),
-            }
-        })),
+            },
+        )),
         // The bound is proven once at production backoff by the online
         // scenario; this offline restart pays none (CAD-809).
         shutdown_backoff_ms_for_test: Some(0),

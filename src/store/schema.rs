@@ -12,8 +12,8 @@ use super::effects;
 use super::messages::{Message, FENCING_UNKNOWN_SQL};
 use super::platform;
 use super::threads;
-use super::{Store, BUSY_TIMEOUT};
 use super::StoreConn;
+use super::{Store, BUSY_TIMEOUT};
 
 /// Read-only open of the daemon store from another process, with the
 /// shared busy timeout — never creates or migrates the file.
@@ -1047,12 +1047,9 @@ impl Store {
                                 r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                             ))
                         },
-                    )?;
-                        drop(stmt);
-                        rows.into_iter()
-                            .filter(|(_, id, _)| !kept_ids.contains(id))
-                            .collect()
-                    };
+                    )?.into_iter()
+                        .filter(|(_, id, _)| !kept_ids.contains(id))
+                        .collect();
                     // A `failed` marker means the previous run's
                     // `shutdown_entries` never committed — no refusal events exist
                     // for the rows it left in flight. Emit each the same refusal a
@@ -1162,13 +1159,18 @@ impl Store {
                     self.reconcile_effects_in(&tx)?;
                     Ok(outcome)
         });
-        }
+    }
 
     /// CAD-162: `token` is current for `generation` under the alias's
     /// own endpoint scheme — [`registry::turn_token_current`] with the
     /// pair read in the caller's transaction. An alias with no agent
     /// row has no scheme, so nothing is current for it (fail closed).
-    fn turn_token_current_in(tx: &impl super::StoreConn, alias: &str, generation: &str, token: &str) -> bool {
+    fn turn_token_current_in(
+        tx: &impl super::StoreConn,
+        alias: &str,
+        generation: &str,
+        token: &str,
+    ) -> bool {
         tx.query_row(
             "SELECT provider, endpoint_kind FROM agents WHERE alias=?",
             [alias],
@@ -1365,7 +1367,10 @@ impl Store {
                 match self.write_tx_raw(|tx| self.shutdown_entries_tx(tx, facts)) {
                     Ok(v) => Ok(v),
                     Err(rusqlite::Error::ToSqlConversionFailure(b))
-                        if matches!(b.downcast_ref::<crate::Error>(), Some(crate::Error::Rejected(_))) =>
+                        if matches!(
+                            b.downcast_ref::<crate::Error>(),
+                            Some(crate::Error::Rejected(_))
+                        ) =>
                     {
                         return Err(ShutdownDrainError::Fenced(crate::Error::rejected(
                             b.to_string(),

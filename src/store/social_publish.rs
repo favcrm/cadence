@@ -15,10 +15,10 @@
 //! and asset are the reviewed ones) lands with the slice-3 E2E wiring; the
 //! store already keeps `run_id`/`effect_id` for that join.
 
+use super::StoreConn;
 use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
-use super::StoreConn;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS social_publish_intents(
@@ -290,7 +290,7 @@ impl Store {
                     let result = read_row(&tx, &intent_id)?;
                     Ok(result)
         });
-        }
+    }
 
     /// Operator cancellation before dispatch. Any other state refuses.
     pub fn social_publish_cancel(&self, intent_id: &str) -> Result<Value> {
@@ -312,7 +312,7 @@ impl Store {
                     let result = read_row(&tx, intent_id)?;
                     Ok(result)
         });
-        }
+    }
 
     pub fn social_publish_show(&self, intent_id: &str) -> Result<Value> {
         read_row(&self.conn(), intent_id)
@@ -340,7 +340,7 @@ impl Store {
                     }
                     Ok(json!({"intents":list}))
         });
-        }
+    }
 
     /// Peek the oldest due queued intent without claiming. The dispatch
     /// RPC uses it to compare operator-supplied current authority against
@@ -356,7 +356,7 @@ impl Store {
                         )?;
                     next.map(|id| read_row(&conn, &id)).transpose()
         });
-        }
+    }
 
     /// Re-prove approved material at dispatch for artifact-frozen intents.
     /// Reloads publication material (refuses stale binding or changed
@@ -440,7 +440,7 @@ impl Store {
                     let result = read_row(&tx, &id)?;
                     Ok(Some(result))
         });
-        }
+    }
 
     /// Persist daemon-observed dispatch evidence on a processing intent.
     /// The evidence must carry the provider's exact binding plus its
@@ -504,7 +504,7 @@ impl Store {
                     let result = read_row(&tx, intent_id)?;
                     Ok(result)
         });
-        }
+    }
 
     /// Record the dispatch outcome. `posted` requires a verified
     /// permalink/receipt (a bare success string is refused) AND a receipt
@@ -637,7 +637,7 @@ impl Store {
                     let result = read_row(&tx, intent_id)?;
                     Ok(result)
         });
-        }
+    }
 }
 
 /// Strip the `sha256:` prefix Cadence artifact digests carry. The pinned

@@ -92,6 +92,8 @@ pub use seal::WriteTxn;
 pub(crate) use seal::{preflight_writer_guard, StoreConn};
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod writer_census;
 
 /// How long a connection waits on another process's lock before
 /// SQLITE_BUSY (CAD-256). The daemon's writer and every out-of-process
@@ -163,8 +165,7 @@ pub struct Store {
 // The test-seam hook type. `WriteTxn` is `pub` but opaque — every
 // method on it is `pub(crate)`, so the public facade exposes nothing
 // usable (no prepare/execute/Connection escape) to an outside caller.
-pub type ShutdownEntriesHook =
-    Arc<dyn Fn(&WriteTxn<'_>) -> rusqlite::Result<()> + Send + Sync>;
+pub type ShutdownEntriesHook = Arc<dyn Fn(&WriteTxn<'_>) -> rusqlite::Result<()> + Send + Sync>;
 
 /// Terminal task states — verdicts/acceptance/cancellation are closed
 /// to these. `verified` sits between review and done (accept pending).
@@ -299,10 +300,7 @@ impl Store {
     where
         T: 'static,
     {
-        self.with_sealed_tx_fenced_raw(
-            || self.write_fence.get().and_then(|f| f.check()),
-            f,
-        )
+        self.with_sealed_tx_fenced_raw(|| self.write_fence.get().and_then(|f| f.check()), f)
     }
 
     /// Install the hosted-lease fence — the daemon calls this right

@@ -392,7 +392,8 @@
                     // the callback's BEGIN IMMEDIATE tx open mid-unwind;
                     // `sealed_tx` rolls it back under TxControl and the
                     // dropped guard still poisons the mutex for recovery.
-                    let _ = s.fixture_write(|_wtx| -> Result<()> {
+                    let _ = s.fixture_write(|wtx| -> Result<()> {
+                        wtx.execute("INSERT INTO events(alias,kind,payload,at) VALUES('panic-probe','probe','{}',0)", [])?;
                         panic!("store closure panicked while holding the lock");
                     });
                 })
@@ -401,6 +402,11 @@
         });
         assert!(s.conn.is_poisoned());
 
+        let held = s.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(held.is_autocommit(), "fixture rollback must precede poison recovery");
+        assert_eq!(held.query_row("SELECT count(*) FROM events WHERE alias='panic-probe'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        drop(held);
+
         let events = s.events(Store::DAEMON_STREAM, 0, 100).unwrap();
         assert!(!s.conn.is_poisoned());
         let poisoned: Vec<_> = events
@@ -408,7 +414,7 @@
             .filter(|e| e.kind == "store_poisoned")
             .collect();
         assert_eq!(poisoned.len(), 1, "{events:?}");
-        assert_eq!(poisoned[0].payload["rolled_back"], true);
+        assert_eq!(poisoned[0].payload["rolled_back"], false);
         // Later calls take the plain path and record nothing more.
         s.event_public("daemon", "probe", json!({})).unwrap();
         let events = s.events(Store::DAEMON_STREAM, 0, 100).unwrap();

@@ -43,11 +43,11 @@
 
 use super::app_records::{email_shape_valid, RecordStore};
 use super::app_runs::material_digest;
+use super::StoreConn;
 use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use super::StoreConn;
 
 /// Subject is required, preheader optional; both are plain text.
 pub const SUBJECT_BYTES: usize = 150;

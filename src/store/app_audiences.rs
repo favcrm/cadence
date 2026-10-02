@@ -20,11 +20,11 @@ use super::app_records::{
     email_shape_valid, source_shape_valid, tag_valid, CustomerProfile, ProfileRefused, RecordStore,
 };
 use super::app_runs::material_digest;
+use super::StoreConn;
 use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use super::StoreConn;
 
 pub const SEGMENT_PREDICATES_MAX: usize = 8;
 pub const SEGMENT_NAME_BYTES: usize = 80;
@@ -520,7 +520,12 @@ impl RecordStore {
         })
     }
 
-    fn sample_in(&self, conn: &impl super::StoreConn, context: &str, ids: &[String]) -> Result<Vec<Value>> {
+    fn sample_in(
+        &self,
+        conn: &impl super::StoreConn,
+        context: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>> {
         let mut sample = Vec::new();
         for id in ids.iter().take(SAMPLE_MAX) {
             let name: String = conn

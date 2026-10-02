@@ -606,10 +606,9 @@ pub(crate) fn preflight_writer_guard(path: &std::path::Path) -> Result<()> {
         .map_err(|e| SealError::Unknown(format!("writer-guard busy_timeout: {e}")))?;
     match preflight_read(&ro).map_err(|e| SealError::Unknown(format!("writer-guard read: {e}")))? {
         Preflight::LatchAbsent => Ok(()),
-        Preflight::Sealed => Err(SealError::Closed(
-            "producer closure latch is set — writes refused".into(),
-        )
-        .into()),
+        Preflight::Sealed => {
+            Err(SealError::Closed("producer closure latch is set — writes refused".into()).into())
+        }
         Preflight::LatchOpen | Preflight::Malformed => Err(SealError::Unknown(
             "closure latch present on a sibling-writer path — refusing the write".into(),
         )
@@ -908,9 +907,7 @@ impl Store {
         if !on_sealed {
             if let Err(e) = Self::check_closed_tx(&tx) {
                 if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        rb,
-                    )));
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(rb)));
                 }
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
             }
@@ -927,9 +924,7 @@ impl Store {
             }
             Ok(Err(e)) => {
                 if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        rb,
-                    )));
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(rb)));
                 }
                 Err(e)
             }
@@ -965,8 +960,7 @@ impl Store {
         }
         if !conn.is_autocommit() {
             return Err(Error::internal(
-                "sealed-tx rollback did not return the connection to autocommit"
-                    .to_string(),
+                "sealed-tx rollback did not return the connection to autocommit".to_string(),
             ));
         }
         Ok(())
@@ -1028,8 +1022,7 @@ impl Store {
         // denies it) and leave the conn inside a tx. Catch, then the
         // verified `rollback_tx` runs under the guard's own TxControl
         // window before resuming the unwind. Mirrors `sealed_tx`.
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&tx)));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&tx)));
         match outcome {
             Ok(Ok(v)) => {
                 let _ctrl = ControlPhase::enter(state);
@@ -1054,22 +1047,6 @@ impl Store {
     pub(crate) fn owner_record_running_build(&self, commit: &str) -> Result<()> {
         self.with_owner_tx(|conn| {
             crate::rollout::upsert_daemon_build(conn, commit, crate::rollout::unix_now())
-        })
-    }
-
-    /// Test-only owner lane probe: runs a real DML write inside
-    /// `with_owner_tx`, then panics — used to prove the held-tx owner
-    /// guard catches the panic, rolls the tx back under TxControl, and
-    /// leaves the conn in autocommit (never a leaked tx for the poison
-    /// forensic to mislabel).
-    #[cfg(test)]
-    pub(super) fn owner_panic_probe(&self) -> Result<()> {
-        self.with_owner_tx(|conn| {
-            conn.execute_batch(
-                "INSERT INTO agents(alias,provider,endpoint_kind,role,cwd,sandbox,created,updated)
-                 VALUES('owner-probe','p','pty','w','/x','none',0,0)",
-            )?;
-            panic!("deliberate panic inside the owner tx after a real DML");
         })
     }
 
@@ -1189,9 +1166,8 @@ impl Store {
         }
         // Reject an epoch that cannot fit the latch's INTEGER column —
         // `as i64` would silently wrap a u64 > i64::MAX into a negative.
-        let epoch = i64::try_from(permit.epoch).map_err(|_| {
-            Error::rejected("owner-maintenance permit epoch overflows the latch")
-        })?;
+        let epoch = i64::try_from(permit.epoch)
+            .map_err(|_| Error::rejected("owner-maintenance permit epoch overflows the latch"))?;
         self.sealed_tx(GuardState::OWNER, false, |wtx| {
             // Re-check the deadline + one-use inside the held tx — the
             // DML below must not outlive the permit's authority window.
@@ -1240,9 +1216,8 @@ impl Store {
                 "owner-maintenance permit is bound to a different database",
             ));
         }
-        let epoch = i64::try_from(permit.epoch).map_err(|_| {
-            Error::rejected("owner-maintenance permit epoch overflows the latch")
-        })?;
+        let epoch = i64::try_from(permit.epoch)
+            .map_err(|_| Error::rejected("owner-maintenance permit epoch overflows the latch"))?;
         // The witness is the owner barrier that commits *after* the latch
         // is sealed — it runs `on_sealed` and verifies the latch in `f`.
         self.sealed_tx(GuardState::OWNER, true, |wtx| {
@@ -1388,11 +1363,7 @@ pub(crate) trait StoreConn {
 macro_rules! storeconn_impl {
     ($t:ty, |$g:ident| -> $ret:ty { $get:expr }) => {
         impl StoreConn for $t {
-            fn execute(
-                &self,
-                sql: &str,
-                params: impl rusqlite::Params,
-            ) -> rusqlite::Result<usize> {
+            fn execute(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<usize> {
                 let $g = self;
                 ($get).execute(sql, params)
             }
@@ -1475,7 +1446,9 @@ macro_rules! storeconn_impl {
 // which would recurse. `Transaction`/`WriteTxn` deref to `Connection`.
 storeconn_impl!(Connection, |g| -> &Connection { g });
 storeconn_impl!(Transaction<'_>, |g| -> &Connection { &**g });
-storeconn_impl!(std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &**g });
+storeconn_impl!(std::sync::MutexGuard<'_, Connection>, |g| -> &Connection {
+    &**g
+});
 storeconn_impl!(WriteTxn<'_>, |g| -> &Connection { &**g.tx });
 
 // Concrete `&`/`&mut`/guard/WriteTxn reference impls — each resolves to
@@ -1486,10 +1459,21 @@ storeconn_impl!(&Connection, |g| -> &Connection { *g });
 storeconn_impl!(&mut Connection, |g| -> &Connection { &**g });
 storeconn_impl!(&&Connection, |g| -> &Connection { **g });
 storeconn_impl!(&&mut Connection, |g| -> &Connection { &***g });
-storeconn_impl!(&std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &***g });
-storeconn_impl!(&mut std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &***g });
-storeconn_impl!(&&std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &****g });
-storeconn_impl!(&&mut std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &****g });
+storeconn_impl!(&std::sync::MutexGuard<'_, Connection>, |g| -> &Connection {
+    &***g
+});
+storeconn_impl!(
+    &mut std::sync::MutexGuard<'_, Connection>,
+    |g| -> &Connection { &***g }
+);
+storeconn_impl!(
+    &&std::sync::MutexGuard<'_, Connection>,
+    |g| -> &Connection { &****g }
+);
+storeconn_impl!(
+    &&mut std::sync::MutexGuard<'_, Connection>,
+    |g| -> &Connection { &****g }
+);
 storeconn_impl!(&Transaction<'_>, |g| -> &Connection { &***g });
 storeconn_impl!(&mut Transaction<'_>, |g| -> &Connection { &***g });
 storeconn_impl!(&&Transaction<'_>, |g| -> &Connection { &****g });
@@ -1498,8 +1482,6 @@ storeconn_impl!(&WriteTxn<'_>, |g| -> &Connection { &**g.tx });
 storeconn_impl!(&mut WriteTxn<'_>, |g| -> &Connection { &**g.tx });
 storeconn_impl!(&&WriteTxn<'_>, |g| -> &Connection { &**g.tx });
 storeconn_impl!(&&mut WriteTxn<'_>, |g| -> &Connection { &**g.tx });
-
-
 
 /// The restricted write facade handed to a business callback. Wraps the
 /// live `Transaction`; exposes only DML/read and owner-managed savepoints
@@ -1515,7 +1497,6 @@ pub struct WriteTxn<'t> {
 }
 
 impl<'t> WriteTxn<'t> {
-
     /// Raw-error `execute` — preserves `rusqlite::Error` (BUSY/constraint
     /// classification survives; the crate `Error` would flatten it).
     pub(crate) fn execute_raw(
@@ -1684,7 +1665,11 @@ mod tests {
         // A producer write goes through.
         s.event_public("daemon", "probe", json!({})).unwrap();
         // Seal it via the owner lane.
-        s.propose_close(&permit(&db, OwnerOp::Close, b"chal", "attempt-1", "", 7), "test").unwrap();
+        s.propose_close(
+            &permit(&db, OwnerOp::Close, b"chal", "attempt-1", "", 7),
+            "test",
+        )
+        .unwrap();
         // Every producer write now refuses.
         assert!(s.event_public("daemon", "probe", json!({})).is_err());
         assert!(s
@@ -1701,14 +1686,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (_db, s) = open_legacy(&dir);
         // Create the latch tables through the owner lane (unsealed db).
-        s.propose_close(&permit(&_db, OwnerOp::Close, b"c", "a", "", 1), "t").unwrap();
+        s.propose_close(&permit(&_db, OwnerOp::Close, b"c", "a", "", 1), "t")
+            .unwrap();
         // Reopen is refused on the sealed file, so exercise the *armed*
         // business conn on a fresh unsealed db that also carries the
         // latch: a Business-armed conn must not write closure_state or
         // owner_witness even though it can write business tables.
         let dir2 = TempDir::new().unwrap();
         let (_db2, s2) = open_legacy(&dir2);
-        s2.propose_close(&permit(&_db2, OwnerOp::Close, b"c", "a", "", 1), "t").unwrap();
+        s2.propose_close(&permit(&_db2, OwnerOp::Close, b"c", "a", "", 1), "t")
+            .unwrap();
         // s2's conn is the armed path — but sealing already closed it.
         // Use a third, unsealed store whose latch tables exist via a
         // *second* owner pass is impossible; instead assert the authorizer
@@ -1761,7 +1748,8 @@ mod tests {
         // A sealed db refuses under both modes.
         let dir2 = TempDir::new().unwrap();
         let (db2, s2) = open_legacy(&dir2);
-        s2.propose_close(&permit(&db2, OwnerOp::Close, b"c", "a", "", 1), "t").unwrap();
+        s2.propose_close(&permit(&db2, OwnerOp::Close, b"c", "a", "", 1), "t")
+            .unwrap();
         drop(s2);
         assert!(Store::open_mode(&db2, OpenMode::Protected).is_err());
         assert!(Store::open_mode(&db2, OpenMode::Legacy).is_err());
@@ -1771,7 +1759,8 @@ mod tests {
     fn legacy_open_of_latch_present_db_refuses() {
         let dir = TempDir::new().unwrap();
         let (db, s) = open_legacy(&dir);
-        s.propose_close(&permit(&db, OwnerOp::Close, b"c", "a", "", 1), "t").unwrap();
+        s.propose_close(&permit(&db, OwnerOp::Close, b"c", "a", "", 1), "t")
+            .unwrap();
         drop(s);
         // Legacy open of a latch-carrying db refuses (no autocommit
         // conversion or recovery on a protected file).
@@ -1792,15 +1781,48 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (_db, s) = open_legacy(&dir);
         // Not sealed -> witness refuses.
-        assert!(s.witness_commit(&permit(&_db, OwnerOp::Witness, b"c", "a", "art", 1)).is_err());
-        s.propose_close(&permit(&_db, OwnerOp::Close, b"ch", "attempt-x", "art", 9), "t").unwrap();
+        assert!(s
+            .witness_commit(&permit(&_db, OwnerOp::Witness, b"c", "a", "art", 1))
+            .is_err());
+        s.propose_close(
+            &permit(&_db, OwnerOp::Close, b"ch", "attempt-x", "art", 9),
+            "t",
+        )
+        .unwrap();
         // Wrong challenge -> refuse.
-        assert!(s.witness_commit(&permit(&_db, OwnerOp::Witness, b"WRONG", "attempt-x", "art", 9)).is_err());
+        assert!(s
+            .witness_commit(&permit(
+                &_db,
+                OwnerOp::Witness,
+                b"WRONG",
+                "attempt-x",
+                "art",
+                9
+            ))
+            .is_err());
         // Correct -> one row, seq 1.
-        let seq = s.witness_commit(&permit(&_db, OwnerOp::Witness, b"ch", "attempt-x", "art", 9)).unwrap();
+        let seq = s
+            .witness_commit(&permit(
+                &_db,
+                OwnerOp::Witness,
+                b"ch",
+                "attempt-x",
+                "art",
+                9,
+            ))
+            .unwrap();
         assert_eq!(seq, 1);
         // Replay -> witness_done refuses.
-        assert!(s.witness_commit(&permit(&_db, OwnerOp::Witness, b"ch", "attempt-x", "art", 9)).is_err());
+        assert!(s
+            .witness_commit(&permit(
+                &_db,
+                OwnerOp::Witness,
+                b"ch",
+                "attempt-x",
+                "art",
+                9
+            ))
+            .is_err());
     }
 
     /// Adversarial: a business-armed write conn must not mutate connection
@@ -1951,212 +1973,6 @@ mod tests {
         .unwrap();
     }
 
-    /// The cadence.sqlite3 production writer census: the exact set of
-    /// `src/` files permitted to reach the store's write surface, with
-    /// the callsite classes each is allowed. A file NOT in this map that
-    /// contains a write marker is a new unclassified writer — refused.
-    /// A file IN the map that gains a marker-class it isn't cleared for
-    /// (e.g. `events.rs` gaining a raw `Connection::open`) is refused
-    /// too — the signature check is per `(file, marker)`, not per file.
-    ///
-    /// `signature` is the *sorted, deduped* marker set; adding a
-    /// call-site class the file doesn't own fails the census even when
-    /// the file is otherwise accepted. Raw `Connection`/`execute` in a
-    /// separate-DB file (records, daemon side-conn, scratch) is not a
-    /// cadence.sqlite3 producer — the census covers the store domain.
-    fn census_scan(root: &std::path::Path) -> Vec<String> {
-        // Write-surface markers — a cadence.sqlite3 producer callsite.
-        const MARKERS: &[&str] = &[
-            "Connection::open",
-            "open_with_flags",
-            "unchecked_transaction",
-            "new_unchecked",
-            ".transaction(",
-            ".execute(",
-            ".execute_batch(",
-            ".prepare(",
-            "Store::open",
-            "open_side",
-            "open_adopting",
-            "with_sealed_tx",
-            "with_owner_tx",
-            "write_tx",
-            "fixture_conn",
-            "fixture_write",
-        ];
-        // The exact cadence.sqlite3 store-domain writers and the marker
-        // classes each is cleared for. Only `src/store/*.rs` (top level),
-        // `src/rollout.rs` and `src/daemon.rs` may produce store writes.
-        const EXPECTED: &[(&str, &[&str])] = &[
-            ("store/mod.rs", &["with_sealed_tx", "write_tx"]),
-            (
-                "store/schema.rs",
-                &["Connection::open", "open_with_flags", "unchecked_transaction",
-                  ".execute(", ".execute_batch(", ".prepare(", "open_side",
-                  "open_adopting", "with_owner_tx", "write_tx"],
-            ),
-            (
-                "store/seal.rs",
-                &["Connection::open", "open_with_flags", "unchecked_transaction",
-                  "new_unchecked", ".transaction(", ".execute(", ".execute_batch(",
-                  ".prepare(", "Store::open", "open_side", "open_adopting",
-                  "with_sealed_tx", "with_owner_tx", "write_tx", "fixture_conn",
-                  "fixture_write"],
-            ),
-            ("store/agents.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/app_audiences.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/app_bindings.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/app_capabilities.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/app_content.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/app_contexts.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/app_effects.rs", &[".execute(", ".prepare(", "write_tx"]),
-            (
-                "store/app_records.rs",
-                &["Connection::open", "unchecked_transaction", "new_unchecked",
-                  ".execute(", ".execute_batch(", ".prepare(", "write_tx"],
-            ),
-            ("store/app_runs.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/app_sends.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/crm_sends.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/crm_smtp.rs", &[".execute(", "write_tx"]),
-            ("store/delivery.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/effects.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/events.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/inbox.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/messages.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/monitors.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/plans.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/platform.rs", &[".execute(", ".prepare(", "write_tx"]),
-            ("store/social_publish.rs", &[".execute(", ".prepare(", "write_tx"]),
-            (
-                "store/threads.rs",
-                &["Connection::open", ".execute(", ".execute_batch(", ".prepare(",
-                  "Store::open", "write_tx"],
-            ),
-            (
-                "rollout.rs",
-                &["Connection::open", "open_with_flags", ".execute(",
-                  ".execute_batch(", ".prepare(", "Store::open"],
-            ),
-        ];
-        // The cadence.sqlite3 producer domain: `src/store/*.rs` (top
-        // level) plus `src/rollout.rs`. Other `src/` files hold
-        // `Connection::open`/`transaction`/`execute` against SEPARATE
-        // databases (records, daemon side-conns, scratch copies) — those
-        // are not cadence producers, so the scan is confined to the
-        // store domain and `rollout.rs` (the owner-lane caller).
-        let mut offenders = Vec::new();
-        let store_dir = root.join("store");
-        let mut files: Vec<std::path::PathBuf> = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&store_dir) {
-            for entry in rd.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("rs") && p.is_file() {
-                    files.push(p);
-                }
-            }
-        }
-        let rollout = root.join("rollout.rs");
-        if rollout.exists() {
-            files.push(rollout);
-        }
-        for p in files {
-            let text = match std::fs::read_to_string(&p) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let rel = p
-                .strip_prefix(root)
-                .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| p.to_string_lossy().into_owned());
-            let mut present: Vec<&str> = MARKERS
-                .iter()
-                .copied()
-                .filter(|m| text.contains(m))
-                .collect();
-            present.sort_unstable();
-            present.dedup();
-            if present.is_empty() {
-                continue; // writer-free file
-            }
-            match EXPECTED.iter().find(|(f, _)| *f == rel) {
-                // A file outside the cleared domain with a marker is a
-                // brand-new unclassified writer.
-                None => offenders.push(format!("{rel}: unclassified writer file")),
-                // A file in the domain whose marker set is not exactly
-                // its cleared signature gained a callsite class it isn't
-                // cleared for (e.g. `events.rs` adding `Connection::open`).
-                Some((_, allowed)) => {
-                    let mut want: Vec<&str> = allowed.to_vec();
-                    want.sort_unstable();
-                    want.dedup();
-                    for m in &present {
-                        if !want.contains(m) {
-                            offenders.push(format!(
-                                "{rel}: unclassified callsite marker {m}"
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        offenders
-    }
-
-    /// CAD-1011 writer census: the recursive scan over `src/` must find
-    /// only the classified owners above — a new file with a write marker,
-    /// or an accepted file that gains a marker-class it isn't cleared
-    /// for, fails here.
-    #[test]
-    fn census_db_writers_enumerated() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let offenders = census_scan(&root);
-        assert!(
-            offenders.is_empty(),
-            "writer census found unclassified cadence.sqlite3 write surface:\n{}",
-            offenders.join("\n")
-        );
-    }
-
-    /// Regression: the scanner must refuse an unclassified write marker
-    /// even in an ALREADY-accepted file and in a brand-new file. Copy the
-    /// real `store/mod.rs` (cleared only for the lane markers) and append
-    /// a raw `Connection::open` — a callsite class it does NOT own — plus
-    /// write a brand-new writer file, into a scratch `src/store/` tree.
-    /// `census_scan` must flag both: the injected callsite in the
-    /// accepted file, and the new file outright.
-    #[test]
-    fn census_rejects_unclassified_writer() {
-        let scratch = TempDir::new().unwrap();
-        let src = scratch.path().join("src");
-        std::fs::create_dir_all(src.join("store")).unwrap();
-        let modreal = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store/mod.rs"),
-        )
-        .unwrap();
-        // store/mod.rs is cleared only for with_sealed_tx/write_tx —
-        // append a raw Connection ctor so the copied accepted file carries
-        // an unclassified callsite class the signature check must flag.
-        let mut sneaky = modreal;
-        sneaky.push_str("\nfn smuggled() { let _ = rusqlite::Connection::open(\"x\"); }\n");
-        std::fs::write(src.join("store/mod.rs"), sneaky).unwrap();
-        // A brand-new writer file inside the domain, never in EXPECTED.
-        std::fs::write(
-            src.join("store/pwned.rs"),
-            "fn evil() { rusqlite::Connection::open(\"db\").unwrap().execute(\"\",[]); }",
-        )
-        .unwrap();
-        let offenders = census_scan(&src);
-        assert!(
-            offenders.iter().any(|o| o.starts_with("store/mod.rs")),
-            "injected raw Connection ctor in an accepted file must be flagged: {offenders:?}"
-        );
-        assert!(
-            offenders.iter().any(|o| o.starts_with("store/pwned.rs")),
-            "new unclassified writer file must be flagged: {offenders:?}"
-        );
-    }
-
     /// Adversarial: a panic inside a `with_owner_tx` callback must not
     /// leave the conn inside a tx — the verified rollback runs under the
     /// guard's own TxControl window before the unwind resumes. Assert the
@@ -2164,7 +1980,7 @@ mod tests {
     #[test]
     fn owner_tx_panic_rolls_back_and_returns_to_autocommit() {
         let dir = TempDir::new().unwrap();
-        let (db, s) = open_legacy(&dir);
+        let (_db, s) = open_legacy(&dir);
         // Drive a REAL owner-maintenance tx (`with_owner_tx`) that runs a
         // DML then panics — catch_unwind inside the guard rolls the tx
         // back under TxControl, then the unwind resumes and drops the
@@ -2172,24 +1988,43 @@ mod tests {
         // a conn already in autocommit — the rollback happened BEFORE
         // any poison-forensic masking could hide a leaked tx.
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = s.owner_panic_probe();
+            let _: Result<()> = s.with_owner_tx(|conn| {
+                conn.execute(
+                    "INSERT INTO events(alias,kind,payload,at) VALUES('owner-probe','panic','{}',0)",
+                    [],
+                )?;
+                assert_eq!(conn.query_row(
+                    "SELECT count(*) FROM events WHERE alias='owner-probe'",
+                    [], |row| row.get::<_, i64>(0),
+                )?, 1, "the owner DML must actually run before panic");
+                panic!("deliberate panic after owner DML");
+            });
         }));
         assert!(r.is_err(), "panic must propagate");
         // The DML must NOT have committed — the rollback discarded it.
-        let present: bool = s
-            .conn()
+        // Inspect the poisoned mutex directly. Store::conn() repairs a
+        // leaked transaction and would hide a broken owner rollback.
+        let held = s
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            held.is_autocommit(),
+            "owner rollback must finish before recovery"
+        );
+        let present: i64 = held
             .query_row(
-                "SELECT COUNT(*) FROM agents WHERE alias='owner-probe'",
+                "SELECT COUNT(*) FROM events WHERE alias='owner-probe'",
                 [],
-                |r| r.get::<_, i64>(0).map(|n| n > 0),
+                |r| r.get(0),
             )
-            .unwrap_or(false);
-        assert!(!present, "owner-tx DML must roll back on panic");
+            .unwrap();
+        assert_eq!(present, 0, "owner-tx DML must roll back on panic");
+        drop(held);
         // A later sanctioned business write still works — the conn is
         // usable, not wedged inside a leaked tx.
         s.event_public("daemon", "after-panic", json!({}))
             .unwrap_or_else(|e| panic!("store unusable after panic rollback: {e}"));
-        let _ = db;
     }
 
     /// Adversarial: the owner-maintenance permit is bound to the database
@@ -2244,10 +2079,7 @@ mod tests {
             (b"ch", "a", "WRONG-artifact", 7, "wrong artifact"),
         ] {
             let p = OwnerMaintenancePermit::synthetic(&id, OwnerOp::Witness, ch, at, art, ep, dl);
-            assert!(
-                s.witness_commit(&p).is_err(),
-                "witness must refuse {label}"
-            );
+            assert!(s.witness_commit(&p).is_err(), "witness must refuse {label}");
         }
         // Expired deadline refuses.
         let stale = OwnerMaintenancePermit::synthetic(
@@ -2282,40 +2114,126 @@ mod tests {
         assert!(s.witness_commit(&replay).is_err());
     }
 
-    /// Adversarial: two connections — one sealing the latch, one writing
-    /// — must serialize through the held `BEGIN IMMEDIATE`: a write that
-    /// begins before the seal commits sees `LatchOpen`; one that waits
-    /// on the write lock sees `Sealed` and refuses. Assert the sealed
-    /// side wins and a late business write refuses.
+    /// Both handles exist before the latch. The second SQLite connection's
+    /// real busy handler proves it reached the contended BEGIN IMMEDIATE;
+    /// bounded channels release the first commit before its retry. No sleeps
+    /// or reopening a sealed file stand in for an actual competing writer.
     #[test]
     fn second_connection_seal_serializes_with_business_write() {
-        let dir = TempDir::new().unwrap();
-        let (db, s1) = open_legacy(&dir);
-        // Seal via the owner lane on s1.
-        s1.propose_close(
-            &OwnerMaintenancePermit::synthetic(
-                &db.canonicalize().unwrap().to_string_lossy(),
-                OwnerOp::Close,
-                b"ch",
-                "a",
-                "art",
-                1,
-                crate::store::now() as i64 + 3_600,
-            ),
-            "t",
-        )
-        .unwrap();
-        // A business write on the same (now-sealed) store refuses.
-        assert!(s1
-            .with_sealed_tx(|wtx| {
-                Ok(wtx.execute_batch(
-                    "INSERT INTO events(alias,kind,payload,at) VALUES('d','k','{}',1)",
-                )?)
-            })
-            .is_err());
-        // A second Store handle on the same file must refuse writable
-        // open — the durable latch survives the seal.
-        drop(s1);
-        assert!(Store::open(&db).is_err(), "sealed file must refuse reopen");
+        use std::sync::{mpsc, Mutex};
+        use std::time::Duration;
+        struct BusyGate {
+            entered: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        static GATE: Mutex<Option<Arc<BusyGate>>> = Mutex::new(None);
+        fn busy(count: i32) -> bool {
+            if count != 0 {
+                return false;
+            }
+            let Some(gate) = GATE.lock().unwrap().clone() else {
+                return false;
+            };
+            if gate.entered.try_send(()).is_err() {
+                return false;
+            }
+            gate.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .is_ok()
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                *GATE.lock().unwrap() = None;
+            }
+        }
+        let _reset = Reset;
+        for close_first in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let (db, first) = open_legacy(&dir);
+            let second = Store::open(&db).unwrap();
+            let (held_tx, held_rx) = mpsc::sync_channel(1);
+            let (commit_tx, commit_rx) = mpsc::sync_channel(1);
+            let (busy_tx, busy_rx) = mpsc::sync_channel(1);
+            let (retry_tx, retry_rx) = mpsc::sync_channel(1);
+            *GATE.lock().unwrap() = Some(Arc::new(BusyGate {
+                entered: busy_tx,
+                release: Mutex::new(retry_rx),
+            }));
+            second.conn().busy_handler(Some(busy)).unwrap();
+            let callback_ran = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let holding = scope.spawn(|| {
+                    if close_first {
+                        // Test-only private owner setup holds the actual close
+                        // DML until commit. It proves lock/latch ordering, not
+                        // external authority or a production permit factory.
+                        first.with_owner_tx(|conn| {
+                            conn.execute_batch(SEAL_SCHEMA)?;
+                            conn.execute("INSERT INTO closure_state(id,closed,reason,challenge,attempt,artifact,epoch,witness_done,closed_at) VALUES(1,1,'test',X'63','a','art',1,0,0)", [])?;
+                            held_tx.send(()).unwrap();
+                            commit_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            Ok(())
+                        })
+                    } else {
+                        first.with_sealed_tx(|wtx| {
+                            wtx.execute("INSERT INTO events(alias,kind,payload,at) VALUES('race-probe','probe','{}',0)", [])?;
+                            held_tx.send(()).unwrap();
+                            commit_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            Ok(())
+                        })
+                    }
+                });
+                held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let pending = scope.spawn(|| {
+                    if close_first {
+                        second.with_sealed_tx(|wtx| {
+                            callback_ran.store(true, Ordering::SeqCst);
+                            wtx.execute("INSERT INTO events(alias,kind,payload,at) VALUES('race-late','probe','{}',0)", [])?;
+                            Ok(())
+                        })
+                    } else {
+                        second.propose_close(&permit(&db, OwnerOp::Close, b"c", "a", "art", 1), "test")
+                    }
+                });
+                busy_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                // The second BEGIN is really blocked by the first connection.
+                assert!(!callback_ran.load(Ordering::SeqCst));
+                commit_tx.send(()).unwrap();
+                holding.join().unwrap().unwrap();
+                retry_tx.send(()).unwrap();
+                let result = pending.join().unwrap();
+                if close_first {
+                    assert!(result.is_err());
+                } else {
+                    result.unwrap();
+                }
+            });
+            assert!(!callback_ran.load(Ordering::SeqCst));
+            let callback = std::sync::atomic::AtomicBool::new(false);
+            assert!(first
+                .with_sealed_tx(|_| {
+                    callback.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .is_err());
+            assert!(
+                !callback.load(Ordering::SeqCst),
+                "late writer must refuse before its callback"
+            );
+            let rows: i64 = second
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM events WHERE alias IN ('race-probe','race-late')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, if close_first { 0 } else { 1 });
+            second.conn().busy_handler(None).unwrap();
+            *GATE.lock().unwrap() = None;
+        }
     }
 }

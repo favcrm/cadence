@@ -1,8 +1,8 @@
 //! Durable, run-scoped results from reviewed read/draft capabilities.
+use super::StoreConn;
 use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
-use super::StoreConn;
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS app_capability_results(
@@ -27,7 +27,10 @@ pub const ASSET_BYTES: usize = 2 * 1024 * 1024;
 /// Return the exact immutable asset and its complete provider receipt. This
 /// works inside a finishing/release SQL transaction, so neither review nor
 /// release can observe a different row between the proof and byte read.
-pub(crate) fn asset_material_in(conn: &impl super::StoreConn, id: &str) -> Result<(Value, Vec<u8>)> {
+pub(crate) fn asset_material_in(
+    conn: &impl super::StoreConn,
+    id: &str,
+) -> Result<(Value, Vec<u8>)> {
     let row = conn
         .query_row(
             "SELECT run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,
@@ -195,7 +198,7 @@ impl Store {
                     }
                     Ok(())
         });
-        }
+    }
 
     pub(crate) fn app_selected_source_input(
         &self,
@@ -402,7 +405,7 @@ impl Store {
                     drop(conn);
                     self.app_capability_result(id)
         });
-        }
+    }
 
     pub(crate) fn app_capability_result(&self, id: &str) -> Result<Value> {
         let conn = self.conn();
