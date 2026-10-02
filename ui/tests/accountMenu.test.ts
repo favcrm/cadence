@@ -73,6 +73,56 @@ const pointerDown = (target: any) => act(() => { target.dispatchEvent(new win.Ev
   done();
 }
 
+// Tab past the last control closes the dialog; moving inside it, or to the trigger, does not.
+{
+  const { host, done } = mount(createElement("div", null, menu(signedIn), createElement("button", { id: "outside" }, "outside")));
+  const t = trigger(host);
+  const outside = host.querySelector("#outside") as HTMLButtonElement;
+  act(() => t.click());
+  const buttons = Array.from(panel(host).querySelectorAll("button")) as HTMLButtonElement[];
+  act(() => buttons[0].focus());
+  act(() => buttons[buttons.length - 1].focus());
+  assert(panel(host), "focus moving between panel controls keeps it open");
+  act(() => t.focus());
+  assert(panel(host), "focus moving to the trigger keeps it open");
+  act(() => buttons[buttons.length - 1].focus());
+  act(() => outside.focus());
+  assert(!panel(host), "Tab out of the panel closes the dialog");
+  assert(document.activeElement === outside, "closing on focus-out does not steal focus back");
+  done();
+}
+
+// Activating any link in the panel (here a footer slot item) closes the dialog; a plain button does not.
+{
+  const footer = createElement("div", null, createElement("a", { href: "#v", id: "footer-link" }, "v1"), createElement("button", { id: "footer-btn" }, "b"));
+  const { host, done } = mount(menu(signedIn, { footer }));
+  act(() => trigger(host).click());
+  act(() => (host.querySelector("#footer-btn") as HTMLElement).click());
+  assert(panel(host), "a non-link click in the panel keeps it open");
+  act(() => (host.querySelector("#footer-link") as HTMLElement).click());
+  assert(!panel(host), "clicking a link in the footer closes the dialog");
+  done();
+}
+
+// The sidebar row trigger: avatar, name, "role · host" with the full value in a title, an up-chevron.
+{
+  const longHost = "demo-company-with-a-very-long-name.cadencecloud.app";
+  const real = win.location.href;
+  win.happyDOM.setURL(`http://${longHost}/`);
+  const { host, done } = mount(menu(signedIn, { trigger: "row", placement: "above-start" }));
+  const t = trigger(host);
+  assert(t.className.includes("navlink") && t.className.includes("account-row"), "row trigger uses the navlink family");
+  assert(t.textContent?.includes("Fable Chen") && t.textContent.includes(`operator · ${longHost}`), "row shows name and role · host");
+  assert(host.querySelector(`[title='operator · ${longHost}']`), "full role · host in a title");
+  assert(t.querySelector(".truncate") && t.querySelector(".rotate-180"), "host truncates and the chevron points up");
+  assert(!t.textContent?.includes("Sign out"), "row trigger is only the trigger");
+  act(() => t.click());
+  const cls = panel(host).className as string;
+  assert(cls.includes("bottom-full") && cls.includes("left-0") && !cls.includes("top-full"), "above-start opens above, left-aligned");
+  done();
+  win.happyDOM.setURL(real);
+}
+
 // Identity and the writes line.
 {
   const { host, done } = mount(menu(signedIn));
@@ -151,6 +201,12 @@ async function guardCases() {
   }
 }
 function rest() {
+// Only signed_in === true shows the menu: unknown, missing or truthy-but-not-true do not.
+for (const value of [null, undefined, "true", 1]) {
+  const { host, done } = mount(menu({ ...signedIn, signed_in: value } as unknown as Meta));
+  assert(!host.querySelector("[data-account-menu]"), `signed_in=${String(value)} renders no menu`);
+  done();
+}
 // Signed out: no account menu, the SignIn disclosure stays.
 {
   const { host, done } = mount(createElement("div", null, menu(signedOut), createElement(SignIn, { meta: signedOut, onChange: () => undefined })));

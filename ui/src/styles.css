@@ -173,6 +173,15 @@ body {
   background: color-mix(in srgb, var(--color-accent) 13%, var(--color-ink-875));
   color: var(--color-accent);
 }
+/* The sidebar footer's account trigger: a two-line navlink. */
+.navlink.account-row {
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  gap: 8px;
+  padding: 4px 8px;
+  font-size: inherit;
+}
 .navlink-sub {
   min-height: 28px;
   padding: 0 8px;

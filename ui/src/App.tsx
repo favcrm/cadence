@@ -148,6 +148,7 @@ export default function App() {
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
   // The serving build when it differs from this bundle's — drives the
   // reload banner (CAD-573).
   const [staleBuild, setStaleBuild] = useState<string | null>(null);
@@ -609,7 +610,17 @@ export default function App() {
         issues={issuesState}
         projectsError={projectsState.status === "failed" ? projectsState.error : null}
         signedIn={meta?.signed_in ?? null}
-        sessionUser={meta?.session?.user}
+        accountOpen={accountOpen}
+        account={<AccountMenu
+          onOpenChange={setAccountOpen}
+          meta={meta}
+          actor={actor}
+          mayWrite={!readOnly}
+          onChange={refresh}
+          trigger="row"
+          placement="above-start"
+          settingsHref={hrefFor({ screen: "settings", section: "models" })}
+        />}
       />
 
       {/* Workspaces fill the dynamic viewport; their panes own scrolling.
@@ -639,9 +650,7 @@ export default function App() {
             <StatusChips
               variant="header"
               readOnly={boardReadOnly}
-              mayWrite={!readOnly}
               health={health}
-              actor={actor}
               onRefresh={refresh}
             >
               <SignIn meta={meta} onChange={refresh} />
@@ -649,8 +658,8 @@ export default function App() {
                 <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
               )}
             </StatusChips>
-            {/* CAD-1033 moves the desktop trigger to the sidebar footer; until then it shows at all widths. Signed-out viewers keep the one-click theme button. */}
-            {meta?.signed_in === true ? <AccountMenu
+            {/* Desktop identity lives in the sidebar footer row; signed-out viewers keep the one-click theme button. */}
+            {meta?.signed_in === true ? <div className="flex lg:hidden"><AccountMenu
               meta={meta}
               actor={actor}
               mayWrite={!readOnly}
@@ -658,7 +667,7 @@ export default function App() {
               trigger="avatar"
               placement="below-end"
               settingsHref={hrefFor({ screen: "settings", section: "models" })}
-            /> : <ThemeToggle />}
+            /></div> : <ThemeToggle />}
           </div>
         </header>
 
@@ -696,9 +705,7 @@ export default function App() {
               <StatusChips
                 variant="menu"
                 readOnly={boardReadOnly}
-                mayWrite={!readOnly}
                 health={health}
-                actor={actor}
                 onRefresh={refresh}
               >
                 <SignIn meta={meta} onChange={refresh} />

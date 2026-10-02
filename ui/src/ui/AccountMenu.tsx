@@ -1,8 +1,8 @@
-import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type FocusEvent, type KeyboardEvent, type ReactNode } from "react";
 import { closeSession } from "../features/auth/session";
 import { setThemePref, type ThemePref } from "../lib/theme";
 import type { Meta } from "../lib/types";
-import { IconMoon, IconSun, IconTheme } from "./icons";
+import { IconChevron, IconMoon, IconSun, IconTheme } from "./icons";
 import Link from "./Link";
 
 const THEMES: { pref: ThemePref; label: string; icon: ReactNode }[] = [
@@ -20,8 +20,8 @@ function appliedTheme(): ThemePref {
 /**
  * One account menu: who you are, who writes are attributed to, theme and
  * sign out. The "avatar" trigger is a 28px initial (header, phones); the
- * "row" trigger is reserved for the sidebar footer (CAD-1033) and renders
- * the same button as a full-width row.
+ * "row" trigger is the desktop sidebar footer (CAD-1033): avatar, name,
+ * "role · host" and an up-chevron in a `.navlink`-family row.
  */
 export default function AccountMenu({
   meta,
@@ -32,6 +32,7 @@ export default function AccountMenu({
   placement,
   settingsHref,
   footer,
+  onOpenChange,
 }: {
   meta: Meta | null;
   actor: string;
@@ -43,6 +44,8 @@ export default function AccountMenu({
   settingsHref?: string;
   /** Slot at the end of the panel for the version line (CAD-1034). */
   footer?: ReactNode;
+  /** Reports the dialog's open state (the sidebar raises itself while it is open). */
+  onOpenChange?: (open: boolean) => void;
 }) {
   const panelId = useId();
   const [open, setOpen] = useState(false);
@@ -54,6 +57,12 @@ export default function AccountMenu({
   const triggerRef = useRef<HTMLButtonElement>(null);
   const user = meta?.session?.user;
   const name = user?.name || user?.email || user?.handle || user?.sub || "operator";
+
+  useEffect(() => {
+    if (!open) return;
+    onOpenChange?.(true);
+    return () => onOpenChange?.(false);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -71,6 +80,12 @@ export default function AccountMenu({
     triggerRef.current?.focus();
   };
   const focusables = () => Array.from(panelRef.current?.querySelectorAll<HTMLElement>("button:not(:disabled), a[href]") ?? []);
+  // Tab past the last control: focus left both the panel and the trigger. A null
+  // relatedTarget (window blur, a click on inert space) is left to pointerdown.
+  const onBlur = (event: FocusEvent) => {
+    const next = event.relatedTarget;
+    if (open && next instanceof Node && !rootRef.current?.contains(next)) setOpen(false);
+  };
   const onKeyDown = (event: KeyboardEvent) => {
     if (event.key === "Escape" && open) {
       event.stopPropagation();
@@ -99,8 +114,9 @@ export default function AccountMenu({
   // A read-only board shows nothing that writes: the logout route skips the read-only guard.
   const canWrite = !meta.read_only;
   const avatar = trigger === "avatar";
+  const hostLine = `${user?.role || "operator"} · ${location.host}`;
   return (
-    <div ref={rootRef} className={avatar ? "header-control-wrap shrink-0" : "relative shrink-0"} data-account-menu onKeyDown={onKeyDown}>
+    <div ref={rootRef} className={avatar ? "header-control-wrap shrink-0" : "relative shrink-0"} data-account-menu onKeyDown={onKeyDown} onBlur={onBlur}>
       <button
         ref={triggerRef}
         type="button"
@@ -111,12 +127,20 @@ export default function AccountMenu({
         onClick={() => setOpen((value) => !value)}
         className={avatar
           ? "header-icon"
-          : "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-label text-ink-200 hover:bg-ink-800"}
+          : "navlink account-row"}
       >
         <span aria-hidden className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-accent/15 text-label font-medium uppercase text-accent">
           {name.trim().charAt(0)}
         </span>
-        {!avatar && <span className="min-w-0 truncate">{name}</span>}
+        {!avatar && (
+          <>
+            <span className="min-w-0 flex-1 text-left" title={hostLine}>
+              <span className="block truncate text-secondary font-medium text-ink-200">{name}</span>
+              <span className="block truncate text-micro text-ink-500">{hostLine}</span>
+            </span>
+            <span aria-hidden className="shrink-0 rotate-180 text-ink-500"><IconChevron /></span>
+          </>
+        )}
       </button>
       {open && (
         <div
@@ -124,7 +148,9 @@ export default function AccountMenu({
           ref={panelRef}
           role="dialog"
           aria-label="Account"
-          className={`absolute z-50 card w-64 p-1.5 shadow-xl ${placement === "below-end" ? "right-0 top-full mt-2" : "left-0 bottom-full mb-2"}`}
+          // Any link in the panel (Settings, a footer slot item) navigates away: close.
+          onClick={(event) => { if ((event.target as Element).closest("a")) setOpen(false); }}
+          className={`absolute z-50 card p-1.5 shadow-xl ${placement === "below-end" ? "right-0 top-full mt-2 w-64" : "left-0 bottom-full mb-2 w-[max(100%,16rem)]"}`}
         >
           <div className="px-2 py-1.5" title={meta.session ? `session ${meta.session.id}` : undefined}>
             <p className="text-secondary text-ink-100 break-words">{name}</p>
