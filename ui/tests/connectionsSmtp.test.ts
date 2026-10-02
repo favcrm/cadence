@@ -263,7 +263,6 @@ async function main() {
   const host2 = document.createElement("div");
   document.body.appendChild(host2);
   const root2 = createRoot(host2);
-  const text2 = () => host2.textContent ?? "";
   const field2 = (label: string) => Array.from(host2.querySelectorAll("label")).find((l) => (l.textContent ?? "").includes(label));
   const fill2 = (label: string, value: string) => {
     const lab = field2(label);
