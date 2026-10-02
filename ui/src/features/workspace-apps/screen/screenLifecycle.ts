@@ -23,8 +23,9 @@ export class ScreenChannel {
     private projection: ScreenPush, private removeFrame: () => void,
     private failed: () => void, private onReady: () => void) {}
   receive(event: Pick<MessageEvent, "origin" | "source" | "data" | "ports">): void {
-    if (this.closed || event.source !== this.source || event.origin !== "null") {
-      event.ports.forEach(p => p.close()); return;
+    if (this.closed || event.source !== this.source) return;
+    if (event.origin !== "null") {
+      event.ports.forEach(p => p.close()); this.close(true); return;
     }
     const init = parseInit(event.data);
     if (!init || init.tag !== this.receipt.tag || init.bridge_nonce !== this.receipt.bridge_nonce ||

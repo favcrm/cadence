@@ -43,10 +43,10 @@ good.channel.update({ ...push, context_id: "other" });
 check(good.port.closed && good.counts().removed === 1, "context changes close port and remove frame");
 good.port.receive({ v: 1, op: "ready" });
 check(good.port.sent.length === 1, "late message cannot revive retired mount");
-for (const changed of [{ origin: "https://foreign.example" }, { source: {} as Window }]) {
-  const m = mount(); m.channel.receive({ ...m.event, ...changed });
-  check(m.port.closed && m.counts().ready === 0, "foreign origin/source cannot acquire data");
-}
+const foreign = mount(); foreign.channel.receive({ ...foreign.event, source: {} as Window });
+check(!foreign.port.closed && foreign.counts().ready === 0, "unrelated listeners own foreign ports, no data disclosed");
+const foreignOrigin = mount(); foreignOrigin.channel.receive({ ...foreignOrigin.event, origin: "https://foreign.example" });
+check(foreignOrigin.port.closed && foreignOrigin.counts().failed === 1, "owned frame with foreign origin fails closed");
 const wrong = mount(); wrong.channel.receive({ ...wrong.event, data: { ...init, generation: 3 } });
 check(wrong.port.closed && wrong.counts().failed === 1, "wrong generation fails closed");
 const twice = mount(); twice.channel.receive(twice.event); twice.channel.receive(twice.event);
