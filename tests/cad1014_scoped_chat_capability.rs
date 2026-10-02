@@ -27,6 +27,14 @@ use std::path::PathBuf;
 
 const CSV: &str = "record_id,display_name,email\ncust-1,Amina Diallo,amina@example.invalid\n";
 
+fn blocks() -> Value {
+    json!([
+        {"type": "heading", "text": "Hello {{first_name|friend}}"},
+        {"type": "paragraph", "text": "A calm first line."},
+        {"type": "button", "label": "Read more", "url": "https://example.com/posts/welcome"},
+    ])
+}
+
 struct Crm {
     _root: tempfile::TempDir,
     _pm: Pm,
@@ -119,6 +127,25 @@ impl Crm {
             .unwrap();
         assert_eq!(changed, 1, "chat turn message missing: {message}");
         token
+    }
+
+    /// The operator mints a one-time email proposal request on a scoped
+    /// chat message — the CAD-813 verb, reused for the no-draft case.
+    fn mint(
+        &self,
+        install: &str,
+        context: &str,
+        campaign: &str,
+        message: &str,
+        request: &str,
+    ) -> Value {
+        self.daemon
+            .operator_rpc(
+                "app_content_proposal_request",
+                json!({"install_id": install, "context_id": context, "campaign_id": campaign,
+                       "message": message, "request_id": request}),
+            )
+            .unwrap()
     }
 
     fn preview(&self, install: &str, context: &str, csv: &str) -> Value {
@@ -339,4 +366,56 @@ fn cad1014_scoped_chat_refusals_are_closed() {
             .is_err(),
         "operator reached the assistant redeem"
     );
+}
+
+/// Email creation from scoped chat with NO prior draft — the composer-
+/// free initial-draft path. The operator's own stamped chat message is
+/// the intent; the one-time proposal request mints on a fresh campaign
+/// (`source_revision` resolves to 0 with no doc), and the agent redeems
+/// it through `app_content_assistant_propose` into an inert `pending`
+/// proposal carrying `assistant-receipt` provenance. No send, no
+/// approval — Apply stays the operator's.
+#[test]
+fn cad1014_scoped_chat_email_first_draft_is_inert() {
+    let w = Crm::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-1014-4");
+    let context_id = context["id"].as_str().unwrap();
+
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "crm-chat", "claude", None, lane.pid());
+    let token = w.chat_turn("crm-chat", install, context_id, "chat-1014-4");
+
+    // Fresh campaign — no draft exists; the mint stamps source_revision 0.
+    let minted = w.mint(
+        install,
+        context_id,
+        "welcome-1",
+        "chat-1014-4",
+        "req-1014-e1",
+    );
+    assert_eq!(
+        minted["request"]["source_revision"].as_i64(),
+        Some(0),
+        "{minted}"
+    );
+
+    let proposed: Value = lane.rpc(
+        &w.daemon.state,
+        "app_content_assistant_propose",
+        json!({"install_id": install, "context_id": context_id, "campaign_id": "welcome-1",
+               "proposal_id": "prop-1014-e1", "subject": "Welcome, {{first_name|friend}}",
+               "preheader": "A note", "blocks": blocks(),
+               "message": "chat-1014-4", "token": token, "request_id": "req-1014-e1"}),
+    );
+    assert_eq!(proposed["ok"], true, "{proposed}");
+    let proposal = &proposed["result"]["proposal"];
+    assert_eq!(proposal["state"], "pending");
+    assert_eq!(proposal["actor"], "assistant");
+    assert_eq!(proposal["origin"], "assistant-receipt");
+    assert_eq!(proposal["source_revision"], 0);
+    // The proposal is inert: applying/approving/sending stays the
+    // operator's — the assistant verb can never reach them (asserted in
+    // the CAD-813 suite).
 }
