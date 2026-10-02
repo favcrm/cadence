@@ -235,6 +235,108 @@ async function main() {
 
   globalThis.fetch = innerFetch;
   await act(async () => root.unmount());
+
+  // ---- CAD-1009 rotate audit: the SMTP rotate form is password-primary,
+  // server details collapsed w/ human labels, a PAIRED port/security
+  // selector, and NEVER a raw scopes or tls_mode box. ----
+  const { RotateForm } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
+  const rotatePosts: { url: string; body: any }[] = [];
+  const innerFetch2 = globalThis.fetch;
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    const url = String(input);
+    if (init?.method === "POST" && url.includes("/rotate")) {
+      rotatePosts.push({ url, body: JSON.parse(String(init.body)) });
+      return new Response(JSON.stringify({ connection: { id: "c-1", revision: 2 } }), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    }
+    return innerFetch2(input as RequestInfo | URL, init);
+  }) as typeof fetch;
+
+  const smtpRow: any = {
+    id: "c-1", provider: "smtp", account: "newsletter",
+    display_name: "newsletter",
+    scopes: ["email:send"],
+    smtp: { host: "mail.example.com", port: 465, tls_mode: "implicit", username: "mailer", sender: "news@example.com", sender_name: "News" },
+    status: { adapter_registered: true, descriptor_available: true, custody_available: true, manifest_status: "matched", reviewed_pin: "smtp@1", reported_pin: "smtp@1", execution_authority: true, network_checked: false },
+  };
+  const host2 = document.createElement("div");
+  document.body.appendChild(host2);
+  const root2 = createRoot(host2);
+  const text2 = () => host2.textContent ?? "";
+  const field2 = (label: string) => Array.from(host2.querySelectorAll("label")).find((l) => (l.textContent ?? "").includes(label));
+  const fill2 = (label: string, value: string) => {
+    const lab = field2(label);
+    assert(lab, `rotate field labelled ${label}`);
+    const input = lab!.parentElement!.querySelector("input,select,textarea") as HTMLInputElement;
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
+      setter.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  };
+  act(() => {
+    root2.render(React.createElement(RotateForm, { row: smtpRow, onDone: () => {}, onClose: () => {} }));
+  });
+  await settle(() => assert(field2("New SMTP password"), "rotate is password-primary"), 30000);
+  // No raw scopes box for SMTP, and no independent raw tls_mode field.
+  assert(!field2("Scopes"), "SMTP rotate exposes NO scopes field — it preserves live scopes");
+  assert(!field2("tls_mode"), "SMTP rotate exposes NO raw tls_mode input");
+  // Server details are collapsed behind a summary; the transport selector
+  // is the PAIRED choice (keep current / 465 implicit / 587 starttls).
+  assert(host2.querySelector("details summary"), "server details are collapsed behind a summary");
+  assert(field2("Port & security"), "the paired Port & security selector renders");
+
+  const submitRotate = () => {
+    const btn = Array.from(host2.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Replace credential")) as HTMLButtonElement;
+    return act(async () => btn.click());
+  };
+
+  // (a) Blank everything-but-password -> INHERIT: only `secret` is sent;
+  // no host/port/tls_mode and NO scopes in the body.
+  fill2("New SMTP password", "rotate-secret-1");
+  await submitRotate();
+  await settle(() => assert(rotatePosts.length === 1, "rotate posted once"), 30000);
+  const b0 = rotatePosts[0].body;
+  equal(b0.secret, "rotate-secret-1", "rotate sends the new password as secret");
+  assert(b0.host === undefined && b0.port === undefined && b0.tls_mode === undefined, "blank details inherit live host/port/tls — nothing sent");
+  assert(b0.scopes === undefined, "SMTP rotate sends NO scopes — live grant preserved");
+
+  // (b) Choose the paired 587/STARTTLS transport -> port+tls_mode travel
+  // together; scopes still absent.
+  const transport = field2("Port & security")!.parentElement!.querySelector("select") as HTMLSelectElement;
+  act(() => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value")!.set!;
+    setter.call(transport, "starttls");
+    transport.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  fill2("New SMTP password", "rotate-secret-2");
+  await submitRotate();
+  await settle(() => assert(rotatePosts.length === 2, "second rotate posted"), 30000);
+  const b1 = rotatePosts[1].body;
+  equal(b1.port, 587, "paired selector sends port 587");
+  equal(b1.tls_mode, "starttls", "paired selector sends tls_mode starttls");
+  assert(b1.scopes === undefined, "paired transport still sends no scopes");
+
+  // (c) Reset the transport back to "Keep current" and change only the
+  // host — the effective inherited 465/implicit pairing is re-validated
+  // and only the host crosses the wire (port/tls inherit the live pair).
+  act(() => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value")!.set!;
+    setter.call(transport, "");
+    transport.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  fill2("Server host", "smtp2.example.com");
+  fill2("New SMTP password", "rotate-secret-3");
+  await submitRotate();
+  await settle(() => assert(rotatePosts.length === 3, "host-only rotate posted"), 30000);
+  const b2 = rotatePosts[2].body;
+  equal(b2.host, "smtp2.example.com", "a changed host is sent");
+  assert(b2.port === undefined && b2.tls_mode === undefined, "host-only change inherits the live port/tls pair — none sent");
+
+  globalThis.fetch = innerFetch2;
+  await act(async () => root2.unmount());
+
   console.log("connections smtp form checks passed");
 }
 

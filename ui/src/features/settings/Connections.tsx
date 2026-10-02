@@ -422,7 +422,7 @@ function enrollmentText(p: ConnectionProvider): string {
 }
 
 /** Replace an enrolled credential. The token clears the moment the request settles. */
-function RotateForm({
+export function RotateForm({
   row,
   onDone,
   onClose,
@@ -437,26 +437,49 @@ function RotateForm({
   const [scopes, setScopes] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // SMTP senders rotate the password under the same identity; blank
-  // transport fields inherit the live custody values.
+  // SMTP senders rotate the password under the same identity; the
+  // password is primary and the optional server details sit collapsed
+  // behind human labels. Blank fields inherit the live custody values;
+  // the port/security selector is a PAIRED transport choice — "keep
+  // current", or the valid (465 implicit) / (587 STARTTLS) pair — never
+  // a raw, independently-editable tls_mode field. SMTP keeps its live
+  // scopes (the rotation never narrows or widens them); token providers
+  // still expose their own scopes box.
   const isSmtp = (row.smtp ?? null) !== null;
-  const [smtp, setSmtp] = useState({ host: "", port: "", tls_mode: "", username: "", sender: "", sender_name: "" });
+  // transport: "" = keep the live host/port/tls pairing; otherwise the
+  // operator picks a paired submission transport.
+  const [smtpTransport, setSmtpTransport] = useState("");
+  const [smtp, setSmtp] = useState({ host: "", username: "", sender: "", sender_name: "" });
 
   const submit = () => {
     if (busy) return;
     const wanted = scopes.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
-    const base = wanted.length > 0 ? { scopes: wanted } : {};
-    if (isSmtp && smtp.port.trim() !== "" && !/^\d+$/.test(smtp.port.trim())) {
-      setError("The SMTP port is digits only — 465 for implicit TLS, 587 for STARTTLS.");
-      return;
+    // SMTP never touches scopes — omitting them preserves the live grant.
+    // Token providers only carry a scopes override when one was typed.
+    const base = !isSmtp && wanted.length > 0 ? { scopes: wanted } : {};
+    // Resolve the effective host/port/tls: a chosen transport pair, else
+    // the live custody values, else any typed host.
+    const liveHost = row.smtp?.host ?? "";
+    const livePort = row.smtp?.port ?? 0;
+    const liveTls = row.smtp?.tls_mode ?? "";
+    const effHost = smtp.host.trim() !== "" ? smtp.host.trim() : liveHost;
+    const effPort = smtpTransport === "" ? livePort : smtpTransport === "implicit" ? 465 : 587;
+    const effTls = smtpTransport === "" ? liveTls : smtpTransport;
+    const hostChanged = smtp.host.trim() !== "";
+    const transportChanged = smtpTransport !== "";
+    if (isSmtp && (hostChanged || transportChanged)) {
+      // Validate the EFFECTIVE inherited host/port/TLS before the request
+      // — a changed piece must still form a valid (465 implicit) /
+      // (587 starttls) submission against the live or new host.
+      const bad = smtpPortTlsError(effHost, String(effPort), effTls);
+      if (bad) { setError(bad); return; }
     }
     const body = isSmtp
       ? {
           ...base,
           secret: token.trim(),
           ...(smtp.host.trim() ? { host: smtp.host.trim() } : {}),
-          ...(smtp.port.trim() ? { port: Number(smtp.port.trim()) } : {}),
-          ...(smtp.tls_mode ? { tls_mode: smtp.tls_mode } : {}),
+          ...(transportChanged ? { port: effPort, tls_mode: effTls } : {}),
           ...(smtp.username.trim() ? { username: smtp.username.trim() } : {}),
           ...(smtp.sender.trim() ? { sender: smtp.sender.trim() } : {}),
           ...(smtp.sender_name.trim() ? { sender_name: smtp.sender_name.trim() } : {}),
@@ -519,46 +542,119 @@ function RotateForm({
         />
       </div>
       {isSmtp && row.smtp && (
-        <fieldset className="space-y-2">
-          <legend className="text-label font-medium text-ink-200">
-            Sender fields <span className="text-ink-500 font-normal">(optional — blank inherits the live values)</span>
-          </legend>
-          {["host", "port", "tls_mode", "username", "sender", "sender_name"].map((field) => (
-            <div key={field}>
-              <label htmlFor={`${scopesId}-${field}`} className="text-label text-ink-300">
-                {field}
+        <details className="space-y-2">
+          <summary className="text-label font-medium text-ink-300 cursor-pointer select-none">
+            Server &amp; sender details <span className="text-ink-500 font-normal">(optional — blank keeps the current values)</span>
+          </summary>
+          <fieldset className="space-y-2 mt-2">
+            <legend className="sr-only">SMTP server and sender</legend>
+            <p className="text-micro text-ink-500 break-words">
+              Leave everything blank to keep the live server and sender. Only fill a
+              field you intend to change.
+            </p>
+            <div>
+              <label htmlFor={`${scopesId}-host`} className="text-label text-ink-300">
+                Server host
               </label>
               <input
-                id={`${scopesId}-${field}`}
+                id={`${scopesId}-host`}
                 type="text"
                 autoComplete="off"
                 spellCheck={false}
-                value={smtp[field as keyof typeof smtp]}
-                onChange={(e) => setSmtp((cur) => ({ ...cur, [field]: e.target.value }))}
-                placeholder={String(row.smtp?.[field as keyof typeof row.smtp] ?? "")}
+                value={smtp.host}
+                onChange={(e) => setSmtp((cur) => ({ ...cur, host: e.target.value }))}
+                placeholder={row.smtp.host}
                 className="field w-full mt-1"
                 disabled={busy}
               />
             </div>
-          ))}
-        </fieldset>
+            <div>
+              <label htmlFor={`${scopesId}-transport`} className="text-label text-ink-300">
+                Port &amp; security
+              </label>
+              <select
+                id={`${scopesId}-transport`}
+                value={smtpTransport}
+                onChange={(e) => setSmtpTransport(e.target.value)}
+                className="field w-full mt-1"
+                disabled={busy}
+              >
+                <option value="">Keep current — {row.smtp.port} ({row.smtp.tls_mode === "implicit" ? "implicit TLS" : "STARTTLS"})</option>
+                <option value="implicit">465 — implicit TLS</option>
+                <option value="starttls">587 — STARTTLS</option>
+              </select>
+            </div>
+            <div>
+              <label htmlFor={`${scopesId}-username`} className="text-label text-ink-300">
+                Username
+              </label>
+              <input
+                id={`${scopesId}-username`}
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={smtp.username}
+                onChange={(e) => setSmtp((cur) => ({ ...cur, username: e.target.value }))}
+                placeholder={row.smtp.username}
+                className="field w-full mt-1"
+                disabled={busy}
+              />
+            </div>
+            <div>
+              <label htmlFor={`${scopesId}-sender`} className="text-label text-ink-300">
+                Sender address (verified)
+              </label>
+              <input
+                id={`${scopesId}-sender`}
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={smtp.sender}
+                onChange={(e) => setSmtp((cur) => ({ ...cur, sender: e.target.value }))}
+                placeholder={row.smtp.sender}
+                className="field w-full mt-1"
+                disabled={busy}
+              />
+            </div>
+            <div>
+              <label htmlFor={`${scopesId}-sender_name`} className="text-label text-ink-300">
+                Sender name
+              </label>
+              <input
+                id={`${scopesId}-sender_name`}
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={smtp.sender_name}
+                onChange={(e) => setSmtp((cur) => ({ ...cur, sender_name: e.target.value }))}
+                placeholder={row.smtp.sender_name}
+                className="field w-full mt-1"
+                disabled={busy}
+              />
+            </div>
+          </fieldset>
+        </details>
       )}
-      <div>
-        <label htmlFor={scopesId} className="text-label font-medium text-ink-200">
-          Scopes <span className="text-ink-500 font-normal">(optional — blank keeps the current scopes)</span>
-        </label>
-        <input
-          id={scopesId}
-          type="text"
-          autoComplete="off"
-          spellCheck={false}
-          value={scopes}
-          onChange={(e) => setScopes(e.target.value)}
-          placeholder={row.scopes.join(", ")}
-          className="field w-full mt-1"
-          disabled={busy}
-        />
-      </div>
+      {/* Scopes only exist for token providers — SMTP rotation preserves
+         the live scopes and never exposes a raw scopes box. */}
+      {!isSmtp && (
+        <div>
+          <label htmlFor={scopesId} className="text-label font-medium text-ink-200">
+            Scopes <span className="text-ink-500 font-normal">(optional — blank keeps the current scopes)</span>
+          </label>
+          <input
+            id={scopesId}
+            type="text"
+            autoComplete="off"
+            spellCheck={false}
+            value={scopes}
+            onChange={(e) => setScopes(e.target.value)}
+            placeholder={row.scopes.join(", ")}
+            className="field w-full mt-1"
+            disabled={busy}
+          />
+        </div>
+      )}
       {error && (
         <p className="text-label text-fail break-words" role="alert">
           {error}
