@@ -43,6 +43,7 @@ import "./workspace-apps.css";
 import ScreenHost from "./screen/ScreenHost";
 import { screenTag, screenProjection, settleIntentRead, type IntentRead } from "./screen/screenProjection";
 import { socialPublish } from "./socialPublish";
+import { supportsSocialContentWorkspace } from "./socialContentSupport";
 
 type Section =
   | "Board"
@@ -62,20 +63,6 @@ type Snapshot = {
   runs: WorkspaceRun[];
   effects: AppEffect[];
 };
-const socialContentWorkflows = new Map<string, readonly string[]>([
-  ["0.2.0", ["instagram", "facebook"]],
-  ["0.3.0", ["instagram", "facebook", "source-instagram"]],
-  ["0.4.0", ["instagram", "facebook", "source-instagram", "image-instagram"]],
-  ["0.5.0", ["instagram", "facebook", "source-instagram", "image-instagram", "image-manual"]],
-]);
-function supportsSocialContentWorkspace(installation: Installation): boolean {
-  const expected = socialContentWorkflows.get(installation.version);
-  if (installation.name !== "social-content" || !expected) return false;
-  const installed = installation.files
-    .filter(path => path.startsWith("workflows/") && path.endsWith(".md"))
-    .map(path => path.slice("workflows/".length, -".md".length));
-  return installed.length === expected.length && expected.every(name => installed.includes(name));
-}
 const message = (error: unknown) =>
   error instanceof Error
     ? error.message
