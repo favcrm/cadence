@@ -2084,6 +2084,28 @@ fn cad1027_freeze_refuses_foreign_effect_and_scope() {
     let mut forged = base.clone();
     forged["effect_id"] = sibling_effect["effect_id"].clone();
     cases.push(("same-scope other-run effect", "bad_effect", forged));
+    // Same run, different artifact: the effect's authorization names
+    // another artifact of the run (rewritten in place, as a two-step run
+    // would carry), so only the artifact comparison refuses it.
+    let mut rewritten = h.complete(&ctx_a, "cad1027-scope-artifact-run");
+    let effect = h.stage(&rewritten, "cad1027-scope-artifact-effect");
+    rewritten["staged_effect_id"] = effect["effect_id"].clone();
+    rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE app_effect_authorizations SET artifact_id='artifact-cad1027-other' WHERE effect_id=?",
+            [effect["effect_id"].as_str().unwrap()],
+        )
+        .unwrap();
+    let forged = freeze_params(
+        &ctx_a,
+        &rewritten,
+        &bundle_a,
+        &install,
+        "cad1027-scope-artifact",
+        epoch_now() + 3600,
+    );
+    cases.push(("same-run other-artifact effect", "bad_effect", forged));
     let mut forged = base.clone();
     forged["effect_id"] = json!("fx-forged-cad1027");
     cases.push(("forged effect", "bad_effect", forged));
