@@ -4188,7 +4188,7 @@ pub struct ServeOptions {
     /// Never set from RPC, PM, or the environment. `pub(crate)` — the
     /// hook type references the crate-internal `WriteTxn` facade and is
     /// not a public/producer authority surface.
-    pub(crate) shutdown_entries_hook: Option<crate::store::ShutdownEntriesHook>,
+    pub shutdown_entries_hook: Option<crate::store::ShutdownEntriesHook>,
     /// CAD-313: the operator-auth clock (epoch seconds) — `None` is the
     /// wall clock; tests inject one they advance past a link's TTL.
     pub operator_clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
