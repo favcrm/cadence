@@ -1,8 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { useHref } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
-import SectionTabs from "../../ui/SectionTabs";
 import type { Viewer } from "../projects/work";
 import CrmShell from "./CrmCustomers";
 import type { HostScope } from "./hostActions";
@@ -12,8 +10,7 @@ export type OutletView = "list" | "new";
 /** CRM nested sections under Apps → CRM (CAD-784). */
 export type CrmSection = "customers" | "segments" | "campaigns";
 
-/** The CRM submenu in host display order. Shared by the outlet
- *  shortcuts and the board-level App menu. */
+/** CRM pages in host sidebar and mobile menu display order. */
 export const CRM_SECTIONS: [CrmSection, string][] = [
   ["customers", "Customers"],
   ["segments", "Segments"],
@@ -104,37 +101,21 @@ export default function CrmOutlet({
   /** Atomic created-record landing (list + details in one URL write). */
   onRecordCreated?: (recordId: string) => void;
 }) {
-  // Host-owned submenu (CAD-499 v4): Apps → CRM → sections lives in
-  // the shared outlet switch as real links — not buttons inside the
-  // CRM pane — so direct links, new-tab opens, breadcrumbs and the
-  // persistent left chat all keep working. Only the query changes, so
-  // the shell (and its single ChatPane) stays mounted across moves.
-  const href = useHref();
+  // CRM pages use the host sidebar and mobile menu as their navigation.
+  // Their URLs keep the installation/context and the single chat mounted.
   if (appKind === "crm") {
-    const active = section ?? "customers";
     return (
-      <>
-        <SectionTabs
-          bare
-          label="CRM"
-          tabs={CRM_SECTIONS.map(([key, label]) => ({
-            label,
-            href: crmSectionHref(href, key),
-            on: active === key,
-          }))}
-        />
-        <CrmShell
-          scope={scope}
-          scopedChatMessage={scopedChatMessage ?? null}
-          viewer={viewer}
-          view={view}
-          recordId={recordId}
-          section={active}
-          onView={onView}
-          onSelect={onSelect}
-          onRecordCreated={onRecordCreated}
-        />
-      </>
+      <CrmShell
+        scope={scope}
+        scopedChatMessage={scopedChatMessage ?? null}
+        viewer={viewer}
+        view={view}
+        recordId={recordId}
+        section={section ?? "customers"}
+        onView={onView}
+        onSelect={onSelect}
+        onRecordCreated={onRecordCreated}
+      />
     );
   }
   return (

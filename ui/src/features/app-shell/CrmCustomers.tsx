@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
-import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
 import CrmCampaigns from "./CrmCampaigns";
 import type { CrmSection } from "./CrmOutlet";
 import CrmSegments from "./CrmSegments";
+import CustomerCsvImport from "./CustomerCsvImport";
+import Detail from "./shared/Detail";
+import DataTable from "./shared/DataTable";
+import Field from "./shared/Field";
+import { EmptyState, ErrorNotice, Loading, Notice } from "./shared/States";
 import {
   buildCustomerProfile,
   consentEntries,
@@ -32,6 +36,10 @@ import { hostActions, type HostRecord, type HostScope } from "./hostActions";
  * and browser back keep it; switching sections clears the record
  * view in the shell. Search text lives in component state only — the
  * route URL keeps scope (`ctx`, `record`) and never record content.
+ *
+ * The shell's own header row is the single Apps → App breadcrumb and
+ * title; each section renders its own real heading instead of a
+ * second crumb (CAD-863 release correction).
  */
 export default function CrmShell({
   scope,
@@ -57,6 +65,12 @@ export default function CrmShell({
   onRecordCreated?: (recordId: string) => void;
 }) {
   const canWrite = viewer.operator && !viewer.readOnly;
+  // The CSV import page is component-local page state under
+  // Customers — it never enters the route URL (no customer content
+  // or bulk bytes in history), so `record`/`view` still own the URL
+  // grammar exactly as before.
+  const [importing, setImporting] = useState(false);
+  const [listRefresh, setListRefresh] = useState(0);
   // Section navigation lives in the host-owned outlet submenu
   // (CrmOutlet): this pane only renders the active section body.
   return (
@@ -86,34 +100,40 @@ export default function CrmShell({
         />
       )}
 
-      {section === "customers" && (
-        <nav className="crm-crumb" aria-label="Breadcrumb">
-          <Link href="/apps" className="lnk text-label">
-            Apps
-          </Link>
-          <span aria-hidden="true" className="text-ink-600">
-            /
-          </span>
-          <span className="text-label text-ink-300">CRM</span>
-          <span aria-hidden="true" className="text-ink-600">
-            /
-          </span>
-          <span className="text-label text-ink-100" aria-current="page">
-            Customers
-            {view === "new" ? " / New" : ""}
-            {recordId !== null ? " / Details" : ""}
-          </span>
-        </nav>
-      )}
       {section === "customers" && view === "list" && (
         <CustomerList
           scope={scope}
           viewer={viewer}
+          refresh={listRefresh}
           onSelect={onSelect}
-          onNew={() => onView("new")}
+          onNew={() => {
+            setImporting(false);
+            onView("new");
+          }}
+          onImport={() => {
+            setImporting(true);
+            onView("new");
+          }}
         />
       )}
-      {section === "customers" && view === "new" && (
+      {section === "customers" && view === "new" && importing && (
+        <CustomerCsvImport
+          scope={scope}
+          viewer={viewer}
+          onDone={() => {
+            // A committed import re-reads the list from the server —
+            // never trust local state over the rows the host stores.
+            setListRefresh((count) => count + 1);
+            setImporting(false);
+            onView("list");
+          }}
+          onCancel={() => {
+            setImporting(false);
+            onView("list");
+          }}
+        />
+      )}
+      {section === "customers" && view === "new" && !importing && (
         <CustomerNew
           scope={scope}
           viewer={viewer}
@@ -126,7 +146,10 @@ export default function CrmShell({
               onSelect(id);
             }
           }}
-          onCancel={() => onView("list")}
+          onCancel={() => {
+            setImporting(false);
+            onView("list");
+          }}
         />
       )}
       {section === "customers" && recordId !== null && (
@@ -147,13 +170,18 @@ const PAGE_SIZE = 20;
 function CustomerList({
   scope,
   viewer,
+  refresh,
   onSelect,
   onNew,
+  onImport,
 }: {
   scope: HostScope;
   viewer: Viewer;
+  /** Bumped after a committed CSV import — re-reads server rows. */
+  refresh: number;
   onSelect: (recordId: string) => void;
   onNew: () => void;
+  onImport: () => void;
 }) {
   const canWrite = viewer.operator && !viewer.readOnly;
   const [query, setQuery] = useState("");
@@ -179,7 +207,7 @@ function CustomerList({
     setCursors([]);
   }, [committed, scope.installId, scope.contextId]);
 
-  const reloadToken = `${scope.installId}:${scope.contextId}:${committed}:${cursor ?? ""}:${retry}`;
+  const reloadToken = `${scope.installId}:${scope.contextId}:${committed}:${cursor ?? ""}:${retry}:${refresh}`;
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
@@ -211,7 +239,10 @@ function CustomerList({
 
   return (
     <section aria-label="Customers list" className="crm-list">
-      <div className="crm-toolbar">
+      <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
+        Customers
+      </h3>
+      <div className="crm-toolbar mb-1">
         <div className="crm-search">
           <label className="sr-only" htmlFor="crm-customer-search">
             Search customers
@@ -227,104 +258,98 @@ function CustomerList({
           />
         </div>
         {canWrite && (
-          <Button variant="primary" size="sm" onClick={onNew}>
-            New customer
-          </Button>
+          <>
+            <Button size="sm" onClick={onImport}>
+              Import CSV
+            </Button>
+            <Button variant="primary" size="sm" onClick={onNew}>
+              New customer
+            </Button>
+          </>
         )}
       </div>
       {!viewer.operator && (
-        <p className="card px-4 py-3 text-label text-ink-400">
-          Sign in as the operator to inspect customer records.
-        </p>
+        <Notice>Sign in as the operator to inspect customer records.</Notice>
       )}
       {viewer.operator && viewer.readOnly && (
-        <p className="card px-4 py-3 text-label text-ink-400" data-state="read-only">
-          Read-only view. Record creation and edits are unavailable.
-        </p>
+        <Notice state="read-only">Read-only view. Record creation and edits are unavailable.</Notice>
       )}
       {scope.contextId === "" && viewer.operator && (
-        <p className="card px-4 py-3 text-label text-ink-400">
-          Pick an App context above to list its customers.
-        </p>
+        <Notice>Administrator CRM setup is required before customers open.</Notice>
       )}
       {scope.contextId !== "" && viewer.operator && loading && (
-        <p className="text-secondary text-ink-400" role="status">
-          Reading customers…
-        </p>
+        <Loading>Reading customers…</Loading>
       )}
       {scope.contextId !== "" && viewer.operator && error !== null && !loading && (
-        <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
-          {error}{" "}
-          <button
-            type="button"
-            className="lnk"
-            onClick={() => setRetry((count) => count + 1)}
-          >
-            Retry
-          </button>
-        </p>
+        <ErrorNotice onRetry={() => setRetry((count) => count + 1)}>{error}</ErrorNotice>
       )}
       {scope.contextId !== "" && viewer.operator && error === null && !loading && records.length === 0 && (
-        <div className="card px-4 py-5 text-secondary text-ink-400" data-empty="customers" role="status">
-          <p className="font-medium text-ink-200">
-            {committed === "" ? "No customers yet in this context" : "No customers match this search"}
-          </p>
-          <p className="mt-1">
-            {committed === ""
-              ? "Create the first record with New customer, or import a CSV once that flow lands. Only real server rows appear here."
-              : "Clear the search to see every record in this context."}
-          </p>
-        </div>
+        <EmptyState
+          name="customers"
+          title={committed === "" ? "No customers yet" : "No customers match this search"}
+        >
+          {committed === ""
+            ? "Create the first record with New customer, or import a CSV. Only real server rows appear here."
+            : "Clear the search to see every record."}
+        </EmptyState>
       )}
       {scope.contextId !== "" && viewer.operator && error === null && records.length > 0 && (
         <>
-          <div
-            className="crm-table-wrap"
-            tabIndex={0}
-            role="region"
-            aria-label="Customers table — scroll horizontally to reach every column"
-          >
-            <table className="crm-table">
-              <thead>
-                <tr>
-                  <th scope="col">Name</th>
-                  <th scope="col">Email</th>
-                  <th scope="col">Tags</th>
-                  <th scope="col">Consent</th>
-                  <th scope="col">Rev</th>
-                  <th scope="col">
-                    <span className="sr-only">Open</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {records.map((record) => {
+          <DataTable<HostRecord>
+            label="Customers table — scroll horizontally to reach every column"
+            wrapClassName="crm-table-wrap"
+            tableClassName="crm-table"
+            rowKey={(record) => record.id}
+            columns={[
+              {
+                key: "name",
+                header: "Name",
+                cellClassName: "text-ink-100",
+                cell: (record) => viewProfile(record.profile).displayName,
+              },
+              {
+                key: "email",
+                header: "Email",
+                cellClassName: "num text-ink-300",
+                cell: (record) => viewProfile(record.profile).email ?? "—",
+              },
+              {
+                key: "tags",
+                header: "Tags",
+                cellClassName: "text-ink-300",
+                cell: (record) => {
                   const view = viewProfile(record.profile);
                   return (
-                    <tr key={record.id}>
-                      <td className="text-ink-100">{view.displayName}</td>
-                      <td className="num text-ink-300">{view.email ?? "—"}</td>
-                      <td className="text-ink-300">
-                        {view.tags.length > 0 ? view.tags.join(", ") : "—"}
-                        {view.source ? <span className="num text-micro text-ink-500"> · {view.source}</span> : null}
-                      </td>
-                      <td>
-                        <span className="chip" title="Email consent">
-                          {view.consentEmail}
-                        </span>
-                      </td>
-                      <td className="num text-ink-500">r{record.revision}</td>
-                      <td>
-                        <button type="button" className="lnk" onClick={() => onSelect(record.id)}>
-                          Open
-                        </button>
-                      </td>
-                    </tr>
+                    <>
+                      {view.tags.length > 0 ? view.tags.join(", ") : "—"}
+                      {view.source ? (
+                        <span className="num text-micro text-ink-500"> · {view.source}</span>
+                      ) : null}
+                    </>
                   );
-                })}
-              </tbody>
-            </table>
-          </div>
+                },
+              },
+              {
+                key: "consent",
+                header: "Consent",
+                cell: (record) => (
+                  <span className="chip" title="Email consent">
+                    {viewProfile(record.profile).consentEmail}
+                  </span>
+                ),
+              },
+              {
+                key: "open",
+                header: <span className="sr-only">Open</span>,
+                cell: (record) => (
+                  <button type="button" className="lnk" onClick={() => onSelect(record.id)}>
+                    Open
+                  </button>
+                ),
+              },
+            ]}
+            rows={records}
+          />
           <div className="crm-pager">
             <Button
               size="sm"
@@ -390,113 +415,103 @@ function CustomerForm({
         onSubmit(fields);
       }}
     >
-      <div className="crm-field">
-        <label className="text-label text-ink-300" htmlFor="crm-display-name">
-          Display name (required)
-        </label>
-        <input
-          id="crm-display-name"
-          className="field"
-          value={fields.displayName}
-          onChange={(e) => set({ displayName: e.target.value })}
-          maxLength={120}
-          autoComplete="off"
-          required
-        />
+      <Field label="Display name" id="crm-display-name" required className="crm-field">
+        {(c) => (
+          <input
+            {...c}
+            className="field"
+            value={fields.displayName}
+            onChange={(e) => set({ displayName: e.target.value })}
+            maxLength={120}
+            autoComplete="off"
+          />
+        )}
+      </Field>
+      <div className="crm-field-row">
+        <Field label="Email (optional)" id="crm-email" className="crm-field">
+          {(c) => (
+            <input
+              {...c}
+              className="field"
+              type="email"
+              value={fields.email}
+              onChange={(e) => set({ email: e.target.value })}
+              maxLength={254}
+              autoComplete="off"
+              placeholder="name@example.com"
+            />
+          )}
+        </Field>
+        <Field label="Phone (optional)" id="crm-phone" className="crm-field">
+          {(c) => (
+            <input
+              {...c}
+              className="field"
+              type="tel"
+              value={fields.phone}
+              onChange={(e) => set({ phone: e.target.value })}
+              maxLength={24}
+              autoComplete="off"
+            />
+          )}
+        </Field>
       </div>
       <div className="crm-field-row">
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="crm-email">
-            Email (optional)
-          </label>
-          <input
-            id="crm-email"
-            className="field"
-            type="email"
-            value={fields.email}
-            onChange={(e) => set({ email: e.target.value })}
-            maxLength={254}
-            autoComplete="off"
-            placeholder="name@example.com"
-          />
-        </div>
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="crm-phone">
-            Phone (optional)
-          </label>
-          <input
-            id="crm-phone"
-            className="field"
-            type="tel"
-            value={fields.phone}
-            onChange={(e) => set({ phone: e.target.value })}
-            maxLength={24}
-            autoComplete="off"
-          />
-        </div>
+        <Field label="Tags (optional)" id="crm-tags" hint="Comma separated" className="crm-field">
+          {(c) => (
+            <input
+              {...c}
+              className="field"
+              value={fields.tags}
+              onChange={(e) => set({ tags: e.target.value })}
+              maxLength={400}
+              autoComplete="off"
+              placeholder="vip, newsletter"
+            />
+          )}
+        </Field>
+        <Field label="Source (optional)" id="crm-source" className="crm-field">
+          {(c) => (
+            <input
+              {...c}
+              className="field"
+              value={fields.source}
+              onChange={(e) => set({ source: e.target.value })}
+              maxLength={40}
+              autoComplete="off"
+              placeholder="import"
+            />
+          )}
+        </Field>
       </div>
       <div className="crm-field-row">
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="crm-tags">
-            Tags (optional, comma separated)
-          </label>
-          <input
-            id="crm-tags"
-            className="field"
-            value={fields.tags}
-            onChange={(e) => set({ tags: e.target.value })}
-            maxLength={400}
-            autoComplete="off"
-            placeholder="vip, newsletter"
-          />
-        </div>
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="crm-source">
-            Source (optional)
-          </label>
-          <input
-            id="crm-source"
-            className="field"
-            value={fields.source}
-            onChange={(e) => set({ source: e.target.value })}
-            maxLength={40}
-            autoComplete="off"
-            placeholder="import"
-          />
-        </div>
-      </div>
-      <div className="crm-field-row">
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="crm-consent-email">
-            Email consent (explicit)
-          </label>
-          <Select
-            id="crm-consent-email"
-            value={fields.consentEmail}
-            onChange={(value) => isConsentChoice(value) && set({ consentEmail: value })}
-            options={CONSENT_OPTIONS}
-            aria-label="Email consent"
-            full
-          />
-        </div>
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="crm-consent-sms">
-            SMS consent (explicit)
-          </label>
-          <Select
-            id="crm-consent-sms"
-            value={fields.consentSms}
-            onChange={(value) => isConsentChoice(value) && set({ consentSms: value })}
-            options={CONSENT_OPTIONS}
-            aria-label="SMS consent"
-            full
-          />
-        </div>
+        <Field label="Email consent (explicit)" id="crm-consent-email" className="crm-field">
+          {(c) => (
+            <Select
+              id={c.id}
+              value={fields.consentEmail}
+              onChange={(value) => isConsentChoice(value) && set({ consentEmail: value })}
+              options={CONSENT_OPTIONS}
+              aria-label="Email consent"
+              full
+            />
+          )}
+        </Field>
+        <Field label="SMS consent (explicit)" id="crm-consent-sms" className="crm-field">
+          {(c) => (
+            <Select
+              id={c.id}
+              value={fields.consentSms}
+              onChange={(value) => isConsentChoice(value) && set({ consentSms: value })}
+              options={CONSENT_OPTIONS}
+              aria-label="SMS consent"
+              full
+            />
+          )}
+        </Field>
       </div>
       {(fieldError ?? formError) && (
-        <p className="text-label text-fail" role="alert">
-          {fieldError ?? formError}
-        </p>
+        <ErrorNotice bare>{fieldError ?? formError}</ErrorNotice>
       )}
       <div>
         <Button type="submit" variant="primary" loading={pending} disabled={pending}>
@@ -535,16 +550,14 @@ function CustomerNew({
         <button type="button" className="lnk" onClick={onCancel}>
           ← Customers
         </button>{" "}
-        · Context {scope.contextId || "none"} — duplicates and stale writes are refused by the server.
+        — duplicates and stale writes are refused by the server.
       </p>
       {!canWrite ? (
-        <p className="card px-4 py-3 mt-2 text-label text-ink-400" data-state="read-only">
+        <Notice className="mt-2" state="read-only">
           Read-only view. A verified operator creates customer records.
-        </p>
+        </Notice>
       ) : scope.contextId === "" ? (
-        <p className="card px-4 py-3 mt-2 text-label text-ink-400">
-          Pick an App context above before creating a customer.
-        </p>
+        <Notice className="mt-2">Administrator CRM setup is required before creating a customer.</Notice>
       ) : (
         <div className="mt-2">
           <CustomerForm
@@ -656,73 +669,60 @@ function CustomerDrawer({
           Close
         </Button>
       </div>
-      <p className="num text-micro text-ink-500">
-        {recordId} · {scope.contextId || "no context"} · selection is chat context only — the server
-        re-proves scope on every send.
+      <p className="text-micro text-ink-500">
+        Selection is chat context only — the server re-proves scope on every send.
       </p>
-      {loading && (
-        <p className="text-secondary text-ink-400 mt-2" role="status">
-          Reading the record…
+      <details className="crm-diag">
+        <summary className="text-micro text-ink-500">Record diagnostics</summary>
+        <p className="num text-micro text-ink-500 mt-1">
+          Record <span className="num">{recordId}</span>
+          {record !== null && (
+            <> · revision r{record.revision} · digest {record.digest.slice(0, 18)}…</>
+          )}{" "}
+          · scope <span className="num">{scope.contextId || "none"}</span>
         </p>
+      </details>
+      {loading && (
+        <Loading className="mt-2">Reading the record…</Loading>
       )}
       {error !== null && !loading && (
-        <p className="card px-4 py-3 mt-2 text-label text-fail border-fail/40" role="alert">
-          {error}{" "}
-          <button
-            type="button"
-            className="lnk"
-            onClick={() => {
-              setError(null);
-              setLoading(true);
-              hostActions
-                .show(scope, recordId)
-                .then(setRecord)
-                .catch((e: unknown) => setError(friendlyError(e)))
-                .finally(() => setLoading(false));
-            }}
-          >
-            Retry
-          </button>
-        </p>
+        <ErrorNotice
+          className="mt-2"
+          onRetry={() => {
+            setError(null);
+            setLoading(true);
+            hostActions
+              .show(scope, recordId)
+              .then(setRecord)
+              .catch((e: unknown) => setError(friendlyError(e)))
+              .finally(() => setLoading(false));
+          }}
+        >
+          {error}
+        </ErrorNotice>
       )}
       {!loading && error === null && record !== null && view !== null && (
         <>
-          <dl className="crm-detail mt-2">
-            <div>
-              <dt>Email</dt>
-              <dd className="num">{view.email ?? "—"}</dd>
-            </div>
-            <div>
-              <dt>Phone</dt>
-              <dd className="num">{view.phone ?? "—"}</dd>
-            </div>
-            <div>
-              <dt>Tags</dt>
-              <dd>{view.tags.length > 0 ? view.tags.join(", ") : "—"}</dd>
-            </div>
-            <div>
-              <dt>Source</dt>
-              <dd>{view.source ?? "—"}</dd>
-            </div>
-            <div>
-              <dt>Email consent</dt>
-              <dd>
-                <span className="chip">{view.consentEmail}</span>
-              </dd>
-            </div>
-            <div>
-              <dt>SMS consent</dt>
-              <dd>
-                <span className="chip">{view.consentSms ?? "unknown"}</span>
-              </dd>
-            </div>
-            <div>
-              <dt>Revision</dt>
-              <dd className="num">
-                r{record.revision} · <span title="Server content digest">{record.digest.slice(0, 18)}…</span>
-              </dd>
-            </div>
-          </dl>
+          <Detail
+            className="crm-detail mt-2"
+            label="Customer fields"
+            items={[
+              { key: "email", term: "Email", value: <span className="num">{view.email ?? "—"}</span> },
+              { key: "phone", term: "Phone", value: <span className="num">{view.phone ?? "—"}</span> },
+              { key: "tags", term: "Tags", value: view.tags.length > 0 ? view.tags.join(", ") : "—" },
+              { key: "source", term: "Source", value: view.source ?? "—" },
+              {
+                key: "consent-email",
+                term: "Email consent",
+                value: <span className="chip">{view.consentEmail}</span>,
+              },
+              {
+                key: "consent-sms",
+                term: "SMS consent",
+                value: <span className="chip">{view.consentSms ?? "unknown"}</span>,
+              },
+            ]}
+          />
           {consentTrail.length > 0 && (
             <section aria-label="Consent history" className="mt-3">
               <h4 className="text-label font-medium text-ink-200">Consent history</h4>
@@ -753,12 +753,12 @@ function CustomerDrawer({
             editing ? (
               <div className="mt-3">
                 <h4 className="text-label font-medium text-ink-200 mb-2">
-                  Edit — expected revision r{record.revision}
+                  Edit — saving is refused if the record changed since you opened it
                 </h4>
                 <CustomerForm
                   key={record.revision}
                   initial={formFromProfile(record.profile)}
-                  submitLabel={`Save as r${record.revision + 1}`}
+                  submitLabel="Save changes"
                   pending={pending}
                   formError={formError}
                   onSubmit={(fields) => {
