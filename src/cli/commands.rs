@@ -95,6 +95,13 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: RolloutAction,
     },
+    /// CAD-1024: the staging-delegation allowlist and grant store
+    /// (operator-only register/delegate/revoke; delegations is a read).
+    /// A grant admits nothing until the `delegate:` caller shape lands.
+    Staging {
+        #[command(subcommand)]
+        action: StagingAction,
+    },
     /// Back up the store with SQLite's online backup API. The running
     /// daemon is not blocked. The copy is integrity-checked, hashed and
     /// described by a manifest (schema, sha256, versions, repo remotes),

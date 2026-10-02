@@ -2886,6 +2886,12 @@ impl Shared {
             "lane_reassign" => self.rpc_lane_reassign(params, peer_pid),
             "rollout_grant" => self.rpc_rollout_grant(params, peer_pid),
             "rollout_revoke" => self.rpc_rollout_revoke(params, peer_pid),
+            // CAD-1024: the staging allowlist and grant store. Register and
+            // delegate/revoke are operator-only; delegations is a read.
+            "staging_register" => self.rpc_staging_register(params, peer_pid),
+            "staging_delegate" => self.rpc_staging_delegate(params, peer_pid),
+            "staging_revoke" => self.rpc_staging_revoke(params, peer_pid),
+            "staging_delegations" => self.rpc_staging_delegations(),
             "project_work_approvals" => Ok(json!({
                 "approvals": self.store.work_approvals()?,
             })),
