@@ -193,6 +193,57 @@ fn cad1009_pi_no_slot_means_no_token_line() {
     assert!(!turn.text.contains("Scoped chat turn"), "{}", turn.text);
 }
 
+/// Managed Claude (the master's other provider) fills the slot the same
+/// way. fake-claude journals every prompt it receives to its log dir.
+#[test]
+fn cad1009_claude_slot_is_filled_with_the_exact_turn_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let logs = dir.path().join("fake-claude-logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/fake-claude.py");
+    let env = ProviderEnv::refusing_providers();
+    env.set(
+        "CADENCE_CLAUDE_COMMAND",
+        format!("python3 {} {}", script.display(), logs.display()),
+    );
+    std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+    let hooks = AdapterHooks {
+        on_event: Box::new(|_, _| {}),
+        on_request: Box::new(|_| {}),
+    };
+    let claude = cadence_agent::adapter::claude::ClaudeAdapter::new(
+        hooks,
+        &dir.path().join("logs").join("claude-stderr.log"),
+        &env,
+    );
+    let mut agent = pi_agent();
+    agent.alias = "turn-ctx".into();
+    agent.provider = "claude".into();
+    agent.params = Some(json!({}));
+    claude.open(&agent).unwrap();
+    let started = std::sync::Mutex::new(String::new());
+    claude
+        .run_turn_slotted(
+            &prompt_with_slot("create segment QA agent VIP"),
+            Some(SLOT),
+            "msg-1009-claude",
+            &|t| *started.lock().unwrap() = t.to_string(),
+        )
+        .unwrap();
+    let started = started.into_inner().unwrap();
+    let journal: String = std::fs::read_dir(&logs)
+        .unwrap()
+        .filter_map(|e| std::fs::read_to_string(e.unwrap().path()).ok())
+        .collect();
+    assert!(!journal.contains(SLOT), "{journal}");
+    assert!(journal.contains("message \"msg-1009-claude\""), "{journal}");
+    assert_eq!(
+        token_in(&journal).as_deref(),
+        Some(started.as_str()),
+        "{journal}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // End to end through the daemon: the master (Pi, fake-pi echo-all).
 // ---------------------------------------------------------------------
@@ -402,6 +453,28 @@ fn cad1009_delivered_token_stays_a_one_turn_one_agent_credential() {
         save("chat-1009-x", &token, "stolen"),
     );
     assert_eq!(stolen["ok"], false, "another agent redeemed: {stolen}");
+
+    // A detached (`setsid`) child of the endpoint holding the live token
+    // is outside the endpoint session and refuses.
+    let live = chat("chat-1009-detached");
+    let request = lane.dir.path().join("detached.json");
+    std::fs::write(
+        &request,
+        cadence_agent::proto::request(
+            "app_segment_assistant_save",
+            save("chat-1009-detached", &live, "detached"),
+        )
+        .to_string(),
+    )
+    .unwrap();
+    let (rc, output) = lane.run(&format!(
+        "setsid python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");print(s.makefile().readline())' {} {}",
+        cadence_agent::client::socket_path(&w.daemon.state).display(),
+        request.display()
+    ));
+    assert_eq!(rc, 0, "{output}");
+    let frame: Value = serde_json::from_str(output.trim()).unwrap();
+    assert_eq!(frame["ok"], false, "detached child redeemed: {frame}");
 
     // Concurrent double redeem from the owner: exactly one claim wins.
     let a = lane.dir.path().join("a.json");
