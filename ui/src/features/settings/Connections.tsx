@@ -40,7 +40,7 @@ const ENROLL_ERROR: Record<string, string> = {
   // future fix under a false specific; the generic fallback below is the
   // honest answer until the backend emits a real code.
   custody_unprotected:
-    "The daemon could not store this credential under its protection — nothing was stored. To save it anyway, tick the storage-consent box below, then retry — it is never pre-selected.",
+    "The daemon cannot isolate this credential from agents using the same system account, so it refused to store it — nothing was stored. To save it anyway, tick the storage-consent box below, then retry — it is never pre-selected.",
 };
 
 /**
@@ -1018,9 +1018,9 @@ export function AddConnection({
                   className="mt-0.5"
                 />
                 <span>
-                  I understand this stores the credential under my existing user account and
-                  I accept that risk. Leave this off unless you knowingly accept it — it is
-                  never pre-selected.
+                  This server cannot isolate saved credentials from agents using the same
+                  system account. I accept storing this credential here. Leave this off
+                  unless you knowingly accept it — it is never pre-selected.
                 </span>
               </label>
             </details>
@@ -1043,9 +1043,9 @@ export function AddConnection({
                 className="mt-0.5"
               />
               <span>
-                <strong>Storage consent required:</strong> the daemon reports this credential
-                is stored unprotected. I understand it is stored under my existing user
-                account and I accept that risk. This is never pre-selected.
+                <strong>Storage consent required:</strong> this server cannot isolate saved
+                SMTP passwords from agents using the same system account. I accept storing
+                this password here. This is never pre-selected.
               </span>
             </label>
           )}
