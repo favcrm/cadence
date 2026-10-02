@@ -201,7 +201,7 @@ fn pty_nudge_needs_a_live_pane_and_dies_with_the_actor() {
         .operator_send("dv1", json!({"text": "steer", "nudge": true}))
         .unwrap_err()
         .to_string();
-    assert!(err.contains("agent dv1 has no live pane"), "{err}");
+    assert!(err.contains("agent dv1 has no live endpoint"), "{err}");
     // Nothing reached the pane.
     let input = std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
     assert!(!input.contains("steer"), "{input}");

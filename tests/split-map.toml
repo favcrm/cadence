@@ -345,6 +345,8 @@ tests = [
     "message_result_prefix_scoped_to_callers_own_messages",
     "message_result_racing_defaults_exactly_one_wins",
     "message_result_tty_stdin_refused",
+    "native_nudge_selects_only_the_verified_runtime_path",
+    "native_nudge_refuses_unproven_peer_self_and_forged_binding",
 ]
 helpers = [
     "wait_lines",

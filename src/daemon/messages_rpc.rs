@@ -183,7 +183,23 @@ impl Shared {
         // characters at delivery; refuse it here so `send` never answers
         // `queued` for a message that cannot be delivered (CAD-218).
         let pty = target.as_ref().is_some_and(|a| a.endpoint_kind == "pty");
+        let mut native_adapter = None;
         if nudge {
+            for field in [
+                "sender",
+                "from",
+                "sender_alias",
+                "session_id",
+                "thread_id",
+                "generation",
+                "expectedTurnId",
+                "expected_turn_id",
+                "endpoint",
+            ] {
+                if params.get(field).is_some() {
+                    return Err(Error::rejected(format!("send --nudge: '{field}' is not accepted; sender and runtime binding are daemon-derived")));
+                }
+            }
             if steer.is_steering() {
                 return Err(Error::rejected(
                     "--nudge is pasted at once and never queued — it takes no \
@@ -202,25 +218,42 @@ impl Shared {
                 )));
             }
             if let Some(agent) = target.as_ref().filter(|a| a.endpoint_kind != "pty") {
-                return Err(Error::rejected(format!(
-                    "--nudge only applies to pty endpoints — '{alias}' is {}/{}; \
-                     send it a normal message instead",
-                    agent.provider, agent.endpoint_kind
-                )));
+                let supported = registry::spec_opt(&agent.provider, &agent.endpoint_kind)
+                    .is_some_and(|spec| spec.supports_native_turn_steering());
+                if !supported {
+                    return Err(Error::rejected(format!(
+                        "--nudge requires a pty or a verified native exact-turn guard — '{alias}' is {}/{}; send a normal queued message instead",
+                        agent.provider, agent.endpoint_kind
+                    )));
+                }
+                let adapter = self.adapter_for(&alias)?;
+                if !adapter.native_turn_steering() {
+                    return Err(Error::rejected(
+                        "this live runtime has no verified native exact-turn input guard",
+                    ));
+                }
+                if text.trim().is_empty() {
+                    return Err(Error::rejected("native guidance must not be blank"));
+                }
+                native_adapter = Some(adapter);
             }
             if optional_str(params, "reply_to").is_some() {
                 return Err(Error::rejected(
                     "--nudge owes no report, so it takes no reply_to",
                 ));
             }
-            // N1: a nudge is for a pane that exists now — never queued for
-            // a stopped or fenced agent to receive later.
+            // N1: a nudge is for an endpoint that exists now — never queued
+            // for a stopped or fenced agent to receive later. The endpoint is
+            // a pty pane or a verified native adapter.
             let live = self.lifecycle.lock().unwrap().agents.contains_key(&alias)
                 && target.as_ref().is_some_and(|a| {
-                    a.endpoint.is_some() && matches!(a.state.as_str(), "idle" | "busy")
+                    (a.endpoint.is_some() || native_adapter.is_some())
+                        && matches!(a.state.as_str(), "idle" | "busy")
                 });
             if !live {
-                return Err(Error::rejected(format!("agent {alias} has no live pane")));
+                return Err(Error::rejected(format!(
+                    "agent {alias} has no live endpoint (pty pane or verified native guard)"
+                )));
             }
         }
         if pty && crate::adapter::pty::has_control_chars(text) {
@@ -297,6 +330,45 @@ impl Shared {
                 "app is a thread_send field — only the operator's chat carries \
                  a verified App binding; `cadence send` and `agent_send` carry none",
             ));
+        }
+        if let Some(adapter) = native_adapter {
+            let target = target
+                .as_ref()
+                .ok_or_else(|| Error::rejected("Unknown managed agent"))?;
+            // Direct submission through the concurrent-control seam: the actor
+            // is still waiting for its original kickoff's provider result.
+            // The store atomically binds/claims this turnless row, so it cannot
+            // be replayed by the normal actor queue or a concurrent duplicate.
+            let (duplicate, _, bound) = self
+                .store
+                .begin_native_nudge(target, text, &message, &sender, &steer)?;
+            if !duplicate {
+                if let Some(turn) = bound.as_deref() {
+                    let (disposition, reason) = match adapter.steer_turn(turn, text, &message) {
+                        Ok(crate::adapter::SteerOutcome::Queued) => ("queued", None),
+                        Ok(crate::adapter::SteerOutcome::NotRunning) => ("skipped_inactive", None),
+                        Err(
+                            Error::Rejected(reason)
+                            | Error::Provider(reason)
+                            | Error::PreWrite(reason),
+                        ) => ("rejected", Some(reason)),
+                        // Without a definitive refusal, acceptance may have
+                        // happened. Preserve uncertainty, never requeue.
+                        Err(error) => ("unknown", Some(error.to_string())),
+                    };
+                    self.store
+                        .finish_native_nudge(&message, disposition, reason.as_deref())?;
+                }
+            }
+            let stored = self
+                .store
+                .message(&message)?
+                .ok_or_else(|| Error::internal("Native steering row vanished"))?;
+            self.wake();
+            return Ok(
+                json!({"message": message, "state": stored.state, "duplicate": duplicate,
+                "turn_id": stored.turn_id, "delivery": "native_turn_steering", "disposition": stored.result}),
+            );
         }
         let (duplicate, state) = self.store.enqueue_steered(
             &alias,

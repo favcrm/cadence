@@ -682,6 +682,332 @@ impl Store {
         Ok(())
     }
 
+    /// CAD-1015: a native nudge — steering bound to the turn that is
+    /// running when the daemon submits it, delivered through the
+    /// provider's own exact-turn input (`turn/steer`), never through
+    /// the pane. Returns `(duplicate, state, bound_turn)` like
+    /// `enqueue`, with the bound turn token the provider call must
+    /// name.
+    ///
+    /// One `BEGIN IMMEDIATE` transaction does all of it:
+    ///
+    /// - **Validate against the live row.** The agent must be enabled,
+    ///   `idle` or `busy` (a live endpoint — `endpoint` non-empty — is
+    ///   what `busy` proves and what a native steer needs), and the
+    ///   `target` snapshot the caller authorized — generation,
+    ///   endpoint, session, thread — must still be exactly this row.
+    ///   Any drift (a restart minted a new generation, a re-open moved
+    ///   the session) is refused whole before anything is written.
+    /// - **Dedupe by the envelope.** `enqueue_tx` compares body,
+    ///   source, rank and every stamped field; a retry of the same
+    ///   envelope returns `(true, stored_state, stored_turn)` — the
+    ///   previously bound turn token, never a re-aim — and a same-id
+    ///   different-body send is the usual conflict, never a second
+    ///   row.
+    /// - **Bind and submit atomically.** While a report-owing turn
+    ///   (`running`, non-turnless, `turn_id` set) is in flight the new
+    ///   row goes straight `queued -> submitting`, `turn_id` bound and
+    ///   `started` stamped, in this same transaction — so no actor
+    ///   claim (`take_queued` reads only `queued`) and no stop/restart
+    ///   nudge sweep can interpose between the insert and the bind.
+    ///   The `native_steer_submitting` event records message, turn and
+    ///   caller. With no such turn the row goes terminal `cancelled`
+    ///   (`skipped_inactive`, `native_turn_steering`) with a
+    ///   `nudge_cancelled` event — steering for a moment that already
+    ///   passed is never queued.
+    ///
+    /// The agent row is never touched here: the nudge owns no turn, so
+    /// `agents.state` stays what the turn's own lifecycle left it, and
+    /// the kickoff it runs beside is unaffected.
+    pub fn begin_native_nudge(
+        &self,
+        target: &Agent,
+        body: &str,
+        id: &str,
+        sender: &Sender,
+        steer: &Steer,
+    ) -> Result<(bool, String, Option<String>)> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        // The live row, not the caller's snapshot: every check below is
+        // against what is durable now, in the write transaction.
+        let current = self.agent_in(&tx, &target.alias)?;
+        if !current.enabled {
+            return Err(Error::rejected(format!(
+                "native steer refused, nothing changed: agent '{}' is disabled",
+                target.alias
+            )));
+        }
+        if !matches!(current.state.as_str(), "idle" | "busy") {
+            return Err(Error::rejected(format!(
+                "native steer refused, nothing changed: agent '{}' is {} — only a live \
+                 idle|busy endpoint takes exact-turn input",
+                target.alias, current.state
+            )));
+        }
+        let live_endpoint = current.endpoint.as_deref().filter(|e| !e.is_empty());
+        // Stdio-managed sessions have no network endpoint address. Their
+        // owned process and native session/thread identify the live runtime.
+        let native_process = current.pid.is_some()
+            && (current.session_id.as_deref().is_some_and(|s| !s.is_empty())
+                || current.thread_id.as_deref().is_some_and(|s| !s.is_empty()));
+        if live_endpoint.is_none() && !native_process {
+            return Err(Error::rejected(format!(
+                "native steer refused, nothing changed: agent '{}' has no live endpoint",
+                target.alias
+            )));
+        }
+        // The snapshot the steer was authorized against must still be
+        // the row: a re-open or restart that moved generation,
+        // endpoint, session or thread makes the old target a different
+        // endpoint, and steering it would land nowhere provable.
+        let drift = [
+            (
+                "generation",
+                target.generation.as_deref(),
+                current.generation.as_deref(),
+            ),
+            (
+                "endpoint",
+                target.endpoint.as_deref(),
+                current.endpoint.as_deref(),
+            ),
+            (
+                "session_id",
+                target.session_id.as_deref(),
+                current.session_id.as_deref(),
+            ),
+            (
+                "thread_id",
+                target.thread_id.as_deref(),
+                current.thread_id.as_deref(),
+            ),
+        ]
+        .iter()
+        .filter(|(_, was, now)| was != now)
+        .map(|(field, _, _)| *field)
+        .collect::<Vec<_>>();
+        if !drift.is_empty() || target.pid != current.pid || target.pid_start != current.pid_start {
+            return Err(Error::rejected(format!(
+                "native steer refused, nothing changed: agent '{}' no longer matches \
+                 the authorized target ({} changed)",
+                target.alias,
+                drift.join(", ")
+            )));
+        }
+        // The turn this nudge would steer: the report-owing row's
+        // token, same rule `take_queued`'s hold uses.
+        let running_turn: Option<(String, String)> = tx
+            .query_row(
+                &format!(
+                    "SELECT id,turn_id FROM messages WHERE alias=? AND state='running'
+                     AND source NOT IN {TURNLESS_SOURCES_SQL}
+                     AND turn_id IS NOT NULL AND turn_id != '' ORDER BY seq LIMIT 1"
+                ),
+                [&target.alias],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (duplicate, _) = self.enqueue_tx(
+            &tx,
+            &target.alias,
+            body,
+            None,
+            id,
+            NUDGE_SOURCE,
+            None,
+            None,
+            None,
+            sender,
+            steer.priority,
+            None,
+            None,
+        )?;
+        if duplicate {
+            // The stored row is authoritative: the retry learns the
+            // bound turn and the state it is already in, never a
+            // second enqueue. A conflicting envelope already refused
+            // above.
+            let stored = self
+                .message_in(&tx, id)?
+                .ok_or_else(|| Error::internal("deduped native nudge row vanished"))?;
+            tx.commit()?;
+            return Ok((true, stored.state, stored.turn_id));
+        }
+        let out = if let Some((target_message, turn)) = running_turn {
+            // `submitting` in the same transaction the row was created
+            // in: the claim gate and every nudge sweep see only
+            // `queued`/`submitting`, so nothing can take or cancel the
+            // row between its insert and this bind.
+            let n = tx.execute(
+                "UPDATE messages SET state='submitting',turn_id=?,started=?,result=?
+                 WHERE id=? AND state='queued'",
+                params![
+                    turn,
+                    now(),
+                    json!({"target_message": target_message, "application": "unconfirmed"})
+                        .to_string(),
+                    id
+                ],
+            )?;
+            if n != 1 {
+                return Err(Error::internal(format!(
+                    "native nudge {id} left queued state before its turn bind committed"
+                )));
+            }
+            Self::event(
+                &tx,
+                &target.alias,
+                "native_steer_submitting",
+                json!({"message": id, "turn": turn.clone(), "target_message": target_message,
+                       "by": steer.by, "by_kind": steer.by_kind}),
+            )?;
+            // The returned token is the caller's steer target — the
+            // same turn the event payload records.
+            (false, "submitting".to_string(), Some(turn))
+        } else {
+            // No turn to steer: `skipped` is the durable outcome —
+            // cancelled, never replayed, with the Codex
+            // `skipped_inactive` via and the native-steer delivery
+            // label. `nudge_cancelled` is the same event the other
+            // nudge exits record.
+            let result = json!({
+                "status": "skipped",
+                "via": "skipped_inactive",
+                "delivery": "native_turn_steering",
+                "reason": "no running turn to steer — a nudge is never replayed",
+            });
+            let n = tx.execute(
+                "UPDATE messages SET state='cancelled',result=?,completed=?
+                 WHERE id=? AND state='queued'",
+                params![result.to_string(), now(), id],
+            )?;
+            if n != 1 {
+                return Err(Error::internal(format!(
+                    "native nudge {id} left queued state before its skip committed"
+                )));
+            }
+            Self::event(
+                &tx,
+                &target.alias,
+                "nudge_cancelled",
+                json!({"message": id, "was": "queued", "state": "cancelled",
+                       "reason": "skipped_inactive"}),
+            )?;
+            (false, "cancelled".to_string(), None)
+        };
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// CAD-1015: record what the provider's exact-turn steer answered
+    /// for a `submitting` native nudge — the terminal the submit path
+    /// left it in. `disposition` is the daemon's allowlisted account of
+    /// the adapter's reply:
+    ///
+    /// - `queued` — the provider accepted the input into the bound
+    ///   turn: `completed` with `result.status accepted`, outcome
+    ///   `queued`, application `unconfirmed` (a wire ack is not proof
+    ///   the model applied it).
+    /// - `skipped_inactive` — the turn ended before the steer could
+    ///   bind: `cancelled`, status `skipped`, outcome `not_applied`.
+    /// - `rejected` — the provider refused the turn precondition:
+    ///   `failed`.
+    /// - `unknown` — the reply proved nothing either way: `unknown`,
+    ///   which for a `nudge` source never fences.
+    ///
+    /// Only a currently-`submitting` `nudge` row with a non-empty bound
+    /// `turn_id` may be written, and the UPDATE is guarded on exactly
+    /// that — a stop or restart that already swept the row to its own
+    /// terminal keeps that evidence; this call records the disposition
+    /// event but overwrites nothing. This is deliberately not
+    /// [`Store::finish`]/`finish_in`: the nudge owns no turn, so no
+    /// `agents.state` idles, no `reply_to` routes, no task edge runs.
+    pub fn finish_native_nudge(
+        &self,
+        id: &str,
+        disposition: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let (to_state, mut result) = match disposition {
+            "queued" => (
+                "completed",
+                json!({"status": "accepted", "outcome": "queued",
+                       "application": "unconfirmed",
+                       "via": "native_turn_steering", "reason": reason}),
+            ),
+            "skipped_inactive" => (
+                "cancelled",
+                json!({"status": "skipped", "outcome": "not_applied",
+                       "via": "native_turn_steering", "reason": reason}),
+            ),
+            "rejected" => (
+                "failed",
+                json!({"status": "failed", "outcome": "rejected",
+                       "via": "native_turn_steering", "reason": reason}),
+            ),
+            "unknown" => (
+                "unknown",
+                json!({"status": "unknown", "outcome": "unknown",
+                       "via": "native_turn_steering", "reason": reason}),
+            ),
+            other => {
+                return Err(Error::rejected(format!(
+                    "native nudge disposition must be queued|skipped_inactive|rejected|unknown, \
+                     not '{other}'"
+                )))
+            }
+        };
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let Some(message) = self.message_in(&tx, id)? else {
+            return Err(Error::rejected(format!("No such message '{id}'")));
+        };
+        if message.source != NUDGE_SOURCE {
+            return Err(Error::rejected(format!(
+                "Message '{id}' is source '{}' — only a native nudge takes a \
+                 steer disposition",
+                message.source
+            )));
+        }
+        if let Some(target_message) = message
+            .result
+            .as_ref()
+            .and_then(|value| value.get("target_message"))
+        {
+            result["target_message"] = target_message.clone();
+        }
+        // The guard that makes this exactly-once and terminal-safe: the
+        // row must still be the `submitting` row `begin_native_nudge`
+        // wrote, bound to a real turn. `n = 0` means stop/restart or a
+        // reconcile already moved it — that terminal evidence stands,
+        // and the disposition still lands on the event stream below so
+        // the provider's answer is never silently dropped.
+        let bound = message
+            .turn_id
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+        let n = match bound.as_deref() {
+            Some(turn) => tx.execute(
+                "UPDATE messages SET state=?,result=?,completed=?
+                 WHERE id=? AND state='submitting' AND source=? AND turn_id=?",
+                params![to_state, result.to_string(), now(), id, NUDGE_SOURCE, turn],
+            )?,
+            None => 0,
+        };
+        Self::event(
+            &tx,
+            &message.alias,
+            "native_steer_disposition",
+            json!({"message": id, "disposition": disposition,
+                   "reason": reason, "turn": bound,
+                   "recorded": n == 1}),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Transactional enqueue — validation, idempotent dedupe, insert,
     /// `queued` event — usable inside a caller's `BEGIN IMMEDIATE`.
     /// Every caller-reachable path (`agent_send`, `thread_send`,
