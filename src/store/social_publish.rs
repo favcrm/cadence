@@ -753,7 +753,10 @@ impl Store {
         let effect_scope = self
             .conn()
             .query_row(
-                "SELECT install_id,context_id,run_id,artifact_id FROM app_effect_authorizations WHERE effect_id=?",
+                // Live authority only: an app-artifact effect still waiting
+                // or accepted. Declined/closed/executed effects never back
+                // a post (the same live set authority changes close).
+                "SELECT a.install_id,a.context_id,a.run_id,a.artifact_id FROM app_effect_authorizations a JOIN platform_effects e ON e.effect_id=a.effect_id WHERE a.effect_id=? AND e.authorization_kind='app_artifact' AND e.state IN ('waiting','decided')",
                 [row.effect_id],
                 |r| {
                     Ok((
@@ -775,7 +778,7 @@ impl Store {
             })
         {
             return Err(Error::rejected(
-                "bad_effect: effect does not belong to this run, artifact and scope",
+                "bad_effect: effect is not live authority for this run, artifact and scope",
             ));
         }
         let caption_digest = bare_digest(

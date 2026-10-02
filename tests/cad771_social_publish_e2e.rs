@@ -2106,6 +2106,25 @@ fn cad1027_freeze_refuses_foreign_effect_and_scope() {
         epoch_now() + 3600,
     );
     cases.push(("same-run other-artifact effect", "bad_effect", forged));
+    // A declined effect is no longer live authority: it never backs a post.
+    let mut declined = h.complete(&ctx_a, "cad1027-scope-declined-run");
+    let effect = h.stage(&declined, "cad1027-scope-declined-effect");
+    h.daemon
+        .operator_rpc(
+            "app_effect_decide",
+            json!({"effect_id": effect["effect_id"], "digest": effect["digest"], "decision": "decline"}),
+        )
+        .unwrap();
+    declined["staged_effect_id"] = effect["effect_id"].clone();
+    let forged = freeze_params(
+        &ctx_a,
+        &declined,
+        &bundle_a,
+        &install,
+        "cad1027-scope-declined",
+        epoch_now() + 3600,
+    );
+    cases.push(("declined effect", "bad_effect", forged));
     let mut forged = base.clone();
     forged["effect_id"] = json!("fx-forged-cad1027");
     cases.push(("forged effect", "bad_effect", forged));
