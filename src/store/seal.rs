@@ -1057,6 +1057,22 @@ impl Store {
         })
     }
 
+    /// Test-only owner lane probe: runs a real DML write inside
+    /// `with_owner_tx`, then panics — used to prove the held-tx owner
+    /// guard catches the panic, rolls the tx back under TxControl, and
+    /// leaves the conn in autocommit (never a leaked tx for the poison
+    /// forensic to mislabel).
+    #[cfg(test)]
+    pub(super) fn owner_panic_probe(&self) -> Result<()> {
+        self.with_owner_tx(|conn| {
+            conn.execute_batch(
+                "INSERT INTO agents(alias,provider,endpoint_kind,role,cwd,sandbox,created,updated)
+                 VALUES('owner-probe','p','pty','w','/x','none',0,0)",
+            )?;
+            panic!("deliberate panic inside the owner tx after a real DML");
+        })
+    }
+
     /// Owner maintenance: enforce that this binary's commit is the one
     /// the daemon last recorded unless the caller holds the lease.
     pub(crate) fn owner_enforce_running_build(&self) -> Result<()> {
@@ -1974,169 +1990,245 @@ mod tests {
         .unwrap();
     }
 
-    /// CAD-1011 writer census: every `src/**` file that opens a
-    /// `rusqlite::Connection`, `open`s a side/legacy writer, or runs
-    /// `execute`/`prepare`/`execute_batch`/`Transaction`/`unchecked_…`
-    /// on `cadence.sqlite3` must be enumerated here — a NEW file that
-    /// touches the write surface, or an existing file that newly does,
-    /// fails this test until a reviewer classifies it. `accepted`
-    /// holds the current set; a file not in it and not clearly
-    /// writer-free fails the census rather than silently widening.
-    #[test]
-    fn census_db_writers_enumerated() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        // Markers that mean "this file can reach a cadence.sqlite3 write
-        // or open" — a Connection constructor, a transaction/batch/raw
-        // execute/prepare, or a `Store::open*`/`open_side*` constructor.
-        // A file matching none of these is writer-free.
-        const WRITE_MARKERS: &[&str] = &[
+    /// The cadence.sqlite3 production writer census: the exact set of
+    /// `src/` files permitted to reach the store's write surface, with
+    /// the callsite classes each is allowed. A file NOT in this map that
+    /// contains a write marker is a new unclassified writer — refused.
+    /// A file IN the map that gains a marker-class it isn't cleared for
+    /// (e.g. `events.rs` gaining a raw `Connection::open`) is refused
+    /// too — the signature check is per `(file, marker)`, not per file.
+    ///
+    /// `signature` is the *sorted, deduped* marker set; adding a
+    /// call-site class the file doesn't own fails the census even when
+    /// the file is otherwise accepted. Raw `Connection`/`execute` in a
+    /// separate-DB file (records, daemon side-conn, scratch) is not a
+    /// cadence.sqlite3 producer — the census covers the store domain.
+    fn census_scan(root: &std::path::Path) -> Vec<String> {
+        // Write-surface markers — a cadence.sqlite3 producer callsite.
+        const MARKERS: &[&str] = &[
             "Connection::open",
             "open_with_flags",
             "unchecked_transaction",
             "new_unchecked",
-            "transaction(",
-            "execute_batch(",
-            "execute(",
-            "prepare(",
+            ".transaction(",
+            ".execute(",
+            ".execute_batch(",
+            ".prepare(",
             "Store::open",
             "open_side",
             "open_adopting",
+            "with_sealed_tx",
+            "with_owner_tx",
+            "write_tx",
             "fixture_conn",
             "fixture_write",
-            "with_owner_tx",
-            "with_sealed_tx",
-            "write_tx",
         ];
-        // Files allowed to reach the write surface, classified by their
-        // accepted role. A new file, or an existing file that newly
-        // gains a marker, must be added here with its class — this test
-        // is the regression that keeps a raw writer from slipping in.
-        const ACCEPTED: &[(&str, &str)] = &[
-            ("store/mod.rs", "seal facade + conn guard + write_tx lane"),
-            ("store/schema.rs", "open_inner/migrations + shutdown_entries tx"),
-            ("store/seal.rs", "authorizer + sealed_tx/WriteTxn + owner ops"),
-            ("store/agents.rs", "business DML via WriteTxn/*_in"),
-            ("store/app_audiences.rs", "business DML"),
-            ("store/app_bindings.rs", "business DML"),
-            ("store/app_capabilities.rs", "business DML"),
-            ("store/app_content.rs", "business DML + RecordStore::write_tx"),
-            ("store/app_contexts.rs", "business DML"),
-            ("store/app_effects.rs", "business DML"),
-            ("store/app_records.rs", "business DML + RecordStore conn"),
-            ("store/app_runs.rs", "business DML"),
-            ("store/app_sends.rs", "business DML"),
-            ("store/crm_sends.rs", "business DML"),
-            ("store/crm_smtp.rs", "business DML"),
-            ("store/delivery.rs", "business DML"),
-            ("store/effects.rs", "business DML"),
-            ("store/events.rs", "business DML + owner_* ops"),
-            ("store/inbox.rs", "business DML"),
-            ("store/messages.rs", "business DML"),
-            ("store/monitors.rs", "business DML"),
-            ("store/plans.rs", "business DML"),
-            ("store/platform.rs", "business DML"),
-            ("store/social_publish.rs", "business DML"),
-            ("store/threads.rs", "business DML"),
-            ("rollout.rs", "owner-lane guard-table + authorize_migration"),
-            ("backup/mod.rs", "scratch-copy transforms — separate file"),
-            ("issue/app.rs", "issue lane — separate db"),
+        // The exact cadence.sqlite3 store-domain writers and the marker
+        // classes each is cleared for. Only `src/store/*.rs` (top level),
+        // `src/rollout.rs` and `src/daemon.rs` may produce store writes.
+        const EXPECTED: &[(&str, &[&str])] = &[
+            ("store/mod.rs", &["with_sealed_tx", "write_tx"]),
+            (
+                "store/schema.rs",
+                &["Connection::open", "open_with_flags", "unchecked_transaction",
+                  ".execute(", ".execute_batch(", ".prepare(", "open_side",
+                  "open_adopting", "with_owner_tx", "write_tx"],
+            ),
+            (
+                "store/seal.rs",
+                &["Connection::open", "open_with_flags", "unchecked_transaction",
+                  "new_unchecked", ".transaction(", ".execute(", ".execute_batch(",
+                  ".prepare(", "Store::open", "open_side", "open_adopting",
+                  "with_sealed_tx", "with_owner_tx", "write_tx", "fixture_conn",
+                  "fixture_write"],
+            ),
+            ("store/agents.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/app_audiences.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/app_bindings.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/app_capabilities.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/app_content.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/app_contexts.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/app_effects.rs", &[".execute(", ".prepare(", "write_tx"]),
+            (
+                "store/app_records.rs",
+                &["Connection::open", "unchecked_transaction", "new_unchecked",
+                  ".execute(", ".execute_batch(", ".prepare(", "write_tx"],
+            ),
+            ("store/app_runs.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/app_sends.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/crm_sends.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/crm_smtp.rs", &[".execute(", "write_tx"]),
+            ("store/delivery.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/effects.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/events.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/inbox.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/messages.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/monitors.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/plans.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/platform.rs", &[".execute(", ".prepare(", "write_tx"]),
+            ("store/social_publish.rs", &[".execute(", ".prepare(", "write_tx"]),
+            (
+                "store/threads.rs",
+                &["Connection::open", ".execute(", ".execute_batch(", ".prepare(",
+                  "Store::open", "write_tx"],
+            ),
+            (
+                "rollout.rs",
+                &["Connection::open", "open_with_flags", ".execute(",
+                  ".execute_batch(", ".prepare(", "Store::open"],
+            ),
         ];
-        let store_dir = root.join("src/store");
-        let mut files: Vec<String> = Vec::new();
-        // Scan src/store/*.rs plus the named non-store writers.
-        for entry in std::fs::read_dir(&store_dir).unwrap() {
-            let p = entry.unwrap().path();
-            if p.extension().and_then(|e| e.to_str()) == Some("rs") {
-                files.push(format!("store/{}", p.file_name().unwrap().to_string_lossy()));
+        // The cadence.sqlite3 producer domain: `src/store/*.rs` (top
+        // level) plus `src/rollout.rs`. Other `src/` files hold
+        // `Connection::open`/`transaction`/`execute` against SEPARATE
+        // databases (records, daemon side-conns, scratch copies) — those
+        // are not cadence producers, so the scan is confined to the
+        // store domain and `rollout.rs` (the owner-lane caller).
+        let mut offenders = Vec::new();
+        let store_dir = root.join("store");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&store_dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("rs") && p.is_file() {
+                    files.push(p);
+                }
             }
         }
-        for extra in ["rollout.rs", "backup/mod.rs", "issue/app.rs"] {
-            files.push(extra.to_string());
+        let rollout = root.join("rollout.rs");
+        if rollout.exists() {
+            files.push(rollout);
         }
-        files.sort();
-        let mut unexpected = Vec::new();
-        for rel in &files {
-            let text = match std::fs::read_to_string(root.join("src").join(rel)) {
+        for p in files {
+            let text = match std::fs::read_to_string(&p) {
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            let touches = WRITE_MARKERS.iter().any(|m| text.contains(m));
-            if !touches {
+            let rel = p
+                .strip_prefix(root)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| p.to_string_lossy().into_owned());
+            let mut present: Vec<&str> = MARKERS
+                .iter()
+                .copied()
+                .filter(|m| text.contains(m))
+                .collect();
+            present.sort_unstable();
+            present.dedup();
+            if present.is_empty() {
                 continue; // writer-free file
             }
-            if !ACCEPTED.iter().any(|(f, _)| f == rel) {
-                unexpected.push(format!(
-                    "{rel} touches the cadence.sqlite3 write surface but is \
-                     not in the census — classify it in ACCEPTED or remove \
-                     the raw write path"
-                ));
+            match EXPECTED.iter().find(|(f, _)| *f == rel) {
+                // A file outside the cleared domain with a marker is a
+                // brand-new unclassified writer.
+                None => offenders.push(format!("{rel}: unclassified writer file")),
+                // A file in the domain whose marker set is not exactly
+                // its cleared signature gained a callsite class it isn't
+                // cleared for (e.g. `events.rs` adding `Connection::open`).
+                Some((_, allowed)) => {
+                    let mut want: Vec<&str> = allowed.to_vec();
+                    want.sort_unstable();
+                    want.dedup();
+                    for m in &present {
+                        if !want.contains(m) {
+                            offenders.push(format!(
+                                "{rel}: unclassified callsite marker {m}"
+                            ));
+                        }
+                    }
+                }
             }
         }
+        offenders
+    }
+                    let mut present: Vec<&str> = MARKERS
+                        .iter()
+                        .copied()
+                        .filter(|m| text.contains(m))
+                        .collect();
+                    present.sort_unstable();
+                    present.dedup();
+                    if present.is_empty() {
+                        continue; // writer-free file
+                    }
+                    match EXPECTED.iter().find(|(f, _)| *f == rel) {
+                        // A file outside the domain with a marker is a
+                        // brand-new unclassified writer.
+                        None => offenders.push(format!("{rel}: unclassified writer file")),
+                        // A file in the domain whose marker set is not
+                        // exactly its cleared signature gained (or lost)
+                        // a callsite class.
+                        Some((_, allowed)) => {
+                            let mut want: Vec<&str> = allowed.to_vec();
+                            want.sort_unstable();
+                            want.dedup();
+                            for m in &present {
+                                if !want.contains(m) {
+                                    offenders.push(format!(
+                                        "{rel}: unclassified callsite marker {m}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        offenders
+    }
+
+    /// CAD-1011 writer census: the recursive scan over `src/` must find
+    /// only the classified owners above — a new file with a write marker,
+    /// or an accepted file that gains a marker-class it isn't cleared
+    /// for, fails here.
+    #[test]
+    fn census_db_writers_enumerated() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let offenders = census_scan(&root);
         assert!(
-            unexpected.is_empty(),
-            "writer census found unclassified write surface:\n{}",
-            unexpected.join("\n")
+            offenders.is_empty(),
+            "writer census found unclassified cadence.sqlite3 write surface:\n{}",
+            offenders.join("\n")
         );
     }
 
-    /// Regression: a NEW writer path that isn't in the census must fail
-    /// the census. Simulate by scanning a directory containing a synthetic
-    /// extra writer file — the census matcher flags it.
+    /// Regression: the scanner must refuse an unclassified write marker
+    /// even in an ALREADY-accepted file and in a brand-new file. Copy the
+    /// real `store/mod.rs` (cleared only for the lane markers) and append
+    /// a raw `Connection::open` — a callsite class it does NOT own — plus
+    /// write a brand-new writer file, into a scratch `src/store/` tree.
+    /// `census_scan` must flag both: the injected callsite in the
+    /// accepted file, and the new file outright.
     #[test]
     fn census_rejects_unclassified_writer() {
-        // Reuse the classification logic directly on a synthetic path list.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let probe = root.join("src/store/seal.rs");
-        let text = std::fs::read_to_string(&probe).unwrap();
-        // A file containing a Connection constructor is a writer.
+        let scratch = TempDir::new().unwrap();
+        let src = scratch.path().join("src");
+        std::fs::create_dir_all(src.join("store")).unwrap();
+        let modreal = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store/mod.rs"),
+        )
+        .unwrap();
+        // store/mod.rs is cleared only for with_sealed_tx/write_tx —
+        // append a raw Connection ctor so the copied accepted file carries
+        // an unclassified callsite class the signature check must flag.
+        let mut sneaky = modreal;
+        sneaky.push_str("\nfn smuggled() { let _ = rusqlite::Connection::open(\"x\"); }\n");
+        std::fs::write(src.join("store/mod.rs"), sneaky).unwrap();
+        // A brand-new writer file inside the domain, never in EXPECTED.
+        std::fs::write(
+            src.join("store/pwned.rs"),
+            "fn evil() { rusqlite::Connection::open(\"db\").unwrap().execute(\"\",[]); }",
+        )
+        .unwrap();
+        let offenders = census_scan(&src);
         assert!(
-            text.contains("Connection::open") || text.contains("new_unchecked"),
-            "seal.rs must contain a write marker for this probe to be valid"
+            offenders.iter().any(|o| o.starts_with("store/mod.rs")),
+            "injected raw Connection ctor in an accepted file must be flagged: {offenders:?}"
         );
-        // A made-up file name is not in ACCEPTED — prove the matcher would
-        // refuse it (the real test iterates the filesystem; here we assert
-        // the allowlist membership test itself discriminates).
-        const ACCEPTED: &[&str] = &[
-            "store/mod.rs",
-            "store/schema.rs",
-            "store/seal.rs",
-            "store/agents.rs",
-            "store/app_audiences.rs",
-            "store/app_bindings.rs",
-            "store/app_capabilities.rs",
-            "store/app_content.rs",
-            "store/app_contexts.rs",
-            "store/app_effects.rs",
-            "store/app_records.rs",
-            "store/app_runs.rs",
-            "store/app_sends.rs",
-            "store/crm_sends.rs",
-            "store/crm_smtp.rs",
-            "store/delivery.rs",
-            "store/effects.rs",
-            "store/events.rs",
-            "store/inbox.rs",
-            "store/messages.rs",
-            "store/monitors.rs",
-            "store/plans.rs",
-            "store/platform.rs",
-            "store/social_publish.rs",
-            "store/threads.rs",
-            "rollout.rs",
-            "backup/mod.rs",
-            "issue/app.rs",
-        ];
-        for synthetic in [
-            "store/new_writer.rs",
-            "store/sneaky.rs",
-            "store/pwned.rs",
-            "store/evil_conn.rs",
-        ] {
-            assert!(
-                !ACCEPTED.contains(&synthetic),
-                "unclassified writer {synthetic} must not be in the census"
-            );
-        }
+        assert!(
+            offenders.iter().any(|o| o.starts_with("store/pwned.rs")),
+            "new unclassified writer file must be flagged: {offenders:?}"
+        );
     }
 
     /// Adversarial: a panic inside a `with_owner_tx` callback must not
@@ -2147,19 +2239,28 @@ mod tests {
     fn owner_tx_panic_rolls_back_and_returns_to_autocommit() {
         let dir = TempDir::new().unwrap();
         let (db, s) = open_legacy(&dir);
+        // Drive a REAL owner-maintenance tx (`with_owner_tx`) that runs a
+        // DML then panics — catch_unwind inside the guard rolls the tx
+        // back under TxControl, then the unwind resumes and drops the
+        // conn mutex guard (poisoning it). `conn()`'s recovery then sees
+        // a conn already in autocommit — the rollback happened BEFORE
+        // any poison-forensic masking could hide a leaked tx.
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = s.owner_record_running_build("commit-x");
-            // Force a panic inside an owner tx by tripping the hook-free
-            // path: use with_owner_tx-equivalent via a propose_close that
-            // panics. Simplest: panic inside a write_tx callback after a
-            // DML — the owner lane isn't the only one; assert the conn
-            // recovers regardless of which lane held the tx.
-            let _ = s.with_sealed_tx(|_wtx| -> Result<()> {
-                panic!("deliberate owner/business panic inside sealed tx");
-            });
+            let _ = s.owner_panic_probe();
         }));
         assert!(r.is_err(), "panic must propagate");
-        // The conn must be usable — the guard rolled the tx back.
+        // The DML must NOT have committed — the rollback discarded it.
+        let present: bool = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE alias='owner-probe'",
+                [],
+                |r| r.get::<_, i64>(0).map(|n| n > 0),
+            )
+            .unwrap_or(false);
+        assert!(!present, "owner-tx DML must roll back on panic");
+        // A later sanctioned business write still works — the conn is
+        // usable, not wedged inside a leaked tx.
         s.event_public("daemon", "after-panic", json!({}))
             .unwrap_or_else(|e| panic!("store unusable after panic rollback: {e}"));
         let _ = db;
