@@ -164,6 +164,9 @@ const generic = {
 const social = { ...generic, install_id: "install-social", title: "Social Content", name: "social-content" };
 const second = { ...generic, install_id: "install-second", title: "Second", name: "reports" };
 const crm = { ...generic, install_id: "install-crm", title: "CRM", name: "crm" };
+// A CRM install with two active scopes — proves the bound scope still
+// hides every switch link (CAD-1008) while the unbound state keeps them.
+const crmMulti = { ...generic, install_id: "install-crm-multi", title: "CRM Multi", name: "crm" };
 const contextsFor: Record<string, unknown> = {
   "install-shell": { contexts: [
     { id: "ctx-a", install_id: "install-shell", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
@@ -178,6 +181,10 @@ const contextsFor: Record<string, unknown> = {
   ] },
   "install-crm": { contexts: [
     { id: "ctx-a", install_id: "install-crm", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
+  ] },
+  "install-crm-multi": { contexts: [
+    { id: "ctx-a", install_id: "install-crm-multi", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
+    { id: "ctx-b", install_id: "install-crm-multi", revision: 1, state: "active", digest: "cb", config: { schema: 1, label: "Beta", input_defaults: {} } },
   ] },
 };
 const thread = {
@@ -205,6 +212,8 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (path === "/api/app-installations/install-social/contexts") return json(contextsFor["install-social"]);
   if (path === "/api/app-installations/install-crm") return json(crm);
   if (path === "/api/app-installations/install-crm/contexts") return json(contextsFor["install-crm"]);
+  if (path === "/api/app-installations/install-crm-multi") return json(crmMulti);
+  if (path === "/api/app-installations/install-crm-multi/contexts") return json(contextsFor["install-crm-multi"]);
   if (path.startsWith("/api/threads/master")) return json(thread);
   // CRM section reads: empty server receipts only — the mounted
   // dedupe assertions below exercise real list/new/detail paths, so
@@ -847,6 +856,43 @@ const appsLinks = (hostEl: HTMLElement) =>
   );
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
+}
+
+// CAD-1008: a bound CRM scope renders no scope switch links at all,
+// even on a multi-context install — the single-company surface is the
+// company's records, never a picker. Mount a two-scope CRM install on
+// the bound `ctx-a` URL; the switch nav must be absent entirely.
+{
+  win.sessionStorage.clear();
+  const multi = document.createElement("div");
+  document.body.append(multi);
+  const multiRoot = createRoot(multi);
+  history.pushState(null, "", "/app-installations/install-crm-multi?ctx=ctx-a");
+  await React.act(async () => {
+    multiRoot.render(React.createElement(AppShell, { installId: "install-crm-multi", viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert(multi.querySelector("[data-outlet-heading]"), "multi-context CRM mounts bound"));
+  equal(multi.querySelectorAll("[data-scope-link]").length, 0, "bound CRM multi-context renders zero scope links (CAD-1008)");
+  assert(!(multi.textContent ?? "").match(/Scope:|Context:|Switch context|Choose a context/), "bound CRM shows no scope switcher or label");
+  await React.act(async () => { multiRoot.unmount(); });
+  multi.remove();
+}
+// The exceptional unbound multi-context CRM install keeps the explicit
+// scoped-entry links with administrator setup guidance — the only place
+// a scope choice ever surfaces (CAD-1008).
+{
+  win.sessionStorage.clear();
+  const unbound = document.createElement("div");
+  document.body.append(unbound);
+  const unboundRoot = createRoot(unbound);
+  history.pushState(null, "", "/app-installations/install-crm-multi");
+  await React.act(async () => {
+    unboundRoot.render(React.createElement(AppShell, { installId: "install-crm-multi", viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert(unbound.querySelectorAll("[data-scope-link]").length === 2, "unbound multi-context CRM keeps the two scope-entry links"));
+  assert((unbound.textContent ?? "").includes("administrator CRM setup"), "unbound CRM names administrator setup");
+  await React.act(async () => { unboundRoot.unmount(); });
+  unbound.remove();
 }
 
 console.log("app shell checks passed");

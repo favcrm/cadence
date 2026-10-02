@@ -516,8 +516,13 @@ export default function AppShell({
                   `navigate` no-op that keeps the open record, the New
                   view and any unsaved draft instead of resetting the
                   outlet. Single-context installs keep the entry hidden
-                  — no link clutter. */}
-              {!isSocial && activeIds.length > 1 && (
+                  — no link clutter.
+                  CAD-1008: a bound CRM scope shows no switch links at
+                  all — the single-company surface never offers a scope
+                  control. Only the exceptional unbound multi-context
+                  legacy install keeps the explicit entry; Social and
+                  generic Apps are unchanged. */}
+              {!isSocial && activeIds.length > 1 && (installation?.name !== "crm" || contextId === "") && (
                 <nav
                   className={
                     contextId === ""
