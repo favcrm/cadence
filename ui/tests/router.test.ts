@@ -120,6 +120,16 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
   equal(locationHref(list), "/apps?project=cadence", "apps href keeps scope");
 }
 
+// CAD-1026: an app page's native-controls choice never follows to another installation.
+{
+  const here = readLocation("/app-installations/install-a", "?screen=native");
+  equal(
+    locationHref(goTo(here, { screen: "workspaceApp", installId: "install-b" }), "?screen=native&foo=1"),
+    "/app-installations/install-b?foo=1",
+    "switching installation drops screen=native",
+  );
+}
+
 // Printing a location keeps unknown params and drops stale app ones.
 {
   const href = locationHref(

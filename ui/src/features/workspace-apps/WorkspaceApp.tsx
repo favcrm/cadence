@@ -40,7 +40,7 @@ import ScheduleCalendar from "./ScheduleCalendar";
 import { forgetContext, initialContext, rememberedContext, rememberContext } from "./contextSelection";
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
-import ScreenOutlet from "./screen/ScreenOutlet";
+import ScreenHost from "./screen/ScreenHost";
 import { screenTag, screenProjection, settleIntentRead, type IntentRead } from "./screen/screenProjection";
 import { socialPublish } from "./socialPublish";
 
@@ -566,7 +566,7 @@ export default function WorkspaceApp({
     catch { /* Oversized/unavailable scope retains the existing native outlet. */ }
   }
   const screen = (fallback: React.ReactNode) => projection
-    ? <ScreenOutlet projection={projection} fallback={fallback} /> : fallback;
+    ? <ScreenHost projection={projection} fallback={fallback} /> : fallback;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
