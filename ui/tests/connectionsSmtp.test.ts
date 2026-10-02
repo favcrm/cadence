@@ -13,6 +13,7 @@
  */
 declare function require(name: string): any;
 import type { ConnectionProvider } from "../src/lib/types";
+import type { act as reactAct } from "react";
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`assert: ${msg}`);
@@ -22,7 +23,11 @@ function equal(a: unknown, e: unknown, msg: string) {
     throw new Error(`${msg}: expected ${JSON.stringify(e)}, got ${JSON.stringify(a)}`);
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-let act: (fn: () => Promise<unknown>) => Promise<void>;
+// React's real `act` is overloaded for sync and async callbacks; assign
+// its actual type so every caller (sync act(() => …) and awaited
+// act(async () => …)) typechecks — a hand-narrowed signature rejects
+// valid callers.
+let act: typeof reactAct;
 async function settle(fn: () => void, ms = 12000) {
   const end = Date.now() + ms;
   for (;;) {
