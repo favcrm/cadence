@@ -304,8 +304,9 @@ export function locationHref(loc: AppLocation, search = ""): string {
   // `run` is owned by the Workflows section — it opens one row's form
   // there — and `new` by an app page (it opens the New post drawer on
   // arrival); neither follows a navigation elsewhere. `screen=native` is
-  // an app page's too (CAD-1026: native controls instead of the mounted
-  // app screen); it never carries over to another installation.
+  // an app page's too (CAD-1040: the operator's back door to native
+  // controls instead of the mounted app screen); it never carries over to
+  // another installation.
   for (const key of ["tab", "view", "project", "issue", "run", "new", "screen"]) q.delete(key);
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
