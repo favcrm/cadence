@@ -13,6 +13,7 @@ import {
   publishStateTone,
   reconcileReading,
   refusalCopy,
+  refusalFromError,
   showsUncertainReading,
   socialPublish,
   type PublishIntent,
@@ -180,7 +181,7 @@ export default function PublishPanel({
       statusRef.current?.focus();
       await refresh();
     } catch (error) {
-      setActionError(message(error));
+      setActionError(refusalFromError(message(error)));
     } finally {
       setBusy(false);
     }

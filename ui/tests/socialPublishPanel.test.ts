@@ -44,6 +44,7 @@ async function openConfirmation() {
   await React.act(async () => { releaseArtifact?.(); });
   await flush();
 }
+let refuseSchedule = false;
 let intents: any[] = [];
 let failList = false;
 const scheduled: any[] = [];
@@ -52,6 +53,7 @@ const stub = {
   list: async () => { if (failList) throw new Error("Operator session expired"); return { intents }; },
   show: async (intentId: string) => ({ intent: intents.find(value => value.intent_id === intentId) }),
   schedule: async (body: any) => {
+    if (refuseSchedule) throw new Error("approval_replay: this approval already authorized another social publish intent");
     assert(body.slot === "publication" && body.timezone === "Asia/Hong_Kong" && body.destination_id === "17841400008460056", "Panel schedules exact pilot destination with timezone");
     assert(!Object.hasOwn(body, "caption_digest"), "Panel never invents digests");
     assert(/^apv-[0-9a-f]{32}$/.test(body.approval_id) && body.request_id === body.approval_id && body.grant_id === "dpq_synthetic_grant_ig", "Confirmation mints the approval id that is also the request id");
@@ -121,6 +123,12 @@ async function main() {
   await React.act(async () => { button("Confirm and post now")?.click(); });
   await flush(); await flush();
   assert(scheduled[scheduled.length - 1].approval_id !== firstApproval, "A new confirmation mints a new approval id");
+  refuseSchedule = true;
+  await openConfirmation();
+  await React.act(async () => { button("Confirm and post now")?.click(); });
+  await flush(); await flush();
+  assert(text().includes("already authorized another post"), "A replay refusal renders operator copy, not the raw code");
+  refuseSchedule = false;
   assert(text().includes("17841400008460056") && text().includes("binding-digest") && text().includes("never relay-vouched"), "Card echoes the destination id and binding digest; the handle stays a display constant");
   // Schedule path needs a due time.
   await React.act(async () => { host.querySelector('input[value="schedule"]')?.dispatchEvent(new win.MouseEvent("click", { bubbles: true })); });

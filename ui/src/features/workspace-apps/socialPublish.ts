@@ -363,6 +363,10 @@ export function refusalCopy(refusal: PublishRefusal): string {
     case "bad_revision":
     case "bad_timezone":
       return `An identity shape is invalid (${refusal.code}). Nothing was stored.`;
+    case "approval_replay":
+      return "This approval already authorized another post. Review again to approve this one — nothing was published.";
+    case "bad_approval":
+      return "The approval id is not one this panel minted. Review again — nothing was published.";
     case "image_required":
       return "Instagram needs a reviewed provider-accessible image. Nothing was published.";
     default:
@@ -372,11 +376,11 @@ export function refusalCopy(refusal: PublishRefusal): string {
   }
 }
 
-/** Landed `cadenceApprovalId` bound: non-empty, max 120 characters.
- *  The UI gates scheduling on it so the contract never sees an
- *  oversize approval from this surface. */
-export function isApprovalIdUsable(approvalId: string): boolean {
-  return approvalId.length > 0 && approvalId.length <= 120;
+/** Daemon refusals arrive as `code: detail`; a known Cadence code gets its
+ *  operator copy, anything else stays raw. */
+export function refusalFromError(text: string): string {
+  const match = /^([a-z_]+): (.+)$/s.exec(text);
+  return match ? refusalCopy({ code: match[1], message: match[2] }) : text;
 }
 
 /** AgenticOS send-grant id shape, mirroring `valid_grant_id` in
