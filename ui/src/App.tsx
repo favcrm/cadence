@@ -31,7 +31,7 @@ import Link from "./ui/Link";
 import ProjectFilter from "./ui/ProjectFilter";
 import SectionTabs from "./ui/SectionTabs";
 import StatusChips from "./ui/StatusChips";
-import ThemeToggle from "./ui/ThemeToggle";
+import AccountMenu from "./ui/AccountMenu";
 import BuildUpdateNotice from "./ui/BuildUpdateNotice";
 import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
@@ -649,7 +649,16 @@ export default function App() {
                 <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
               )}
             </StatusChips>
-            <ThemeToggle />
+            {/* CAD-1033 moves the desktop trigger to the sidebar footer; until then it shows at all widths. */}
+            <AccountMenu
+              meta={meta}
+              actor={actor}
+              mayWrite={!readOnly}
+              onChange={refresh}
+              trigger="avatar"
+              placement="below-end"
+              settingsHref={hrefFor({ screen: "settings", section: "models" })}
+            />
           </div>
         </header>
 

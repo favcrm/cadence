@@ -8,9 +8,16 @@ for (const key of ["window", "document", "navigator", "HTMLElement", "location"]
   Object.defineProperty(globalThis, key, { value: key === "window" ? win : win[key], configurable: true });
 }
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
+const moduleLoader = require("module");
+const originalRequire = moduleLoader.prototype.require;
+moduleLoader.prototype.require = function (this: unknown, id: string) {
+  if (id === "@hugeicons/core-free-icons") return new Proxy({}, { get: () => ({}) });
+  if (id === "@hugeicons/react") return { HugeiconsIcon: () => null };
+  return originalRequire.apply(this, arguments);
+};
 const { createElement, act } = require("react");
 const { createRoot } = require("react-dom/client");
-const { default: SignIn } = require("../src/features/auth/SignIn") as typeof import("../src/features/auth/SignIn");
+const { default: AccountMenu } = require("../src/ui/AccountMenu") as typeof import("../src/ui/AccountMenu");
 
 function assert(condition: unknown, message: string): void {
   if (!condition) throw new Error(message);
@@ -22,11 +29,12 @@ for (const role of ["member", "operator"]) {
   document.body.append(host);
   const root = createRoot(host);
   const meta = { ...base, session: { id: "safe-session", origin: "public", user: { name: "Fable Chen", email: "fable@example.com", role } } } as unknown as Meta;
-  act(() => root.render(createElement(SignIn, { meta, onChange: () => undefined })));
-  const button = host.querySelector("button");
-  assert(button?.textContent?.includes("Fable Chen"), "signed-in chip must name the person");
-  assert(button?.title.includes("fable@example.com") && button.title.includes(role), "signed-in title must show email and mapped role");
-  if (role === "member") assert(!button?.textContent?.includes("operator"), "member must never be labelled operator");
+  act(() => root.render(createElement(AccountMenu, { meta, actor: "x", mayWrite: true, onChange: () => undefined, trigger: "avatar", placement: "below-end" })));
+  act(() => { host.querySelector("button")?.click(); });
+  const panel = host.querySelector("[role=menu]");
+  assert(panel?.textContent?.includes("Fable Chen"), "account menu must name the person");
+  assert(panel?.textContent?.includes("fable@example.com") && panel.textContent.includes(role), "account menu must show email and mapped role");
+  if (role === "member") assert(!panel?.textContent?.includes("operator"), "member must never be labelled operator");
   act(() => root.unmount());
   host.remove();
 }

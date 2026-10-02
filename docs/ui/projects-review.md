@@ -20,7 +20,7 @@ Overview counts come from issue records, excluding epic containers from task tot
 Preserve existing issue deep links, board/list preferences, filters, read-only behavior, project isolation, and all backend security contracts. Existing issue bookmarks with a view query still open Issues. No production rollout is part of this review.
 
 ## Navigation polish
-The header shows the project breadcrumb; section links share the content left edge and mark the active destination with an underline. Links preserve browser Back navigation. Targets are 44px tall and wrap on narrow screens. Connection, refresh, theme and update controls share the header utility area and the Hugeicons set. The update control opens Reload/Later on demand, closes with Escape or an outside click, and no longer floats over the page by default.
+The header shows the project breadcrumb; section links share the content left edge and mark the active destination with an underline. Links preserve browser Back navigation. Targets are 44px tall and wrap on narrow screens. Connection, refresh and update controls share the header utility area and the Hugeicons set. Identity, write actor, theme and sign-out live in the account menu (header avatar on phones, sidebar footer on desktop; the avatar shows at all widths until CAD-1033 lands the sidebar row). The update control opens Reload/Later on demand, closes with Escape or an outside click, and no longer floats over the page by default.
 
 
 ## Project Context workspace

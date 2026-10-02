@@ -14,7 +14,7 @@ export default function StatusChips({
 }: {
   /** The server refuses every write (meta.read_only) — the lock chip. */
   readOnly: boolean;
-  /** This client may write — the "writes: actor" chip. */
+  /** This client may write — the phone menu's "writes: actor" chip (the header's lives in AccountMenu). */
   mayWrite: boolean;
   health: Health | null;
   actor: string;
@@ -68,9 +68,9 @@ export default function StatusChips({
           </button>
         </>
       )}
-      {mayWrite && (
+      {mayWrite && !header && (
         <span
-          className={`chip bg-ink-800 text-ink-400 ${header ? "hidden lg:inline-flex" : ""}`}
+          className="chip bg-ink-800 text-ink-400"
           title={`writes commit to the tracker as ${actor}`}
         >
           writes: {actor}
