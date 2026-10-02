@@ -2282,12 +2282,12 @@ impl ProviderAdapter for PiAdapter {
         &self,
         prompt: &str,
         slot: Option<&str>,
-        client_message_id: &str,
+        _client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
         let generation = self.shared.generation.lock().unwrap().clone();
         let turn_id = registry::PI_MANAGED_TURN_TOKENS.mint(&generation);
-        let prompt = &super::with_turn_token(prompt, slot, client_message_id, &turn_id);
+        let prompt = &super::with_turn_token(prompt, slot, &turn_id);
         *self.shared.interrupt_at.lock().unwrap() = None;
         // A settled-but-unconsumed turn is stale — it belongs to a
         // message the daemon already fenced.

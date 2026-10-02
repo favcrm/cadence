@@ -996,8 +996,22 @@ impl Shared {
                     // CAD-1009: the turn-token slot follows the hint on
                     // its own line; the adapter fills it with the token
                     // it mints for this very turn.
-                    body = match slot {
-                        Some(slot) => format!("{envelope}\n{slot}\n\n{body}"),
+                    // The block carries the daemon-rendered verb reference
+                    // (`master::scoped_verb_reference`) with the slot
+                    // wherever the token goes.
+                    let block = slot.and_then(|slot| {
+                        let install = hint.get("install_id")?.as_str()?;
+                        let context = hint.get("context_id")?.as_str()?;
+                        Some(crate::master::scoped_verb_reference(
+                            install,
+                            context,
+                            &message.id,
+                            slot,
+                            &crate::master::tmpdir(&self.state_dir),
+                        ))
+                    });
+                    body = match block {
+                        Some(block) => format!("{envelope}\n{block}\n\n{body}"),
                         None => format!("{envelope}\n\n{body}"),
                     };
                 }
@@ -1050,7 +1064,7 @@ impl Shared {
     /// `run_turn`, after the prompt text is fixed, so the daemon leaves
     /// this random slot after the App hint and the adapter replaces it
     /// with a line naming the message id and the exact token it minted
-    /// (`adapter::scoped_turn_line`). A slot exists only for an App
+    /// (`master::scoped_verb_reference`). A slot exists only for an App
     /// message whose stamp still re-proves (the same condition that
     /// puts the hint in the prompt) on an endpoint that can redeem: a
     /// turn-token scheme and not a pty paste. The master (the only
@@ -3818,7 +3832,17 @@ mod app_hint_tests {
                 .unwrap_or_else(|| panic!("{alias}: {prompt}"));
             let words = prompt.find("create segment").unwrap();
             assert!(hint < at && at < words, "{alias}: {prompt}");
-            assert_eq!(prompt.matches(&slot).count(), 1, "{alias}: {prompt}");
+            // The block carries the daemon-rendered reference with the
+            // slot where the token goes, and the real ids.
+            assert!(
+                prompt.contains("segment-assistant-save: "),
+                "{alias}: {prompt}"
+            );
+            assert!(prompt.contains("--message m-"), "{alias}: {prompt}");
+            assert!(
+                prompt.contains("install-1 --context-id"),
+                "{alias}: {prompt}"
+            );
             // The message body (stored, durable) never holds the slot.
             assert!(!message.body.contains(&slot));
             // A fresh slot per call: no value to replay between turns.
