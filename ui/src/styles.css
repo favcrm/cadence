@@ -1328,6 +1328,15 @@ button.refchip:hover {
 
 /* Workspace navigation and utilities share the content's left edge. */
 .app-workspace > aside { height: 100%; min-height: 0; }
+/* CAD-1007: inside the bounded workspace grid the shared App shell is
+   the one scrollable pane — it fills the column's leftover height and
+   scrolls its own overflow so long app screens (Settings, custom
+   loader outlets) stay reachable while the page itself never scrolls. */
+.app-workspace .app-shell {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow-y: auto;
+}
 .app-header { height: 3.25rem; flex-shrink: 0; }
 .header-menu svg { flex-shrink: 0; }
 @media (width >= 1024px) { .app-header .header-menu { display: none; } }
