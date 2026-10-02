@@ -809,15 +809,24 @@ async function mountedFlow() {
   await click(byText("button", "Cancel"));
 
   // ---- CAD-813: the verified assistant draft seam ----
-  // The disabled-without-message state was proven earlier (the mint
-  // control was disabled before the first chat send). A scoped message
-  // already exists from the creation flow, so this seam re-verifies the
-  // mint body shape, the scope binding and the apply — with RELATIVE
-  // counts, since earlier mints/sends already ran in this mount.
+  // Isolate the precondition for real: the creation flow already sent a
+  // scoped chat message in this mount, so this seam clears the shared
+  // thread store to a genuine no-scoped-message state — the assertion
+  // (mint disabled until a message exists) is kept, not weakened.
   const mintButton = () => byText("button", "Ask assistant to draft") as HTMLButtonElement | null;
-  assert(mintButton() && !mintButton()!.disabled, "the mint is enabled with a scoped message present");
   const mintsAtSeam = mintBodies.length;
   const sendsAtSeam = sendBodies.length;
+  await React.act(async () => {
+    threadEntries.length = 0;
+    const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
+    await resources.masterThread.refresh();
+  });
+  await settle(() => assert(mintButton()!.disabled, "mint is disabled once the scoped message is gone"));
+  assert(
+    text().includes("Send the assistant a message in the left chat first"),
+    "the disabled mint explains what to do",
+  );
+  assert(mintBodies.length === mintsAtSeam, "no proposal request leaves the browser while disabled");
 
   // Send the assistant a scoped chat message through the left pane —
   // the daemon stamps the verified App binding on the stored entry,
@@ -830,14 +839,11 @@ async function mountedFlow() {
     { install_id: "install-crm", context_id: "ctx-a" },
     "the chat send carried the shell's scope",
   );
-  // The stored entry lands via the thread stream; in this fixture the
-  // fake SSE is silent, so revalidate the shared store the way the
-  // stream's arrival would.
   await React.act(async () => {
     const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
     await resources.masterThread.refresh();
   });
-  await settle(() => assert(!mintButton()!.disabled, "the mint stays enabled with a scoped message"));
+  await settle(() => assert(!mintButton()!.disabled, "the mint enables once a scoped message exists"));
 
   // Mint: the body is exactly {campaign_id, message_id, request_id} —
   // no token, receipt, turn or source_revision ever travels. (This is
