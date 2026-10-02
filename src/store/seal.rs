@@ -2134,6 +2134,61 @@ mod tests {
     }
 
     #[test]
+    fn review_regression_witness_records_actual_database_schema() {
+        let dir = TempDir::new().unwrap();
+        let (db, store) = open_legacy(&dir);
+        let actual: i64 = store
+            .conn()
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        store
+            .propose_close(&permit(&db, OwnerOp::Close, b"c", "a", "art", 1), "test")
+            .unwrap();
+        store
+            .witness_commit(&permit(&db, OwnerOp::Witness, b"c", "a", "art", 1))
+            .unwrap();
+        let witnessed: i64 = store
+            .conn()
+            .query_row("SELECT db_schema FROM owner_witness", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            witnessed, actual,
+            "witness must record the actual schema, not a supported ceiling"
+        );
+    }
+
+    #[test]
+    fn review_regression_sibling_seal_before_migration_refuses_all_ddl() {
+        let dir = TempDir::new().unwrap();
+        let (db, store) = open_legacy(&dir);
+        drop(store);
+        Connection::open(&db)
+            .unwrap()
+            .execute("UPDATE schema_version SET version=30", [])
+            .unwrap();
+        super::super::schema::before_migration_for_test(|path| {
+            // The opening connection already passed read-only preflight.
+            // A different real connection now closes before migration begins.
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(SEAL_SCHEMA).unwrap();
+            conn.execute("INSERT INTO closure_state(id,closed,reason,challenge,attempt,artifact,epoch,witness_done,closed_at) VALUES(1,1,'race',X'63','a','art',1,0,0)", []).unwrap();
+        });
+        let result = super::super::schema::open_migration_for_test(&db);
+        assert!(
+            result.is_err(),
+            "migration admitted a sibling closure after preflight"
+        );
+        let actual: i64 = Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            actual, 30,
+            "closed database must receive no migration writes"
+        );
+    }
+
+    #[test]
     fn read_snapshot_has_no_write_authority_when_fenced_or_closed() {
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);

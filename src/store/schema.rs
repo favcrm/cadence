@@ -15,6 +15,25 @@ use super::threads;
 use super::StoreConn;
 use super::{Store, BUSY_TIMEOUT};
 
+#[cfg(test)]
+type MigrationTestHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_TEST_HOOK: std::cell::RefCell<Option<MigrationTestHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(super) fn before_migration_for_test(hook: impl FnOnce(&Path) + 'static) {
+    MIGRATION_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+pub(super) fn open_migration_for_test(path: &Path) -> Result<Store> {
+    Store::open_inner(path, None, false, false, super::seal::OpenMode::Legacy)
+        .map(|(store, _)| store)
+}
+
 /// Read-only open of the daemon store from another process, with the
 /// shared busy timeout — never creates or migrates the file.
 pub(crate) fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
@@ -205,6 +224,10 @@ impl Store {
                 conn.pragma_update(None, "journal_mode", "WAL")
                     .map_err(Error::from)
             })?;
+        }
+        #[cfg(test)]
+        if let Some(hook) = MIGRATION_TEST_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook(path);
         }
         // CAD-1011: the schema bootstrap + every migration run under the
         // constructor's owner-maintenance + tx-control window — the only
