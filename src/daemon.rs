@@ -3069,6 +3069,7 @@ impl Shared {
             "social_publish_show" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_list" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_claim_due" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_send_now" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_reconcile" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_report" => self.rpc_social_publish(method, params, peer_pid),
             "app_context_create" => self.rpc_app_context(method, params, peer_pid),

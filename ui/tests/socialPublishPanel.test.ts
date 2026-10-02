@@ -55,6 +55,7 @@ let intents: any[] = [];
 let failList = false;
 const scheduled: any[] = [];
 const cancelled: string[] = [];
+const sent: string[] = [];
 const stub = {
   list: async () => { if (failList) throw new Error("Operator session expired"); return { intents }; },
   show: async (intentId: string) => ({ intent: intents.find(value => value.intent_id === intentId) }),
@@ -74,6 +75,7 @@ const stub = {
     return { media_key: `dp1.ws.conn.${importHex.slice(0, 32)}`, image_digest: importHex };
   },
   cancel: async (intentId: string, installId: string, contextId: string | null) => { cancelScopes.push([installId, contextId]); cancelled.push(intentId); intents = intents.map(value => value.intent_id === intentId ? { ...value, state: "cancelled" } : value); return { intent: intents.find(value => value.intent_id === intentId) }; },
+  sendNow: async (intentId: string) => { sent.push(intentId); intents = intents.map(value => value.intent_id === intentId ? { ...value, state: "posted" } : value); return { intent: intents.find(value => value.intent_id === intentId) }; },
 };
 let mounts = 0;
 async function render(props: any) {
@@ -168,6 +170,22 @@ async function main() {
   await flush(); await flush();
   assert(cancelled.includes("intent-q") && text().includes("Nothing was sent"), "Cancel closes the intent without a send");
   assert(cancelScopes.at(-1)?.[0] === "install-a" && cancelScopes.at(-1)?.[1] === "ctx-other", "Cancel uses the intent's frozen install/context, not the panel's");
+  // CAD-1041: Send now takes two explicit presses on a queued intent
+  // only; processing/posted offer nothing, one click never sends.
+  assert(!sent.includes("intent-q"), "Cancel alone never sends");
+  intents = [{ ...intents[0], intent_id: "intent-s", state: "queued" }];
+  await render({ candidates: [candidate] });
+  assert(button("Send now"), "Queued intent offers Send now");
+  await React.act(async () => { button("Send now")?.click(); });
+  await flush();
+  assert(button("Confirm send now"), "Send now needs an explicit second press");
+  assert(!sent.includes("intent-s"), "Arming alone sends nothing");
+  await React.act(async () => { button("Confirm send now")?.click(); });
+  await flush(); await flush();
+  assert(sent.includes("intent-s") && text().includes("posted"), "Confirmed send posts the named intent");
+  intents = [{ ...intents[0], intent_id: "intent-p", state: "processing" }];
+  await render({ candidates: [candidate] });
+  assert(!button("Send now"), "Processing intent offers no Send now");
   // Every state renders its operator copy.
   intents = [
     { ...intents[0], intent_id: "i-posted", state: "posted", permalink: "https://www.instagram.com/p/fixture000/", receipt: { ok: true } },

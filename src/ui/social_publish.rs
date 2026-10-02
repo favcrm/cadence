@@ -22,6 +22,11 @@ pub(super) enum Route<'a> {
     List,
     Show(&'a str),
     Cancel(&'a str),
+    /// CAD-1041: `POST /api/social-publishes/<id>/send-now` — the
+    /// operator's explicit send of one named queued intent. Relays the
+    /// operator-only `social_publish_send_now` RPC; the HTTP peer
+    /// carries the same `intent_id` the daemon claims by identity.
+    SendNow(&'a str),
     /// CAD-979: `POST /api/social-media-imports` → `social_publish_media_import`.
     MediaImport,
 }
@@ -46,9 +51,11 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         if !segment(id) {
             return None;
         }
-        // Dispatch stays off-board: claim-due/reconcile/report 404 here.
+        // Dispatch stays off-board except the operator's own send-now:
+        // claim-due/reconcile/report 404 here.
         return match verb {
             "cancel" => Some(Route::Cancel(id)),
+            "send-now" => Some(Route::SendNow(id)),
             _ => None,
         };
     }
@@ -139,6 +146,11 @@ struct Cancel {
     )]
     context_id: Option<String>,
 }
+
+/// CAD-1041: send-now carries no body fields — the path id names the intent.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Empty {}
 
 fn query(request: &Request) -> Result<Value, HttpResp> {
     let raw = request
@@ -272,6 +284,20 @@ pub(super) fn handle(
             params["intent_id"] = json!(id);
             ("social_publish_cancel", params)
         }
+        Route::SendNow(id) => {
+            let bytes = match read_body(request, BODY_CAP) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            if let Err(response) = parse_json::<Empty>(&bytes) {
+                return response;
+            }
+            // The relay passes only the path id — the RPC gate is the
+            // same `operator_connection` the daemon applies, so the
+            // board is exactly as strict as the RPC (an agent or
+            // detached peer's write never reaches it).
+            ("social_publish_send_now", json!({"intent_id": id}))
+        }
         Route::MediaImport => {
             let bytes = match read_body(request, BODY_CAP) {
                 Ok(bytes) => bytes,
@@ -311,6 +337,12 @@ mod tests {
         assert!(matches!(
             route("/api/social-publishes/intent-a/cancel"),
             Some(Route::Cancel("intent-a"))
+        ));
+        // CAD-1041: send-now routes exactly; a forged or second verb
+        // segment still 404s.
+        assert!(matches!(
+            route("/api/social-publishes/intent-a/send-now"),
+            Some(Route::SendNow("intent-a"))
         ));
         for path in [
             "/api/social-publishes/claim-due",

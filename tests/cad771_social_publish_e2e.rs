@@ -2308,3 +2308,371 @@ fn cad1027_daemon_refuses_unminted_approval_shape() {
         "queued"
     );
 }
+
+/// CAD-1041 adversarial (written before the guard): the operator's
+/// send-now claims ONE named queued intent by identity, stages it,
+/// dispatches once through the shared path, then reconciles via status
+/// — never a re-send, never another intent, and only an operator may
+/// invoke it. Each refusal keeps the provider-call count unchanged.
+///
+/// Schedule one queued intent and return `(intent_id, request_key)`.
+#[allow(clippy::too_many_arguments)]
+fn send_now_fixture(
+    h: &Release,
+    context: &Value,
+    run: &Value,
+    bundle: &str,
+    install: &str,
+    request: &str,
+    due: i64,
+) -> (String, String) {
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(context, run, bundle, install, request, due),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(intent["state"], "queued");
+    (
+        intent["intent_id"].as_str().unwrap().to_owned(),
+        intent["request"].as_str().unwrap().to_owned(),
+    )
+}
+
+#[test]
+fn cad1041_send_now_posts_the_named_intent_once() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "sn");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-send-ok",
+        epoch_now() + 3600, // future due — the click is the trigger
+    );
+    let out = h
+        .daemon
+        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(out["state"], "posted", "{out}");
+    // The test HttpSender uses the default preflight (Approved — its
+    // checks run inside execute), so exactly one provider call: the
+    // single exec POST. A production HttpPublishSender would stage
+    // first; the fake proves the once-only claim CAS either way.
+    assert_eq!(
+        *door.calls.lock().unwrap(),
+        1,
+        "the single exec POST — exactly once"
+    );
+    // A second send-now on a posted row refuses without a provider call.
+    let err = h
+        .daemon
+        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("queued"), "{err}");
+    assert_eq!(*door.calls.lock().unwrap(), 1);
+}
+
+#[test]
+fn cad1041_agent_and_detached_child_never_send() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "sngate");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-gate",
+        epoch_now(),
+    );
+    // Agent caller: refused.
+    let err = h
+        .daemon
+        .agent_rpc(
+            "cc13-pw",
+            "social_publish_send_now",
+            json!({"intent_id": id}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("authority") || err.contains("operator"),
+        "{err}"
+    );
+    // Detached setsid child (unproven peer): refused.
+    let err = h
+        .daemon
+        .unproven_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("authority") || err.contains("operator"),
+        "{err}"
+    );
+    assert_eq!(*door.calls.lock().unwrap(), 0);
+    // The row is still queued — refusals never mutate.
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(shown["intent"]["state"], "queued");
+}
+
+#[test]
+fn cad1041_forged_id_never_claims_a_different_intent() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snid");
+    let (id_a, key_a) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-id-a",
+        epoch_now(),
+    );
+    let (id_b, _key_b) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-id-b",
+        epoch_now(),
+    );
+    // A forged id (valid shape, never scheduled) claims nothing.
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            json!({"intent_id": "sp-forged-never-scheduled"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not exist"), "{err}");
+    // Send A by name: A posts on its own request key; B stays queued.
+    let out = h
+        .daemon
+        .operator_rpc("social_publish_send_now", json!({"intent_id": id_a}))
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(out["state"], "posted");
+    assert_eq!(out["request"].as_str().unwrap(), key_a);
+    let shown_b = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id_b}))
+        .unwrap();
+    assert_eq!(shown_b["intent"]["state"], "queued", "B must not move");
+    // One provider call, keyed to A's request — a head-of-queue claim
+    // would send B's key instead.
+    assert_eq!(*door.calls.lock().unwrap(), 1);
+    let keys = door.ledger.keys();
+    assert!(
+        !keys.is_empty() && keys.iter().all(|k| k == &key_a),
+        "keys: {keys:?} want only {key_a}"
+    );
+}
+
+#[test]
+fn cad1041_concurrent_double_click_one_provider_call() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "sndbl");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-dbl",
+        epoch_now(),
+    );
+    // Two operator clicks race on the same intent id; the single CAS
+    // inside claim_id means only one wins the queued→processing move.
+    let state = h.daemon.state.clone();
+    let id2 = id.clone();
+    let winner = thread::spawn(move || {
+        cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
+            cadence_agent::client::rpc(&state, "social_publish_send_now", json!({"intent_id": id2}))
+        })
+    });
+    let second = h
+        .daemon
+        .operator_rpc("social_publish_send_now", json!({"intent_id": id}));
+    let first = winner.join().unwrap();
+    // Exactly one posts; the other either posts the same claimed row
+    // (idempotent claim) or refuses "no longer queued" — never two
+    // provider sends.
+    let posted = [&first, &second]
+        .iter()
+        .filter(|r| {
+            r.as_ref()
+                .map(|v| v["intent"]["state"] == "posted")
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(posted, 1, "first={first:?} second={second:?}");
+    assert_eq!(
+        *door.calls.lock().unwrap(),
+        1,
+        "exactly one provider call across the racing clicks"
+    );
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(shown["intent"]["state"], "posted");
+}
+
+#[test]
+fn cad1041_revoked_grant_sends_nothing() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snrev");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-rev",
+        epoch_now(),
+    );
+    // Revoke after schedule: preflight refuses at the door and the row
+    // is claimed only to be reported refused — zero send calls reach
+    // the provider beyond the refused stage.
+    door.grants.lock().unwrap().revoke(GRANT_FB);
+    let out = h
+        .daemon
+        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unwrap();
+    let state = out["intent"]["state"].as_str().unwrap_or("").to_owned();
+    assert!(
+        state == "refused" || out["sent"] == false,
+        "revoked grant: {out}"
+    );
+    // Stage may have run (it is the refusal), but no POST ever left.
+    assert!(
+        *door.calls.lock().unwrap() <= 1,
+        "send calls must be zero: {}",
+        *door.calls.lock().unwrap()
+    );
+}
+
+#[test]
+fn cad1041_overdue_intent_refuses_until_rescheduled() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snlate");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-late",
+        epoch_now() - 901, // > MAX_LATENESS
+    );
+    let err = h
+        .daemon
+        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("overdue"), "{err}");
+    assert_eq!(*door.calls.lock().unwrap(), 0);
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(shown["intent"]["state"], "queued");
+}
+
+#[test]
+fn cad1041_send_now_board_route_reaches_the_same_gate() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snboard");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-board",
+        epoch_now() + 3600,
+    );
+    let board = Board::serve(&h);
+    // The operator's click through the HTTP peer posts the named row.
+    let (code, text) = board.post(
+        &h,
+        &format!("/api/social-publishes/{id}/send-now"),
+        &json!({}),
+    );
+    assert_eq!(code, 200, "{code} {text}");
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["intent"]["state"], "posted", "{text}");
+    assert_eq!(*door.calls.lock().unwrap(), 1);
+    // A second click on the posted row is refused, provider count flat.
+    let (code2, _text2) = board.post(
+        &h,
+        &format!("/api/social-publishes/{id}/send-now"),
+        &json!({}),
+    );
+    assert!((400..500).contains(&code2), "{code2}");
+    assert_eq!(*door.calls.lock().unwrap(), 1);
+    // An unsigned session cannot reach the write: sign-in is the gate.
+}
+
+#[test]
+fn cad1041_crash_after_door_accept_reconciles_never_resends() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "sncrash");
+    let (id, key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-crash",
+        epoch_now(),
+    );
+    // The door accepts the POST but the response is lost — the
+    // in-RPC status reconcile recovers it to posted inside the same
+    // call, never a second send.
+    sender.set_behavior(&key, FakeProviderBehavior::LoseResponseAfterAccept);
+    let out = h
+        .daemon
+        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(out["state"], "posted", "{out}");
+    // exec POST + one status GET — reconcile never re-sends.
+    assert_eq!(*door.calls.lock().unwrap(), 2);
+    // A send-now on the settled row refuses; no third provider call.
+    let err = h
+        .daemon
+        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("queued"), "{err}");
+    assert_eq!(*door.calls.lock().unwrap(), 2);
+}

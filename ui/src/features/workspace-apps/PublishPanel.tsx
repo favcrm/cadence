@@ -88,6 +88,10 @@ export default function PublishPanel({
   const [due, setDue] = useState("");
   const [busy, setBusy] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState<string | null>(null);
+  // CAD-1041: send-now is an explicit operator act behind the same
+  // two-press confirmation the cancel flow uses — the first press arms
+  // the intent id, the second sends. One click can never send.
+  const [confirmSend, setConfirmSend] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
   // CAD-1027: the imported, digest-verified media for one draft+channel.
   const [media, setMedia] = useState<{ key: string; digest: string; subject: string } | null>(null);
@@ -251,6 +255,26 @@ export default function PublishPanel({
     }
   };
 
+  const sendNow = async (intentId: string) => {
+    setBusy(true);
+    setActionError(null);
+    try {
+      const reply = await client.sendNow(intentId);
+      setConfirmSend(null);
+      setNotice(
+        reply.intent.state === "posted"
+          ? `Sent ${intentId} — posted.`
+          : `Send-now for ${intentId} left it ${reply.intent.state}.`
+      );
+      statusRef.current?.focus();
+      await refresh();
+    } catch (error) {
+      setActionError(message(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const card = (intent: PublishIntent) => {
     const reading = reconcileReading(intent.state);
     const unconfirmed = showsUncertainReading(intent);
@@ -323,6 +347,38 @@ export default function PublishPanel({
         </p>
       )}
       {reading && <p className="wa-muted">{reading}</p>}
+      {intent.state === "queued" && (
+        <div className="wa-row">
+          {confirmSend === intent.intent_id ? (
+            <>
+              <Button
+                variant="danger"
+                size="sm"
+                loading={busy}
+                disabled={!canWrite}
+                onClick={() => void sendNow(intent.intent_id)}
+              >
+                Confirm send now
+              </Button>
+              <Button
+                size="sm"
+                disabled={busy}
+                onClick={() => setConfirmSend(null)}
+              >
+                Keep queued
+              </Button>
+            </>
+          ) : (
+            <Button
+              size="sm"
+              disabled={!canWrite || busy}
+              onClick={() => setConfirmSend(intent.intent_id)}
+            >
+              Send now
+            </Button>
+          )}
+        </div>
+      )}
       {canCancel(intent.state) && (
         <div className="wa-row">
           {confirmCancel === intent.intent_id ? (

@@ -191,9 +191,10 @@ fn read_row(conn: &Connection, intent_id: &str) -> Result<Value> {
         String,
         Option<String>,
         Option<String>,
+        i64,
     ) = conn
         .query_row(
-            "SELECT intent_id,request,state,frozen,frozen_digest,receipt,upstream FROM social_publish_intents WHERE intent_id=?",
+            "SELECT intent_id,request,state,frozen,frozen_digest,receipt,upstream,due_epoch FROM social_publish_intents WHERE intent_id=?",
             [intent_id],
             |r| {
                 Ok((
@@ -204,6 +205,7 @@ fn read_row(conn: &Connection, intent_id: &str) -> Result<Value> {
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
+                    r.get(7)?,
                 ))
             },
         )
@@ -212,7 +214,7 @@ fn read_row(conn: &Connection, intent_id: &str) -> Result<Value> {
     let frozen: Value = serde_json::from_str(&row.3)?;
     let receipt = parse_json_cell(row.5, "receipt")?;
     let upstream = parse_json_cell(row.6, "upstream evidence")?;
-    Ok(envelope(
+    let mut env = envelope(
         &row.0,
         &row.1,
         &row.2,
@@ -220,7 +222,13 @@ fn read_row(conn: &Connection, intent_id: &str) -> Result<Value> {
         &row.4,
         receipt.as_ref(),
         upstream.as_ref(),
-    ))
+    );
+    // The `due_epoch` COLUMN is the scheduled-time source of truth the
+    // claim SQL selects on; the send-now lateness check reads it so a
+    // forged column can never hide behind the still-frozen
+    // `frozen.due_epoch`.
+    env["intent"]["due_epoch"] = json!(row.7);
+    Ok(env)
 }
 
 impl Store {
@@ -425,7 +433,7 @@ impl Store {
         eligible: F,
     ) -> Result<Option<Value>>
     where
-        F: FnOnce(&Connection, &Value) -> Result<bool>,
+        F: FnOnce(&Connection, &str, &Value) -> Result<bool>,
     {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
@@ -445,7 +453,11 @@ impl Store {
             |r| r.get(0),
         )?;
         let frozen: Value = serde_json::from_str(&frozen_text)?;
-        if !eligible(&tx, &frozen)? {
+        // The candidate intent_id passes too: a caller that peeked one
+        // id can pin its claim to that exact row — a queue-head move
+        // between peek and claim is a no-claim, never a send of an
+        // intent the caller never inspected.
+        if !eligible(&tx, &id, &frozen)? {
             tx.commit()?;
             return Ok(None);
         }
@@ -461,6 +473,62 @@ impl Store {
             json!({"intent_id":id}),
         )?;
         let result = read_row(&tx, &id)?;
+        tx.commit()?;
+        Ok(Some(result))
+    }
+
+    /// CAD-1041: atomically claim one NAMED queued intent — the
+    /// operator's send-now. Unlike `claim_due` there is no due_epoch
+    /// filter: the operator's explicit click IS the dispatch trigger,
+    /// so an intent not yet due sends all the same (the lateness bound
+    /// runs earlier and refuses only the over-stale). The candidate is
+    /// the named row or nothing — the eligible callback still receives
+    /// (conn, candidate id, frozen) and the same single CAS transition
+    /// guards the claim: exactly one claimant wins, a second click or a
+    /// racing `claim_due` reads `state='processing'` and yields `None`.
+    pub(crate) fn social_publish_claim_id<F>(
+        &self,
+        intent_id: &str,
+        eligible: F,
+    ) -> Result<Option<Value>>
+    where
+        F: FnOnce(&Connection, &str, &Value) -> Result<bool>,
+    {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM social_publish_intents WHERE intent_id=?",
+                [intent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if state.as_deref() != Some("queued") {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let frozen_text: String = tx.query_row(
+            "SELECT frozen FROM social_publish_intents WHERE intent_id=?",
+            [intent_id],
+            |r| r.get(0),
+        )?;
+        let frozen: Value = serde_json::from_str(&frozen_text)?;
+        if !eligible(&tx, intent_id, &frozen)? {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let changed = tx.execute("UPDATE social_publish_intents SET state='processing',updated=? WHERE intent_id=? AND state='queued'",params![now(),intent_id])?;
+        if changed != 1 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        Self::event(
+            &tx,
+            platform::PLATFORM_STREAM,
+            SOCIAL_PUBLISH_CLAIMED_EVENT,
+            json!({"intent_id":intent_id}),
+        )?;
+        let result = read_row(&tx, intent_id)?;
         tx.commit()?;
         Ok(Some(result))
     }

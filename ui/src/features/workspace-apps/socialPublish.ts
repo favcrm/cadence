@@ -197,6 +197,8 @@ const paths = {
   cancel: (intentId: string) =>
     `/api/social-publishes/${encodeURIComponent(intentId)}/cancel`,
   importMedia: () => "/api/social-media-imports",
+  sendNow: (intentId: string) =>
+    `/api/social-publishes/${encodeURIComponent(intentId)}/send-now`,
 };
 
 /** CAD-979 media import body: the approved run's provenance + scope only —
@@ -290,6 +292,14 @@ export const socialPublish = {
   cancel: async (intentId: string, installId: string, contextId: string | null) => {
     const body = { install_id: installId, ...(contextId ? { context_id: contextId } : {}) };
     const reply = await request<{ intent: BackendIntent }>(paths.cancel(intentId), undefined, body, CANCEL_KEYS);
+    return { intent: toPublishIntent(reply.intent) };
+  },
+  /** CAD-1041: the operator's explicit "send this queued intent now".
+   *  The daemon claims the named row by identity, stages it, dispatches
+   *  once and reconciles through status — one click, one provider call,
+   *  never another intent. A refused call leaves the row for a human. */
+  sendNow: async (intentId: string) => {
+    const reply = await request<{ intent: BackendIntent }>(paths.sendNow(intentId), undefined, {});
     return { intent: toPublishIntent(reply.intent) };
   },
 };
