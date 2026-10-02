@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 use super::{now, take_bytes, Store};
 use crate::error::{Error, Result};
+use super::StoreConn;
 
 pub const ROLE_OPERATOR: &str = "operator";
 pub const ROLE_AGENT: &str = "agent";
@@ -369,7 +370,7 @@ impl Store {
 
     /// [`Self::ensure_thread`] inside the caller's transaction; the
     /// caller has already proved the agent exists.
-    fn ensure_thread_in(tx: &dyn super::StoreConn, alias: &str) -> Result<Thread> {
+    fn ensure_thread_in(tx: &impl super::StoreConn, alias: &str) -> Result<Thread> {
         if let Some(thread) = Self::thread_in(tx, alias)? {
             return Ok(thread);
         }
@@ -393,7 +394,7 @@ impl Store {
     /// id; the alias moves to `archived_alias` and a `system` entry marks
     /// the removal. A later registration under the alias gets a new
     /// thread.
-    pub(super) fn thread_detach_in(tx: &dyn super::StoreConn, alias: &str) -> Result<()> {
+    pub(super) fn thread_detach_in(tx: &impl super::StoreConn, alias: &str) -> Result<()> {
         let Some(thread) = Self::thread_in(tx, alias)? else {
             return Ok(());
         };
@@ -425,7 +426,7 @@ impl Store {
         });
         }
 
-    fn thread_in(conn: &dyn super::StoreConn, alias: &str) -> Result<Option<Thread>> {
+    fn thread_in(conn: &impl super::StoreConn, alias: &str) -> Result<Option<Thread>> {
         Ok(conn
             .query_row("SELECT * FROM threads WHERE alias=?", [alias], row_thread)
             .optional()?)
@@ -521,7 +522,7 @@ impl Store {
     /// The alias's in-flight turn. `submitting` counts: a provider can
     /// persist items before `on_started` marks the message `running`
     /// (Codex emits them right behind the `turn/start` reply).
-    fn running_message_in(tx: &dyn super::StoreConn, alias: &str) -> Result<Option<String>> {
+    fn running_message_in(tx: &impl super::StoreConn, alias: &str) -> Result<Option<String>> {
         Ok(tx
             .query_row(
                 "SELECT id FROM messages WHERE alias=?
@@ -536,7 +537,7 @@ impl Store {
     /// Transactional append — used inside enqueue and finish so an entry
     /// lands with the state change it records, or not at all.
     pub(super) fn thread_append_in(
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         alias: &str,
         entry: NewEntry,
     ) -> Result<Option<i64>> {
@@ -582,7 +583,7 @@ impl Store {
     /// The operator/system entry for a freshly queued message.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn thread_note_enqueued(
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         alias: &str,
         sender: &Sender,
         source: &str,
@@ -605,7 +606,7 @@ impl Store {
     /// The verified App binding the enqueue note for `id` recorded
     /// (CAD-802), `None` when its payload carries none — the stored
     /// side of the retry's content comparison.
-    pub(super) fn entry_app_in(tx: &dyn super::StoreConn, id: &str) -> Result<Option<Value>> {
+    pub(super) fn entry_app_in(tx: &impl super::StoreConn, id: &str) -> Result<Option<Value>> {
         Self::entry_payload_field_in(tx, id, "app")
     }
 
@@ -669,14 +670,14 @@ impl Store {
     /// The refs the enqueue note for `id` recorded (CAD-574), `None`
     /// when its payload carries none — the stored side of the retry's
     /// content comparison.
-    pub(super) fn entry_refs_in(tx: &dyn super::StoreConn, id: &str) -> Result<Option<Value>> {
+    pub(super) fn entry_refs_in(tx: &impl super::StoreConn, id: &str) -> Result<Option<Value>> {
         Self::entry_payload_field_in(tx, id, "refs")
     }
 
     /// One named field of the enqueue note's payload for `id`, `None`
     /// when the payload carries none — the stored side of the retry's
     /// content comparison.
-    fn entry_payload_field_in(tx: &dyn super::StoreConn, id: &str, field: &str) -> Result<Option<Value>> {
+    fn entry_payload_field_in(tx: &impl super::StoreConn, id: &str, field: &str) -> Result<Option<Value>> {
         let first: Option<Option<String>> = tx
             .query_row(
                 "SELECT payload FROM thread_entries WHERE message_id=? \
@@ -698,7 +699,7 @@ impl Store {
     /// carry lands first, as `assistant_text`.
     pub(super) fn thread_note_finished(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         message: &super::Message,
         status: &str,
         result: &Value,

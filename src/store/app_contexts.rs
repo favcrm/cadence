@@ -5,6 +5,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use super::StoreConn;
 
 pub const CONFIG_BYTES: usize = 32 * 1024;
 pub const CONTEXT_LIMIT: i64 = 100;
@@ -70,7 +71,7 @@ pub struct ContextProof {
 }
 
 impl Store {
-    pub(super) fn app_context_show_in(conn: &dyn super::StoreConn, install: &str, id: &str) -> Result<Value> {
+    pub(super) fn app_context_show_in(conn: &impl super::StoreConn, install: &str, id: &str) -> Result<Value> {
         let (revision,state,encoded,digest): (i64,String,String,String) = conn.query_row(
             "SELECT revision,state,config_json,config_digest FROM app_contexts WHERE id=? AND install_id=?",
             params![id,install], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
@@ -139,7 +140,7 @@ impl Store {
         });
         }
     pub(super) fn app_context_proof_current_in(
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         install: &str,
         proof: &ContextProof,
     ) -> Result<()> {
@@ -170,12 +171,11 @@ impl Store {
 
                     let tx = &mut *conn;
                     if let Some(id) = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT id FROM app_contexts WHERE install_id=? AND request_id=?",
                             params![install, request],
                             |r| r.get::<_, String>(0),
-                        )
-                        .optional()?
+                        )?
                     {
                         let existing = Self::app_context_show_in(&tx, install, &id)?;
                         if existing["digest"].as_str() != Some(digest.as_str()) || existing["state"] != "active"

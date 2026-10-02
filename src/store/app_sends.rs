@@ -437,71 +437,69 @@ impl RecordStore {
         context: &str,
         draft: &SendDraft,
     ) -> Result<CampaignSend> {
-        let conn = self.conn();
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+        // `write_tx` holds `BEGIN IMMEDIATE` across the replay check +
+        // insert: a racing prepare blocks on the write lock first, so a
+        // request_id binds exactly one frozen material set.
+        self.write_tx(|tx| {
+            let existing: Option<CampaignSend> = tx
+                .query_opt(
+                    &format!("SELECT {SEND_COLUMNS} FROM app_campaign_sends WHERE context_id=? AND request_id=?"),
+                    params![context, draft.request_id],
+                    row_send,
+                )
                 .map_err(|e| Error::internal(e.to_string()))?;
-        let existing: Option<CampaignSend> = tx
-            .query_row(
-                &format!("SELECT {SEND_COLUMNS} FROM app_campaign_sends WHERE context_id=? AND request_id=?"),
-                params![context, draft.request_id],
-                row_send,
-            )
-            .optional()
-            .map_err(|e| Error::internal(e.to_string()))?;
-        if let Some(stored) = existing {
-            // A replay binds every frozen field, not just the ID.
-            if stored.send_id == draft.send_id
-                && stored.campaign_id == draft.campaign_id
-                && stored.content_revision == draft.content_revision
-                && stored.content_digest == draft.content_digest
-                && stored.audience_freeze_id == draft.audience_freeze_id
-                && stored.audience_digest == draft.audience_digest
-                && stored.connection_id == draft.connection_id
-                && stored.auth_revision == draft.auth_revision
-                && stored.link_revision == draft.link_revision
-                && stored.link_digest == draft.link_digest
-                && stored.max_recipients == draft.max_recipients
-                && stored.send_digest == draft.send_digest
-                && stored.unsubscribe_origin == draft.unsubscribe_origin
-            {
-                tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-                return Ok(stored);
+            if let Some(stored) = existing {
+                // A replay binds every frozen field, not just the ID.
+                if stored.send_id == draft.send_id
+                    && stored.campaign_id == draft.campaign_id
+                    && stored.content_revision == draft.content_revision
+                    && stored.content_digest == draft.content_digest
+                    && stored.audience_freeze_id == draft.audience_freeze_id
+                    && stored.audience_digest == draft.audience_digest
+                    && stored.connection_id == draft.connection_id
+                    && stored.auth_revision == draft.auth_revision
+                    && stored.link_revision == draft.link_revision
+                    && stored.link_digest == draft.link_digest
+                    && stored.max_recipients == draft.max_recipients
+                    && stored.send_digest == draft.send_digest
+                    && stored.unsubscribe_origin == draft.unsubscribe_origin
+                {
+                    return Ok(stored);
+                }
+                return Err(Error::rejected(
+                    "campaign send request ID is already used for different material",
+                ));
             }
-            return Err(Error::rejected(
-                "campaign send request ID is already used for different material",
-            ));
-        }
-        let now = super::now();
-        let changed = tx
-            .execute(
-                "INSERT INTO app_campaign_sends(context_id,send_id,campaign_id,request_id,content_revision,content_digest,audience_freeze_id,audience_digest,connection_id,auth_revision,link_revision,link_digest,max_recipients,send_digest,unsubscribe_origin,state,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'prepared', ?, ?)",
-                params![
-                    context,
-                    draft.send_id,
-                    draft.campaign_id,
-                    draft.request_id,
-                    draft.content_revision,
-                    draft.content_digest,
-                    draft.audience_freeze_id,
-                    draft.audience_digest,
-                    draft.connection_id,
-                    draft.auth_revision,
-                    draft.link_revision,
-                    draft.link_digest,
-                    draft.max_recipients,
-                    draft.send_digest,
-                    draft.unsubscribe_origin,
-                    now,
-                    now
-                ],
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        if changed != 1 {
-            return Err(Error::rejected("campaign send ID is already used"));
-        }
-        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-        drop(conn);
+            let now = super::now();
+            let changed = tx
+                .execute(
+                    "INSERT INTO app_campaign_sends(context_id,send_id,campaign_id,request_id,content_revision,content_digest,audience_freeze_id,audience_digest,connection_id,auth_revision,link_revision,link_digest,max_recipients,send_digest,unsubscribe_origin,state,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'prepared', ?, ?)",
+                    params![
+                        context,
+                        draft.send_id,
+                        draft.campaign_id,
+                        draft.request_id,
+                        draft.content_revision,
+                        draft.content_digest,
+                        draft.audience_freeze_id,
+                        draft.audience_digest,
+                        draft.connection_id,
+                        draft.auth_revision,
+                        draft.link_revision,
+                        draft.link_digest,
+                        draft.max_recipients,
+                        draft.send_digest,
+                        draft.unsubscribe_origin,
+                        now,
+                        now
+                    ],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            if changed != 1 {
+                return Err(Error::rejected("campaign send ID is already used"));
+            }
+            Ok(())
+        })?;
         self.app_campaign_send(context, &draft.send_id)?
             .ok_or_else(|| Error::internal("campaign send vanished after prepare"))
     }
@@ -570,31 +568,28 @@ impl RecordStore {
         send_id: &str,
         deliveries: &[(String, String, String)], // (customer_id, email, idempotency_key)
     ) -> Result<()> {
-        let conn = self.conn();
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+        self.write_tx(|tx| {
+            let now = super::now();
+            let changed = tx
+                .execute(
+                    "UPDATE app_campaign_sends SET state='sending', approved_at=?, updated=? WHERE context_id=? AND send_id=? AND state='prepared'",
+                    params![now, now, context, send_id],
+                )
                 .map_err(|e| Error::internal(e.to_string()))?;
-        let now = super::now();
-        let changed = tx
-            .execute(
-                "UPDATE app_campaign_sends SET state='sending', approved_at=?, updated=? WHERE context_id=? AND send_id=? AND state='prepared'",
-                params![now, now, context, send_id],
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        if changed != 1 {
-            return Err(Error::rejected(
-                "campaign send is not awaiting approval — already decided or unknown",
-            ));
-        }
-        for (customer_id, email, idempotency_key) in deliveries {
-            tx.execute(
-                "INSERT INTO app_campaign_deliveries(context_id,send_id,customer_id,email,idempotency_key,state,attempts,updated) VALUES(?,?,?,?,?, 'queued', 0, ?)",
-                params![context, send_id, customer_id, email, idempotency_key, now],
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        }
-        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-        Ok(())
+            if changed != 1 {
+                return Err(Error::rejected(
+                    "campaign send is not awaiting approval — already decided or unknown",
+                ));
+            }
+            for (customer_id, email, idempotency_key) in deliveries {
+                tx.execute(
+                    "INSERT INTO app_campaign_deliveries(context_id,send_id,customer_id,email,idempotency_key,state,attempts,updated) VALUES(?,?,?,?,?, 'queued', 0, ?)",
+                    params![context, send_id, customer_id, email, idempotency_key, now],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            }
+            Ok(())
+        })
     }
 
     /// Terminal state on the send row: `completed` or `closed` with
@@ -662,18 +657,15 @@ impl RecordStore {
         send_id: &str,
         customer_id: &str,
     ) -> Result<bool> {
-        let conn = self.conn();
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE app_campaign_deliveries SET state='submitting', attempts=attempts+1, updated=? WHERE context_id=? AND send_id=? AND customer_id=? AND state='queued'",
+                    params![super::now(), context, send_id, customer_id],
+                )
                 .map_err(|e| Error::internal(e.to_string()))?;
-        let changed = tx
-            .execute(
-                "UPDATE app_campaign_deliveries SET state='submitting', attempts=attempts+1, updated=? WHERE context_id=? AND send_id=? AND customer_id=? AND state='queued'",
-                params![super::now(), context, send_id, customer_id],
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-        Ok(changed == 1)
+            Ok(changed == 1)
+        })
     }
 
     /// A `submitting` row that did not reach the wire goes back to
@@ -685,13 +677,14 @@ impl RecordStore {
         send_id: &str,
         customer_id: &str,
     ) -> Result<()> {
-        let conn = self.conn();
-        conn.execute(
-            "UPDATE app_campaign_deliveries SET state='queued', updated=? WHERE context_id=? AND send_id=? AND customer_id=? AND state='submitting'",
-            params![super::now(), context, send_id, customer_id],
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
-        Ok(())
+        self.write_tx(|tx| {
+            tx.execute(
+                "UPDATE app_campaign_deliveries SET state='queued', updated=? WHERE context_id=? AND send_id=? AND customer_id=? AND state='submitting'",
+                params![super::now(), context, send_id, customer_id],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+            Ok(())
+        })
     }
 
     /// Terminal/suppression state on one delivery, compare-and-set:
@@ -763,23 +756,20 @@ impl RecordStore {
         resolved_by: &str,
     ) -> Result<()> {
         debug_assert!(matches!(resolution, "accepted" | "failed"));
-        let conn = self.conn();
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE app_campaign_deliveries SET state=?, resolved_by=?, updated=? WHERE context_id=? AND send_id=? AND customer_id=? AND state='uncertain'",
+                    params![resolution, resolved_by, super::now(), context, send_id, customer_id],
+                )
                 .map_err(|e| Error::internal(e.to_string()))?;
-        let changed = tx
-            .execute(
-                "UPDATE app_campaign_deliveries SET state=?, resolved_by=?, updated=? WHERE context_id=? AND send_id=? AND customer_id=? AND state='uncertain'",
-                params![resolution, resolved_by, super::now(), context, send_id, customer_id],
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        if changed != 1 {
-            return Err(Error::rejected(
-                "only an uncertain delivery can be resolved",
-            ));
-        }
-        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-        Ok(())
+            if changed != 1 {
+                return Err(Error::rejected(
+                    "only an uncertain delivery can be resolved",
+                ));
+            }
+            Ok(())
+        })
     }
 
     /// Crash sweep inside one record file: every `submitting` row of
@@ -790,13 +780,13 @@ impl RecordStore {
         context: &str,
         send_id: &str,
     ) -> Result<u64> {
-        let conn = self.conn();
-        let changed = conn
-            .execute(
+        let changed = self.write_tx(|tx| {
+            tx.execute(
                 "UPDATE app_campaign_deliveries SET state='uncertain', reason='daemon restarted mid-submission', updated=? WHERE context_id=? AND send_id=? AND state='submitting'",
                 params![super::now(), context, send_id],
             )
-            .map_err(|e| Error::internal(e.to_string()))?;
+            .map_err(|e| Error::internal(e.to_string()))
+        })?;
         Ok(changed as u64)
     }
 

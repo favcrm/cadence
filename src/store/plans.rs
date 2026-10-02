@@ -11,6 +11,7 @@ use super::agents::Agent;
 use super::kickoff::{check_commit_sha, criteria_too_long, flatten_controls, kickoff_body};
 use super::messages::{row_message, Message, Priority};
 use super::{is_task_terminal, is_terminal, now, take_bytes, Sender, Store};
+use super::StoreConn;
 
 /// The `jobs.state` vocabulary for `job list --state`.
 pub const JOB_STATES: &[&str] = &["draft", "open", "done", "failed", "cancelled"];
@@ -194,7 +195,7 @@ impl Verdict {
 }
 
 impl Store {
-    pub(super) fn job_in(&self, conn: &dyn super::StoreConn, id: &str) -> Result<Job> {
+    pub(super) fn job_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<Job> {
         conn.query_row("SELECT * FROM jobs WHERE id=?", [id], row_job)
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
@@ -204,7 +205,7 @@ impl Store {
             })
     }
 
-    pub(super) fn task_in(&self, conn: &dyn super::StoreConn, id: &str) -> Result<Task> {
+    pub(super) fn task_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<Task> {
         conn.query_row("SELECT * FROM tasks WHERE id=?", [id], row_task)
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
@@ -563,7 +564,7 @@ impl Store {
         });
         }
 
-    fn task_opt_in(&self, conn: &dyn super::StoreConn, id: &str) -> Result<bool> {
+    fn task_opt_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<bool> {
         Ok(conn
             .query_row("SELECT 1 FROM tasks WHERE id=?", [id], |_| Ok(()))
             .is_ok())
@@ -1048,7 +1049,7 @@ impl Store {
         });
         }
 
-    fn cancel_task_tx(&self, tx: &dyn super::StoreConn, task: &Task, by: &str) -> Result<()> {
+    fn cancel_task_tx(&self, tx: &impl super::StoreConn, task: &Task, by: &str) -> Result<()> {
         if let Some(kickoff) = &task.dispatch_message {
             tx.execute(
                 "UPDATE messages SET state='cancelled',completed=?
@@ -1197,7 +1198,7 @@ impl Store {
         });
         }
 
-    fn verdict_in(&self, conn: &dyn super::StoreConn, seq: i64) -> Result<Verdict> {
+    fn verdict_in(&self, conn: &impl super::StoreConn, seq: i64) -> Result<Verdict> {
         conn.query_row("SELECT * FROM verdicts WHERE seq=?", [seq], row_verdict)
             .map_err(Into::into)
     }

@@ -2,6 +2,7 @@
 use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
+use super::StoreConn;
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS app_capability_results(
@@ -26,7 +27,7 @@ pub const ASSET_BYTES: usize = 2 * 1024 * 1024;
 /// Return the exact immutable asset and its complete provider receipt. This
 /// works inside a finishing/release SQL transaction, so neither review nor
 /// release can observe a different row between the proof and byte read.
-pub(crate) fn asset_material_in(conn: &dyn super::StoreConn, id: &str) -> Result<(Value, Vec<u8>)> {
+pub(crate) fn asset_material_in(conn: &impl super::StoreConn, id: &str) -> Result<(Value, Vec<u8>)> {
     let row = conn
         .query_row(
             "SELECT run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,
@@ -345,11 +346,11 @@ impl Store {
                             "app capability result has no matching pre-call claim",
                         ));
                     }
-                    let existing = tx.query_row(
+                    let existing = tx.query_opt(
                         "SELECT id,step_id,request_id,binding_digest,input_digest FROM app_capability_results WHERE run_id=? AND slot=?",
                         params![run,slot],
                         |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)),
-                    ).optional()?;
+                    )?;
                     if let Some((
                         existing_id,
                         existing_step,
@@ -473,7 +474,7 @@ impl Store {
 /// caller must still verify the current installation/context and binding in
 /// the run-creation transaction before freezing a selected post.
 pub(super) fn source_receipt_recoverable_in(
-    conn: &dyn super::StoreConn,
+    conn: &impl super::StoreConn,
     run: &Value,
     receipt: &Value,
 ) -> Result<()> {

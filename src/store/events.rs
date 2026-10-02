@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use super::{now, Store};
+use super::StoreConn;
 
 /// Operator approval evidence (CAD-217) rides its own event stream.
 /// The name is not a valid agent identifier (it holds a `:`), so no
@@ -119,7 +120,7 @@ pub(crate) struct EventStoreStats {
 
 /// Read-only counts for doctor over an already-open connection.
 pub(crate) fn event_store_stats(
-    conn: &dyn super::StoreConn,
+    conn: &impl super::StoreConn,
     cutoff: f64,
 ) -> rusqlite::Result<EventStoreStats> {
     let events = conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
@@ -248,7 +249,7 @@ impl Store {
     /// inside `BEGIN IMMEDIATE`, or an owner `Connection`/`Transaction`),
     /// never a raw unguarded producer connection.
     pub(super) fn event(
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         alias: &str,
         kind: &str,
         payload: Value,
@@ -260,7 +261,7 @@ impl Store {
     /// was caused by — the `job events` view is one indexed query
     /// across these rows.
     pub(super) fn event_scoped(
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         alias: &str,
         kind: &str,
         payload: Value,
@@ -275,14 +276,14 @@ impl Store {
     /// inside a transaction can classify a BUSY-family failure instead
     /// of losing the code to the crate error's flattening.
     pub(super) fn event_scoped_raw(
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         alias: &str,
         kind: &str,
         payload: &Value,
         job_id: Option<&str>,
         task_id: Option<&str>,
     ) -> rusqlite::Result<()> {
-        tx.sql_execute(
+        tx.execute(
             "INSERT INTO events(alias,kind,payload,job_id,task_id,at)
              VALUES(?,?,?,?,?,?)",
             params![alias, kind, payload.to_string(), job_id, task_id, now()],
@@ -343,13 +344,12 @@ impl Store {
                     for batch in rows.chunk_by(|a, b| a.1 == b.1) {
                         let alias = &batch[0].1;
                         let existing: Option<(i64, String)> = tx
-                            .query_row(
+                            .query_opt(
                                 "SELECT seq, payload FROM events WHERE alias=?1 AND kind=?2 \
                                  ORDER BY seq LIMIT 1",
                                 params![alias, DELIVERY_ROLLUP_EVENT],
                                 |r| Ok((r.get(0)?, r.get(1)?)),
-                            )
-                            .optional()?;
+                            )?;
                         let mut summary = match &existing {
                             Some((_, payload)) => serde_json::from_str::<Value>(payload).map_err(|e| {
                                 Error::internal(format!("{DELIVERY_ROLLUP_EVENT} payload: {e}"))
@@ -585,12 +585,13 @@ impl Store {
     /// The first approval event of `kind` naming approval `id` on
     /// [`APPROVAL_STREAM`]. The stream is not a mailbox, so deleting or
     /// cancelling a message can neither remove nor revoke an approval.
-    fn approval_event(conn: &dyn super::StoreConn, kind: &str, id: &str) -> Result<Option<Value>> {
-        let mut stmt =
-            conn.prepare("SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq")?;
-        let mut rows = stmt.query(params![APPROVAL_STREAM, kind])?;
-        while let Some(row) = rows.next()? {
-            let raw: String = row.get(0)?;
+    fn approval_event(conn: &impl super::StoreConn, kind: &str, id: &str) -> Result<Option<Value>> {
+        let raws: Vec<String> = conn.query_vec(
+            "SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq",
+            params![APPROVAL_STREAM, kind],
+            |r| r.get::<_, String>(0),
+        )?;
+        for raw in raws {
             let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
                 continue;
             };
@@ -675,13 +676,12 @@ impl Store {
         }
 
     /// Every approval-stream event, oldest first: `(kind, payload, at)`.
-    fn approval_stream(conn: &dyn super::StoreConn) -> Result<Vec<(String, Value, f64)>> {
-        let mut stmt =
-            conn.prepare("SELECT kind, payload, at FROM events WHERE alias=? ORDER BY seq")?;
-        let rows = stmt.query_map(params![APPROVAL_STREAM], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?))
-        })?;
-        let rows = rows.collect::<rusqlite::Result<Vec<(String, String, f64)>>>()?;
+    fn approval_stream(conn: &impl super::StoreConn) -> Result<Vec<(String, Value, f64)>> {
+        let rows: Vec<(String, String, f64)> = conn.query_vec(
+            "SELECT kind, payload, at FROM events WHERE alias=? ORDER BY seq",
+            params![APPROVAL_STREAM],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?)),
+        )?;
         let parse =
             |(k, raw, at): (String, String, f64)| Some((k, serde_json::from_str(&raw).ok()?, at));
         Ok(rows.into_iter().filter_map(parse).collect())
@@ -690,7 +690,7 @@ impl Store {
     /// Append an approval record whose id is `base`, or the first free
     /// `<base>-<n>`: ids are never reused.
     fn append_approval(
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         stream: &[(String, Value, f64)],
         base: &str,
         mut payload: Value,
@@ -888,7 +888,7 @@ impl Store {
         Self::designations_in(&self.conn())
     }
 
-    fn designations_in(conn: &dyn super::StoreConn) -> Result<Vec<Value>> {
+    fn designations_in(conn: &impl super::StoreConn) -> Result<Vec<Value>> {
         let mut latest: std::collections::BTreeMap<(String, String), Value> = Default::default();
         for (k, p, at) in Self::approval_stream(conn)? {
             if k != DESIGNATION_EVENT || p["recorded_via"] != "operator-connection" {
@@ -1001,7 +1001,7 @@ impl Store {
     /// accepts it; sends still require a registered alias.
     pub const DAEMON_STREAM: &str = "daemon";
 
-    fn events_alias_in(&self, conn: &dyn super::StoreConn, alias: &str) -> Result<()> {
+    fn events_alias_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<()> {
         if alias == Self::DAEMON_STREAM {
             return Ok(());
         }

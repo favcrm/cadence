@@ -15,6 +15,7 @@ use crate::proto::identifier;
 
 use super::events::{APPROVAL_STREAM, APP_APPROVED_EVENT};
 use super::{now, Store};
+use super::StoreConn;
 
 /// The platform custody audit stream (§5.5). Like `audit:approvals`
 /// the name is no valid agent identifier (it holds a `:`), so no
@@ -263,7 +264,7 @@ fn subtract_derived(
 /// The latest `app_approved` payload for `app` (`"<project>/<name>"`),
 /// read on the caller's transaction so a revoke that committed under
 /// the same write lock is visible (CAD-577 review 344, note 3).
-fn latest_app_approval(tx: &dyn super::StoreConn, app: &str) -> Result<Option<Value>> {
+fn latest_app_approval(tx: &impl super::StoreConn, app: &str) -> Result<Option<Value>> {
     let Some((project, name)) = app.split_once('/') else {
         return Ok(None);
     };
@@ -500,12 +501,11 @@ impl Store {
     ) -> Result<Option<CredentialRecord>> {
         return self.write_tx(|conn| {
 
-                    conn.query_row(
+                    conn.query_opt(
                         "SELECT * FROM platform_credentials WHERE platform=?1 AND account=?2",
                         params![platform, account],
                         credential_row,
                     )
-                    .optional()
                     .map_err(Into::into)
         });
         }
@@ -552,13 +552,12 @@ impl Store {
 
                     let tx = &mut *conn;
                     let existing: Option<(String, String, u64)> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT fingerprint,connection_id,credential_revision FROM platform_credentials \
                              WHERE platform=?1 AND account=?2",
                             params![record.platform, record.account],
                             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                        )
-                        .optional()?;
+                        )?;
                     match (existing, rotated) {
                         (Some(_), false) => {
                             return Err(Error::rejected(format!(
@@ -654,12 +653,11 @@ impl Store {
 
                     let tx = &mut *conn;
                     let record: Option<CredentialRecord> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT * FROM platform_credentials WHERE platform=?1 AND account=?2",
                             params![platform, account],
                             credential_row,
-                        )
-                        .optional()?;
+                        )?;
                     let Some(record) = record else {
                         return Ok(None);
                     };
@@ -726,12 +724,11 @@ impl Store {
     ) -> Result<Option<Grant>> {
         return self.write_tx(|conn| {
 
-                    conn.query_row(
+                    conn.query_opt(
                         "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
                         params![agent, platform, account],
                         grant_row,
                     )
-                    .optional()
                     .map_err(Into::into)
         });
         }
@@ -784,12 +781,11 @@ impl Store {
                     // `local/local` account is the exception (CAD-577): it is always
                     // available with no enrollment, so a grant on it is recordable.
                     let enrolled: Option<i64> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT 1 FROM platform_credentials WHERE platform=?1 AND account=?2",
                             params![platform, account],
                             |r| r.get(0),
-                        )
-                        .optional()?;
+                        )?;
                     if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
                         return Err(Error::rejected(format!(
                             "platform '{platform}' account '{account}' is not enrolled — \
@@ -797,12 +793,11 @@ impl Store {
                         )));
                     }
                     let existing: Option<Grant> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
                             params![agent, platform, account],
                             grant_row,
-                        )
-                        .optional()?;
+                        )?;
                     let merged: Vec<String> = match &existing {
                         Some(g) => {
                             let mut all = g.scopes.clone();
@@ -877,12 +872,11 @@ impl Store {
 
                     let tx = &mut *conn;
                     let existing: Option<Grant> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
                             params![agent, platform, account],
                             grant_row,
-                        )
-                        .optional()?;
+                        )?;
                     let Some(grant) = existing else {
                         return Ok((false, None));
                     };
@@ -943,12 +937,11 @@ impl Store {
 
                     let tx = &mut *conn;
                     let enrolled: Option<i64> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT 1 FROM platform_credentials WHERE platform=?1 AND account=?2",
                             params![platform, account],
                             |r| r.get(0),
-                        )
-                        .optional()?;
+                        )?;
                     if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
                         return Err(Error::rejected(format!(
                             "platform '{platform}' account '{account}' is not enrolled — \
@@ -985,7 +978,7 @@ impl Store {
     ) -> Result<Option<ProjectDefault>> {
         return self.write_tx(|conn| {
 
-                    conn.query_row(
+                    conn.query_opt(
                         "SELECT * FROM platform_defaults WHERE project=?1 AND platform=?2",
                         params![project, platform],
                         |row| {
@@ -998,7 +991,6 @@ impl Store {
                             })
                         },
                     )
-                    .optional()
                     .map_err(Into::into)
         });
         }

@@ -11,6 +11,7 @@ use super::messages::{row_message, Message};
 use super::quota::{canonical_quota, merge_quota_json, quota_now_iso};
 use super::schema::AdoptEntry;
 use super::{now, Store};
+use super::StoreConn;
 
 /// The agent-state vocabulary — the `agents.state` column values —
 /// for `agent list --state` (CAD-437). `attention` is a fence, `error`
@@ -285,18 +286,18 @@ impl Store {
                 ));
             }
         }
-        let mut conn = self.write_conn()?;
-        // IMMEDIATE so a concurrent register waits, then observes the
-        // committed alias, instead of resolving against a stale snapshot
-        // and returning `params_too_large`.
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // `write_tx` already holds `BEGIN IMMEDIATE`, so a concurrent
+        // register waits, then observes the committed alias, instead of
+        // resolving against a stale snapshot and returning
+        // `params_too_large`.
+        return self.write_tx(|tx| {
         // A relaunch of a saved alias must keep that row. Resolving the
         // current defaults first can reject a previously valid near-cap
         // params blob with `params_too_large` and hide the duplicate.
-        if Self::agent_alias_exists(&tx, new.alias)? {
-            return Err(Self::duplicate_alias());
-        }
-        let defaults = Self::read_model_defaults_tx(&tx)?;
+            if Self::agent_alias_exists(&*tx, new.alias)? {
+                return Err(Self::duplicate_alias());
+            }
+            let defaults = Self::read_model_defaults_tx(&*tx)?;
         let resolved = match crate::model_defaults::resolve(crate::model_defaults::ResolveRequest {
             provider: new.provider,
             endpoint_kind: new.endpoint_kind,
@@ -308,26 +309,26 @@ impl Store {
             revision: defaults.revision,
         }) {
             Ok(resolved) => resolved,
-            Err(err) => {
-                if Self::agent_alias_exists(&tx, new.alias)? {
-                    return Err(Self::duplicate_alias());
+                Err(err) => {
+                    if Self::agent_alias_exists(&*tx, new.alias)? {
+                        return Err(Self::duplicate_alias());
+                    }
+                    return Err(err);
                 }
-                return Err(err);
-            }
-        };
-        let selection = resolved.model_selection.as_ref().map(Value::to_string);
+            };
+            let selection = resolved.model_selection.as_ref().map(Value::to_string);
         let merged_params = match resolved.params.as_deref() {
             Some(raw) => serde_json::from_str(raw)?,
             None => json!({}),
         };
-        if let Err(err) =
-            registry::validate_launch_params(new.provider, new.endpoint_kind, &merged_params)
-        {
-            if Self::agent_alias_exists(&tx, new.alias)? {
-                return Err(Self::duplicate_alias());
+            if let Err(err) =
+                registry::validate_launch_params(new.provider, new.endpoint_kind, &merged_params)
+            {
+                if Self::agent_alias_exists(&*tx, new.alias)? {
+                    return Err(Self::duplicate_alias());
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
         // Inbox agents are durable mailboxes, not processes: they
         // register directly into `idle` with a stable pseudo-endpoint
         // (so `dead` reads false) and never spawn an actor.
@@ -336,37 +337,37 @@ impl Store {
         } else {
             ("starting", None)
         };
-        tx.execute(
-            "INSERT INTO agents(alias,provider,endpoint_kind,role,team_role,cwd,sandbox,
+            tx.execute(
+                "INSERT INTO agents(alias,provider,endpoint_kind,role,team_role,cwd,sandbox,
                                instructions,params,model_selection,state,endpoint,created,updated)
              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![
+                params![
+                    new.alias,
+                    new.provider,
+                    new.endpoint_kind,
+                    new.role,
+                    resolved.team_role,
+                    new.cwd,
+                    new.sandbox,
+                    new.instructions,
+                    resolved.params,
+                    selection,
+                    state,
+                    endpoint,
+                    now(),
+                    now()
+                ],
+            )?;
+            Self::event(
+                &*tx,
                 new.alias,
-                new.provider,
-                new.endpoint_kind,
-                new.role,
-                resolved.team_role,
-                new.cwd,
-                new.sandbox,
-                new.instructions,
-                resolved.params,
-                selection,
-                state,
-                endpoint,
-                now(),
-                now()
-            ],
-        )?;
-        Self::event(
-            &tx,
-            new.alias,
-            "registered",
-            json!({"provider": new.provider,
+                "registered",
+                json!({"provider": new.provider,
                    "endpoint_kind": new.endpoint_kind, "role": new.role,
                    "team_role": resolved.team_role}),
-        )?;
-        tx.commit()?;
-        Ok(())
+            )?;
+            Ok(())
+        })
     }
 
     /// Same text `INSERT` raises for `agents.alias`, including the `sqlite:`
@@ -376,7 +377,7 @@ impl Store {
         Error::Internal("sqlite: UNIQUE constraint failed: agents.alias".to_string())
     }
 
-    fn agent_alias_exists(tx: &dyn super::StoreConn, alias: &str) -> Result<bool> {
+    fn agent_alias_exists(tx: &impl super::StoreConn, alias: &str) -> Result<bool> {
         match tx.query_row("SELECT 1 FROM agents WHERE alias=?", [alias], |_| Ok(1i32)) {
             Ok(_) => Ok(true),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
@@ -384,7 +385,7 @@ impl Store {
         }
     }
 
-    pub(super) fn agent_in(&self, conn: &dyn super::StoreConn, alias: &str) -> Result<Agent> {
+    pub(super) fn agent_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<Agent> {
         conn.query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent)
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Error::rejected("Unknown managed agent"),
@@ -879,7 +880,7 @@ impl Store {
         });
         }
 
-    fn read_model_defaults_tx(tx: &dyn super::StoreConn) -> Result<ModelDefaultsSnapshot> {
+    fn read_model_defaults_tx(tx: &impl super::StoreConn) -> Result<ModelDefaultsSnapshot> {
         let (revision, document): (i64, String) = tx
             .query_row(
                 "SELECT revision, document FROM model_defaults WHERE id=1",
@@ -1168,7 +1169,7 @@ impl Store {
     /// named as a task's `dispatch_message` or a verdict's `message`,
     /// and job-scoped events. Those stay in place under the old alias so
     /// `job show`/`job events`/`task show` read them unchanged.
-    fn prune_agent_history(tx: &dyn super::StoreConn, alias: &str) -> Result<()> {
+    fn prune_agent_history(tx: &impl super::StoreConn, alias: &str) -> Result<()> {
         tx.execute(
             "DELETE FROM messages WHERE alias=?1 AND task_id IS NULL
              AND id NOT IN (SELECT dispatch_message FROM tasks
@@ -1204,7 +1205,7 @@ impl Store {
         });
         }
 
-    pub(super) fn agent_opt_in(&self, conn: &dyn super::StoreConn, alias: &str) -> Result<Option<Agent>> {
+    pub(super) fn agent_opt_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<Option<Agent>> {
         match conn.query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent) {
             Ok(a) => Ok(Some(a)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1230,8 +1231,7 @@ impl Store {
 
                     let tx = &mut *conn;
                     let Some(agent) = tx
-                        .query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent)
-                        .optional()?
+                        .query_opt("SELECT * FROM agents WHERE alias=?", [alias], row_agent)?
                     else {
                         return Ok(None);
                     };

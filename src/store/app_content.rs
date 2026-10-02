@@ -47,6 +47,7 @@ use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use super::StoreConn;
 
 /// Subject is required, preheader optional; both are plain text.
 pub const SUBJECT_BYTES: usize = 150;
@@ -818,7 +819,7 @@ struct ResolvedBinding {
 impl RecordStore {
     fn content_row(
         &self,
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         context: &str,
         campaign: &str,
     ) -> Result<Option<ContentRow>> {
@@ -882,66 +883,63 @@ impl RecordStore {
         crate::proto::identifier(campaign, "campaign ID")?;
         let blocks_text = serde_json::to_string(&draft.canonical_blocks())
             .map_err(|e| Error::internal(e.to_string()))?;
-        let conn = self.conn();
-        // IMMEDIATE: a racing saver blocks on the write lock first,
-        // so exactly one revision wins and the loser is stale.
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| Error::internal(e.to_string()))?;
-        let current: Option<i64> = tx
-            .query_row(
-                "SELECT revision FROM app_content_docs WHERE context_id=? AND campaign_id=?",
-                params![context, campaign],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let revision = match (current, expected_revision) {
-            (None, None) => 1,
-            (None, Some(_)) => {
-                return Err(Error::rejected(
-                    "email content is unknown; save without an expected revision",
-                ));
-            }
-            (Some(_), None) => {
-                return Err(Error::rejected(
-                    "email content already exists; name the observed revision",
-                ));
-            }
-            (Some(current), Some(expected)) => {
-                if current != expected {
-                    return Err(Error::rejected("email content revision is stale"));
-                }
-                current
-                    .checked_add(1)
-                    .ok_or_else(|| Error::rejected("email content revision exhausted"))?
-            }
-        };
-        let digest = content_digest(self.install(), context, campaign, revision, draft);
-        if current.is_none() {
-            tx.execute(
-                "INSERT INTO app_content_docs(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,actor,created,updated) VALUES(?,?,?,?,?,?,?,NULL,NULL,'operator',?,?)",
-                params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now(), now()],
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        } else {
-            let changed = tx
-                .execute(
-                    "UPDATE app_content_docs SET revision=?,subject=?,preheader=?,blocks=?,content_digest=?,approval_revision=NULL,approval_digest=NULL,actor='operator',updated=? WHERE context_id=? AND campaign_id=? AND revision=?",
-                    params![revision, draft.subject, draft.preheader, blocks_text, digest, now(), context, campaign, current],
+        // `write_tx` holds `BEGIN IMMEDIATE` across the revision check
+        // + writes: a racing saver blocks on the write lock first, so
+        // exactly one revision wins and the loser is stale.
+        self.write_tx(|tx| {
+            let current: Option<i64> = tx
+                .query_opt(
+                    "SELECT revision FROM app_content_docs WHERE context_id=? AND campaign_id=?",
+                    params![context, campaign],
+                    |r| r.get(0),
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
-            if changed != 1 {
-                return Err(Error::rejected("email content revision is stale"));
+            let revision = match (current, expected_revision) {
+                (None, None) => 1,
+                (None, Some(_)) => {
+                    return Err(Error::rejected(
+                        "email content is unknown; save without an expected revision",
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(Error::rejected(
+                        "email content already exists; name the observed revision",
+                    ));
+                }
+                (Some(current), Some(expected)) => {
+                    if current != expected {
+                        return Err(Error::rejected("email content revision is stale"));
+                    }
+                    current
+                        .checked_add(1)
+                        .ok_or_else(|| Error::rejected("email content revision exhausted"))?
+                }
+            };
+            let digest = content_digest(self.install(), context, campaign, revision, draft);
+            if current.is_none() {
+                tx.execute(
+                    "INSERT INTO app_content_docs(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,actor,created,updated) VALUES(?,?,?,?,?,?,?,NULL,NULL,'operator',?,?)",
+                    params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now(), now()],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            } else {
+                let changed = tx
+                    .execute(
+                        "UPDATE app_content_docs SET revision=?,subject=?,preheader=?,blocks=?,content_digest=?,approval_revision=NULL,approval_digest=NULL,actor='operator',updated=? WHERE context_id=? AND campaign_id=? AND revision=?",
+                        params![revision, draft.subject, draft.preheader, blocks_text, digest, now(), context, campaign, current],
+                    )
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                if changed != 1 {
+                    return Err(Error::rejected("email content revision is stale"));
+                }
             }
-        }
-        tx.execute(
-            "INSERT INTO app_content_revisions(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,actor,origin,proposal_id,at) VALUES(?,?,?,?,?,?,?,'operator','operator',NULL,?)",
-            params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now()],
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
-        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-        drop(conn);
+            tx.execute(
+                "INSERT INTO app_content_revisions(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,actor,origin,proposal_id,at) VALUES(?,?,?,?,?,?,?,'operator','operator',NULL,?)",
+                params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now()],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+            Ok(())
+        })?;
         Ok(json!({"content": self.app_content_show(context, campaign)?["content"]}))
     }
 
@@ -984,7 +982,7 @@ impl RecordStore {
 
     fn draft_at(
         &self,
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         context: &str,
         campaign: &str,
         revision: Option<i64>,
@@ -1056,7 +1054,7 @@ impl RecordStore {
     /// name a saved binding in this installation and context.
     fn resolve_binding(
         &self,
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         context: &str,
         binding_id: Option<&str>,
     ) -> Result<ResolvedBinding> {
@@ -1094,7 +1092,7 @@ impl RecordStore {
 
     fn binding_record(
         &self,
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         context: &str,
         binding_id: &str,
     ) -> Result<BindingRecord> {
@@ -1178,66 +1176,63 @@ impl RecordStore {
         if let Some(connection) = draft.connection_id {
             reject_connection_id(connection)?;
         }
-        let conn = self.conn();
-        // IMMEDIATE: a racing saver blocks on the write lock first,
-        // so exactly one revision wins and the loser is stale.
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| Error::internal(e.to_string()))?;
-        let current: Option<i64> = tx
-            .query_row(
-                "SELECT revision FROM app_sender_bindings WHERE context_id=? AND binding_id=?",
-                params![context, binding_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let revision = match (current, expected_revision) {
-            (None, None) => 1,
-            (None, Some(_)) => {
-                return Err(Error::rejected(
-                    "email sender binding is unknown; save without an expected revision",
-                ));
-            }
-            (Some(_), None) => {
-                return Err(Error::rejected(
-                    "email sender binding already exists; name the observed revision",
-                ));
-            }
-            (Some(current), Some(expected)) => {
-                if current != expected {
-                    return Err(Error::rejected("email sender binding revision is stale"));
-                }
-                current
-                    .checked_add(1)
-                    .ok_or_else(|| Error::rejected("email sender binding revision exhausted"))?
-            }
-        };
-        let digest = binding_digest(self.install(), context, binding_id, revision, draft);
-        if current.is_none() {
-            tx.execute(
-                "INSERT INTO app_sender_bindings(context_id,binding_id,revision,sender_name,sender_address,unsubscribe_base,connection_id,binding_digest,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                params![context, binding_id, revision, draft.sender_name, draft.sender_address, draft.unsubscribe_base, draft.connection_id, digest, now(), now()],
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        } else {
-            let changed = tx
-                .execute(
-                    "UPDATE app_sender_bindings SET revision=?,sender_name=?,sender_address=?,unsubscribe_base=?,connection_id=?,binding_digest=?,updated=? WHERE context_id=? AND binding_id=? AND revision=?",
-                    params![revision, draft.sender_name, draft.sender_address, draft.unsubscribe_base, draft.connection_id, digest, now(), context, binding_id, current],
+        // `write_tx` holds `BEGIN IMMEDIATE` across the revision check
+        // + writes: a racing saver blocks on the write lock first, so
+        // exactly one revision wins and the loser is stale.
+        self.write_tx(|tx| {
+            let current: Option<i64> = tx
+                .query_opt(
+                    "SELECT revision FROM app_sender_bindings WHERE context_id=? AND binding_id=?",
+                    params![context, binding_id],
+                    |r| r.get(0),
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
-            if changed != 1 {
-                return Err(Error::rejected("email sender binding revision is stale"));
+            let revision = match (current, expected_revision) {
+                (None, None) => 1,
+                (None, Some(_)) => {
+                    return Err(Error::rejected(
+                        "email sender binding is unknown; save without an expected revision",
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(Error::rejected(
+                        "email sender binding already exists; name the observed revision",
+                    ));
+                }
+                (Some(current), Some(expected)) => {
+                    if current != expected {
+                        return Err(Error::rejected("email sender binding revision is stale"));
+                    }
+                    current
+                        .checked_add(1)
+                        .ok_or_else(|| Error::rejected("email sender binding revision exhausted"))?
+                }
+            };
+            let digest = binding_digest(self.install(), context, binding_id, revision, draft);
+            if current.is_none() {
+                tx.execute(
+                    "INSERT INTO app_sender_bindings(context_id,binding_id,revision,sender_name,sender_address,unsubscribe_base,connection_id,binding_digest,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    params![context, binding_id, revision, draft.sender_name, draft.sender_address, draft.unsubscribe_base, draft.connection_id, digest, now(), now()],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            } else {
+                let changed = tx
+                    .execute(
+                        "UPDATE app_sender_bindings SET revision=?,sender_name=?,sender_address=?,unsubscribe_base=?,connection_id=?,binding_digest=?,updated=? WHERE context_id=? AND binding_id=? AND revision=?",
+                        params![revision, draft.sender_name, draft.sender_address, draft.unsubscribe_base, draft.connection_id, digest, now(), context, binding_id, current],
+                    )
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                if changed != 1 {
+                    return Err(Error::rejected("email sender binding revision is stale"));
+                }
             }
-        }
-        tx.execute(
-            "INSERT INTO app_sender_binding_revisions(context_id,binding_id,revision,sender_name,sender_address,unsubscribe_base,connection_id,binding_digest,actor,at) VALUES(?,?,?,?,?,?,?,?,'operator',?)",
-            params![context, binding_id, revision, draft.sender_name, draft.sender_address, draft.unsubscribe_base, draft.connection_id, digest, now()],
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
-        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-        drop(conn);
+            tx.execute(
+                "INSERT INTO app_sender_binding_revisions(context_id,binding_id,revision,sender_name,sender_address,unsubscribe_base,connection_id,binding_digest,actor,at) VALUES(?,?,?,?,?,?,?,?,'operator',?)",
+                params![context, binding_id, revision, draft.sender_name, draft.sender_address, draft.unsubscribe_base, draft.connection_id, digest, now()],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+            Ok(())
+        })?;
         Ok(json!({"binding": self.app_sender_binding_show(context, binding_id)?["binding"]}))
     }
 
@@ -1410,7 +1405,7 @@ impl RecordStore {
 
     fn proposal_row(
         &self,
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         context: &str,
         proposal_id: &str,
     ) -> Result<ProposalRow> {
@@ -1556,7 +1551,7 @@ impl RecordStore {
 
     fn proposal_request_row(
         &self,
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         context: &str,
         request_id: &str,
     ) -> Result<ProposalRequestRow> {
@@ -1658,47 +1653,45 @@ impl RecordStore {
         let digest = proposal_digest(self.install(), context, campaign, proposal_id, draft);
         let blocks_text = serde_json::to_string(&draft.canonical_blocks())
             .map_err(|e| Error::internal(e.to_string()))?;
-        let conn = self.conn();
-        // IMMEDIATE: concurrent redeemers of one message serialize
-        // on the write lock; the losers meet the spent request, the
-        // per-message claim or the UNIQUE backstop below.
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| Error::internal(e.to_string()))?;
-        let source_revision = tx
-            .query_row(
-                "SELECT revision FROM app_content_docs WHERE context_id=? AND campaign_id=?",
-                params![context, campaign],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|e| Error::internal(e.to_string()))?
-            .unwrap_or(0);
+        // `write_tx` holds `BEGIN IMMEDIATE` across the whole redeem:
+        // concurrent redeemers of one message serialize on the write
+        // lock; the losers meet the spent request, the per-message
+        // claim or the UNIQUE backstop below.
+        self.write_tx(|tx| {
+            let source_revision = tx
+                .query_opt(
+                    "SELECT revision FROM app_content_docs WHERE context_id=? AND campaign_id=?",
+                    params![context, campaign],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?
+                .unwrap_or(0);
         // The stamped request decides scope: unknown requests,
         // requests for another message or campaign, spent requests
         // and requests whose stamped source drifted behind the live
         // draft all refuse — agent text never widens them.
-        let stamped: ProposalRequestRow = tx
-            .query_row(
-                "SELECT campaign_id,source_revision,message_id,state,used_by,created,decided FROM app_content_proposal_requests WHERE context_id=? AND request_id=?",
-                params![context, request_id],
-                |r| {
-                    Ok(ProposalRequestRow {
-                        campaign: r.get(0)?,
-                        source_revision: r.get(1)?,
-                        message: r.get(2)?,
-                        state: r.get(3)?,
-                        used_by: r.get(4)?,
-                        created: r.get(5)?,
-                        decided: r.get(6)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(|e| Error::internal(e.to_string()))?
-            .ok_or_else(|| {
-                Error::rejected("email proposal request is unknown for this installation and context")
-            })?;
+            let stamped: ProposalRequestRow = tx
+                .query_opt(
+                    "SELECT campaign_id,source_revision,message_id,state,used_by,created,decided FROM app_content_proposal_requests WHERE context_id=? AND request_id=?",
+                    params![context, request_id],
+                    |r| {
+                        Ok(ProposalRequestRow {
+                            campaign: r.get(0)?,
+                            source_revision: r.get(1)?,
+                            message: r.get(2)?,
+                            state: r.get(3)?,
+                            used_by: r.get(4)?,
+                            created: r.get(5)?,
+                            decided: r.get(6)?,
+                        })
+                    },
+                )
+                .map_err(|e| Error::internal(e.to_string()))?
+                .ok_or_else(|| {
+                    Error::rejected(
+                        "email proposal request is unknown for this installation and context",
+                    )
+                })?;
         if stamped.message != message {
             return Err(Error::rejected(
                 "email proposal request was stamped for another chat message",
@@ -1727,74 +1720,71 @@ impl RecordStore {
             Option<String>,
             Option<String>,
             Option<String>,
-        )> = tx
-            .query_row(
-                "SELECT campaign_id,source_revision,content_digest,actor,origin,receipt_message,receipt_agent,receipt_request FROM app_content_proposals WHERE context_id=? AND proposal_id=?",
-                params![context, proposal_id],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| Error::internal(e.to_string()))?;
-        if let Some(stored) = existing {
-            if stored.0 == campaign
-                && stored.1 == source_revision
-                && stored.2 == digest
-                && stored.3 == "assistant"
-                && stored.4 == "assistant-receipt"
-                && stored.5.as_deref() == Some(message)
-                && stored.6.as_deref() == Some(agent)
-                && stored.7.as_deref() == Some(request_id)
-            {
-                drop(tx);
-                drop(conn);
-                return self.app_content_proposal_show(context, proposal_id);
+            )> = tx
+                .query_opt(
+                    "SELECT campaign_id,source_revision,content_digest,actor,origin,receipt_message,receipt_agent,receipt_request FROM app_content_proposals WHERE context_id=? AND proposal_id=?",
+                    params![context, proposal_id],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                        ))
+                    },
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            if let Some(stored) = existing {
+                if stored.0 == campaign
+                    && stored.1 == source_revision
+                    && stored.2 == digest
+                    && stored.3 == "assistant"
+                    && stored.4 == "assistant-receipt"
+                    && stored.5.as_deref() == Some(message)
+                    && stored.6.as_deref() == Some(agent)
+                    && stored.7.as_deref() == Some(request_id)
+                {
+                    // Idempotent replay: commit (empty) then re-read.
+                    return Ok(true);
+                }
+                return Err(Error::rejected("email proposal ID is already used"));
             }
-            return Err(Error::rejected("email proposal ID is already used"));
-        }
-        let claimed: Option<String> = tx
-            .query_row(
-                "SELECT proposal_id FROM app_content_proposals WHERE context_id=? AND receipt_message=?",
-                params![context, message],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| Error::internal(e.to_string()))?;
-        if claimed.is_some() {
-            return Err(Error::rejected("email proposal message is already claimed"));
-        }
-        let spent = tx
-            .execute(
-                "UPDATE app_content_proposal_requests SET state='used',used_by=?,decided=? WHERE context_id=? AND request_id=? AND state='open'",
-                params![proposal_id, now(), context, request_id],
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        if spent != 1 {
-            return Err(Error::rejected("email proposal request is already claimed"));
-        }
-        if let Err(error) = tx.execute(
-            "INSERT INTO app_content_proposals(context_id,proposal_id,campaign_id,source_revision,subject,preheader,blocks,content_digest,actor,origin,receipt_message,receipt_agent,receipt_request,state,created,decided) VALUES(?,?,?,?,?,?,?,?,'assistant','assistant-receipt',?,?,?,'pending',?,NULL)",
-            params![context, proposal_id, campaign, source_revision, draft.subject, draft.preheader, blocks_text, digest, message, agent, request_id, now()],
-        ) {
-            if is_claim_conflict(&error) {
-                return Err(Error::rejected(
-                    "email proposal message is already claimed",
-                ));
+            let claimed: Option<String> = tx
+                .query_opt(
+                    "SELECT proposal_id FROM app_content_proposals WHERE context_id=? AND receipt_message=?",
+                    params![context, message],
+                    |r| r.get(0),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            if claimed.is_some() {
+                return Err(Error::rejected("email proposal message is already claimed"));
             }
-            return Err(Error::internal(error.to_string()));
-        }
-        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-        drop(conn);
+            let spent = tx
+                .execute(
+                    "UPDATE app_content_proposal_requests SET state='used',used_by=?,decided=? WHERE context_id=? AND request_id=? AND state='open'",
+                    params![proposal_id, now(), context, request_id],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            if spent != 1 {
+                return Err(Error::rejected("email proposal request is already claimed"));
+            }
+            if let Err(error) = tx.execute_raw(
+                "INSERT INTO app_content_proposals(context_id,proposal_id,campaign_id,source_revision,subject,preheader,blocks,content_digest,actor,origin,receipt_message,receipt_agent,receipt_request,state,created,decided) VALUES(?,?,?,?,?,?,?,?,'assistant','assistant-receipt',?,?,?,'pending',?,NULL)",
+                params![context, proposal_id, campaign, source_revision, draft.subject, draft.preheader, blocks_text, digest, message, agent, request_id, now()],
+            ) {
+                if is_claim_conflict(&error) {
+                    return Err(Error::rejected(
+                        "email proposal message is already claimed",
+                    ));
+                }
+                return Err(Error::internal(error.to_string()));
+            }
+            Ok(false)
+        })?;
         self.app_content_proposal_show(context, proposal_id)
     }
 
@@ -1870,16 +1860,18 @@ impl RecordStore {
             preheader: proposal.preheader.clone(),
             blocks,
         };
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| Error::internal(e.to_string()))?;
+        // `write_tx` holds `BEGIN IMMEDIATE` across the revision check
+        // + writes, so a racing apply blocks on the write lock first.
+        // `conn` (the read guard) must be released before it re-locks
+        // the same mutex.
+        drop(conn);
+        self.write_tx(|tx| {
         let current: Option<i64> = tx
-            .query_row(
+            .query_opt(
                 "SELECT revision FROM app_content_docs WHERE context_id=? AND campaign_id=?",
                 params![context, proposal.campaign],
                 |r| r.get(0),
             )
-            .optional()
             .map_err(|e| Error::internal(e.to_string()))?;
         match current {
             None if proposal.source_revision != 0 => {
@@ -1942,8 +1934,8 @@ impl RecordStore {
         if decided != 1 {
             return Err(Error::rejected("email proposal is already decided"));
         }
-        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-        drop(conn);
+        Ok(())
+        })?;
         Ok(json!({"content": self.app_content_show(context, &proposal.campaign)?["content"]}))
     }
 
@@ -2006,7 +1998,7 @@ impl RecordStore {
         self.app_content_show(context, campaign)
     }
 
-    fn send_payload(&self, conn: &dyn super::StoreConn, prep: &SendPrep) -> Result<Value> {
+    fn send_payload(&self, conn: &impl super::StoreConn, prep: &SendPrep) -> Result<Value> {
         let context = prep.context;
         let campaign = prep.campaign;
         let kind = prep.kind;
@@ -2249,22 +2241,8 @@ impl Store {
         digest: &str,
         actor: &str,
     ) {
-        let guard = match self.write_conn() {
-            Ok(guard) => guard,
-            Err(error) => {
-                eprintln!("content audit event skipped: {error}");
-                return;
-            }
-        };
-        if Self::event(
-            &guard,
-            Self::DAEMON_STREAM,
+        let _ = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
             "app_content_changed",
-            json!({"install_id": install, "context_id": context, "action": action, "digest": digest, "actor": actor}),
-        )
-        .is_err()
-        {
-            eprintln!("content audit event skipped: event write refused");
-        }
+            json!({"install_id": install, "context_id": context, "action": action, "digest": digest, "actor": actor}),));
     }
 }

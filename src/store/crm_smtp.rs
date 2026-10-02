@@ -22,6 +22,7 @@ use super::*;
 use crate::platform::smtp::SmtpProjection;
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
+use super::StoreConn;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS crm_smtp_links(
@@ -85,7 +86,7 @@ fn link_json(install: &str, context: &str, row: &SmtpLink, projection: &SmtpProj
 impl Store {
     fn crm_smtp_row(
         &self,
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         install: &str,
         context: &str,
     ) -> Result<Option<SmtpLink>> {
@@ -161,8 +162,6 @@ impl Store {
                                 && row.auth_revision == auth_revision
                                 && row.digest == digest
                             {
-                                tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-                                drop(conn);
                                 return Ok(json!({"binding": link_json(install, context, &row, projection)}));
                             }
                             if row.request_id == request_id {
@@ -201,10 +200,8 @@ impl Store {
                             )?;
                         }
                     }
-                    tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-                    drop(conn);
                     let row = self
-                        .crm_smtp_link(install, context)?
+                        .crm_smtp_row(&tx, install, context)?
                         .ok_or_else(|| Error::internal("SMTP sender binding vanished after bind"))?;
                     Ok(json!({"binding": link_json(install, context, &row, projection)}))
         });
@@ -260,10 +257,8 @@ impl Store {
                         "crm_smtp_rebound",
                         json!({"install_id": install, "context_id": context, "connection_id": connection_id, "auth_revision": auth_revision, "link_revision": revision, "digest": digest}),
                     )?;
-                    tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-                    drop(conn);
                     let row = self
-                        .crm_smtp_link(install, context)?
+                        .crm_smtp_row(&tx, install, context)?
                         .ok_or_else(|| Error::internal("SMTP sender binding vanished after rebind"))?;
                     Ok(json!({"binding": link_json(install, context, &row, projection)}))
         });
@@ -314,7 +309,6 @@ impl Store {
                         "crm_smtp_revoked",
                         json!({"install_id": install, "context_id": context, "connection_id": row.connection_id, "link_revision": revision}),
                     )?;
-                    tx.commit().map_err(|e| Error::internal(e.to_string()))?;
                     Ok(json!({"revoked": true, "link_revision": revision}))
         });
         }
@@ -322,16 +316,7 @@ impl Store {
     /// Best-effort audit for a test send: digests and the SMTP
     /// verdict only — never addresses, content or secrets.
     pub fn note_crm_smtp_test(&self, install: &str, context: &str, receipt: &Value) {
-        let guard = match self.write_conn() {
-            Ok(guard) => guard,
-            Err(error) => {
-                eprintln!("smtp test audit event skipped: {error}");
-                return;
-            }
-        };
-        if Self::event(
-            &guard,
-            Self::DAEMON_STREAM,
+        let _ = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
             "crm_smtp_test_sent",
             json!({"install_id": install, "context_id": context,
                    "connection_id": receipt["connection_id"],
@@ -340,11 +325,6 @@ impl Store {
                    "content_digest": receipt["content_digest"],
                    "payload_digest": receipt["payload_digest"],
                    "accepted": receipt["accepted"],
-                   "smtp_code": receipt["smtp_code"]}),
-        )
-        .is_err()
-        {
-            eprintln!("smtp test audit event skipped: event write refused");
-        }
+                   "smtp_code": receipt["smtp_code"]}),));
     }
 }

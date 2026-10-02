@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 
 use super::{now, Store};
+use super::StoreConn;
 
 /// §5.5 effect event names — all on [`super::platform::PLATFORM_STREAM`]
 /// (carrying fingerprints and handles, never secrets).
@@ -243,12 +244,11 @@ impl Store {
 
                     let tx = &mut *conn;
                     let existing: Option<EffectRow> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT * FROM platform_effects WHERE request=?1",
                             params![row.request],
                             EffectRow::from_row,
-                        )
-                        .optional()?;
+                        )?;
                     if let Some(existing) = existing {
                         // The dedupe must be genuine: a same-named handle carrying a
                         // different call is a conflict, not a retry — refuse it so a
@@ -307,12 +307,11 @@ impl Store {
     pub fn effect_by_request(&self, request: &str) -> Result<Option<EffectRow>> {
         return self.write_tx(|conn| {
 
-                    conn.query_row(
+                    conn.query_opt(
                         "SELECT * FROM platform_effects WHERE request=?1",
                         params![request],
                         EffectRow::from_row,
                     )
-                    .optional()
                     .map_err(Into::into)
         });
         }
@@ -321,12 +320,11 @@ impl Store {
     pub fn effect_by_id(&self, effect_id: &str) -> Result<Option<EffectRow>> {
         return self.write_tx(|conn| {
 
-                    conn.query_row(
+                    conn.query_opt(
                         "SELECT * FROM platform_effects WHERE effect_id=?1",
                         params![effect_id],
                         EffectRow::from_row,
                     )
-                    .optional()
                     .map_err(Into::into)
         });
         }
@@ -572,15 +570,14 @@ impl Store {
                         .collect::<Vec<_>>()
                         .join(",");
                     let row: Option<EffectRow> = tx
-                        .query_row(
+                        .query_opt(
                             &format!(
                                 "SELECT * FROM platform_effects WHERE {where_by}=?1 \
                                  AND state IN ({list})"
                             ),
                             params![arg],
                             EffectRow::from_row,
-                        )
-                        .optional()?;
+                        )?;
                     let Some(row) = row else {
                         return Ok(None);
                     };
@@ -607,12 +604,12 @@ impl Store {
     /// platform, so it becomes `reconcile` for a human — never
     /// re-fired. `waiting` rows survive untouched; the request listing
     /// reads them from this table, so nothing needs re-parking.
-    pub fn reconcile_effects_in(&self, tx: &dyn super::StoreConn) -> Result<Vec<EffectRow>> {
-        let mut stmt =
-            tx.prepare("SELECT * FROM platform_effects WHERE state IN ('decided','executing')")?;
-        let rows: Vec<EffectRow> = stmt
-            .query_map([], EffectRow::from_row)?
-            .collect::<std::result::Result<_, _>>()?;
+    pub fn reconcile_effects_in(&self, tx: &impl super::StoreConn) -> Result<Vec<EffectRow>> {
+        let rows: Vec<EffectRow> = tx.query_vec(
+            "SELECT * FROM platform_effects WHERE state IN ('decided','executing')",
+            [],
+            EffectRow::from_row,
+        )?;
         if rows.is_empty() {
             return Ok(rows);
         }

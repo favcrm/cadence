@@ -14,6 +14,7 @@ use super::messages::Priority;
 use super::plans::Task;
 use super::quota::automatic_quota_error;
 use super::{is_terminal, now, Sender, Store};
+use super::StoreConn;
 
 /// A daemon-owned supervision registration. `state` is the monitor
 /// lifecycle (`degraded` until the first successful check, then `active`,
@@ -157,7 +158,7 @@ impl MonitorAlert {
 }
 
 impl Store {
-    fn monitor_in(&self, conn: &dyn super::StoreConn, id: &str) -> Result<Monitor> {
+    fn monitor_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<Monitor> {
         conn.query_row("SELECT * FROM monitors WHERE id=?", [id], row_monitor)
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
@@ -167,7 +168,7 @@ impl Store {
             })
     }
 
-    fn monitor_alert_in(&self, conn: &dyn super::StoreConn, seq: i64) -> Result<MonitorAlert> {
+    fn monitor_alert_in(&self, conn: &impl super::StoreConn, seq: i64) -> Result<MonitorAlert> {
         conn.query_row(
             "SELECT * FROM monitor_alerts WHERE seq=?",
             [seq],
@@ -181,14 +182,16 @@ impl Store {
         })
     }
 
-    fn monitor_coverage_in(&self, conn: &dyn super::StoreConn, id: &str) -> Result<Vec<String>> {
-        let mut stmt =
-            conn.prepare("SELECT task_id FROM monitor_tasks WHERE monitor_id=? ORDER BY task_id")?;
-        let rows = stmt.query_map([id], |row| row.get::<_, String>(0))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    fn monitor_coverage_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<Vec<String>> {
+        conn.query_vec(
+            "SELECT task_id FROM monitor_tasks WHERE monitor_id=? ORDER BY task_id",
+            [id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(Into::into)
     }
 
-    fn monitor_counts_in(&self, conn: &dyn super::StoreConn, id: &str) -> Result<(i64, i64)> {
+    fn monitor_counts_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<(i64, i64)> {
         let open: i64 = conn.query_row(
             "SELECT COUNT(*) FROM monitor_alerts WHERE monitor_id=? AND state='open'",
             [id],
@@ -546,15 +549,14 @@ impl Store {
                         )));
                     }
                     let unfinished: Option<String> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT id FROM tasks
                              WHERE assignee=? AND id<>?
                                AND state NOT IN ('verified','done','cancelled','failed')
                              ORDER BY updated LIMIT 1",
                             params![assignee, task_id],
                             |row| row.get(0),
-                        )
-                        .optional()?;
+                        )?;
                     if unfinished.is_some() {
                         return Err(Error::rejected(format!(
                             "Assignee '{assignee}' already has unfinished task work"
@@ -804,13 +806,12 @@ impl Store {
                     }
                     let fingerprint = format!("dispatch-blocked:{task_id}");
                     let previous: Option<(i64, i64, String, Option<String>)> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT seq,event_seq,state,last_error FROM monitor_alerts
                              WHERE monitor_id=? AND fingerprint=?",
                             params![id, fingerprint],
                             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                        )
-                        .optional()?;
+                        )?;
                     let action =
                         "Inspect the guard reason, resolve the explicit task/worker prerequisite, then retry";
                     let seq = if let Some((seq, event_seq, state, previous_reason)) = previous {
@@ -890,7 +891,7 @@ impl Store {
     /// operator dispatch repair the same stale alert as well.
     fn resolve_monitor_dispatch_blocked_tx(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         id: &str,
         task_id: &str,
         at: f64,

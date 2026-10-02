@@ -13,6 +13,7 @@ use super::messages::{Message, FENCING_UNKNOWN_SQL};
 use super::platform;
 use super::threads;
 use super::{Store, BUSY_TIMEOUT};
+use super::StoreConn;
 
 /// Read-only open of the daemon store from another process, with the
 /// shared busy timeout — never creates or migrates the file.
@@ -1154,7 +1155,7 @@ impl Store {
     /// own endpoint scheme — [`registry::turn_token_current`] with the
     /// pair read in the caller's transaction. An alias with no agent
     /// row has no scheme, so nothing is current for it (fail closed).
-    fn turn_token_current_in(tx: &dyn super::StoreConn, alias: &str, generation: &str, token: &str) -> bool {
+    fn turn_token_current_in(tx: &impl super::StoreConn, alias: &str, generation: &str, token: &str) -> bool {
         tx.query_row(
             "SELECT provider, endpoint_kind FROM agents WHERE alias=?",
             [alias],
@@ -1170,7 +1171,7 @@ impl Store {
     /// level — `None` means the message may stay `running` for the
     /// actor's pane checks. Every failure maps to the plain recovery
     /// path (message `unknown`, agent fenced) for that agent only.
-    fn adoption_block(&self, tx: &dyn super::StoreConn, e: &AdoptEntry) -> Option<String> {
+    fn adoption_block(&self, tx: &impl super::StoreConn, e: &AdoptEntry) -> Option<String> {
         let msg = tx
             .query_row(
                 "SELECT state, turn_id FROM messages WHERE id=?",
@@ -1342,12 +1343,23 @@ impl Store {
         // fails every attempt just as fast, so nothing else is retried.
         let mut attempt = 0u32;
         loop {
-            let result = {
-                // `write_conn` fails only on the fence: that refusal is
-                // the one typed-fenced cause.
-                let conn = self.write_conn().map_err(ShutdownDrainError::Fenced)?;
-                self.shutdown_entries_tx(&conn, facts)
-            };
+            // `write_tx_raw` refuses the write on the lease fence by
+            // wrapping `Error::Rejected` in `ToSqlConversionFailure` —
+            // that refusal is the one typed-fenced cause. A genuine
+            // sqlite fault (BUSY/LOCKED, …) stays `rusqlite`-typed so the
+            // retry classifier sees it unchanged.
+            let result: rusqlite::Result<Vec<AdoptEntry>> =
+                match self.write_tx_raw(|tx| self.shutdown_entries_tx(tx, facts)) {
+                    Ok(v) => Ok(v),
+                    Err(rusqlite::Error::ToSqlConversionFailure(b))
+                        if matches!(b.as_ref(), crate::Error::Rejected(_)) =>
+                    {
+                        return Err(ShutdownDrainError::Fenced(crate::Error::rejected(
+                            b.to_string(),
+                        )))
+                    }
+                    Err(e) => Err(e),
+                };
             match result {
                 Ok(entries) => return Ok(entries),
                 Err(e) if attempt < SHUTDOWN_ENTRIES_RETRIES && shutdown_retryable(&e) => {
@@ -1368,44 +1380,40 @@ impl Store {
     /// the caller can tell retryable lock contention from a dead store.
     fn shutdown_entries_tx(
         &self,
-        conn: &dyn super::StoreConn,
+        tx: &mut super::WriteTxn<'_>,
         facts: &std::collections::HashMap<String, (String, u32, String)>,
     ) -> rusqlite::Result<Vec<AdoptEntry>> {
-        // IMMEDIATE: take the write lock up front so `busy_timeout`
-        // waits for it. A deferred transaction upgrades its read lock
-        // on the first write and gets SQLITE_BUSY at once, burning a
-        // retry on contention the lock wait would have absorbed. The
-        // bounded retry stays as the backstop.
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-        let mut stmt = tx.prepare(
+        // The sealed facade already opened this `BEGIN IMMEDIATE` —
+        // `busy_timeout` waits for the write lock; the deferred-upgrade
+        // BUSY_SNAPSHOT hazard `IMMEDIATE` was chosen to avoid stays
+        // avoided, and the bounded retry is still the backstop.
+        let inflight: Vec<(String, String, String, String)> = tx.query_vec(
             "SELECT alias, id, turn_id, state FROM messages
              WHERE state IN ('running','submitting') AND source != 'nudge'",
-        )?;
-        let inflight = stmt
-            .query_map([], |r| {
+            [],
+            |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                     r.get::<_, String>(3)?,
                 ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
+            },
+        )?;
         let mut entries = Vec::new();
         for (alias, message_id, turn_id, state) in inflight {
             let Some((generation, pane_pid, native_session)) = facts.get(&alias) else {
                 let kind: Option<String> = tx
-                    .query_row(
+                    .query_opt(
                         "SELECT endpoint_kind FROM agents WHERE alias=?",
                         [&alias],
                         |r| r.get(0),
                     )
-                    .ok();
+                    .ok()
+                    .flatten();
                 if kind.as_deref() == Some("pty") {
                     Self::event_scoped_raw(
-                        &tx,
+                        &*tx,
                         &alias,
                         "turn_adopt_refused",
                         &json!({"message": message_id, "turn_id": turn_id,
@@ -1416,10 +1424,11 @@ impl Store {
                 }
                 continue;
             };
-            if state == "running" && !Self::turn_token_current_in(&tx, &alias, generation, &turn_id)
+            if state == "running"
+                && !Self::turn_token_current_in(&*tx, &alias, generation, &turn_id)
             {
                 Self::event_scoped_raw(
-                    &tx,
+                    &*tx,
                     &alias,
                     "turn_adopt_refused",
                     &json!({"message": message_id, "turn_id": turn_id,
@@ -1443,9 +1452,10 @@ impl Store {
         // here discards them too, so rollback coverage is the real
         // shape, not just pre-write faults. Never set in production.
         if let Some(hook) = &self.shutdown_entries_hook {
-            hook(&tx)?;
+            hook(tx)?;
         }
-        tx.commit()?;
+        // The sealed facade commits `tx` after this returns Ok — a
+        // `commit()` here would be a tx-boundary the facade forbids.
         Ok(entries)
     }
 }

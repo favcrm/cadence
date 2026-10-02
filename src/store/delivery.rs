@@ -9,6 +9,7 @@ use super::kickoff::{check_commit_sha, cloud_hold_exit, last_sha_line};
 use super::messages::{Message, FENCING_UNKNOWN_SQL};
 use super::plans::{Job, Task};
 use super::{now, Store};
+use super::StoreConn;
 
 pub(super) const UNKNOWN_EVENT_REASON_CHARS: usize = 512;
 
@@ -129,12 +130,11 @@ impl Store {
                         return Ok(None);
                     }
                     let result: Option<String> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT result FROM messages WHERE id=?1 AND alias=?2 AND state='running'",
                             params![id, alias],
                             |row| row.get(0),
-                        )
-                        .optional()?
+                        )?
                         .ok_or_else(|| Error::rejected(format!("message {id} is no longer running")))?;
                     let mut result = result
                         .and_then(|r| serde_json::from_str::<Value>(&r).ok())
@@ -183,13 +183,12 @@ impl Store {
         return self.write_tx(|conn| {
 
                     let raw: Option<String> = conn
-                        .query_row(
+                        .query_opt(
                             "SELECT payload FROM events WHERE alias=?1 AND kind='submit_recovered' \
                              AND json_extract(payload,'$.message')=?2 ORDER BY seq LIMIT 1",
                             params![alias, id],
                             |row| row.get(0),
-                        )
-                        .optional()?;
+                        )?;
                     Ok(raw.map(|r| serde_json::from_str(&r).unwrap_or(Value::Null)))
         });
         }
@@ -233,7 +232,7 @@ impl Store {
     /// `older_than` limits to rows created before that epoch (the TTL).
     /// Returns the `(id, alias)` pairs it closed.
     pub(super) fn cancel_nudges_in(
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         alias: Option<&str>,
         reason: &str,
         older_than: Option<f64>,
@@ -245,21 +244,21 @@ impl Store {
         } else {
             "('queued','submitting')"
         };
-        let mut stmt = tx.prepare(&format!(
-            "SELECT id, alias, state FROM messages
-             WHERE source='nudge' AND state IN {states}
-               AND (?1 IS NULL OR alias=?1) AND (?2 IS NULL OR created < ?2)"
-        ))?;
-        let stale = stmt
-            .query_map(params![alias, older_than], |r| {
+        let stale: Vec<(String, String, String)> = tx.query_vec(
+            &format!(
+                "SELECT id, alias, state FROM messages
+                 WHERE source='nudge' AND state IN {states}
+                   AND (?1 IS NULL OR alias=?1) AND (?2 IS NULL OR created < ?2)"
+            ),
+            params![alias, older_than],
+            |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                 ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
+            },
+        )?;
         let mut closed = Vec::new();
         for (id, alias, state) in stale {
             let (to, why) = if state == "queued" {
@@ -370,7 +369,7 @@ impl Store {
 
     pub(super) fn finish_in(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         message: &Message,
         status: &str,
         result: &Value,
@@ -464,7 +463,7 @@ impl Store {
     /// deterministic id and no `reply_to`, so they cannot create loops.
     pub(super) fn route_result(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         message: &Message,
         result: &Value,
     ) -> Result<bool> {
@@ -566,7 +565,7 @@ impl Store {
     /// may route.
     pub(super) fn route_notice(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         message: &Message,
         kind: &str,
         result: &Value,
@@ -718,7 +717,7 @@ impl Store {
     /// isn't a pty endpoint, where the full body delivers fine).
     fn bound_routed_result(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         target: &str,
         result: &mut Value,
         worker: &str,
@@ -922,8 +921,7 @@ impl Store {
                             params![now(), message.alias],
                         )?;
                     }
-                    drop(conn);
-                    self.message(message_id)?
+                    self.message_in(&*tx, message_id)?
                         .ok_or_else(|| Error::internal("reconciled message vanished"))
         });
         }
@@ -977,8 +975,7 @@ impl Store {
                         json!({"message": message_id, "by": by, "reason": reason}),
                     )?;
                     self.route_notice(&tx, &message, "cancelled", &result)?;
-                    drop(conn);
-                    self.message(message_id)?
+                    self.message_in(&*tx, message_id)?
                         .ok_or_else(|| Error::internal("cancelled message vanished"))
         });
         }
@@ -996,7 +993,7 @@ impl Store {
     /// once while a retried write is a no-op.
     pub(super) fn route_job_event(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         job: &Job,
         task: &Task,
         new_state: &str,
@@ -1084,7 +1081,7 @@ impl Store {
     /// or already-advanced task is untouched.
     pub(super) fn task_on_running(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         message_id: &str,
         alias: &str,
     ) -> Result<()> {
@@ -1129,7 +1126,7 @@ impl Store {
     /// reaches `review` with NULL; `job task sha` repairs it. Any
     /// non-completion terminal leaves the task where it is — `job show`
     /// reports the drift and `job dispatch` starts the next revision.
-    fn task_on_completed(&self, tx: &dyn super::StoreConn, message: &Message, result: &Value) -> Result<()> {
+    fn task_on_completed(&self, tx: &impl super::StoreConn, message: &Message, result: &Value) -> Result<()> {
         // Only a dispatch kickoff carries the work axis: `--task`
         // follow-ups and `job_event` notifications attach `task_id`
         // for indexing but completing them must not move the task.

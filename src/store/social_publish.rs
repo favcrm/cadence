@@ -18,6 +18,7 @@
 use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
+use super::StoreConn;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS social_publish_intents(
@@ -181,7 +182,7 @@ fn parse_json_cell(cell: Option<String>, what: &str) -> Result<Option<Value>> {
         .map_err(|_| Error::rejected(format!("social publish {what} is corrupt")))
 }
 
-fn read_row(conn: &dyn super::StoreConn, intent_id: &str) -> Result<Value> {
+fn read_row(conn: &impl super::StoreConn, intent_id: &str) -> Result<Value> {
     let row: (
         String,
         String,
@@ -243,7 +244,7 @@ impl Store {
 
                     let tx = &mut *conn;
                     if let Some(existing) = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT intent_id,request,state,frozen,frozen_digest,receipt,upstream FROM social_publish_intents WHERE request=?",
                             [&request],
                             |r| {
@@ -257,8 +258,7 @@ impl Store {
                                     r.get::<_, Option<String>>(6)?,
                                 ))
                             },
-                        )
-                        .optional()?
+                        )?
                     {
                         if existing.4 != digest {
                             return Err(Error::rejected(
@@ -349,12 +349,11 @@ impl Store {
         return self.write_tx(|conn| {
 
                     let next: Option<String> = conn
-                        .query_row(
+                        .query_opt(
                             "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=? ORDER BY due_epoch,intent_id LIMIT 1",
                             [now_epoch],
                             |r| r.get(0),
-                        )
-                        .optional()?;
+                        )?;
                     next.map(|id| read_row(&conn, &id)).transpose()
         });
         }
@@ -411,12 +410,11 @@ impl Store {
 
                     let tx = &mut *conn;
                     let next: Option<String> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=? ORDER BY due_epoch,intent_id LIMIT 1",
                             [now_epoch],
                             |r| r.get(0),
-                        )
-                        .optional()?;
+                        )?;
                     let Some(id) = next else {
                         return Ok(None);
                     };
@@ -482,12 +480,11 @@ impl Store {
 
                     let tx = &mut *conn;
                     let frozen_text: Option<String> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT frozen FROM social_publish_intents WHERE intent_id=? AND state='processing'",
                             [intent_id],
                             |r| r.get(0),
-                        )
-                        .optional()?;
+                        )?;
                     let frozen_text = frozen_text
                         .ok_or_else(|| Error::rejected("social publish intent is not processing"))?;
                     let frozen: Value = serde_json::from_str(&frozen_text)?;
@@ -569,12 +566,11 @@ impl Store {
                     let tx = &mut *conn;
                     if state == "posted" {
                         let row: Option<(String, Option<String>)> = tx
-                            .query_row(
+                            .query_opt(
                                 "SELECT frozen,upstream FROM social_publish_intents WHERE intent_id=? AND state='processing'",
                                 [intent_id],
                                 |r| Ok((r.get(0)?, r.get(1)?)),
-                            )
-                            .optional()?;
+                            )?;
                         let (frozen_text, upstream_text) =
                             row.ok_or_else(|| Error::rejected("social publish intent is not processing"))?;
                         let frozen: Value = serde_json::from_str(&frozen_text)?;

@@ -121,12 +121,11 @@ impl Store {
     ) -> Result<Option<(String, String)>> {
         return self.write_tx(|conn| {
 
-                    conn.query_row(
+                    conn.query_opt(
                         "SELECT install_id,context_id FROM crm_unsubscribe_index WHERE token_hash=?",
                         params![token_hash],
                         |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
                     )
-                    .optional()
                     .map_err(|e| Error::internal(e.to_string()))
         });
         }
@@ -167,22 +166,8 @@ impl Store {
     /// Best-effort audit for the unsubscribe origin — the origin is
     /// public configuration, never a secret.
     pub fn note_crm_send_origin(&self, origin: Option<&str>) {
-        let guard = match self.write_conn() {
-            Ok(guard) => guard,
-            Err(error) => {
-                eprintln!("send origin audit event skipped: {error}");
-                return;
-            }
-        };
-        if Self::event(
-            &guard,
-            Self::DAEMON_STREAM,
+        let _ = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
             "crm_send_origin_set",
-            json!({"unsubscribe_origin": origin}),
-        )
-        .is_err()
-        {
-            eprintln!("send origin audit event skipped: event write refused");
-        }
+            json!({"unsubscribe_origin": origin}),));
     }
 }

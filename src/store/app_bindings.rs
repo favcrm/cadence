@@ -3,6 +3,7 @@ use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use super::StoreConn;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS app_bindings(
@@ -84,7 +85,7 @@ fn binding_material_same(old: &Value, new: &Value) -> bool {
     FIELDS.iter().all(|field| old[field] == new[field])
 }
 
-fn binding_in(conn: &dyn super::StoreConn, install: &str, id: &str) -> Result<Value> {
+fn binding_in(conn: &impl super::StoreConn, install: &str, id: &str) -> Result<Value> {
     let row = conn.query_row(
         "SELECT context_id,slot,revision,state,config,digest FROM app_bindings WHERE install_id=? AND id=?",
         params![install,id], |r| Ok((r.get::<_,Option<String>>(0)?,r.get::<_,String>(1)?,
@@ -101,7 +102,7 @@ fn binding_in(conn: &dyn super::StoreConn, install: &str, id: &str) -> Result<Va
 }
 
 pub(crate) fn binding_current_in(
-    conn: &dyn super::StoreConn,
+    conn: &impl super::StoreConn,
     install: &str,
     context: Option<&str>,
     slot: &str,
@@ -170,7 +171,7 @@ impl Store {
     /// historical authority.
     /// Answers whether an approval was withdrawn (absent stays absent).
     pub(super) fn app_binding_approval_withdraw_in(
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         install: &str,
         reason: &str,
     ) -> Result<bool> {
@@ -212,7 +213,7 @@ impl Store {
     /// derivation (any app, any install) still covers it, so a rebind
     /// never cuts another install's grant and never keeps this one's.
     pub(super) fn app_install_grants_drop_in(
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         install_id: &str,
         by: &str,
     ) -> Result<()> {
@@ -221,23 +222,20 @@ impl Store {
             .query_map([install_id], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for app in apps {
-            let rows: Vec<(String, String, String, Vec<String>)> = {
-                let mut stmt = tx.prepare(
-                    "SELECT agent, platform, account, scopes FROM app_grants WHERE app=? AND install_id=?",
-                )?;
-                let mapped = stmt.query_map(params![app, install_id], |r| {
+            let raws = tx.query_vec(
+                "SELECT agent, platform, account, scopes FROM app_grants WHERE app=? AND install_id=?",
+                params![app, install_id],
+                &mut |r| {
                     let raw: String = r.get(3)?;
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, raw))
-                })?;
-                let mut rows: Vec<(String, String, String, Vec<String>)> = Vec::new();
-                for row in mapped {
-                    let (agent, plat, account, raw): (String, String, String, String) = row?;
-                    let scopes: Vec<String> = serde_json::from_str(&raw)
-                        .map_err(|_| Error::internal("derived grant receipt is corrupt"))?;
-                    rows.push((agent, plat, account, scopes));
-                }
-                rows
-            };
+                },
+            )?;
+            let mut rows: Vec<(String, String, String, Vec<String>)> = Vec::new();
+            for (agent, plat, account, raw) in raws {
+                let scopes: Vec<String> = serde_json::from_str(&raw)
+                    .map_err(|_| Error::internal("derived grant receipt is corrupt"))?;
+                rows.push((agent, plat, account, scopes));
+            }
             if rows.is_empty() {
                 continue;
             }
@@ -247,14 +245,13 @@ impl Store {
             )?;
             for (agent, plat, account, derived) in &rows {
                 let still: Vec<String> = {
-                    let mut stmt = tx.prepare(
+                    let raws = tx.query_vec(
                         "SELECT scopes FROM app_grants WHERE agent=? AND platform=? AND account=?",
+                        params![agent, plat, account],
+                        &mut |r| r.get::<_, String>(0),
                     )?;
-                    let mapped =
-                        stmt.query_map(params![agent, plat, account], |r| r.get::<_, String>(0))?;
                     let mut still: Vec<String> = Vec::new();
-                    for row in mapped {
-                        let raw: String = row?;
+                    for raw in raws {
                         still
                             .extend(serde_json::from_str::<Vec<String>>(&raw).map_err(|_| {
                                 Error::internal("derived grant receipt is corrupt")
@@ -263,12 +260,11 @@ impl Store {
                     still
                 };
                 let existing: Option<String> = tx
-                    .query_row(
+                    .query_opt(
                         "SELECT scopes FROM platform_grants WHERE agent=? AND platform=? AND account=?",
                         params![agent, plat, account],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
+                        &mut |r| r.get(0),
+                    )?;
                 let Some(raw) = existing else {
                     continue;
                 };
@@ -310,25 +306,15 @@ impl Store {
     /// credential revoke/rotate transaction, so the record change and
     /// the approval withdrawal land together.
     pub(super) fn app_binding_approvals_withdraw_for_credential_in(
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         platform_name: &str,
         account: &str,
     ) -> Result<()> {
-        let rows: Vec<(String, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT install_id, id FROM app_bindings WHERE state='configured' AND json_extract(config,'$.provider')=? AND json_extract(config,'$.account')=?",
-            )?;
-            let mapped = stmt.query_map(params![platform_name, account], |r| {
-                let install: String = r.get(0)?;
-                let binding: String = r.get(1)?;
-                Ok((install, binding))
-            })?;
-            let mut rows: Vec<(String, String)> = Vec::new();
-            for row in mapped {
-                rows.push(row?);
-            }
-            rows
-        };
+        let rows: Vec<(String, String)> = tx.query_vec(
+            "SELECT install_id, id FROM app_bindings WHERE state='configured' AND json_extract(config,'$.provider')=? AND json_extract(config,'$.account')=?",
+            params![platform_name, account],
+            &mut |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         if rows.is_empty() {
             return Ok(());
         }
@@ -392,15 +378,13 @@ impl Store {
     /// rows intentionally hidden by the bounded operator inventory.
     pub fn app_binding_upgrade_configured(&self, install: &str) -> Result<Vec<Value>> {
         return self.write_tx(|conn| {
-
-                    let mut stmt = conn.prepare(
+                    let ids: Vec<String> = conn.query_vec(
                         "SELECT id FROM app_bindings WHERE install_id=? AND state='configured' ORDER BY id",
+                        [install],
+                        &mut |row| row.get::<_, String>(0),
                     )?;
-                    let ids = stmt
-                        .query_map([install], |row| row.get::<_, String>(0))?
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
                     ids.iter()
-                        .map(|id| binding_in(&conn, install, id))
+                        .map(|id| binding_in(&*conn, install, id))
                         .collect()
         });
         }
@@ -465,12 +449,11 @@ impl Store {
 
                     let tx = &mut *conn;
                     let existing = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT id FROM app_bindings WHERE install_id=? AND request_id=?",
                             params![install, request],
                             |r| r.get::<_, String>(0),
-                        )
-                        .optional()?;
+                        )?;
                     if let Some(id) = existing {
                         let row = binding_in(&tx, install, &id)?;
                         if row["context_id"] != json!(context)

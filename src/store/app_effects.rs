@@ -3,6 +3,7 @@ use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 use std::path::Path;
+use super::StoreConn;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS app_effect_authorizations(
@@ -91,7 +92,7 @@ fn validate_child(row: &EffectRow, authority: &Value) -> Result<()> {
     Ok(())
 }
 
-fn child_in(conn: &dyn super::StoreConn, id: &str) -> Result<(EffectRow, Value, String)> {
+fn child_in(conn: &impl super::StoreConn, id: &str) -> Result<(EffectRow, Value, String)> {
     let row = conn
         .query_row(
             "SELECT * FROM platform_effects WHERE effect_id=?",
@@ -161,28 +162,25 @@ pub fn read_execution_permit(path: &Path, effect_id: &str) -> Result<AppEffectPe
 
 impl Store {
     pub(super) fn app_effect_invalidate_in(
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         install: &str,
         context: Option<&str>,
         binding: Option<&str>,
         bundle_digest: Option<&str>,
     ) -> Result<()> {
-        let mut statement = conn.prepare("SELECT e.effect_id FROM platform_effects e JOIN app_effect_authorizations a ON a.effect_id=e.effect_id WHERE a.install_id=? AND (? IS NULL OR a.context_id=?) AND (? IS NULL OR json_extract(a.authority,'$.binding.id')=?) AND (? IS NULL OR json_extract(a.authority,'$.bundle_digest')=?) AND e.authorization_kind='app_artifact' AND e.state IN ('waiting','decided')")?;
-        let ids = statement
-            .query_map(
-                params![
-                    install,
-                    context,
-                    context,
-                    binding,
-                    binding,
-                    bundle_digest,
-                    bundle_digest
-                ],
-                |r| r.get::<_, String>(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
+        let ids: Vec<String> = conn.query_vec(
+            "SELECT e.effect_id FROM platform_effects e JOIN app_effect_authorizations a ON a.effect_id=e.effect_id WHERE a.install_id=? AND (? IS NULL OR a.context_id=?) AND (? IS NULL OR json_extract(a.authority,'$.binding.id')=?) AND (? IS NULL OR json_extract(a.authority,'$.bundle_digest')=?) AND e.authorization_kind='app_artifact' AND e.state IN ('waiting','decided')",
+            params![
+                install,
+                context,
+                context,
+                binding,
+                binding,
+                bundle_digest,
+                bundle_digest
+            ],
+            &mut |r| r.get::<_, String>(0),
+        )?;
         for id in ids {
             conn.execute("UPDATE platform_effects SET state='closed',close_reason='app_authority_changed',updated_at=? WHERE effect_id=? AND state IN ('waiting','decided')",params![now(),id])?;
             Self::event(
@@ -208,7 +206,7 @@ impl Store {
     /// Retiring those endpoints does not alter their recorded acceptance.
     /// The installation, context and binding are nevertheless current here.
     pub(crate) fn app_publication_material_in(
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         id: &str,
         artifact: &str,
         bundle: &str,
@@ -463,12 +461,11 @@ impl Store {
 
                     let tx = &mut *conn;
                     let existing = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT effect_id FROM platform_effects WHERE request=?",
                             [&row.request],
                             |r| r.get::<_, String>(0),
-                        )
-                        .optional()?;
+                        )?;
                     if let Some(id) = existing {
                         let (existing, stored, digest) = child_in(&tx, &id)?;
                         if release_digest(row, authority) != digest || stored != *authority {
@@ -540,7 +537,7 @@ impl Store {
 }
 
 fn historical_step_receipt(
-    conn: &dyn super::StoreConn,
+    conn: &impl super::StoreConn,
     run: &Value,
     step: &str,
     message: &str,

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use super::StoreConn;
 
 pub const ARTIFACT_BYTES: usize = 256 * 1024;
 pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -196,7 +197,7 @@ pub struct LocalRunProvenance<'a> {
 }
 
 impl Store {
-    pub(super) fn refuse_app_task(conn: &dyn super::StoreConn, task_id: &str) -> Result<()> {
+    pub(super) fn refuse_app_task(conn: &impl super::StoreConn, task_id: &str) -> Result<()> {
         if conn
             .query_row(
                 "SELECT 1 FROM app_run_steps WHERE task_id=?",
@@ -212,7 +213,7 @@ impl Store {
         }
         Ok(())
     }
-    pub(super) fn refuse_app_job(conn: &dyn super::StoreConn, job_id: &str) -> Result<()> {
+    pub(super) fn refuse_app_job(conn: &impl super::StoreConn, job_id: &str) -> Result<()> {
         if conn.query_row("SELECT 1 FROM app_run_steps s JOIN tasks t ON t.id=s.task_id WHERE t.job_id=? LIMIT 1",[job_id], |_| Ok(())).optional()?.is_some() {
             return Err(Error::rejected("app-owned jobs use the app run lifecycle"));
         }
@@ -223,12 +224,11 @@ impl Store {
 
                     let tx = &mut *conn;
                     let previous: Option<(String, String)> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT digest,state FROM app_install_capabilities WHERE install_id=?",
                             [id],
                             |r| Ok((r.get(0)?, r.get(1)?)),
-                        )
-                        .optional()?;
+                        )?;
                     tx.execute("INSERT INTO app_install_capabilities VALUES(?,1,?,?,?) ON CONFLICT(install_id) DO UPDATE SET epoch=epoch+1,digest=excluded.digest,state=excluded.state,created=excluded.created",params![id,digest,if approve{"approved"}else{"revoked"},now()])?;
                     let epoch: i64 = tx.query_row(
                         "SELECT epoch FROM app_install_capabilities WHERE install_id=?",
@@ -392,7 +392,7 @@ impl Store {
                         }
                     }
                     let source = if let Some((receipt_id, post_id)) = selected_source {
-                        let row = tx.query_row(
+                        let row = tx.query_opt(
                             "SELECT r.run_id,r.slot,r.binding_digest,r.result,r.result_digest,a.install_id,a.context_id,a.state
                              FROM app_capability_results r JOIN app_runs a ON a.id=r.run_id WHERE r.id=?",
                             [receipt_id], |r| Ok((
@@ -400,7 +400,7 @@ impl Store {
                                 r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,
                                 r.get::<_,Option<String>>(6)?,r.get::<_,String>(7)?
                             )),
-                        ).optional()?.ok_or_else(||Error::rejected("source receipt is unavailable"))?;
+                        )?.ok_or_else(||Error::rejected("source receipt is unavailable"))?;
                         if row.5 != install_id
                             || row.6.as_deref() != context.map(|c| c.id.as_str())
                             || !matches!(row.7.as_str(), "succeeded" | "failed")
@@ -466,7 +466,7 @@ impl Store {
                     } else {
                         None
                     };
-                    let epoch:i64=tx.query_row("SELECT epoch FROM app_install_capabilities WHERE install_id=? AND digest=? AND state='approved'",params![install_id,bundle_digest],|r|r.get(0)).optional()?.ok_or_else(||Error::rejected("installation capability approval is absent or stale"))?;
+                    let epoch:i64=tx.query_opt("SELECT epoch FROM app_install_capabilities WHERE install_id=? AND digest=? AND state='approved'",params![install_id,bundle_digest],|r|r.get(0))?.ok_or_else(||Error::rejected("installation capability approval is absent or stale"))?;
                     let owner = self.agent_in(&tx, owner_pm)?;
                     if owner.role != "pm" {
                         return Err(Error::rejected("run owner must be an existing PM"));
@@ -540,12 +540,11 @@ impl Store {
                     }
                     let digest = material_digest(&snapshot);
                     if let Some((id, existing)) = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT id,snapshot_digest FROM app_runs WHERE install_id=? AND request_id=?",
                             params![install_id, request_id],
                             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-                        )
-                        .optional()?
+                        )?
                     {
                         if existing != digest {
                             return Err(Error::rejected(
@@ -595,8 +594,7 @@ impl Store {
                         "app_run_created",
                         json!({"run_id":id,"install_id":install_id,"snapshot_digest":digest,"actor":"operator"}),
                     )?;
-                    drop(conn);
-                    self.app_run_show(&id)
+                    Self::app_run_show_in(&*tx, &id)
         });
         }
     pub fn app_run_show(&self, id: &str) -> Result<Value> {
@@ -605,7 +603,7 @@ impl Store {
                     Self::app_run_show_in(&conn, id)
         });
         }
-    pub(super) fn app_run_show_in(conn: &dyn super::StoreConn, id: &str) -> Result<Value> {
+    pub(super) fn app_run_show_in(conn: &impl super::StoreConn, id: &str) -> Result<Value> {
         let mut value=conn.query_row("SELECT install_id,epoch,snapshot,snapshot_digest,project_link,state,approved_digest FROM app_runs WHERE id=?",[id],|r|Ok(json!({"id":id,"install_id":r.get::<_,String>(0)?,"epoch":r.get::<_,i64>(1)?,"snapshot":r.get::<_,String>(2)?,"snapshot_digest":r.get::<_,String>(3)?,"project_link":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"approved_digest":r.get::<_,Option<String>>(6)?}))).optional()?.ok_or_else(||Error::rejected("unknown app run"))?;
         value["snapshot"] = serde_json::from_str(value["snapshot"].as_str().unwrap())
             .map_err(|e| Error::internal(e.to_string()))?;
@@ -614,9 +612,9 @@ impl Store {
             [id],
             |r| r.get::<_, Option<String>>(0)
         )?);
-        value["steps"]=Value::Array(conn.prepare("SELECT step_id,task_id,state,message_id FROM app_run_steps WHERE run_id=? ORDER BY step_id")?.query_map([id],|r|Ok(json!({"step_id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"message_id":r.get::<_,Option<String>>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
-        value["artifacts"]=Value::Array(conn.prepare("SELECT id,step_id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? ORDER BY step_id")?.query_map([id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"step_id":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"media_type":r.get::<_,String>(3)?,"size":r.get::<_,i64>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
-        value["reviews"]=Value::Array(conn.prepare("SELECT step_id,artifact_digest,reviewer,decision,rationale,asset_receipt_id,asset_digest FROM app_run_reviews WHERE run_id=?")?.query_map([id],|r|{
+        value["steps"]=Value::Array(conn.query_vec("SELECT step_id,task_id,state,message_id FROM app_run_steps WHERE run_id=? ORDER BY step_id",[id],|r|Ok(json!({"step_id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"message_id":r.get::<_,Option<String>>(3)?})))?);
+        value["artifacts"]=Value::Array(conn.query_vec("SELECT id,step_id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? ORDER BY step_id",[id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"step_id":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"media_type":r.get::<_,String>(3)?,"size":r.get::<_,i64>(4)?})))?);
+        value["reviews"]=Value::Array(conn.query_vec("SELECT step_id,artifact_digest,reviewer,decision,rationale,asset_receipt_id,asset_digest FROM app_run_reviews WHERE run_id=?",[id],|r|{
             let mut review=json!({"step_id":r.get::<_,String>(0)?,"artifact_digest":r.get::<_,String>(1)?,"reviewer":r.get::<_,String>(2)?,"decision":r.get::<_,String>(3)?,"rationale":r.get::<_,String>(4)?});
             let asset:Option<String>=r.get(5)?;
             let digest:Option<String>=r.get(6)?;
@@ -625,7 +623,7 @@ impl Store {
                 review["asset_digest"]=json!(digest);
             }
             Ok(review)
-        })?.collect::<rusqlite::Result<Vec<_>>>()?);
+        })?);
         Ok(value)
     }
     pub fn app_run_list(&self, install_id: Option<&str>) -> Result<Value> {
@@ -705,12 +703,12 @@ impl Store {
                     self.app_run_show(id)
         });
         }
-    pub(super) fn app_current_in(conn: &dyn super::StoreConn, run: &Value, bundle: &str) -> Result<()> {
+    pub(super) fn app_current_in(conn: &impl super::StoreConn, run: &Value, bundle: &str) -> Result<()> {
         Self::app_authority_in(conn, run, bundle, false)
     }
     /// Completed material retains its original approval epoch across package
     /// upgrades. It is never used for a new/active run or worker dispatch.
-    pub(super) fn app_completed_current_in(conn: &dyn super::StoreConn, run: &Value) -> Result<()> {
+    pub(super) fn app_completed_current_in(conn: &impl super::StoreConn, run: &Value) -> Result<()> {
         if !matches!(run["state"].as_str(), Some("succeeded" | "failed"))
             || run["approved_digest"] != run["snapshot_digest"]
         {
@@ -724,7 +722,7 @@ impl Store {
         Self::app_authority_in(conn, run, bundle, true)
     }
     fn app_authority_in(
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         run: &Value,
         bundle: &str,
         historical: bool,
@@ -873,7 +871,7 @@ impl Store {
         }
         Ok(())
     }
-    fn app_context_current_in(conn: &dyn super::StoreConn, run: &Value) -> Result<()> {
+    fn app_context_current_in(conn: &impl super::StoreConn, run: &Value) -> Result<()> {
         let context = run["context_id"].as_str();
         if let Some(id) = context {
             let snapshot = &run["snapshot"];
@@ -943,7 +941,7 @@ impl Store {
                                 ready = false;
                                 break;
                             }
-                            if let Some(artifact)=tx.query_row("SELECT id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? AND step_id=?",params![id,dep],|r|Ok(json!({"artifact_id":r.get::<_,String>(0)?,"producer_step_id":dep,"revision":1,"sha256":r.get::<_,String>(1)?,"media_type":r.get::<_,String>(2)?,"size":r.get::<_,i64>(3)?}))).optional()? {dependencies.push(artifact);}
+                            if let Some(artifact)=tx.query_opt("SELECT id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? AND step_id=?",params![id,dep],|r|Ok(json!({"artifact_id":r.get::<_,String>(0)?,"producer_step_id":dep,"revision":1,"sha256":r.get::<_,String>(1)?,"media_type":r.get::<_,String>(2)?,"size":r.get::<_,i64>(3)?})))? {dependencies.push(artifact);}
                         }
                         if !ready {
                             continue;
@@ -1019,7 +1017,7 @@ impl Store {
                     Ok(())
         });
         }
-    pub(super) fn app_run_invalidate_in(&self, tx: &dyn super::StoreConn, id: &str) -> Result<()> {
+    pub(super) fn app_run_invalidate_in(&self, tx: &impl super::StoreConn, id: &str) -> Result<()> {
         let changed = tx.execute("UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state IN ('awaiting_approval','approved','running')", params![now(), id])?;
         if changed != 0 {
             tx.execute(
@@ -1282,7 +1280,7 @@ impl Store {
     /// transaction records durable eligibility; it never acquires the PM lock.
     pub(super) fn app_run_finished_in(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         message: &Message,
         status: &str,
         result: &Value,
@@ -1557,7 +1555,7 @@ impl Store {
     }
     fn app_step_failed_in(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         run: &str,
         step: &str,
         task: &str,
@@ -1702,13 +1700,13 @@ impl Store {
         {
             return self.write_tx(|conn| {
 
-                            Ok(conn.query_row("SELECT r.id,r.install_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.message_id=?",[message],|r|Ok((r.get(0)?,r.get(1)?))).optional()?)
+                            Ok(conn.query_opt("SELECT r.id,r.install_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.message_id=?",[message],|r|Ok((r.get(0)?,r.get(1)?)))?)
             });
             }
     }
     pub(super) fn app_message_admit_in(
         &self,
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         message: &Message,
         bundle: &str,
     ) -> Result<()> {
@@ -1752,7 +1750,7 @@ impl Store {
 
                     let tx = &mut *conn;
                     if let Some((run, step, task)) = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT run_id,step_id,task_id FROM app_run_steps WHERE message_id=?",
                             [message],
                             |r| {
@@ -1762,8 +1760,7 @@ impl Store {
                                     r.get::<_, String>(2)?,
                                 ))
                             },
-                        )
-                        .optional()?
+                        )?
                     {
                         let changed=tx.execute("UPDATE messages SET state='failed',error='app submission authorization changed',completed=? WHERE id=? AND state IN ('queued','submitting')",params![now(),message])?;
                         if changed > 0 {
@@ -1866,7 +1863,7 @@ pub(super) enum AppCompletionProof {
 impl Store {
     pub(super) fn app_completion_proof(
         &self,
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         message: &Message,
         result: &Value,
     ) -> Result<AppCompletionProof> {

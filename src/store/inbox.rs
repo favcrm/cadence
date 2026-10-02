@@ -8,11 +8,12 @@ use serde_json::{json, Value};
 use super::agents::Agent;
 use super::messages::{row_message, Message};
 use super::{now, Store};
+use super::StoreConn;
 
 impl Store {
     /// The alias must be a passive inbox — every `cadence inbox` verb
     /// (drain, peek, ack) shares this refusal for process endpoints.
-    fn inbox_agent_in(&self, conn: &dyn super::StoreConn, alias: &str) -> Result<Agent> {
+    fn inbox_agent_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<Agent> {
         let agent = self.agent_in(conn, alias)?;
         if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             return Err(Error::rejected(format!(
@@ -87,15 +88,15 @@ impl Store {
     /// events), as a set the peek filters out.
     fn inbox_parked_in(
         &self,
-        conn: &dyn super::StoreConn,
+        conn: &impl super::StoreConn,
         alias: &str,
         reader: &str,
     ) -> Result<std::collections::HashSet<String>> {
-        let mut stmt =
-            conn.prepare("SELECT payload FROM events WHERE alias=? AND kind='inbox_park'")?;
-        let rows = stmt
-            .query_map([alias], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = conn.query_vec(
+            "SELECT payload FROM events WHERE alias=? AND kind='inbox_park'",
+            [alias],
+            |row| row.get::<_, String>(0),
+        )?;
         Ok(rows
             .iter()
             .filter_map(|p| serde_json::from_str::<Value>(p).ok())
@@ -199,12 +200,11 @@ impl Store {
                     let tx = &mut *conn;
                     self.inbox_agent_in(&tx, alias)?;
                     let state: Option<String> = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT state FROM messages WHERE alias=? AND id=?",
                             params![alias, message],
                             |r| r.get(0),
-                        )
-                        .optional()?;
+                        )?;
                     match state.as_deref() {
                         Some("queued") => {}
                         Some(s) => {
@@ -267,20 +267,19 @@ impl Store {
     }
 
     /// [`Self::inbox_readers`] on a caller-held connection.
-    fn inbox_readers_in(&self, conn: &dyn super::StoreConn, alias: &str) -> Result<Value> {
-        let mut stmt = conn.prepare(
+    fn inbox_readers_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<Value> {
+        let rows = conn.query_vec(
             "SELECT kind, payload, at FROM events WHERE alias=?
              AND kind IN ('inbox_ack','inbox_ack_reset') ORDER BY seq",
-        )?;
-        let rows = stmt
-            .query_map([alias], |row| {
+            [alias],
+            |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, f64>(2)?,
                 ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            },
+        )?;
         let mut readers = serde_json::Map::new();
         for (kind, payload, at) in rows {
             let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);

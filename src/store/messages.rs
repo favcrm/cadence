@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use super::agents::Agent;
 use super::schema::Take;
 use super::{now, Sender, Store};
+use super::StoreConn;
 
 // Deterministic cost evidence for recurring read paths. Thread-local so
 // unrelated parallel tests cannot add to a caller's measurement.
@@ -548,21 +549,20 @@ impl Store {
         }
 
     /// The ids a steering send superseded, oldest first.
-    fn superseded_by_in(tx: &dyn super::StoreConn, id: &str) -> Result<Vec<String>> {
-        let mut stmt = tx.prepare(
+    fn superseded_by_in(tx: &impl super::StoreConn, id: &str) -> Result<Vec<String>> {
+        let ids = tx.query_vec(
             "SELECT id FROM messages WHERE state='cancelled'
              AND json_extract(result,'$.superseded_by')=? ORDER BY seq",
+            [id],
+            |r| r.get::<_, String>(0),
         )?;
-        let ids = stmt
-            .query_map([id], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(ids)
     }
 
     /// CAD-158 fail-closed gate: `id` may be superseded by a send to
     /// `alias` only while it is `alias`'s own still-`queued` instruction.
     /// The refusal names the id and what it is.
-    fn supersedable_in(&self, tx: &dyn super::StoreConn, alias: &str, id: &str) -> Result<Message> {
+    fn supersedable_in(&self, tx: &impl super::StoreConn, alias: &str, id: &str) -> Result<Message> {
         let refuse = |why: String| {
             Error::rejected(format!(
                 "--supersedes refused, nothing changed: message '{id}' {why} — only \
@@ -601,7 +601,7 @@ impl Store {
     /// caller's transaction then rolls back the whole send.
     fn supersede_in(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         message: &Message,
         new_id: &str,
         steer: &Steer,
@@ -653,7 +653,7 @@ impl Store {
     /// replaced row per recipient.
     fn notify_superseded(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         superseded: &[Message],
         new_id: &str,
         steer: &Steer,
@@ -692,7 +692,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn enqueue_tx(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         alias: &str,
         body: &str,
         reply_to: Option<&str>,
@@ -715,7 +715,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     fn enqueue_tx_as(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         alias: &str,
         body: &str,
         reply_to: Option<&str>,
@@ -814,7 +814,7 @@ impl Store {
         Ok((false, "queued".to_string()))
     }
 
-    pub(super) fn message_in(&self, conn: &dyn super::StoreConn, id: &str) -> Result<Option<Message>> {
+    pub(super) fn message_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<Option<Message>> {
         match conn.query_row("SELECT * FROM messages WHERE id=?", [id], row_message) {
             Ok(m) => Ok(Some(m)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -827,18 +827,18 @@ impl Store {
     /// no schema column or migration is needed for this handoff proof.
     fn queued_recipient_identity(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         alias: &str,
         message_id: &str,
         source: &str,
     ) -> Result<Option<Value>> {
-        let mut stmt = tx.prepare(
+        let raws = tx.query_vec(
             "SELECT payload FROM events
              WHERE alias=? AND kind='queued' ORDER BY seq",
+            [alias],
+            |row| row.get::<_, String>(0),
         )?;
-        let mut rows = stmt.query([alias])?;
-        while let Some(row) = rows.next()? {
-            let payload: String = row.get(0)?;
+        for payload in raws {
             let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
                 continue;
             };
@@ -881,7 +881,7 @@ impl Store {
 
     pub(super) fn recipient_binding(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         source_alias: &str,
         source_message: &str,
         source: &str,
@@ -902,16 +902,16 @@ impl Store {
 
     pub(super) fn handoff_unresolved_exists(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         delivery: &str,
     ) -> Result<bool> {
-        let mut stmt = tx.prepare(
+        let raws = tx.query_vec(
             "SELECT payload FROM events
              WHERE alias=? AND kind='handoff_unresolved' ORDER BY seq",
+            [Self::DAEMON_STREAM],
+            |row| row.get::<_, String>(0),
         )?;
-        let mut rows = stmt.query([Self::DAEMON_STREAM])?;
-        while let Some(row) = rows.next()? {
-            let payload: String = row.get(0)?;
+        for payload in raws {
             let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
                 continue;
             };
@@ -928,7 +928,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn handoff_unresolved(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         task_id: Option<&str>,
         recipient: &str,
         delivery: &str,
@@ -974,7 +974,7 @@ impl Store {
 
     fn fail_unresolved_routed(
         &self,
-        tx: &dyn super::StoreConn,
+        tx: &impl super::StoreConn,
         message: &Message,
         recipient: &Agent,
         expected: Option<&Value>,
@@ -1039,15 +1039,14 @@ impl Store {
                     // to it at claim (below) and is rechecked against it, in this
                     // same transaction, on every later claim.
                     let running_turn: Option<String> = tx
-                        .query_row(
+                        .query_opt(
                             &format!(
                                 "SELECT turn_id FROM messages WHERE alias=? AND state='running'
                                  AND source NOT IN {TURNLESS_SOURCES_SQL} ORDER BY seq LIMIT 1"
                             ),
                             [alias],
                             |r| r.get(0),
-                        )
-                        .optional()?;
+                        )?;
                     let holding = running_turn.is_some();
                     let next_sql = if holding {
                         format!(
@@ -1224,7 +1223,7 @@ impl Store {
 
                     let tx = &mut *conn;
                     let turn_result = tx
-                        .query_row(
+                        .query_opt(
                             "SELECT provider, endpoint_kind FROM agents WHERE alias=?",
                             [&message.alias],
                             |r| {
@@ -1233,8 +1232,7 @@ impl Store {
                                     &r.get::<_, String>(1)?,
                                 ))
                             },
-                        )
-                        .optional()?
+                        )?
                         .unwrap_or(false);
                     let status = if turn_result {
                         "acknowledged"

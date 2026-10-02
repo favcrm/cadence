@@ -26,7 +26,7 @@
 
 use crate::error::{Error, Result};
 use rusqlite::hooks::{AuthAction, Authorization};
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -1010,179 +1010,231 @@ impl<'a> std::ops::Deref for FixtureConn<'a> {
 /// cannot reach a `Connection`/`Transaction`/`commit`/`rollback`, only
 /// the read/DML verbs below. The authorizer still denies a boundary or
 /// DDL the SQL text sneaks in at `phase=Callback`.
+/// The restricted connection surface every read-guard and write-facade
+/// shares: the `Connection`/`Transaction` DML+query verbs under their
+/// rusqlite names, plus collecting helpers (`query_vec`, `for_each_row`)
+/// that keep the `Statement` borrow local so no `Statement` escapes a
+/// callback. Methods are generic over `rusqlite::Params`, so `params!`,
+/// `[]`, `[x]` and `params_from_iter` all work unchanged — the trait is
+/// used as `&impl StoreConn`, never `&dyn`.
+///
+/// `WriteTxn` additionally provides `execute`/`execute_batch`/`query_row`
+/// inherent wrappers that flatten errors for prose callers; `StoreConn`
+/// is how a business `*_in` helper written once runs on a read guard, a
+/// live `Transaction`, and the sealed write facade alike.
 pub(crate) trait StoreConn {
-    fn sql_execute(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize>;
-    fn sql_execute_batch(&self, sql: &str) -> rusqlite::Result<()>;
-    fn sql_query_row<T>(
+    fn execute(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<usize>;
+    fn execute_batch(&self, sql: &str) -> rusqlite::Result<()>;
+    fn query_row<T>(
         &self,
         sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        params: impl rusqlite::Params,
+        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T>;
-    /// Collect a `query_map` to a `Vec` — keeps the `Statement` borrow
-    /// local so the trait is object-safe.
-    fn sql_query_vec<T>(
+    /// `query_row` + `optional()` folded in — `Ok(None)` on no rows.
+    fn query_opt<T>(
         &self,
         sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        params: impl rusqlite::Params,
+        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<Option<T>>;
+    /// `EXISTS`-style boolean probe over `sql`.
+    fn exists(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<bool>;
+    /// `query_map` collected to a `Vec` — the `Statement` borrow stays
+    /// inside the impl so none escapes a callback.
+    fn query_vec<T>(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<Vec<T>>;
-    fn sql_last_insert_rowid(&self) -> i64;
-    fn sql_changes(&self) -> u64;
-}
-impl StoreConn for Connection {
-    fn sql_execute(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize> {
-        self.execute(sql, params)
-    }
-    fn sql_execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
-        self.execute_batch(sql)
-    }
-    fn sql_query_row<T>(
+    /// `query_map` driven row-by-row, early-return safe.
+    fn for_each_row(
         &self,
         sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<T> {
-        self.query_row(sql, params, |r| f(r))
-    }
-    fn sql_query_vec<T>(
+        params: impl rusqlite::Params,
+        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
+    ) -> rusqlite::Result<()>;
+    fn last_insert_rowid(&self) -> i64;
+    fn changes(&self) -> usize;
+    /// `pragma_query_value` for a pragma whose value the caller decodes.
+    fn pragma_query_value<T, F>(
         &self,
-        sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<Vec<T>> {
-        let mut stmt = self.prepare(sql)?;
-        stmt.query_map(params, |r| f(r))?.collect()
-    }
-    fn sql_last_insert_rowid(&self) -> i64 {
-        self.last_insert_rowid()
-    }
-    fn sql_changes(&self) -> u64 {
-        self.changes()
-    }
-}
-impl StoreConn for Transaction<'_> {
-    fn sql_execute(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize> {
-        self.execute(sql, params)
-    }
-    fn sql_execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
-        self.execute_batch(sql)
-    }
-    fn sql_query_row<T>(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<T> {
-        self.query_row(sql, params, |r| f(r))
-    }
-    fn sql_query_vec<T>(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<Vec<T>> {
-        let mut stmt = self.prepare(sql)?;
-        stmt.query_map(params, |r| f(r))?.collect()
-    }
-    fn sql_last_insert_rowid(&self) -> i64 {
-        self.last_insert_rowid()
-    }
-    fn sql_changes(&self) -> u64 {
-        self.changes()
-    }
-}
-impl StoreConn for &Connection {
-    fn sql_execute(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize> {
-        (**self).sql_execute(sql, params)
-    }
-    fn sql_execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
-        (**self).sql_execute_batch(sql)
-    }
-    fn sql_query_row<T>(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<T> {
-        (**self).sql_query_row(sql, params, f)
-    }
-    fn sql_query_vec<T>(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<Vec<T>> {
-        (**self).sql_query_vec(sql, params, f)
-    }
-    fn sql_last_insert_rowid(&self) -> i64 {
-        (**self).sql_last_insert_rowid()
-    }
-    fn sql_changes(&self) -> u64 {
-        (**self).sql_changes()
-    }
-}
-impl StoreConn for &Transaction<'_> {
-    fn sql_execute(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize> {
-        (**self).sql_execute(sql, params)
-    }
-    fn sql_execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
-        (**self).sql_execute_batch(sql)
-    }
-    fn sql_query_row<T>(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<T> {
-        (**self).sql_query_row(sql, params, f)
-    }
-    fn sql_query_vec<T>(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<Vec<T>> {
-        (**self).sql_query_vec(sql, params, f)
-    }
-    fn sql_last_insert_rowid(&self) -> i64 {
-        (**self).sql_last_insert_rowid()
-    }
-    fn sql_changes(&self) -> u64 {
-        (**self).sql_changes()
-    }
+        database_name: Option<rusqlite::DatabaseName<'_>>,
+        pragma_name: &str,
+        f: F,
+    ) -> rusqlite::Result<T>
+    where
+        T: rusqlite::types::FromSql,
+        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>;
 }
 
-impl<'t> StoreConn for WriteTxn<'t> {
-    fn sql_execute(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize> {
-        self.tx.execute(sql, params)
-    }
-    fn sql_execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
-        self.tx.execute_batch(sql)
-    }
-    fn sql_query_row<T>(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<T> {
-        self.tx.query_row(sql, params, |r| f(r))
-    }
-    fn sql_query_vec<T>(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-        f: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<Vec<T>> {
-        let mut stmt = self.tx.prepare(sql)?;
-        stmt.query_map(params, |r| f(r))?.collect()
-    }
-    fn sql_last_insert_rowid(&self) -> i64 {
-        self.tx.last_insert_rowid()
-    }
-    fn sql_changes(&self) -> u64 {
-        self.tx.changes()
-    }
+/// Implement `StoreConn` for a type that derefs to a `&Connection`
+/// (`Connection`, `MutexGuard`, owner fixtures) — or a `&Transaction`
+/// (`Transaction`, `WriteTxn` via its `tx`). `|$g| expr` yields the
+/// `&Connection`/`&Transaction` to call the matching inherent verb on.
+macro_rules! storeconn_impl {
+    ($t:ty, |$g:ident| $get:expr) => {
+        impl StoreConn for $t {
+            fn execute(
+                &self,
+                sql: &str,
+                params: impl rusqlite::Params,
+            ) -> rusqlite::Result<usize> {
+                let $g = self;
+                ($get).execute(sql, params)
+            }
+            fn execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+                let $g = self;
+                ($get).execute_batch(sql)
+            }
+            fn query_row<T>(
+                &self,
+                sql: &str,
+                params: impl rusqlite::Params,
+                f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+            ) -> rusqlite::Result<T> {
+                let $g = self;
+                ($get).query_row(sql, params, f)
+            }
+            fn query_opt<T>(
+                &self,
+                sql: &str,
+                params: impl rusqlite::Params,
+                f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+            ) -> rusqlite::Result<Option<T>> {
+                let $g = self;
+                ($get).query_row(sql, params, f).optional()
+            }
+            fn exists(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<bool> {
+                let $g = self;
+                ($get).prepare(sql)?.exists(params)
+            }
+            fn query_vec<T>(
+                &self,
+                sql: &str,
+                params: impl rusqlite::Params,
+                f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+            ) -> rusqlite::Result<Vec<T>> {
+                let $g = self;
+                ($get).prepare(sql)?.query_map(params, f)?.collect()
+            }
+            fn for_each_row(
+                &self,
+                sql: &str,
+                params: impl rusqlite::Params,
+                f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
+            ) -> rusqlite::Result<()> {
+                let $g = self;
+                let mut stmt = ($get).prepare(sql)?;
+                let mut rows = stmt.query_map(params, f)?;
+                while let Some(next) = rows.next() {
+                    next?;
+                }
+                Ok(())
+            }
+            fn last_insert_rowid(&self) -> i64 {
+                let $g = self;
+                ($get).last_insert_rowid()
+            }
+            fn changes(&self) -> usize {
+                let $g = self;
+                ($get).changes()
+            }
+            fn pragma_query_value<T, F>(
+                &self,
+                database_name: Option<rusqlite::DatabaseName<'_>>,
+                pragma_name: &str,
+                f: F,
+            ) -> rusqlite::Result<T>
+            where
+                T: rusqlite::types::FromSql,
+                F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+            {
+                let $g = self;
+                ($get).pragma_query_value(database_name, pragma_name, f)
+            }
+        }
+    };
+}
+
+storeconn_impl!(Connection, |g| -> &Connection { g });
+storeconn_impl!(Transaction<'_>, |g| -> &Transaction<'_> { g });
+storeconn_impl!(std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &**g });
+storeconn_impl!(WriteTxn<'_>, |g| -> &Transaction<'_> { g.tx });
+
+/// `&T`/`&mut T` for any `StoreConn` forwards — a `*_in` helper taking
+/// `&impl StoreConn` composes with a caller holding a `&conn`/`&tx` of
+/// any receiver type without an extra borrow.
+macro_rules! storeconn_fwd {
+    () => {
+        fn execute(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<usize> {
+            (**self).execute(sql, params)
+        }
+        fn execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+            (**self).execute_batch(sql)
+        }
+        fn query_row<T>(
+            &self,
+            sql: &str,
+            params: impl rusqlite::Params,
+            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        ) -> rusqlite::Result<T> {
+            (**self).query_row(sql, params, f)
+        }
+        fn query_opt<T>(
+            &self,
+            sql: &str,
+            params: impl rusqlite::Params,
+            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        ) -> rusqlite::Result<Option<T>> {
+            (**self).query_opt(sql, params, f)
+        }
+        fn exists(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<bool> {
+            (**self).exists(sql, params)
+        }
+        fn query_vec<T>(
+            &self,
+            sql: &str,
+            params: impl rusqlite::Params,
+            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        ) -> rusqlite::Result<Vec<T>> {
+            (**self).query_vec(sql, params, f)
+        }
+        fn for_each_row(
+            &self,
+            sql: &str,
+            params: impl rusqlite::Params,
+            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
+        ) -> rusqlite::Result<()> {
+            (**self).for_each_row(sql, params, f)
+        }
+        fn last_insert_rowid(&self) -> i64 {
+            (**self).last_insert_rowid()
+        }
+        fn changes(&self) -> usize {
+            (**self).changes()
+        }
+        fn pragma_query_value<T, F>(
+            &self,
+            database_name: Option<rusqlite::DatabaseName<'_>>,
+            pragma_name: &str,
+            f: F,
+        ) -> rusqlite::Result<T>
+        where
+            T: rusqlite::types::FromSql,
+            F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        {
+            (**self).pragma_query_value(database_name, pragma_name, f)
+        }
+    };
+}
+
+impl<T: StoreConn + ?Sized> StoreConn for &T {
+    storeconn_fwd!();
+}
+impl<T: StoreConn + ?Sized> StoreConn for &mut T {
+    storeconn_fwd!();
 }
 
 /// The restricted write facade handed to a business callback. Wraps the
