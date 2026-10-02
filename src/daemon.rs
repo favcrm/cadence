@@ -58,6 +58,7 @@ mod requests_rpc;
 mod review_evidence_rpc;
 mod serve;
 mod slots_rpc;
+mod social_publish_driver;
 mod social_publish_rpc;
 mod test_queue_rpc;
 mod threads_rpc;
