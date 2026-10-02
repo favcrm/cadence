@@ -224,6 +224,42 @@ class PrePush(unittest.TestCase):
         self.assertEqual(self.calls(), [])
         self.assertIn("[PLAN] clippy:", r.stdout)
 
+    # ---------- CAD-1021: --receipt ----------
+
+    def receipt_line(self, out):
+        return [l for l in out.splitlines() if l.startswith("head=")]
+
+    def test_receipt_on_success_binds_head_lane_kind_and_steps(self):
+        self.edit("src/lib.rs", "pub fn x() {}\n")
+        r = self.pp("--receipt")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        lines = self.receipt_line(r.stdout)
+        self.assertEqual(len(lines), 1, r.stdout)
+        line = lines[0]
+        # head binds the checked SHA; lane/kind identify the runner.
+        head = subprocess.run([*GIT, "-C", str(self.repo), "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        self.assertIn(f"head={head}", line)
+        self.assertIn("lane=", line)
+        self.assertIn("kind=", line)
+        self.assertIn("rc=0", line)
+        self.assertIn("fmt:0", line)
+        self.assertIn("clippy:0", line)
+        self.assertIn("at=", line)
+
+    def test_receipt_on_failure_records_the_failing_step(self):
+        self.edit("src/lib.rs", "pub fn x() {}\n")
+        r = self.pp("--receipt", fail="fmt", rc="3")
+        self.assertEqual(r.returncode, 1)
+        lines = self.receipt_line(r.stdout)
+        self.assertEqual(len(lines), 1, r.stdout)
+        self.assertIn("fmt:3", lines[0])
+        self.assertIn("rc=1", lines[0])
+
+    def test_receipt_off_by_default(self):
+        r = self.pp()
+        self.assertEqual(self.receipt_line(r.stdout), [])
+
 
 if __name__ == "__main__":
     unittest.main()
