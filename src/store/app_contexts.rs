@@ -94,13 +94,11 @@ impl Store {
     }
     pub fn app_context_show(&self, install: &str, id: &str) -> Result<Value> {
         {
-            self.write_tx(|conn| {
-                Ok(json!({"context":Self::app_context_show_in(&conn,install,id)?}))
-            })
+            self.read_tx(|conn| Ok(json!({"context":Self::app_context_show_in(&conn,install,id)?})))
         }
     }
     pub fn app_context_list(&self, install: &str) -> Result<Value> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
 
                     let ids = conn.query_vec("SELECT id FROM app_contexts WHERE install_id=? ORDER BY created,id LIMIT 101", [install], |r| r.get::<_, String>(0)).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -119,7 +117,7 @@ impl Store {
         install: &str,
         id: &str,
     ) -> Result<(ContextConfig, ContextProof)> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let row = Self::app_context_show_in(&conn, install, id)?;
             if row["state"] != "active" {
                 return Err(Error::rejected("context is archived"));

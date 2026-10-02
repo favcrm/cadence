@@ -508,7 +508,7 @@ impl Store {
         platform: &str,
         account: &str,
     ) -> Result<Option<CredentialRecord>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             conn.query_opt(
                 "SELECT * FROM platform_credentials WHERE platform=?1 AND account=?2",
                 params![platform, account],
@@ -520,7 +520,7 @@ impl Store {
 
     /// Every enrolled credential record, sorted by platform/account.
     pub fn platform_credentials(&self) -> Result<Vec<CredentialRecord>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let stmt_sql = "SELECT * FROM platform_credentials ORDER BY platform, account";
             let rows = conn
                 .query_vec(stmt_sql, [], credential_row)
@@ -722,7 +722,7 @@ impl Store {
         platform: &str,
         account: &str,
     ) -> Result<Option<Grant>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             conn.query_opt(
                 "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
                 params![agent, platform, account],
@@ -734,7 +734,7 @@ impl Store {
 
     /// Grants — all of them, or one agent's.
     pub fn platform_grants(&self, agent: Option<&str>) -> Result<Vec<Grant>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let mut out = Vec::new();
             match agent {
                 Some(agent) => {
@@ -971,7 +971,7 @@ impl Store {
         project: &str,
         platform: &str,
     ) -> Result<Option<ProjectDefault>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             conn.query_opt(
                 "SELECT * FROM platform_defaults WHERE project=?1 AND platform=?2",
                 params![project, platform],
@@ -991,7 +991,7 @@ impl Store {
 
     /// Every project default — `platform_defaults` lists them.
     pub fn platform_defaults(&self) -> Result<Vec<ProjectDefault>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let stmt_sql = "SELECT * FROM platform_defaults ORDER BY project, platform";
             let rows = conn
                 .query_vec(stmt_sql, [], |row| {
@@ -1114,7 +1114,7 @@ impl Store {
     /// removed from the tracker, so a removal can never leave a
     /// standing grant behind.
     pub fn app_grants_apps(&self) -> Result<Vec<String>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let stmt_sql = "SELECT DISTINCT app FROM app_grants ORDER BY app";
             let rows = conn
                 .query_vec(stmt_sql, [], |r| r.get::<_, String>(0))
@@ -1170,7 +1170,7 @@ impl Store {
     /// this to find a grant whose install is no longer the current one,
     /// including a row whose approval derived nothing else to list.
     pub fn app_grant_installs(&self) -> Result<Vec<(String, String)>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let stmt_sql = "SELECT DISTINCT app, install_id FROM app_grants ORDER BY app";
             let rows = conn
                 .query_vec(stmt_sql, [], |r| {

@@ -353,13 +353,6 @@ impl Store {
     /// a foreign reader keeps the file alive, which is `Ok(false)`,
     /// not a failure — the WAL is durable either way, just not merged.
     pub fn checkpoint(&self) -> Result<bool> {
-        let conn = self.conn();
-        let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
-        match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-        }) {
-            Ok((0, log)) => Ok(log >= 0),
-            _ => Ok(false),
-        }
+        self.owner_checkpoint()
     }
 }

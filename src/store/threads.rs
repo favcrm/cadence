@@ -419,7 +419,7 @@ impl Store {
 
     /// The alias's thread, if one was ever started.
     pub fn thread(&self, alias: &str) -> Result<Option<Thread>> {
-        self.write_tx(|conn| Self::thread_in(&conn, alias))
+        self.read_tx(|conn| Self::thread_in(&conn, alias))
     }
 
     fn thread_in(conn: &impl super::StoreConn, alias: &str) -> Result<Option<Thread>> {

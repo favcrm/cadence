@@ -597,7 +597,7 @@ impl Store {
         })
     }
     pub fn app_run_show(&self, id: &str) -> Result<Value> {
-        self.write_tx(|conn| Self::app_run_show_in(&conn, id))
+        self.read_tx(|conn| Self::app_run_show_in(&conn, id))
     }
     pub(super) fn app_run_show_in(conn: &impl super::StoreConn, id: &str) -> Result<Value> {
         let mut value=conn.query_row("SELECT install_id,epoch,snapshot,snapshot_digest,project_link,state,approved_digest FROM app_runs WHERE id=?",[id],|r|Ok(json!({"id":id,"install_id":r.get::<_,String>(0)?,"epoch":r.get::<_,i64>(1)?,"snapshot":r.get::<_,String>(2)?,"snapshot_digest":r.get::<_,String>(3)?,"project_link":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"approved_digest":r.get::<_,Option<String>>(6)?}))).optional()?.ok_or_else(||Error::rejected("unknown app run"))?;
@@ -1698,7 +1698,7 @@ impl Store {
 
     pub fn app_message_installation(&self, message: &str) -> Result<Option<(String, String)>> {
         {
-            self.write_tx(|conn| {
+            self.read_tx(|conn| {
 
                             Ok(conn.query_opt("SELECT r.id,r.install_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.message_id=?",[message],|r|Ok((r.get(0)?,r.get(1)?)))?)
             })
@@ -1740,7 +1740,7 @@ impl Store {
         Ok(())
     }
     pub fn app_message_admit(&self, message: &Message, bundle: &str) -> Result<()> {
-        self.write_tx(|conn| self.app_message_admit_in(&conn, message, bundle))
+        self.read_tx(|conn| self.app_message_admit_in(&conn, message, bundle))
     }
     pub fn reject_app_submission(&self, message: &str) -> Result<()> {
         self.write_tx(|conn| {

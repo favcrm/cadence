@@ -818,7 +818,7 @@ impl Store {
     }
 
     pub fn model_defaults(&self) -> Result<ModelDefaultsSnapshot> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let tx = &mut *conn;
             let snapshot = Self::read_model_defaults_tx(&tx)?;
             Ok(snapshot)
@@ -1189,7 +1189,7 @@ impl Store {
     /// [`Store::timer_gc_remove`].
     pub fn gc_candidates(&self, older_than: Option<f64>) -> Result<Vec<Agent>> {
         let cutoff = older_than.map(|age| now() - age).unwrap_or(f64::MAX);
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let stmt_sql = "SELECT * FROM agents WHERE endpoint IS NULL
                          AND state IN ('attention','stopped') AND updated < ?";
             let rows = conn

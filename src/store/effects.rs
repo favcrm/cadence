@@ -303,7 +303,7 @@ impl Store {
 
     /// One row by brokered handle.
     pub fn effect_by_request(&self, request: &str) -> Result<Option<EffectRow>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             conn.query_opt(
                 "SELECT * FROM platform_effects WHERE request=?1",
                 params![request],
@@ -315,7 +315,7 @@ impl Store {
 
     /// One row by durable id.
     pub fn effect_by_id(&self, effect_id: &str) -> Result<Option<EffectRow>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             conn.query_opt(
                 "SELECT * FROM platform_effects WHERE effect_id=?1",
                 params![effect_id],
@@ -327,7 +327,7 @@ impl Store {
 
     /// Pending-effect records — all of them, or one agent's.
     pub fn platform_effects(&self, agent: Option<&str>) -> Result<Vec<EffectRow>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
 
                     let mut out = Vec::new();
                     match agent {
@@ -352,7 +352,7 @@ impl Store {
     /// The draft log — the information-only "ran without you" rows.
     /// `limit` bounds the listing; newest first.
     pub fn platform_drafts(&self, agent: Option<&str>, limit: usize) -> Result<Vec<DraftRow>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let mut out = Vec::new();
             let sql = match agent {
                 Some(_) => {

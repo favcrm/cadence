@@ -271,6 +271,7 @@ const ALLOWED_FUNCTIONS: &[&str] = &[
     "round",
     "printf",
     "glob",
+    "like",
     "group_concat",
     "json_extract",
     "json_array",
@@ -760,6 +761,20 @@ impl Store {
         self.sealed_tx(GuardState::BUSINESS, false, f)
     }
 
+    /// A consistent read snapshot remains available after lease loss or
+    /// closure. The authorizer stays Disarmed, so even facade DML verbs
+    /// refuse; only the guard opens/finishes the deferred read transaction.
+    /// Owned results cannot carry a prepared statement outside the snapshot.
+    pub(crate) fn read_tx<R>(
+        &self,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
+    ) -> Result<R>
+    where
+        R: 'static,
+    {
+        self.sealed_tx(GuardState::DISARMED, true, f)
+    }
+
     /// [`Self::with_sealed_tx`] plus a fence re-check inside the held
     /// conn mutex — a writer fenced while waiting on the lock is refused
     /// before the arm and before `BEGIN`, so the fence/latch/DML decision
@@ -767,7 +782,7 @@ impl Store {
     /// reason when the lease is lost; `|| None` passes always-armed.
     pub(crate) fn with_sealed_tx_fenced<R>(
         &self,
-        fence: impl FnOnce() -> Option<String>,
+        fence: impl Fn() -> Option<String>,
         f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
     ) -> Result<R>
     where
@@ -779,7 +794,7 @@ impl Store {
     /// Raw-error variant of [`Self::with_sealed_tx_fenced`].
     pub(crate) fn with_sealed_tx_fenced_raw<T>(
         &self,
-        fence: impl FnOnce() -> Option<String>,
+        fence: impl Fn() -> Option<String>,
         f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T>
     where
@@ -804,7 +819,7 @@ impl Store {
         &self,
         arm: u8,
         on_sealed: bool,
-        fence: Option<impl FnOnce() -> Option<String>>,
+        fence: Option<impl Fn() -> Option<String>>,
         f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
     ) -> Result<R>
     where
@@ -815,7 +830,7 @@ impl Store {
         // Re-check the hosted-lease fence INSIDE the held mutex — a
         // writer fenced while waiting on the lock is refused before the
         // arm and before `BEGIN`, so fence/latch/DML serialize together.
-        if let Some(fence) = fence {
+        if let Some(fence) = fence.as_ref() {
             if let Some(reason) = fence() {
                 return Err(Error::rejected(format!(
                     "store write refused — the daemon's hosted lease is lost: {reason}"
@@ -827,9 +842,22 @@ impl Store {
         // permits the tx boundary.
         let tx = {
             let _ctrl = ControlPhase::enter(state);
-            Transaction::new_unchecked(&guard, TransactionBehavior::Immediate)
+            let behavior = if arm == GuardState::DISARMED {
+                TransactionBehavior::Deferred
+            } else {
+                TransactionBehavior::Immediate
+            };
+            Transaction::new_unchecked(&guard, behavior)
                 .map_err(|e| Error::internal(e.to_string()))?
         };
+        // BEGIN may have waited on another connection after the first check.
+        // Refuse a lease lost during that wait before any callback begins.
+        if let Some(reason) = fence.as_ref().and_then(|check| check()) {
+            Self::rollback_tx(state, &guard, tx)?;
+            return Err(Error::rejected(format!(
+                "store write refused — the daemon's hosted lease is lost: {reason}"
+            )));
+        }
         // Producer/business writes refuse a sealed latch. `witness_commit`
         // is the owner barrier that legitimately writes *after* seal — it
         // passes `on_sealed` and verifies the latch itself inside `f`.
@@ -852,6 +880,12 @@ impl Store {
         };
         match outcome {
             Ok(Ok(v)) => {
+                if let Some(reason) = fence.as_ref().and_then(|check| check()) {
+                    Self::rollback_tx(state, &guard, tx)?;
+                    return Err(Error::rejected(format!(
+                        "store write refused — the daemon's hosted lease is lost: {reason}"
+                    )));
+                }
                 let _ctrl = ControlPhase::enter(state);
                 tx.commit().map_err(|e| Error::internal(e.to_string()))?;
                 Ok(v)
@@ -880,7 +914,7 @@ impl Store {
         &self,
         arm: u8,
         on_sealed: bool,
-        fence: Option<impl FnOnce() -> Option<String>>,
+        fence: Option<impl Fn() -> Option<String>>,
         f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T>
     where
@@ -888,7 +922,7 @@ impl Store {
     {
         let guard = self.conn();
         let state = &*self.seal_state;
-        if let Some(fence) = fence {
+        if let Some(fence) = fence.as_ref() {
             if let Some(reason) = fence() {
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                     Error::rejected(format!(
@@ -902,6 +936,16 @@ impl Store {
             let _ctrl = ControlPhase::enter(state);
             Transaction::new_unchecked(&guard, TransactionBehavior::Immediate)?
         };
+        if let Some(reason) = fence.as_ref().and_then(|check| check()) {
+            if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(rb)));
+            }
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                Error::rejected(format!(
+                    "store write refused — the daemon's hosted lease is lost: {reason}"
+                )),
+            )));
+        }
         if !on_sealed {
             if let Err(e) = Self::check_closed_tx(&tx) {
                 if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
@@ -916,6 +960,16 @@ impl Store {
         };
         match outcome {
             Ok(Ok(v)) => {
+                if let Some(reason) = fence.as_ref().and_then(|check| check()) {
+                    if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
+                        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(rb)));
+                    }
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        Error::rejected(format!(
+                            "store write refused — the daemon's hosted lease is lost: {reason}"
+                        )),
+                    )));
+                }
                 let _ctrl = ControlPhase::enter(state);
                 tx.commit()?;
                 Ok(v)
@@ -1000,6 +1054,7 @@ impl Store {
     /// `Owner`. A sealed store refuses inside the tx before `f` runs.
     fn with_owner_tx<R>(&self, f: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
         let guard = self.conn();
+        self.check_owner_write_fence()?;
         let state = &*self.seal_state;
         let _armed = ArmGuard::enter(state, GuardState::OWNER);
         // BEGIN IMMEDIATE in the tx-control window; the authorizer
@@ -1009,6 +1064,10 @@ impl Store {
             Transaction::new_unchecked(&guard, TransactionBehavior::Immediate)
                 .map_err(|e| Error::internal(e.to_string()))?
         };
+        if let Err(error) = self.check_owner_write_fence() {
+            Self::rollback_tx(state, &guard, tx)?;
+            return Err(error);
+        }
         // Latch check INSIDE the held tx — serializes the check+write
         // against any other writer on the file.
         if let Err(e) = Self::check_closed_tx(&tx) {
@@ -1023,6 +1082,10 @@ impl Store {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&tx)));
         match outcome {
             Ok(Ok(v)) => {
+                if let Err(error) = self.check_owner_write_fence() {
+                    Self::rollback_tx(state, &guard, tx)?;
+                    return Err(error);
+                }
                 let _ctrl = ControlPhase::enter(state);
                 tx.commit().map_err(|e| Error::internal(e.to_string()))?;
                 Ok(v)
@@ -1037,6 +1100,40 @@ impl Store {
                 }
                 std::panic::resume_unwind(payload);
             }
+        }
+    }
+
+    fn check_owner_write_fence(&self) -> Result<()> {
+        if let Some(reason) = self.write_fence.get().and_then(|fence| fence.check()) {
+            return Err(Error::rejected(format!(
+                "store owner write refused — the daemon's hosted lease is lost: {reason}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Finite legacy shutdown maintenance: folding already committed WAL
+    /// pages introduces no business rows and may complete after lease loss.
+    /// SQLite forbids checkpointing inside a transaction. No callback gets
+    /// this owner arm; latch-bearing/protected stores refuse. This is neither
+    /// physical retirement nor protected closure/FINAL evidence.
+    pub(super) fn owner_checkpoint(&self) -> Result<bool> {
+        let conn = self.conn();
+        if self.protected_open || preflight_read(&conn)? != Preflight::LatchAbsent {
+            return Err(SealError::Unknown(
+                "checkpoint unavailable for a protected or latch-bearing store".into(),
+            )
+            .into());
+        }
+        let _armed = ArmGuard::enter(&self.seal_state, GuardState::OWNER);
+        let _ctrl = ControlPhase::enter(&self.seal_state);
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+        match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        }) {
+            Ok((0, log)) => Ok(log >= 0),
+            Ok(_) => Ok(false),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -1997,6 +2094,102 @@ mod tests {
     /// real busy handler proves it reached the contended BEGIN IMMEDIATE;
     /// bounded channels release the first commit before its retry. No sleeps
     /// or reopening a sealed file stand in for an actual competing writer.
+    #[test]
+    fn lease_loss_inside_callback_rolls_back_business_raw_and_owner_writes() {
+        for mode in [0, 1, 2] {
+            let dir = TempDir::new().unwrap();
+            let (_, store) = open_legacy(&dir);
+            let fence = Arc::new(crate::lease::Fence::default());
+            store.install_write_fence(Arc::clone(&fence));
+            let result = match mode {
+                0 => store.write_tx(|tx| {
+                    tx.execute("INSERT INTO events(alias,kind,payload,at) VALUES('lease-in-callback','probe','{}',0)", [])?;
+                    fence.trip("test lease lost inside callback");
+                    Ok(())
+                }),
+                1 => store.write_tx_raw(|tx| {
+                    tx.execute_raw("INSERT INTO events(alias,kind,payload,at) VALUES('lease-in-callback','probe','{}',0)", [])?;
+                    fence.trip("test lease lost inside callback");
+                    Ok(())
+                }).map_err(Error::from),
+                _ => store.with_owner_tx(|tx| {
+                    tx.execute("INSERT INTO events(alias,kind,payload,at) VALUES('lease-in-callback','probe','{}',0)", [])?;
+                    fence.trip("test lease lost inside callback");
+                    Ok(())
+                }),
+            };
+            assert!(result.is_err(), "mode={mode}: lease loss admitted a commit");
+            let conn = store.conn();
+            assert!(conn.is_autocommit());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE alias='lease-in-callback'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn read_snapshot_has_no_write_authority_when_fenced_or_closed() {
+        let dir = TempDir::new().unwrap();
+        let (db, store) = open_legacy(&dir);
+        let blocker = Connection::open(&db).unwrap();
+        let held = Transaction::new_unchecked(&blocker, TransactionBehavior::Immediate).unwrap();
+        // A WAL reader must not acquire the other connection's write lock.
+        assert_eq!(
+            store
+                .read_tx(|tx| tx.query_row(
+                    "SELECT COUNT(*) FROM events WHERE alias LIKE 'read-%'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                ))
+                .unwrap(),
+            0
+        );
+        held.rollback().unwrap();
+        let fence = Arc::new(crate::lease::Fence::default());
+        store.install_write_fence(Arc::clone(&fence));
+        fence.trip("test lost lease");
+        assert!(store
+            .owner_record_running_build("untrusted-after-loss")
+            .is_err());
+        assert!(
+            store.checkpoint().unwrap(),
+            "legacy committed WAL remains flushable after lease loss"
+        );
+        for closed in [false, true] {
+            if closed {
+                // Synthetic owner permit exercises the mechanism only.
+                store
+                    .propose_close(&permit(&db, OwnerOp::Close, b"c", "a", "art", 1), "test")
+                    .unwrap();
+                assert!(
+                    store.checkpoint().is_err(),
+                    "latched stores cannot use legacy checkpoint maintenance"
+                );
+            }
+            assert!(store.read_tx(|tx| {
+                tx.execute("INSERT INTO events(alias,kind,payload,at) VALUES('read-write-probe','probe','{}',0)", [])?;
+                Ok(())
+            }).is_err());
+            assert_eq!(
+                store
+                    .read_tx(|tx| tx.query_row(
+                        "SELECT COUNT(*) FROM events WHERE alias LIKE 'read-%'",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    ))
+                    .unwrap(),
+                0
+            );
+            assert!(store.conn().is_autocommit());
+        }
+    }
+
     #[test]
     fn lease_loss_while_waiting_for_sqlite_writer_refuses_both_callbacks() {
         use std::sync::{mpsc, Mutex};

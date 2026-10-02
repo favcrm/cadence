@@ -295,7 +295,7 @@ impl Store {
     /// (`payload.message`) — e.g. the daemon's `master_dispatched`
     /// record of a master kickoff (CAD-323).
     pub fn event_names_message(&self, alias: &str, kind: &str, message_id: &str) -> Result<bool> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let n: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind=?2 \
                          AND json_extract(payload,'$.message')=?3",
@@ -537,7 +537,7 @@ impl Store {
 
     /// CAD-405: the latest work-gate approval per project.
     pub fn work_approvals(&self) -> Result<std::collections::HashMap<String, Value>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let rows: Vec<String> = conn.query_vec(
                 "SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq",
                 params![APPROVAL_STREAM, WORK_APPROVED_EVENT],
@@ -806,7 +806,7 @@ impl Store {
 
     /// A live (unrevoked) scope pre-approval by id: `(issue, digest)`.
     pub fn scope_approval(&self, id: &str) -> Result<Option<(String, String)>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let stream = Self::approval_stream(&conn)?;
             if Self::revoked_ids(&stream).contains(id) {
                 return Ok(None);

@@ -62,7 +62,7 @@ impl Store {
     /// queued and countable but stop blocking the follower's head of
     /// line.
     pub fn inbox_peek(&self, alias: &str, after: i64, reader: &str) -> Result<Vec<Message>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             self.inbox_agent_in(&conn, alias)?;
             let stmt_sql = "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
                          ORDER BY seq";

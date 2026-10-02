@@ -206,7 +206,7 @@ impl Store {
     }
 
     pub fn monitor_view(&self, id: &str) -> Result<(Monitor, Vec<String>, i64, i64)> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let monitor = self.monitor_in(&conn, id)?;
             let coverage = self.monitor_coverage_in(&conn, id)?;
             let (open, total) = self.monitor_counts_in(&conn, id)?;
@@ -215,7 +215,7 @@ impl Store {
     }
 
     pub fn monitors(&self) -> Result<Vec<Monitor>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let stmt_sql = "SELECT * FROM monitors ORDER BY id";
             let rows = conn
                 .query_vec(stmt_sql, [], row_monitor)
@@ -340,11 +340,11 @@ impl Store {
     }
 
     pub fn monitor(&self, id: &str) -> Result<Monitor> {
-        self.write_tx(|conn| self.monitor_in(&conn, id))
+        self.read_tx(|conn| self.monitor_in(&conn, id))
     }
 
     pub fn monitor_is_covered(&self, id: &str, task_id: &str) -> Result<bool> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             self.monitor_in(&conn, id)?;
             Ok(conn
                 .query_row(
@@ -360,7 +360,7 @@ impl Store {
     /// reconciliation; membership is always the stored task set and is
     /// never inferred from a project or job name.
     pub fn monitor_tasks(&self, id: &str) -> Result<Vec<String>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             self.monitor_in(&conn, id)?;
             self.monitor_coverage_in(&conn, id)
         })
@@ -625,7 +625,7 @@ impl Store {
     }
 
     pub fn due_monitors(&self, at: f64) -> Result<Vec<Monitor>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             let stmt_sql = "SELECT * FROM monitors
                          WHERE state IN ('active','degraded') AND next_check_at IS NOT NULL
                            AND next_check_at<=?
@@ -982,7 +982,7 @@ impl Store {
         open_only: bool,
         limit: i64,
     ) -> Result<Vec<MonitorAlert>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             self.monitor_in(&conn, id)?;
             let sql = if open_only {
                 "SELECT * FROM monitor_alerts WHERE monitor_id=? AND seq>? AND state='open'

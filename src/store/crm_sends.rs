@@ -76,7 +76,7 @@ impl Store {
     /// Every send whose durable intent is still live — the boot-time
     /// sweep's worklist.
     pub fn crm_sends_sending(&self) -> Result<Vec<(String, String, String)>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
 
                     let stmt_sql = "SELECT install_id,context_id,send_id FROM crm_sends WHERE state='sending' ORDER BY created";
                     let rows = conn.query_vec(stmt_sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))
@@ -116,7 +116,7 @@ impl Store {
         &self,
         token_hash: &str,
     ) -> Result<Option<(String, String)>> {
-        self.write_tx(|conn| {
+        self.read_tx(|conn| {
             conn.query_opt(
                 "SELECT install_id,context_id FROM crm_unsubscribe_index WHERE token_hash=?",
                 params![token_hash],
