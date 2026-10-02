@@ -61,19 +61,26 @@ pane and must never pass `operator_proof`.
   (a) the calling process natively derives to `alias` (I4), (b) a live grant
   names `alias` **and the op being run** and **this state dir**, and (c) it is
   not expired/revoked. On any other state dir — including another staging dir —
-  the same `--as delegate:<alias>` finds no grant and is refused.
+  the same `--as delegate:<alias>` finds no grant and is refused. The v1 ops
+  allowlist is `rollout_claim`, `daemon_start`, `daemon_stop`, `ui_start`,
+  `ui_stop` — `app_upgrade` is **cut** (PM decision; see Out of scope).
 - **I4 — native identity.** `delegate:<alias>` is admitted only when the
   caller's *process* identity proves `alias`. On the daemon RPC path that is
   `connection_caller` → `Who::Agent(alias)`. On the CLI lease path
   (`rollout claim`, `daemon start --as`) there is no daemon connection to lean
-  on, so the CLI must derive `alias` positively: the process's own
-  `CADENCE_ALIAS` must equal `alias` **and** the target state dir's `agents`
-  table must register that alias with a live endpoint whose pid sits on this
-  process's `/proc` ancestry (pane pid or enrolled managed root, `pid_start`
-  re-verified) — i.e. the same derivation `operator_proof` runs, inverted. A
-  forged `CADENCE_ALIAS` on an unregistered process, a scrubbed env, or an
-  alias not registered **in that state dir** all fail. `delegate:` never names
-  `operator:` and can never mint operator authority.
+  on, so the CLI derives `alias` positively — **this is new code, named here
+  (PM decision 4)**: (i) the process's own `CADENCE_ALIAS` must equal `alias`;
+  (ii) the *target* state dir's `agents` table — read through the rollout
+  read-only peek — must register `alias`; (iii) a `caller_chain` /
+  `slot_identity`-style `/proc` ancestry walk of this process must find that
+  alias's live endpoint (a registered pane pid or an enrolled managed root,
+  `pid_start` re-verified via `AgentPids::classify(...).fenced()`). The
+  endpoint must be registered **in that state dir** — an alias registered only
+  in dir B does not prove the shell's identity for dir A, and the ancestry
+  binding is checked against *this* state dir's agents table, not a global one.
+  A forged `CADENCE_ALIAS` on an unregistered process, a scrubbed env, and a
+  cross-state-dir registration all fail. `delegate:` never names `operator:`
+  and can never mint operator authority.
 - **I5 — production can never qualify.** The staging registration and every
   grant check runs a hard allowlist: the state dir must resolve (via
   `sandbox::resolved`-style canonicalization) outside `client::default_state_dir()`,
@@ -85,10 +92,16 @@ pane and must never pass `operator_proof`.
   registered. A `delegate:` claim against `~/.local/state/cadence` finds no
   grant because none can have been created.
 - **I6 — lease records `delegate:<alias>`, never `operator:`.** When the
-  delegate claims, `rollout_leases.holder` is the literal `delegate:<alias>`
-  string (or `<alias>` with `holder_source` distinguishing it — contract item
-  decides; see Minimal change). It never becomes `operator:*`, so `granted_lease_holder`,
-  `require_holder` and the shutdown rule see a non-operator holder.
+  delegate claims, `rollout_leases.holder` is the **literal string**
+  `delegate:<alias>` (decided — PM, on the spec review's fail-closed
+  recommendation). Every existing holder comparison (`holder_block`,
+  `require_holder`, `granted_lease_holder`, `Rule::Shutdown`) compares the
+  literal holder and so refuses a `delegate:` holder *by default*; each seam
+  that should admit it is extended deliberately. The alternative
+  (`holder=alias` + `holder_source=delegate`) was rejected: it would let a
+  `delegate:`-backed lease satisfy `granted_lease_holder`'s `live_grant(
+  rollout_grants, alias)` whenever a rollout grant for `alias` also existed —
+  a subtle cross-table confusion. The holder never becomes `operator:*`.
 - **I7 — audit-readable.** Grant create, each use, revoke and expiry land on
   the `events` stream via `insert_event` (kinds `staging_delegate`,
   `staging_delegate_use`, `staging_revoke`) carrying `delegate:<alias>`, the
@@ -111,15 +124,26 @@ as `delegate:<alias>`:
    state_dir, alias, op)` check reads a `staging_grants` table (new, beside
    `rollout_grants`): live row for `(alias, state_dir, op)` within TTL, else
    `Err(rejected)`. `op` is the verb name (`rollout_claim`, `daemon_start`,
-   `daemon_stop`, `ui_start`, `ui_stop`, `app_upgrade`).
-4. `holder` on the lease is recorded as `delegate:<alias>` so it can never be
-   confused with an operator holder (I6).
+   `daemon_stop`, `ui_start`, `ui_stop` — `app_upgrade` cut, PM decision 3).
+4. `holder` on the lease is recorded as the literal `delegate:<alias>` (I6),
+   so it can never be confused with an operator holder.
 
 On the daemon RPC side (`shutdown`, and any `staging_*` RPC), `connection_caller`
 already yields `Who::Agent(alias)`; the change is that `Rule::Shutdown`'s
 `lease_holder` check accepts a lease whose holder is `delegate:<alias>` when
 the caller is `Who::Agent(alias)` and a live grant covers `daemon_stop` — a
 one-line extension of `granted_lease_holder`'s lookup shape, not a new gate.
+
+**`ui start` / `ui stop` stay in v1** (PM decision 2 — a staging refresh needs
+them). They run through `cadence_agent::ui::run_cli` → `start`/`stop` as local
+pidfile ops that today consult no lease and no caller, so a `delegate:` `--as`
+is never even read there. The named seam is a `require_delegate_grant(
+state_dir, alias, "ui_start" | "ui_stop")` call inserted at the top of
+`ui::run_cli`'s `Start`/`Stop` arms (before any pidfile touch), gated on: the
+`--as` flag parses as `delegate:<alias>`, the I4 derivation passes, and the
+live grant covers the op — with tests per the adversarial table. Without a
+`delegate:` `--as`, `ui start`/`ui stop` behave exactly as today (no grant
+needed for the operator path).
 
 `holder_block`, `require_holder`, `force_holder_refusal`, `preview_force_refusal`
 and the take-over path are **unchanged** — they compare holder strings; a
@@ -144,6 +168,21 @@ and the take-over path are **unchanged** — they compare holder strings; a
   in-flight second call after a revoke sees the revoked row (linearized).
 - **Audit:** every transition `insert_event`s onto `Store::DAEMON_STREAM`;
   `cadence audit` and `agent events` read them without a new reader.
+
+## Changes this round (PR #694, contract revise)
+
+- Holder is the literal `delegate:<alias>` in `rollout_leases.holder`
+  (fail-closed; the `holder_source` alternative rejected for the
+  cross-`rollout_grants` confusion it invites). — PM decision 1.
+- `ui_start`/`ui_stop` stay in v1 with the named `require_delegate_grant` seam
+  inside `ui::run_cli`'s `Start`/`Stop` arms + tests. — PM decision 2, closing
+  the reviewer's coverage gap (they consulted no lease before).
+- `app_upgrade` **cut** from the v1 ops allowlist — app-only updates already
+  have an authorized installation API; noted as a follow-up. — PM decision 3,
+  resolving the reviewer's `operator_connection` gap without a new seam.
+- I4's ancestry binding named explicitly (target state dir's `agents` table +
+  `caller_chain`/`slot_identity` walk at claim/authorize) and a
+  cross-state-dir alias test added. — PM decision 4.
 
 ## Failure modes
 
@@ -208,6 +247,7 @@ and the take-over path are **unchanged** — they compare holder strings; a
 | `delegate_two_delegates_one_holder` | I3 | `rollout_lease_one_active` unique index | two delegates both hold the lease |
 | `delegate_other_alias_refused` | I4 | `CADENCE_ALIAS == alias` + ancestry endpoint | agent B uses agent A's grant |
 | `delegate_forged_env_refused` | I4 | registration + ancestry check | `CADENCE_ALIAS=B` on an unregistered process claims as `delegate:B` |
+| `delegate_cross_statedir_alias_refused` | I4 | `agents` table is read from the *target* state dir + ancestry endpoint is that dir's | `alias` registered only in dir B (pane lives there) claims `delegate:alias` on dir A — the grant exists on A but the ancestry endpoint is not A's |
 | `delegate_holder_never_operator` | I6 | `holder = delegate:<alias>` | lease holder reads `operator:*`, bypassing grant checks |
 | `delegate_audit_reads` | I7 | `insert_event` on each transition | grant/use/revoke are invisible to `cadence audit` |
 | `operator_mode_unchanged` | regression | `source=="as"` → `require_operator_proof` | the swap script's operator path changes behaviour |
@@ -233,11 +273,16 @@ alias/ancestry check), shown red, then restored.
 
 ## Out of scope
 
+- **`app_upgrade`** — cut from the v1 ops allowlist (PM decision 3).
+  `app_workspace_upgrade`/`_check`/`_recover` are `operator_connection`-gated
+  RPCs that refuse any agent connection outright; admitting `delegate:` there
+  needs a grant-scoped alternative to `operator_connection` for those methods,
+  which is its own contract. App-only updates already go through the
+  authorized installation API, so nothing in the refresh path needs it in v1.
+  Follow-up ticket to be filed.
 - Tailnet mapping changes and any op outside the v1 ops allowlist — stay
   operator-only.
 - `cadence staging refresh` as a single supported command — a later ticket;
   v1 admits the individual ops the script already runs.
 - Broadening `operator_proof` to admit enrolled endpoints as operator —
   explicitly rejected; the grant is the authority, not a relaxed proof.
-- App-only upgrades via the installation API — already out of scope per the
-  ticket.
