@@ -33,29 +33,14 @@ import { connectionLabel } from "../../lib/connections";
  * deliberately non-specific.
  */
 const ENROLL_ERROR: Record<string, string> = {
-  connection_refused:
-    "The connection was refused. Check the provider host and the account, then retry.",
-  connection_unavailable:
-    "Connection management is unavailable right now. Wait a moment, refresh the connections list, then retry.",
-  smtp_unreachable:
-    "The SMTP host could not be reached. Check the host and port, then retry.",
-  smtp_tls_failed:
-    "The SMTP TLS check failed. The daemon refuses plaintext, downgrades and unverifiable hosts — confirm the certificate and TLS mode (465 implicit / 587 STARTTLS), then retry.",
-  smtp_auth_failed:
-    "The SMTP login was rejected. Re-check the username and password, then retry — the password is cleared from this form either way.",
-  smtp_sender_unverified:
-    "The sender address is not verified for this provider. Verify the sender, then retry.",
-  provider_not_registered:
-    "This provider is not registered for enrollment. Choose a provider from the list, then retry.",
-  scope_not_reviewed:
-    "A declared scope is not reviewed for this provider. Keep only the reviewed scopes, then retry.",
-  // CAD-1014 backend (52a2a7d0): the daemon's stable enrollment codes.
-  // custody_unprotected is the one code that can truthfully say nothing
-  // was stored — the daemon refused before custody took the credential.
+  // The only stable code the daemon actually emits on this path
+  // (platform_rpc enroll): custody_unprotected. It can truthfully say
+  // nothing was stored — the daemon refused before custody took the
+  // credential. Invented codes for non-emitted paths would only mask a
+  // future fix under a false specific; the generic fallback below is the
+  // honest answer until the backend emits a real code.
   custody_unprotected:
     "The daemon could not store this credential under its protection — nothing was stored. To save it anyway, tick the storage-consent box below, then retry — it is never pre-selected.",
-  revision_conflict:
-    "This connection changed while the form was open. Refresh the connections list, then retry.",
 };
 
 /**

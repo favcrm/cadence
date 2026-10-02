@@ -11,7 +11,7 @@
  *  - the password is cleared from the form on settle;
  *  - token providers and other providers are unchanged.
  */
-import { act } from "react";
+declare function require(name: string): any;
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`assert: ${msg}`);
@@ -21,6 +21,7 @@ function equal(a: unknown, e: unknown, msg: string) {
     throw new Error(`${msg}: expected ${JSON.stringify(e)}, got ${JSON.stringify(a)}`);
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let act: (typeof import("react"))["act"];
 async function settle(fn: () => void, ms = 12000) {
   const end = Date.now() + ms;
   for (;;) {
@@ -81,7 +82,26 @@ function tokenProvider(): import("../src/lib/types").ConnectionProvider {
 }
 
 async function main() {
+  // Same DOM + loader stub the other mounted suites use: happy-dom
+  // globals before React is required, and a require hook so .css and the
+  // icon packages resolve to inert stubs.
+  const { Window } = require("happy-dom");
+  const win = new Window({ url: "http://localhost/settings/connections" });
+  for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "HTMLSelectElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
+    Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
+  for (const name of ["addEventListener", "removeEventListener"])
+    Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
+  Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
+  const loader = require("module"), originalRequire = loader.prototype.require;
+  loader.prototype.require = function (this: unknown, id: string) {
+    if (id.endsWith(".css")) return {};
+    if (id === "@hugeicons/core-free-icons") return new Proxy({}, { get: () => ({}) });
+    if (id === "@hugeicons/react") return { HugeiconsIcon: () => null };
+    return originalRequire.apply(this, arguments);
+  };
+
   const React = require("react") as typeof import("react");
+  act = React.act;
   const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
   const { AddConnection } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
 
