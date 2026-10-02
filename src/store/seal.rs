@@ -242,6 +242,30 @@ pub(super) fn with_owner_tx_control<R>(state: &GuardState, f: impl FnOnce() -> R
     f()
 }
 
+/// Bootstrap and every schema migration share one SQLite writer lock.
+/// A sibling latch installed after read-only preflight refuses before DDL;
+/// no intermediate migration commit can reopen that race.
+pub(super) fn with_legacy_migration_tx<R>(
+    conn: &Connection,
+    state: &GuardState,
+    f: impl FnOnce(&Connection) -> Result<R>,
+) -> Result<R> {
+    with_owner_tx_control(state, || {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        crate::rollout::require_legacy_writer_tx(&tx)?;
+        match f(&tx) {
+            Ok(value) => {
+                tx.commit()?;
+                Ok(value)
+            }
+            Err(error) => {
+                tx.rollback()?;
+                Err(error)
+            }
+        }
+    })
+}
+
 /// SQLite built-ins the store's business SQL actually uses — enumerated
 /// from `src/store/**`. Everything else, and `load_extension`, is denied.
 const ALLOWED_FUNCTIONS: &[&str] = &[
@@ -1175,8 +1199,9 @@ impl Store {
         R: 'static,
     {
         // Owner arm so fixture DDL (CREATE/ALTER) is authorized; the
-        // restricted WriteTxn facade still forbids a tx boundary or a
-        // latch-table write at phase=Callback.
+        // restricted WriteTxn facade still forbids a tx boundary. This
+        // test-only owner scope may seed latch/witness rows; it is never
+        // production owner authority and cannot write after closure.
         self.sealed_tx(GuardState::OWNER, false, f)
     }
 
@@ -1263,6 +1288,10 @@ impl Store {
         // `as i64` would silently wrap a u64 > i64::MAX into a negative.
         let epoch = i64::try_from(permit.epoch)
             .map_err(|_| Error::rejected("owner-maintenance permit epoch overflows the latch"))?;
+        // Closure authority is independent of the producer's hosted lease:
+        // losing that lease must not prevent an externally authorized owner
+        // from closing the producer. A Fence never grants this permit.
+        // Production permit issuance remains unavailable in this build.
         self.sealed_tx(GuardState::OWNER, false, |wtx| {
             // Re-check the deadline + one-use inside the held tx — the
             // DML below must not outlive the permit's authority window.
@@ -1315,6 +1344,8 @@ impl Store {
             .map_err(|_| Error::rejected("owner-maintenance permit epoch overflows the latch"))?;
         // The witness is the owner barrier that commits *after* the latch
         // is sealed — it runs `on_sealed` and verifies the latch in `f`.
+        // As with close, independent owner authority may complete after a
+        // producer lease loss; it cannot authorize further business writes.
         self.sealed_tx(GuardState::OWNER, true, |wtx| {
             // Deadline re-check inside the held tx before any DML.
             if permit.deadline_unix <= super::now() as i64 {
@@ -1364,6 +1395,13 @@ impl Store {
                     "witness permit does not match the sealed latch",
                 ));
             }
+            let schemas: Vec<i64> = wtx.query_vec("SELECT version FROM schema_version", [], |r| r.get(0))?;
+            let [db_schema] = schemas.as_slice() else {
+                return Err(Error::rejected("owner witness requires one actual schema version"));
+            };
+            if !(1..=PROTECTED_SCHEMA_MAX).contains(db_schema) {
+                return Err(Error::rejected("owner witness database schema is unsupported"));
+            }
             wtx.execute(
                 "INSERT INTO owner_witness(challenge,attempt,artifact_identity,epoch,db_schema,committed_at)
                  VALUES(?,?,?,?,?,?)",
@@ -1372,7 +1410,7 @@ impl Store {
                     permit.attempt.as_str(),
                     permit.artifact.as_str(),
                     epoch,
-                    PROTECTED_SCHEMA_MAX,
+                    db_schema,
                     super::now()
                 ],
             )?;
@@ -2155,6 +2193,85 @@ mod tests {
             witnessed, actual,
             "witness must record the actual schema, not a supported ceiling"
         );
+    }
+
+    #[test]
+    fn closure_owner_authority_is_independent_of_lost_producer_lease() {
+        let dir = TempDir::new().unwrap();
+        let (db, store) = open_legacy(&dir);
+        let fence = Arc::new(crate::lease::Fence::default());
+        store.install_write_fence(Arc::clone(&fence));
+        fence.trip("producer lease lost before owner barrier");
+        assert!(store
+            .event_public("daemon", "must-refuse", json!({}))
+            .is_err());
+        // Synthetic owner authority proves only the intended split. A lost
+        // producer lease never mints a permit; production issue() still Errs.
+        store
+            .propose_close(&permit(&db, OwnerOp::Close, b"c", "a", "art", 1), "test")
+            .unwrap();
+        store
+            .witness_commit(&permit(&db, OwnerOp::Witness, b"c", "a", "art", 1))
+            .unwrap();
+        assert!(store
+            .event_public("daemon", "still-refuse", json!({}))
+            .is_err());
+        let conn = store.conn();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind IN ('must-refuse','still-refuse')",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT witness_done FROM closure_state WHERE id=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn migration_scope_rolls_back_errors_and_panics_before_recovery() {
+        for panic in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let conn = Connection::open(dir.path().join("migration.sqlite3")).unwrap();
+            let state = Arc::new(GuardState::default());
+            install_authorizer(&conn, Arc::clone(&state));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_legacy_migration_tx(&conn, &state, |tx| -> Result<()> {
+                    tx.execute_batch("CREATE TABLE migration_probe(value INTEGER)")?;
+                    if panic {
+                        panic!("test migration unwind");
+                    }
+                    Err(Error::rejected("test migration error"))
+                })
+            }));
+            if panic {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            assert!(conn.is_autocommit(), "rollback must precede any recovery");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name='migration_probe'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert!(conn
+                .execute_batch("CREATE TABLE outside_scope(value INTEGER)")
+                .is_err());
+        }
     }
 
     #[test]
