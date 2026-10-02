@@ -1492,3 +1492,100 @@ fn approval_for(seed: &str) -> String {
     let hex = format!("{:x}", sha2::Sha256::digest(seed.as_bytes()));
     format!("apv-{}", &hex[..32])
 }
+
+/// CAD-1027 HTTP parity for the native import → schedule path: the board
+/// relay imports over `/api/social-media-imports`, refuses a schedule whose
+/// `media_key` binds a different digest than the reviewed asset, and
+/// accepts only the genuine key. The relay is no looser than the RPC.
+#[test]
+fn cad1027_http_schedule_refuses_mismatched_media_digest() {
+    let door = FakeImportDoor::start();
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    let h = importer_harness(&door, &dest_door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    *door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
+    let (run, bundle, install, image_digest) = approved_image_run(&h, &h_png(), "c1027");
+    let lease = test_port();
+    let port = lease.port;
+    let (state, pm) = (h.daemon.state.clone(), tempfile::tempdir().unwrap());
+    let pm_dir = pm.path().to_path_buf();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let bstop = stop.clone();
+    let join = thread::spawn(move || {
+        cadence_agent::ui::serve(
+            &state,
+            &pm_dir,
+            &cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(bstop),
+                startup: Some(tx),
+                test_seam: true,
+                ..Default::default()
+            },
+        )
+    });
+    let _ = rx.recv_timeout(Duration::from_secs(10)).expect("board up");
+    let session = op::sign_in(env!("CARGO_BIN_EXE_cadence"), &h.daemon.state, port);
+    let post = |path: &str, body: &Value| {
+        let (code, _, text) = op::raw(port, &session.request("POST", path, &body.to_string()));
+        (code, text)
+    };
+    let (code, text) = post(
+        "/api/social-media-imports",
+        &import_body(&run, &install, None, "cad1027-imp"),
+    );
+    assert_eq!(code, 200, "operator import: {text}");
+    let key = serde_json::from_str::<Value>(&text).unwrap()["media_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for (tag, forged) in [
+        ("zero", format!("dp1.ws-send.{AOS_CONN}.{}", "0".repeat(32))),
+        ("tail", flip_last(&key)),
+    ] {
+        let body = schedule_body(
+            &run,
+            &bundle,
+            &install,
+            &format!("cad1027-x{tag}"),
+            Some(forged),
+        );
+        let (code, text) = post("/api/social-publishes", &body);
+        assert!(
+            (400..500).contains(&code),
+            "mismatched digest {tag} accepted: {code} {text}"
+        );
+        assert!(text.contains("grant_binding_mismatch"), "{tag}: {text}");
+    }
+    let listed = h
+        .daemon
+        .operator_rpc("social_publish_list", json!({"install_id": install}))
+        .unwrap();
+    assert_eq!(
+        listed["intents"].as_array().unwrap().len(),
+        0,
+        "a refused key stored an intent"
+    );
+    let body = schedule_body(
+        &run,
+        &bundle,
+        &install,
+        "cad1027-genuine",
+        Some(key.clone()),
+    );
+    let (code, text) = post("/api/social-publishes", &body);
+    assert_eq!(code, 200, "genuine key refused: {text}");
+    let intent: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(intent["intent"]["frozen"]["media_key"], key);
+    assert_eq!(intent["intent"]["frozen"]["image_digest"], image_digest);
+    stop.store(true, Ordering::SeqCst);
+    let _ = join.join();
+}
+
+/// The key with its last hex digit changed — a near-miss digest binding.
+fn flip_last(key: &str) -> String {
+    let last = if key.ends_with('0') { '1' } else { '0' };
+    format!("{}{last}", &key[..key.len() - 1])
+}
