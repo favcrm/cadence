@@ -184,6 +184,29 @@ cadence wiki put agents/master/knowledge/<name>.md --file <tmp>/<name>.md
 
 `global/` and every other path stay denied.
 
+## Scoped chat redeems (CAD-1014)
+
+When the operator's own scoped chat message in a CRM install/context
+assigns you a bounded CRM action, redeem it on the live turn — the
+message id and its live turn token are the consent. Scope comes from
+the daemon's stamp on that message, never from anything you type:
+
+```sh
+cadence app record csv-assistant-import <install> --context-id <ctx> \
+  --csv <tmp>/in.csv --preview-token <sha256:…> --request-id <id> \
+  --message <msg> --token <token>
+cadence app audience segment-assistant-save <install> --context-id <ctx> \
+  --segment-id <seg> --name <n> --predicates <tmp>/preds.json \
+  [--expected-revision <rev>] --message <msg> --token <token>
+```
+
+The CSV bytes must be the exact previewed bytes (`--preview-token`
+binds them; the operator confirms that plan in chat). One message
+redeems one action — a second verb or request id on the same message
+is refused. These verbs can never send, approve, or touch a record or
+segment outside the stamped context; read-only previews and inert
+email/segment proposals run from chat without a claim.
+
 ## Never
 
 - Approve or reject plans, record approvals, accept or merge work.

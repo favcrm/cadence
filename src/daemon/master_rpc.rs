@@ -86,6 +86,12 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "master_ask_permission",
     "master_peek_grant",
     "master_permission_use",
+    // CAD-1014(b): the master's scoped-chat redeem verbs — a bounded CSV
+    // import and a segment save, each redeeming the operator's own
+    // stamped scoped chat message on the live assigned turn. Narrow
+    // delegated writes, never the operator verbs or a generic app write.
+    "app_record_csv_assistant_import",
+    "app_segment_assistant_save",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for

@@ -161,49 +161,34 @@ fn cad1014_scoped_chat_csv_import_redeems_scope_once() {
                "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-1",
                "message": "chat-1014-1", "token": token}),
     );
-    // RED today: unknown method. The proof this test makes is that the
-    // redeem fails NOW (no agent import exists); once the guard lands
-    // every refusal here becomes a contract the rest of the test pins.
-    assert_eq!(
-        redeem["ok"], false,
-        "a delegated CSV import verb already exists — this test must be \
-         reviewed before that surface is widened further: {redeem}"
-    );
-    assert!(
-        redeem.to_string().contains("Unknown method") || redeem.to_string().contains("unknown"),
-        "pre-guard refusal should be an unknown-method rejection: {redeem}"
-    );
-    return;
-    // Post-guard contract (unreachable until the verb exists):
-    #[allow(unreachable_code)]
-    {
-        // Post-guard contract (runs once the verb exists):
-        assert_eq!(redeem["ok"], true, "{redeem}");
-        let record = &redeem["result"]["records"][0];
-        assert_eq!(record["id"], "cust-1");
-        assert_eq!(record["consent"]["email"], "unknown");
-        // Replay with the identical request id is idempotent; a fresh id on
-        // the same message is refused as already claimed.
-        let replay: Value = lane.rpc(
-            &w.daemon.state,
-            "app_record_csv_assistant_import",
-            json!({"install_id": install, "context_id": context_id,
+    // GREEN post-guard: the stamped scoped chat message redeems one
+    // byte-bound import under the verified scope.
+    assert_eq!(redeem["ok"], true, "{redeem}");
+    let applied = redeem["result"]["summary"]["applied"]
+        .as_i64()
+        .unwrap_or(-1);
+    assert_eq!(applied, 1, "expected one imported record: {redeem}");
+    // Replay with the identical request id is idempotent; a fresh id on
+    // the same message is refused as already claimed.
+    let replay: Value = lane.rpc(
+        &w.daemon.state,
+        "app_record_csv_assistant_import",
+        json!({"install_id": install, "context_id": context_id,
                "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-1",
                "message": "chat-1014-1", "token": token}),
-        );
-        assert_eq!(replay["ok"], true, "identical replay refused: {replay}");
-        let second: Value = lane.rpc(
-            &w.daemon.state,
-            "app_record_csv_assistant_import",
-            json!({"install_id": install, "context_id": context_id,
+    );
+    assert_eq!(replay["ok"], true, "identical replay refused: {replay}");
+    let second: Value = lane.rpc(
+        &w.daemon.state,
+        "app_record_csv_assistant_import",
+        json!({"install_id": install, "context_id": context_id,
                "csv_text": CSV, "preview_token": token_preview, "request_id": "req-1014-2",
                "message": "chat-1014-1", "token": token}),
-        );
-        assert_eq!(
-            second["ok"], false,
-            "one message minted two imports: {second}"
-        );
-    }
+    );
+    assert_eq!(
+        second["ok"], false,
+        "one message minted two imports: {second}"
+    );
 }
 
 #[test]
@@ -223,33 +208,28 @@ fn cad1014_scoped_chat_segment_save_redeems_scope_once() {
         "app_segment_assistant_save",
         json!({"install_id": install, "context_id": context_id,
                "segment_id": "vip", "name": "VIP customers",
-               "predicates": [{"field": "tags", "op": "contains", "value": "vip"}],
+               "predicates": [{"field": "tag", "op": "eq", "value": "vip"}],
+               "message": "chat-1014-2", "token": token}),
+    );
+    assert_eq!(redeem["ok"], true, "{redeem}");
+    assert_eq!(
+        redeem["result"]["segment"]["id"].as_str(),
+        Some("vip"),
+        "{redeem}"
+    );
+    // A second segment on the SAME message is refused (one claim).
+    let second: Value = lane.rpc(
+        &w.daemon.state,
+        "app_segment_assistant_save",
+        json!({"install_id": install, "context_id": context_id,
+               "segment_id": "other", "name": "Another",
+               "predicates": [{"field": "tag", "op": "eq", "value": "x"}],
                "message": "chat-1014-2", "token": token}),
     );
     assert_eq!(
-        redeem["ok"], false,
-        "a delegated segment-save verb already exists — this test must \
-         be reviewed before that surface is widened further: {redeem}"
+        second["ok"], false,
+        "one message minted two segment saves: {second}"
     );
-    return;
-    // Post-guard contract (unreachable until the verb exists):
-    #[allow(unreachable_code)]
-    {
-        assert_eq!(redeem["result"]["segment"]["segment_id"], "vip");
-        assert_eq!(redeem["result"]["segment"]["actor"], "assistant");
-        let second: Value = lane.rpc(
-            &w.daemon.state,
-            "app_segment_assistant_save",
-            json!({"install_id": install, "context_id": context_id,
-               "segment_id": "other", "name": "Another",
-               "predicates": [{"field": "tags", "op": "contains", "value": "x"}],
-               "message": "chat-1014-2", "token": token}),
-        );
-        assert_eq!(
-            second["ok"], false,
-            "one message minted two segment saves: {second}"
-        );
-    }
 }
 
 /// Cross-scope, forged-field, wrong-turn and detached-child refusals —

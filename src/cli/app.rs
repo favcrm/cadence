@@ -294,6 +294,33 @@ pub(crate) enum RecordAction {
         #[arg(long)]
         decisions: Option<PathBuf>,
     },
+    /// CAD-1014(b): a scoped chat turn's delegated CSV import. The
+    /// operator's own stamped scoped chat message is the intent; the
+    /// caller must be the live assigned agent on `--message`/`--token`.
+    CsvAssistantImport {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// CSV file holding the exact previewed bytes.
+        #[arg(long)]
+        csv: PathBuf,
+        /// Preview token from `csv-preview` over the same bytes.
+        #[arg(long)]
+        preview_token: String,
+        /// Idempotency key; reuse with different bytes is refused.
+        #[arg(long)]
+        request_id: String,
+        /// Optional JSON array of `{row, action, expected_revision?}`
+        /// decisions overriding the preview plan.
+        #[arg(long)]
+        decisions: Option<PathBuf>,
+        /// The scoped chat message the operator sent (turn identity).
+        #[arg(long, requires = "token")]
+        message: String,
+        /// The live turn token for that message.
+        #[arg(long, requires = "message")]
+        token: String,
+    },
 }
 
 /// CAD-780 audience verbs. JSON files hold predicates (`[{field,
@@ -317,6 +344,29 @@ pub(crate) enum AudienceAction {
         /// Observed revision; absent creates.
         #[arg(long)]
         expected_revision: Option<u64>,
+    },
+    /// CAD-1014(b): a scoped chat turn's delegated segment save. The
+    /// operator's own stamped scoped chat message is the intent.
+    SegmentAssistantSave {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        segment_id: String,
+        #[arg(long)]
+        name: String,
+        /// JSON file holding the predicates array.
+        #[arg(long)]
+        predicates: PathBuf,
+        /// Observed revision; absent creates.
+        #[arg(long)]
+        expected_revision: Option<u64>,
+        /// The scoped chat message the operator sent (turn identity).
+        #[arg(long, requires = "token")]
+        message: String,
+        /// The live turn token for that message.
+        #[arg(long, requires = "message")]
+        token: String,
     },
     /// Inspect one exact saved segment.
     SegmentShow {
@@ -657,6 +707,22 @@ fn record_params(action: &RecordAction) -> Result<(&'static str, serde_json::Val
             }
             ("app_record_csv_import", params)
         }
+        RecordAction::CsvAssistantImport {
+            install_id,
+            context_id,
+            csv,
+            preview_token,
+            request_id,
+            decisions,
+            message,
+            token,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "csv_text": read_record_csv(csv)?, "preview_token": preview_token, "request_id": request_id, "message": message, "token": token});
+            if let Some(path) = decisions {
+                params["decisions"] = read_csv_decisions(path)?;
+            }
+            ("app_record_csv_assistant_import", params)
+        }
     })
 }
 
@@ -694,6 +760,22 @@ fn audience_params(action: &AudienceAction) -> Result<(&'static str, serde_json:
                 params["expected_revision"] = json!(revision);
             }
             ("app_segment_save", params)
+        }
+        AudienceAction::SegmentAssistantSave {
+            install_id,
+            context_id,
+            segment_id,
+            name,
+            predicates,
+            expected_revision,
+            message,
+            token,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "segment_id": segment_id, "name": name, "predicates": read_audience_json(predicates, "predicates")?, "message": message, "token": token});
+            if let Some(revision) = expected_revision {
+                params["expected_revision"] = json!(revision);
+            }
+            ("app_segment_assistant_save", params)
         }
         AudienceAction::SegmentShow {
             install_id,

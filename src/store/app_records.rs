@@ -175,6 +175,11 @@ CREATE TABLE IF NOT EXISTS app_unsubscribe_tokens(
  token_hash TEXT PRIMARY KEY,
  context_id TEXT NOT NULL, customer_id TEXT NOT NULL, send_id TEXT NOT NULL,
  created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS app_assistant_claims(
+ context_id TEXT NOT NULL, message_id TEXT NOT NULL,
+ action TEXT NOT NULL, request_id TEXT, agent TEXT NOT NULL,
+ created REAL NOT NULL,
+ PRIMARY KEY(context_id, message_id));
 ";
 
 /// The record file for an installation. The identifier grammar
@@ -629,6 +634,21 @@ impl RecordStore {
                  token_hash TEXT PRIMARY KEY,
                  context_id TEXT NOT NULL, customer_id TEXT NOT NULL, send_id TEXT NOT NULL,
                  created REAL NOT NULL)",
+            )
+            .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            // CAD-1014: one scoped chat message redeems exactly one
+            // delegated assistant action in an installation's context.
+            // Idempotent forward migration like the tables above —
+            // older files gain the empty claim table; the version
+            // stays 1. `action` names the redeemed verb for audit;
+            // the claim is the authorization and is spent whether or
+            // not the action lands.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS app_assistant_claims(\
+                 context_id TEXT NOT NULL, message_id TEXT NOT NULL,\
+                 action TEXT NOT NULL, request_id TEXT, agent TEXT NOT NULL,\
+                 created REAL NOT NULL,\
+                 PRIMARY KEY(context_id, message_id))",
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
         }
@@ -1683,6 +1703,82 @@ impl RecordStore {
             &json!({"domain":"cadence-app-record-csv-preview-v1","install_id":self.install_id,"context_id":context,"csv":csv_text}),
         );
         Ok((token, plan))
+    }
+
+    /// CAD-1014: claim a scoped chat message for exactly one delegated
+    /// assistant action in this context. `PRIMARY KEY(context_id,
+    /// message_id)` makes the claim atomic — a second action on the
+    /// same message (any verb, any request id, concurrent or replayed)
+    /// is refused before the action's own transaction opens. The claim
+    /// records the verb, the request id and the connection-derived agent
+    /// for audit; it is spent whether or not the action lands, so a
+    /// retried action must ride the SAME request id (CSV idempotency)
+    /// rather than mint a second claim. This is the message-level gate
+    /// the daemon's redeem verbs call after the scoped-chat proof; the
+    /// operator path never claims.
+    pub fn app_assistant_claim(
+        &self,
+        context: &str,
+        message_id: &str,
+        action: &str,
+        request_id: Option<&str>,
+        agent: &str,
+    ) -> Result<()> {
+        crate::proto::identifier(context, "context ID")?;
+        if message_id.is_empty()
+            || message_id.len() > 128
+            || message_id.chars().any(char::is_control)
+        {
+            return Err(Error::rejected(
+                "assistant claim message identity is malformed",
+            ));
+        }
+        if action.is_empty() || action.len() > 64 {
+            return Err(Error::rejected("assistant claim action is malformed"));
+        }
+        if agent.is_empty() || agent.len() > 80 {
+            return Err(Error::rejected(
+                "assistant claim agent identity is malformed",
+            ));
+        }
+        let conn = self.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| Error::internal(e.to_string()))?;
+        // An existing claim for this message settles the call before a
+        // second action mints: the SAME action+request id is a replay
+        // (the verb's own idempotency then returns the stored receipt),
+        // anything else is a second action on one intent and refuses.
+        let existing: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT action,request_id FROM app_assistant_claims WHERE context_id=? AND message_id=?",
+                params![context, message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if let Some((claimed_action, claimed_request)) = existing {
+            if claimed_action == action && claimed_request.as_deref() == request_id {
+                tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+                return Ok(());
+            }
+            return Err(Error::rejected(
+                "this scoped chat message already redeemed an action",
+            ));
+        }
+        tx.execute(
+            "INSERT INTO app_assistant_claims(context_id,message_id,action,request_id,agent,created) VALUES(?,?,?,?,?,?)",
+            params![context, message_id, action, request_id, agent, now()],
+        )
+        .map_err(|error| {
+            if matches!(error, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::ConstraintViolation)
+            {
+                Error::rejected("this scoped chat message already redeemed an action")
+            } else {
+                Error::internal(error.to_string())
+            }
+        })?;
+        tx.commit().map_err(|e| Error::internal(e.to_string()))
     }
 
     /// Read-only plan of bounded CSV text: per-row decisions plus the

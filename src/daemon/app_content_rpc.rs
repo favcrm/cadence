@@ -36,6 +36,8 @@
 //! follows the CAD-768 strict-peer contract (URL IDs are authority,
 //! exact transport grammar, POST-only writes) and exposes no
 //! assistant-mint route.
+use super::app_audiences_rpc::{audience_expected, audience_name, audience_predicates};
+use super::app_records_rpc::{csv_decisions, csv_text};
 use super::*;
 use crate::issue::app_catalog::workspace;
 use crate::store::app_content::Draft;
@@ -472,6 +474,197 @@ impl Shared {
                 "app content payload has unsupported fields",
             ));
         }
+        let ScopedChat {
+            caller,
+            install,
+            context,
+            message_id,
+            ..
+        } = self.scoped_chat_assistant(params, peer_pid, "assistant proposal")?;
+        let campaign = required_str(params, "campaign_id")?;
+        let proposal = required_str(params, "proposal_id")?;
+        let draft = content_draft(params)?;
+        let request_id = content_request_id(params)?;
+        let records = RecordStore::open(&self.state_dir, &install)?;
+        let claim = crate::store::app_content::AssistantClaim {
+            agent: &caller,
+            message: &message_id,
+            request: request_id,
+        };
+        let result =
+            records.app_content_assistant_propose(&context, campaign, proposal, &draft, &claim)?;
+        let digest = result
+            .get("proposal")
+            .and_then(|proposal| proposal.get("content_digest"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        self.store.note_app_content_by(
+            &install,
+            &context,
+            "app_content_assistant_propose",
+            digest,
+            &caller,
+        );
+        self.wake();
+        Ok(result)
+    }
+
+    /// CAD-1014(b): a scoped chat turn's delegated customer CSV import.
+    /// The intent is the OPERATOR's own genuine scoped chat message
+    /// (`thread_send` carrying the daemon-verified App binding), not a
+    /// separate mint verb: [`Self::scoped_chat_assistant`] proves the
+    /// caller is a connection-derived agent on the live assigned turn
+    /// whose `message_app` stamp names exactly this install+context, and
+    /// that the caller lives in the endpoint's own session (a detached
+    /// child is refused). The exact CSV bytes are still bound by the
+    /// existing `preview_token` (a `sha256:` of the very bytes the
+    /// operator previewed) and `request_id` is the idempotency key — the
+    /// user-facing explicit-confirm gate lives in the chat surface,
+    /// which the agent cannot reach; an agent can only commit the bytes
+    /// the operator previewed. Agent-supplied `install_id`/`context_id`
+    /// must EQUAL the stamped scope, never widen it. This verb can never
+    /// send, approve or touch a record outside the stamped context.
+    pub(super) fn rpc_app_record_csv_assistant_import(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("app record payload must be an object"))?;
+        const ALLOWED: &[&str] = &[
+            "install_id",
+            "context_id",
+            "csv_text",
+            "preview_token",
+            "request_id",
+            "decisions",
+            "message",
+            "token",
+        ];
+        if fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+            return Err(Error::rejected("app record payload has unsupported fields"));
+        }
+        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant CSV import")?;
+        let records = RecordStore::open(&self.state_dir, &scoped.install)?;
+        // One stamped message redeems one action across all request ids
+        // (CAD-1014). The claim commits before the action opens its own
+        // transaction; a replay must ride the same request id.
+        records.app_assistant_claim(
+            &scoped.context,
+            &scoped.message_id,
+            "app_record_csv_assistant_import",
+            Some(required_str(params, "request_id")?),
+            &scoped.caller,
+        )?;
+        let result = records.app_record_csv_import(
+            &scoped.context,
+            &csv_text(params)?,
+            required_str(params, "preview_token")?,
+            required_str(params, "request_id")?,
+            csv_decisions(params)?,
+        )?;
+        self.store.note_app_record_csv_import(
+            &scoped.install,
+            &scoped.context,
+            required_str(params, "request_id").unwrap_or(""),
+            result["summary"]["applied"].as_i64().unwrap_or(0),
+            result["summary"]["skipped"].as_i64().unwrap_or(0),
+            result["summary"]["failed"].as_i64().unwrap_or(0),
+        );
+        self.wake();
+        Ok(result)
+    }
+
+    /// CAD-1014(b): a scoped chat turn's delegated segment save. Same
+    /// intent source and redeem gate as the CSV import; the segment id
+    /// stays agent-chosen inside the stamped scope and `expected_revision`
+    /// is the CAS the operator path already uses, so an agent can create
+    /// or revise only the segment it names inside the verified context —
+    /// never a blanket write. No send/approve.
+    pub(super) fn rpc_app_segment_assistant_save(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("app audience payload must be an object"))?;
+        const ALLOWED: &[&str] = &[
+            "install_id",
+            "context_id",
+            "segment_id",
+            "name",
+            "predicates",
+            "expected_revision",
+            "message",
+            "token",
+        ];
+        if fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+            return Err(Error::rejected(
+                "app audience payload has unsupported fields",
+            ));
+        }
+        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant segment save")?;
+        let records = RecordStore::open(&self.state_dir, &scoped.install)?;
+        // One stamped message redeems one action across all ids
+        // (CAD-1014); `expected_revision` is the CAS on the named
+        // segment. The segment id is the claim key: a re-save of the
+        // SAME segment replays, a different segment on this message
+        // refuses as a second action.
+        records.app_assistant_claim(
+            &scoped.context,
+            &scoped.message_id,
+            "app_segment_assistant_save",
+            Some(required_str(params, "segment_id")?),
+            &scoped.caller,
+        )?;
+        let result = records.app_segment_save(
+            &scoped.context,
+            required_str(params, "segment_id")?,
+            audience_expected(params)?,
+            &audience_name(params)?,
+            &audience_predicates(params)?,
+        )?;
+        let digest = result
+            .get("segment")
+            .and_then(|segment| segment.get("digest"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        self.store.note_app_audience(
+            &scoped.install,
+            &scoped.context,
+            "app_segment_assistant_save",
+            digest,
+        );
+        self.wake();
+        Ok(result)
+    }
+}
+
+/// The verified scoped-chat redeem context a delegated assistant verb
+/// runs under (CAD-1014). The caller is the connection-derived agent;
+/// install+context come from the re-proved `message_app` stamp on the
+/// operator's own scoped chat message — never agent text.
+pub(super) struct ScopedChat {
+    pub(super) caller: String,
+    pub(super) install: String,
+    pub(super) context: String,
+    pub(super) message_id: String,
+}
+
+impl Shared {
+    /// The shared CAD-813/CAD-1014(b) scoped-chat redeem gate. `desc`
+    /// names the verb in refusal text. Returns the connection-derived
+    /// caller and the stamped install/context; a detached child, an
+    /// unproven caller, the operator, a foreign or stale turn, and any
+    /// scope mismatch all refuse before any file opens.
+    pub(super) fn scoped_chat_assistant(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+        desc: &str,
+    ) -> Result<ScopedChat> {
         // The caller is the connection's alone: identity-shaped,
         // receipt-shaped and routing fields are not transport fields
         // here at all — the allowlist above already refused them —
@@ -479,13 +672,13 @@ impl Shared {
         let caller = match self.connection_caller(peer_pid)? {
             caller_rule::Who::Agent(alias) => alias,
             caller_rule::Who::Operator => {
-                return Err(Error::rejected(
-                    "assistant proposal is an agent turn's verb — the operator proposes through app_content_propose",
-                ));
+                return Err(Error::rejected(format!(
+                    "{desc} is an agent turn's verb — the operator acts through the app record, segment and content verbs"
+                )));
             }
             caller_rule::Who::Unproven(why) => {
                 return Err(Error::rejected(format!(
-                    "assistant proposal refused: this connection derives no agent identity and is \
+                    "{desc} refused: this connection derives no agent identity and is \
                      not provably the operator: {why} (caller rule, CAD-384)"
                 )));
             }
@@ -503,14 +696,14 @@ impl Shared {
         );
         if !seam_agent {
             let caller_session = crate::peer::proc_session(peer_pid)
-                .map_err(|_| Error::rejected("assistant proposal caller session is unreadable"))?;
+                .map_err(|_| Error::rejected(format!("{desc} caller session is unreadable")))?;
             let inside = match self.slot_identity(peer_pid)? {
                 Some(SlotWho::Strict(proof)) => {
                     let root = *proof.segment.last().ok_or_else(|| {
-                        Error::rejected("assistant proposal endpoint ancestry is empty")
+                        Error::rejected(format!("{desc} endpoint ancestry is empty"))
                     })?;
                     let endpoint_session = crate::peer::proc_session(root).map_err(|_| {
-                        Error::rejected("assistant proposal endpoint session is unreadable")
+                        Error::rejected(format!("{desc} endpoint session is unreadable"))
                     })?;
                     proof.lane == caller
                         && (caller_session == endpoint_session
@@ -540,35 +733,33 @@ impl Shared {
         let install = required_str(params, "install_id")?;
         crate::proto::identifier(install, "installation ID")?;
         let context = required_str(params, "context_id")?;
-        let campaign = required_str(params, "campaign_id")?;
-        let proposal = required_str(params, "proposal_id")?;
         let message_id = required_str(params, "message")?;
         let token = required_str(params, "token")?;
         if message_id.is_empty() || message_id.len() > 128 {
-            return Err(Error::rejected("proposal message identity is malformed"));
+            return Err(Error::rejected(format!(
+                "{desc} message identity is malformed"
+            )));
         }
         if token.is_empty() || token.len() > 256 {
-            return Err(Error::rejected("proposal turn token is malformed"));
+            return Err(Error::rejected(format!("{desc} turn token is malformed")));
         }
         // The live assigned turn, from the daemon's own rows: the
         // message addresses the caller, is running under exactly this
         // token, and the token is current under the endpoint's own
-        // scheme and live generation — a token for another turn, a
-        // stale generation, or an endpoint with no checkable scheme
-        // refuses here.
+        // scheme and live generation.
         let stored = self
             .store
             .message(message_id)?
-            .ok_or_else(|| Error::rejected("assistant proposal turn is unknown"))?;
+            .ok_or_else(|| Error::rejected(format!("{desc} turn is unknown")))?;
         if stored.alias != caller {
-            return Err(Error::rejected(
-                "assistant proposal turn belongs to another agent",
-            ));
+            return Err(Error::rejected(format!(
+                "{desc} turn belongs to another agent"
+            )));
         }
         if stored.state != "running" || stored.turn_id.as_deref() != Some(token) {
-            return Err(Error::rejected(
-                "assistant proposal needs the active assigned chat turn",
-            ));
+            return Err(Error::rejected(format!(
+                "{desc} needs the active assigned chat turn"
+            )));
         }
         let agent = self.store.agent(&caller)?;
         if !registry::turn_token_current(
@@ -577,24 +768,23 @@ impl Shared {
             agent.generation.as_deref(),
             token,
         ) {
-            return Err(Error::rejected(
-                "assistant proposal turn token is no longer current",
-            ));
+            return Err(Error::rejected(format!(
+                "{desc} turn token is no longer current"
+            )));
         }
         // The turn's server-verified App binding, re-proved against
         // the live store: the stamp names exactly this installation
-        // and context, or the call has no verified chat scope — a
-        // browser value, a turn from another install/context, or a
-        // binding revised or archived after send refuses here.
-        let hint = self.store.message_app(message_id)?.ok_or_else(|| {
-            Error::rejected("assistant proposal turn carries no verified App scope")
-        })?;
+        // and context, or the call has no verified chat scope.
+        let hint = self
+            .store
+            .message_app(message_id)?
+            .ok_or_else(|| Error::rejected(format!("{desc} turn carries no verified App scope")))?;
         if hint.get("install_id").and_then(Value::as_str) != Some(install)
             || hint.get("context_id").and_then(Value::as_str) != Some(context)
         {
-            return Err(Error::rejected(
-                "assistant proposal scope does not match its verified chat turn",
-            ));
+            return Err(Error::rejected(format!(
+                "{desc} scope does not match its verified chat turn"
+            )));
         }
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, install, |_, _| {
@@ -605,29 +795,11 @@ impl Shared {
             self.store.app_context_proof(install, context)?;
             Ok(())
         })?;
-        let draft = content_draft(params)?;
-        let request_id = content_request_id(params)?;
-        let records = RecordStore::open(&self.state_dir, install)?;
-        let claim = crate::store::app_content::AssistantClaim {
-            agent: &caller,
-            message: message_id,
-            request: request_id,
-        };
-        let result =
-            records.app_content_assistant_propose(context, campaign, proposal, &draft, &claim)?;
-        let digest = result
-            .get("proposal")
-            .and_then(|proposal| proposal.get("content_digest"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        self.store.note_app_content_by(
-            install,
-            context,
-            "app_content_assistant_propose",
-            digest,
-            &caller,
-        );
-        self.wake();
-        Ok(result)
+        Ok(ScopedChat {
+            caller,
+            install: install.to_string(),
+            context: context.to_string(),
+            message_id: message_id.to_string(),
+        })
     }
 }

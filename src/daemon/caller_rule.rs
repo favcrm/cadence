@@ -484,6 +484,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_content_propose", Rule::Handler("operator_connection (CAD-782)")),
     ("app_content_proposal_request", Rule::Handler("operator_connection (CAD-813)")),
     ("app_content_assistant_propose", Rule::Handler("active assigned chat turn and verified App binding (CAD-813)")),
+    ("app_record_csv_assistant_import", Rule::Handler("active assigned scoped chat turn and verified App binding (CAD-1014)")),
+    ("app_segment_assistant_save", Rule::Handler("active assigned scoped chat turn and verified App binding (CAD-1014)")),
     ("app_content_proposal_show", Rule::Handler("operator_connection (CAD-782)")),
     ("app_content_proposal_list", Rule::Handler("operator_connection (CAD-782)")),
     ("app_content_proposal_apply", Rule::Handler("operator_connection (CAD-782)")),

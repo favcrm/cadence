@@ -160,6 +160,13 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     // CAD-615: ask the operator to approve one plain command. The
     // decision verbs are not here — the master cannot approve itself.
     "Bash(cadence master ask-permission *)",
+    // CAD-1014(b): the scoped-chat redeem verbs. Each redeems the
+    // operator's own stamped scoped chat message on the live assigned
+    // turn (`--message`/`--token` are the turn identity); scope comes
+    // from the daemon stamp, never the agent. Bounded CSV import and a
+    // revision-checked segment save — never the operator verbs.
+    "Bash(cadence app record csv-assistant-import *)",
+    "Bash(cadence app audience segment-assistant-save *)",
 ];
 
 /// The only built-in tool the master's Claude session has (`--tools`):

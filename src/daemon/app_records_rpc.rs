@@ -56,7 +56,7 @@ fn record_list_scope(params: &Value) -> Result<(Option<String>, i64, Option<Stri
     Ok((query, limit, cursor))
 }
 
-fn csv_text(params: &Value) -> Result<String> {
+pub(super) fn csv_text(params: &Value) -> Result<String> {
     let text = required_str(params, "csv_text")?;
     if text.is_empty() || text.len() > crate::store::app_records::CSV_TEXT_BYTES {
         return Err(Error::rejected("customer CSV exceeds its size bound"));
@@ -64,7 +64,7 @@ fn csv_text(params: &Value) -> Result<String> {
     Ok(text.to_string())
 }
 
-fn csv_decisions(params: &Value) -> Result<Option<Vec<CsvDecision>>> {
+pub(super) fn csv_decisions(params: &Value) -> Result<Option<Vec<CsvDecision>>> {
     let Some(list) = params.get("decisions") else {
         return Ok(None);
     };
