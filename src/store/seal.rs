@@ -1158,84 +1158,36 @@ macro_rules! storeconn_impl {
     };
 }
 
+// Every impl resolves the getter to a `&Connection` and calls
+// `Connection`'s inherent verbs — never the trait's same-named methods,
+// which would recurse. `Transaction`/`WriteTxn` deref to `Connection`.
 storeconn_impl!(Connection, |g| -> &Connection { g });
-storeconn_impl!(Transaction<'_>, |g| -> &Transaction<'_> { g });
+storeconn_impl!(Transaction<'_>, |g| -> &Connection { &**g });
 storeconn_impl!(std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &**g });
-storeconn_impl!(WriteTxn<'_>, |g| -> &Transaction<'_> { g.tx });
+storeconn_impl!(WriteTxn<'_>, |g| -> &Connection { &**g.tx });
 
-/// `&T`/`&mut T` for any `StoreConn` forwards — a `*_in` helper taking
-/// `&impl StoreConn` composes with a caller holding a `&conn`/`&tx` of
-/// any receiver type without an extra borrow.
-macro_rules! storeconn_fwd {
-    () => {
-        fn execute(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<usize> {
-            (**self).execute(sql, params)
-        }
-        fn execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
-            (**self).execute_batch(sql)
-        }
-        fn query_row<R>(
-            &self,
-            sql: &str,
-            params: impl rusqlite::Params,
-            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<R>,
-        ) -> rusqlite::Result<R> {
-            (**self).query_row(sql, params, f)
-        }
-        fn query_opt<R>(
-            &self,
-            sql: &str,
-            params: impl rusqlite::Params,
-            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<R>,
-        ) -> rusqlite::Result<Option<R>> {
-            (**self).query_opt(sql, params, f)
-        }
-        fn exists(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<bool> {
-            (**self).exists(sql, params)
-        }
-        fn query_vec<R>(
-            &self,
-            sql: &str,
-            params: impl rusqlite::Params,
-            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<R>,
-        ) -> rusqlite::Result<Vec<R>> {
-            (**self).query_vec(sql, params, f)
-        }
-        fn for_each_row(
-            &self,
-            sql: &str,
-            params: impl rusqlite::Params,
-            f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
-        ) -> rusqlite::Result<()> {
-            (**self).for_each_row(sql, params, f)
-        }
-        fn last_insert_rowid(&self) -> i64 {
-            (**self).last_insert_rowid()
-        }
-        fn changes(&self) -> usize {
-            (**self).changes()
-        }
-        fn pragma_query_value<R, F>(
-            &self,
-            database_name: Option<rusqlite::DatabaseName<'_>>,
-            pragma_name: &str,
-            f: F,
-        ) -> rusqlite::Result<R>
-        where
-            R: rusqlite::types::FromSql,
-            F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<R>,
-        {
-            (**self).pragma_query_value(database_name, pragma_name, f)
-        }
-    };
-}
+// Concrete `&`/`&mut`/guard/WriteTxn reference impls — each resolves to
+// a `&Connection` so `Connection`'s inherent verbs run once (no trait
+// recursion, no inherent-return-type mismatch). `conn`/`tx`/`&conn`/`&tx`
+// at a `*_in(&impl StoreConn)` call site match one of these shapes.
+storeconn_impl!(&Connection, |g| -> &Connection { *g });
+storeconn_impl!(&mut Connection, |g| -> &Connection { &**g });
+storeconn_impl!(&std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &***g });
+storeconn_impl!(&mut std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &***g });
+storeconn_impl!(&Transaction<'_>, |g| -> &Connection { &**g });
+storeconn_impl!(&mut Transaction<'_>, |g| -> &Connection { &***g });
+storeconn_impl!(&WriteTxn<'_>, |g| -> &Connection { &**g.tx });
+storeconn_impl!(&mut WriteTxn<'_>, |g| -> &Connection { &***g.tx });
+storeconn_impl!(&&mut WriteTxn<'_>, |g| -> &Connection { &****g.tx });
+storeconn_impl!(&&WriteTxn<'_>, |g| -> &Connection { &***g.tx });
+storeconn_impl!(&&Transaction<'_>, |g| -> &Connection { &***g });
+storeconn_impl!(&&mut Transaction<'_>, |g| -> &Connection { &****g });
+storeconn_impl!(&&Connection, |g| -> &Connection { &**g });
+storeconn_impl!(&&mut Connection, |g| -> &Connection { &***g });
+storeconn_impl!(&&std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &****g });
+storeconn_impl!(&&mut std::sync::MutexGuard<'_, Connection>, |g| -> &Connection { &****g });
 
-impl<T: StoreConn + ?Sized> StoreConn for &T {
-    storeconn_fwd!();
-}
-impl<T: StoreConn + ?Sized> StoreConn for &mut T {
-    storeconn_fwd!();
-}
+
 
 /// The restricted write facade handed to a business callback. Wraps the
 /// live `Transaction`; exposes only DML/read and owner-managed savepoints

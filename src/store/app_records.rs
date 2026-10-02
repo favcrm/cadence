@@ -660,7 +660,7 @@ impl RecordStore {
     /// separate file from `cadence.sqlite3` — it is NOT under `Store`'s
     /// producer seal; this is `RecordStore`'s own write shape, not the
     /// daemon witness.
-    fn write_tx<R>(
+    pub(crate) fn write_tx<R>(
         &self,
         f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<R>,
     ) -> Result<R> {
@@ -999,7 +999,7 @@ pub struct CustomerProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileRefused;
 impl std::fmt::Display for ProfileRefused {
-    fn fmt(&self, f: std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("record profile exceeds its supported shape or bounds")
     }
 }
