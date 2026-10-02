@@ -142,7 +142,8 @@ fn cad1027_approval_authorizes_exactly_one_intent() {
     };
     refuse("req-apv-2", "install-harbour");
     refuse("req-apv-3", "install-other");
-    s.social_publish_cancel(&id).unwrap();
+    s.social_publish_cancel(&id, "install-harbour", None)
+        .unwrap();
     refuse("req-apv-4", "install-harbour");
     let rows: i64 = s
         .conn()
@@ -158,16 +159,38 @@ fn cad771_cancel_only_before_dispatch() {
     let (_dir, s) = store();
     let staged = s.social_publish_schedule(&intent("req-cancel")).unwrap();
     let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
-    let cancelled = s.social_publish_cancel(&id).unwrap();
+    let cancelled = s
+        .social_publish_cancel(&id, "install-harbour", None)
+        .unwrap();
     assert_eq!(cancelled["intent"]["state"], "cancelled");
+    // CAD-1027: cancel is scoped — another install or a context the intent
+    // does not carry refuses and leaves it queued.
+    let mut later = intent("req-cancel-scope");
+    later.due_epoch = 1_900_000_000;
+    let staged = s.social_publish_schedule(&later).unwrap();
+    let scoped = staged["intent"]["intent_id"].as_str().unwrap();
+    assert!(s
+        .social_publish_cancel(scoped, "install-other", None)
+        .is_err());
+    assert!(s
+        .social_publish_cancel(scoped, "install-harbour", Some("ctx-a"))
+        .is_err());
+    assert_eq!(
+        s.social_publish_show(scoped).unwrap()["intent"]["state"],
+        "queued"
+    );
     // A cancelled intent cannot be cancelled again or claimed.
-    assert!(s.social_publish_cancel(&id).is_err());
+    assert!(s
+        .social_publish_cancel(&id, "install-harbour", None)
+        .is_err());
     assert!(s
         .social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
         .unwrap()
         .is_none());
     // Unknown intent ids are refused, never created.
-    assert!(s.social_publish_cancel("spub-nope").is_err());
+    assert!(s
+        .social_publish_cancel("spub-nope", "install-harbour", None)
+        .is_err());
     assert!(s.social_publish_show("spub-nope").is_err());
 }
 

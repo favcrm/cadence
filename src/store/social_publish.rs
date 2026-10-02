@@ -11,9 +11,10 @@
 //! Shape validation reuses
 //! [`crate::platform::agenticos_external::publish`], the read-only mirror
 //! of the pinned AOS-94 device-publish v1 contract (PR #214 @ 12953144).
-//! The run/effect cross-check against app runs (proving the frozen caption
-//! and asset are the reviewed ones) lands with the slice-3 E2E wiring; the
-//! store already keeps `run_id`/`effect_id` for that join.
+//! Freeze from an artifact re-proves the reviewed run material (caption and
+//! asset digests derive from it) and, since CAD-1027, that the request's
+//! install/context are the run's own and that `effect_id` is a live app
+//! effect authorized by this run's artifact in that scope.
 
 use super::*;
 use rusqlite::{params, OptionalExtension};
@@ -309,14 +310,21 @@ impl Store {
         Ok(result)
     }
 
-    /// Operator cancellation before dispatch. Any other state refuses.
-    pub fn social_publish_cancel(&self, intent_id: &str) -> Result<Value> {
+    /// Operator cancellation before dispatch, scoped (CAD-1027): the intent
+    /// must belong to exactly this install and context (null-preserving).
+    /// Any other state or scope refuses and changes nothing.
+    pub fn social_publish_cancel(
+        &self,
+        intent_id: &str,
+        install_id: &str,
+        context_id: Option<&str>,
+    ) -> Result<Value> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
-        let changed = tx.execute("UPDATE social_publish_intents SET state='cancelled',updated=? WHERE intent_id=? AND state='queued'",params![now(),intent_id])?;
+        let changed = tx.execute("UPDATE social_publish_intents SET state='cancelled',updated=? WHERE intent_id=? AND state='queued' AND install_id=? AND context_id IS ?",params![now(),intent_id,install_id,context_id])?;
         if changed != 1 {
             return Err(Error::rejected(
-                "only a queued social publish intent can be cancelled",
+                "only a queued social publish intent in this install and context can be cancelled",
             ));
         }
         Self::event(
@@ -690,7 +698,8 @@ pub struct FreezeFromArtifact<'a> {
     pub artifact_id: &'a str,
     pub bundle_digest: &'a str,
     pub slot: &'a str,
-    /// The operator's publish-approval identity (not an app_effect row).
+    /// A live app effect authorized by this run's artifact in this exact
+    /// install/context (CAD-1027): freeze refuses any other id.
     pub effect_id: &'a str,
     pub destination_id: &'a str,
     pub toolkit: &'a str,
@@ -730,6 +739,50 @@ impl Store {
             row.bundle_digest,
             row.slot,
         )?;
+        // CAD-1027: the request's install/context must be the run's own —
+        // the material proves the run's binding in the run's scope only, so
+        // a request naming another scope would otherwise freeze under it.
+        // context_id is exact and null-preserving (no wildcard).
+        if material["run"]["install_id"].as_str() != Some(row.install_id)
+            || material["run"]["context_id"].as_str() != row.context_id
+        {
+            return Err(Error::rejected(
+                "grant_binding_mismatch: schedule names a different install or context than the run",
+            ));
+        }
+        // CAD-1027: the effect must be an app effect authorized by THIS run's
+        // artifact in this exact scope — never a forged id or another run's.
+        let effect_scope = self
+            .conn()
+            .query_row(
+                // Live authority only: an app-artifact effect still waiting
+                // or accepted. Declined/closed/executed effects never back
+                // a post (the same live set authority changes close).
+                "SELECT a.install_id,a.context_id,a.run_id,a.artifact_id FROM app_effect_authorizations a JOIN platform_effects e ON e.effect_id=a.effect_id WHERE a.effect_id=? AND e.authorization_kind='app_artifact' AND e.state IN ('waiting','decided')",
+                [row.effect_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if effect_scope
+            .as_ref()
+            .is_none_or(|(install, context, run, artifact)| {
+                install != row.install_id
+                    || context.as_deref() != row.context_id
+                    || run != row.run_id
+                    || artifact != row.artifact_id
+            })
+        {
+            return Err(Error::rejected(
+                "bad_effect: effect is not live authority for this run, artifact and scope",
+            ));
+        }
         let caption_digest = bare_digest(
             material["artifact"]["digest"]
                 .as_str()

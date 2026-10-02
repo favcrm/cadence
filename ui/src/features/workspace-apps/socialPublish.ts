@@ -196,7 +196,28 @@ const paths = {
   schedule: () => "/api/social-publishes",
   cancel: (intentId: string) =>
     `/api/social-publishes/${encodeURIComponent(intentId)}/cancel`,
+  importMedia: () => "/api/social-media-imports",
 };
+
+/** CAD-979 media import body: the approved run's provenance + scope only —
+ *  never caller bytes, path or URL. The daemon reads the reviewed retained
+ *  asset by receipt custody and returns the minted `media_key`. */
+export interface MediaImportBody {
+  request_id: string;
+  install_id: string;
+  context_id?: string;
+  run_id: string;
+  artifact_id: string;
+  bundle_digest: string;
+  slot: "publication";
+  toolkit: "instagram" | "facebook";
+  destination_id: string;
+}
+
+export interface MediaImportReply {
+  media_key: string;
+  image_digest: string;
+}
 
 function sameOrigin(path: string): string {
   if (!path.startsWith("/api/"))
@@ -213,6 +234,11 @@ const SCHEDULE_KEYS = [
   "artifact_id", "bundle_digest", "slot", "destination_id", "toolkit",
   "media_key", "grant_id", "approval_id", "due_epoch", "timezone",
 ] as const;
+const CANCEL_KEYS = ["install_id", "context_id"] as const;
+const MEDIA_IMPORT_KEYS = [
+  "request_id", "install_id", "context_id", "run_id", "artifact_id",
+  "bundle_digest", "slot", "toolkit", "destination_id",
+] as const;
 
 function assertCleanBody(body: Record<string, unknown>, allowed: readonly string[]): void {
   for (const key of Object.keys(body)) {
@@ -223,8 +249,8 @@ function assertCleanBody(body: Record<string, unknown>, allowed: readonly string
 /** Reads are abortable and uncached so receipts never outlive an operator
 session; transport mirrors workspaceApps/hostActions (same-origin
 credentials, session headers, board marker on writes). */
-async function request<T>(path: string, signal?: AbortSignal, body?: Record<string, unknown>): Promise<T> {
-  if (body !== undefined) assertCleanBody(body, SCHEDULE_KEYS);
+async function request<T>(path: string, signal?: AbortSignal, body?: Record<string, unknown>, allowed: readonly string[] = SCHEDULE_KEYS): Promise<T> {
+  if (body !== undefined) assertCleanBody(body, allowed);
   const response = await fetch(sameOrigin(path), {
     method: body === undefined ? "GET" : "POST", signal,
     credentials: "same-origin", cache: "no-store",
@@ -253,8 +279,17 @@ export const socialPublish = {
     const reply = await request<{ intent: BackendIntent }>(paths.schedule(), undefined, body as unknown as Record<string, unknown>);
     return { intent: toPublishIntent(reply.intent) };
   },
-  cancel: async (intentId: string) => {
-    const reply = await request<{ intent: BackendIntent }>(paths.cancel(intentId), undefined, {});
+  importMedia: async (body: MediaImportBody): Promise<MediaImportReply> => {
+    const reply = await request<Record<string, unknown>>(paths.importMedia(), undefined, body as unknown as Record<string, unknown>, MEDIA_IMPORT_KEYS);
+    const key = str(reply.media_key), digest = str(reply.image_digest);
+    if (!key || !digest) throw new ApiError("The server returned an invalid media import receipt", 502);
+    return { media_key: key, image_digest: digest };
+  },
+  /** CAD-1027: cancel names the intent's own install and exact context;
+   *  the daemon refuses any other scope. */
+  cancel: async (intentId: string, installId: string, contextId: string | null) => {
+    const body = { install_id: installId, ...(contextId ? { context_id: contextId } : {}) };
+    const reply = await request<{ intent: BackendIntent }>(paths.cancel(intentId), undefined, body, CANCEL_KEYS);
     return { intent: toPublishIntent(reply.intent) };
   },
 };
@@ -397,8 +432,23 @@ export function isGrantIdUsable(grantId: string): boolean {
  *  any other request refuses `approval_replay`. `getRandomValues` works on
  *  a plain-http board, where `randomUUID` does not. */
 export function mintApprovalId(): string {
+  return `apv-${randomHex()}`;
+}
+
+/** 32 random lowercase hex characters. */
+export function randomHex(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return `apv-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** CAD-1027: an import is usable only when it carries exactly the reviewed
+ *  image — the receipt's `sha256:<hex>` asset digest — and its key binds
+ *  that digest (`dp1.<ws>.<connection>.<digest[..32]>`). Anything else is
+ *  refused before scheduling; the daemon re-proves the key at freeze. */
+export function importMatchesReviewed(reply: MediaImportReply, reviewedDigest: string): boolean {
+  const hex = reviewedDigest.startsWith("sha256:") ? reviewedDigest.slice(7) : "";
+  return /^[a-f0-9]{64}$/.test(hex) && reply.image_digest === hex
+    && reply.media_key.endsWith(`.${hex.slice(0, 32)}`);
 }
 
 /** Only a queued intent can cancel — past queued the contract answers

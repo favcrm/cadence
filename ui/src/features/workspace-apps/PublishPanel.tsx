@@ -6,11 +6,13 @@ import {
   PUBLISH_TIMEZONE,
   canCancel,
   dueLabel,
+  importMatchesReviewed,
   isGrantIdUsable,
   mintApprovalId,
   parseDueEpoch,
   publishStateText,
   publishStateTone,
+  randomHex,
   reconcileReading,
   refusalCopy,
   refusalFromError,
@@ -52,6 +54,7 @@ export default function PublishPanel({
   canWrite,
   client = socialPublish,
   loadArtifact = workspaceApps.artifact,
+  imageReceipts = workspaceApps.imageResults,
 }: {
   installId: string;
   contextId: string | null;
@@ -59,6 +62,7 @@ export default function PublishPanel({
   canWrite: boolean;
   client?: typeof socialPublish;
   loadArtifact?: typeof workspaceApps.artifact;
+  imageReceipts?: typeof workspaceApps.imageResults;
 }) {
   const [intents, setIntents] = useState<PublishIntent[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -85,6 +89,8 @@ export default function PublishPanel({
   const [busy, setBusy] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
+  // CAD-1027: the imported, digest-verified media for one draft+channel.
+  const [media, setMedia] = useState<{ key: string; digest: string; subject: string } | null>(null);
   const statusRef = useRef<HTMLHeadingElement>(null);
   const candidate =
     candidates.find((value) => value.run_id === candidateId) ?? null;
@@ -92,8 +98,13 @@ export default function PublishPanel({
   const grantReady = isGrantIdUsable(grantId);
   const imageMissing =
     toolkit === "instagram" && candidate !== null && !candidate.image_digest;
+  // A draft with a reviewed image sends only with a media key that binds
+  // it: the sender accepts (no key, no digest) or (key, digest), never half.
+  const needsImport = candidate !== null && candidate.image_digest !== null;
+  const mediaReady = media !== null && media.subject === `${candidateId}|${toolkit}`;
   const canReview =
     canWrite &&
+    (!needsImport || mediaReady) &&
     grantReady &&
     candidate !== null &&
     !busy &&
@@ -120,6 +131,39 @@ export default function PublishPanel({
     setLoadError(null);
     void refresh();
   }, [refresh]);
+
+  const importImage = async () => {
+    if (!candidate || !canWrite || busy) return;
+    setBusy(true);
+    setActionError(null);
+    setMedia(null);
+    try {
+      const receipt = (await imageReceipts(candidate.run_id)).find(
+        (value) => value.slot === "image" && value.asset !== null,
+      );
+      if (!receipt?.asset) throw new Error("This draft has no reviewed image receipt to import.");
+      const reply = await client.importMedia({
+        request_id: `imp-${randomHex()}`,
+        install_id: installId,
+        ...(contextId ? { context_id: contextId } : {}),
+        run_id: candidate.run_id,
+        artifact_id: candidate.artifact_id,
+        bundle_digest: candidate.bundle_digest,
+        slot: "publication",
+        toolkit,
+        destination_id: PILOT_DESTINATION.account_id,
+      });
+      if (!importMatchesReviewed(reply, receipt.asset.digest))
+        throw new Error(
+          `The imported image (${reply.image_digest}) does not match the reviewed image (${receipt.asset.digest}). Nothing was scheduled.`,
+        );
+      setMedia({ key: reply.media_key, digest: reply.image_digest, subject: `${candidateId}|${toolkit}` });
+    } catch (error) {
+      setActionError(message(error));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const review = () => {
     if (!canReview) return;
@@ -167,6 +211,7 @@ export default function PublishPanel({
         slot: "publication",
         destination_id: PILOT_DESTINATION.account_id,
         toolkit,
+        ...(needsImport && media ? { media_key: media.key } : {}),
         grant_id: grantId,
         approval_id: approvalId,
         due_epoch: epoch,
@@ -187,11 +232,14 @@ export default function PublishPanel({
     }
   };
 
-  const cancel = async (intentId: string) => {
+  // CAD-1027: cancel in the intent's own frozen scope. An unscoped list
+  // shows every context's intents; the panel's context would refuse them.
+  const cancel = async (intent: PublishIntent) => {
+    const intentId = intent.intent_id;
     setBusy(true);
     setActionError(null);
     try {
-      await client.cancel(intentId);
+      await client.cancel(intentId, intent.install_id, intent.context_id);
       setConfirmCancel(null);
       setNotice(`Cancelled ${intentId} before dispatch. Nothing was sent.`);
       statusRef.current?.focus();
@@ -284,7 +332,7 @@ export default function PublishPanel({
                 size="sm"
                 loading={busy}
                 disabled={!canWrite}
-                onClick={() => void cancel(intent.intent_id)}
+                onClick={() => void cancel(intent)}
               >
                 Confirm cancel
               </Button>
@@ -453,8 +501,10 @@ export default function PublishPanel({
                   </dd>
                   <dt className="wa-kicker">Image digest</dt>
                   <dd>
-                    {candidate.image_digest ? (
-                      <code>{candidate.image_digest}</code>
+                    {needsImport && media ? (
+                      <>
+                        <code>{media.digest}</code> · key <code>{media.key}</code>
+                      </>
                     ) : (
                       "text-only"
                     )}
@@ -489,6 +539,15 @@ export default function PublishPanel({
               </section>
             ) : (
               <div className="wa-row">
+                {needsImport && (
+                  <Button
+                    disabled={!canWrite || busy || mediaReady || imageMissing}
+                    loading={busy}
+                    onClick={() => void importImage()}
+                  >
+                    {mediaReady ? "Image imported" : "Import image"}
+                  </Button>
+                )}
                 <Button variant="primary" disabled={!canReview} onClick={review}>
                   {choice === "now" ? "Review post now" : "Review schedule"}
                 </Button>

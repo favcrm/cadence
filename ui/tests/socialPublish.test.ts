@@ -35,6 +35,8 @@ let intents: any[] = [envelope()];
     intents[0] = { ...intents[0], state: "cancelled" };
     return new Response(JSON.stringify({ intent: intents[0] }), { status: 200 });
   }
+  if (url === "/api/social-media-imports" && init?.method === "POST")
+    return new Response(JSON.stringify({ ok: true, media_key: `dp1.ws.conn.${"ab".repeat(16)}`, image_digest: "ab".repeat(32) }), { status: 200 });
   throw new Error(`Unexpected fetch ${init?.method ?? "GET"} ${url}`);
 };
 async function main() {
@@ -53,7 +55,9 @@ async function main() {
   assert(write?.body.slot === "publication" && write?.body.timezone === "Asia/Hong_Kong"
     && write?.body.destination_id === "17841400008460056"
     && !Object.hasOwn(write?.body ?? {}, "caption_digest"), "Artifact-freeze body carries no caller-invented digest");
-  const cancelled = await store.socialPublish.cancel("intent-a");
+  const cancelled = await store.socialPublish.cancel("intent-a", "install-a", "ctx-a");
+  const cancelCall = calls.find(call => call.url === "/api/social-publishes/intent-a/cancel");
+  assert(cancelCall?.body.install_id === "install-a" && cancelCall?.body.context_id === "ctx-a" && Object.keys(cancelCall.body).length === 2, "Cancel names the intent's install and context scope only");
   assert(cancelled.intent.state === "cancelled", "Cancel closes the intent");
   assert(calls.length > 0 && calls.every(call => call.url.startsWith("/api/") && !call.url.includes("http")), "Every client call stays same-origin — no external provider reachable");
   const states = ["queued", "processing", "posted", "refused", "cancelled", "held"] as const;
@@ -100,6 +104,18 @@ async function main() {
   assert(label.includes("Asia/Hong_Kong") && label.includes("1790601000"), "Due label always shows timezone and epoch");
   assert(store.parseDueEpoch("2026-09-30T18:30") !== null && store.parseDueEpoch("") === null && store.parseDueEpoch("tomorrow") === null, "Incomplete due values keep Schedule gated");
   assert(store.PILOT_DESTINATION.handle === "@sakeboyhk" && store.PILOT_DESTINATION.account_id === "17841400008460056", "Pilot identity is the operator-named account");
+  const importBody = { request_id: "imp-a", install_id: "install-a", run_id: "run-a", artifact_id: "artifact-a", bundle_digest: "bundle-a", slot: "publication" as const, toolkit: "instagram" as const, destination_id: "17841400008460056" };
+  const imported = await store.socialPublish.importMedia(importBody);
+  assert(imported.image_digest === "ab".repeat(32) && calls.some(call => call.url === "/api/social-media-imports" && call.method === "POST"), "Import posts provenance to the same-origin media door");
+  let forgedThrew = false;
+  try { await store.socialPublish.importMedia({ ...importBody, bytes_url: "https://evil" } as any); } catch { forgedThrew = true; }
+  assert(forgedThrew, "Import never serializes a caller path, URL or byte field");
+  const reviewed = `sha256:${"ab".repeat(32)}`;
+  assert(store.importMatchesReviewed(imported, reviewed), "A key binding the reviewed digest is usable");
+  assert(!store.importMatchesReviewed({ ...imported, image_digest: "cd".repeat(32) }, reviewed), "A different imported digest is refused");
+  assert(!store.importMatchesReviewed({ ...imported, media_key: `dp1.ws.conn.${"cd".repeat(16)}` }, reviewed), "A key bound to another digest is refused");
+  assert(!store.importMatchesReviewed(imported, "ab".repeat(32)), "A reviewed digest without its sha256: prefix is not trusted");
+  assert(store.isGrantIdUsable("dpq_synthetic_grant_01") && !store.isGrantIdUsable("dpq_short") && !store.isGrantIdUsable("grant-a") && !store.isGrantIdUsable(`dpq_${"a".repeat(65)}`), "Grant ids mirror valid_grant_id");
   console.log("social publish client checks passed");
 }
 void main();

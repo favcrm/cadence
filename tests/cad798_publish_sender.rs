@@ -1292,7 +1292,11 @@ fn daemon_release(door: &FakeDoor) -> (Release, Arc<HttpPublishSender>) {
 fn approved_run(h: &Release, tag: &str) -> (Value, Value, String, String) {
     let context = h.context("Harbour", A, &format!("cad798-{tag}-context"));
     h.bind(&context, &format!("cad798-{tag}-binding"));
-    let run = h.complete(&context, &format!("cad798-{tag}-run"));
+    let mut run = h.complete(&context, &format!("cad798-{tag}-run"));
+    // CAD-1027: freeze proves the effect belongs to this run+artifact, so
+    // every fixture schedules against a real staged app effect.
+    let effect = h.stage(&run, &format!("cad798-{tag}-effect"));
+    run["staged_effect_id"] = effect["effect_id"].clone();
     let bundle_digest = run["snapshot"]["bundle_digest"]
         .as_str()
         .unwrap()
@@ -1314,7 +1318,7 @@ fn freeze_params(
         "context_id": context["id"], "run_id": run["id"],
         "artifact_id": run["artifacts"][0]["id"],
         "bundle_digest": bundle_digest,
-        "slot": "publication", "effect_id": "cad_fx_798_e2e_01",
+        "slot": "publication", "effect_id": run["staged_effect_id"],
         "destination_id": DEST, "toolkit": "facebook",
         "grant_id": grant, "approval_id": approval_for(request),
         "due_epoch": due, "timezone": "Asia/Hong_Kong"})

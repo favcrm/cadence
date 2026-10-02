@@ -45,6 +45,12 @@ async function openConfirmation() {
   await flush();
 }
 let refuseSchedule = false;
+const cancelScopes: [string, string | null][] = [];
+const reviewedHex = "ab".repeat(32);
+const otherHex = "cd".repeat(32);
+let importHex = otherHex;
+const imports: any[] = [];
+const receipts = async () => [{ id: "receipt-a", run_id: "run-a", slot: "image", asset: { media_type: "image/png", digest: `sha256:${reviewedHex}`, size: 1 } }];
 let intents: any[] = [];
 let failList = false;
 const scheduled: any[] = [];
@@ -56,16 +62,22 @@ const stub = {
     if (refuseSchedule) throw new Error("approval_replay: this approval already authorized another social publish intent");
     assert(body.slot === "publication" && body.timezone === "Asia/Hong_Kong" && body.destination_id === "17841400008460056", "Panel schedules exact pilot destination with timezone");
     assert(!Object.hasOwn(body, "caption_digest"), "Panel never invents digests");
+    assert(body.media_key === `dp1.ws.conn.${reviewedHex.slice(0, 32)}`, "An image draft schedules only with the verified media key");
     assert(/^apv-[0-9a-f]{32}$/.test(body.approval_id) && body.request_id === body.approval_id && body.grant_id === "dpq_synthetic_grant_ig", "Confirmation mints the approval id that is also the request id");
     const intent = { intent_id: `intent-${scheduled.length}`, install_id: "install-a", context_id: null, run_id: body.run_id, effect_id: body.effect_id, state: body.due_epoch <= Math.floor(Date.now() / 1000) + 5 ? "processing" : "queued", channel: body.toolkit, destination_id: body.destination_id, caption_digest: "c-digest", image_digest: "i-digest", frozen_digest: "binding-digest", idempotency_key: `key-${scheduled.length}`, due_epoch: body.due_epoch, timezone: body.timezone, grant_id: body.grant_id, approval_id: body.approval_id, writer: "writer-a", reviewer: "reviewer-a", permalink: null, receipt: null, refusal: null, upstream: null };
     scheduled.push(body); intents = [intent, ...intents];
     return { intent };
   },
-  cancel: async (intentId: string) => { cancelled.push(intentId); intents = intents.map(value => value.intent_id === intentId ? { ...value, state: "cancelled" } : value); return { intent: intents.find(value => value.intent_id === intentId) }; },
+  importMedia: async (body: any) => {
+    assert(Object.keys(body).every(key => ["request_id", "install_id", "context_id", "run_id", "artifact_id", "bundle_digest", "slot", "toolkit", "destination_id"].includes(key)) && /^imp-[0-9a-f]{32}$/.test(body.request_id), "Import sends provenance and scope only");
+    imports.push(body);
+    return { media_key: `dp1.ws.conn.${importHex.slice(0, 32)}`, image_digest: importHex };
+  },
+  cancel: async (intentId: string, installId: string, contextId: string | null) => { cancelScopes.push([installId, contextId]); cancelled.push(intentId); intents = intents.map(value => value.intent_id === intentId ? { ...value, state: "cancelled" } : value); return { intent: intents.find(value => value.intent_id === intentId) }; },
 };
 let mounts = 0;
 async function render(props: any) {
-  await React.act(async () => { root.render(React.createElement(PublishPanel, { key: ++mounts, installId: "install-a", contextId: null, candidates: [], canWrite: true, client: stub, loadArtifact, ...props })); });
+  await React.act(async () => { root.render(React.createElement(PublishPanel, { key: ++mounts, installId: "install-a", contextId: null, candidates: [], canWrite: true, client: stub, loadArtifact, imageReceipts: receipts, ...props })); });
   await flush();
 }
 async function typeGrant(value: string) {
@@ -96,6 +108,14 @@ async function main() {
   await flush();
   assert(text().includes("@sakeboyhk"), "Exact destination is shown before any decision");
   assert(!button("Confirm and post now"), "Nothing schedules without the confirmation step");
+  assert(button("Review post now")?.disabled, "An image draft cannot review before its image is imported");
+  await React.act(async () => { button("Import image")?.click(); });
+  await flush(); await flush();
+  assert(imports.length === 1 && text().includes("does not match the reviewed image") && button("Review post now")?.disabled && scheduled.length === 0, "A mismatched import digest is refused and nothing schedules");
+  importHex = reviewedHex;
+  await React.act(async () => { button("Import image")?.click(); });
+  await flush(); await flush();
+  assert(button("Image imported") && !button("Review post now")?.disabled, "A matching import unlocks review");
   await React.act(async () => { button("Review post now")?.click(); });
   await flush();
   assert(button("Confirm and post now")?.disabled && text().includes("Loading the reviewed caption"), "Confirm stays disabled until the reviewed artifact text loads");
@@ -104,7 +124,7 @@ async function main() {
   const confirm = host.querySelector('[aria-label="Confirm publish"]')?.textContent ?? "";
   assert(confirm.includes(reviewedText) && confirm.includes("sha256:artifact-digest") && !confirm.includes("Synthetic caption"), "Confirmation shows the reviewed artifact text verbatim with its digest, not the run title");
   assert(!button("Confirm and post now")?.disabled, "A loaded matching artifact enables Confirm");
-  assert(confirm.includes("i-digest") && confirm.includes("Asia/Hong_Kong") && confirm.includes("17841400008460056") && confirm.includes("instagram") && /apv-[0-9a-f]{32}/.test(confirm), "Confirmation shows caption, image digest, due, timezone, destination and the approval id");
+  assert(confirm.includes(reviewedHex) && confirm.includes("dp1.ws.conn.") && confirm.includes("Asia/Hong_Kong") && confirm.includes("17841400008460056") && confirm.includes("instagram") && /apv-[0-9a-f]{32}/.test(confirm), "Confirmation shows caption, image digest, due, timezone, destination and the approval id");
   await React.act(async () => { button("Confirm and post now")?.click(); button("Confirm and post now")?.click(); });
   await flush(); await flush();
   assert(scheduled.length >= 1 && scheduled.every(body => body.approval_id === scheduled[0].approval_id) && text().includes("intent-0"), "A double press reuses one approval id, so the daemon keeps one intent");
@@ -136,7 +156,9 @@ async function main() {
   assert(button("Review schedule")?.disabled, "Schedule without a due time stays gated");
   // Cancel takes two explicit presses from queued only (cancel_closed past queued).
   assert(!button("Cancel before dispatch"), "Processing intent offers no cancel");
-  intents = [{ ...intents[0], intent_id: "intent-q", state: "queued" }];
+  // An unscoped panel (contextId null) lists another context's intent; its
+  // cancel must carry that intent's own frozen install and context.
+  intents = [{ ...intents[0], intent_id: "intent-q", state: "queued", install_id: "install-a", context_id: "ctx-other" }];
   await render({ candidates: [candidate], });
   assert(button("Cancel before dispatch"), "Queued intent offers cancel");
   await React.act(async () => { button("Cancel before dispatch")?.click(); });
@@ -145,6 +167,7 @@ async function main() {
   await React.act(async () => { button("Confirm cancel")?.click(); });
   await flush(); await flush();
   assert(cancelled.includes("intent-q") && text().includes("Nothing was sent"), "Cancel closes the intent without a send");
+  assert(cancelScopes.at(-1)?.[0] === "install-a" && cancelScopes.at(-1)?.[1] === "ctx-other", "Cancel uses the intent's frozen install/context, not the panel's");
   // Every state renders its operator copy.
   intents = [
     { ...intents[0], intent_id: "i-posted", state: "posted", permalink: "https://www.instagram.com/p/fixture000/", receipt: { ok: true } },
