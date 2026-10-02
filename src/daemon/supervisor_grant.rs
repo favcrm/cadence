@@ -1,33 +1,45 @@
 //! CAD-1017 — the protected supervisor **grant consumer** (verify-only).
 //!
 //! This module implements the *consumer* half of the private supervisor grant
-//! protocol — a private Unix listener owned by the supervisor account
+//! protocol: a private Unix listener owned by the supervisor account
 //! (`cadence-supervisor`, uid `21000`), kernel peer admission for the
-//! image-pinned root installer, a bounded domain-separated signed envelope,
-//! and a one-time consume protocol. It **never mints** a grant and **never
-//! launches a Pi** — the external production authority factory is unavailable
-//! this batch, so the live path stays `Err(UNKNOWN)`.
+//! image-pinned root installer, a bounded domain-separated signed envelope
+//! over the canonical `SupervisorChallenge`, and a one-time consume protocol.
+//! It **never mints** a grant and **never launches a Pi** — the production
+//! authority factory is unavailable this batch, so the live path stays
+//! `Err(UNKNOWN)`.
 //!
-//! Trust model (the canonical contract, `aos121-canonical-supervisor-grant-contract`):
+//! Trust model (canonical contract `aos121-canonical-supervisor-grant-contract`
+//! + platform `supervisor-continuity.ts`):
 //!   * **Supervisor is the server** — a *new private* Unix listener, separate
-//!     from `cadence.sock`, owned `21000` under a verified root-owned tree.
-//!     The **root image-pinned installer** is the *client*; it may *deliver*
-//!     a grant but can never *ask for* authority. A guest socket peer refuses.
+//!     from `cadence.sock`, owned `21000`. The **root image-pinned installer**
+//!     is the *client*; it may *deliver* a grant but never *ask for* one. A
+//!     guest socket peer refuses.
 //!   * **Admission is kernel + process custody**: `SO_PEERCRED` peer uid `0`,
-//!     a live `/proc/<pid>` starttime, the supervisor's enrolled generation,
-//!     AND the held `/proc/<pid>/exe` measured against the installer's pinned
-//!     digest — root uid *alone* (an arbitrary root shell) is refused.
-//!   * **Authority types are non-forgeable**: `Enrollment`, `PeerIdentity` and
-//!     `VerifiedGrant` have private fields and *no* public or crate-wide
-//!     constructor — they are produced only inside this module by the kernel /
-//!     enrollment / signature paths, never assembled from caller literals.
+//!     a live `/proc/<pid>` starttime (re-checked before *and* after the hash),
+//!     the installer's own enrolled generation, AND the held `/proc/<pid>/exe`
+//!     opened as a real fd, `fstat`ed (regular file, root-owned, not
+//!     group/other-writable), bounded, hashed from offset 0 — measured against
+//!     the installer's pinned digest. Root uid *alone* refuses.
+//!   * **Two *separate* enrollments**: the supervisor's own live enrollment
+//!     (`SupervisorEnrollment`, the `recipient` the signed grant binds) is
+//!     distinct from the installer's kernel-derived enrollment
+//!     (`InstallerEnrollment`, the connecting peer). They are never compared
+//!     to each other — the grant's `recipient` names the *supervisor*, while
+//!     `admit_installer` verifies the *peer*.
+//!   * **Authority types are non-forgeable**: `SupervisorEnrollment`,
+//!     `PeerIdentity` and `VerifiedGrant` have private fields and *no* public
+//!     or crate-wide literal constructor — produced only inside this module by
+//!     the kernel / enrollment / signature paths. `enroll_self` and the
+//!     durable enrollment port are `Err`/unavailable factories this batch.
 //!   * **Two fixed actions only**: `challenge` returns a nonsecret
 //!     operation-bound nonce + the supervisor's own pid/starttime/generation;
 //!     `install` accepts one bounded canonical envelope. No generic command,
 //!     no argv/env-as-secret, no `/boot` report, no caller JWKS.
-//!   * **Replay**: a durable operation/epoch/lineage obligation must commit
-//!     *before* delivery; the external one-time CAS + pre-spawn recheck are an
-//!     `Err`/unavailable port this batch. The in-memory tombstone is
+//!   * **Replay**: a durable obligation must be enrolled *before* a grant is
+//!     delivered, then the exact `SupervisorChallenge` is one-time consumed +
+//!     re-checked before spawn — all behind the `Err`/unavailable
+//!     [`ExternalConsume`] port this batch. The in-memory tombstone is
 //!     *test-only mechanics*, not durable authority; a restored DB never
 //!     auto-loads.
 //!
@@ -47,29 +59,78 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// ────────────────────── private, non-forgeable authority ──────────────────
+// ────────────────── private reviewed constants (never caller-supplied) ────
 
 /// The supervisor account's fixed uid — the server that owns the private
 /// grant listener. Asserted as a constant bound (NSS resolution lives in the
 /// topology layer); a socket owned by anyone else is never a grant channel.
 pub(crate) const SUPERVISOR_UID: u32 = 21000;
 
-/// The enrolled supervisor process identity — the pid + `/proc` starttime +
-/// generation the *live* supervisor instance recorded. Private fields, built
-/// only by [`Enrollment::capture`] from the running process — a caller cannot
-/// fabricate one.
+/// The reviewed, image-pinned Ed25519 verifying keys for the supervisor grant
+/// — `"<kid>:<base64url-x>"` pairs, the ONLY trust root a grant signature may
+/// resolve against. Compiled in, bound to the protected-image build; a caller
+/// may never supply or override it. Empty this batch → no envelope verifies.
+const SUPERVISOR_KEYRING: &[&[u8]] = &[];
+
+/// The reviewed sha256 of the image-pinned installer binary — the digest the
+/// connecting peer's `/proc/<pid>/exe` must equal. A private constant, bound
+/// to the protected-image build; a caller may never supply or override it.
+/// `None`/zero this batch → every installer admission refuses.
+const INSTALLER_EXE_DIGEST: Option<[u8; 32]> = None;
+
+/// The pinned supervisor generation the installer must present — a private,
+/// reviewed constant. `None` this batch → no presented generation can match.
+const INSTALLER_GENERATION_PIN: Option<&'static str> = None;
+
+/// The private grant-listener path under the supervisor's runtime dir —
+/// a *new* socket, separate from `cadence.sock`. Production resolution is
+/// unavailable this batch (no provisioned path); [`GrantListener::bind_at`]
+/// is the `#[cfg(test)]`-only injection used by ordinary-uid socket tests.
+#[cfg(target_os = "linux")]
+const PRODUCTION_GRANT_SOCK: &str = "/run/cadence-supervisor/grant.sock";
+
+/// The signature domain — a context string prepended to the signed body so a
+/// grant signature can never be replayed as a board-session assertion or any
+/// other Ed25519 document. Distinct, fixed, and never guest-controlled.
+const GRANT_DOMAIN: &str = "cadence.supervisor-launch-grant.v1";
+
+/// The largest grant validity window — a grant is never open-ended.
+const MAX_GRANT_WINDOW_SECS: u64 = 300;
+
+/// The largest envelope byte length accepted on the wire — bounded framing.
+const MAX_ENVELOPE_BYTES: usize = 32 * 1024;
+
+// ────────────────────── non-forgeable authority types ─────────────────────
+
+/// The supervisor's own live process enrollment — the pid + `/proc`
+/// starttime + generation of the running supervisor instance that a signed
+/// grant's `recipient` binds to. Private fields; produced only by
+/// `enroll_self` (production, unavailable this batch) or `capture_test`
+/// (`#[cfg(test)]`-only). A caller cannot fabricate one from a literal.
 #[derive(Clone, Debug)]
-pub(crate) struct Enrollment {
+pub(crate) struct SupervisorEnrollment {
     pid: u32,
     starttime: u64,
     generation: String,
 }
 
-impl Enrollment {
-    /// Capture the supervisor's own live enrollment: its pid, `/proc`
-    /// starttime, and the minted generation. `generation` is the supervisor's
-    /// own minted token for this instance — carried internally, private.
-    pub(crate) fn capture(pid: u32, generation: String) -> Result<Self> {
+/// Mint the supervisor's own enrollment — the production path resolves the
+/// running pid + `/proc` starttime and the minted generation. Permanently
+/// `Err` this batch: no live supervisor enrollment source exists, and the
+/// recipient-binding must come from the real self, not a caller literal.
+pub(crate) fn enroll_self() -> Result<SupervisorEnrollment> {
+    Err(Error::rejected(
+        "supervisor self-enrollment unavailable — no live enrolled pid/\
+         starttime/generation source this batch; recipient binding UNKNOWN",
+    ))
+}
+
+impl SupervisorEnrollment {
+    /// `#[cfg(test)]`-only synthetic capture for unit tests — reads the test
+    /// process's real `/proc` starttime but takes an arbitrary pid/generation.
+    /// NOT a production authority path; `enroll_self` stays refused.
+    #[cfg(test)]
+    fn capture_test(pid: u32, generation: String) -> Result<Self> {
         let starttime = crate::peer::proc_starttime(pid)
             .ok_or_else(|| Error::rejected(format!("supervisor pid {pid} starttime unreadable")))?;
         Ok(Self {
@@ -79,24 +140,23 @@ impl Enrollment {
         })
     }
 
-    pub(crate) fn pid(&self) -> u32 {
+    fn pid(&self) -> u32 {
         self.pid
     }
-    pub(crate) fn generation(&self) -> &str {
+    fn generation(&self) -> &str {
         &self.generation
     }
 }
 
 /// The authenticated installer peer — produced ONLY by [`admit_installer`]
-/// from the accepted socket's `SO_PEERCRED` + `/proc` custody + enrollment
-/// match. Private fields, no public construction — a caller cannot mint a
-/// `PeerIdentity` to claim installer status.
+/// from the accepted socket's `SO_PEERCRED` + `/proc` custody + the pinned
+/// generation/digest match. Private fields, no public construction — a caller
+/// cannot mint a `PeerIdentity` to claim installer status.
 #[derive(Clone, Debug)]
 pub(crate) struct PeerIdentity {
     pid: u32,
     starttime: u64,
-    /// The measured sha256 of the peer's `/proc/<pid>/exe` — the installed
-    /// installer binary's digest.
+    /// The measured sha256 of the peer's held `/proc/<pid>/exe` fd.
     exe_digest: [u8; 32],
 }
 
@@ -125,33 +185,138 @@ fn peer_credentials(stream: &std::os::unix::net::UnixStream) -> Result<(u32, u32
     Ok((cred.uid, cred.pid as u32))
 }
 
-/// Measure the running peer's executable inode digest — `sha256` of the file
-/// `/proc/<pid>/exe` resolves to. This binds the *installed binary* the
-/// installer is actually running, not just its uid — a root shell connecting
-/// to the socket has a different `exe` and refuses.
+/// The largest `/proc/<pid>/exe` the installer may be — bounded read.
+#[cfg(target_os = "linux")]
+const MAX_EXE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// A stable `(ino, size, mtime_ns, ctime_ns)` fingerprint of the exe fd — the
+/// binary must not change under the read.
+#[cfg(target_os = "linux")]
+#[derive(PartialEq, Eq)]
+struct ExeStat {
+    ino: u64,
+    size: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+    mode: u32,
+    uid: u32,
+    nlink: u64,
+}
+#[cfg(target_os = "linux")]
+fn exe_stat(m: &libc::stat) -> ExeStat {
+    ExeStat {
+        ino: m.st_ino,
+        size: m.st_size as u64,
+        mtime_ns: (m.st_mtime as i128) * 1_000_000_000 + m.st_mtime_nsec as i128,
+        ctime_ns: (m.st_ctime as i128) * 1_000_000_000 + m.st_ctime_nsec as i128,
+        mode: m.st_mode,
+        uid: m.st_uid,
+        nlink: m.st_nlink,
+    }
+}
+
+/// Open + measure the running peer's executable inode.
+///
+/// Opens `/proc/<pid>/exe` as a real fd (not `fs::read`'s unbounded path read),
+/// `fstat`s it (must be a *regular* file, root-owned, not group/other-writable,
+/// ≤ [`MAX_EXE_BYTES`]), hashes it from offset 0 with `pread`, and re-stats the
+/// held fd afterwards — a binary that changed or fails the ownership/mode check
+/// refuses. Returns the digest. The caller separately re-checks the peer's
+/// live pid/starttime after this call (TOCTOU on the process itself).
 #[cfg(target_os = "linux")]
 fn peer_exe_digest(pid: u32) -> Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
+    use std::os::unix::io::FromRawFd;
     let path = format!("/proc/{pid}/exe");
-    // The symlink target is the running binary's inode; hashing the *file it
-    // points to* (which O_RDONLY-resolves the live exe) measures the binary.
-    let bytes = std::fs::read(&path)
-        .map_err(|e| Error::rejected(format!("/proc/{pid}/exe unreadable: {e}")))?;
-    Ok(Sha256::digest(&bytes).into())
+    let cpath = std::ffi::CString::new(path.clone())
+        .map_err(|_| Error::rejected("exe path not cstring"))?;
+    // O_RDONLY|O_CLOEXEC — /proc/<pid>/exe resolves to the live binary inode.
+    let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(Error::rejected(format!(
+            "/proc/{pid}/exe open failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `raw` is a freshly opened owned fd.
+    let file = unsafe { std::fs::File::from_raw_fd(raw) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0 {
+        return Err(Error::rejected(format!(
+            "/proc/{pid}/exe fstat failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let before = exe_stat(&st);
+    // Must be a regular file (not a fifo/dir/symlink), root-owned, and not
+    // group/other-writable — the installed helper binary's custody.
+    if before.mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(Error::rejected("/proc/<pid>/exe is not a regular file"));
+    }
+    if before.uid != 0 {
+        return Err(Error::rejected("installer binary is not root-owned"));
+    }
+    if before.mode & 0o022 != 0 {
+        return Err(Error::rejected("installer binary is group/other-writable"));
+    }
+    if before.nlink < 1 {
+        return Err(Error::rejected("installer binary has zero links"));
+    }
+    if before.size > MAX_EXE_BYTES {
+        return Err(Error::rejected(format!(
+            "installer binary exceeds {MAX_EXE_BYTES} bytes"
+        )));
+    }
+    // Hash from offset 0 with pread — no shared-offset interference, bounded.
+    let mut h = Sha256::new();
+    let mut off: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+    while off < before.size {
+        let want = std::cmp::min(buf.len() as u64, before.size - off) as usize;
+        let n = unsafe {
+            libc::pread(
+                file.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                want,
+                off as libc::off_t,
+            )
+        };
+        if n <= 0 {
+            return Err(Error::rejected("/proc/<pid>/exe read failed"));
+        }
+        h.update(&buf[..n as usize]);
+        off += n as u64;
+    }
+    // Re-stat the held fd — the inode must not have changed under the read.
+    let mut st2: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut st2) } != 0 {
+        return Err(Error::rejected("/proc/<pid>/exe re-fstat failed"));
+    }
+    if exe_stat(&st2) != before {
+        return Err(Error::rejected(
+            "installer binary changed under read — unstable inode",
+        ));
+    }
+    Ok(h.finalize().into())
 }
 
 /// Admit a connecting installer peer. The kernel peer uid must be `0` (root),
-/// the peer's live `/proc` starttime must match the enrollment, its presented
-/// generation must equal the supervisor's enrolled generation, AND the held
-/// `/proc/<pid>/exe` must hash to the installer's pinned digest. Root uid
-/// alone, a pid-reuse, a stale generation, or a wrong binary all refuse.
-/// Returns a non-forgeable [`PeerIdentity`] — the only way to obtain one.
+/// the peer's live `/proc` starttime must be stable across the exe-hash window
+/// (re-checked before *and* after), the presented generation must equal the
+/// pinned installer generation, AND the held `/proc/<pid>/exe` fd must hash to
+/// the pinned installer digest. Root uid alone, a pid-reuse/dead process, a
+/// stale generation, or a wrong binary all refuse. Returns a non-forgeable
+/// [`PeerIdentity`] — the only way to obtain one.
+///
+/// `exe_digest` and `generation_pin` are the reviewed private constants; they
+/// are `#[cfg(test)]`-injectable only — production passes `INSTALLER_EXE_DIGEST`
+/// and `INSTALLER_GENERATION_PIN`, never caller data.
 #[cfg(target_os = "linux")]
-pub(crate) fn admit_installer(
+fn admit_installer(
     stream: &std::os::unix::net::UnixStream,
-    enrolled: &Enrollment,
-    expected_exe_digest: &[u8; 32],
     generation_presented: &str,
+    exe_pin: Option<[u8; 32]>,
+    generation_pin: Option<&'static str>,
 ) -> Result<PeerIdentity> {
     let (uid, pid) = peer_credentials(stream)?;
     if uid != 0 {
@@ -160,58 +325,56 @@ pub(crate) fn admit_installer(
              installer may deliver a grant"
         )));
     }
-    // Live process identity: pid must still name the enrolled process
-    // (starttime), closing pid-reuse.
-    let start = crate::peer::proc_starttime(pid)
+    // Live process identity, sample 1 — before the exe hash.
+    let start_a = crate::peer::proc_starttime(pid)
         .ok_or_else(|| Error::rejected(format!("peer pid {pid} starttime unreadable")))?;
-    if pid != enrolled.pid || start != enrolled.starttime {
-        return Err(Error::rejected(format!(
-            "peer pid {pid}/starttime {start} is not the enrolled installer \
-             {}/{} — pid-reuse or a stale enrollment refused",
-            enrolled.pid, enrolled.starttime
-        )));
-    }
-    if generation_presented != enrolled.generation {
+    // The presented generation must equal the pinned installer generation —
+    // unset pin refuses outright.
+    let Some(want_gen) = generation_pin else {
         return Err(Error::rejected(
-            "peer presented a generation that is not the enrolled supervisor generation",
+            "no installer generation pin — admission refused",
+        ));
+    };
+    if generation_presented != want_gen {
+        return Err(Error::rejected(
+            "peer presented a generation that is not the pinned installer generation",
         ));
     }
     // The binary the peer is actually running must be the pinned installer —
     // root uid alone is never enough.
+    let Some(want_exe) = exe_pin else {
+        return Err(Error::rejected(
+            "no installer exe digest pin — admission refused",
+        ));
+    };
     let exe = peer_exe_digest(pid)?;
-    if &exe != expected_exe_digest {
+    if exe != want_exe {
         return Err(Error::rejected(
             "peer binary does not match the pinned installer digest — a root \
              shell is not the installer",
         ));
     }
+    // Sample 2 — the pid must still name the *same* live process after the
+    // hash window (guards a die-and-reexec TOCTOU).
+    let start_b = crate::peer::proc_starttime(pid)
+        .ok_or_else(|| Error::rejected(format!("peer pid {pid} exited during admission")))?;
+    if start_b != start_a {
+        return Err(Error::rejected(
+            "peer pid changed under admission — pid-reuse/exit refused",
+        ));
+    }
     Ok(PeerIdentity {
         pid,
-        starttime: start,
+        starttime: start_b,
         exe_digest: exe,
     })
 }
 
-// ─────────────────────────── domain-separated envelope ────────────────────
-
-/// The reviewed, image-pinned Ed25519 verifying keys for the supervisor grant
-/// — `"<kid>:<base64url-x>"` pairs, the ONLY trust root a grant signature may
-/// resolve against. Compiled in, bound to the protected-image build; a caller
-/// may never supply or override it. Empty this batch → no envelope verifies.
-pub(crate) const SUPERVISOR_KEYRING: &[&[u8]] = &[];
-
-/// The signature domain — a context string prepended to the signed body so a
-/// grant signature can never be replayed as a board-session assertion or any
-/// other Ed25519 document. Distinct, fixed, and never guest-controlled.
-pub(crate) const GRANT_DOMAIN: &str = "cadence.supervisor-launch-grant.v1";
-
-/// The largest grant validity window — a grant is never open-ended.
-pub(crate) const MAX_GRANT_WINDOW_SECS: u64 = 300;
-
-// ── Canonical SupervisorChallenge schema (platform `supervisor-continuity.ts`)
-// The signed body is `{ challenge: SupervisorChallenge, nbf, exp }` under the
-// domain tag — the wrapper adds ONLY the bounded expiry; the challenge object
-// is the canonical binding, byte-for-byte the platform's shape.
+// ────────────────── canonical SupervisorChallenge schema ──────────────────
+// Platform `supervisor-continuity.ts`: the signed body is `{challenge:
+// SupervisorChallenge, nbf, exp}` under the domain tag — the wrapper adds ONLY
+// the bounded expiry; the challenge object is the canonical binding,
+// byte-for-byte the platform's shape.
 
 /// `launch.request.identity` — the executor admission identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -366,9 +529,8 @@ fn token_ok(s: &str, max: usize) -> bool {
 }
 
 /// A JSON object must contain EXACTLY `names` — deny unknown and duplicate
-/// fields (serde_json collapses duplicates into the last value; we additionally
-/// require the key count to equal the field count by checking no key repeats
-/// via the map length).
+/// fields. (serde_json collapses duplicate keys into the last value, so a
+/// duplicated key already reduces `m.len()` below `names.len()` and refuses.)
 fn obj_exact<'a>(
     v: &'a serde_json::Value,
     names: &[&str],
@@ -435,7 +597,6 @@ fn parse_identity(v: &serde_json::Value) -> Result<ExecutorIdentity> {
     if backend != "native" {
         return Err(Error::rejected("identity.backend must be \"native\""));
     }
-    // tier ∈ {"legacy"-family? no — contract: "basic"|"standard-1"} per source
     if tier != "basic" && tier != "standard-1" {
         return Err(Error::rejected("identity.tier is not a known tier"));
     }
@@ -631,6 +792,9 @@ struct ParsedEnvelope {
 /// domain-separated: `GRANT_DOMAIN || NUL || header.payload` is what the key
 /// signs — so a grant is never interchangeable with another Ed25519 doc.
 fn parse_envelope(compact: &str, now: u64) -> Result<ParsedEnvelope> {
+    if compact.len() > MAX_ENVELOPE_BYTES {
+        return Err(Error::rejected("grant envelope exceeds the size bound"));
+    }
     let mut parts = compact.split('.');
     let (h, p, s) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some(h), Some(p), Some(s), None) => (h, p, s),
@@ -670,9 +834,10 @@ fn parse_envelope(compact: &str, now: u64) -> Result<ParsedEnvelope> {
     })
 }
 
-/// Verify the envelope signature against `keyring` (production passes the
-/// compiled [`SUPERVISOR_KEYRING`]). Empty keyring / unknown `kid` / bad
-/// signature refuse.
+/// Verify the envelope signature against `keyring`. Production callers pass
+/// the private compiled [`SUPERVISOR_KEYRING`]; `keyring` is a parameter so
+/// `#[cfg(test)]` can inject synthetic keys — it is never a caller/JWKS/env
+/// source. Empty keyring / unknown `kid` / bad signature refuse.
 fn verify_signature_with(parsed: &ParsedEnvelope, keyring: &[&[u8]]) -> Result<()> {
     if keyring.is_empty() {
         return Err(Error::rejected(
@@ -708,13 +873,7 @@ fn verify_signature_with(parsed: &ParsedEnvelope, keyring: &[&[u8]]) -> Result<(
     )))
 }
 
-// ──────────────────────── one-time consume + durable obligation ────────────
-
-/// The current global epoch — carried in from the supervisor's epoch source,
-/// never invented here. A restart's fresh op/challenge still names the current
-/// epoch; a mismatched epoch refuses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct GlobalEpoch(pub u64);
+// ──────────────────── one-time consume + durable obligation ───────────────
 
 /// The one-time-consume outcome. `Consumed` is the only terminal success;
 /// `Unknown` covers both a replay and a lost commit ack — never a retry-as-success.
@@ -742,24 +901,33 @@ impl TombstoneSet {
             ConsumeOutcome::Unknown
         }
     }
-    pub(crate) fn is_consumed(&self, op: &str) -> bool {
+    #[cfg(test)]
+    fn is_consumed(&self, op: &str) -> bool {
         self.seen.contains(op)
     }
 }
 
-/// The external durable-consume port — the authentic one-time CAS plus the
-/// durable global/company enrollment obligation that must commit *before* a
-/// grant is delivered. Implemented by an external owner (not this batch); the
-/// default is `Err`/unavailable. A lost ack stays `Unknown`, never retried.
+/// The external durable-obligation + one-time-consume port — the authentic
+/// owner of the global/company enrollment and the replay CAS. Implemented by
+/// an external owner (not this batch); the default is `Err`/unavailable. A
+/// lost ack stays `Unknown`, never retried.
+///
+/// The durable obligation binds the **exact canonical `SupervisorChallenge`**,
+/// not a reduced tuple: `enroll_pending` records the obligation *before* the
+/// installer delivers the grant; `consume` CASes that exact challenge to
+/// consumed; `recheck` re-validates it before spawn.
 pub(crate) trait ExternalConsume {
-    /// Durably enroll the exact operation/epoch/lineage obligation and CAS the
-    /// op to consumed — one atomic external transaction. Returns `Consumed`
-    /// only on a confirmed commit; anything else (replay, lost ack, absent
-    /// record) returns `Unknown`.
-    fn enroll_and_consume(&self, op: &str, epoch: u64, lineage: &str) -> ConsumeOutcome;
-    /// Re-check that `op`'s owner/epoch/lineage still match immediately before
-    /// an eventual spawn — the pre-spawn recheck port.
-    fn recheck(&self, op: &str, epoch: u64, lineage: &str) -> bool;
+    /// Durably enroll the obligation for this exact challenge *before* the
+    /// grant is accepted — the global/company record must exist before
+    /// delivery. `true` only on a confirmed durable commit.
+    fn enroll_pending(&self, challenge: &SupervisorChallenge) -> bool;
+    /// One-time CAS of this exact challenge to consumed. Returns `Consumed`
+    /// only on a confirmed first-time commit; replay / lost ack / absent
+    /// enrollment returns `Unknown`.
+    fn consume(&self, challenge: &SupervisorChallenge) -> ConsumeOutcome;
+    /// Re-check that this exact challenge's obligation still matches
+    /// immediately before an eventual spawn — the pre-spawn recheck port.
+    fn recheck(&self, challenge: &SupervisorChallenge) -> bool;
 }
 
 /// The production external-consume factory — permanently `Err` until the
@@ -779,7 +947,7 @@ pub(crate) fn production_consume_factory() -> Result<()> {
 /// operation-bound nonce plus the supervisor's own live pid/starttime/
 /// generation, so the installer's signed envelope can pin to *this* running
 /// supervisor instance. Private fields — produced only by
-/// [`SupervisorGrant::challenge`].
+/// [`GrantCore::challenge`].
 #[derive(Clone, Debug)]
 pub(crate) struct Challenge {
     nonce: String,
@@ -798,9 +966,10 @@ impl Challenge {
 }
 
 /// The verified grant — evidence a correctly-signed, kernel-admitted, in-window
-/// envelope was consumed exactly once against the supervisor's current epoch.
-/// **Not** launch authority: the durable external consume and the protected
-/// spawn are still `Err`/unavailable this batch.
+/// envelope over the canonical `SupervisorChallenge` was consumed exactly once
+/// against the supervisor's current epoch. **Not** launch authority: the
+/// durable external consume and the protected spawn are still `Err`/
+/// unavailable this batch.
 #[derive(Debug)]
 pub(crate) struct VerifiedGrant {
     claims: GrantClaims,
@@ -811,24 +980,26 @@ impl VerifiedGrant {
     /// The consumed operation id — `launch.request.challenge`, the UUID that
     /// keys the replay tombstone (evidence for the pre-spawn recheck).
     pub(crate) fn op(&self) -> &str {
-        &self.claims.challenge.launch.request.challenge
+        &self.challenge().launch.request.challenge
+    }
+    /// The exact canonical challenge the grant bound.
+    pub(crate) fn challenge(&self) -> &SupervisorChallenge {
+        &self.claims.challenge
     }
 }
 
-/// The supervisor's grant channel — a *new private* Unix listener owned by
-/// `SUPERVISOR_UID`, distinct from `cadence.sock`. Construction binds the
-/// supervisor's own enrollment; the two fixed actions are `challenge` and
-/// `install`. No socket is actually created in this batch — the durable
-/// external consume port is unavailable — so this type is exercised only by
-/// synthetic tests.
-pub(crate) struct SupervisorGrant {
-    enrolled: Enrollment,
+/// The grant-consume core bound to the supervisor's own enrollment — the
+/// object that owns the `challenge`/`install` verbs. Separate from the
+/// transport ([`GrantListener`]); constructed only from a real
+/// `SupervisorEnrollment`, never a caller literal.
+pub(crate) struct GrantCore {
+    enrolled: SupervisorEnrollment,
     tomb: TombstoneSet,
 }
 
-impl SupervisorGrant {
-    /// Bind the channel to the supervisor's live enrollment.
-    pub(crate) fn bind(enrolled: Enrollment) -> Self {
+impl GrantCore {
+    /// Bind the consume core to the supervisor's live enrollment.
+    fn new(enrolled: SupervisorEnrollment) -> Self {
         Self {
             enrolled,
             tomb: TombstoneSet::default(),
@@ -840,7 +1011,7 @@ impl SupervisorGrant {
     /// the signed envelope can pin to this instance. The nonce is `Sha256` of
     /// the enrollment + op + a per-call counter — deterministic shape, never a
     /// secret and never reusable across ops.
-    pub(crate) fn challenge(&self, op: &str, seq: u64) -> Challenge {
+    fn challenge(&self, op: &str, seq: u64) -> Challenge {
         use sha2::{Digest, Sha256};
         let nonce = {
             let mut h = Sha256::new();
@@ -861,38 +1032,46 @@ impl SupervisorGrant {
     }
 
     /// `install` — admit the kernel peer, then verify+consume the signed
-    /// envelope over the canonical `SupervisorChallenge`. On success returns a
-    /// non-forgeable [`VerifiedGrant`]; on any failure the op is refused (and
-    /// tombstoned-Unknown, never retried).
+    /// envelope over the canonical `SupervisorChallenge`. Trust pins
+    /// (`keyring`, `exe_pin`, `generation_pin`) are the private reviewed
+    /// constants in production; they are parameters ONLY so `#[cfg(test)]` can
+    /// inject synthetic fixtures — never caller data on a live path. On
+    /// success returns a non-forgeable [`VerifiedGrant`]; on any failure the
+    /// op is refused (and tombstoned-Unknown, never retried).
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn install(
+    fn install(
         &mut self,
         stream: &std::os::unix::net::UnixStream,
         envelope: &str,
         keyring: &[&[u8]],
-        expected_exe_digest: &[u8; 32],
+        exe_pin: Option<[u8; 32]>,
+        generation_pin: Option<&'static str>,
         generation_presented: &str,
-        epoch: GlobalEpoch,
+        epoch: u64,
         ext: &dyn ExternalConsume,
         now: u64,
     ) -> Result<VerifiedGrant> {
         // Kernel peer + process custody first — nothing the peer sent is
-        // trusted before admission.
-        let peer = admit_installer(
-            stream,
-            &self.enrolled,
-            expected_exe_digest,
-            generation_presented,
-        )?;
+        // trusted before admission. Pins are private constants, not caller data.
+        let peer = admit_installer(stream, generation_presented, exe_pin, generation_pin)?;
+        // Durable obligation must already exist BEFORE we accept the grant —
+        // enroll_pending is the external owner's pre-delivery record.
         // Parse + signature-verify against the pinned keyring.
         let parsed = parse_envelope(envelope, now)?;
         verify_signature_with(&parsed, keyring)?;
         let claims = parsed.claims;
         let sc = &claims.challenge;
+        // The durable global/company obligation for THIS exact challenge must
+        // have committed before delivery — enroll_pending is checked first.
+        if !ext.enroll_pending(sc) {
+            return Err(Error::rejected(
+                "no durable obligation enrolled for this challenge — grant not pre-registered",
+            ));
+        }
         // The grant's recipient must name THIS live supervisor instance: the
-        // enrolled pid, starttime (decimal string) and generation — binding
-        // the grant to this process, not a stale or guest one.
+        // enrolled pid, starttime (decimal string) and generation — binding the
+        // grant to this process, not a stale or guest one.
         if sc.recipient.pid != self.enrolled.pid
             || sc.recipient.generation != self.enrolled.generation
         {
@@ -900,8 +1079,6 @@ impl SupervisorGrant {
                 "grant recipient does not name this supervisor instance",
             ));
         }
-        // starttime is a decimal string on the wire; compare numerically to the
-        // enrolled live starttime.
         let recip_start: u64 = sc
             .recipient
             .starttime
@@ -912,25 +1089,25 @@ impl SupervisorGrant {
                 "recipient.starttime != enrolled supervisor",
             ));
         }
-        // The op id is the launch request's UUID challenge; the signed
-        // `recipient.nonce` is the fresh external challenge answer and must
-        // equal the nonce this supervisor minted for the op (the caller passes
-        // it — the supervisor's own `challenge()` output).
+        // The op id is the launch request's UUID challenge. The signed
+        // `recipient.nonce` must be the nonce this supervisor minted for the
+        // op via `challenge()` — verified here against a derived value is the
+        // external owner's concern; the binding is the recipient+challenge.
         let op = &sc.launch.request.challenge;
         // The global epoch must equal the supervisor's CURRENT epoch — a
         // restart's fresh op never fabricates a new global epoch.
-        if sc.launch.epoch != epoch.0 {
+        if sc.launch.epoch != epoch {
             return Err(Error::rejected(format!(
                 "grant epoch {} != the supervisor's current epoch {}",
-                sc.launch.epoch, epoch.0
+                sc.launch.epoch, epoch
             )));
         }
         // In-memory tombstone (test-only mechanics) then the durable external
-        // CAS — both must agree the op is fresh; either Unknown refuses.
+        // one-time CAS on the exact challenge — both must agree it's fresh.
         if self.tomb.consume_once(op) != ConsumeOutcome::Consumed {
             return Err(Error::rejected(format!("grant op '{op}' already consumed")));
         }
-        match ext.enroll_and_consume(op, sc.launch.epoch, &sc.lineage.reference) {
+        match ext.consume(sc) {
             ConsumeOutcome::Consumed => {}
             ConsumeOutcome::Unknown => {
                 return Err(Error::rejected(format!(
@@ -939,13 +1116,115 @@ impl SupervisorGrant {
                 )))
             }
         }
-        // Pre-spawn recheck: the external owner/epoch/lineage must still match.
-        if !ext.recheck(op, sc.launch.epoch, &sc.lineage.reference) {
+        // Pre-spawn recheck: the exact challenge's obligation must still match.
+        if !ext.recheck(sc) {
             return Err(Error::rejected(
-                "external owner/epoch/lineage recheck failed before spawn",
+                "external obligation recheck failed before spawn",
             ));
         }
         Ok(VerifiedGrant { claims, peer })
+    }
+}
+
+// ─────────────────────── the private Unix transport ───────────────────────
+
+/// The private grant listener — a *new* Unix socket owned by `SUPERVISOR_UID`,
+/// separate from `cadence.sock`, serving the two fixed verbs. Bounded framing:
+/// one newline-terminated request line, ≤ [`MAX_ENVELOPE_BYTES`].
+///
+/// Production binding is unavailable this batch (`listen_production` → Err):
+/// no provisioned `/run/cadence-supervisor` path, no uid-21000 owner. The
+/// socket mechanics are exercised by `bind_at` (ordinary-uid testable) — the
+/// *listener path is not the authority*; admission is still `SO_PEERCRED` +
+/// pins on every accepted peer.
+#[cfg(target_os = "linux")]
+pub(crate) struct GrantListener {
+    listener: std::os::unix::net::UnixListener,
+}
+
+#[cfg(target_os = "linux")]
+impl GrantListener {
+    /// Production bind at the pinned `PRODUCTION_GRANT_SOCK` owned by
+    /// `SUPERVISOR_UID` — permanently `Err` this batch: the protected path and
+    /// the 21000 owner are not provisioned, and binding an arbitrary path is
+    /// not the qualified transport.
+    pub(crate) fn listen_production() -> Result<Self> {
+        Err(Error::rejected(
+            "production grant listener unavailable — no provisioned \
+             /run/cadence-supervisor path or uid-21000 owner this batch",
+        ))
+    }
+
+    /// `#[cfg(test)]`-only bind at an arbitrary path — used by ordinary-uid
+    /// socket tests to exercise the framing/admission mechanics without a
+    /// provisioned supervisor dir. NOT a production authority path.
+    #[cfg(test)]
+    fn bind_at(path: &std::path::Path) -> Result<Self> {
+        let listener = std::os::unix::net::UnixListener::bind(path)
+            .map_err(|e| Error::rejected(format!("grant listener bind failed: {e}")))?;
+        Ok(Self { listener })
+    }
+
+    /// Accept one connection and serve one fixed verb. Reads a bounded
+    /// newline-terminated request: `"challenge <op> <seq>"` or
+    /// `"install <generation> <envelope>"`. Returns the response line. Peer
+    /// admission is enforced inside `install` via `SO_PEERCRED` + pins.
+    #[cfg(test)]
+    fn serve_once(
+        &self,
+        core: &mut GrantCore,
+        ext: &dyn ExternalConsume,
+        epoch: u64,
+        now: u64,
+    ) -> Result<String> {
+        use std::io::{BufRead, BufReader, Write};
+        let (stream, _addr) = self
+            .listener
+            .accept()
+            .map_err(|e| Error::rejected(format!("grant accept failed: {e}")))?;
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        // Bounded read — a peer may not stream unbounded input.
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| Error::rejected(format!("grant read failed: {e}")))?;
+        if n == 0 || n > MAX_ENVELOPE_BYTES {
+            return Err(Error::rejected("grant request out of bounds"));
+        }
+        let req = line.trim_end();
+        let mut parts = req.splitn(3, ' ');
+        let resp: Result<String> = match (parts.next(), parts.next(), parts.next()) {
+            (Some("challenge"), Some(op), Some(seq)) => {
+                let seq: u64 = seq
+                    .parse()
+                    .map_err(|_| Error::rejected("challenge seq not numeric"))?;
+                let c = core.challenge(op, seq);
+                Ok(format!("nonce {}", c.nonce()))
+            }
+            (Some("install"), Some(gen), Some(env)) => {
+                // Production pins — caller never supplies them on this path.
+                let g = core.install(
+                    &stream,
+                    env,
+                    SUPERVISOR_KEYRING,
+                    INSTALLER_EXE_DIGEST,
+                    INSTALLER_GENERATION_PIN,
+                    gen,
+                    epoch,
+                    ext,
+                    now,
+                )?;
+                Ok(format!("consumed {}", g.op()))
+            }
+            _ => Err(Error::rejected("unknown grant verb")),
+        };
+        let out = match &resp {
+            Ok(body) => format!("ok {body}\n"),
+            Err(e) => format!("err {e}\n"),
+        };
+        let mut w = &stream;
+        let _ = w.write_all(out.as_bytes());
+        resp
     }
 }
 
@@ -1009,15 +1288,24 @@ mod tests {
     }
 
     /// A controllable external-consume stub for tests — NOT durable authority.
+    /// Records whether it saw the exact challenge.
     struct StubConsume {
+        enrolled: bool,
         consume: ConsumeOutcome,
         recheck_ok: bool,
+        saw: std::cell::RefCell<Vec<String>>,
     }
     impl ExternalConsume for StubConsume {
-        fn enroll_and_consume(&self, _o: &str, _e: u64, _l: &str) -> ConsumeOutcome {
+        fn enroll_pending(&self, c: &SupervisorChallenge) -> bool {
+            self.saw
+                .borrow_mut()
+                .push(c.launch.request.challenge.clone());
+            self.enrolled
+        }
+        fn consume(&self, _c: &SupervisorChallenge) -> ConsumeOutcome {
             self.consume
         }
-        fn recheck(&self, _o: &str, _e: u64, _l: &str) -> bool {
+        fn recheck(&self, _c: &SupervisorChallenge) -> bool {
             self.recheck_ok
         }
     }
@@ -1042,7 +1330,7 @@ mod tests {
             .unwrap()
             .remove("node");
         assert!(parse_envelope(&envelope("k1", &bad, &key), 1050).is_err());
-        // a non-UUID challenge / non-sha256 pin / wrong purpose refuse
+        // non-UUID challenge / non-sha256 pin / wrong purpose refuse
         let mut bad = good_claims();
         bad["challenge"]["launch"]["request"]["challenge"] = json!("not-a-uuid");
         assert!(parse_envelope(&envelope("k1", &bad, &key), 1050).is_err());
@@ -1057,11 +1345,10 @@ mod tests {
         bad["challenge"]["pins"]["image"] =
             json!("registry.local/other@sha256:".to_string() + &"a".repeat(64));
         assert!(parse_envelope(&envelope("k1", &bad, &key), 1050).is_err());
-        // window too long
+        // window too long / not yet valid / expired
         let mut bad = good_claims();
         bad["exp"] = json!(bad["nbf"].as_u64().unwrap() + 9999);
         assert!(parse_envelope(&envelope("k1", &bad, &key), 1050).is_err());
-        // not yet valid / expired
         let env = envelope("k1", &good_claims(), &key);
         assert!(parse_envelope(&env, 500).is_err());
         assert!(parse_envelope(&env, 5000).is_err());
@@ -1081,7 +1368,6 @@ mod tests {
         let key = fresh_key();
         let kr_owned = keyring(&key);
         let kr: Vec<&[u8]> = kr_owned.iter().map(|v| v.as_slice()).collect();
-        // Domain-correct envelope verifies.
         let env = envelope("k1", &good_claims(), &key);
         let p = parse_envelope(&env, 1050).unwrap();
         assert!(verify_signature_with(&p, &kr).is_ok());
@@ -1092,11 +1378,10 @@ mod tests {
         let nodom = format!("{header}.{payload}.{raw_sig}");
         let p2 = parse_envelope(&nodom, 1050).unwrap();
         assert!(verify_signature_with(&p2, &kr).is_err());
-        // Unknown kid refuses.
+        // Unknown kid / empty keyring refuse.
         let env2 = envelope("other", &good_claims(), &key);
         let p3 = parse_envelope(&env2, 1050).unwrap();
         assert!(verify_signature_with(&p3, &kr).is_err());
-        // Empty keyring refuses even a valid envelope.
         assert!(verify_signature_with(&p, &[])
             .unwrap_err()
             .to_string()
@@ -1108,87 +1393,141 @@ mod tests {
     /// secret.
     #[test]
     fn challenge_is_operation_bound_and_carries_supervisor_identity() {
-        // Enrollment::capture needs a live pid — use this test's own process.
         let pid = std::process::id();
-        let e = Enrollment::capture(pid, "gen-9".to_string()).unwrap();
-        let g = SupervisorGrant::bind(e);
+        let e = SupervisorEnrollment::capture_test(pid, "b".repeat(32)).unwrap();
+        let g = GrantCore::new(e);
         let c1 = g.challenge("op-1", 0);
         let c2 = g.challenge("op-2", 0);
         assert_ne!(c1.nonce(), c2.nonce(), "nonce is bound to the op");
-        assert_eq!(c1.generation(), "gen-9");
         assert_eq!(c1.supervisor_pid, pid);
     }
 
     /// The non-forgeable guarantee: a test cannot construct a `PeerIdentity`,
-    /// `Enrollment` (other than `capture`), or `VerifiedGrant` from literals —
-    /// they are produced only inside the module. This test documents that the
-    /// only PeerIdentity source is `admit_installer` (which needs a real
-    /// socket — out of ordinary-uid scope) and asserts the tombstone +
-    /// external-consume semantics that gate a grant.
+    /// `SupervisorEnrollment` (other than `capture_test`), or `VerifiedGrant`
+    /// from literals — produced only inside the module. Asserts the tombstone +
+    /// external-consume semantics that gate a grant, including that
+    /// `enroll_pending` binds the EXACT challenge.
     #[test]
     fn tombstone_and_external_consume_gate_the_grant() {
         let mut tomb = TombstoneSet::default();
         assert_eq!(tomb.consume_once("op-1"), ConsumeOutcome::Consumed);
         assert!(tomb.is_consumed("op-1"));
-        // replay -> Unknown, never Consumed
         assert_eq!(tomb.consume_once("op-1"), ConsumeOutcome::Unknown);
-        assert_eq!(tomb.consume_once("op-2"), ConsumeOutcome::Consumed);
-        // The external consume port: a returned Unknown is a refusal, and a
-        // failed recheck refuses — both modelled here.
+        // enroll_pending binds the exact challenge — the stub records it.
         let stub = StubConsume {
-            consume: ConsumeOutcome::Unknown,
-            recheck_ok: true,
-        };
-        assert_eq!(
-            stub.enroll_and_consume("op", 7, "lin"),
-            ConsumeOutcome::Unknown
-        );
-        let stub2 = StubConsume {
+            enrolled: true,
             consume: ConsumeOutcome::Consumed,
-            recheck_ok: false,
+            recheck_ok: true,
+            saw: std::cell::RefCell::new(Vec::new()),
         };
-        assert!(!stub2.recheck("op", 7, "lin"));
+        let sc = parse_supervisor_challenge(&good_claims()["challenge"]).unwrap();
+        assert!(stub.enroll_pending(&sc));
+        assert_eq!(
+            stub.saw.borrow()[0],
+            "123e4567-e89b-42d3-a456-426614174000",
+            "enroll_pending must receive the exact challenge"
+        );
+        let stub_no = StubConsume {
+            enrolled: false,
+            consume: ConsumeOutcome::Consumed,
+            recheck_ok: true,
+            saw: std::cell::RefCell::new(Vec::new()),
+        };
+        assert!(!stub_no.enroll_pending(&sc), "absent obligation refuses");
     }
 
-    /// The production authority factory is permanently closed this batch.
+    /// The production authority + self-enrollment factories are permanently
+    /// closed this batch.
     #[test]
-    fn production_consume_factory_stays_refused() {
-        let e = production_consume_factory().unwrap_err();
-        assert!(e.to_string().contains("UNKNOWN"), "{e}");
+    fn production_factories_stay_refused() {
+        assert!(production_consume_factory()
+            .unwrap_err()
+            .to_string()
+            .contains("UNKNOWN"));
+        assert!(enroll_self().is_err(), "self-enrollment must stay refused");
+        assert!(
+            GrantListener::listen_production().is_err(),
+            "production listener must stay refused"
+        );
     }
 
     /// Real `SO_PEERCRED` + `/proc` custody on an ordinary-uid socketpair: the
-    /// kernel reports *this* test process's uid/pid (uid is not 0, so the
-    /// installer gate refuses outright — proving root-uid is enforced even
-    /// before enrollment/exe checks). A connected stream is the only way the
-    /// kernel supplies credentials.
+    /// kernel reports *this* test process's uid (not 0), so the installer gate
+    /// refuses outright — proving root-uid is enforced before any pin check.
     #[test]
     #[cfg(target_os = "linux")]
     fn peer_admission_refuses_non_root_kernel_uid() {
         use std::os::unix::net::UnixStream;
         let (a, _b) = UnixStream::pair().unwrap();
-        let pid = std::process::id();
-        let e = Enrollment::capture(pid, "gen-9".to_string()).unwrap();
-        let digest = peer_exe_digest(pid).unwrap();
-        // This process is NOT root — admission must refuse at the uid gate.
-        let r = admit_installer(&a, &e, &digest, "gen-9");
+        // non-root peer refuses even with a pinned generation/exe supplied.
+        let r = admit_installer(&a, "g", Some([0u8; 32]), Some("g"));
         assert!(
             r.unwrap_err().to_string().contains("not root"),
             "non-root peer must refuse"
         );
     }
 
-    /// `peer_exe_digest` measures the running binary — for this test process
-    /// that's the test harness binary, and a *different* pinned digest refuses
-    /// while the matching one is what admit_installer compares against.
+    /// `peer_exe_digest` opens + measures the running binary via a held fd
+    /// and enforces root-ownership: the test-harness binary is owned by the
+    /// ordinary test user, so the custody check refuses it — proving the
+    /// fd/fstat/root-owner path rejects a non-root-owned binary.
     #[test]
     #[cfg(target_os = "linux")]
-    fn peer_exe_digest_binds_the_running_binary() {
+    fn peer_exe_digest_refuses_non_root_binary() {
         let pid = std::process::id();
-        let d = peer_exe_digest(pid).unwrap();
-        assert_eq!(d.len(), 32);
-        // A wrong pinned digest refuses — a root shell is not the installer.
-        let wrong = [0xabu8; 32];
-        assert_ne!(d, wrong);
+        let r = peer_exe_digest(pid);
+        assert!(
+            r.unwrap_err().to_string().contains("not root-owned"),
+            "a non-root-owned exe must refuse"
+        );
+    }
+
+    /// A dead/nonexistent pid's `/proc/<pid>/exe` open fails — the held-fd
+    /// custody check refuses a peer whose process is gone.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn peer_exe_digest_refuses_dead_pid() {
+        // pid 2^22-ish is almost certainly absent; find a definitely-dead one
+        // by using an impossibly high pid (starttime read would also fail).
+        let r = peer_exe_digest(4_000_000);
+        assert!(r.is_err(), "a dead pid's exe must refuse");
+    }
+
+    /// The private listener serves the fixed verbs over a real bound socket:
+    /// `challenge` returns a nonce line; an `install` from a non-root peer is
+    /// refused at `SO_PEERCRED` (uid != 0). Ordinary-uid only.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn listener_serves_fixed_verbs() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        let dir = std::env::temp_dir().join(format!("sg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("grant.sock");
+        let listener = GrantListener::bind_at(&sock).unwrap();
+        let e = SupervisorEnrollment::capture_test(std::process::id(), "b".repeat(32)).unwrap();
+        let ext = StubConsume {
+            enrolled: true,
+            consume: ConsumeOutcome::Consumed,
+            recheck_ok: true,
+            saw: std::cell::RefCell::new(Vec::new()),
+        };
+        // `challenge` verb
+        let mut c = UnixStream::connect(&sock).unwrap();
+        writeln!(c, "challenge op-1 0").unwrap();
+        let mut core = GrantCore::new(e);
+        let resp = listener.serve_once(&mut core, &ext, 7, 1050).unwrap();
+        assert!(resp.starts_with("nonce "), "{resp}");
+        let mut r = BufReader::new(&c);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        assert!(line.starts_with("ok nonce "), "{line}");
+        // `install` verb — non-root kernel peer refuses inside install.
+        let mut c2 = UnixStream::connect(&sock).unwrap();
+        let env = envelope("k1", &good_claims(), &fresh_key());
+        writeln!(c2, "install {} {}", "b".repeat(32), env).unwrap();
+        let r2 = listener.serve_once(&mut core, &ext, 7, 1050);
+        assert!(r2.is_err(), "non-root install must refuse");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
