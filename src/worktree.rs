@@ -286,10 +286,21 @@ fn install_cargo_shim(wt_dir: &Path) -> Result<PathBuf> {
     // Record the shim dir on the lane's `.env` PATH so a shell that
     // sources the lane env resolves `cargo` here first. `.env` is the
     // existing lane-env file `write_slot_env` owns; we prepend our dir
-    // under the same tmp+rename discipline, keeping every other line.
+    // under the same tmp+rename discipline, keeping every other line AND
+    // an existing file's mode (a `0600`→`0640` the operator set survives).
     let file = wt_dir.join(".env");
+    let mut mode = 0o600;
     let mut text = String::new();
     let mut wrote_path = false;
+    if let Ok(meta) = std::fs::symlink_metadata(&file) {
+        if meta.file_type().is_symlink() {
+            return Err(Error::rejected(format!(
+                "{} is a symlink — refusing to write the slot env through it",
+                file.display()
+            )));
+        }
+        mode = meta.permissions().mode() & 0o777;
+    }
     if let Ok(existing) = std::fs::read_to_string(&file) {
         for line in existing.lines() {
             if let Some(rest) = line.strip_prefix("PATH=") {
@@ -319,6 +330,7 @@ fn install_cargo_shim(wt_dir: &Path) -> Result<PathBuf> {
             .mode(0o600)
             .open(&tmp)?;
         f.write_all(text.as_bytes())?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
     }
     std::fs::rename(&tmp, &file)?;
     Ok(shim)
