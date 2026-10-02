@@ -665,9 +665,19 @@ function AddConnection({
   const submit = () => {
     if (busy) return;
     const cleanedAccount = account.trim();
-    const wanted = scopes.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+    // CAD-1013 SMTP simplification: an SMTP sender enrolls exactly its
+    // provider's reviewed scopes — they are not operator-typed grants, so
+    // the form derives them instead of asking. Token providers still
+    // take an explicit scope list.
+    const wanted = smtpShape
+      ? hint
+      : scopes.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
     if (!provider || cleanedAccount === "" || wanted.length === 0) {
-      setError("Choose a provider and fill in the account and at least one scope.");
+      setError(
+        smtpShape
+          ? "Name this email account and fill in the SMTP details below."
+          : "Choose a provider and fill in the account and at least one scope.",
+      );
       return;
     }
     if (smtpShape) {
@@ -776,7 +786,7 @@ function AddConnection({
           </div>
           <div>
             <label htmlFor={accountId} className="text-label font-medium text-ink-200">
-              Account
+              {smtpShape ? "Email account name" : "Account"}
             </label>
             <input
               id={accountId}
@@ -785,7 +795,13 @@ function AddConnection({
               spellCheck={false}
               value={account}
               onChange={(e) => setAccount(e.target.value)}
-              placeholder={provider === "agenticos_external" ? "ws_…" : "account name"}
+              placeholder={
+                provider === "agenticos_external"
+                  ? "ws_…"
+                  : smtpShape
+                    ? "newsletter"
+                    : "account name"
+              }
               className="field w-full mt-1"
               disabled={busy}
             />
@@ -796,59 +812,59 @@ function AddConnection({
               </p>
             )}
           </div>
-          <div>
-            <label htmlFor={scopesId} className="text-label font-medium text-ink-200">
-              Scopes
-            </label>
-            <input
-              id={scopesId}
-              type="text"
-              autoComplete="off"
-              spellCheck={false}
-              value={scopes}
-              onChange={(e) => setScopes(e.target.value)}
-              placeholder={hint.length > 0 ? hint.join(", ") : "scope names"}
-              className="field w-full mt-1"
-              disabled={busy}
-            />
-            {hint.length > 0 && (
-              <p className="text-micro text-ink-500 mt-1 break-words">
-                Reviewed scopes for this provider: <span className="num">{hint.join(", ")}</span>.
-                Declare only the scopes granted at the provider&apos;s consent screen.
-              </p>
-            )}
-          </div>
+          {!smtpShape && (
+            <div>
+              <label htmlFor={scopesId} className="text-label font-medium text-ink-200">
+                Scopes
+              </label>
+              <input
+                id={scopesId}
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={scopes}
+                onChange={(e) => setScopes(e.target.value)}
+                placeholder={hint.length > 0 ? hint.join(", ") : "scope names"}
+                className="field w-full mt-1"
+                disabled={busy}
+              />
+              {hint.length > 0 && (
+                <p className="text-micro text-ink-500 mt-1 break-words">
+                  Reviewed scopes for this provider: <span className="num">{hint.join(", ")}</span>.
+                  Declare only the scopes granted at the provider&apos;s consent screen.
+                </p>
+              )}
+            </div>
+          )}
           {smtpShape ? (
             <fieldset className="space-y-2">
               <legend className="text-label font-medium text-ink-200">
-                SMTP sender — authenticated encrypted submission only
+                SMTP server — encrypted submission only
               </legend>
               <p className="text-micro text-ink-500 break-words">
-                Port 465 with implicit TLS, or port 587 with mandatory STARTTLS. The
-                daemon verifies the certificate and refuses plaintext, downgrades and
-                unverifiable hosts before sending.
+                The daemon verifies the server certificate and refuses plaintext, downgrades
+                and unverifiable hosts before sending. Choose the security your provider
+                expects — port and TLS move together.
               </p>
-              {["host", "port", "username", "sender", "sender_name"].map((field) => (
-                <div key={field}>
-                  <label htmlFor={`${tokenId}-${field}`} className="text-label text-ink-300">
-                    {field === "sender" ? "verified sender address" : field === "sender_name" ? "sender name (optional)" : field}
-                  </label>
-                  <input
-                    id={`${tokenId}-${field}`}
-                    type="text"
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={smtp[field as keyof typeof smtp]}
-                    onChange={(e) => setSmtp((cur) => ({ ...cur, [field]: e.target.value }))}
-                    placeholder={field === "host" ? "mail.example.com" : field === "sender" ? "news@example.com" : ""}
-                    className="field w-full mt-1"
-                    disabled={busy}
-                  />
-                </div>
-              ))}
+              <div>
+                <label htmlFor={`${tokenId}-host`} className="text-label text-ink-300">
+                  Server host
+                </label>
+                <input
+                  id={`${tokenId}-host`}
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={smtp.host}
+                  onChange={(e) => setSmtp((cur) => ({ ...cur, host: e.target.value }))}
+                  placeholder="mail.example.com"
+                  className="field w-full mt-1"
+                  disabled={busy}
+                />
+              </div>
               <div>
                 <label htmlFor={`${tokenId}-tls`} className="text-label text-ink-300">
-                  TLS mode
+                  Port &amp; security
                 </label>
                 <select
                   id={`${tokenId}-tls`}
@@ -861,13 +877,28 @@ function AddConnection({
                   className="field w-full mt-1"
                   disabled={busy}
                 >
-                  <option value="implicit">implicit TLS (port 465)</option>
-                  <option value="starttls">STARTTLS (port 587)</option>
+                  <option value="implicit">465 — implicit TLS</option>
+                  <option value="starttls">587 — STARTTLS</option>
                 </select>
               </div>
               <div>
+                <label htmlFor={`${tokenId}-username`} className="text-label text-ink-300">
+                  Username
+                </label>
+                <input
+                  id={`${tokenId}-username`}
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={smtp.username}
+                  onChange={(e) => setSmtp((cur) => ({ ...cur, username: e.target.value }))}
+                  className="field w-full mt-1"
+                  disabled={busy}
+                />
+              </div>
+              <div>
                 <label htmlFor={tokenId} className="text-label font-medium text-ink-200">
-                  SMTP password
+                  Password
                 </label>
                 <input
                   id={tokenId}
@@ -884,6 +915,37 @@ function AddConnection({
                   cleared from this form afterwards. Never paste a credential anywhere else
                   on this board.
                 </p>
+              </div>
+              <div>
+                <label htmlFor={`${tokenId}-sender`} className="text-label text-ink-300">
+                  Sender address (verified)
+                </label>
+                <input
+                  id={`${tokenId}-sender`}
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={smtp.sender}
+                  onChange={(e) => setSmtp((cur) => ({ ...cur, sender: e.target.value }))}
+                  placeholder="news@example.com"
+                  className="field w-full mt-1"
+                  disabled={busy}
+                />
+              </div>
+              <div>
+                <label htmlFor={`${tokenId}-sender_name`} className="text-label text-ink-300">
+                  Sender name (optional)
+                </label>
+                <input
+                  id={`${tokenId}-sender_name`}
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={smtp.sender_name}
+                  onChange={(e) => setSmtp((cur) => ({ ...cur, sender_name: e.target.value }))}
+                  className="field w-full mt-1"
+                  disabled={busy}
+                />
               </div>
             </fieldset>
           ) : (
@@ -920,9 +982,9 @@ function AddConnection({
                 className="mt-0.5"
               />
               <span>
-                Accept the existing same-user custody risk, when the daemon reports the
-                enrollment as unprotected. Only choose this when you accept that existing
-                risk.
+                I understand this stores the credential under my existing user account and
+                I accept that risk. Leave this off unless you knowingly accept it — it is
+                never pre-selected.
               </span>
             </label>
           </details>
