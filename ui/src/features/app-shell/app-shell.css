@@ -160,6 +160,17 @@
   overflow: auto;
 }
 
+/* An installed-app screen mounts a metadata `<p>` above the
+   `ScreenOutlet` div. In the grid these become two auto rows, so the
+   frame never receives height and renders at its collapsed fallback.
+   Switch just this case to a column: the `<p>` takes natural height,
+   the ScreenOutlet `flex: 1` div fills the remainder (CAD-1006).
+   Native/CRM outlets have no such child and keep the grid. */
+.app-shell-outlet:has(> [aria-label="Installed app screen"]) {
+  display: flex;
+  flex-direction: column;
+}
+
 .app-shell-context {
   display: grid;
   gap: 0.35rem;
