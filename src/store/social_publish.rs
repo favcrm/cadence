@@ -11,9 +11,10 @@
 //! Shape validation reuses
 //! [`crate::platform::agenticos_external::publish`], the read-only mirror
 //! of the pinned AOS-94 device-publish v1 contract (PR #214 @ 12953144).
-//! The run/effect cross-check against app runs (proving the frozen caption
-//! and asset are the reviewed ones) lands with the slice-3 E2E wiring; the
-//! store already keeps `run_id`/`effect_id` for that join.
+//! Freeze from an artifact re-proves the reviewed run material (caption and
+//! asset digests derive from it) and, since CAD-1027, that the request's
+//! install/context are the run's own and that `effect_id` is a live app
+//! effect authorized by this run's artifact in that scope.
 
 use super::*;
 use rusqlite::{params, OptionalExtension};
@@ -697,7 +698,8 @@ pub struct FreezeFromArtifact<'a> {
     pub artifact_id: &'a str,
     pub bundle_digest: &'a str,
     pub slot: &'a str,
-    /// The operator's publish-approval identity (not an app_effect row).
+    /// A live app effect authorized by this run's artifact in this exact
+    /// install/context (CAD-1027): freeze refuses any other id.
     pub effect_id: &'a str,
     pub destination_id: &'a str,
     pub toolkit: &'a str,

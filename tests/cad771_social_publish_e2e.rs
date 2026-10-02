@@ -2206,7 +2206,10 @@ fn cad1027_cancel_is_scoped_to_install_and_context() {
             .daemon
             .operator_rpc("social_publish_cancel", params)
             .unwrap_err();
-        assert!(err.to_string().contains("cancel"), "{scope}: {err}");
+        assert!(
+            err.to_string().contains("in this install and context"),
+            "{scope}: {err}"
+        );
         let (code, text) = board.post(&h, &path, &scope);
         assert!(
             (400..500).contains(&code),
