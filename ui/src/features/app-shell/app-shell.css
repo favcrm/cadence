@@ -694,7 +694,7 @@
 /* ============================================================
    CAD-1008 additive layer: CRM-only selectors + shared host
    primitives (CAD-866), appended after the parent's shared shell.
-   No parent .app-*/.av-*/existing .crm-* rule above is overridden —
+   No parent app-shell, app-view or existing CRM rule above is overridden —
    every block below is a new selector or a CRM-scoped rule. */
 
 /* CAD-1008: the email content form and its saved-version preview sit
