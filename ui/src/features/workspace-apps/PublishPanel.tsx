@@ -6,7 +6,8 @@ import {
   PUBLISH_TIMEZONE,
   canCancel,
   dueLabel,
-  isApprovalIdUsable,
+  isGrantIdUsable,
+  mintApprovalId,
   parseDueEpoch,
   publishStateText,
   publishStateTone,
@@ -36,31 +37,35 @@ const message = (error: unknown) =>
     : "Could not complete this action. Refresh and try again.";
 
 /** CAD-787 product panel: the accepted preview flow bound to the
- *  CAD-771/AOS-94 exact-destination states. Human approves the frozen
- *  digest set, then chooses Post now (`due_epoch` at now) or Schedule (a
- *  future `due_epoch` with timezone). Digests always derive server-side
- *  from the approved run artifact — the UI never invents one. */
+ *  CAD-771/AOS-94 exact-destination states. The operator enters the
+ *  AgenticOS `dpq_` send grant, chooses Post now (`due_epoch` at now) or
+ *  Schedule (a future `due_epoch` with timezone), then confirms the exact
+ *  caption, image, due time, timezone and destination (CAD-1027). Each
+ *  confirmation mints one approval id that authorizes one intent. Digests
+ *  always derive server-side from the approved run — never invented here. */
 export default function PublishPanel({
   installId,
   contextId,
   candidates,
-  grantId,
-  approvalId,
   canWrite,
   client = socialPublish,
 }: {
   installId: string;
   contextId: string | null;
   candidates: PublishCandidate[];
-  grantId: string;
-  approvalId: string;
   canWrite: boolean;
   client?: typeof socialPublish;
 }) {
   const [intents, setIntents] = useState<PublishIntent[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [approved, setApproved] = useState(false);
+  const [grantId, setGrantId] = useState("");
+  // One operator confirmation: its approval id doubles as the request id,
+  // so a retry or double submit of this confirmation replays one intent.
+  const [confirmation, setConfirmation] = useState<{
+    approvalId: string;
+    epoch: number;
+  } | null>(null);
   const [choice, setChoice] = useState<"now" | "schedule">("now");
   const [candidateId, setCandidateId] = useState("");
   const [toolkit, setToolkit] = useState<"instagram" | "facebook">("instagram");
@@ -72,11 +77,21 @@ export default function PublishPanel({
   const candidate =
     candidates.find((value) => value.run_id === candidateId) ?? null;
   const dueEpoch = parseDueEpoch(due);
-  const approvalOversize = approvalId.length > 120;
-  const grantReady =
-    grantId.trim().length > 0 && isApprovalIdUsable(approvalId);
-  const canDecide =
-    canWrite && grantReady && candidate !== null && !busy && approved;
+  const grantReady = isGrantIdUsable(grantId);
+  const imageMissing =
+    toolkit === "instagram" && candidate !== null && !candidate.image_digest;
+  const canReview =
+    canWrite &&
+    grantReady &&
+    candidate !== null &&
+    !busy &&
+    !imageMissing &&
+    (choice === "now" || dueEpoch !== null);
+  // Any edit after review voids the confirmation: a new review mints a
+  // new approval for the new content.
+  useEffect(() => {
+    setConfirmation(null);
+  }, [candidateId, toolkit, due, grantId, choice]);
 
   const refresh = useCallback(async () => {
     try {
@@ -94,17 +109,24 @@ export default function PublishPanel({
     void refresh();
   }, [refresh]);
 
-  const schedule = async (mode: "now" | "schedule") => {
-    if (!candidate || !canDecide) return;
+  const review = () => {
+    if (!canReview) return;
     const epoch =
-      mode === "now" ? Math.floor(Date.now() / 1000) : dueEpoch;
+      choice === "now" ? Math.floor(Date.now() / 1000) : dueEpoch;
     if (epoch === null) return;
-    if (toolkit === "instagram" && !candidate.image_digest) return;
+    setActionError(null);
+    setConfirmation({ approvalId: mintApprovalId(), epoch });
+  };
+
+  const schedule = async () => {
+    if (!candidate || !confirmation || !canReview) return;
+    const { approvalId, epoch } = confirmation;
+    const mode = choice;
     setBusy(true);
     setActionError(null);
     try {
       const reply = await client.schedule({
-        request_id: `${installId}.${candidate.run_id}.${epoch}`,
+        request_id: approvalId,
         install_id: installId,
         ...(contextId ? { context_id: contextId } : {}),
         run_id: candidate.run_id,
@@ -119,7 +141,7 @@ export default function PublishPanel({
         due_epoch: epoch,
         timezone: PUBLISH_TIMEZONE,
       });
-      setApproved(false);
+      setConfirmation(null);
       setNotice(
         mode === "now"
           ? `Posted for dispatch as ${reply.intent.intent_id}.`
@@ -275,16 +297,28 @@ export default function PublishPanel({
           freezes the intent, never sends · binding pins digest-form, caption
           re-resolves from the run at dispatch.
         </p>
-        {approvalOversize && (
-          <p className="wa-alert" data-tone="fail" role="alert">
-            The approval identity exceeds 120 characters — the contract
-            refuses it (grant_approval). Bind a shorter approval identity.
+        <div className="wa-field">
+          <label htmlFor="publish-grant">AgenticOS send grant</label>
+          <input
+            id="publish-grant"
+            className="wa-input"
+            value={grantId}
+            onChange={(event) => setGrantId(event.target.value)}
+            placeholder="dpq_…"
+            autoComplete="off"
+            spellCheck={false}
+            disabled={!canWrite || busy}
+          />
+        </div>
+        {grantReady ? (
+          <p className="wa-muted">
+            Grant bound: <code>{grantId}</code>
           </p>
-        )}
-        {!grantReady && (
+        ) : (
           <p className="wa-alert">
-            No publish grant is bound. Connect the destination and bind a send
-            grant before scheduling — approval stays disabled until then.
+            {grantId
+              ? "A send grant id is dpq_ followed by 8–64 letters, digits, _ or -."
+              : "No publish grant is bound. Enter the AgenticOS send grant id before scheduling."}
           </p>
         )}
         {!candidates.length && (
@@ -323,19 +357,7 @@ export default function PublishPanel({
               </div>
             )}
             <fieldset className="wa-field" disabled={!canWrite || busy}>
-              <legend className="wa-kicker">Approve, then choose</legend>
-              <label className="wa-row">
-                <input
-                  type="checkbox"
-                  checked={approved}
-                  onChange={(event) => setApproved(event.target.checked)}
-                  aria-label="Approve the exact destination and content digests"
-                />
-                <span>
-                  I approve {PILOT_DESTINATION.handle} receiving this exact
-                  frozen revision. Only the operator&apos;s press releases it.
-                </span>
-              </label>
+              <legend className="wa-kicker">Choose, then confirm</legend>
               <div className="wa-row" role="radiogroup" aria-label="Post now or schedule">
                 {(["now", "schedule"] as const).map((value) => (
                   <label key={value} className="wa-row">
@@ -381,28 +403,56 @@ export default function PublishPanel({
                 />
               </div>
             </fieldset>
-            <div className="wa-row">
-              {choice === "now" ? (
-                <Button
-                  variant="primary"
-                  disabled={!canDecide}
-                  loading={busy}
-                  onClick={() => void schedule("now")}
-                >
-                  Post now
+            {confirmation && candidate ? (
+              <section className="wa-panel wa-stack" aria-label="Confirm publish">
+                <h3>Confirm this exact post</h3>
+                <dl className="wa-stack">
+                  <dt className="wa-kicker">Caption</dt>
+                  <dd>{candidate.caption}</dd>
+                  <dt className="wa-kicker">Image digest</dt>
+                  <dd>
+                    {candidate.image_digest ? (
+                      <code>{candidate.image_digest}</code>
+                    ) : (
+                      "text-only"
+                    )}
+                  </dd>
+                  <dt className="wa-kicker">Due</dt>
+                  <dd>{dueLabel(confirmation.epoch, PUBLISH_TIMEZONE)}</dd>
+                  <dt className="wa-kicker">Timezone</dt>
+                  <dd>{PUBLISH_TIMEZONE}</dd>
+                  <dt className="wa-kicker">Destination</dt>
+                  <dd>
+                    {toolkit} · {PILOT_DESTINATION.handle} ·{" "}
+                    <code>{PILOT_DESTINATION.account_id}</code>
+                  </dd>
+                  <dt className="wa-kicker">Grant · approval</dt>
+                  <dd>
+                    <code>{grantId}</code> · <code>{confirmation.approvalId}</code>
+                  </dd>
+                </dl>
+                <div className="wa-row">
+                  <Button
+                    variant="primary"
+                    disabled={!canReview}
+                    loading={busy}
+                    onClick={() => void schedule()}
+                  >
+                    {choice === "now" ? "Confirm and post now" : "Confirm and schedule"}
+                  </Button>
+                  <Button disabled={busy} onClick={() => setConfirmation(null)}>
+                    Back
+                  </Button>
+                </div>
+              </section>
+            ) : (
+              <div className="wa-row">
+                <Button variant="primary" disabled={!canReview} onClick={review}>
+                  {choice === "now" ? "Review post now" : "Review schedule"}
                 </Button>
-              ) : (
-                <Button
-                  variant="primary"
-                  disabled={!canDecide || dueEpoch === null}
-                  loading={busy}
-                  onClick={() => void schedule("schedule")}
-                >
-                  Schedule
-                </Button>
-              )}
-            </div>
-            {toolkit === "instagram" && candidate && !candidate.image_digest && (
+              </div>
+            )}
+            {imageMissing && (
               <p className="wa-alert" data-tone="fail" role="alert">
                 Instagram needs a reviewed provider-accessible image. Pick a
                 draft with a bound image, or use Facebook text-only.

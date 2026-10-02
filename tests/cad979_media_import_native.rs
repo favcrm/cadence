@@ -186,7 +186,7 @@ fn schedule_body(
         "bundle_digest": bundle,
         "slot": "publication", "effect_id": "cad_fx_cad979",
         "destination_id": "17841400008460056", "toolkit": "instagram",
-        "grant_id": "dpq_synthetic_grant_ig", "approval_id": "cad_approval_cad979",
+        "grant_id": "dpq_synthetic_grant_ig", "approval_id": format!("apv-{request}"),
         "due_epoch": 1_750_000_000, "timezone": "Asia/Hong_Kong"});
     if let Some(key) = media_key {
         b["media_key"] = json!(key);

@@ -379,6 +379,24 @@ export function isApprovalIdUsable(approvalId: string): boolean {
   return approvalId.length > 0 && approvalId.length <= 120;
 }
 
+/** AgenticOS send-grant id shape, mirroring `valid_grant_id` in
+ *  publish.rs: `dpq_` then 8–64 ASCII letters, digits, `_` or `-`. The
+ *  daemon re-validates; this only keeps a malformed id from scheduling. */
+export function isGrantIdUsable(grantId: string): boolean {
+  return /^dpq_[A-Za-z0-9_-]{8,64}$/.test(grantId);
+}
+
+/** CAD-1027: one operator confirmation mints one approval identity,
+ *  `apv-` + 32 random hex (also the schedule request id, so a retry or a
+ *  double submit of the same confirmation replays the same intent). The
+ *  daemon lets an approval authorize exactly one intent: reusing it under
+ *  any other request refuses `approval_replay`. `getRandomValues` works on
+ *  a plain-http board, where `randomUUID` does not. */
+export function mintApprovalId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return `apv-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
 /** Only a queued intent can cancel — past queued the contract answers
  *  `cancel_closed`. */
 export function canCancel(state: PublishState): boolean {

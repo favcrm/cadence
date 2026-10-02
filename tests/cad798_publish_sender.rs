@@ -1316,7 +1316,7 @@ fn freeze_params(
         "bundle_digest": bundle_digest,
         "slot": "publication", "effect_id": "cad_fx_798_e2e_01",
         "destination_id": DEST, "toolkit": "facebook",
-        "grant_id": grant, "approval_id": "cad_approval_798_01",
+        "grant_id": grant, "approval_id": format!("apv-{request}"),
         "due_epoch": due, "timezone": "Asia/Hong_Kong"})
 }
 

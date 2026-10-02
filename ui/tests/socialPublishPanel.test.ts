@@ -1,6 +1,7 @@
 export {};
 /** CAD-787 mounted panel QA with an injected stub client — no fetch, no
- *  provider, no live post. Proves the approve gate, now-vs-schedule choice,
+ *  provider, no live post. Proves the dpq_ grant input, the CAD-1027
+ *  confirmation step and its one-approval-one-intent ids, now-vs-schedule,
  *  every dispatch state, cancel behaviour and empty/error states. */
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
@@ -38,6 +39,7 @@ const stub = {
   schedule: async (body: any) => {
     assert(body.slot === "publication" && body.timezone === "Asia/Hong_Kong" && body.destination_id === "17841400008460056", "Panel schedules exact pilot destination with timezone");
     assert(!Object.hasOwn(body, "caption_digest"), "Panel never invents digests");
+    assert(/^apv-[0-9a-f]{32}$/.test(body.approval_id) && body.request_id === body.approval_id && body.grant_id === "dpq_synthetic_grant_ig", "Confirmation mints the approval id that is also the request id");
     const intent = { intent_id: `intent-${scheduled.length}`, install_id: "install-a", context_id: null, run_id: body.run_id, effect_id: body.effect_id, state: body.due_epoch <= Math.floor(Date.now() / 1000) + 5 ? "processing" : "queued", channel: body.toolkit, destination_id: body.destination_id, caption_digest: "c-digest", image_digest: "i-digest", frozen_digest: "binding-digest", idempotency_key: `key-${scheduled.length}`, due_epoch: body.due_epoch, timezone: body.timezone, grant_id: body.grant_id, approval_id: body.approval_id, writer: "writer-a", reviewer: "reviewer-a", permalink: null, receipt: null, refusal: null, upstream: null };
     scheduled.push(body); intents = [intent, ...intents];
     return { intent };
@@ -46,18 +48,29 @@ const stub = {
 };
 let mounts = 0;
 async function render(props: any) {
-  await React.act(async () => { root.render(React.createElement(PublishPanel, { key: ++mounts, installId: "install-a", contextId: null, candidates: [], grantId: "", approvalId: "", canWrite: true, client: stub, ...props })); });
+  await React.act(async () => { root.render(React.createElement(PublishPanel, { key: ++mounts, installId: "install-a", contextId: null, candidates: [], canWrite: true, client: stub, ...props })); });
+  await flush();
+}
+async function typeGrant(value: string) {
+  const input = host.querySelector("#publish-grant") as HTMLInputElement;
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!.call(input, value);
+    input.dispatchEvent(new win.Event("input", { bubbles: true }));
+  });
   await flush();
 }
 async function main() {
   await render({});
   assert(text().includes("No publish grant") && text().includes("No approved drafts"), "Missing grant and drafts render honest empty states");
   assert(text().includes("1–10 uses") && text().includes("send_disabled"), "Grant-use range and disabled gate are always visible");
-  assert(!button("Post now"), "No send action without a candidate");
+  assert(!button("Review post now"), "No send action without a candidate");
   await render({ candidates: [candidate] });
   assert(text().includes("No publish grant"), "Grant gate holds with a candidate present");
-  assert(button("Post now")?.disabled, "Post now stays disabled until a grant binds");
-  await render({ candidates: [candidate], grantId: "grant-a", approvalId: "op-a" });
+  assert(button("Review post now")?.disabled, "Review stays disabled until a grant binds");
+  await typeGrant("grant-a");
+  assert(text().includes("dpq_ followed by") && button("Review post now")?.disabled, "A non-dpq_ grant is refused in place");
+  await typeGrant("dpq_synthetic_grant_ig");
+  assert(text().includes("Grant bound: dpq_synthetic_grant_ig"), "A valid grant is shown back");
   // Candidate picker + approval gate.
   await React.act(async () => { host.querySelector('button[aria-label="Approved draft"]')?.dispatchEvent(new win.MouseEvent("click", { bubbles: true })); });
   await flush();
@@ -65,24 +78,34 @@ async function main() {
   await React.act(async () => { option?.dispatchEvent(new win.MouseEvent("click", { bubbles: true })); });
   await flush();
   assert(text().includes("@sakeboyhk"), "Exact destination is shown before any decision");
-  const postNow = button("Post now");
-  assert(postNow?.disabled, "Post now is gated on explicit approval");
-  const approve = host.querySelector('input[aria-label="Approve the exact destination and content digests"]') as HTMLInputElement;
-  await React.act(async () => { approve.click(); });
+  assert(!button("Confirm and post now"), "Nothing schedules without the confirmation step");
+  await React.act(async () => { button("Review post now")?.click(); });
   await flush();
-  assert(!button("Post now")?.disabled, "Approval unlocks Post now");
-  await React.act(async () => { button("Post now")?.click(); });
+  const confirm = host.querySelector('[aria-label="Confirm publish"]')?.textContent ?? "";
+  assert(confirm.includes("Synthetic caption") && confirm.includes("i-digest") && confirm.includes("Asia/Hong_Kong") && confirm.includes("17841400008460056") && confirm.includes("instagram") && /apv-[0-9a-f]{32}/.test(confirm), "Confirmation shows caption, image digest, due, timezone, destination and the approval id");
+  await React.act(async () => { button("Confirm and post now")?.click(); button("Confirm and post now")?.click(); });
   await flush(); await flush();
-  assert(scheduled.length === 1 && text().includes("intent-0"), "Post now schedules with due at now");
+  assert(scheduled.length >= 1 && scheduled.every(body => body.approval_id === scheduled[0].approval_id) && text().includes("intent-0"), "A double press reuses one approval id, so the daemon keeps one intent");
+  const firstApproval = scheduled[0].approval_id;
+  await React.act(async () => { button("Review post now")?.click(); });
+  await flush();
+  await typeGrant("dpq_synthetic_grant_other");
+  assert(!button("Confirm and post now"), "Editing after review voids the confirmation");
+  await typeGrant("dpq_synthetic_grant_ig");
+  await React.act(async () => { button("Review post now")?.click(); });
+  await flush();
+  await React.act(async () => { button("Confirm and post now")?.click(); });
+  await flush(); await flush();
+  assert(scheduled[scheduled.length - 1].approval_id !== firstApproval, "A new confirmation mints a new approval id");
   assert(text().includes("17841400008460056") && text().includes("binding-digest") && text().includes("never relay-vouched"), "Card echoes the destination id and binding digest; the handle stays a display constant");
   // Schedule path needs a due time.
   await React.act(async () => { host.querySelector('input[value="schedule"]')?.dispatchEvent(new win.MouseEvent("click", { bubbles: true })); });
   await flush();
-  assert(button("Schedule")?.disabled, "Schedule without a due time stays gated");
+  assert(button("Review schedule")?.disabled, "Schedule without a due time stays gated");
   // Cancel takes two explicit presses from queued only (cancel_closed past queued).
   assert(!button("Cancel before dispatch"), "Processing intent offers no cancel");
   intents = [{ ...intents[0], intent_id: "intent-q", state: "queued" }];
-  await render({ candidates: [candidate], grantId: "grant-a", approvalId: "op-a" });
+  await render({ candidates: [candidate], });
   assert(button("Cancel before dispatch"), "Queued intent offers cancel");
   await React.act(async () => { button("Cancel before dispatch")?.click(); });
   await flush();
@@ -99,7 +122,7 @@ async function main() {
     { ...intents[0], intent_id: "i-held", state: "held", refusal: { code: "", message: "dispatch authority differs from frozen approval" } },
     { ...intents[0], intent_id: "i-held-material", state: "held", refusal: { code: "", message: "approved material changed since freeze" } },
   ];
-  await render({ candidates: [candidate], grantId: "grant-a", approvalId: "op-a" });
+  await render({ candidates: [candidate], });
   assert(text().includes("fixture000") && text().includes("never counts"), "Posted shows the verified receipt, never a bare string");
   assert(text().includes("no uses left"), "Refused names the grant cause");
   const uncertainCount = text().split("Reads as uncertain").length - 1;
@@ -108,13 +131,11 @@ async function main() {
   assert(text().includes("dispatch authority differs from frozen approval") && text().includes("approved material changed since freeze"), "Both held literals render raw with no invented code");
   assert(text().includes("Needs a human decision") && text().includes("reconnect_needed is a separate layer"), "Held names the human; ledger reconnect_needed stays separate");
   assert(text().includes("Processing"), "Processing state renders");
-  await render({ candidates: [candidate], grantId: "grant-a", approvalId: "x".repeat(121) });
-  assert(text().includes("grant_approval") && button("Post now")?.disabled, "Oversize approval gates with its contract code");
   // Read-only and failure states.
-  await render({ candidates: [candidate], grantId: "grant-a", approvalId: "op-a", canWrite: false });
+  await render({ candidates: [candidate], canWrite: false });
   assert(host.querySelector("fieldset[disabled]"), "Read-only disables the whole decision fieldset");
   failList = true;
-  await render({ candidates: [], grantId: "g", approvalId: "a" });
+  await render({ candidates: [] });
   assert(text().includes("Operator session expired"), "Failed intent load is explicit");
   failList = false;
   await React.act(async () => root.unmount());
