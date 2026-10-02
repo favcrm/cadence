@@ -242,15 +242,18 @@ impl Shared {
                     "--nudge owes no report, so it takes no reply_to",
                 ));
             }
-            // N1: a nudge is for a pane that exists now — never queued for
-            // a stopped or fenced agent to receive later.
+            // N1: a nudge is for an endpoint that exists now — never queued
+            // for a stopped or fenced agent to receive later. The endpoint is
+            // a pty pane or a verified native adapter.
             let live = self.lifecycle.lock().unwrap().agents.contains_key(&alias)
                 && target.as_ref().is_some_and(|a| {
                     (a.endpoint.is_some() || native_adapter.is_some())
                         && matches!(a.state.as_str(), "idle" | "busy")
                 });
             if !live {
-                return Err(Error::rejected(format!("agent {alias} has no live pane")));
+                return Err(Error::rejected(format!(
+                    "agent {alias} has no live endpoint (pty pane or verified native guard)"
+                )));
             }
         }
         if pty && crate::adapter::pty::has_control_chars(text) {
