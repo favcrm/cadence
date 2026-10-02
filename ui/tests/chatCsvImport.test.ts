@@ -19,9 +19,25 @@ function assert(cond: unknown, why: string): asserts cond {
   if (!cond) throw new Error(why);
 }
 function equal(actual: unknown, expected: unknown, why: string): void {
-  if (actual !== expected) {
+  // Reference equality for primitives; deep structural compare for
+  // objects/arrays (key order-insensitive) — two same-content arrays are
+  // never === and must still compare equal.
+  const same =
+    actual === expected ||
+    (typeof actual === "object" && actual !== null && typeof expected === "object" && expected !== null
+      ? JSON.stringify(actual, sorted) === JSON.stringify(expected, sorted)
+      : false);
+  if (!same) {
     throw new Error(`${why}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
   }
+}
+
+// JSON replacer that sorts object keys so deep-compare is order-insensitive.
+function sorted(_key: string, value: unknown): unknown {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)));
+  }
+  return value;
 }
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
