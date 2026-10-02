@@ -127,6 +127,11 @@ const PRE_PUSH_HOOK: &str = r#"#!/bin/sh
 top=$(git rev-parse --show-toplevel) || exit 1
 gd=$(git rev-parse --absolute-git-dir) || exit 1
 cd "$top" || exit 1
+# git exports GIT_DIR/GIT_WORK_TREE/etc for the hook — unset them before
+# spawning scripts/pre-push so its own `git` calls (and any subprocess that
+# shells out to git, e.g. the contract tests) resolve the worktree normally
+# instead of running inside the bare-dir context the hook inherits.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX GIT_QUARANTINE_PATH
 tmp="$gd/cadence-pre-push-receipt.tmp"
 out="$gd/cadence-pre-push-receipt"
 line=$(scripts/pre-push --receipt ${PRE_PUSH_TESTS:+--tests})
