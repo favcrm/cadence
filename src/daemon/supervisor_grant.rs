@@ -93,6 +93,17 @@ const MAX_GRANT_WINDOW_SECS: u64 = 300;
 /// The largest envelope byte length accepted on the wire — bounded framing.
 const MAX_ENVELOPE_BYTES: usize = 32 * 1024;
 
+/// The absolute whole-request deadline for the grant listener — the total
+/// elapsed time a peer may hold the connection while sending one request,
+/// regardless of how slowly bytes trickle in. Monotonic `Instant`-based.
+#[cfg(target_os = "linux")]
+const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The absolute deadline for writing one response — a peer that stops reading
+/// must not hold the writer.
+#[cfg(target_os = "linux")]
+const RESPONSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 // ────────────────────── non-forgeable authority types ─────────────────────
 
 /// The supervisor's own live process enrollment — the pid + `/proc`
@@ -1161,29 +1172,46 @@ impl GrantListener {
         Ok(Self { listener })
     }
 
-    /// Read one newline-terminated request into `buf`, incrementally, with a
-    /// hard byte cap (≤ `MAX_ENVELOPE_BYTES` + 1) and a socket read deadline —
-    /// a peer may not stream unbounded input or hang the listener. Rejects an
-    /// oversize line, a missing newline, or a stalled peer; never allocates
-    /// unboundedly before the bound is checked.
+    /// Read one newline-terminated request into `buf`, incrementally, under a
+    /// single **absolute** `Instant` deadline for the whole request plus a
+    /// hard byte cap (≤ `MAX_ENVELOPE_BYTES` + 1). The socket read timeout is
+    /// recomputed to the *remaining* budget before each `read`, so a slow
+    /// trickle (a byte every few seconds) cannot hold the server — the total
+    /// elapsed time is bounded, not per-read. Rejects an oversize line, a
+    /// missing newline, a closed stream, or an elapsed deadline; never
+    /// allocates unboundedly before the bound is checked.
+    ///
+    /// `budget` is the whole-request deadline; `#[cfg(test)]` injects a short
+    /// one for the slow-trickle regression. Production callers pass the fixed
+    /// `REQUEST_BUDGET`.
     #[cfg(target_os = "linux")]
-    fn read_request(stream: &std::os::unix::net::UnixStream) -> Result<String> {
+    fn read_request(
+        stream: &std::os::unix::net::UnixStream,
+        budget: std::time::Duration,
+    ) -> Result<String> {
         use std::io::Read;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .map_err(|e| Error::rejected(format!("grant read deadline failed: {e}")))?;
+        let deadline = std::time::Instant::now() + budget;
         let mut buf: Vec<u8> = Vec::with_capacity(1024);
         let mut chunk = [0u8; 4096];
         let mut s = stream;
         loop {
+            // Recompute the remaining budget and refuse the whole request once
+            // it elapses — the deadline is absolute, not per-read.
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(Error::rejected("grant request deadline elapsed"));
+            }
+            let remaining_budget = deadline - now;
+            s.set_read_timeout(Some(remaining_budget))
+                .map_err(|e| Error::rejected(format!("grant read deadline failed: {e}")))?;
             // Bound the read window: never read past MAX_ENVELOPE_BYTES + 1, so
             // a peer streaming more than the cap is refused before the buffer
             // grows unboundedly — and the cap is checked *before* each read.
-            let remaining = MAX_ENVELOPE_BYTES + 1 - buf.len();
-            if remaining == 0 {
+            let remaining_bytes = MAX_ENVELOPE_BYTES + 1 - buf.len();
+            if remaining_bytes == 0 {
                 return Err(Error::rejected("grant request exceeds the size bound"));
             }
-            let want = std::cmp::min(remaining, chunk.len());
+            let want = std::cmp::min(remaining_bytes, chunk.len());
             match s.read(&mut chunk[..want]) {
                 Ok(0) => {
                     return Err(Error::rejected(
@@ -1198,6 +1226,7 @@ impl GrantListener {
                     }
                     buf.extend_from_slice(got);
                 }
+                // A WouldBlock/TimedOut is the deadline firing — refuse.
                 Err(e) => return Err(Error::rejected(format!("grant request read failed: {e}"))),
             }
         }
@@ -1226,7 +1255,12 @@ impl GrantListener {
             .listener
             .accept()
             .map_err(|e| Error::rejected(format!("grant accept failed: {e}")))?;
-        let req = Self::read_request(&stream)?;
+        // The whole request is bounded by an absolute deadline — a slow
+        // trickle cannot hold the server. Bound the response write too.
+        stream
+            .set_write_timeout(Some(RESPONSE_BUDGET))
+            .map_err(|e| Error::rejected(format!("grant write deadline failed: {e}")))?;
+        let req = Self::read_request(&stream, REQUEST_BUDGET)?;
         let req = req.trim_end();
         let mut parts = req.splitn(2, ' ');
         let verb = parts.next();
@@ -1258,8 +1292,10 @@ impl GrantListener {
             Ok(body) => format!("ok {body}\n"),
             Err(e) => format!("err {e}\n"),
         };
-        let mut w = &stream;
-        let _ = w.write_all(out.as_bytes());
+        // Bounded write — errors are propagated, not swallowed.
+        (&stream)
+            .write_all(out.as_bytes())
+            .map_err(|e| Error::rejected(format!("grant response write failed: {e}")))?;
         resp
     }
 }
@@ -1554,7 +1590,8 @@ mod tests {
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.write_all(b"challenge no-newline").unwrap();
         drop(peer); // peer closes without a newline
-        let r = GrantListener::read_request(&server);
+        let budget = std::time::Duration::from_secs(2);
+        let r = GrantListener::read_request(&server, budget);
         assert!(r.is_err(), "missing newline must refuse: {r:?}");
         // Oversize line (> MAX_ENVELOPE_BYTES) -> refuse. Write from a thread
         // so the write can block on a full socket buffer without deadlocking
@@ -1563,13 +1600,31 @@ mod tests {
         std::thread::spawn(move || {
             let _ = peer2.write_all(&vec![b'x'; MAX_ENVELOPE_BYTES + 4096]);
         });
-        let r2 = GrantListener::read_request(&server2);
+        let r2 = GrantListener::read_request(&server2, budget);
         assert!(r2.is_err(), "oversize line must refuse: {r2:?}");
         // A valid newline-terminated request parses.
         let (server3, mut peer3) = UnixStream::pair().unwrap();
         writeln!(peer3, "challenge gen").unwrap();
-        let r3 = GrantListener::read_request(&server3).unwrap();
+        let r3 = GrantListener::read_request(&server3, budget).unwrap();
         assert_eq!(r3, "challenge gen");
+        // Slow trickle: a peer sending one byte then stalling past the WHOLE-
+        // request deadline must be refused — a per-read timeout alone lets a
+        // byte-every-few-seconds peer hold the server forever. Short injected
+        // budget proves the absolute Instant deadline.
+        let (server4, mut peer4) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let _ = peer4.write_all(b"challenge "); // no newline, then stall
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            let _ = peer4.write_all(b"x"); // one more byte, still no newline
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        let t0 = std::time::Instant::now();
+        let r4 = GrantListener::read_request(&server4, std::time::Duration::from_millis(500));
+        assert!(r4.is_err(), "slow trickle must refuse: {r4:?}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "the absolute deadline bounded the read, not a per-read timeout"
+        );
     }
 
     /// The private listener serves the fixed verbs over a real bound socket:
