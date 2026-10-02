@@ -1282,6 +1282,10 @@ tests = [
     "svg_blob_records_svg_mime",
     "traversal_is_refused_everywhere",
     "refused_upload_never_deletes_a_shared_blob",
+    "concurrent_same_bytes_upload_never_orphans_an_accepted_pointer",
+    "cross_filesystem_publication_is_atomic_and_never_overwrites",
+    "dedupe_refuses_a_nonregular_object_at_the_hash_name",
+    "same_bytes_accepted_and_rejected_keep_bytes_under_both_orderings",
     "profile_and_memory_views_are_read_only",
     "users_area_is_member_private",
     "public_caller_reads_shared_areas_only",
@@ -1316,6 +1320,11 @@ helpers = [
     "put_as",
     "upload_as",
     "op_get",
+    "OwnedState",
+    "impl:drop",
+    "stage_upload",
+    "blob_names",
+    "no_stage_left",
 ]
 
 [binaries.master_permission]

@@ -17,9 +17,11 @@
 mod board_common;
 mod common;
 
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 use board_common::op;
+use cadence_agent::wiki::Caller;
 use common::*;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -1180,11 +1182,460 @@ fn refused_upload_never_deletes_a_shared_blob() {
         )
         .unwrap();
     assert_eq!(out["conflict"], "if_rev", "{out}");
-    assert_eq!(
-        names(&blobs),
-        before,
-        "a refused upload left its created blob behind"
+    // CAD-911: the published object is immutable shared custody — a
+    // refused write may leave the orphan blob behind (its bytes are
+    // addressable by hash; another pointer could already name them).
+    // GC, not this refusal, owns unreferenced blobs. What the refusal
+    // MUST do is leave its private `.upload-` staging name cleaned.
+    let after = names(&blobs);
+    let stray: Vec<_> = after
+        .iter()
+        .filter(|n| n.to_string_lossy().contains(".upload-"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "staging leftovers must not linger: {stray:?}"
     );
+    assert!(
+        after.len() == before.len() + 1,
+        "the refused write's own object is kept as an orphan, not deleted"
+    );
+}
+
+/// CAD-911: two `put_blob` calls carry identical bytes. The first
+/// published `.blobs/<sha>` is shared the moment it exists — a second
+/// call may dedupe it and commit its pointer BEFORE the first hits its
+/// `if_rev`/kind failure. The store must never unlink the published
+/// object on that failure: the accepted writer's pointer must still
+/// resolve to correct bytes, under either ordering.
+///
+/// Here the winner is staged and its pointer committed while a loser
+/// (same bytes, stale `if_rev`) conflicts — the loser's refusal path
+/// must not have deleted the winner's object. This is a live-RPC
+/// TIMING check: the Barrier makes the overlap likely, not certain.
+/// The deterministic reproduction — a real `put_blob` parked between
+/// publication and the pointer lock while a second real `put_blob`
+/// dedupes and commits — lives in the unit tests
+/// `wiki::tests::loser_publishes_winner_dedupes_and_commits_then_loser_
+/// conflicts` and `..._winner_dedupes_then_pauses_loser_conflicts_then_
+/// winner_commits` (src/wiki/mod.rs `test_pause` seam, cfg(test)).
+/// `same_bytes_accepted_and_rejected_keep_bytes_under_both_orderings`
+/// is a sequential INVARIANT, not the race reproduction.
+#[test]
+fn concurrent_same_bytes_upload_never_orphans_an_accepted_pointer() {
+    let fx = fx();
+    let d = &fx.d;
+    let uploads = d.state.join("wiki-uploads");
+    std::fs::create_dir_all(&uploads).unwrap();
+
+    // Identical content → identical sha. Two logical names: the
+    // "winner" commits, the "loser" conflicts on a stale if_rev.
+    let bytes: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 7, 7, 7, 7];
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let results: Vec<Value> = std::thread::scope(|s| {
+        let joins: Vec<_> = ["winner.bin", "loser.bin"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let b = barrier.clone();
+                let tmp = uploads.join(format!("race-{i}.bin"));
+                std::fs::write(&tmp, bytes).unwrap();
+                // The loser carries a stale if_rev so the pointer
+                // write conflicts AFTER the bytes were published —
+                // exactly the ordering the old `created` unlink hit.
+                let if_rev = if *name == "loser.bin" {
+                    Some("fnv1a:deadbeefdeadbeef")
+                } else {
+                    None
+                };
+                s.spawn(move || {
+                    b.wait();
+                    let mut p = json!({"path": format!("global/{name}"), "tmp": tmp});
+                    if let Some(r) = if_rev {
+                        p["if_rev"] = json!(r);
+                    }
+                    d.operator_rpc("wiki_put_blob", p)
+                })
+            })
+            .collect();
+        barrier.wait();
+        joins
+            .into_iter()
+            .map(|j| j.join().unwrap())
+            .collect::<Vec<cadence_agent::Result<Value>>>()
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|e| json!({"error": e.to_string()})))
+            .collect()
+    });
+
+    let winner = &results[0];
+    let loser = &results[1];
+    assert!(winner["rev"].is_string(), "winner must commit: {winner}");
+    assert_eq!(
+        loser["conflict"].as_str().unwrap_or(""),
+        "if_rev",
+        "loser must conflict, not error or succeed: {loser}"
+    );
+    // The accepted pointer's blob must still exist and be byte-exact —
+    // the loser's refusal must not have unlinked shared bytes.
+    let sha = winner["sha256"].as_str().unwrap();
+    let blob = cadence_agent::wiki::blobs_dir(&vault(&fx)).join(sha);
+    assert_eq!(
+        std::fs::read(&blob)
+            .unwrap_or_else(|e| panic!("accepted pointer's blob is missing/corrupt: {e}")),
+        bytes,
+        "rejected concurrent upload must not delete the accepted blob"
+    );
+    // And the losing pointer was never written.
+    assert!(read_op_err(d, "global/loser.bin").is_err());
+}
+
+/// A private upload-state dir an exclusive `create_dir` owns, removed
+/// on drop. On tmpfs (`/dev/shm`, when mounted) the tmp→stage link is
+/// a real EXDEV split against a vault on the fixture filesystem; on the
+/// fixture fs itself it exercises the same-filesystem staging path.
+struct OwnedState {
+    dir: PathBuf,
+    /// `true` only when `dir`'s device provably differs from the
+    /// vault's — an EXDEV claim never rides a same-fs fallback.
+    exdev: bool,
+}
+impl OwnedState {
+    /// Exclusive create: a pre-existing or raced name is a hard
+    /// failure, not a shared dir (stale PIDs never alias it).
+    fn new(root: &Path, parent: &Path, exdev: bool) -> Self {
+        let dir = parent.join(format!(
+            "cad911-state-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        if exdev {
+            assert_ne!(
+                parent.metadata().unwrap().dev(),
+                root.metadata().unwrap().dev(),
+                "{parent:?} must be a different filesystem than {root:?}"
+            );
+        }
+        std::fs::create_dir(&dir).unwrap_or_else(|e| {
+            panic!("exclusive state dir {} must not exist: {e}", dir.display())
+        });
+        Self { dir, exdev }
+    }
+    fn uploads(&self) -> PathBuf {
+        let up = self.dir.join(cadence_agent::wiki::UPLOAD_DIR);
+        std::fs::create_dir_all(&up).unwrap();
+        up
+    }
+}
+impl Drop for OwnedState {
+    fn drop(&mut self) {
+        // Only the dir this fixture created — never a shared or
+        // caller-owned path.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn stage_upload(up: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    let tmp = up.join(name);
+    std::fs::write(&tmp, bytes).unwrap();
+    tmp
+}
+
+/// `.blobs/` entry names, sorted — staging-leak evidence.
+fn blob_names(blobs: &Path) -> Vec<String> {
+    let mut v: Vec<_> = std::fs::read_dir(blobs)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+fn no_stage_left(blobs: &Path) {
+    let stray: Vec<_> = blob_names(blobs)
+        .into_iter()
+        .filter(|n| n.contains(".upload-"))
+        .collect();
+    assert!(stray.is_empty(), "staging leftovers: {stray:?}");
+}
+
+/// CAD-911: publication stages bytes on `.blobs/`'s own filesystem and
+/// installs them at `<sha256>` atomically — never overwriting,
+/// partially exposing, or trusting the name of an existing object. A
+/// private PM's `<state>/wiki-uploads/` sits on tmpfs (`/dev/shm`,
+/// proven a different device than the fixture fs) for a real EXDEV
+/// staging copy.
+#[test]
+fn cross_filesystem_publication_is_atomic_and_never_overwrites() {
+    let root = TempDir::new().unwrap();
+    let pm_dir = root.path().join("pm");
+    let pm = cadence_agent::issue::Pm::init(&pm_dir).unwrap();
+    let shm = PathBuf::from("/dev/shm");
+    let state = OwnedState::new(root.path(), &shm, true);
+    let uploads = state.uploads();
+    assert!(state.exdev, "tmpfs↔fixture split must be a real EXDEV pair");
+
+    let vault = cadence_agent::wiki::vault_dir(&pm).unwrap();
+    let blobs = cadence_agent::wiki::blobs_dir(&vault);
+    let bytes: &[u8] = b"cross-device blob payload - publish me atomically";
+
+    // A cross-device tmp stages by copy onto `.blobs/`'s filesystem,
+    // then publishes the verified bytes under the hash name —
+    // byte-exact, and the tmp is consumed.
+    let tmp_a = stage_upload(&uploads, "a.bin", bytes);
+    let out = cadence_agent::wiki::put_blob(
+        &pm,
+        &state.dir,
+        &Caller::Operator,
+        "global/x.bin",
+        &tmp_a,
+        None,
+        None,
+    )
+    .unwrap();
+    let sha = out["sha256"].as_str().unwrap().to_string();
+    assert_eq!(std::fs::read(blobs.join(&sha)).unwrap(), bytes);
+    assert!(!tmp_a.exists(), "the consumed tmp was cleaned");
+    no_stage_left(&blobs);
+
+    // Byte-exact dedupe: the same bytes under a second name verify
+    // the existing object and commit another pointer to it.
+    let tmp_a2 = stage_upload(&uploads, "a2.bin", bytes);
+    let again = cadence_agent::wiki::put_blob(
+        &pm,
+        &state.dir,
+        &Caller::Operator,
+        "global/x2.bin",
+        &tmp_a2,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(again["sha256"], sha);
+    assert_eq!(std::fs::read(blobs.join(&sha)).unwrap(), bytes);
+    no_stage_left(&blobs);
+
+    // A hash name is not a byte proof: foreign bytes planted under
+    // the upload's hash name must make the dedupe REFUSE — the
+    // existing object is kept exactly as planted, no new pointer
+    // commits, and this call's private stage is cleaned.
+    let bytes_b: &[u8] = b"different bytes, same path family";
+    let tmp_b0 = stage_upload(&uploads, "b0.bin", bytes_b);
+    let first = cadence_agent::wiki::put_blob(
+        &pm,
+        &state.dir,
+        &Caller::Operator,
+        "global/b0.bin",
+        &tmp_b0,
+        None,
+        None,
+    )
+    .unwrap();
+    let sha_b = first["sha256"].as_str().unwrap().to_string();
+    let object = blobs.join(&sha_b);
+    let foreign: &[u8] = b"PRE-EXISTING foreign bytes - not the upload's";
+    std::fs::write(&object, foreign).unwrap();
+    let tmp_b = stage_upload(&uploads, "b.bin", bytes_b);
+    let err = cadence_agent::wiki::put_blob(
+        &pm,
+        &state.dir,
+        &Caller::Operator,
+        "global/y.bin",
+        &tmp_b,
+        None,
+        None,
+    )
+    .expect_err("a foreign-bytes object at the hash name must refuse");
+    let msg = err.to_string();
+    assert!(msg.contains(&sha_b), "refusal names the object: {msg}");
+    assert_eq!(
+        std::fs::read(&object).unwrap(),
+        foreign,
+        "the refused publish must leave the existing object untouched"
+    );
+    assert!(
+        vault.join("global/y.bin.blob").symlink_metadata().is_err(),
+        "no pointer commits against unverified bytes"
+    );
+    no_stage_left(&blobs);
+}
+
+/// CAD-911: a same-filesystem upload exercises the link-staging path.
+/// A non-regular entry planted at the upload's hash name — a
+/// directory or a symlink, not merely wrong bytes — must refuse the
+/// same way, and the refused write leaves no pointer and no stage.
+#[test]
+fn dedupe_refuses_a_nonregular_object_at_the_hash_name() {
+    let root = TempDir::new().unwrap();
+    let pm_dir = root.path().join("pm");
+    let pm = cadence_agent::issue::Pm::init(&pm_dir).unwrap();
+    let state = OwnedState::new(root.path(), root.path(), false);
+    let uploads = state.uploads();
+
+    let vault = cadence_agent::wiki::vault_dir(&pm).unwrap();
+    let blobs = cadence_agent::wiki::blobs_dir(&vault);
+    let bytes: &[u8] = b"same-fs blob payload";
+
+    let tmp = stage_upload(&uploads, "a.bin", bytes);
+    let out = cadence_agent::wiki::put_blob(
+        &pm,
+        &state.dir,
+        &Caller::Operator,
+        "global/a.bin",
+        &tmp,
+        None,
+        None,
+    )
+    .unwrap();
+    let sha = out["sha256"].as_str().unwrap().to_string();
+    assert_eq!(std::fs::read(blobs.join(&sha)).unwrap(), bytes);
+
+    for (i, plant) in ["dir", "symlink"].into_iter().enumerate() {
+        // Publish distinct bytes once, then replace the object with a
+        // non-regular entry under the same hash name. The bytes differ
+        // per iteration so the first publish never re-collides with a
+        // previous iteration's planted entry.
+        let bytes_b: &[u8] = match plant {
+            "dir" => b"nonregular-object bytes, dir case",
+            _ => b"nonregular-object bytes, symlink case",
+        };
+        let tmp_b = stage_upload(&uploads, &format!("b{i}.bin"), bytes_b);
+        let first = cadence_agent::wiki::put_blob(
+            &pm,
+            &state.dir,
+            &Caller::Operator,
+            &format!("global/b{i}.bin"),
+            &tmp_b,
+            None,
+            None,
+        )
+        .unwrap();
+        let sha_b = first["sha256"].as_str().unwrap().to_string();
+        let object = blobs.join(&sha_b);
+        std::fs::remove_file(&object).unwrap();
+        match plant {
+            "dir" => std::fs::create_dir(&object).unwrap(),
+            _ => std::os::unix::fs::symlink(root.path().join("elsewhere"), &object).unwrap(),
+        }
+        let tmp_b2 = stage_upload(&uploads, &format!("b{i}b.bin"), bytes_b);
+        let err = cadence_agent::wiki::put_blob(
+            &pm,
+            &state.dir,
+            &Caller::Operator,
+            &format!("global/y{i}.bin"),
+            &tmp_b2,
+            None,
+            None,
+        )
+        .expect_err("a non-regular object at the hash name must refuse");
+        assert!(
+            err.to_string().contains(&sha_b),
+            "{plant} refusal names the object: {err}"
+        );
+        // The planted entry stays exactly as planted; no pointer.
+        assert!(object.symlink_metadata().is_ok(), "{plant} left in place");
+        assert!(
+            vault
+                .join(format!("global/y{i}.bin.blob"))
+                .symlink_metadata()
+                .is_err(),
+            "no pointer against an unverified object"
+        );
+        no_stage_left(&blobs);
+    }
+}
+
+/// CAD-911: a sequential INVARIANT, not the old-race reproduction —
+/// the pre-fix defect needed the loser's created-flag unlink to land
+/// BETWEEN the winner's dedupe and its pointer commit, an
+/// interleaving no sequential call order can reach (both orders
+/// pass unmodified pre-fix code). What this pins is the standing
+/// contract: under both literal orderings the accepted pointer keeps
+/// byte-exact bytes and the refused call deletes nothing shared.
+/// The checked-in deterministic reproduction of the defect — real
+/// `put_blob` calls interleaved at the publish seam — is the
+/// `wiki::tests::*` pair in src/wiki/mod.rs.
+#[test]
+fn same_bytes_accepted_and_rejected_keep_bytes_under_both_orderings() {
+    for ordering in [
+        "winner-commits-then-loser-refuses",
+        "loser-refuses-then-winner-commits",
+    ] {
+        let root = TempDir::new().unwrap();
+        let pm_dir = root.path().join("pm");
+        let pm = cadence_agent::issue::Pm::init(&pm_dir).unwrap();
+        let state = OwnedState::new(root.path(), root.path(), false);
+        let uploads = state.uploads();
+        let vault = cadence_agent::wiki::vault_dir(&pm).unwrap();
+        let blobs = cadence_agent::wiki::blobs_dir(&vault);
+        let bytes: &[u8] = b"identical bytes, two writers, one winner";
+
+        // Whatever the order, the winner's pointer must resolve to
+        // correct bytes and the loser's stale-if_rev refusal must
+        // leave every shared object untouched.
+        let winner = |s: &OwnedState, tmp: &Path| {
+            cadence_agent::wiki::put_blob(
+                &pm,
+                &s.dir,
+                &Caller::Operator,
+                "global/winner.bin",
+                tmp,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let loser = |s: &OwnedState, tmp: &Path| {
+            cadence_agent::wiki::put_blob(
+                &pm,
+                &s.dir,
+                &Caller::Operator,
+                "global/loser.bin",
+                tmp,
+                None,
+                Some("fnv1a:deadbeefdeadbeef"),
+            )
+            .unwrap()
+        };
+        let tmp_w = stage_upload(&uploads, "w.bin", bytes);
+        let tmp_l = stage_upload(&uploads, "l.bin", bytes);
+        // Literal sequential calls — an invariant under both
+        // orderings. The deterministic race reproduction needs a
+        // parked call (the `test_pause` seam in src/wiki/mod.rs),
+        // which integration tests cannot see: the library they link
+        // is built without cfg(test).
+        let (out_w, out_l) = if ordering.starts_with("winner") {
+            (winner(&state, &tmp_w), loser(&state, &tmp_l))
+        } else {
+            let l = loser(&state, &tmp_l);
+            let w = winner(&state, &tmp_w);
+            (w, l)
+        };
+
+        assert!(out_w["rev"].is_string(), "{ordering}: winner commits");
+        assert_eq!(
+            out_l["conflict"].as_str().unwrap_or(""),
+            "if_rev",
+            "{ordering}: loser conflicts, never an error or success: {out_l}"
+        );
+        let sha = out_w["sha256"].as_str().unwrap();
+        assert_eq!(
+            std::fs::read(blobs.join(sha)).unwrap_or_else(|e| panic!(
+                "{ordering}: accepted pointer's blob missing/corrupt: {e}"
+            )),
+            bytes,
+            "{ordering}: rejected same-bytes upload must not delete or corrupt the accepted blob"
+        );
+        assert!(
+            vault
+                .join("global/loser.bin.blob")
+                .symlink_metadata()
+                .is_err(),
+            "{ordering}: no loser pointer"
+        );
+        no_stage_left(&blobs);
+    }
 }
 
 #[test]
@@ -1496,6 +1947,13 @@ fn unproven_callers_are_refused() {
         ("wiki_write", json!({"path": "global/x.md", "text": "x"})),
         ("wiki_search", json!({"q": "shared"})),
         ("wiki_history", json!({"path": "global/n.md"})),
+        // The blob upload is refused on the caller binding before a
+        // tmp is ever considered — the nonexistent tmp below would
+        // fail later checks anyway, but the caller refusal is first.
+        (
+            "wiki_put_blob",
+            json!({"path": "global/x.bin", "tmp": "/nonexistent-tmp"}),
+        ),
     ] {
         let err = refused(d.unproven_rpc(method, params));
         assert!(err.contains("refused"), "{method}: {err}");
