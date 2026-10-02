@@ -982,9 +982,7 @@ impl Auth {
         if self.prune(now) {
             self.persist()?;
         }
-        Ok(self.sessions.iter().any(|r| {
-            r.hash == hash && r.live(now)
-        }))
+        Ok(self.sessions.iter().any(|r| r.hash == hash && r.live(now)))
     }
 
     /// The verified row's FULL credential hash for `token` (+ `key` on a
@@ -1017,11 +1015,7 @@ impl Auth {
 
     /// The verified public row's FULL credential hash for `token` — the
     /// cookie-only public surface has no `key`. `crate`-private.
-    pub(crate) fn public_session_hash(
-        &mut self,
-        token: &str,
-        now: i64,
-    ) -> Result<Option<String>> {
+    pub(crate) fn public_session_hash(&mut self, token: &str, now: i64) -> Result<Option<String>> {
         if !well_formed(token) {
             return Ok(None);
         }
@@ -1029,11 +1023,7 @@ impl Auth {
         Ok(self
             .sessions
             .iter()
-            .find(|r| {
-                r.origin == Origin::Public
-                    && same_credential(&r.hash, &hash)
-                    && r.live(now)
-            })
+            .find(|r| r.origin == Origin::Public && same_credential(&r.hash, &hash) && r.live(now))
             .map(|r| r.hash.clone()))
     }
 
@@ -1108,8 +1098,10 @@ mod tests {
         auth.sessions.retain(|r| r.hash != orig_hash);
         // The collider (same display prefix) still lives — but the cap's
         // full-hash check for the revoked original must now FAIL.
-        assert!(!auth.live_hash(&orig_hash, now).unwrap(),
-            "colliding row satisfied the revoked cap's full-hash binding");
+        assert!(
+            !auth.live_hash(&orig_hash, now).unwrap(),
+            "colliding row satisfied the revoked cap's full-hash binding"
+        );
         assert!(auth.live_hash(&collider_hash, now).unwrap());
         // The display-prefix check still sees the survivor (unchanged).
         assert!(auth.live_session_id(prefix, now).unwrap());

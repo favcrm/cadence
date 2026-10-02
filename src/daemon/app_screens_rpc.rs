@@ -72,8 +72,7 @@ pub(crate) const CAP_TTL: std::time::Duration = std::time::Duration::from_secs(6
 /// This bounds the expensive digest/approval/package re-proof each mint
 /// runs, distinct from the outstanding-cap count.
 pub(crate) const MINT_RATE_PER_SESSION: usize = 64;
-pub(crate) const MINT_RATE_WINDOW: std::time::Duration =
-    std::time::Duration::from_secs(60);
+pub(crate) const MINT_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 /// Bound the rate map itself (a session-id → timestamps entry).
 const MINT_RATE_SESSIONS: usize = 128;
 
@@ -211,13 +210,14 @@ impl Shared {
     /// counter. Returns `{mount, bridge_nonce, generation, tag}`.
     pub(super) fn rpc_app_screen_mint(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("app screen mint", params, peer_pid)?;
-        const ALLOWED: &[&str] =
-            &["install_id", "tag", "token", "key", "origin", "generation"];
+        const ALLOWED: &[&str] = &["install_id", "tag", "token", "key", "origin", "generation"];
         let fields = params
             .as_object()
             .ok_or_else(|| Error::rejected("screen mint params must be an object"))?;
         if fields.keys().any(|k| !ALLOWED.contains(&k.as_str())) {
-            return Err(Error::rejected("screen mint params have unsupported fields"));
+            return Err(Error::rejected(
+                "screen mint params have unsupported fields",
+            ));
         }
         let install_id = required_str(params, "install_id")?;
         let tag = required_str(params, "tag")?;
@@ -314,11 +314,7 @@ impl Shared {
     /// (single-use), the stored minting session must still be live, and
     /// the live digest/approval/package re-proof runs. No cookie/key/
     /// session field is accepted or read.
-    pub(super) fn rpc_app_screen_consume(
-        &self,
-        params: &Value,
-        peer_pid: u32,
-    ) -> Result<Value> {
+    pub(super) fn rpc_app_screen_consume(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         // The native peer guard: an agent-derived or detached connection
         // is denied outright — a stolen nonce still cannot be spent by
         // one. This is what lets the headerless local GET stay safe.
@@ -400,9 +396,9 @@ impl Shared {
             // The screen package's declared app must equal the installed
             // app manifest's name — a package cannot claim a different app.
             let installed_app = crate::issue::app::parse_manifest(
-                files.get("app.md").ok_or_else(|| {
-                    Error::rejected("installation manifest unavailable")
-                })?,
+                files
+                    .get("app.md")
+                    .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
             )?
             .app;
             let pkg = app_screen_pkg::extract(files, tag)?;
@@ -529,17 +525,31 @@ mod tests {
     #[test]
     fn render_preserves_exact_js_and_refuses_end_tokens() {
         let clean = "(function(){var r=1<2&&2>1;return r;})();";
-        let h = render_frame_html("cspnonce", "main", "bridgenonce64", 1, "a{color:red}", clean, "http://h");
+        let h = render_frame_html(
+            "cspnonce",
+            "main",
+            "bridgenonce64",
+            1,
+            "a{color:red}",
+            clean,
+            "http://h",
+        );
         assert!(h.is_ok());
         let h = h.unwrap();
         // Exact bytes preserved — verbatim, not backslash-rewritten.
         assert!(h.contains(clean));
-        assert!(h.contains("<div id=\"root\"></div>"), "no generic #root mount: {h}");
+        assert!(
+            h.contains("<div id=\"root\"></div>"),
+            "no generic #root mount: {h}"
+        );
         assert!(h.contains("cadence-screen-boot"));
         // Bootstrap uses \uXXXX not HTML entities.
         let h2 = render_frame_html("csp", "main", "b<nonce>", 1, "a{}", "x()", "http://h").unwrap();
         assert!(!h2.contains("&lt;"), "bootstrap used HTML entities: {h2}");
-        assert!(h2.contains("\\u003c"), "bootstrap not \\uXXXX-escaped: {h2}");
+        assert!(
+            h2.contains("\\u003c"),
+            "bootstrap not \\uXXXX-escaped: {h2}"
+        );
         // End tokens refuse, never rewrite.
         for bad in ["a</script>b", "a<!--b", "a-->b", "a</ScRiPt>b"] {
             assert!(

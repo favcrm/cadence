@@ -205,20 +205,18 @@ fn member_path_ok(name: &str) -> bool {
         return true;
     }
     match (parts.len(), normal(0)) {
-        (2, Some(top)) if matches!(top, "workflows" | "rubrics" | "templates") => {
-            normal(1).is_some_and(|leaf| {
+        (2, Some(top)) if matches!(top, "workflows" | "rubrics" | "templates") => normal(1)
+            .is_some_and(|leaf| {
                 !leaf.starts_with('.')
                     && (top != "workflows"
                         || (leaf.ends_with(".md")
                             && model::valid_tag(leaf.trim_end_matches(".md"))))
-            })
-        }
+            }),
         // screens/<tag>/<leaf> — tag-validated dir + package leaf grammar.
         (3, Some("screens")) => {
             normal(1).is_some_and(model::valid_tag)
                 && normal(2).is_some_and(|leaf| {
-                    !leaf.starts_with('.')
-                        && crate::issue::app_screen_pkg::leaf_ok(leaf)
+                    !leaf.starts_with('.') && crate::issue::app_screen_pkg::leaf_ok(leaf)
                 })
         }
         _ => false,
@@ -325,14 +323,10 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
                     }
                     let tagdir = path.join(&tag);
                     if root.kind(&tagdir)? != Some(libc::S_IFDIR) {
-                        return Err(Error::rejected(
-                            "screens/<tag> must be a directory",
-                        ));
+                        return Err(Error::rejected("screens/<tag> must be a directory"));
                     }
                     for leaf in root.list(&tagdir, &mut budget)? {
-                        if leaf.starts_with('.')
-                            || !crate::issue::app_screen_pkg::leaf_ok(&leaf)
-                        {
+                        if leaf.starts_with('.') || !crate::issue::app_screen_pkg::leaf_ok(&leaf) {
                             return Err(Error::rejected(
                                 "a screen asset is <stem>.<js|css|svg|json>, or screens.json",
                             ));

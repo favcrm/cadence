@@ -107,7 +107,10 @@ fn screen_bundle() -> Vec<(String, String)> {
     ];
     let decl = screens_decl("crm", assets);
     let mut files: Vec<(String, String)> = vec![
-        ("app.md".into(), "---\napp: crm\ntitle: CRM\nversion: '1'\n---\nGuide.\n".into()),
+        (
+            "app.md".into(),
+            "---\napp: crm\ntitle: CRM\nversion: '1'\n---\nGuide.\n".into(),
+        ),
         // A valid workflow per the tested schema (title/goal/inputs
         // frontmatter + `## Task` section + `agent:`/`### Acceptance`):
         // mirrors the workspace.rs WORKFLOW fixture exactly.
@@ -185,7 +188,14 @@ impl Screen {
             assert!(Instant::now() < deadline, "board did not start");
             std::thread::sleep(Duration::from_millis(20));
         }
-        (port, Cleanup(stop, Some(handle), lease))
+        (
+            port,
+            Cleanup {
+                stop,
+                handle: Some(handle),
+                _lease: lease,
+            },
+        )
     }
 
     /// A real board session (operator sign-in via `cadence ui login`).
@@ -195,7 +205,13 @@ impl Screen {
 
     /// `app_screen_mint` as the operator over a live session credential —
     /// relays the real cookie token + key + origin, never a caller id.
-    fn mint(&self, token: &str, key: &str, origin: &str, generation: u64) -> cadence_agent::Result<Value> {
+    fn mint(
+        &self,
+        token: &str,
+        key: &str,
+        origin: &str,
+        generation: u64,
+    ) -> cadence_agent::Result<Value> {
         self.daemon.operator_rpc(
             "app_screen_mint",
             json!({"install_id": self.install_id, "tag": TAG,
@@ -214,11 +230,18 @@ impl Screen {
     }
 }
 
-struct Cleanup(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>, PortLease);
+/// RAII for the spawned board: `stop` signals the accept loop, `handle`
+/// joins it, `_lease` holds the port reservation alive until drop so no
+/// sibling test rebinds it mid-run.
+struct Cleanup {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    _lease: PortLease,
+}
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-        if let Some(h) = self.1.take() {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
@@ -279,10 +302,7 @@ fn cad1006_mint_is_operator_only_and_strict_body() {
 
     // (c) a non-empty body — a field is a forgery attempt — refused 400.
     let op = s.board_session(port);
-    let (code, _, _) = common::op::raw(
-        port,
-        &op.request("POST", &path, r#"{"install_id":"x"}"#),
-    );
+    let (code, _, _) = common::op::raw(port, &op.request("POST", &path, r#"{"install_id":"x"}"#));
     assert_eq!(code, 400, "non-empty mint body accepted: {code}");
     let (code, _, _) = common::op::raw(port, &op.request("POST", &path, r#"{"tag":"other"}"#));
     assert_eq!(code, 400);
@@ -301,7 +321,10 @@ fn cad1006_mint_returns_bridge_and_consumes_once() {
 
     let mint = s.mint(&token, &session.key, "loopback", 7).unwrap();
     let mount = mint["mount"].as_str().unwrap();
-    assert!(mount.starts_with("/api/app-screen/"), "no mount path: {mint}");
+    assert!(
+        mount.starts_with("/api/app-screen/"),
+        "no mount path: {mint}"
+    );
     assert_eq!(mint["generation"].as_u64(), Some(7));
     let bridge = mint["bridge_nonce"].as_str().unwrap();
     assert_eq!(bridge.len(), 64, "bridge nonce not 64-hex: {bridge}");
@@ -344,12 +367,16 @@ fn cad1006_mint_requires_real_session_and_origin() {
     // (d) a mint under the real session succeeds; then revoke the session
     // and the stored-session-live check at consume kills the cap.
     let mint = s.mint(&token, &session.key, "loopback", 9).unwrap();
-    let nonce = mint["mount"].as_str().unwrap().strip_prefix("/api/app-screen/").unwrap().to_string();
+    let nonce = mint["mount"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("/api/app-screen/")
+        .unwrap()
+        .to_string();
     // Revoke via the daemon's own session revoke (operator action).
-    let _ = s.daemon.operator_rpc(
-        "operator_session_stolen",
-        json!({"token": token}),
-    );
+    let _ = s
+        .daemon
+        .operator_rpc("operator_session_stolen", json!({"token": token}));
     let err = s.consume(&nonce).unwrap_err();
     assert!(
         err.to_string().contains("no longer live") || err.to_string().contains("session"),
@@ -368,14 +395,11 @@ fn cad1006_consume_nonce_grammar_fail_closed() {
         "short",
         &"a".repeat(63),
         &"a".repeat(65),
-        &"A".repeat(64),           // uppercase — not the hex grammar
-        &"g".repeat(64),           // non-hex chars
+        &"A".repeat(64), // uppercase — not the hex grammar
+        &"g".repeat(64), // non-hex chars
         &format!("{}e", "a".repeat(63)),
     ] {
-        assert!(
-            s.consume(bad).is_err(),
-            "malformed nonce accepted: {bad}"
-        );
+        assert!(s.consume(bad).is_err(), "malformed nonce accepted: {bad}");
     }
 }
 
@@ -401,7 +425,10 @@ fn cad1006_frame_get_renders_csp_and_exact_bytes() {
     // on a seam-armed fixture it carries ONLY the CAD-482 caller
     // assertion so the board's in-process peer proof resolves `operator`.
     let req = common::op::assert_as(
-        format!("GET {mount} HTTP/1.0\r\nHost: {host}\r\n\r\n", host = session.host),
+        format!(
+            "GET {mount} HTTP/1.0\r\nHost: {host}\r\n\r\n",
+            host = session.host
+        ),
         &s.daemon.state,
         "operator",
     );
@@ -411,20 +438,41 @@ fn cad1006_frame_get_renders_csp_and_exact_bytes() {
     let csp_count = head.matches("Content-Security-Policy").count();
     assert_eq!(csp_count, 1, "board CSP stacked onto frame CSP: {head}");
     assert!(head.contains("script-src 'nonce-"), "no nonce CSP: {head}");
-    assert!(head.contains("frame-ancestors"), "no frame-ancestors: {head}");
-    assert!(head.to_lowercase().contains("no-store"), "no no-store: {head}");
-    assert!(head.to_lowercase().contains("no-referrer"), "no no-referrer: {head}");
+    assert!(
+        head.contains("frame-ancestors"),
+        "no frame-ancestors: {head}"
+    );
+    assert!(
+        head.to_lowercase().contains("no-store"),
+        "no no-store: {head}"
+    );
+    assert!(
+        head.to_lowercase().contains("no-referrer"),
+        "no no-referrer: {head}"
+    );
     // Bootstrap carries the mint-bound bridge nonce + generation.
-    assert!(body.contains(&bridge), "bootstrap lost the bridge nonce: {body}");
-    assert!(body.contains("\"generation\":5"), "bootstrap lost generation: {body}");
-    assert!(body.contains("cadence-screen-boot"), "no bootstrap block: {body}");
+    assert!(
+        body.contains(&bridge),
+        "bootstrap lost the bridge nonce: {body}"
+    );
+    assert!(
+        body.contains("\"generation\":5"),
+        "bootstrap lost generation: {body}"
+    );
+    assert!(
+        body.contains("cadence-screen-boot"),
+        "no bootstrap block: {body}"
+    );
     // The approved IIFE appears verbatim (the exact bytes, not an escape).
     assert!(
         body.contains("(function(){var p=window.__CADENCE_SCREEN__"),
         "IIFE bytes were rewritten/corrupted: {body}"
     );
     // The mount point is the generic #root the frozen app auto-mounts.
-    assert!(body.contains("<div id=\"root\"></div>"), "no #root mount: {body}");
+    assert!(
+        body.contains("<div id=\"root\"></div>"),
+        "no #root mount: {body}"
+    );
 
     // Replay over HTTP: the cap is burned — a second GET is a refusal.
     let (code2, _, _) = common::op::raw(port, &req);
@@ -524,7 +572,10 @@ fn cad1006_screen_package_bounds() {
     files.insert(format!("screens/{TAG}/client.js"), js.to_string());
     let pkg = app_screen_pkg::extract(&files, TAG).unwrap();
     assert_eq!(pkg.app, "other", "declared app not recovered verbatim");
-    assert_ne!(pkg.app, "crm", "declared app must differ from install app crm");
+    assert_ne!(
+        pkg.app, "crm",
+        "declared app must differ from install app crm"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -563,22 +614,32 @@ fn cad1006_mint_refuses_unapproved_or_wrong_install() {
 #[test]
 fn cad1006_consume_denied_to_nonoperator_and_replay() {
     let s = Screen::new();
-    let mut lane = LaneShell::spawn(s._root.path());
-    plant_member_pane(&s.daemon, "screen-consume-agent", "claude", None, lane.pid());
+    let lane = LaneShell::spawn(s._root.path());
+    plant_member_pane(
+        &s.daemon,
+        "screen-consume-agent",
+        "claude",
+        None,
+        lane.pid(),
+    );
     let (port, _cleanup) = serve_board(&s);
     let session = s.board_session(port);
     let token = session.cookie.split('=').nth(1).unwrap().to_string();
     let mint = s.mint(&token, &session.key, "loopback", 1).unwrap();
-    let nonce = mint["mount"].as_str().unwrap().strip_prefix("/api/app-screen/").unwrap().to_string();
+    let nonce = mint["mount"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("/api/app-screen/")
+        .unwrap()
+        .to_string();
 
     // An unattributed/detached caller holding a VALID nonce is denied by
     // the native `operator_connection` peer guard — the FrameCap is not a
     // general bearer for a non-operator peer. On a seam-armed fixture the
     // planted agent is denied the same way via its pid.
-    let denied = s.daemon.unproven_rpc(
-        "app_screen_consume",
-        json!({"nonce": nonce}),
-    );
+    let denied = s
+        .daemon
+        .unproven_rpc("app_screen_consume", json!({"nonce": nonce}));
     assert!(denied.is_err(), "non-operator consume accepted a valid cap");
     // The cap survived the refused consume — the peer guard denied BEFORE
     // the burn, so a later operator consume still succeeds.
@@ -588,7 +649,12 @@ fn cad1006_consume_denied_to_nonoperator_and_replay() {
     // Two concurrent consumes of the SAME nonce — exactly one burns it
     // (both callers are operator here; the atomic remove decides).
     let mint2 = s.mint(&token, &session.key, "loopback", 2).unwrap();
-    let nonce2 = mint2["mount"].as_str().unwrap().strip_prefix("/api/app-screen/").unwrap().to_string();
+    let nonce2 = mint2["mount"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("/api/app-screen/")
+        .unwrap()
+        .to_string();
     let state = s.daemon.state.clone();
     let nonce_t = nonce2.clone();
     let handle = std::thread::spawn(move || {
@@ -625,7 +691,13 @@ fn upgrade_files_map(new_version: &str) -> Value {
     let members: Vec<Value> = assets
         .iter()
         .map(|(name, body)| {
-            let media = if name.ends_with(".js") { "text/javascript" } else if name.ends_with(".css") { "text/css" } else { "application/json" };
+            let media = if name.ends_with(".js") {
+                "text/javascript"
+            } else if name.ends_with(".css") {
+                "text/css"
+            } else {
+                "application/json"
+            };
             let digest = {
                 use sha2::{Digest, Sha256};
                 format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
@@ -642,7 +714,12 @@ fn upgrade_files_map(new_version: &str) -> Value {
         "provenance":{"source_digest":sha256("src"),"sdk_digest":sha256("sdk"),"toolchain_digest":sha256("tc")},
         "may":[]}).to_string();
     let mut files = Map::new();
-    files.insert("app.md".into(), json!(format!("---\napp: crm\ntitle: CRM\nversion: '{new_version}'\n---\nGuide v{new_version}.\n")));
+    files.insert(
+        "app.md".into(),
+        json!(format!(
+            "---\napp: crm\ntitle: CRM\nversion: '{new_version}'\n---\nGuide v{new_version}.\n"
+        )),
+    );
     files.insert("workflows/do.md".into(), json!(WORKFLOW_V2));
     files.insert(format!("screens/{TAG}/screens.json"), json!(decl));
     for (name, body) in assets {
@@ -676,10 +753,18 @@ fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
 
     // The catalog_generation the native journal expects.
     let gen = |s: &Screen| -> String {
-        let list = s.daemon.operator_rpc("app_workspace_list", json!({})).unwrap();
-        list.as_array().unwrap().iter()
+        let list = s
+            .daemon
+            .operator_rpc("app_workspace_list", json!({}))
+            .unwrap();
+        list.as_array()
+            .unwrap()
+            .iter()
             .find(|r| r["install_id"].as_str() == Some(install_id.as_str()))
-            .unwrap()["catalog_generation"].as_str().unwrap().to_string()
+            .unwrap()["catalog_generation"]
+            .as_str()
+            .unwrap()
+            .to_string()
     };
 
     let check_path = format!("/api/app-installations/{install_id}/upgrade/check");
@@ -688,7 +773,10 @@ fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
     // ---- NEGATIVES against the SAME valid files map ----
     let files = upgrade_files_map("2");
     let files_body = files_obj(&files).to_string();
-    assert!(files_body.len() > 4096, "test bundle must exceed 4KiB BODY_CAP");
+    assert!(
+        files_body.len() > 4096,
+        "test bundle must exceed 4KiB BODY_CAP"
+    );
 
     // (a) files+source together — ambiguity refused.
     let mut amb = serde_json::Map::new();
@@ -696,7 +784,10 @@ fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
     amb.insert("source".into(), json!("/tmp/x"));
     amb.insert("expected_digest".into(), json!(before_digest));
     amb.insert("expected_generation".into(), json!(gen(&s)));
-    let (code, _, _) = common::op::raw(port, &session.request("POST", &check_path, &Value::Object(amb).to_string()));
+    let (code, _, _) = common::op::raw(
+        port,
+        &session.request("POST", &check_path, &Value::Object(amb).to_string()),
+    );
     assert_eq!(code, 400, "files+source ambiguity accepted");
 
     // (b) wrong expected_digest refuses (daemon compares to live).
@@ -704,7 +795,10 @@ fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
     bad.insert("files".into(), files_obj(&files));
     bad.insert("expected_digest".into(), json!("sha256:deadbeef"));
     bad.insert("expected_generation".into(), json!(gen(&s)));
-    let (code, _, _) = common::op::raw(port, &session.request("POST", &check_path, &Value::Object(bad).to_string()));
+    let (code, _, _) = common::op::raw(
+        port,
+        &session.request("POST", &check_path, &Value::Object(bad).to_string()),
+    );
     assert_eq!(code, 400, "wrong expected_digest accepted");
 
     // (c) wrong catalog_generation refuses.
@@ -712,7 +806,10 @@ fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
     badg.insert("files".into(), files_obj(&files));
     badg.insert("expected_digest".into(), json!(before_digest));
     badg.insert("expected_generation".into(), json!("sha256:wrong-gen"));
-    let (code, _, _) = common::op::raw(port, &session.request("POST", &check_path, &Value::Object(badg).to_string()));
+    let (code, _, _) = common::op::raw(
+        port,
+        &session.request("POST", &check_path, &Value::Object(badg).to_string()),
+    );
     assert_eq!(code, 400, "wrong expected_generation accepted");
 
     // (d) a foreign field refuses (closed param set).
@@ -721,7 +818,10 @@ fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
     foreign.insert("expected_digest".into(), json!(before_digest));
     foreign.insert("expected_generation".into(), json!(gen(&s)));
     foreign.insert("actor".into(), json!("operator"));
-    let (code, _, _) = common::op::raw(port, &session.request("POST", &check_path, &Value::Object(foreign).to_string()));
+    let (code, _, _) = common::op::raw(
+        port,
+        &session.request("POST", &check_path, &Value::Object(foreign).to_string()),
+    );
     assert_eq!(code, 400, "foreign field accepted");
 
     // (e) a DUPLICATE top-level `files` key — a `Value` parse would keep
@@ -757,11 +857,20 @@ fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
     chk.insert("files".into(), files_obj(&files));
     chk.insert("expected_digest".into(), json!(before_digest));
     chk.insert("expected_generation".into(), json!(gen(&s)));
-    let (code, _, body) = common::op::raw(port, &session.request("POST", &check_path, &Value::Object(chk).to_string()));
+    let (code, _, body) = common::op::raw(
+        port,
+        &session.request("POST", &check_path, &Value::Object(chk).to_string()),
+    );
     assert_eq!(code, 200, "upgrade-check refused valid files: {body}");
     let proposal: Value = serde_json::from_str(&body).unwrap();
-    let new_digest = proposal["digest"].as_str().expect("no proposed digest").to_string();
-    assert_ne!(new_digest, before_digest, "upgrade produced an unchanged digest");
+    let new_digest = proposal["digest"]
+        .as_str()
+        .expect("no proposed digest")
+        .to_string();
+    assert_ne!(
+        new_digest, before_digest,
+        "upgrade produced an unchanged digest"
+    );
 
     // (e) wrong expected_new_digest refuses against the valid proposal.
     let mut badn = serde_json::Map::new();
@@ -770,7 +879,10 @@ fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
     badn.insert("expected_generation".into(), json!(gen(&s)));
     badn.insert("expected_new_digest".into(), json!("sha256:wrong-new"));
     badn.insert("request_id".into(), json!("upg-bad"));
-    let (code, _, _) = common::op::raw(port, &session.request("POST", &up_path, &Value::Object(badn).to_string()));
+    let (code, _, _) = common::op::raw(
+        port,
+        &session.request("POST", &up_path, &Value::Object(badn).to_string()),
+    );
     assert_eq!(code, 400, "wrong expected_new_digest accepted");
 
     // The real upgrade: same files, correct pins, a request_id.
@@ -780,21 +892,49 @@ fn cad1006_upgrade_files_http_roundtrip_and_strict_fields() {
     up.insert("expected_generation".into(), json!(gen(&s)));
     up.insert("expected_new_digest".into(), json!(new_digest));
     up.insert("request_id".into(), json!("upg-1"));
-    let (code, _, body) = common::op::raw(port, &session.request("POST", &up_path, &Value::Object(up).to_string()));
+    let (code, _, body) = common::op::raw(
+        port,
+        &session.request("POST", &up_path, &Value::Object(up).to_string()),
+    );
     assert_eq!(code, 200, "upgrade refused valid files body: {body}");
 
     // SAME install id persists; digest changed; approval reset.
-    let list = s.daemon.operator_rpc("app_workspace_list", json!({})).unwrap();
-    let row = list.as_array().unwrap().iter()
+    let list = s
+        .daemon
+        .operator_rpc("app_workspace_list", json!({}))
+        .unwrap();
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
         .find(|r| r["install_id"].as_str() == Some(install_id.as_str()))
-        .expect("upgrade erased the install id").clone();
-    assert_eq!(row["digest"].as_str(), Some(new_digest.as_str()), "digest unchanged after upgrade");
-    assert_eq!(row["approval"]["state"].as_str(), Some("unapproved"), "upgrade kept approval: {row}");
-    assert_eq!(row["name"].as_str(), Some("crm"), "install app identity changed");
-    assert_eq!(row["version"].as_str(), Some("2"), "version did not advance to 2: {row}");
+        .expect("upgrade erased the install id")
+        .clone();
+    assert_eq!(
+        row["digest"].as_str(),
+        Some(new_digest.as_str()),
+        "digest unchanged after upgrade"
+    );
+    assert_eq!(
+        row["approval"]["state"].as_str(),
+        Some("unapproved"),
+        "upgrade kept approval: {row}"
+    );
+    assert_eq!(
+        row["name"].as_str(),
+        Some("crm"),
+        "install app identity changed"
+    );
+    assert_eq!(
+        row["version"].as_str(),
+        Some("2"),
+        "version did not advance to 2: {row}"
+    );
     // Contexts/bindings/records are keyed by install_id, not digest — the
     // same id surviving the journal commit is the retention proof.
-    let ctx = s.daemon.operator_rpc("app_context_list", json!({"install_id": install_id}));
+    let ctx = s
+        .daemon
+        .operator_rpc("app_context_list", json!({"install_id": install_id}));
     assert!(ctx.is_ok(), "context list failed after upgrade: {ctx:?}");
 }
 
@@ -813,7 +953,12 @@ fn cad1006_mint_per_install_cap_bound() {
     let mut nonces = Vec::new();
     for gen in 0..4u64 {
         let mint = s.mint(&token, &session.key, "loopback", gen).unwrap();
-        let n = mint["mount"].as_str().unwrap().strip_prefix("/api/app-screen/").unwrap().to_string();
+        let n = mint["mount"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("/api/app-screen/")
+            .unwrap()
+            .to_string();
         nonces.push(n);
     }
     let fifth = s.mint(&token, &session.key, "loopback", 5);
@@ -844,14 +989,21 @@ fn cad1006_mint_rate_bound_allows_64_refuses_65() {
         let mint = s
             .mint(&token, &session.key, "loopback", gen)
             .unwrap_or_else(|e| panic!("mint {gen} within rate bound refused: {e}"));
-        let nonce = mint["mount"].as_str().unwrap()
-            .strip_prefix("/api/app-screen/").unwrap().to_string();
+        let nonce = mint["mount"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("/api/app-screen/")
+            .unwrap()
+            .to_string();
         s.consume(&nonce).expect("consume after mint failed");
     }
     // The 65th mint in the same window refuses at the RATE gate — not the
     // outstanding-cap bound (only one cap is ever outstanding here).
     let over = s.mint(&token, &session.key, "loopback", 64);
-    assert!(over.is_err(), "65th mint in one window was not rate-refused");
+    assert!(
+        over.is_err(),
+        "65th mint in one window was not rate-refused"
+    );
     assert!(
         over.unwrap_err().to_string().contains("rate"),
         "65th mint refused for a non-rate reason"
@@ -881,7 +1033,12 @@ fn cad1006_mint_and_consume_reject_foreign_fields() {
     // Consume: only {nonce} — an extra field refuses BEFORE the burn on a
     // valid nonce, so the cap survives.
     let mint = s.mint(&token, &session.key, "loopback", 1).unwrap();
-    let nonce = mint["mount"].as_str().unwrap().strip_prefix("/api/app-screen/").unwrap().to_string();
+    let nonce = mint["mount"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("/api/app-screen/")
+        .unwrap()
+        .to_string();
     let bad = s.daemon.operator_rpc(
         "app_screen_consume",
         json!({"nonce": nonce, "session_id": "forged"}),
@@ -901,7 +1058,12 @@ fn cad1006_cap_ttl_expires() {
     let session = s.board_session(port);
     let token = session.cookie.split('=').nth(1).unwrap().to_string();
     let mint = s.mint(&token, &session.key, "loopback", 1).unwrap();
-    let nonce = mint["mount"].as_str().unwrap().strip_prefix("/api/app-screen/").unwrap().to_string();
+    let nonce = mint["mount"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("/api/app-screen/")
+        .unwrap()
+        .to_string();
     std::thread::sleep(std::time::Duration::from_secs(61));
     let err = s.consume(&nonce).unwrap_err();
     assert!(
@@ -932,9 +1094,7 @@ fn cad1006_nested_screen_dir_installs_and_symlink_parent_refused() {
         .expect("nested screens/<tag>/ install refused");
     let id = installed["install_id"].as_str().unwrap().to_string();
     // The nested member landed under the installed bundle.
-    let installed_dir = pm
-        .dir
-        .join(format!(".apps/installations/{id}/bundle"));
+    let installed_dir = pm.dir.join(format!(".apps/installations/{id}/bundle"));
     assert!(
         installed_dir.join("screens/main/client.js").is_file(),
         "nested screens/main/client.js not installed"
@@ -956,7 +1116,9 @@ fn cad1006_nested_screen_dir_installs_and_symlink_parent_refused() {
     let target = tempfile::tempdir().unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(target.path(), bad_screens.join("main")).unwrap();
-    let refused = daemon
-        .operator_rpc("app_workspace_install", json!({"source": bad.canonicalize().unwrap().to_string_lossy()}));
+    let refused = daemon.operator_rpc(
+        "app_workspace_install",
+        json!({"source": bad.canonicalize().unwrap().to_string_lossy()}),
+    );
     assert!(refused.is_err(), "symlinked screens/<tag> dir admitted");
 }

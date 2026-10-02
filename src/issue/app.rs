@@ -597,38 +597,61 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
                     return Err(Error::rejected("screens/ carries a non-UTF-8 name"));
                 };
                 if tag.starts_with('.') {
-                    return Err(entry_err(&format!("screens/{tag}"), "dotfiles are not app content"));
+                    return Err(entry_err(
+                        &format!("screens/{tag}"),
+                        "dotfiles are not app content",
+                    ));
                 }
                 let ft = tag_entry
                     .file_type()
                     .map_err(|e| Error::rejected(format!("cannot stat 'screens/{tag}': {e}")))?;
                 if ft.is_symlink() {
-                    return Err(entry_err(&format!("screens/{tag}"), "a symlink — an app folder holds real files only"));
+                    return Err(entry_err(
+                        &format!("screens/{tag}"),
+                        "a symlink — an app folder holds real files only",
+                    ));
                 }
                 if !ft.is_dir() {
-                    return Err(entry_err(&format!("screens/{tag}"), "a screen package is a <tag>/ directory"));
+                    return Err(entry_err(
+                        &format!("screens/{tag}"),
+                        "a screen package is a <tag>/ directory",
+                    ));
                 }
                 check_name(tag, "screen tag")?;
                 for leaf in std::fs::read_dir(tag_entry.path())?.flatten() {
                     let leaf_name = leaf.file_name();
                     let Some(leaf_name) = leaf_name.to_str() else {
-                        return Err(Error::rejected("screens/<tag>/ carries a non-UTF-8 leaf name"));
+                        return Err(Error::rejected(
+                            "screens/<tag>/ carries a non-UTF-8 leaf name",
+                        ));
                     };
                     if leaf_name.starts_with('.') {
-                        return Err(entry_err(&format!("screens/{tag}/{leaf_name}"), "dotfiles are not app content"));
+                        return Err(entry_err(
+                            &format!("screens/{tag}/{leaf_name}"),
+                            "dotfiles are not app content",
+                        ));
                     }
-                    let lft = leaf
-                        .file_type()
-                        .map_err(|e| Error::rejected(format!("cannot stat 'screens/{tag}/{leaf_name}': {e}")))?;
+                    let lft = leaf.file_type().map_err(|e| {
+                        Error::rejected(format!("cannot stat 'screens/{tag}/{leaf_name}': {e}"))
+                    })?;
                     if lft.is_symlink() {
-                        return Err(entry_err(&format!("screens/{tag}/{leaf_name}"), "a symlink — an app folder holds real files only"));
+                        return Err(entry_err(
+                            &format!("screens/{tag}/{leaf_name}"),
+                            "a symlink — an app folder holds real files only",
+                        ));
                     }
                     if !lft.is_file() {
-                        return Err(entry_err(&format!("screens/{tag}/{leaf_name}"), "screen assets are flat files — no nested folders"));
+                        return Err(entry_err(
+                            &format!("screens/{tag}/{leaf_name}"),
+                            "screen assets are flat files — no nested folders",
+                        ));
                     }
                     let rel = format!("screens/{tag}/{leaf_name}");
                     if !crate::issue::app_screen_pkg::leaf_ok(leaf_name) {
-                        return Err(entry_err(&rel, "a screen asset is <stem>.<js|css|svg|json>, or screens.json"));
+                        return Err(entry_err(
+                            &rel,
+                            "a screen asset is <stem>.<js|css|svg|json>, or screens.json",
+                        ));
                     }
                     files.push((rel, leaf.path()));
                 }

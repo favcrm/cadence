@@ -374,7 +374,8 @@ pub(crate) enum RecordAction {
 pub(crate) enum ContentAction {
     /// Draft a campaign email on the live scoped chat turn (inert
     /// pending proposal; first draft or a replacement revision).
-    AssistantDraft {
+    #[command(name = "assistant-draft")]
+    Draft {
         install_id: String,
         #[arg(long)]
         context_id: String,
@@ -395,7 +396,8 @@ pub(crate) enum ContentAction {
     /// List the context's email proposals (optionally one campaign) on
     /// the live scoped turn — the agent's inert pending draft must be
     /// discoverable before the operator applies it.
-    AssistantProposals {
+    #[command(name = "assistant-proposals")]
+    Proposals {
         install_id: String,
         #[arg(long)]
         context_id: String,
@@ -407,7 +409,8 @@ pub(crate) enum ContentAction {
         token: String,
     },
     /// Show one proposal on the live scoped turn (read-only).
-    AssistantProposalShow {
+    #[command(name = "assistant-proposal-show")]
+    ProposalShow {
         install_id: String,
         #[arg(long)]
         context_id: String,
@@ -916,7 +919,7 @@ fn read_audience_json(path: &Path, kind: &str) -> Result<serde_json::Value> {
 
 fn content_params(action: &ContentAction) -> Result<(&'static str, serde_json::Value)> {
     Ok(match action {
-        ContentAction::AssistantDraft {
+        ContentAction::Draft {
             install_id,
             context_id,
             campaign_id,
@@ -947,7 +950,7 @@ fn content_params(action: &ContentAction) -> Result<(&'static str, serde_json::V
             }
             ("app_content_assistant_draft", params)
         }
-        ContentAction::AssistantProposals {
+        ContentAction::Proposals {
             install_id,
             context_id,
             campaign_id,
@@ -960,7 +963,7 @@ fn content_params(action: &ContentAction) -> Result<(&'static str, serde_json::V
             }
             ("app_content_assistant_proposals", params)
         }
-        ContentAction::AssistantProposalShow {
+        ContentAction::ProposalShow {
             install_id,
             context_id,
             proposal_id,
