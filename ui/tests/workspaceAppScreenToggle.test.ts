@@ -53,7 +53,15 @@ globalThis.fetch = async (input, init) => {
 };
 win.setInterval = () => 1;
 win.clearInterval = () => {};
-const host = document.createElement("div"); document.body.append(host);
+// The host stands in for AppShell's outlet: WorkspaceApp's top-level nodes are its direct children.
+const host = document.createElement("section"); host.className = "app-shell-outlet"; document.body.append(host);
+// happy-dom has no layout engine, so apply the shipped flex-column selectors to the real DOM:
+// without them the outlet stays a stretching grid and the tab row grows to the pane height.
+const shellCss: string = require("fs").readFileSync(require("path").join((globalThis as any).process.cwd(), "src/features/app-shell/app-shell.css"), "utf8");
+const columnRule = Array.from(shellCss.matchAll(/([^{}]+)\{([^}]*)\}/g)).find(match => match[1].includes(".app-shell-outlet:has(") && /flex-direction:\s*column/.test(match[2]));
+assert(columnRule, "app-shell.css keeps a flex-column rule for screen outlets");
+const columnSelector = columnRule[1].replace(/\/\*[\s\S]*?\*\//g, "").trim();
+const columnLayout = () => host.matches(columnSelector);
 let root = createRoot(host);
 const flush = () => React.act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
 const control = (label: string) => Array.from(host.querySelectorAll("a, button")).find(value => value.textContent?.trim() === label);
@@ -97,17 +105,18 @@ async function handshake(): Promise<Port> {
 async function main() {
   // Default is unchanged: the app screen mounts and the native workspace stays behind it.
   await render();
-  assert(location.search === "", "Default URL carries no view");
+  assert(location.search === "", "Default URL carries no screen parameter");
   assert(mountCount() === 1 && frame(), "Default view mounts the declared app screen");
   assert(!control("New post"), "Default view does not render the native controls");
   const appView = control("App view"), nativeView = control("Native controls");
   assert(appView && nativeView, "Host chrome offers both views outside the frame");
   assert(!appView.closest("[aria-label='Installed app screen']") && !nativeView.closest("[aria-label='Installed app screen']"), "Toggle lives in host chrome, not the frame container");
+  assert(columnLayout(), "App view lays the outlet out as a column");
   const port = await handshake();
 
   // Switching to native tears down the frame and the port, like a context switch.
   await click(nativeView);
-  assert(new URLSearchParams(location.search).get("view") === "native", "Native view is deep-linkable");
+  assert(new URLSearchParams(location.search).get("screen") === "native", "Native view is deep-linkable");
   assert(!frame(), "Native view removes the app frame");
   assert(port.closed && port.onmessage === null, "Native view closes the frame's port");
   assert(control("New post"), "Native view renders the native workspace controls");
@@ -115,20 +124,22 @@ async function main() {
   port.receive({ v: 1, op: "ready" });
   assert(port.sent.length === 1, "No stale channel: the closed port receives nothing further");
   assert(mountCount() === 1, "Native view does not mount the screen again");
+  assert(columnLayout(), "Native view keeps the column layout, so the tab row never stretches");
 
   // Switching back remounts a fresh frame generation.
   await click(control("App view"));
-  assert(!new URLSearchParams(location.search).has("view"), "App view is the default and drops the parameter");
+  assert(!new URLSearchParams(location.search).has("screen"), "App view is the default and drops the parameter");
   assert(mountCount() === 2 && frame(), "App view remounts the screen");
   assert(!control("New post"), "App view hides the native controls again");
 
   // Deep link straight into native controls: no mount at all.
   await React.act(async () => root.unmount()); root = createRoot(host);
-  history.replaceState(null, "", "/app-installations/install-a?view=native");
+  history.replaceState(null, "", "/app-installations/install-a?screen=native");
   mounts.length = 0;
   await render();
   assert(mountCount() === 0 && !frame(), "Deep link to native never mounts the screen");
   assert(control("New post"), "Deep link to native renders the native controls");
+  assert(columnLayout(), "Deep-linked native view keeps the column layout");
   await React.act(async () => root.unmount());
   assert(frameLoads.length > 0 && frameLoads.every(path => path === receipt.mount), "Only the stubbed frame document was loaded");
   console.log("workspace app screen toggle checks passed");
