@@ -41,7 +41,8 @@ import { forgetContext, initialContext, rememberedContext, rememberContext } fro
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
 import ScreenOutlet from "./screen/ScreenOutlet";
-import { screenTag, screenProjection } from "./screen/screenProjection";
+import { screenTag, screenProjection, type IntentRead } from "./screen/screenProjection";
+import { socialPublish } from "./socialPublish";
 
 type Section =
   | "Board"
@@ -121,6 +122,7 @@ export default function WorkspaceApp({
   const [outboxError, setOutboxError] = useState<string | null>(null);
   const [selectedEffectId, setSelectedEffectId] = useState("");
   const [accessDenied, setAccessDenied] = useState(false);
+  const [intentRead, setIntentRead] = useState<IntentRead | undefined>(undefined);
   const clearPrivate = useCallback(() => {
     activeRead.current?.abort();
     activeRead.current = null;
@@ -239,6 +241,22 @@ export default function WorkspaceApp({
       if (identity.current === expectedInstall) await refresh();
     }
   };
+  // CAD-1025: the mounted screen's publish intents, read with the existing
+  // operator-only list and tagged with its scope; the projection pushes it
+  // only while that tag still matches the route install and context.
+  const screenInstall = data && screenTag(data.installation) ? data.installation.install_id : null;
+  useEffect(() => {
+    if (screenInstall !== installId || accessDenied) return;
+    const controller = new AbortController();
+    socialPublish.list(installId, contextId || null, controller.signal)
+      .then(reply => { if (!controller.signal.aborted) setIntentRead({ installId, contextId, status: "ok", intents: reply.intents }); })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        if (error instanceof ApiError && [401, 403].includes(error.status)) clearPrivate();
+        setIntentRead({ installId, contextId, status: "unavailable", intents: [] });
+      });
+    return () => controller.abort();
+  }, [screenInstall, installId, contextId, data, accessDenied, clearPrivate]);
   const runs =
     data?.runs.filter((run) => (run.context_id ?? "") === contextId) ?? [];
   const isSourceRun = (value: WorkspaceRun) => !!value.snapshot.inputs.profile_handle;
@@ -531,7 +549,7 @@ export default function WorkspaceApp({
   const tag = data && screenTag(data.installation);
   let projection = null;
   if (data && tag && !accessDenied) {
-    try { projection = screenProjection(data.installation, tag, contextId, data.contexts, data.runs, data.effects); }
+    try { projection = screenProjection(data.installation, tag, contextId, data.contexts, data.runs, data.effects, intentRead); }
     catch { /* Oversized/unavailable scope retains the existing native outlet. */ }
   }
   const screen = (fallback: React.ReactNode) => projection

@@ -48,8 +48,42 @@ export interface ScreenInit {
  *  else closes the port. `state` is the child's opaque draft snapshot
  *  (≤ 32 KiB string), held host-side in memory only. */
 export type ChildToHost =
-  | { v: 1; op: "ready" }
+  | { v: 1; op: "ready"; accepts?: [typeof PUBLISH_INTENTS_V1] }
   | { v: 1; op: "state"; data: string };
+
+/** CAD-1025 — the one optional PUSH extension. A child opts in by sending
+ *  `{v:1, op:"ready", accepts:["publish-intents.v1"]}`; a child that sends
+ *  the bare `ready` keeps receiving the exact CAD-1006 v1 shape. */
+export const PUBLISH_INTENTS_V1 = "publish-intents.v1";
+/** Mirrors the daemon list cap (`ScheduleCalendar` LIST_CAP). */
+export const INTENT_ROWS_MAX = 100;
+
+/** One verified publish intent, read-only. Every field is required; there is
+ *  no grant, approval, idempotency key, receipt, upstream evidence, caption or
+ *  image digest. `context_id` `""` means no context. */
+export interface ScreenIntent {
+  intent_id: string;
+  install_id: string;
+  context_id: string;
+  run_id: string;
+  effect_id: string;
+  state: "queued" | "processing" | "posted" | "refused" | "cancelled" | "held";
+  channel: "instagram" | "facebook";
+  destination_id: string;
+  due_epoch: number;
+  timezone: string;
+}
+
+/** `ok`: the complete scoped list (empty rows = honestly nothing planned).
+ *  `truncated`: the list hit its cap, so absence proves nothing.
+ *  `loading`/`unavailable`: no verified read for this scope; rows are empty.
+ *  `withheld` counts host-dropped rows (foreign, dangling, malformed, or a
+ *  duplicated id), never their content. */
+export interface ScreenIntents {
+  status: "loading" | "ok" | "truncated" | "unavailable";
+  withheld: number;
+  rows: ScreenIntent[];
+}
 
 /** The host's only PUSH: the closed read-only projection of the verified
  *  scope. Every identity field is host-stamped — the child can never
@@ -88,6 +122,8 @@ export interface ScreenPush {
     workflow: { title: string };
     created?: number;
     closed?: number;
+    /** publish-intents.v1 only: the run's context, `""` = none. */
+    context_id?: string;
   }[];
   /** Scoped effects/outbox/calendar-intent receipts — real rows only. */
   outbox: {
@@ -95,7 +131,12 @@ export interface ScreenPush {
     state: string;
     title: string;
     scheduled_at?: number;
+    /** publish-intents.v1 only: the effect's full linkage identity. */
+    run_id?: string;
+    context_id?: string;
   }[];
+  /** publish-intents.v1 only. */
+  publish_intents?: ScreenIntents;
   /** Server epoch seconds for day-row alignment. */
   now: number;
   /** The child's own last `state` snapshot, replayed on remount. */
@@ -141,6 +182,12 @@ export function parseChild(data: unknown): ChildToHost | null {
     return { v: 1, op: "ready" };
   }
   if (
+    Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
+    Array.isArray(d.accepts) && d.accepts.length === 1 && d.accepts[0] === PUBLISH_INTENTS_V1
+  ) {
+    return { v: 1, op: "ready", accepts: [PUBLISH_INTENTS_V1] };
+  }
+  if (
     Object.keys(d).sort().join() === "data,op,v" &&
     d.v === 1 &&
     d.op === "state" &&
@@ -151,4 +198,15 @@ export function parseChild(data: unknown): ChildToHost | null {
     return { v: 1, op: "state", data: d.data };
   }
   return null;
+}
+
+/** The exact CAD-1006 v1 shape for a child that did not opt in: every
+ *  publish-intents.v1 field is removed, nothing else changes. */
+export function legacyPush(push: ScreenPush): ScreenPush {
+  const { publish_intents: _intents, ...rest } = push;
+  return {
+    ...rest,
+    runs: push.runs.map(({ context_id: _context, ...run }) => run),
+    outbox: push.outbox.map(({ run_id: _run, context_id: _context, ...row }) => row),
+  };
 }
