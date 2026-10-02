@@ -557,6 +557,10 @@ pub fn build(
     // produced inline. `fake` resolves for any provider via the
     // registry's provider-agnostic lookup, so no bypass is needed here.
     registry::spec(&agent.provider, &agent.endpoint_kind)?;
+    // Only the PTY layer currently consumes the fixed agent-UID launch context,
+    // and its real profiles independently refuse unsupported split launches.
+    // Managed constructors must not silently execute as the protected operator.
+    require_split_launch_path(agent_uid, &agent.endpoint_kind)?;
     match agent.endpoint_kind.as_str() {
         "managed" => match agent.provider.as_str() {
             "codex" => Ok(Box::new(codex::CodexAdapter::new(hooks, log_path, env))),
@@ -630,6 +634,95 @@ pub fn build(
             "Endpoint kind '{other}' is not implemented \
              (implemented: managed, managed-ws, pty, cloud, fake)"
         ))),
+    }
+}
+
+fn require_split_launch_path(agent_uid: Option<u32>, endpoint_kind: &str) -> Result<()> {
+    if agent_uid.is_some() && !matches!(endpoint_kind, "pty" | "fake") {
+        return Err(crate::error::Error::rejected(
+            "This endpoint does not implement protected agent-UID launch; refusing operator-UID fallback",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod split_launch_tests {
+    use super::{build, require_split_launch_path, AdapterHooks, ProviderEnv};
+    use crate::store::Agent;
+    #[test]
+    fn actual_adapter_entrypoint_refuses_every_uncovered_provider_and_master() {
+        for (provider, endpoint) in [
+            ("pi", "managed"),
+            ("claude", "managed"),
+            ("codex", "managed"),
+            ("codex", "managed-ws"),
+            ("devin", "cloud"),
+        ] {
+            for alias in ["master", "fixture-worker"] {
+                let agent = Agent {
+                    alias: alias.into(),
+                    provider: provider.into(),
+                    endpoint_kind: endpoint.into(),
+                    role: if alias == "master" {
+                        "master"
+                    } else {
+                        "worker"
+                    }
+                    .into(),
+                    team_role: None,
+                    cwd: "/tmp".into(),
+                    sandbox: "".into(),
+                    instructions: None,
+                    thread_id: None,
+                    session_id: None,
+                    model: None,
+                    effort: None,
+                    pid: None,
+                    pid_start: None,
+                    endpoint: None,
+                    params: None,
+                    model_selection: None,
+                    quota: None,
+                    generation: None,
+                    state: "registered".into(),
+                    enabled: true,
+                    error: None,
+                    created: 0.0,
+                    updated: 0.0,
+                };
+                let hooks = AdapterHooks {
+                    on_event: Box::new(|_, _| panic!("unsupported provider emitted traffic")),
+                    on_request: Box::new(|_| panic!("unsupported provider requested authority")),
+                };
+                let result = build(
+                    &agent,
+                    hooks,
+                    std::path::Path::new("/nonexistent/fixture.log"),
+                    &ProviderEnv::refusing_providers(),
+                    Some(21001),
+                );
+                let Err(error) = result else {
+                    panic!("{provider}/{endpoint}/{alias} constructed");
+                };
+                assert!(
+                    error.to_string().contains("protected agent-UID launch"),
+                    "{error}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn split_managed_and_remote_paths_refuse_before_constructors() {
+        for endpoint in ["managed", "managed-ws", "cloud", "unknown"] {
+            assert!(require_split_launch_path(Some(21001), endpoint).is_err());
+            assert!(require_split_launch_path(None, endpoint).is_ok());
+        }
+    }
+    #[test]
+    fn pty_retains_its_own_profile_gate_and_fake_is_not_production_coverage() {
+        assert!(require_split_launch_path(Some(21001), "pty").is_ok());
+        assert!(require_split_launch_path(Some(21001), "fake").is_ok());
     }
 }
 
