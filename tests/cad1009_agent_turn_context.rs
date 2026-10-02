@@ -79,7 +79,7 @@ fn pi(dir: &Path) -> (PiAdapter, mpsc::Receiver<(String, Value)>) {
         on_request: Box::new(|_| {}),
     };
     (
-        PiAdapter::new(hooks, &dir.join("logs").join("pi-stderr.log"), &env),
+        PiAdapter::new(hooks, &dir.join("logs").join("pi-stderr.log"), &env, None),
         rx,
     )
 }
