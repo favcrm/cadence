@@ -192,19 +192,35 @@ message id and its live turn token are the consent. Scope comes from
 the daemon's stamp on that message, never from anything you type:
 
 ```sh
+The operator's `csv-confirm` mints the durable plan server-side — the
+exact CSV bytes + decisions bound to a `preview_token`, `request_id`
+and `decisions_digest`. Your scoped chat turn then carries only the
+tagged handle, a short JSON you relay verbatim:
+
+```json
+{"cadence_csv_import": {"request_id": "<req>", "confirm_token": "confirm-…"}}
+```
+
+Redeem it handle-only — NO bytes, no preview token, no decisions
+(those never ride the ≤48KB chat; the host resolves the confirmed plan
+from the request id + nonce, so you can never substitute a plan the
+operator did not confirm):
+
+```sh
 cadence app record csv-assistant-import <install> --context-id <ctx> \
-  --csv <tmp>/in.csv --preview-token <sha256:…> --request-id <id> \
+  --request-id <id> --confirm-token <confirm-…> \
   --message <msg> --token <token>
+```
+
+Do NOT pass `--csv`, `--preview-token` or `--decisions` — the daemon
+refuses them (bytes aren't a redeem param). The operator mints the
+nonce; you cannot mint or forge it, and a scoped chat message alone is
+not confirmation — the nonce is.
+
 cadence app audience segment-assistant-save <install> --context-id <ctx> \
   --segment-id <seg> --name <n> --predicates <tmp>/preds.json \
   [--expected-revision <rev>] --message <msg> --token <token>
 ```
-
-The CSV bytes must be the exact previewed bytes (`--preview-token`
-binds them). The import ALSO needs the operator's host-side confirm —
-a `confirm-…` nonce the operator mints with `csv-confirm`, bound to
-the byte token + request id + decisions digest. You cannot mint or
-forge it; a scoped chat message alone is not confirmation.
 
 Read/preview on the same live turn never consumes the message:
 
