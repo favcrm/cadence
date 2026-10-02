@@ -3,7 +3,7 @@ import { api, ApiError } from "../../lib/api";
 import { useWriteBlock } from "../auth/WriteGate";
 import Button from "../../ui/Button";
 import { IconRefresh, IconWarning } from "../../ui/icons";
-import { fmtTime } from "../../lib/fmt";
+import { fmtTime, releaseLabel } from "../../lib/fmt";
 import type { UpdateStatus, WaitingTurn } from "../../lib/types";
 import "./update.css";
 
@@ -16,18 +16,6 @@ export function waiterLabel(w: WaitingTurn): string {
 
 export function waitingLabel(waiting: WaitingTurn[]): string {
   return `waiting for ${waiting.length} turn${waiting.length === 1 ? "" : "s"}: ${waiting.map(waiterLabel).join(", ")}`;
-}
-
-function releaseLabel(
-  version: string | null | undefined,
-  sha: string | null | undefined,
-): string {
-  if (version)
-    return version.replace(
-      /\+([a-f0-9]{40})$/,
-      (_, build: string) => `+${build.slice(0, 7)}`,
-    );
-  return sha ? sha.slice(0, 7) : "Not installed";
 }
 
 function timeLabel(secs: number): string {

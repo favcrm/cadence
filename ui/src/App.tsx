@@ -33,6 +33,7 @@ import ProjectFilter from "./ui/ProjectFilter";
 import SectionTabs from "./ui/SectionTabs";
 import StatusChips from "./ui/StatusChips";
 import AccountMenu from "./ui/AccountMenu";
+import VersionLine from "./ui/VersionLine";
 import ThemeToggle from "./ui/ThemeToggle";
 import BuildUpdateNotice from "./ui/BuildUpdateNotice";
 import Setup from "./features/setup/Setup";
@@ -43,6 +44,7 @@ import { kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/aut
 import { WriteGate } from "./features/auth/WriteGate";
 import { sessionKey, setSessionKey } from "./lib/sessionKey";
 import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
+import { runningRelease } from "./lib/fmt";
 import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
 import Toast, { type ToastMsg } from "./ui/Toast";
 import { IconList } from "./ui/icons";
@@ -591,6 +593,15 @@ export default function App() {
   const crmSection: CrmSection =
     crmQuery === "segments" || crmQuery === "campaigns" ? crmQuery : "customers";
   const appMenu = activeCrm ? crmAppMenu(href, activeCrm.title, crmSection) : null;
+  // One element for both account menus (sidebar row, header avatar) so they cannot drift.
+  const versionLine = (
+    <VersionLine
+      release={runningRelease(meta)}
+      build={UI_BUILD}
+      href={hrefFor({ screen: "settings", section: "update" })}
+      updatePending={updateBanner !== null || staleBuild !== null}
+    />
+  );
 
   return (
     <WriteGate.Provider value={meta === null ? "Checking write access…" : block}>
@@ -620,6 +631,7 @@ export default function App() {
           trigger="row"
           placement="above-start"
           settingsHref={hrefFor({ screen: "settings", section: "models" })}
+          footer={versionLine}
         />}
       />
 
@@ -667,6 +679,7 @@ export default function App() {
               trigger="avatar"
               placement="below-end"
               settingsHref={hrefFor({ screen: "settings", section: "models" })}
+              footer={versionLine}
             /></div> : <ThemeToggle />}
           </div>
         </header>
