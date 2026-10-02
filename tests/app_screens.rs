@@ -193,6 +193,7 @@ impl Screen {
         self.daemon
             .operator_rpc("app_screen_consume", json!({"nonce": nonce}))
     }
+}
 
 struct Cleanup(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>, PortLease);
 impl Drop for Cleanup {
