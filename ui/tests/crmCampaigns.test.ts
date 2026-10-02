@@ -759,8 +759,10 @@ async function mountedFlow() {
   await click(byText("button", "Save text corrections (new revision)"));
   await settle(() => assert(text().includes("Saved revision 3"), "the correction saved r3"));
   await settle(() => assert(text().includes("Needs review (stale)"), "the drifted proposal renders stale"));
+  // The row's first button is "Preview draft" — the Apply control is a
+  // later button in the same row; find it by label, never by position.
   const staleApply = Array.from(host.querySelectorAll('[data-proposal]'))
-    .map((li) => li.querySelector("button"))
+    .flatMap((li) => Array.from(li.querySelectorAll("button")))
     .find((b) => (b?.textContent ?? "").includes("Apply"));
   assert(staleApply && (staleApply as HTMLButtonElement).disabled, "stale proposal's Apply is disabled");
   // Discard clears it non-mutating.
