@@ -52,13 +52,6 @@ use std::os::unix::io::AsRawFd;
 
 use crate::error::{Error, Result};
 
-/// Lowercase-hex encode (the challenge nonce). Local to this module — no
-/// shared helper is imported (this batch must not depend on the frozen #685
-/// seam).
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 // ────────────────── private reviewed constants (never caller-supplied) ────
 
 /// The supervisor account's fixed uid — the server that owns the private
@@ -901,10 +894,6 @@ impl TombstoneSet {
             ConsumeOutcome::Unknown
         }
     }
-    #[cfg(test)]
-    fn is_consumed(&self, op: &str) -> bool {
-        self.seen.contains(op)
-    }
 }
 
 /// The external durable-obligation + one-time-consume port — the authentic
@@ -912,22 +901,30 @@ impl TombstoneSet {
 /// an external owner (not this batch); the default is `Err`/unavailable. A
 /// lost ack stays `Unknown`, never retried.
 ///
-/// The durable obligation binds the **exact canonical `SupervisorChallenge`**,
-/// not a reduced tuple: `enroll_pending` records the obligation *before* the
-/// installer delivers the grant; `consume` CASes that exact challenge to
-/// consumed; `recheck` re-validates it before spawn.
+/// The durable obligation binds the **exact canonical `SupervisorChallenge`**
+/// and must exist **before** the installer delivers a grant: `install` only
+/// *queries* an already-enrolled challenge via `enrolled`, never enrolls at
+/// receipt. `enroll_pending` is the external owner's pre-delivery record;
+/// `consume` CASes that exact challenge to consumed; `recheck` re-validates
+/// it (including the recipient nonce) before spawn.
 pub(crate) trait ExternalConsume {
-    /// Durably enroll the obligation for this exact challenge *before* the
-    /// grant is accepted — the global/company record must exist before
-    /// delivery. `true` only on a confirmed durable commit.
+    /// Durably enroll the obligation for this exact challenge. Called by the
+    /// external owner *before* a grant is delivered — never from `install`.
+    /// `true` only on a confirmed durable commit.
     fn enroll_pending(&self, challenge: &SupervisorChallenge) -> bool;
+    /// Query whether this exact challenge is already durably enrolled — the
+    /// pre-delivery gate. `install` refuses a challenge that is not enrolled.
+    fn enrolled(&self, challenge: &SupervisorChallenge) -> bool;
     /// One-time CAS of this exact challenge to consumed. Returns `Consumed`
     /// only on a confirmed first-time commit; replay / lost ack / absent
     /// enrollment returns `Unknown`.
     fn consume(&self, challenge: &SupervisorChallenge) -> ConsumeOutcome;
-    /// Re-check that this exact challenge's obligation still matches
-    /// immediately before an eventual spawn — the pre-spawn recheck port.
+    /// Re-check that this exact challenge's obligation (including the
+    /// recipient nonce) still matches before an eventual spawn.
     fn recheck(&self, challenge: &SupervisorChallenge) -> bool;
+    /// The current global epoch — the external owner's authoritative value,
+    /// never caller-supplied.
+    fn current_epoch(&self) -> u64;
 }
 
 /// The production external-consume factory — permanently `Err` until the
@@ -943,33 +940,11 @@ pub(crate) fn production_consume_factory() -> Result<()> {
 
 // ─────────────────────────── the fixed action verbs ───────────────────────
 
-/// A nonsecret challenge a supervisor mints for one `challenge` action — the
-/// operation-bound nonce plus the supervisor's own live pid/starttime/
-/// generation, so the installer's signed envelope can pin to *this* running
-/// supervisor instance. Private fields — produced only by
-/// [`GrantCore::challenge`].
-#[derive(Clone, Debug)]
-pub(crate) struct Challenge {
-    nonce: String,
-    supervisor_pid: u32,
-    supervisor_starttime: u64,
-    supervisor_generation: String,
-}
-
-impl Challenge {
-    pub(crate) fn nonce(&self) -> &str {
-        &self.nonce
-    }
-    pub(crate) fn generation(&self) -> &str {
-        &self.supervisor_generation
-    }
-}
-
-/// The verified grant — evidence a correctly-signed, kernel-admitted, in-window
-/// envelope over the canonical `SupervisorChallenge` was consumed exactly once
-/// against the supervisor's current epoch. **Not** launch authority: the
-/// durable external consume and the protected spawn are still `Err`/
-/// unavailable this batch.
+/// The verified grant — evidence a correctly-signed, kernel-admitted,
+/// in-window envelope over the canonical `SupervisorChallenge` was consumed
+/// exactly once against the supervisor's current epoch. **Not** launch
+/// authority: the durable external consume and the protected spawn are still
+/// `Err`/unavailable this batch.
 #[derive(Debug)]
 pub(crate) struct VerifiedGrant {
     claims: GrantClaims,
@@ -988,17 +963,32 @@ impl VerifiedGrant {
     }
 }
 
+/// The supervisor's live identity the `challenge` verb echoes — the values a
+/// signed grant's `recipient` must bind. Private fields; produced only inside
+/// the module from the enrolled supervisor, never a caller literal. There is
+/// no supervisor-minted nonce: the canonical `recipient.nonce` is the
+/// externally-enrolled pending nonce, not something this endpoint invents.
+#[derive(Clone, Debug)]
+pub(crate) struct SupervisorRecipient {
+    pid: u32,
+    starttime: u64,
+    generation: String,
+}
+
 /// The grant-consume core bound to the supervisor's own enrollment — the
 /// object that owns the `challenge`/`install` verbs. Separate from the
 /// transport ([`GrantListener`]); constructed only from a real
-/// `SupervisorEnrollment`, never a caller literal.
+/// `SupervisorEnrollment`, never a caller literal. `GrantCore` has **no**
+/// caller-injectable trust — every trust input is a private constant resolved
+/// inside `install`/`challenge`.
 pub(crate) struct GrantCore {
     enrolled: SupervisorEnrollment,
     tomb: TombstoneSet,
 }
 
 impl GrantCore {
-    /// Bind the consume core to the supervisor's live enrollment.
+    /// Bind the consume core to the supervisor's live enrollment. Production
+    /// enrollment comes only from `enroll_self` (unavailable this batch).
     fn new(enrolled: SupervisorEnrollment) -> Self {
         Self {
             enrolled,
@@ -1006,72 +996,73 @@ impl GrantCore {
         }
     }
 
-    /// `challenge` — mint a nonsecret, operation-bound nonce for one installer
-    /// request, returning the supervisor's own live pid/starttime/generation so
-    /// the signed envelope can pin to this instance. The nonce is `Sha256` of
-    /// the enrollment + op + a per-call counter — deterministic shape, never a
-    /// secret and never reusable across ops.
-    fn challenge(&self, op: &str, seq: u64) -> Challenge {
-        use sha2::{Digest, Sha256};
-        let nonce = {
-            let mut h = Sha256::new();
-            h.update(b"cadence.supervisor-challenge.v1\x00");
-            h.update(self.enrolled.generation.as_bytes());
-            h.update(b"\x00");
-            h.update(op.as_bytes());
-            h.update(b"\x00");
-            h.update(seq.to_be_bytes());
-            hex_encode(&h.finalize())
-        };
-        Challenge {
-            nonce,
-            supervisor_pid: self.enrolled.pid,
-            supervisor_starttime: self.enrolled.starttime,
-            supervisor_generation: self.enrolled.generation.clone(),
-        }
+    /// `challenge` — admit the kernel installer and return the supervisor's
+    /// live `recipient` identity (pid/starttime/generation). The supervisor
+    /// does NOT mint a nonce: the canonical `recipient.nonce` is assigned by
+    /// the external enrollment owner and bound at `install`. Peer admission
+    /// (`SO_PEERCRED` + `/proc` custody + pins) runs here exactly as in
+    /// `install` — a `challenge` request is not a lighter-trust path.
+    #[cfg(target_os = "linux")]
+    fn challenge(
+        &self,
+        stream: &std::os::unix::net::UnixStream,
+        generation_presented: &str,
+    ) -> Result<SupervisorRecipient> {
+        // Admit the kernel peer with the same pinned custody as `install` —
+        // a challenge is served only to the pinned installer, never a guest.
+        admit_installer(
+            stream,
+            generation_presented,
+            INSTALLER_EXE_DIGEST,
+            INSTALLER_GENERATION_PIN,
+        )?;
+        Ok(SupervisorRecipient {
+            pid: self.enrolled.pid,
+            starttime: self.enrolled.starttime,
+            generation: self.enrolled.generation.clone(),
+        })
     }
 
     /// `install` — admit the kernel peer, then verify+consume the signed
-    /// envelope over the canonical `SupervisorChallenge`. Trust pins
-    /// (`keyring`, `exe_pin`, `generation_pin`) are the private reviewed
-    /// constants in production; they are parameters ONLY so `#[cfg(test)]` can
-    /// inject synthetic fixtures — never caller data on a live path. On
-    /// success returns a non-forgeable [`VerifiedGrant`]; on any failure the
-    /// op is refused (and tombstoned-Unknown, never retried).
+    /// envelope over the canonical `SupervisorChallenge`. ALL trust inputs
+    /// (keyring, exe pin, generation pin) are the private reviewed constants —
+    /// `install` takes no caller key/pin/epoch authority. The durable external
+    /// port supplies the current epoch via `ext.current_epoch()` and the
+    /// already-enrolled obligation via `ext.enrolled`. On success returns a
+    /// non-forgeable [`VerifiedGrant`]; any failure refuses (a consumed op is
+    /// tombstoned-Unknown, never retried).
     #[cfg(target_os = "linux")]
-    #[allow(clippy::too_many_arguments)]
     fn install(
         &mut self,
         stream: &std::os::unix::net::UnixStream,
         envelope: &str,
-        keyring: &[&[u8]],
-        exe_pin: Option<[u8; 32]>,
-        generation_pin: Option<&'static str>,
         generation_presented: &str,
-        epoch: u64,
         ext: &dyn ExternalConsume,
         now: u64,
     ) -> Result<VerifiedGrant> {
-        // Kernel peer + process custody first — nothing the peer sent is
-        // trusted before admission. Pins are private constants, not caller data.
-        let peer = admit_installer(stream, generation_presented, exe_pin, generation_pin)?;
-        // Durable obligation must already exist BEFORE we accept the grant —
-        // enroll_pending is the external owner's pre-delivery record.
-        // Parse + signature-verify against the pinned keyring.
+        // Kernel peer + process custody first — pins are private constants.
+        let peer = admit_installer(
+            stream,
+            generation_presented,
+            INSTALLER_EXE_DIGEST,
+            INSTALLER_GENERATION_PIN,
+        )?;
+        // Parse + signature-verify against the private compiled keyring.
         let parsed = parse_envelope(envelope, now)?;
-        verify_signature_with(&parsed, keyring)?;
+        verify_signature_with(&parsed, SUPERVISOR_KEYRING)?;
         let claims = parsed.claims;
         let sc = &claims.challenge;
         // The durable global/company obligation for THIS exact challenge must
-        // have committed before delivery — enroll_pending is checked first.
-        if !ext.enroll_pending(sc) {
+        // ALREADY be enrolled — delivery is only honoured after a pre-existing
+        // enrollment; install never enrolls at receipt.
+        if !ext.enrolled(sc) {
             return Err(Error::rejected(
                 "no durable obligation enrolled for this challenge — grant not pre-registered",
             ));
         }
         // The grant's recipient must name THIS live supervisor instance: the
-        // enrolled pid, starttime (decimal string) and generation — binding the
-        // grant to this process, not a stale or guest one.
+        // enrolled pid, starttime (decimal string) and generation — binding
+        // the grant to this process, not a stale or guest one.
         if sc.recipient.pid != self.enrolled.pid
             || sc.recipient.generation != self.enrolled.generation
         {
@@ -1089,13 +1080,17 @@ impl GrantCore {
                 "recipient.starttime != enrolled supervisor",
             ));
         }
-        // The op id is the launch request's UUID challenge. The signed
-        // `recipient.nonce` must be the nonce this supervisor minted for the
-        // op via `challenge()` — verified here against a derived value is the
-        // external owner's concern; the binding is the recipient+challenge.
-        let op = &sc.launch.request.challenge;
-        // The global epoch must equal the supervisor's CURRENT epoch — a
-        // restart's fresh op never fabricates a new global epoch.
+        // The grant's `recipient.nonce` must equal the nonce the external owner
+        // enrolled for this exact challenge — recheck binds the full tuple
+        // including the nonce; a stale/mismatched nonce refuses.
+        if !ext.recheck(sc) {
+            return Err(Error::rejected(
+                "grant recipient.nonce/obligation does not match the enrolled pending",
+            ));
+        }
+        // The global epoch must equal the supervisor's CURRENT epoch — the
+        // external owner reports it; install never trusts a caller epoch.
+        let epoch = ext.current_epoch();
         if sc.launch.epoch != epoch {
             return Err(Error::rejected(format!(
                 "grant epoch {} != the supervisor's current epoch {}",
@@ -1104,6 +1099,7 @@ impl GrantCore {
         }
         // In-memory tombstone (test-only mechanics) then the durable external
         // one-time CAS on the exact challenge — both must agree it's fresh.
+        let op = &sc.launch.request.challenge;
         if self.tomb.consume_once(op) != ConsumeOutcome::Consumed {
             return Err(Error::rejected(format!("grant op '{op}' already consumed")));
         }
@@ -1165,55 +1161,95 @@ impl GrantListener {
         Ok(Self { listener })
     }
 
-    /// Accept one connection and serve one fixed verb. Reads a bounded
-    /// newline-terminated request: `"challenge <op> <seq>"` or
-    /// `"install <generation> <envelope>"`. Returns the response line. Peer
-    /// admission is enforced inside `install` via `SO_PEERCRED` + pins.
+    /// Read one newline-terminated request into `buf`, incrementally, with a
+    /// hard byte cap (≤ `MAX_ENVELOPE_BYTES` + 1) and a socket read deadline —
+    /// a peer may not stream unbounded input or hang the listener. Rejects an
+    /// oversize line, a missing newline, or a stalled peer; never allocates
+    /// unboundedly before the bound is checked.
+    #[cfg(target_os = "linux")]
+    fn read_request(stream: &std::os::unix::net::UnixStream) -> Result<String> {
+        use std::io::Read;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .map_err(|e| Error::rejected(format!("grant read deadline failed: {e}")))?;
+        let mut buf: Vec<u8> = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 4096];
+        let mut s = stream;
+        loop {
+            // Bound the read window: never read past MAX_ENVELOPE_BYTES + 1, so
+            // a peer streaming more than the cap is refused before the buffer
+            // grows unboundedly — and the cap is checked *before* each read.
+            let remaining = MAX_ENVELOPE_BYTES + 1 - buf.len();
+            if remaining == 0 {
+                return Err(Error::rejected("grant request exceeds the size bound"));
+            }
+            let want = std::cmp::min(remaining, chunk.len());
+            match s.read(&mut chunk[..want]) {
+                Ok(0) => {
+                    return Err(Error::rejected(
+                        "grant request closed without a newline terminator",
+                    ))
+                }
+                Ok(n) => {
+                    let got = &chunk[..n];
+                    if let Some(pos) = got.iter().position(|&b| b == b'\n') {
+                        buf.extend_from_slice(&got[..pos]);
+                        break;
+                    }
+                    buf.extend_from_slice(got);
+                }
+                Err(e) => return Err(Error::rejected(format!("grant request read failed: {e}"))),
+            }
+        }
+        if buf.len() > MAX_ENVELOPE_BYTES {
+            return Err(Error::rejected("grant request exceeds the size bound"));
+        }
+        String::from_utf8(buf).map_err(|_| Error::rejected("grant request is not UTF-8"))
+    }
+
+    /// Accept one connection and serve one fixed verb, under a bounded
+    /// incremental read + read deadline. `challenge` admits the kernel
+    /// installer (same `SO_PEERCRED` + `/proc` + pins custody as `install`)
+    /// and returns the supervisor's live `recipient` identity — the nonce is
+    /// NOT minted here (the canonical `recipient.nonce` is the externally
+    /// enrolled pending nonce, bound at `install`). `install` verifies +
+    /// consumes the signed envelope.
     #[cfg(test)]
     fn serve_once(
         &self,
         core: &mut GrantCore,
         ext: &dyn ExternalConsume,
-        epoch: u64,
         now: u64,
     ) -> Result<String> {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::Write;
         let (stream, _addr) = self
             .listener
             .accept()
             .map_err(|e| Error::rejected(format!("grant accept failed: {e}")))?;
-        let mut reader = BufReader::new(&stream);
-        let mut line = String::new();
-        // Bounded read — a peer may not stream unbounded input.
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|e| Error::rejected(format!("grant read failed: {e}")))?;
-        if n == 0 || n > MAX_ENVELOPE_BYTES {
-            return Err(Error::rejected("grant request out of bounds"));
-        }
-        let req = line.trim_end();
-        let mut parts = req.splitn(3, ' ');
-        let resp: Result<String> = match (parts.next(), parts.next(), parts.next()) {
-            (Some("challenge"), Some(op), Some(seq)) => {
-                let seq: u64 = seq
-                    .parse()
-                    .map_err(|_| Error::rejected("challenge seq not numeric"))?;
-                let c = core.challenge(op, seq);
-                Ok(format!("nonce {}", c.nonce()))
+        let req = Self::read_request(&stream)?;
+        let req = req.trim_end();
+        let mut parts = req.splitn(2, ' ');
+        let verb = parts.next();
+        let rest = parts.next().unwrap_or("");
+        let resp: Result<String> = match verb {
+            Some("challenge") => {
+                // `challenge <generation>` — admit the installer, echo the
+                // supervisor's recipient identity for the external enrollment.
+                let gen = rest;
+                let r = core.challenge(&stream, gen)?;
+                Ok(format!(
+                    "recipient pid={} starttime={} generation={}",
+                    r.pid, r.starttime, r.generation
+                ))
             }
-            (Some("install"), Some(gen), Some(env)) => {
-                // Production pins — caller never supplies them on this path.
-                let g = core.install(
-                    &stream,
-                    env,
-                    SUPERVISOR_KEYRING,
-                    INSTALLER_EXE_DIGEST,
-                    INSTALLER_GENERATION_PIN,
-                    gen,
-                    epoch,
-                    ext,
-                    now,
-                )?;
+            Some("install") => {
+                // `install <generation> <envelope>`
+                let mut p = rest.splitn(2, ' ');
+                let (gen, env) = match (p.next(), p.next()) {
+                    (Some(g), Some(e)) if !e.is_empty() => (g, e),
+                    _ => return Err(Error::rejected("install requires <generation> <envelope>")),
+                };
+                let g = core.install(&stream, env, gen, ext, now)?;
                 Ok(format!("consumed {}", g.op()))
             }
             _ => Err(Error::rejected("unknown grant verb")),
@@ -1288,25 +1324,33 @@ mod tests {
     }
 
     /// A controllable external-consume stub for tests — NOT durable authority.
-    /// Records whether it saw the exact challenge.
+    /// Holds a *pre-enrolled* challenge (the external owner's durable record)
+    /// and reports whether a query matches it; `install` only ever *queries*
+    /// `enrolled`, never enrolls at receipt.
     struct StubConsume {
-        enrolled: bool,
+        /// The already-enrolled challenge the external owner recorded (or None).
+        enrolled_record: Option<SupervisorChallenge>,
         consume: ConsumeOutcome,
         recheck_ok: bool,
-        saw: std::cell::RefCell<Vec<String>>,
+        epoch: u64,
     }
     impl ExternalConsume for StubConsume {
-        fn enroll_pending(&self, c: &SupervisorChallenge) -> bool {
-            self.saw
-                .borrow_mut()
-                .push(c.launch.request.challenge.clone());
-            self.enrolled
+        fn enroll_pending(&self, _c: &SupervisorChallenge) -> bool {
+            // Pre-delivery enrollment — install never calls this; tests use it
+            // only to model the external owner's commit.
+            true
+        }
+        fn enrolled(&self, c: &SupervisorChallenge) -> bool {
+            self.enrolled_record.as_ref() == Some(c)
         }
         fn consume(&self, _c: &SupervisorChallenge) -> ConsumeOutcome {
             self.consume
         }
-        fn recheck(&self, _c: &SupervisorChallenge) -> bool {
-            self.recheck_ok
+        fn recheck(&self, c: &SupervisorChallenge) -> bool {
+            self.recheck_ok && self.enrolled(c)
+        }
+        fn current_epoch(&self) -> u64 {
+            self.epoch
         }
     }
 
@@ -1388,52 +1432,45 @@ mod tests {
             .contains("keyring"));
     }
 
-    /// The challenge verb mints a nonsecret op-bound nonce carrying the
-    /// supervisor's own pid/starttime/generation — distinct per op, never a
-    /// secret.
+    /// `install` never enrolls at receipt: it only *queries* an already-
+    /// enrolled exact challenge via `enrolled`. A missing obligation, a stale
+    /// enrollment, or a nonce mismatch all refuse before consume.
     #[test]
-    fn challenge_is_operation_bound_and_carries_supervisor_identity() {
-        let pid = std::process::id();
-        let e = SupervisorEnrollment::capture_test(pid, "b".repeat(32)).unwrap();
-        let g = GrantCore::new(e);
-        let c1 = g.challenge("op-1", 0);
-        let c2 = g.challenge("op-2", 0);
-        assert_ne!(c1.nonce(), c2.nonce(), "nonce is bound to the op");
-        assert_eq!(c1.supervisor_pid, pid);
-    }
-
-    /// The non-forgeable guarantee: a test cannot construct a `PeerIdentity`,
-    /// `SupervisorEnrollment` (other than `capture_test`), or `VerifiedGrant`
-    /// from literals — produced only inside the module. Asserts the tombstone +
-    /// external-consume semantics that gate a grant, including that
-    /// `enroll_pending` binds the EXACT challenge.
-    #[test]
-    fn tombstone_and_external_consume_gate_the_grant() {
+    fn install_requires_a_pre_enrolled_exact_challenge() {
+        let sc = parse_supervisor_challenge(&good_claims()["challenge"]).unwrap();
+        // enrolled() is true only for the exact enrolled challenge.
+        let stub = StubConsume {
+            enrolled_record: Some(sc.clone()),
+            consume: ConsumeOutcome::Consumed,
+            recheck_ok: true,
+            epoch: 7,
+        };
+        assert!(stub.enrolled(&sc), "the enrolled challenge is honoured");
+        // A different challenge (different nonce) is not enrolled -> refuses.
+        let mut other = sc.clone();
+        other.recipient.nonce = "123e4567-e89b-42d3-a456-426614174002".into();
+        assert!(
+            !stub.enrolled(&other),
+            "a nonce-mismatched challenge is not enrolled"
+        );
+        // recheck also binds the exact tuple incl. the nonce.
+        assert!(stub.recheck(&sc));
+        assert!(
+            !stub.recheck(&other),
+            "stale/nonce-mismatched recheck refuses"
+        );
+        // No enrollment at all -> enrolled() false -> install refuses.
+        let stub_none = StubConsume {
+            enrolled_record: None,
+            consume: ConsumeOutcome::Consumed,
+            recheck_ok: true,
+            epoch: 7,
+        };
+        assert!(!stub_none.enrolled(&sc), "absent obligation refuses");
+        // in-memory tombstone is single-use mechanics.
         let mut tomb = TombstoneSet::default();
         assert_eq!(tomb.consume_once("op-1"), ConsumeOutcome::Consumed);
-        assert!(tomb.is_consumed("op-1"));
         assert_eq!(tomb.consume_once("op-1"), ConsumeOutcome::Unknown);
-        // enroll_pending binds the exact challenge — the stub records it.
-        let stub = StubConsume {
-            enrolled: true,
-            consume: ConsumeOutcome::Consumed,
-            recheck_ok: true,
-            saw: std::cell::RefCell::new(Vec::new()),
-        };
-        let sc = parse_supervisor_challenge(&good_claims()["challenge"]).unwrap();
-        assert!(stub.enroll_pending(&sc));
-        assert_eq!(
-            stub.saw.borrow()[0],
-            "123e4567-e89b-42d3-a456-426614174000",
-            "enroll_pending must receive the exact challenge"
-        );
-        let stub_no = StubConsume {
-            enrolled: false,
-            consume: ConsumeOutcome::Consumed,
-            recheck_ok: true,
-            saw: std::cell::RefCell::new(Vec::new()),
-        };
-        assert!(!stub_no.enroll_pending(&sc), "absent obligation refuses");
     }
 
     /// The production authority + self-enrollment factories are permanently
@@ -1454,16 +1491,26 @@ mod tests {
     /// Real `SO_PEERCRED` + `/proc` custody on an ordinary-uid socketpair: the
     /// kernel reports *this* test process's uid (not 0), so the installer gate
     /// refuses outright — proving root-uid is enforced before any pin check.
+    /// Runs `challenge` too — that verb admits the installer, not just install.
     #[test]
     #[cfg(target_os = "linux")]
     fn peer_admission_refuses_non_root_kernel_uid() {
         use std::os::unix::net::UnixStream;
         let (a, _b) = UnixStream::pair().unwrap();
-        // non-root peer refuses even with a pinned generation/exe supplied.
         let r = admit_installer(&a, "g", Some([0u8; 32]), Some("g"));
         assert!(
             r.unwrap_err().to_string().contains("not root"),
             "non-root peer must refuse"
+        );
+        // The challenge verb admits the same way — non-root refuses there too.
+        let pid = std::process::id();
+        let e = SupervisorEnrollment::capture_test(pid, "b".repeat(32)).unwrap();
+        let core = GrantCore::new(e);
+        let (a2, _b2) = UnixStream::pair().unwrap();
+        let r2 = core.challenge(&a2, "g");
+        assert!(
+            r2.unwrap_err().to_string().contains("not root"),
+            "challenge must refuse a non-root peer"
         );
     }
 
@@ -1493,40 +1540,71 @@ mod tests {
         assert!(r.is_err(), "a dead pid's exe must refuse");
     }
 
+    /// The private listener's bounded incremental read + deadline: a missing
+    /// newline / oversize line / closed stream refuses — never a success from
+    /// framing alone.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn listener_read_is_bounded() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        // The reader is the endpoint that *receives* the peer's bytes: write
+        // on `peer`, read on `server` (a connected socketpair).
+        // No newline + peer closes -> refuse (not a success).
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(b"challenge no-newline").unwrap();
+        drop(peer); // peer closes without a newline
+        let r = GrantListener::read_request(&server);
+        assert!(r.is_err(), "missing newline must refuse: {r:?}");
+        // Oversize line (> MAX_ENVELOPE_BYTES) -> refuse. Write from a thread
+        // so the write can block on a full socket buffer without deadlocking
+        // the read; the read refuses as soon as the cap is exceeded.
+        let (server2, mut peer2) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let _ = peer2.write_all(&vec![b'x'; MAX_ENVELOPE_BYTES + 4096]);
+        });
+        let r2 = GrantListener::read_request(&server2);
+        assert!(r2.is_err(), "oversize line must refuse: {r2:?}");
+        // A valid newline-terminated request parses.
+        let (server3, mut peer3) = UnixStream::pair().unwrap();
+        writeln!(peer3, "challenge gen").unwrap();
+        let r3 = GrantListener::read_request(&server3).unwrap();
+        assert_eq!(r3, "challenge gen");
+    }
+
     /// The private listener serves the fixed verbs over a real bound socket:
-    /// `challenge` returns a nonce line; an `install` from a non-root peer is
-    /// refused at `SO_PEERCRED` (uid != 0). Ordinary-uid only.
+    /// `challenge` admits the kernel installer and returns the supervisor's
+    /// recipient identity (never a minted nonce); `install` from a non-root
+    /// peer is refused at `SO_PEERCRED` (uid != 0). Ordinary-uid only — both
+    /// verbs refuse this test's non-root peer, proving admission gates both.
     #[test]
     #[cfg(target_os = "linux")]
     fn listener_serves_fixed_verbs() {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::Write;
         use std::os::unix::net::UnixStream;
         let dir = std::env::temp_dir().join(format!("sg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("grant.sock");
         let listener = GrantListener::bind_at(&sock).unwrap();
-        let e = SupervisorEnrollment::capture_test(std::process::id(), "b".repeat(32)).unwrap();
+        let sc = parse_supervisor_challenge(&good_claims()["challenge"]).unwrap();
         let ext = StubConsume {
-            enrolled: true,
+            enrolled_record: Some(sc),
             consume: ConsumeOutcome::Consumed,
             recheck_ok: true,
-            saw: std::cell::RefCell::new(Vec::new()),
+            epoch: 7,
         };
-        // `challenge` verb
+        // `challenge` verb — admits the kernel installer; non-root refuses.
         let mut c = UnixStream::connect(&sock).unwrap();
-        writeln!(c, "challenge op-1 0").unwrap();
+        writeln!(c, "challenge {}", "b".repeat(32)).unwrap();
+        let e = SupervisorEnrollment::capture_test(std::process::id(), "b".repeat(32)).unwrap();
         let mut core = GrantCore::new(e);
-        let resp = listener.serve_once(&mut core, &ext, 7, 1050).unwrap();
-        assert!(resp.starts_with("nonce "), "{resp}");
-        let mut r = BufReader::new(&c);
-        let mut line = String::new();
-        r.read_line(&mut line).unwrap();
-        assert!(line.starts_with("ok nonce "), "{line}");
+        let resp = listener.serve_once(&mut core, &ext, 1050);
+        assert!(resp.is_err(), "non-root challenge must refuse");
         // `install` verb — non-root kernel peer refuses inside install.
         let mut c2 = UnixStream::connect(&sock).unwrap();
         let env = envelope("k1", &good_claims(), &fresh_key());
         writeln!(c2, "install {} {}", "b".repeat(32), env).unwrap();
-        let r2 = listener.serve_once(&mut core, &ext, 7, 1050);
+        let r2 = listener.serve_once(&mut core, &ext, 1050);
         assert!(r2.is_err(), "non-root install must refuse");
         std::fs::remove_dir_all(&dir).ok();
     }
