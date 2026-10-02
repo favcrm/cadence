@@ -695,7 +695,9 @@ fn freeze_params(
         "bundle_digest": bundle_digest,
         "slot": "publication", "effect_id": effect,
         "destination_id": DEST_FB, "toolkit": "facebook",
-        "grant_id": GRANT_FB, "approval_id": "cad_approval_e2e_01",
+        // CAD-1027: one approval authorizes one intent — each request
+        // carries its own approval identity.
+        "grant_id": GRANT_FB, "approval_id": approval_for(request),
         "due_epoch": due, "timezone": "Asia/Hong_Kong"})
 }
 
@@ -1898,4 +1900,248 @@ fn cad771_e2e_hostile_reconcile_with_no_prior_evidence_stays_null() {
         .clone();
     assert_eq!(shown["state"], "processing");
     assert!(shown["upstream"].is_null());
+}
+
+/// An in-process board on the daemon's own state dir, for HTTP parity.
+struct Board {
+    port: u16,
+    _lease: common::PortLease,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    join: Option<thread::JoinHandle<cadence_agent::Result<()>>>,
+    _pm: tempfile::TempDir,
+}
+impl Board {
+    fn serve(h: &Release) -> Self {
+        let lease = common::test_port();
+        let port = lease.port;
+        let (state, pm) = (h.daemon.state.clone(), tempfile::tempdir().unwrap());
+        let pm_dir = pm.path().to_path_buf();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bstop = stop.clone();
+        let join = thread::spawn(move || {
+            cadence_agent::ui::serve(
+                &state,
+                &pm_dir,
+                &cadence_agent::ui::ServeOpts {
+                    host: "127.0.0.1".into(),
+                    port,
+                    stop: Some(bstop),
+                    startup: Some(tx),
+                    test_seam: true,
+                    ..Default::default()
+                },
+            )
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("board up")
+            .expect("board started");
+        Self {
+            port,
+            _lease: lease,
+            stop,
+            join: Some(join),
+            _pm: pm,
+        }
+    }
+    /// Operator POST; returns `(status, body)`.
+    fn post(&self, h: &Release, path: &str, body: &Value) -> (u16, String) {
+        let session =
+            common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &h.daemon.state, self.port);
+        let (code, _, text) =
+            common::op::raw(self.port, &session.request("POST", path, &body.to_string()));
+        (code, text)
+    }
+}
+impl Drop for Board {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn intent_count(h: &Release, install: &str) -> usize {
+    h.daemon
+        .operator_rpc("social_publish_list", json!({"install_id": install}))
+        .unwrap()["intents"]
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+/// CAD-1027 adversarial (written before the guard): one operator approval
+/// authorizes exactly one intent. Concurrent double submits that share the
+/// approval but carry fresh request ids yield one intent; a replay of the
+/// approval refuses through the RPC and the HTTP relay alike; a forged
+/// (non-`dpq_`) grant refuses through both doors; an agent caller and a
+/// detached unproven peer never reach schedule.
+#[test]
+fn cad1027_one_approval_one_intent_rpc_and_http() {
+    let door = FakeDoor::start();
+    let h = resolver_only_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "apv");
+    let body = |request: &str| {
+        let mut b = freeze_params(
+            &context,
+            &run,
+            &bundle,
+            &install,
+            request,
+            "cad_fx_apv",
+            epoch_now() + 3600,
+        );
+        b["approval_id"] = json!(approval_for("cad1027-double"));
+        b
+    };
+    // Four concurrent submits of one approval with distinct request ids.
+    let wins = thread::scope(|scope| {
+        let calls: Vec<_> = (0..4)
+            .map(|i| {
+                let (state, params) = (h.daemon.state.clone(), body(&format!("cad1027-dbl-{i}")));
+                scope.spawn(move || {
+                    cadence_agent::test_seam::scoped(
+                        cadence_agent::test_seam::Asserted::Operator,
+                        || cadence_agent::client::rpc(&state, "social_publish_schedule", params),
+                    )
+                })
+            })
+            .collect();
+        calls
+            .into_iter()
+            .map(|call| call.join().unwrap())
+            .filter(Result::is_ok)
+            .count()
+    });
+    assert_eq!(wins, 1, "a double submit must produce exactly one intent");
+    assert_eq!(intent_count(&h, &install), 1);
+    // RPC replay of the consumed approval under a fresh request refuses.
+    let err = h
+        .daemon
+        .operator_rpc("social_publish_schedule", body("cad1027-replay-rpc"))
+        .unwrap_err();
+    assert!(err.to_string().contains("approval_replay"), "{err}");
+    // An agent caller and an unproven (detached) peer never reach schedule.
+    for err in [
+        h.daemon
+            .agent_rpc("worker-0", "social_publish_schedule", body("cad1027-agent"))
+            .unwrap_err(),
+        h.daemon
+            .unproven_rpc("social_publish_schedule", body("cad1027-unproven"))
+            .unwrap_err(),
+    ] {
+        assert!(err.to_string().contains("operator"), "{err}");
+    }
+    // The HTTP relay is at least as strict: replay and forged grant refuse.
+    let board = Board::serve(&h);
+    let (code, text) = board.post(&h, "/api/social-publishes", &body("cad1027-replay-http"));
+    // The relay maps the store's "already" refusal to 409 Conflict.
+    assert_eq!(code, 409, "HTTP replay: {text}");
+    assert!(text.contains("approval_replay"), "{text}");
+    for grant in ["grant-a", "dpq_short", "DPQ_synthetic_grant_fb"] {
+        let mut forged = freeze_params(
+            &context,
+            &run,
+            &bundle,
+            &install,
+            "cad1027-forged",
+            "cad_fx_apv",
+            epoch_now() + 3600,
+        );
+        forged["grant_id"] = json!(grant);
+        let (code, text) = board.post(&h, "/api/social-publishes", &forged);
+        assert_eq!(code, 400, "HTTP forged grant {grant} accepted: {text}");
+        let err = h
+            .daemon
+            .operator_rpc("social_publish_schedule", forged)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("grant is invalid"),
+            "{grant}: {err}"
+        );
+    }
+    assert_eq!(
+        intent_count(&h, &install),
+        1,
+        "a refused call stored an intent"
+    );
+}
+
+/// CAD-1027: a daemon-shaped approval id (`apv-` + 32 lowercase hex),
+/// distinct per seed — one approval authorizes one intent.
+fn approval_for(seed: &str) -> String {
+    use sha2::Digest as _;
+    let hex = format!("{:x}", sha2::Sha256::digest(seed.as_bytes()));
+    format!("apv-{}", &hex[..32])
+}
+
+/// CAD-1027 adversarial: the daemon accepts only the minted approval shape
+/// (`apv-` + 32 lowercase hex), so a non-UI operator client cannot choose a
+/// guessable approval id. Every other shape refuses `bad_approval` through
+/// the RPC and the HTTP relay and stores nothing.
+#[test]
+fn cad1027_daemon_refuses_unminted_approval_shape() {
+    let door = FakeDoor::start();
+    let h = resolver_only_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "apvshape");
+    let board = Board::serve(&h);
+    let hex = "0123456789abcdef0123456789abcdef";
+    for (i, approval) in [
+        "op-a".to_owned(),
+        "cad_approval_01".to_owned(),
+        format!("apv-{}", hex.to_uppercase()),
+        format!("apv-{}", &hex[..31]),
+        format!("apv-{hex}0"),
+        format!("apv-{}g", &hex[..31]),
+        format!("APV-{hex}"),
+        format!(" apv-{hex}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut params = freeze_params(
+            &context,
+            &run,
+            &bundle,
+            &install,
+            &format!("cad1027-shape-{i}"),
+            "cad_fx_apvshape",
+            epoch_now() + 3600,
+        );
+        params["approval_id"] = json!(approval);
+        let err = h
+            .daemon
+            .operator_rpc("social_publish_schedule", params.clone())
+            .expect_err(&approval)
+            .to_string();
+        assert!(err.contains("bad_approval"), "RPC {approval:?}: {err}");
+        let (code, text) = board.post(&h, "/api/social-publishes", &params);
+        assert!(
+            (400..500).contains(&code),
+            "HTTP accepted {approval:?}: {code} {text}"
+        );
+        assert!(text.contains("bad_approval"), "HTTP {approval:?}: {text}");
+    }
+    assert_eq!(
+        intent_count(&h, &install),
+        0,
+        "an unminted approval stored an intent"
+    );
+    let mut ok = freeze_params(
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1027-shape-ok",
+        "cad_fx_apvshape",
+        epoch_now() + 3600,
+    );
+    ok["approval_id"] = json!(format!("apv-{hex}"));
+    assert_eq!(
+        h.daemon
+            .operator_rpc("social_publish_schedule", ok)
+            .unwrap()["intent"]["state"],
+        "queued"
+    );
 }

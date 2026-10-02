@@ -278,6 +278,23 @@ impl Store {
                 upstream.as_ref(),
             ));
         }
+        // CAD-1027: one operator approval authorizes exactly one intent. The
+        // same-request retry returned above; the same approval under any
+        // other request — a replay, a double submit with a fresh request id,
+        // a re-schedule after cancel, another install — refuses. The check
+        // and the insert share this transaction on the one write connection.
+        let replayed: Option<String> = tx
+            .query_row(
+                "SELECT intent_id FROM social_publish_intents WHERE approval_id=?",
+                [row.approval_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if replayed.is_some() {
+            return Err(Error::rejected(
+                "approval_replay: this approval already authorized another social publish intent",
+            ));
+        }
         let intent_id = format!("spub-{}", uuid::Uuid::new_v4().simple());
         tx.execute("INSERT INTO social_publish_intents(intent_id,request,install_id,context_id,run_id,effect_id,connection_id,destination_id,toolkit,caption_digest,image_digest,media_key,grant_id,approval_id,due_epoch,timezone,state,frozen,frozen_digest,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?,?)",
             params![intent_id,request,row.install_id,row.context_id,row.run_id,row.effect_id,row.connection_id,row.destination_id,row.toolkit,row.caption_digest,row.image_digest,row.media_key,row.grant_id,row.approval_id,row.due_epoch,row.timezone,frozen.to_string(),digest,now(),now()])?;
@@ -651,6 +668,17 @@ fn bare_digest(prefixed: &str) -> Result<&str> {
     Ok(hex)
 }
 
+/// CAD-1027: the operator approval id the confirmation step mints —
+/// `apv-` then exactly 32 lowercase hex (128 random bits).
+pub fn valid_approval_id(raw: &str) -> bool {
+    raw.strip_prefix("apv-").is_some_and(|hex| {
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 /// Params for freezing an intent from reviewed run material instead of
 /// caller-supplied digests.
 #[allow(clippy::too_many_arguments)]
@@ -689,6 +717,13 @@ impl Store {
         &self,
         row: &FreezeFromArtifact<'_>,
     ) -> Result<Value> {
+        // CAD-1027: only the minted approval shape freezes, so the
+        // per-confirmation, unguessable approval is not a UI-only property.
+        if !valid_approval_id(row.approval_id) {
+            return Err(Error::rejected(
+                "bad_approval: approval id must be apv- followed by 32 lowercase hex",
+            ));
+        }
         let material = self.app_publication_material(
             row.run_id,
             row.artifact_id,

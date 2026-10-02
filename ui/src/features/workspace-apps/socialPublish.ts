@@ -363,6 +363,10 @@ export function refusalCopy(refusal: PublishRefusal): string {
     case "bad_revision":
     case "bad_timezone":
       return `An identity shape is invalid (${refusal.code}). Nothing was stored.`;
+    case "approval_replay":
+      return "This approval already authorized another post. Review again to approve this one — nothing was published.";
+    case "bad_approval":
+      return "The approval id is not one this panel minted. Review again — nothing was published.";
     case "image_required":
       return "Instagram needs a reviewed provider-accessible image. Nothing was published.";
     default:
@@ -372,11 +376,29 @@ export function refusalCopy(refusal: PublishRefusal): string {
   }
 }
 
-/** Landed `cadenceApprovalId` bound: non-empty, max 120 characters.
- *  The UI gates scheduling on it so the contract never sees an
- *  oversize approval from this surface. */
-export function isApprovalIdUsable(approvalId: string): boolean {
-  return approvalId.length > 0 && approvalId.length <= 120;
+/** Daemon refusals arrive as `code: detail`; a known Cadence code gets its
+ *  operator copy, anything else stays raw. */
+export function refusalFromError(text: string): string {
+  const match = /^([a-z_]+): (.+)$/s.exec(text);
+  return match ? refusalCopy({ code: match[1], message: match[2] }) : text;
+}
+
+/** AgenticOS send-grant id shape, mirroring `valid_grant_id` in
+ *  publish.rs: `dpq_` then 8–64 ASCII letters, digits, `_` or `-`. The
+ *  daemon re-validates; this only keeps a malformed id from scheduling. */
+export function isGrantIdUsable(grantId: string): boolean {
+  return /^dpq_[A-Za-z0-9_-]{8,64}$/.test(grantId);
+}
+
+/** CAD-1027: one operator confirmation mints one approval identity,
+ *  `apv-` + 32 random hex (also the schedule request id, so a retry or a
+ *  double submit of the same confirmation replays the same intent). The
+ *  daemon lets an approval authorize exactly one intent: reusing it under
+ *  any other request refuses `approval_replay`. `getRandomValues` works on
+ *  a plain-http board, where `randomUUID` does not. */
+export function mintApprovalId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return `apv-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
 }
 
 /** Only a queued intent can cancel — past queued the contract answers

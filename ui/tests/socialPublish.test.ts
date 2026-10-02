@@ -92,7 +92,8 @@ async function main() {
   }
   assert(store.refusalCopy({ code: "send_disabled", message: "" }).includes("not a state"), "send_disabled is a refusal code, not a state");
   assert(store.refusalCopy({ code: "future_code", message: "raw" }).includes("future_code") && store.refusalCopy({ code: "future_code", message: "raw" }).includes("raw"), "Unknown codes stay visible with raw message");
-  assert(store.isApprovalIdUsable("op-a") && !store.isApprovalIdUsable("") && !store.isApprovalIdUsable("x".repeat(121)) && store.isApprovalIdUsable("x".repeat(120)), "Approval bound is 1..=120 characters");
+  assert(store.refusalFromError("approval_replay: this approval already authorized another social publish intent").includes("already authorized another post") && store.refusalFromError("bad_approval: approval id must be apv-").includes("not one this panel minted"), "Cadence approval refusals get operator copy");
+  assert(store.refusalFromError("plain failure") === "plain failure", "Uncoded errors stay raw");
   assert(store.refusalCopy({ code: "send_disabled", message: "" }).includes("changed nothing"), "Disabled gate names validate-all/mutate-nothing");
   assert(store.canCancel("queued") && !store.canCancel("processing") && !store.canCancel("posted") && !store.canCancel("cancelled"), "Only queued intents cancel (cancel_closed past queued)");
   const label = store.dueLabel(1790601000, "Asia/Hong_Kong");

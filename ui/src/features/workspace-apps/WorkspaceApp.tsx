@@ -765,8 +765,6 @@ export default function WorkspaceApp({
                 installId={installId}
                 contextId={contextId || null}
                 candidates={publishCandidates}
-                grantId=""
-                approvalId=""
                 canWrite={canWrite && !busy}
               />
             )}

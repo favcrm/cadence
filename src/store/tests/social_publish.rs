@@ -43,7 +43,9 @@ fn intent(request: &str) -> NewSocialPublish<'_> {
         image_digest: Some(img_digest()),
         media_key: None,
         grant_id: "dpq_synthetic_grant_01",
-        approval_id: "cad_approval_01",
+        // CAD-1027: an approval authorizes exactly one intent, so each
+        // fixture request carries its own approval identity.
+        approval_id: request,
         due_epoch: 1_750_000_000,
         timezone: "Asia/Hong_Kong",
     }
@@ -116,6 +118,39 @@ fn cad771_schedule_refuses_forged_and_mismatched_shapes() {
             .len(),
         0
     );
+}
+
+/// CAD-1027 adversarial: an approval authorizes exactly one intent. The
+/// same-request retry is idempotent; the same approval under any other
+/// request (a replay, a double submit with a fresh request id, a
+/// re-schedule after cancel, another install) refuses and stores nothing.
+#[test]
+fn cad1027_approval_authorizes_exactly_one_intent() {
+    let (_dir, s) = store();
+    let mut first = intent("req-apv-1");
+    first.approval_id = "apv-once";
+    let made = s.social_publish_schedule(&first).unwrap();
+    let id = made["intent"]["intent_id"].as_str().unwrap().to_owned();
+    let retry = s.social_publish_schedule(&first).unwrap();
+    assert_eq!(retry["intent"]["intent_id"], id.as_str());
+    let refuse = |request: &str, install: &str| {
+        let mut replay = intent(request);
+        replay.approval_id = "apv-once";
+        replay.install_id = install;
+        let err = s.social_publish_schedule(&replay).unwrap_err().to_string();
+        assert!(err.contains("approval_replay"), "{request}: {err}");
+    };
+    refuse("req-apv-2", "install-harbour");
+    refuse("req-apv-3", "install-other");
+    s.social_publish_cancel(&id).unwrap();
+    refuse("req-apv-4", "install-harbour");
+    let rows: i64 = s
+        .conn()
+        .query_row("SELECT count(*) FROM social_publish_intents", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 1, "a replayed approval stored a second intent");
 }
 
 #[test]
