@@ -15,4 +15,9 @@ check(!JSON.stringify(projected).includes("PRIVATE") && !JSON.stringify(projecte
 let refused = false;
 try { screenProjection(installation, "main", "unavailable", [context], [run], [effect]); } catch { refused = true; }
 check(refused, "unavailable context fails closed");
+const long = { ...run, snapshot: { ...run.snapshot, workflow: { ...run.snapshot.workflow, title: "x".repeat(2048) } } };
+check(screenProjection(installation, "main", "brand", [context], [long], []).runs[0].title.length === 512, "host and app title bounds agree");
+refused = false;
+try { screenProjection(installation, "main", "brand", [context], Array.from({length: 200}, (_, n) => ({ ...long, id: `run${n}` })), []); } catch { refused = true; }
+check(refused, "aggregate message size fails closed before transfer");
 console.log("screen projection scope and privacy checks pass");

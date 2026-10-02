@@ -529,22 +529,15 @@ export default function WorkspaceApp({
   ];
   if (!viewer.operator) return <main className="workspace-app" aria-label="Workspace app"><h1>Workspace app</h1><p className="wa-alert">Sign in as the operator to inspect this installation.</p><Button href="/apps">All apps</Button></main>;
   const tag = data && screenTag(data.installation);
+  let projection = null;
   if (data && tag && !accessDenied) {
-    let projection;
     try { projection = screenProjection(data.installation, tag, contextId, data.contexts, data.runs, data.effects); }
-    catch { projection = null; }
-    if (projection) return <ScreenOutlet projection={projection} fallback={
-      <main className="workspace-app" aria-label="Workspace app">
-        <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
-        <section className="wa-panel wa-stack"><p>{data.installation.summary}</p>
-          <p className="wa-muted">The installed screen is unavailable. Its workflows and guide remain installed.</p>
-          <pre className="wa-preview">{data.installation.guide}</pre>
-        </section>
-      </main>
-    } />;
+    catch { /* Oversized/unavailable scope retains the existing native outlet. */ }
   }
+  const screen = (fallback: React.ReactNode) => projection
+    ? <ScreenOutlet projection={projection} fallback={fallback} /> : fallback;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
-    return <main className="workspace-app" aria-label="Workspace app">
+    return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
       <section className="wa-panel wa-stack">
         <p>{data.installation.summary}</p>
@@ -552,9 +545,9 @@ export default function WorkspaceApp({
         <p className="wa-kicker">Installation {installId} · version {data.installation.version}</p>
         <pre className="wa-preview">{data.installation.guide}</pre>
       </section>
-    </main>;
+    </main>);
   }
-  return (
+  return screen(
     <main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header">
         <div className="wa-heading">

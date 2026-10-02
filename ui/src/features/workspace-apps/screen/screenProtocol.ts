@@ -145,6 +145,7 @@ export function parseChild(data: unknown): ChildToHost | null {
     d.v === 1 &&
     d.op === "state" &&
     typeof d.data === "string" &&
+    d.data.length <= 32 * 1024 &&
     new TextEncoder().encode(d.data).byteLength <= 32 * 1024
   ) {
     return { v: 1, op: "state", data: d.data };
