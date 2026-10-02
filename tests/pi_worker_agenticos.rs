@@ -59,6 +59,7 @@ fn open_worker(root: &Path) -> cadence_agent::Result<PiAdapter> {
         },
         &state.join("agents/w.provider.log"),
         &env,
+        None,
     );
     let agent = Agent {
         alias: "w".into(),

@@ -96,7 +96,7 @@ fn adapter_env(
         on_request: Box::new(|_| {}),
     };
     (
-        PiAdapter::new(hooks, &dir.join("logs").join("pi-stderr.log"), &env),
+        PiAdapter::new(hooks, &dir.join("logs").join("pi-stderr.log"), &env, None),
         rx,
     )
 }
@@ -136,6 +136,7 @@ fn master_adapter(mode: &str, state: &Path, own: &[(&str, String)]) -> PiAdapter
         },
         &state.join("logs").join("pi-master.log"),
         &env,
+        None,
     )
 }
 
@@ -1375,6 +1376,7 @@ fn status_prompt_probe() {
         },
         &state.join("logs").join("pi-master.log"),
         &env,
+        None,
     );
     let mut params = json!({"unconfined": true, "turn_max_secs": 300});
     if let Ok(model) = std::env::var("CADENCE_PROBE_MODEL") {
