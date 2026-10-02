@@ -245,9 +245,32 @@ string; issuer bodies and tokens are never echoed anywhere (existing
 | `forged_session_field_refused` | I2 | `deny_unknown_fields`/verb schema | a body field names org/caller/destination |
 | `concurrent_logins_different_orgs_keep_both` | I5 | existing credential lock + registry lock | one login clobbers the other |
 
+## Live probes this design still needs (none taken)
+
+Phase 1 was code-reading only — no requests were made to any live or staging
+host (`demo-company.cadencecloud.app`, tailnet 9460/9461, CDP 9222 are owned
+elsewhere). The contract rests on static evidence; the following live probes
+remain unverified and are listed for the PM to arrange ownership:
+
+- `GET {issuer}/.well-known/agenticos-board-jwks.json` reachable from a CLI
+  network — the contract assumes the JWKS endpoint is public per contract §6,
+  unverified against the deployed worker.
+- `DEVICE_GRANT_ENABLED` state on staging/prod — code shows the flag gates
+  `/v1/device/*` and `/v1/runtime/*`; the deployed value was not probed.
+- Whether a board-host request carrying `Authorization` but no cookie is
+  answered by the worker's redirect without touching the container — inferred
+  from `hasBoardSession` in `app.all("*")`; a probe would confirm no edge
+  rule (e.g. Cloudflare config outside the repo) alters it.
+- `POST /__platform/cli/session` end-to-end mint — cannot exist until the AOS
+  change lands; the acceptance smoke test is that probe, deferred to
+  implementation and a designated staging slot.
+- Redirect behaviour of the board host on expired/missing session (302 →
+  authorize) — read from code, not exercised.
+
 ## Out of scope
 
 Renewal (CAD-740), multi-org UX beyond CAD-657, operator-only verbs over the
 remote path, generic RPC passthrough (CAD-913's stance kept), wiki chunking
 (CAD-913 itself), container wake policy details (flagged above),
-`DEVICE_GRANT_ENABLED` rollout approval (AOS-side ops decision).
+`DEVICE_GRANT_ENABLED` rollout approval (AOS-side ops decision), and all live
+probing (listed above for PM-arranged ownership).
