@@ -441,7 +441,7 @@ impl RecordStore {
         // `write_tx` holds `BEGIN IMMEDIATE` across the replay check +
         // insert: a racing prepare blocks on the write lock first, so a
         // request_id binds exactly one frozen material set.
-        self.write_tx(|tx| {
+        match self.write_tx(|tx| {
             let existing: Option<CampaignSend> = tx
                 .query_opt(
                     &format!("SELECT {SEND_COLUMNS} FROM app_campaign_sends WHERE context_id=? AND request_id=?"),
@@ -501,7 +501,7 @@ impl RecordStore {
             }
             Ok(None)
         })? {
-            Some(stored) => Ok(stored),
+            Some(stored) => return Ok(stored),
             None => self
                 .app_campaign_send(context, &draft.send_id)?
                 .ok_or_else(|| Error::internal("campaign send vanished after prepare")),
