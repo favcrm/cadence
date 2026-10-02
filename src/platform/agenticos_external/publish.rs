@@ -687,6 +687,21 @@ impl Default for FakePublishLedger {
     }
 }
 
+/// CAD-1020: the pre-claim staging verdict the daemon's publish driver
+/// needs before committing a row to `processing`. `Approved` means the
+/// door staged the exact binding — claiming and executing is safe.
+/// `Refused` is a definitive door refusal — the claim may proceed and
+/// report it. `Uncertain` means a transport-ambiguous staging answer
+/// (timeout, 5xx, drift): nothing was sent and nothing can be proven,
+/// so the row must stay `queued` for a later tick — claiming it would
+/// burn the intent to `refused` on a transient door blip.
+#[derive(Debug)]
+pub enum Preflight {
+    Approved,
+    Refused(Refusal),
+    Uncertain(Refusal),
+}
+
 /// Daemon-side dispatch observation: the party that speaks to the provider
 /// door, so posted reports verify against evidence the daemon itself
 /// observed — never operator-supplied JSON alone. Production leaves the
@@ -700,6 +715,14 @@ pub trait PublishSender: Send + Sync {
     /// Reconcile one stable key against the provider door. Never a second
     /// provider call for an already-accepted send.
     fn status(&self, key: &str) -> Result<LedgerOutcome, Refusal>;
+    /// CAD-1020: pre-claim staging probe. The default approves — senders
+    /// without a separate staging door (the in-memory test fakes, which
+    /// validate inside `execute`) need no preflight; the production HTTP
+    /// sender overrides it so the driver can back off on ambiguity
+    /// instead of claiming a row it cannot send.
+    fn preflight(&self, _binding: &SendBinding) -> Preflight {
+        Preflight::Approved
+    }
 }
 
 impl LedgerOutcome {

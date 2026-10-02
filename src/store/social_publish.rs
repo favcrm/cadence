@@ -339,6 +339,37 @@ impl Store {
         Ok(json!({"intents":list}))
     }
 
+    /// CAD-1020: read-only list of `processing` intent ids for the
+    /// daemon driver's reconcile sweep. `after` is a rotating cursor —
+    /// strictly-greater `intent_id` ordering wraps so a bounded scan
+    /// visits every row over successive ticks and a backlog of
+    /// permanently-unknown keys can never starve newer claims.
+    /// Returns `(intent_id, request_key, updated)` rows ordered by
+    /// `intent_id`.
+    #[allow(dead_code)] // the driver's reconcile sweep lands in the stacked PR
+    pub(crate) fn social_publish_processing(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT intent_id,request,updated FROM social_publish_intents \
+             WHERE state='processing' AND (?1 IS NULL OR intent_id>?1) \
+             ORDER BY intent_id LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![after, limit.max(1) as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Peek the oldest due queued intent without claiming. The dispatch
     /// RPC uses it to compare operator-supplied current authority against
     /// frozen before claiming; the claim itself re-verifies in-transaction.

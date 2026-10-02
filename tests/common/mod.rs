@@ -1268,6 +1268,15 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         provider_deployments: None,
         effect_execute_gate: None,
         social_publish_sender: None,
+        // CAD-1020: driver inert by default in tests — a fixture that
+        // wants the loop clears `publish_driver_off` and pins
+        // `publish_driver_ms` to a hot interval.
+        publish_driver_ms: None,
+        publish_driver_off: Some(true),
+        publish_driver_max_lateness_secs: None,
+        publish_driver_clock: None,
+        #[cfg(feature = "test-seam")]
+        publish_driver_claimed_gate: None,
         social_media_importer: None,
         social_media_resolver: None,
         app_release_claim_gate: None,

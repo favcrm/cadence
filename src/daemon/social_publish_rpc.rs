@@ -70,13 +70,28 @@ impl Shared {
             "social_publish_cancel" => self
                 .store
                 .social_publish_cancel(required_str(params, "intent_id")?),
-            "social_publish_show" => self
-                .store
-                .social_publish_show(required_str(params, "intent_id")?),
-            "social_publish_list" => self.store.social_publish_list(
-                optional_str(params, "install_id"),
-                optional_str(params, "context_id"),
-            ),
+            "social_publish_show" => {
+                let mut shown = self
+                    .store
+                    .social_publish_show(required_str(params, "intent_id")?)?;
+                self.attach_driver_status(&mut shown);
+                Ok(shown)
+            }
+            "social_publish_list" => {
+                let mut list = self.store.social_publish_list(
+                    optional_str(params, "install_id"),
+                    optional_str(params, "context_id"),
+                )?;
+                // CAD-1020: the driver status rides the list envelope and
+                // each intent carries its transient `driver.last_error`.
+                list["driver"] = self.publish_driver.status_json();
+                if let Some(intents) = list["intents"].as_array_mut() {
+                    for intent in intents {
+                        self.attach_driver_status_to_intent(intent);
+                    }
+                }
+                Ok(list)
+            }
             "social_publish_claim_due" => self.claim_social_publish(params),
             "social_publish_reconcile" => self.reconcile_social_publish(params),
             "social_publish_report" => self.store.social_publish_report(
@@ -344,17 +359,25 @@ impl Shared {
                 &json!({"reason": "approved material changed since freeze"}),
             );
         }
-        // Daemon-observed dispatch: when a sender is registered, the exact
-        // frozen binding executes here and its evidence is persisted before
-        // any report. Without a sender the intent stays processing until
-        // the send adapter lands — posted reports require evidence.
+        self.dispatch_claimed(&id, claimed)
+    }
+
+    /// CAD-1020: the one claim-execution path, shared by the operator
+    /// dispatch RPC above and the daemon-owned driver
+    /// ([`super::social_publish_driver`]). Callers must have already
+    /// proven dispatch authority (operator recheck or the driver's own
+    /// preflight + `material_current`); this helper runs the exact
+    /// frozen binding through the registered sender and persists the
+    /// provider's evidence before any report. Without a sender the
+    /// intent stays processing — posted reports require evidence.
+    pub(crate) fn dispatch_claimed(&self, id: &str, claimed: Value) -> Result<Value> {
         let Some(sender) = self.social_publish_sender.clone() else {
             return Ok(claimed);
         };
         let frozen = &claimed["intent"]["frozen"];
         let Some(binding) = sender_binding(frozen, &claimed["intent"]["request"]) else {
             return self.store.social_publish_report(
-                &id,
+                id,
                 "held",
                 &json!({"reason": "frozen binding does not parse for dispatch"}),
             );
@@ -368,19 +391,40 @@ impl Shared {
                 ) =>
             {
                 self.store
-                    .social_publish_note_evidence(&id, &outcome.evidence_json())
+                    .social_publish_note_evidence(id, &outcome.evidence_json())
             }
             Ok(outcome) => self.store.social_publish_report(
-                &id,
+                id,
                 "refused",
                 &json!({"error": format!("dispatch ended {}", outcome.state.as_str())}),
             ),
             Err(refusal) => self.store.social_publish_report(
-                &id,
+                id,
                 "refused",
                 &json!({"error": refusal.to_string()}),
             ),
         }
+    }
+
+    /// CAD-1020: attach the driver block to one show envelope — the
+    /// daemon's last tick, and this intent's transient `last_error` from
+    /// the bounded in-memory map (terminal reasons live on the receipt).
+    fn attach_driver_status(&self, shown: &mut Value) {
+        shown["intent"]["driver"] = json!({
+            "status": self.publish_driver.status_json(),
+            "last_error": self.publish_driver.last_error_for(
+                shown["intent"]["intent_id"].as_str().unwrap_or("")
+            ),
+        });
+    }
+
+    /// Per-intent `driver.last_error` inside a list envelope row.
+    fn attach_driver_status_to_intent(&self, intent: &mut Value) {
+        intent["driver"] = json!({
+            "last_error": self.publish_driver.last_error_for(
+                intent["intent_id"].as_str().unwrap_or("")
+            ),
+        });
     }
 
     /// Reconcile one processing intent against the provider door: refresh
@@ -410,7 +454,8 @@ impl Shared {
 
 /// The exact frozen binding as the dispatch sender speaks it. `None`
 /// when frozen fails its own contract shapes — held, never dispatched.
-fn sender_binding(
+/// `pub(super)` so the CAD-1020 driver preflights the same shape.
+pub(crate) fn sender_binding(
     frozen: &Value,
     request: &Value,
 ) -> Option<crate::platform::agenticos_external::publish::SendBinding> {

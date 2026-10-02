@@ -321,6 +321,29 @@ impl super::publish::PublishSender for HttpPublishSender {
     fn status(&self, key: &str) -> std::result::Result<LedgerOutcome, Refusal> {
         self.status_request(key)
     }
+
+    /// CAD-1020: pre-claim staging for the driver. Resolves the exact
+    /// approved material the same way `execute` does (store re-proof),
+    /// then stages once. Ambiguity maps to `Preflight::Uncertain` —
+    /// the caller leaves the row queued and retries next tick; a
+    /// definitive door refusal maps to `Preflight::Refused`, which the
+    /// caller claims and reports. Staging never sends, so this probe is
+    /// always safe to repeat.
+    fn preflight(&self, binding: &SendBinding) -> super::publish::Preflight {
+        use super::publish::Preflight;
+        let material = match (self.material)(binding) {
+            Ok(material) => material,
+            Err(refusal) => return Preflight::Refused(refusal),
+        };
+        match self.preflight_inner(binding, &material) {
+            Ok(_) => Preflight::Approved,
+            Err(Fault::Refused(refusal)) => Preflight::Refused(refusal),
+            Err(Fault::Ambiguous) => Preflight::Uncertain(Refusal::new(
+                "refused",
+                "publish preflight is uncertain; row stays queued",
+            )),
+        }
+    }
 }
 
 /// Transport outcome of one door call: either a parsed refusal or an
