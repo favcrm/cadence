@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline regressions for the reduced-window local check plan (CAD-1088)."""
+"""Offline regressions for the reduced local check plan (CAD-1088)."""
 import importlib.machinery
 import importlib.util
 from pathlib import Path

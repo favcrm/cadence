@@ -45,7 +45,7 @@ jobs:
         with:
           persist-credentials: false
       # CAD-1073: tests/scripts/test_clean_install.py was retired with
-      # the suite. The gate stays present as a stub during the window.
+      # the suite. The gate stays present as a stub.
       - name: Installer fixtures retired — clean-slate transition
         run: echo 'installer fixtures retired under CAD-1073; rebuild behavior checks under the new policy.'
 

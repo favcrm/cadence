@@ -1,5 +1,31 @@
 # A shorter, honest development loop (CAD-1088)
 
+## The loop today
+
+The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
+
+1. One PR per feature. Small PRs review and merge fast, and a split feature
+   leaves main half-built.
+2. Put the design note in the PR description, not in a separate document.
+3. Run `scripts/pre-push` before every push (`--tests` before asking for
+   review of Rust changes).
+4. One independent reviewer. Two for auth, identity, secrets, the daemon trees
+   and UI paths (`docs/roles/one-review-paths.toml` lists what gets one).
+5. Review notes never block. Findings that are not defects go in a follow-up
+   PR, not into this head.
+6. Operator approval: for a `human`-class PR the operator records ONE scope
+   approval per ticket with
+   `cadence audit approve --issue <ID> --action scope`. It covers the ticket
+   only while it is ready, doing or review, and its body declares its risk
+   triggers on exactly one `Risk:` line. It is bound to the ticket body, so
+   editing the body voids it, and verdict notes state `Scope: in-scope <ID>`.
+   A per-PR approval (`--pr <n> --head <sha>`) is needed only for triggers 1
+   or 3, or for a diff outside the declared scope.
+7. Enqueue with `scripts/enqueue-reviewed <n> --head <full-sha>`; it checks the
+   scope rules above.
+8. Production: dispatch a staging promote, then the GitHub `production`
+   approval, then `cadence update --as operator:<n>`.
+
 ## What #738 taught us
 
 PR #738 took more than four hours to deliver. It was not just a small update:

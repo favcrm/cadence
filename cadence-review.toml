@@ -38,7 +38,7 @@ gates = [
     "cargo clippy --all-targets --locked --features test-seam -- -D warnings",
     "cargo clippy --all-targets --locked --features ui -- -D warnings",
     # CAD-1073: the test_seam gate's target was retired; the safety floor
-    # is the executable check during the window.
+    # is the executable check.
     "cargo test --locked --test safety_floor -- --test-threads 2",
 ]
 

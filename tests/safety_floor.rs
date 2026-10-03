@@ -1,6 +1,6 @@
 //! CAD-1073 safety-floor binary: the minimum executable coverage retained
 //! while the legacy test suite is retired. Proves release-boundary and
-//! refusal contracts that the reduced gate still enforces.
+//! refusal contracts that the permanent gate (CAD-1102) still enforces.
 //!
 //! This is intentionally small: it exercises the CLI's own refusal paths and
 //! the test-seam exclusion without depending on the retired fixture
@@ -294,7 +294,7 @@ fn safety_floor_port_fence_refuses_occupied_lock() {
 #[test]
 fn safety_floor_cli_refuses_unknown_verb() {
     // Basic CLI refusal: unknown verbs exit non-zero. This proves the binary
-    // still enforces its command surface during the clean-slate window.
+    // still enforces its command surface (CAD-1073 clean-slate floor).
     let mut cmd = Command::new(BINARY);
     cmd.args(["nonexistent-verb"]);
     let out = reaper::output(&mut cmd).expect("cadence binary must exist to test refusal");
