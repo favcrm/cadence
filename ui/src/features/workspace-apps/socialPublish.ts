@@ -63,6 +63,9 @@ export interface PublishIntent {
   context_id: string | null;
   run_id: string;
   effect_id: string;
+  /** The reviewed artifact whose text the intent froze. Absent or null
+   *  (a legacy explicit-digest intent): send-now cannot confirm it. */
+  artifact_id?: string | null;
   state: PublishState;
   /** Channel is the request toolkit, echoed back. */
   channel: "instagram" | "facebook";
@@ -132,6 +135,7 @@ export function toPublishIntent(envelope: BackendIntent): PublishIntent {
     context_id: get("context_id"),
     run_id: get("run_id") as string,
     effect_id: get("effect_id") as string,
+    artifact_id: get("artifact_id"),
     state: state as PublishState,
     channel,
     destination_id: get("destination_id") as string,

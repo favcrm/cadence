@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
+import PublishConfirmation from "./PublishConfirmation";
 import {
   PILOT_DESTINATION,
   PUBLISH_TIMEZONE,
@@ -88,10 +89,17 @@ export default function PublishPanel({
   const [due, setDue] = useState("");
   const [busy, setBusy] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState<string | null>(null);
-  // CAD-1041: send-now is an explicit operator act behind the same
-  // two-press confirmation the cancel flow uses — the first press arms
-  // the intent id, the second sends. One click can never send.
-  const [confirmSend, setConfirmSend] = useState<string | null>(null);
+  // CAD-1041: send-now takes two presses. The first loads the frozen
+  // post (reviewed caption and image receipt, checked against the frozen
+  // digests) into the CAD-1027 confirmation; only then can the second
+  // press send. One click can never send.
+  const [sendReview, setSendReview] = useState<{
+    intentId: string;
+    caption: { text: string; digest: string } | null;
+    image: { digest: string; label: string; ref: string } | null;
+    ready: boolean;
+    error: string | null;
+  } | null>(null);
   const [notice, setNotice] = useState("");
   // CAD-1027: the imported, digest-verified media for one draft+channel.
   const [media, setMedia] = useState<{ key: string; digest: string; subject: string } | null>(null);
@@ -256,13 +264,50 @@ export default function PublishPanel({
   };
 
   // CAD-1041: send-now in the intent's own frozen scope, as cancel.
+  // The frozen post as the operator will send it, or why it cannot be shown.
+  const frozenPost = async (intent: PublishIntent) => {
+    if (!intent.artifact_id)
+      throw new Error("This intent names no reviewed caption. Nothing was sent.");
+    const artifact = await loadArtifact(intent.artifact_id);
+    if (
+      artifact.id !== intent.artifact_id ||
+      typeof artifact.text !== "string" ||
+      artifact.digest !== `sha256:${intent.caption_digest}`
+    )
+      throw new Error("The reviewed caption no longer matches this intent. Nothing was sent.");
+    let image: { digest: string; label: string; ref: string } | null = null;
+    if (intent.image_digest) {
+      const receipt = (await imageReceipts(intent.run_id)).find(
+        (value) => value.slot === "image" && value.asset?.digest === `sha256:${intent.image_digest}`,
+      );
+      if (!receipt)
+        throw new Error("No reviewed image receipt matches this intent's image. Nothing was sent.");
+      image = { digest: intent.image_digest, label: "receipt", ref: receipt.id };
+    }
+    return { caption: { text: artifact.text, digest: artifact.digest }, image };
+  };
+
+  const armSend = (intent: PublishIntent) => {
+    const intentId = intent.intent_id;
+    setActionError(null);
+    setSendReview({ intentId, caption: null, image: null, ready: false, error: null });
+    const settle = (patch: Partial<NonNullable<typeof sendReview>>) =>
+      setSendReview((current) =>
+        current && current.intentId === intentId ? { ...current, ...patch } : current,
+      );
+    frozenPost(intent).then(
+      ({ caption, image }) => settle({ caption, image, ready: true }),
+      (error) => settle({ error: message(error) }),
+    );
+  };
+
   const sendNow = async (intent: PublishIntent) => {
     const intentId = intent.intent_id;
     setBusy(true);
     setActionError(null);
     try {
       const reply = await client.sendNow(intentId, intent.install_id, intent.context_id);
-      setConfirmSend(null);
+      setSendReview(null);
       setNotice(
         reply.intent.state === "posted"
           ? `Sent ${intentId} — posted.`
@@ -349,38 +394,50 @@ export default function PublishPanel({
         </p>
       )}
       {reading && <p className="wa-muted">{reading}</p>}
-      {intent.state === "queued" && (
-        <div className="wa-row">
-          {confirmSend === intent.intent_id ? (
-            <>
+      {intent.state === "queued" &&
+        (sendReview?.intentId === intent.intent_id ? (
+          <section className="wa-panel wa-stack" aria-label="Confirm send now">
+            <h4>Send this exact post now</h4>
+            {sendReview.error ? (
+              <p className="wa-alert" data-tone="fail" role="alert">
+                {sendReview.error}
+              </p>
+            ) : (
+              <PublishConfirmation
+                facts={{
+                  caption: sendReview.caption,
+                  image: sendReview.image,
+                  dueEpoch: intent.due_epoch,
+                  timezone: intent.timezone,
+                  toolkit: intent.channel,
+                  destinationId: intent.destination_id,
+                  grantId: intent.grant_id,
+                  approvalId: intent.approval_id,
+                }}
+              />
+            )}
+            <div className="wa-row">
               <Button
                 variant="danger"
                 size="sm"
                 loading={busy}
-                disabled={!canWrite}
+                disabled={!canWrite || !sendReview.ready || sendReview.error !== null}
                 onClick={() => void sendNow(intent)}
               >
                 Confirm send now
               </Button>
-              <Button
-                size="sm"
-                disabled={busy}
-                onClick={() => setConfirmSend(null)}
-              >
+              <Button size="sm" disabled={busy} onClick={() => setSendReview(null)}>
                 Keep queued
               </Button>
-            </>
-          ) : (
-            <Button
-              size="sm"
-              disabled={!canWrite || busy}
-              onClick={() => setConfirmSend(intent.intent_id)}
-            >
+            </div>
+          </section>
+        ) : (
+          <div className="wa-row">
+            <Button size="sm" disabled={!canWrite || busy} onClick={() => armSend(intent)}>
               Send now
             </Button>
-          )}
-        </div>
-      )}
+          </div>
+        ))}
       {canCancel(intent.state) && (
         <div className="wa-row">
           {confirmCancel === intent.intent_id ? (
@@ -543,44 +600,24 @@ export default function PublishPanel({
             {confirmation && candidate ? (
               <section className="wa-panel wa-stack" aria-label="Confirm publish">
                 <h3>Confirm this exact post</h3>
-                <dl className="wa-stack">
-                  <dt className="wa-kicker">Caption (reviewed text that will post)</dt>
-                  <dd>
-                    {reviewedReady && reviewed ? (
-                      <>
-                        <p className="wa-caption" style={{ whiteSpace: "pre-wrap" }}>
-                          {reviewed.text}
-                        </p>
-                        <code>{reviewed.digest}</code>
-                      </>
-                    ) : (
-                      "Loading the reviewed caption…"
-                    )}
-                  </dd>
-                  <dt className="wa-kicker">Image digest</dt>
-                  <dd>
-                    {needsImport && media ? (
-                      <>
-                        <code>{media.digest}</code> · key <code>{media.key}</code>
-                      </>
-                    ) : (
-                      "text-only"
-                    )}
-                  </dd>
-                  <dt className="wa-kicker">Due</dt>
-                  <dd>{dueLabel(confirmation.epoch, PUBLISH_TIMEZONE)}</dd>
-                  <dt className="wa-kicker">Timezone</dt>
-                  <dd>{PUBLISH_TIMEZONE}</dd>
-                  <dt className="wa-kicker">Destination</dt>
-                  <dd>
-                    {toolkit} · {PILOT_DESTINATION.handle} ·{" "}
-                    <code>{PILOT_DESTINATION.account_id}</code>
-                  </dd>
-                  <dt className="wa-kicker">Grant · approval</dt>
-                  <dd>
-                    <code>{grantId}</code> · <code>{confirmation.approvalId}</code>
-                  </dd>
-                </dl>
+                <PublishConfirmation
+                  facts={{
+                    caption:
+                      reviewedReady && reviewed
+                        ? { text: reviewed.text, digest: reviewed.digest }
+                        : null,
+                    image:
+                      needsImport && media
+                        ? { digest: media.digest, label: "key", ref: media.key }
+                        : null,
+                    dueEpoch: confirmation.epoch,
+                    timezone: PUBLISH_TIMEZONE,
+                    toolkit,
+                    destinationId: PILOT_DESTINATION.account_id,
+                    grantId,
+                    approvalId: confirmation.approvalId,
+                  }}
+                />
                 <div className="wa-row">
                   <Button
                     variant="primary"
