@@ -1154,11 +1154,17 @@ impl Shared {
             "permission_used",
             json!({"argv": argv, "cwd": cwd, "use": out["use"].clone(), "code": out["code"].clone()}),
         );
+        // CAD-1076: a command that printed nothing says so — the notice
+        // never implies output the master should look for.
+        let silent = ["stdout", "stderr"]
+            .iter()
+            .all(|k| out[*k].as_str().unwrap_or("").trim().is_empty());
         self.tell_master(
             &format!("use/{}-{}", argv.join(" "), now),
             &format!(
-                "Ran approved command (exit {}): `{}`",
+                "Ran approved command (exit {}{}): `{}`",
                 out["code"].as_i64().unwrap_or(1),
+                if silent { ", no output" } else { "" },
                 argv.join(" ")
             ),
         );

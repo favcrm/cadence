@@ -180,6 +180,13 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/social-publishes/*/cancel",
         RouteClass::OperatorOnly,
     ),
+    // CAD-1041: the operator's send-now posts publicly — listed, never
+    // left to the unlisted default.
+    route(
+        "POST",
+        "/api/social-publishes/*/send-now",
+        RouteClass::OperatorOnly,
+    ),
     route(
         "POST",
         "/api/app-installations/*/approve",
@@ -2045,6 +2052,10 @@ mod tests {
         );
         assert_eq!(
             route_class("POST", "/api/issues/CAD-1/kickoff"),
+            RouteClass::OperatorOnly
+        );
+        assert_eq!(
+            route_class("POST", "/api/social-publishes/spub-1/send-now"),
             RouteClass::OperatorOnly
         );
         assert_eq!(

@@ -63,6 +63,9 @@ export interface PublishIntent {
   context_id: string | null;
   run_id: string;
   effect_id: string;
+  /** The reviewed artifact whose text the intent froze. Absent or null
+   *  (a legacy explicit-digest intent): send-now cannot confirm it. */
+  artifact_id?: string | null;
   state: PublishState;
   /** Channel is the request toolkit, echoed back. */
   channel: "instagram" | "facebook";
@@ -132,6 +135,7 @@ export function toPublishIntent(envelope: BackendIntent): PublishIntent {
     context_id: get("context_id"),
     run_id: get("run_id") as string,
     effect_id: get("effect_id") as string,
+    artifact_id: get("artifact_id"),
     state: state as PublishState,
     channel,
     destination_id: get("destination_id") as string,
@@ -197,6 +201,8 @@ const paths = {
   cancel: (intentId: string) =>
     `/api/social-publishes/${encodeURIComponent(intentId)}/cancel`,
   importMedia: () => "/api/social-media-imports",
+  sendNow: (intentId: string) =>
+    `/api/social-publishes/${encodeURIComponent(intentId)}/send-now`,
 };
 
 /** CAD-979 media import body: the approved run's provenance + scope only —
@@ -290,6 +296,16 @@ export const socialPublish = {
   cancel: async (intentId: string, installId: string, contextId: string | null) => {
     const body = { install_id: installId, ...(contextId ? { context_id: contextId } : {}) };
     const reply = await request<{ intent: BackendIntent }>(paths.cancel(intentId), undefined, body, CANCEL_KEYS);
+    return { intent: toPublishIntent(reply.intent) };
+  },
+  /** CAD-1041: the operator's explicit "send this queued intent now".
+   *  The daemon claims the named row by identity, stages it, dispatches
+   *  once and reconciles through status — one click, one provider call,
+   *  never another intent. A refused call leaves the row for a human.
+   *  Like cancel, it names the intent's own install and exact context. */
+  sendNow: async (intentId: string, installId: string, contextId: string | null) => {
+    const body = { install_id: installId, ...(contextId ? { context_id: contextId } : {}) };
+    const reply = await request<{ intent: BackendIntent }>(paths.sendNow(intentId), undefined, body, CANCEL_KEYS);
     return { intent: toPublishIntent(reply.intent) };
   },
 };
