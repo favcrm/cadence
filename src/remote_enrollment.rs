@@ -1301,6 +1301,46 @@ impl LoginGrant {
     }
 }
 
+/// What the login device poll needs from its environment: a monotonic
+/// clock, a wait and the public request/response transport
+/// (CAD-1124). Production always uses [`RealLoginRuntime`]; tests drive
+/// [`login_browser_with`] with a scripted in-memory one. The seam is
+/// private and `pub fn login_browser` constructs the real runtime itself
+/// — no caller, environment or remote input can ever select another.
+trait LoginRuntime {
+    fn now(&mut self) -> Instant;
+    fn wait(&mut self, interval: Duration);
+    fn post_public(
+        &mut self,
+        issuer: &str,
+        path: &str,
+        body: Value,
+        access: Option<&AccessIngress>,
+    ) -> Result<(u16, Value)>;
+}
+
+/// The production login runtime: the real monotonic clock, a real sleep
+/// and the real [`post_public_with_access`] transport, unchanged.
+struct RealLoginRuntime;
+
+impl LoginRuntime for RealLoginRuntime {
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+    fn wait(&mut self, interval: Duration) {
+        std::thread::sleep(interval);
+    }
+    fn post_public(
+        &mut self,
+        issuer: &str,
+        path: &str,
+        body: Value,
+        access: Option<&AccessIngress>,
+    ) -> Result<(u16, Value)> {
+        post_public_with_access(issuer, path, body, access)
+    }
+}
+
 /// `cadence login` (CAD-1019 slice 1b): the hosted-cadence device grant
 /// (PKCE, `hcd_` device code, `hct_` bridge) against the operator-pinned
 /// issuer. The operator names the workspace and slug; the request carries
@@ -1313,6 +1353,24 @@ pub fn login_browser(
     slug_value: &str,
     dir: &Path,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<LoginGrant> {
+    login_browser_with(
+        issuer,
+        org,
+        slug_value,
+        dir,
+        show_code,
+        &mut RealLoginRuntime,
+    )
+}
+
+fn login_browser_with(
+    issuer: &str,
+    org: &str,
+    slug_value: &str,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+    runtime: &mut dyn LoginRuntime,
 ) -> Result<LoginGrant> {
     let issuer = origin(issuer, cfg!(test))?;
     if !id(org) || !slug(slug_value) {
@@ -1329,7 +1387,7 @@ pub fn login_browser(
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(Sha256::digest(verifier.as_bytes()));
     confirm_access_ingress(dir, &issuer, &access)?;
-    let (status, code) = post_public_with_access(
+    let (status, code) = runtime.post_public(
         &issuer,
         "/v1/hosted-cadence/device/code",
         json!({"version":DEVICE_VERSION,"organization_id":org,"audience":audience,
@@ -1342,24 +1400,24 @@ pub fn login_browser(
     }
     let (device, user, verification, mut interval) = device_code(&code)?;
     show_code(verification, user)?;
-    let deadline = Instant::now() + Duration::from_secs(timestamp(&code, "expires_in")?);
+    let deadline = runtime.now() + Duration::from_secs(timestamp(&code, "expires_in")?);
     let expired = || reject("Hosted browser authorization expired; start again");
     let grant = loop {
-        if Instant::now() >= deadline {
+        if runtime.now() >= deadline {
             return Err(expired());
         }
-        std::thread::sleep(Duration::from_secs(interval));
-        if Instant::now() >= deadline {
+        runtime.wait(Duration::from_secs(interval));
+        if runtime.now() >= deadline {
             return Err(expired());
         }
         confirm_access_ingress(dir, &issuer, &access)?;
-        let (status, response) = post_public_with_access(
+        let (status, response) = runtime.post_public(
             &issuer,
             "/v1/hosted-cadence/device/token",
             json!({"device_code":device,"code_verifier":verifier}),
             access.as_ref(),
         )?;
-        if Instant::now() >= deadline {
+        if runtime.now() >= deadline {
             return Err(expired());
         }
         if status == 200 {
@@ -2882,42 +2940,133 @@ mod tests {
                 "token_type":"Bearer","issued_at":at,"expires_at":at+120,"renewal":"reexchange"}})
     }
 
-    /// Drive `login_browser` for slug `acme` against a loopback fake issuer
-    /// that enforces the real request contract, answers any `token_errors`
-    /// in order, then `grant`.
+    /// A scripted in-memory login issuer (CAD-1124): the same request
+    /// contract the loopback fixture enforced — device/code first, then
+    /// one device/token poll per `token_errors`, then the grant — plus a
+    /// virtual monotonic clock `wait` advances and records, so pending
+    /// and slow_down scheduling stays observable. No TCP and no wall
+    /// sleeps; every trust/PKCE/access/grant check in the real
+    /// implementation still runs.
+    struct ScriptedLogin {
+        grant: Option<Value>,
+        token_errors: Vec<&'static str>,
+        finished: bool,
+        /// Fixed baseline captured at construction; `now` is
+        /// `baseline + virtual_secs` — wall time never advances the
+        /// virtual clock.
+        baseline: Instant,
+        /// Virtual seconds elapsed since the runtime was created.
+        virtual_secs: u64,
+        /// Every `wait` interval observed, in order.
+        waits: Vec<u64>,
+        /// Requests received, in order — checked for exact script
+        /// consumption at the end of `run_login`.
+        requests: Vec<String>,
+    }
+
+    impl ScriptedLogin {
+        fn new(grant: Value, token_errors: Vec<&'static str>) -> Self {
+            let terminal = token_errors
+                .iter()
+                .position(|error| matches!(*error, "access_denied" | "expired_token"));
+            if let Some(index) = terminal {
+                assert_eq!(
+                    index + 1,
+                    token_errors.len(),
+                    "response after terminal error"
+                );
+            }
+            Self {
+                grant: terminal.is_none().then_some(grant),
+                token_errors,
+                finished: false,
+                baseline: Instant::now(),
+                virtual_secs: 0,
+                waits: Vec::new(),
+                requests: Vec::new(),
+            }
+        }
+    }
+
+    impl LoginRuntime for ScriptedLogin {
+        fn now(&mut self) -> Instant {
+            self.baseline + Duration::from_secs(self.virtual_secs)
+        }
+        fn wait(&mut self, interval: Duration) {
+            self.virtual_secs += interval.as_secs();
+            self.waits.push(interval.as_secs());
+        }
+        fn post_public(
+            &mut self,
+            issuer: &str,
+            path: &str,
+            body: Value,
+            access: Option<&AccessIngress>,
+        ) -> Result<(u16, Value)> {
+            assert_eq!(issuer, "https://issuer.scripted.test");
+            assert!(access.is_none(), "login script wrote no ingress");
+            assert!(!self.finished, "request after terminal login response");
+            self.requests.push(path.to_string());
+            if self.requests.len() == 1 {
+                assert_eq!(path, "/v1/hosted-cadence/device/code");
+                if !real_code_request_ok(&body)
+                    || body["organization_id"] != "ws_real"
+                    || body["audience"] != LOGIN_ENDPOINT
+                    || body["requested_capabilities"] != json!(["cli.read", "cli.write"])
+                {
+                    return Ok((400, json!({"error":"invalid_request"})));
+                }
+                return Ok((200, browser_code(60)));
+            }
+            assert_eq!(
+                path, "/v1/hosted-cadence/device/token",
+                "unexpected request order"
+            );
+            assert_eq!(body["device_code"], format!("hcd_{}", "A".repeat(43)));
+            assert_eq!(body["code_verifier"].as_str().unwrap().len(), 43);
+            if let Some(error) = self.token_errors.first().copied() {
+                self.token_errors.remove(0);
+                self.finished = matches!(error, "access_denied" | "expired_token");
+                return Ok((400, json!({"error":error})));
+            }
+            let grant = self.grant.take().expect("unexpected token request");
+            self.finished = true;
+            Ok((200, grant))
+        }
+    }
+
+    /// Drive `login_browser` for slug `acme` through the scripted
+    /// runtime: the issuer answers any `token_errors` in order, then
+    /// `grant`. Returns the outcome plus the recorded waits and request
+    /// order so pending/slow_down backoff stays observable.
     fn run_login(
         grant: Value,
         token_errors: Vec<&'static str>,
-    ) -> (Result<LoginGrant>, PathBuf, tempfile::TempDir) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let issuer = format!("http://{}", listener.local_addr().unwrap());
-        let server = thread::spawn(move || {
-            let (mut code, body) = public_request(&listener, "/v1/hosted-cadence/device/code");
-            if !real_code_request_ok(&body)
-                || body["organization_id"] != "ws_real"
-                || body["audience"] != LOGIN_ENDPOINT
-                || body["requested_capabilities"] != json!(["cli.read", "cli.write"])
-            {
-                respond_error(&mut code, "invalid_request");
-                return;
-            }
-            respond(&mut code, &browser_code(60));
-            for e in &token_errors {
-                let (mut token, _) = public_request(&listener, "/v1/hosted-cadence/device/token");
-                respond_error(&mut token, e);
-                if matches!(*e, "access_denied" | "expired_token") {
-                    return;
-                }
-            }
-            let (mut token, _) = public_request(&listener, "/v1/hosted-cadence/device/token");
-            respond(&mut token, &grant);
-        });
+    ) -> (
+        Result<LoginGrant>,
+        PathBuf,
+        tempfile::TempDir,
+        ScriptedLogin,
+    ) {
+        let issuer = "https://issuer.scripted.test";
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("e");
-        trust(&dir, &issuer);
-        let out = login_browser(&issuer, "ws_real", "acme", &dir, |_, _| Ok(()));
-        server.join().unwrap();
-        (out, dir, root)
+        trust(&dir, issuer);
+        let mut script = ScriptedLogin::new(grant, token_errors);
+        let expected_requests = 1 + script.token_errors.len() + usize::from(script.grant.is_some());
+        let out = login_browser_with(issuer, "ws_real", "acme", &dir, |_, _| Ok(()), &mut script);
+        assert!(
+            script.finished,
+            "login never consumed its terminal response"
+        );
+        assert!(script.grant.is_none(), "login never consumed its grant");
+        assert!(script.token_errors.is_empty(), "unconsumed login errors");
+        assert_eq!(
+            script.requests.len(),
+            expected_requests,
+            "unexpected poll count"
+        );
+        (out, dir, root, script)
     }
 
     fn assert_nothing_stored(dir: &Path) {
@@ -2941,7 +3090,16 @@ mod tests {
 
     #[test]
     fn login_sends_the_slug_audience_and_returns_the_verified_org() {
-        let (out, dir, _root) = run_login(login_grant_body(), vec![]);
+        let (out, dir, _root, script) = run_login(login_grant_body(), vec![]);
+        assert_eq!(
+            script.requests,
+            [
+                "/v1/hosted-cadence/device/code",
+                "/v1/hosted-cadence/device/token"
+            ]
+        );
+        // interval 5 from the device grant — one scheduled wait, no sleep.
+        assert_eq!(script.waits, [5]);
         let grant = out.unwrap();
         assert_eq!(
             (
@@ -2964,15 +3122,19 @@ mod tests {
 
     #[test]
     fn login_denied_expired_and_slow_down() {
-        let (out, dir, _r) = run_login(login_grant_body(), vec!["access_denied"]);
+        let (out, dir, _r, script) = run_login(login_grant_body(), vec!["access_denied"]);
         assert!(out.err().unwrap().to_string().contains("denied"));
         assert_nothing_stored(&dir);
-        let (out, dir, _r) = run_login(login_grant_body(), vec!["expired_token"]);
+        assert_eq!(script.requests.len(), 2, "denied login kept polling");
+        let (out, dir, _r, script) = run_login(login_grant_body(), vec!["expired_token"]);
         assert!(out.err().unwrap().to_string().contains("expired"));
         assert_nothing_stored(&dir);
-        // slow_down is not terminal: back off, then the grant lands.
-        let (out, _dir, _r) = run_login(login_grant_body(), vec!["slow_down"]);
+        assert_eq!(script.requests.len(), 2, "expired login kept polling");
+        // slow_down is not terminal: back off 5->10, then the grant lands.
+        let (out, _dir, _r, script) = run_login(login_grant_body(), vec!["slow_down"]);
         assert_eq!(out.unwrap().slug, "acme");
+        assert_eq!(script.waits, [5, 10], "slow_down backoff not applied");
+        assert_eq!(script.requests.len(), 3);
     }
 
     #[test]
@@ -2980,7 +3142,7 @@ mod tests {
         // `--org` asked for ws_real; the issuer answers for another one.
         let mut grant = login_grant_body();
         grant["organization_id"] = json!("ws_other");
-        let (out, dir, _r) = run_login(grant, vec![]);
+        let (out, dir, _r, _s) = run_login(grant, vec![]);
         assert!(out.is_err());
         assert_nothing_stored(&dir);
     }
@@ -2996,7 +3158,7 @@ mod tests {
         ] {
             let mut grant = login_grant_body();
             grant["audience"] = json!(audience);
-            let (out, dir, _r) = run_login(grant, vec![]);
+            let (out, dir, _r, _s) = run_login(grant, vec![]);
             assert!(out.is_err(), "{audience}");
             assert_nothing_stored(&dir);
         }
@@ -3035,7 +3197,7 @@ mod tests {
         let mut member = login_grant_body();
         member["principal"]["current_role"] = json!("member");
         for grant in [agent, member] {
-            let (out, dir, _r) = run_login(grant, vec![]);
+            let (out, dir, _r, _s) = run_login(grant, vec![]);
             assert!(out.is_err());
             assert_nothing_stored(&dir);
         }
