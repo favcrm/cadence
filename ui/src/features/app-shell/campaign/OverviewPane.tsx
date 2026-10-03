@@ -1,6 +1,8 @@
 import Button from "../../../ui/Button";
 import type { ContentDoc } from "../campaignGrammar";
+import Link from "../../../ui/Link";
 import type { SmtpBinding } from "../sendClient";
+import { EMAIL_SENDING_HREF, isHostedTransport, sendingFrom } from "../../settings/emailSendingView";
 import type { CampaignTab, FixTarget, ReadinessItem } from "./readiness";
 
 /** Jump to a panel on the Overview and move focus into it. */
@@ -30,7 +32,9 @@ export default function OverviewPane({
   onTab: (tab: CampaignTab) => void;
 }) {
   const done = items.filter((item) => item.done).length;
-  const go = (fix: FixTarget) => (fix.kind === "tab" ? onTab(fix.tab) : focusAnchor(fix.id));
+  const go = (fix: Exclude<FixTarget, { kind: "href" }>) =>
+    fix.kind === "tab" ? onTab(fix.tab) : focusAnchor(fix.id);
+  const from = sendingFrom(binding);
   return (
     <div className="crm-cgrid">
       <section aria-label="Ready to send" className="card px-4 py-4 grid gap-2" data-checklist>
@@ -50,11 +54,16 @@ export default function OverviewPane({
                 {item.label}
                 <span className="sr-only">{item.done ? " — done" : " — not done"}</span>
               </span>
-              {!item.done && item.fix !== null && (
+              {!item.done && item.fix !== null && item.fix.kind === "href" && (
+                <Button size="sm" className="crm-ready-go" href={item.fix.href}>
+                  {item.fix.label}
+                </Button>
+              )}
+              {!item.done && item.fix !== null && item.fix.kind !== "href" && (
                 <Button
                   size="sm"
                   className="crm-ready-go"
-                  onClick={() => go(item.fix as FixTarget)}
+                  onClick={() => go(item.fix as Exclude<FixTarget, { kind: "href" }>)}
                 >
                   {item.fix.label}
                 </Button>
@@ -62,6 +71,18 @@ export default function OverviewPane({
             </li>
           ))}
         </ul>
+        <p className="text-label" data-sending-status={from === null ? "unset" : "set"}>
+          {binding === undefined ? (
+            <span className="text-ink-500">Checking the sender…</span>
+          ) : from === null ? (
+            <Link href={EMAIL_SENDING_HREF}>Set up sending →</Link>
+          ) : (
+            <span className="text-ink-200">
+              Sending from {from}
+              {isHostedTransport(binding) ? " via AgenticOS" : ""} <span aria-hidden="true">✓</span>
+            </span>
+          )}
+        </p>
       </section>
       <section aria-label="Campaign summary" className="card px-4 py-4 grid gap-2">
         <h4 className="text-cardtitle font-medium text-ink-100">Summary</h4>
@@ -75,9 +96,9 @@ export default function OverviewPane({
             <dd>
               {binding === undefined
                 ? "Reading…"
-                : binding === null
+                : from === null
                   ? "No sender connected"
-                  : `${binding.sender.name} <${binding.sender.address}>`}
+                  : `${binding?.sender.name ?? ""} <${from}>`.trim()}
             </dd>
           </div>
           <div>
