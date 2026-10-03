@@ -131,7 +131,14 @@ struct ContentSave {
     subject: String,
     #[serde(default)]
     preheader: String,
-    blocks: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocks: Option<Value>,
+    /// CAD-1056: pasted HTML, sanitised by the host. The daemon
+    /// enforces exactly one of `blocks` / `html`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    html: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_revision: Option<u64>,
 }
@@ -259,8 +266,16 @@ pub(super) fn handle(
                 "install_id": install, "context_id": context,
                 "campaign_id": body.campaign_id,
                 "subject": body.subject, "preheader": body.preheader,
-                "blocks": body.blocks,
             });
+            if let Some(blocks) = body.blocks {
+                params["blocks"] = blocks;
+            }
+            if let Some(html) = body.html {
+                params["html"] = Value::String(html);
+            }
+            if let Some(text) = body.text {
+                params["text"] = Value::String(text);
+            }
             if let Some(expected) = body.expected_revision {
                 params["expected_revision"] = match revision(expected) {
                     Ok(value) => value.into(),
@@ -615,12 +630,19 @@ mod tests {
             r#"{"campaign_id":"launch-1","subject":"Hi","blocks":[]}"#
         )
         .is_ok());
+        // CAD-1056: pasted HTML and a text override are body fields;
+        // the daemon refuses a body with both or neither of blocks/html.
+        assert!(serde_json::from_str::<ContentSave>(
+            r#"{"campaign_id":"launch-1","subject":"Hi","html":"<p>x</p>","text":"x","expected_revision":1}"#
+        )
+        .is_ok());
         for body in [
             r#"{"campaign_id":"launch-1","subject":"Hi","blocks":[],"install_id":"other"}"#,
             r#"{"campaign_id":"launch-1","subject":"Hi","blocks":[],"by":"operator"}"#,
             r#"{"campaign_id":"launch-1","subject":"Hi","blocks":[],"project":"client"}"#,
-            r#"{"campaign_id":"launch-1","subject":"Hi"}"#,
             r#"{"campaign_id":"launch-1","subject":"Hi","blocks":[],"actor":"op"}"#,
+            r#"{"campaign_id":"launch-1","subject":"Hi","html":"<p>x</p>","actor":"op"}"#,
+            r#"{"campaign_id":"launch-1","subject":"Hi","html":"<p>x</p>","content_digest":"d"}"#,
         ] {
             assert!(
                 serde_json::from_str::<ContentSave>(body).is_err(),

@@ -37,6 +37,8 @@ const SAVE_KEYS = [
   "subject",
   "preheader",
   "blocks",
+  "html",
+  "text",
   "expected_revision",
 ] as const;
 const RENDER_KEYS = ["revision", "sample_first_name", "binding_id"] as const;
@@ -177,13 +179,22 @@ async function get<T>(path: string): Promise<T> {
   return value as T;
 }
 
-export interface ContentDraftInput {
+/**
+ * CAD-1056 operator save: exactly one of `blocks` (structured) or
+ * `html` (pasted; the host sanitises it and stores only the result),
+ * plus an optional plain-text override. The host always appends the
+ * unsubscribe footer and any save resets approval.
+ */
+export type ContentDraftInput = {
   campaignId: string;
   subject: string;
   preheader?: string;
-  blocks: ContentBlock[];
+  text?: string;
   expectedRevision?: number;
-}
+} & (
+  | { blocks: ContentBlock[]; html?: never }
+  | { html: string; blocks?: never }
+);
 
 export interface ProposalInput {
   campaignId: string;
@@ -199,13 +210,20 @@ export interface ProposalInput {
 export const contentClient = {
   paths: contentPaths,
   save(scope: ContentScope, input: ContentDraftInput): Promise<unknown> {
-    assertInputClean(input as unknown as Record<string, unknown>, ["campaignId", "subject", "preheader", "blocks", "expectedRevision"], "save");
+    assertInputClean(input as unknown as Record<string, unknown>, ["campaignId", "subject", "preheader", "blocks", "html", "text", "expectedRevision"], "save");
+    if ((input.blocks === undefined) === (input.html === undefined)) {
+      throw new ApiError("content save needs exactly one of blocks or html", 400, {
+        code: "invalid_body",
+      });
+    }
     const body: Record<string, unknown> = {
       campaign_id: input.campaignId,
       subject: input.subject,
       preheader: input.preheader ?? "",
-      blocks: input.blocks,
     };
+    if (input.blocks !== undefined) body.blocks = input.blocks;
+    if (input.html !== undefined) body.html = input.html;
+    if (input.text !== undefined) body.text = input.text;
     if (input.expectedRevision !== undefined) body.expected_revision = input.expectedRevision;
     assertClean(body, SAVE_KEYS, "save");
     return post(contentPaths.savePath(scope), body);

@@ -367,6 +367,11 @@ pub struct Draft {
     pub subject: String,
     pub preheader: String,
     pub blocks: Vec<Block>,
+    /// CAD-1056: host-sanitised operator HTML body. When set it
+    /// replaces `blocks` (kept empty) at render time.
+    pub html: Option<String>,
+    /// CAD-1056: operator plain-text override; generated when absent.
+    pub text: Option<String>,
 }
 
 impl Draft {
@@ -397,7 +402,50 @@ impl Draft {
             subject: subject.to_string(),
             preheader: preheader.to_string(),
             blocks: parsed,
+            html: None,
+            text: None,
         })
+    }
+
+    /// CAD-1056: an operator draft whose body is pasted HTML. The
+    /// HTML is sanitised here, so a `Draft` never holds raw markup.
+    pub fn parse_html(subject: &str, preheader: &str, html: &str) -> Result<Self> {
+        reject_subject(subject)?;
+        reject_preheader(preheader)?;
+        let clean = super::app_content_html::sanitize_html(html)?;
+        let mut tokens = validate_tokens(subject, 0)?;
+        tokens = validate_tokens(preheader, tokens)?;
+        validate_tokens(&clean, tokens)?;
+        Ok(Self {
+            subject: subject.to_string(),
+            preheader: preheader.to_string(),
+            blocks: Vec::new(),
+            html: Some(clean),
+            text: None,
+        })
+    }
+
+    /// CAD-1056: attach an optional plain-text override. It is bound,
+    /// control-free, token-checked and may not carry the host footer.
+    pub fn with_text(mut self, text: Option<&str>) -> Result<Self> {
+        let Some(text) = text else {
+            return Ok(self);
+        };
+        const BAD: &str = "email plain text exceeds its supported shape or bounds";
+        if text.trim().is_empty()
+            || text.len() > super::app_content_html::TEXT_OVERRIDE_BYTES
+            || text
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+            || text
+                .to_ascii_lowercase()
+                .contains(&FOOTER_NOTE.to_ascii_lowercase())
+        {
+            return Err(Error::rejected(BAD));
+        }
+        validate_tokens(text, 0)?;
+        self.text = Some(text.to_string());
+        Ok(self)
     }
 
     fn canonical_blocks(&self) -> Value {
@@ -581,6 +629,11 @@ fn render_html(draft: &Draft, sample: Option<&str>, binding: &BindingView) -> St
     // the 600px desktop measure but cap it as a style (never a fixed
     // attribute) so the column fills the frame at narrower widths.
     out.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td align=\"center\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#ffffff;max-width:600px;margin:24px auto;\"><tr><td style=\"padding:32px;font-family:Arial,sans-serif;color:#222222;\">");
+    if let Some(html) = &draft.html {
+        // Sanitised at save time; the sample name and fallbacks are
+        // alphabetic by grammar, so substitution cannot add markup.
+        out.push_str(&personalize(html, sample));
+    }
     for block in &draft.blocks {
         match block {
             Block::Heading { text } => {
@@ -624,7 +677,19 @@ fn render_text(draft: &Draft, sample: Option<&str>, binding: &BindingView) -> St
         out.push('\n');
     }
     out.push('\n');
+    if let Some(text) = &draft.text {
+        out.push_str(&personalize(text, sample));
+        out.push_str("\n\n");
+    } else if let Some(html) = &draft.html {
+        out.push_str(&super::app_content_html::html_to_text(&personalize(
+            html, sample,
+        )));
+        out.push_str("\n\n");
+    }
     for block in &draft.blocks {
+        if draft.text.is_some() {
+            break;
+        }
         match block {
             Block::Heading { text } => {
                 out.push_str(&personalize(text, sample));
@@ -660,7 +725,7 @@ fn content_digest(
     revision: i64,
     draft: &Draft,
 ) -> String {
-    material_digest(&json!({
+    let mut doc = json!({
         "domain": "cadence-app-content-v1",
         "install_id": install,
         "context_id": context,
@@ -669,7 +734,16 @@ fn content_digest(
         "subject": draft.subject,
         "preheader": draft.preheader,
         "blocks": draft.canonical_blocks(),
-    }))
+    });
+    // CAD-1056: present only when set, so every earlier digest is
+    // unchanged and a body or text change always changes the digest.
+    if let Some(html) = &draft.html {
+        doc["html"] = json!(html);
+    }
+    if let Some(text) = &draft.text {
+        doc["text_override"] = json!(text);
+    }
+    material_digest(&doc)
 }
 
 fn proposal_digest(
@@ -712,6 +786,8 @@ struct ContentRow {
     digest: String,
     approval_revision: Option<i64>,
     approval_digest: Option<String>,
+    html: Option<String>,
+    text: Option<String>,
 }
 
 struct ProposalRow {
@@ -840,7 +916,7 @@ impl RecordStore {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(campaign, "campaign ID")?;
         conn.query_row(
-            "SELECT revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest FROM app_content_docs WHERE context_id=? AND campaign_id=?",
+            "SELECT revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,html,text_override FROM app_content_docs WHERE context_id=? AND campaign_id=?",
             params![context, campaign],
             |r| {
                 let blocks: String = r.get(3)?;
@@ -853,6 +929,8 @@ impl RecordStore {
                     digest: r.get(4)?,
                     approval_revision: r.get(5)?,
                     approval_digest: r.get(6)?,
+                    html: r.get(7)?,
+                    text: r.get(8)?,
                 })
             },
         )
@@ -871,6 +949,9 @@ impl RecordStore {
             "subject": row.subject,
             "preheader": row.preheader,
             "blocks": row.blocks,
+            "mode": if row.html.is_some() { "html" } else { "blocks" },
+            "html": row.html,
+            "text_override": row.text,
             "content_digest": row.digest,
             "approval": {
                 "revision": row.approval_revision,
@@ -935,15 +1016,15 @@ impl RecordStore {
         let digest = content_digest(self.install(), context, campaign, revision, draft);
         if current.is_none() {
             tx.execute(
-                "INSERT INTO app_content_docs(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,actor,created,updated) VALUES(?,?,?,?,?,?,?,NULL,NULL,'operator',?,?)",
-                params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now(), now()],
+                "INSERT INTO app_content_docs(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,actor,created,updated,html,text_override) VALUES(?,?,?,?,?,?,?,NULL,NULL,'operator',?,?,?,?)",
+                params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now(), now(), draft.html, draft.text],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
         } else {
             let changed = tx
                 .execute(
-                    "UPDATE app_content_docs SET revision=?,subject=?,preheader=?,blocks=?,content_digest=?,approval_revision=NULL,approval_digest=NULL,actor='operator',updated=? WHERE context_id=? AND campaign_id=? AND revision=?",
-                    params![revision, draft.subject, draft.preheader, blocks_text, digest, now(), context, campaign, current],
+                    "UPDATE app_content_docs SET revision=?,subject=?,preheader=?,blocks=?,content_digest=?,approval_revision=NULL,approval_digest=NULL,actor='operator',updated=?,html=?,text_override=? WHERE context_id=? AND campaign_id=? AND revision=?",
+                    params![revision, draft.subject, draft.preheader, blocks_text, digest, now(), draft.html, draft.text, context, campaign, current],
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
             if changed != 1 {
@@ -951,8 +1032,8 @@ impl RecordStore {
             }
         }
         tx.execute(
-            "INSERT INTO app_content_revisions(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,actor,origin,proposal_id,at) VALUES(?,?,?,?,?,?,?,'operator','operator',NULL,?)",
-            params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now()],
+            "INSERT INTO app_content_revisions(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,actor,origin,proposal_id,at,html,text_override) VALUES(?,?,?,?,?,?,?,'operator','operator',NULL,?,?,?)",
+            params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now(), draft.html, draft.text],
         )
         .map_err(|e| Error::internal(e.to_string()))?;
         tx.commit().map_err(|e| Error::internal(e.to_string()))?;
@@ -1011,11 +1092,19 @@ impl RecordStore {
             if wanted != row.revision {
                 // Immutable history: fetch the exact requested
                 // revision; anything else is stale, not approximate.
-                let (subject, preheader, blocks, digest): (String, String, String, String) = conn
+                type Hist = (
+                    String,
+                    String,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                );
+                let (subject, preheader, blocks, digest, html, text): Hist = conn
                     .query_row(
-                        "SELECT subject,preheader,blocks,content_digest FROM app_content_revisions WHERE context_id=? AND campaign_id=? AND revision=?",
+                        "SELECT subject,preheader,blocks,content_digest,html,text_override FROM app_content_revisions WHERE context_id=? AND campaign_id=? AND revision=?",
                         params![context, campaign, wanted],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
                     )
                     .optional()
                     .map_err(|e| Error::internal(e.to_string()))?
@@ -1039,6 +1128,8 @@ impl RecordStore {
                     subject,
                     preheader,
                     blocks: parsed,
+                    html,
+                    text,
                 };
                 return Ok((wanted, draft, digest));
             }
@@ -1061,6 +1152,8 @@ impl RecordStore {
                 subject: row.subject,
                 preheader: row.preheader,
                 blocks: parsed,
+                html: row.html,
+                text: row.text,
             },
             row.digest,
         ))
@@ -1260,6 +1353,32 @@ impl RecordStore {
         let conn = self.conn();
         let record = self.binding_record(&conn, context, binding_id)?;
         Ok(json!({"binding": self.binding_json(context, &record)}))
+    }
+
+    /// CAD-1056: the host's own unsubscribe URL shapes for this
+    /// context — the preview base and every saved binding base —
+    /// so operator HTML cannot link to them.
+    pub fn app_unsubscribe_endpoints(
+        &self,
+        context: &str,
+    ) -> Result<Vec<super::app_content_html::HostEndpoint>> {
+        use super::app_content_html::HostEndpoint;
+        crate::proto::identifier(context, "context ID")?;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT unsubscribe_base FROM app_sender_bindings WHERE context_id=?")
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let bases = stmt
+            .query_map(params![context], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let mut out: Vec<HostEndpoint> = HostEndpoint::binding(UNSUBSCRIBE_BASE)
+            .into_iter()
+            .collect();
+        for base in bases {
+            let base = base.map_err(|e| Error::internal(e.to_string()))?;
+            out.extend(HostEndpoint::binding(&base));
+        }
+        Ok(out)
     }
 
     pub fn app_sender_binding_list(&self, context: &str) -> Result<Value> {
@@ -2060,6 +2179,8 @@ impl RecordStore {
             subject: proposal.subject.clone(),
             preheader: proposal.preheader.clone(),
             blocks,
+            html: None,
+            text: None,
         };
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
@@ -2111,7 +2232,7 @@ impl RecordStore {
         } else {
             let changed = tx
                 .execute(
-                    "UPDATE app_content_docs SET revision=?,subject=?,preheader=?,blocks=?,content_digest=?,approval_revision=NULL,approval_digest=NULL,actor='operator',updated=? WHERE context_id=? AND campaign_id=? AND revision=?",
+                    "UPDATE app_content_docs SET revision=?,subject=?,preheader=?,blocks=?,content_digest=?,approval_revision=NULL,approval_digest=NULL,actor='operator',updated=?,html=NULL,text_override=NULL WHERE context_id=? AND campaign_id=? AND revision=?",
                     params![revision, draft.subject, draft.preheader, stored, content_digest, now(), context, proposal.campaign, current],
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
@@ -2495,5 +2616,21 @@ mod tests {
         // Content still renders through the new table shape.
         assert!(html.contains("Hello Amina"), "{html}");
         assert!(html.contains("https://example.com/x"), "{html}");
+    }
+
+    /// CAD-1056: the digest binds the HTML body and the text override,
+    /// so approval can never carry across a changed body.
+    #[test]
+    fn digest_binds_html_and_text_override() {
+        let digest = |draft: &Draft| content_digest("i", "c", "k", 1, draft);
+        let a = Draft::parse_html("Hi", "", "<p>one</p>").unwrap();
+        let b = Draft::parse_html("Hi", "", "<p>two</p>").unwrap();
+        assert_ne!(digest(&a), digest(&b));
+        let with_text = a.clone().with_text(Some("plain")).unwrap();
+        assert_ne!(digest(&a), digest(&with_text));
+        assert_ne!(
+            digest(&with_text),
+            digest(&a.clone().with_text(Some("other")).unwrap())
+        );
     }
 }
