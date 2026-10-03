@@ -35,6 +35,19 @@ Modes (argv[1]):
   /model gate's verification exists to catch (CAD-551's set_model is
   held to open()'s rule).
 
+- `gateway-cap` (CAD-1076): mirrors the AgenticOS gateway's request
+  schema, whose `messages` array is capped (100 there, GATEWAY_CAP
+  here). The fake counts what Pi would send — the system prompt, each
+  prompt, each assistant message and each tool result — and a model
+  call over the cap ends the turn with the gateway's exact 400, before
+  any work, until `new_session` resets the history. A prompt with
+  "run empty tool" runs a tool whose result has no content (the Demo
+  "(no output)" shape). `gateway-always` refuses every model call;
+  `gateway-stuck` also refuses `new_session`.
+  In any mode, a prompt containing `fake-fail <key>` ends with the
+  provider error FAIL_SHAPES[key] (a 429, a 5xx, a credential error, the
+  exact gateway 400) — the shapes a session reset must tell apart.
+
 When CADENCE_ALIAS is `master` the fake also records what the launch
 actually delivered — `pi-argv.json` (sys.argv tail, i.e. every flag the
 adapter put on the provider) and `pi-env.json` (sorted environment
@@ -242,6 +255,20 @@ MODELS = [
      "contextWindow": 200000},
 ]
 usage = {"tokens": 42000, "contextWindow": 200000}
+GATEWAY_CAP = {"gateway-cap": 12, "gateway-always": 0, "gateway-stuck": 0}.get(MODE)
+GATEWAY_400 = ('400 {"message":"Unsupported or malformed text request.",'
+               '"type":"invalid_request_error","code":"invalid_request"}')
+history = 1  # the system prompt
+FAIL_SHAPES = {
+    "429": '429 {"error":{"message":"Rate limited","type":"rate_limit_error","code":"rate_limited"}}',
+    "502": '502 {"error":{"message":"The model provider could not complete the call.","type":"server_error","code":"upstream_unavailable"}}',
+    "auth": "No API key found for agenticos. Use /login to sign in.",
+    "gateway400": GATEWAY_400,
+    "gateway400colon": GATEWAY_400.replace("400 ", "400: ", 1),
+    # Both substrings, neither the gateway's status nor its code.
+    "loose400": '400 {"message":"invalid_request in tool schema","code":"invalid_tools"}',
+    "invalid500": '500 {"error":{"message":"x","code":"invalid_request"}}',
+}
 live_turn = False
 pending_dialog = None
 
@@ -278,25 +305,41 @@ def respond(req_id, command, success, data=None, error=None):
     emit(out)
 
 
-def assistant_message(text, stop="stop"):
-    return {
+def assistant_message(text, stop="stop", error=None):
+    message = {
         "role": "assistant",
         "content": [{"type": "text", "text": text}],
         "stopReason": stop,
         "usage": {"input": 1, "output": 1, "totalTokens": 2},
     }
+    if error is not None:
+        message["errorMessage"] = error
+    return message
 
 
-def finish_turn(stop="stop", text=""):
-    emit({"type": "message_end", "message": assistant_message(text, stop)})
-    emit({"type": "turn_end", "message": assistant_message(text, stop), "toolResults": []})
+def finish_turn(stop="stop", text="", error=None):
+    message = assistant_message(text, stop, error)
+    emit({"type": "message_end", "message": message})
+    emit({"type": "turn_end", "message": message, "toolResults": []})
     emit({"type": "agent_end", "messages": [], "willRetry": False})
     emit({"type": "agent_settled"})
 
 
-def run_prompt(message):
+def gateway_refused():
+    """One model call: refused with the gateway's 400 when the history
+    it would carry is over the cap (CAD-1076)."""
     global live_turn
+    if GATEWAY_CAP is None or history <= GATEWAY_CAP:
+        return False
+    live_turn = False
+    finish_turn("error", "", GATEWAY_400)
+    return True
+
+
+def run_prompt(message):
+    global live_turn, history
     live_turn = True
+    history += 1
     emit({"type": "agent_start"})
     emit({"type": "turn_start"})
     emit({"type": "message_start", "message": {"role": "assistant"}})
@@ -306,6 +349,23 @@ def run_prompt(message):
         # the daemon actually delivered (envelope lines included).
         reply = "fake-pi prompt: " + message
     slow = MODE == "slow"  # CAD-551: a visible turn for the working row
+    # Exact token after "fake-fail ": no key may shadow another.
+    words = message.split()
+    for i, word in enumerate(words[:-1]):
+        if word == "fake-fail" and words[i + 1] in FAIL_SHAPES:
+            live_turn = False
+            finish_turn("error", "", FAIL_SHAPES[words[i + 1]])
+            return
+    if gateway_refused():
+        return
+    if "run empty tool" in message:
+        emit({"type": "tool_execution_start", "toolCallId": "call_e",
+              "toolName": "bash", "args": {"command": "cadence status"}})
+        emit({"type": "tool_execution_end", "toolCallId": "call_e",
+              "toolName": "bash", "result": {"content": []}, "isError": False})
+        history += 2
+        if gateway_refused():
+            return
     if "run tool" in message:
         emit({
             "type": "tool_execution_start",
@@ -329,6 +389,9 @@ def run_prompt(message):
             "result": {"content": [{"type": "text", "text": "ok: 1 agent"}]},
             "isError": False,
         })
+        history += 2
+        if gateway_refused():
+            return
     for chunk in [reply[: len(reply) // 2], reply[len(reply) // 2 :]]:
         emit({
             "type": "message_update",
@@ -340,11 +403,12 @@ def run_prompt(message):
     if slow:
         time.sleep(1.6)
     live_turn = False
+    history += 1
     finish_turn("stop", reply)
 
 
 def main():
-    global pending_dialog
+    global pending_dialog, history
     if MODE == "dialog":
         pending_dialog = "dlg-1"
         emit({
@@ -445,6 +509,10 @@ def main():
             respond(rid, "compact", True,
                     data={"compacted": True, "tokensAfter": usage["tokens"]})
         elif rtype == "new_session":
+            if MODE == "gateway-stuck":
+                respond(rid, "new_session", False, error="synthetic new_session failure")
+                continue
+            history = 1
             state["sessionId"] = "fakepi-session-{}-{}".format(
                 os.getpid(), int(time.time()))
             respond(rid, "new_session", True,
