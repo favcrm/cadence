@@ -554,17 +554,24 @@ impl Shared {
                 driver.fail(&format!("lease fenced mid-tick: {reason}"));
                 return;
             }
-            if !self
-                .store
-                .social_publish_material_current(&cid)
-                .unwrap_or(false)
-            {
-                self.end_report_at(
-                    &cid,
-                    "held",
-                    &json!({"reason": "approved material changed since freeze"}),
-                );
-                continue;
+            // A failed read is not a material change: record it and back
+            // off, never send. The unsent row stays `processing` and
+            // reconcile ends it (send-now's `?` leaves it the same way).
+            match self.store.social_publish_material_current(&cid) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.end_report_at(
+                        &cid,
+                        "held",
+                        &json!({"reason": "approved material changed since freeze"}),
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    driver.note_error(&cid, &Refusal::new("store_error", e.to_string()));
+                    backoff.insert(cid, (driver.clock)() + BACKOFF_MIN_SECS as i64);
+                    continue;
+                }
             }
             match self.dispatch_claimed(&cid, claimed) {
                 Ok(_envelope) => {
