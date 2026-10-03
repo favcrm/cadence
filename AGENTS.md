@@ -244,6 +244,31 @@ not reduce the protected contracts or merge gates. A replacement PR must:
    admission/runner waits and workflow wall time, and list residual unprotected
    contracts. Diagnose fixture failures rather than masking them with retries.
 
+#### Emergency clean-slate transition
+
+When the operator wants to retire the legacy suite without waiting for a full
+replacement, an explicit operator-approved ticket may declare a time-bounded
+transition and its merge gate. The declaration must name the deleted test scope,
+the reduced checks allowed to merge, residual controls, duration and how the
+normal gates return. An agent or PR may not grant that exception to itself.
+
+- During the window, an approved PR may remove the named legacy tests and merge
+  through only the approved reduced gate. The exception does not delete
+  production effects, authorization or enforcement code; it changes which
+  retained tests and required checks may be suspended for the named scope.
+- Changes merged under the transition must not produce release or production
+  artifacts, and cleanup cannot depend on unverified state. A check that still
+  protects a residual control remains mandatory; unknown or uncontrollable
+  effects stay outside the window.
+- Every reduced-gate PR still identifies the intended behavior and residual
+  unprotected contracts, records executed checks and limitations, and receives
+  the reviews/approval its own diff requires. A temporary gate cannot waive
+  the risk classification itself.
+- At expiry the declared restore criteria apply: the replacement behavior
+  checks or the restored mandatory controls must be present before ordinary
+  delivery resumes. The exception is evidence for a controlled transition, not
+  proof that the removed coverage was safe or equivalent.
+
 ### Checks: trust exit codes, not filtered text
 - A shell hook routes commands through `rtk`, which can print "clean" or
   nothing at all when a check really failed. It has hidden a
