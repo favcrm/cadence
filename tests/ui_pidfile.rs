@@ -4,7 +4,9 @@
 //! Every board here gets a port from 3110-3199, written to `ui.json`
 //! before any pid is planted and passed as `--port`, so nothing can reach
 //! the production board on 3010. Every process this file spawns is killed
-//! by a drop guard, a failed assertion included.
+//! by a drop guard, a failed assertion included: the board guard falls
+//! back to SIGKILL on the pid `ui start` returned, so a regression in the
+//! pid identity code cannot strand a board.
 
 use cadence_agent::reaper;
 use serde_json::Value;
@@ -86,18 +88,65 @@ impl Host {
     }
 }
 
-/// Stops this host's board on drop, a failed assertion included.
-struct Board<'a>(&'a Host);
+/// Stops this host's board on drop, a failed assertion included. `ui
+/// stop` runs through the identity code under test, so a regression
+/// there can strand the board: whatever pid survives that is then
+/// SIGKILLed directly, if it still belongs to this test's root.
+struct Board<'a> {
+    host: &'a Host,
+    pid: std::cell::Cell<Option<i32>>,
+}
+
+impl<'a> Board<'a> {
+    fn new(host: &'a Host) -> Self {
+        Self {
+            host,
+            pid: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Record the pid `ui start` returned.
+    fn track(&self, out: &Value) -> i32 {
+        let pid = out["pid"].as_i64().unwrap() as i32;
+        self.pid.set(Some(pid));
+        pid
+    }
+
+    /// Is `pid` a process of this test's root (argv or cwd)?
+    fn is_ours(&self, pid: i32) -> bool {
+        let root = self.host.root.path();
+        let argv = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let argv_hit = String::from_utf8_lossy(&argv).contains(root.to_str().unwrap());
+        let cwd_hit =
+            std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|c| c.starts_with(root));
+        argv_hit || cwd_hit
+    }
+}
 
 impl Drop for Board<'_> {
     fn drop(&mut self) {
+        let h = self.host;
         let mut cmd = Command::new(BINARY);
         cmd.arg("--state-dir")
-            .arg(&self.0.state)
+            .arg(&h.state)
             .args(["ui", "stop"])
-            .env("HOME", self.0.root.path().join("home"))
-            .env("CADENCE_PM_DIR", self.0.root.path().join("pm"));
+            .current_dir(h.root.path())
+            .env("HOME", h.root.path().join("home"))
+            .env("XDG_STATE_HOME", h.root.path().join("home"))
+            .env("CADENCE_PM_DIR", h.root.path().join("pm"))
+            .env_remove("CADENCE_STATE_DIR")
+            .env_remove("CADENCE_ALIAS");
         let _ = reaper::output(&mut cmd);
+        if let Some(pid) = self.pid.get() {
+            if alive(pid) && self.is_ours(pid) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                // The board is detached (not our child): wait for it to go.
+                let until = Instant::now() + Duration::from_secs(5);
+                while alive(pid) && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
     }
 }
 
@@ -126,15 +175,16 @@ impl Drop for Bystander {
 /// board. `ui start` starts the board anyway and `ui status` reports it.
 #[test]
 fn stale_live_pid_does_not_block_ui_start() {
-    let host = Host::new(test_port());
-    let port = test_port().to_string();
-    let _board = Board(&host);
+    let port = test_port();
+    let host = Host::new(port);
+    let port = port.to_string();
+    let board = Board::new(&host);
     let bystander = Bystander::new();
     host.plant_pid(bystander.0.id());
 
     let out = host.ui(&["start", "--port", &port]);
     assert_eq!(out["state"], "started", "{out}");
-    let board = out["pid"].as_i64().unwrap();
+    let board = board.track(&out) as i64;
     assert_ne!(board, bystander.pid() as i64);
 
     let out = host.ui(&["status"]);
@@ -166,7 +216,7 @@ fn ui_stop_never_signals_a_non_board_pid() {
 fn relative_state_dir_board_is_found_and_stopped_from_another_cwd() {
     let host = Host::new(test_port());
     let port = test_port().to_string();
-    let _board = Board(&host);
+    let guard = Board::new(&host);
 
     let out = host.cadence(
         Path::new("st"),
@@ -174,7 +224,7 @@ fn relative_state_dir_board_is_found_and_stopped_from_another_cwd() {
         &["ui", "start", "--port", &port],
     );
     assert_eq!(out["state"], "started", "{out}");
-    let board = out["pid"].as_i64().unwrap() as i32;
+    let board = guard.track(&out);
 
     let elsewhere = TempDir::new().unwrap();
     let out = host.cadence(&host.state, elsewhere.path(), &["ui", "status"]);
