@@ -1,16 +1,41 @@
 #!/bin/bash
-# CAD-1090: run every cargo test target (scripts/result-test-args) the same
-# way in CI and in `scripts/pre-push --tests`.
+# CAD-1090/CAD-1105: run every cargo test target (scripts/result-test-args)
+# and the lib unit tests the same way in CI and in `scripts/pre-push --tests`.
 #  - --features test-seam: some targets are cfg(feature = "test-seam") and
 #    would otherwise run 0 tests and pass.
 #  - fails when any selected target reports `running 0 tests`.
-#  - --no-fail-fast: every target reports, not just the first red one.
+#  - --no-fail-fast: every target reports, not just the first red one; the
+#    lib suite runs even when an integration target failed.
 #  - HOME/XDG/TMPDIR are private; toolchain homes pass through.
+#  - CARGO_TARGET_DIR is handed to cargo as CARGO_BUILD_TARGET_DIR, so the
+#    build lands in the same place but code under test that reads
+#    CARGO_TARGET_DIR (src/worktree.rs) sees a clean environment.
+#  - the lib suite runs with PATH limited to the cargo toolchain dir and the
+#    system dirs, and refuses to start if a provider CLI still resolves:
+#    `doctor::run` probes every registry provider with `--version`, and a
+#    host CLI writes under HOME and makes the result depend on the host.
 set -euo pipefail
+caller_cwd=$PWD
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 targets=$("$root/scripts/result-test-args")
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  case $CARGO_TARGET_DIR in
+    /*) CARGO_BUILD_TARGET_DIR=$CARGO_TARGET_DIR ;;
+    *) CARGO_BUILD_TARGET_DIR=$caller_cwd/$CARGO_TARGET_DIR ;;
+  esac
+  export CARGO_BUILD_TARGET_DIR
+fi
+unset CARGO_TARGET_DIR
+cargo_bin=$(command -v cargo) || { echo "::error::cargo is not on PATH" >&2; exit 1; }
+lib_path="$(dirname "$cargo_bin"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+for cli in claude codex cursor-agent cursor agent devin pi gemini; do
+  if found=$(PATH=$lib_path command -v "$cli"); then
+    echo "::error::provider CLI $cli resolves on the lib suite PATH ($found)" >&2
+    exit 1
+  fi
+done
 scratch=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/result-tests.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/xdg-config" \
@@ -18,11 +43,24 @@ export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/xdg-config" \
        XDG_CACHE_HOME="$scratch/xdg-cache" TMPDIR="$scratch/tmp"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
 export CADENCE_SUITE_LOCK="${CADENCE_SUITE_LOCK:-$scratch/cadence-suite.lock}"
+status=0
+
+# Fails when a target ran 0 tests (cfg-gated off?) or none reported at all.
+zero_guard() {
+  if grep -q '^running 0 tests' "$1" || ! grep -q '^running [1-9]' "$1"; then
+    echo "::error::$2: a selected test target ran 0 tests (cfg-gated off?)" >&2
+    status=1
+  fi
+}
+
 echo "integration targets:" $(echo "$targets" | grep -v '^--test$')
-log="$scratch/out.log"
 # shellcheck disable=SC2086
-cargo test --locked --features test-seam --no-fail-fast $targets -- --test-threads 2 2>&1 | tee "$log"
-if grep -q '^running 0 tests' "$log"; then
-  echo "::error::a selected test target ran 0 tests (cfg-gated off?)" >&2
-  exit 1
-fi
+cargo test --locked --features test-seam --no-fail-fast $targets -- --test-threads 2 \
+  2>&1 | tee "$scratch/integration.log" || status=1
+zero_guard "$scratch/integration.log" integration
+
+echo "lib suite PATH: $lib_path"
+PATH=$lib_path cargo test --locked --features test-seam --lib --no-fail-fast -- --test-threads 2 \
+  2>&1 | tee "$scratch/lib.log" || status=1
+zero_guard "$scratch/lib.log" lib
+exit "$status"

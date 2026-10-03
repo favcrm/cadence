@@ -19,7 +19,8 @@ Steps run in order and stop at the first failure:
   6. nextest wrapper  scripts/test-cadence-nextest, which includes the
                   `flock -o` leak regression (CAD-968)
                                                               (scripts/cadence-nextest or its test/installer changed)
-  7. tests        scripts/run-result-tests (every test target) (--tests only)
+  7. tests        scripts/run-result-tests (every test target, then the lib
+                  unit tests)                                (--tests only)
 
 Every step is judged by its exit code alone and gets one summary line. Host
 limits from AGENTS.md apply: CARGO_BUILD_JOBS defaults to 4 and tests run with
@@ -156,8 +157,8 @@ def plan(root, changed, with_tests):
     if not with_tests:
         steps.append(("tests", None, "pass --tests to run every test target"))
     else:
-        # CAD-1090: the same runner CI uses.
-        steps.append(("tests integration", ["scripts/run-result-tests"], None))
+        # CAD-1090/CAD-1105: the same runner CI uses, integration and lib.
+        steps.append(("tests integration+lib", ["scripts/run-result-tests"], None))
     return steps
 
 

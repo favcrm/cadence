@@ -44,8 +44,11 @@ class CleanupTests(unittest.TestCase):
         self.assertIn("scripts/run-result-tests", test)
         runner = (ROOT / "scripts/run-result-tests").read_text()
         self.assertIn("scripts/result-test-args", runner)
+        # CAD-1105: the lib unit tests run too, in the same runner.
         for needle in ("--features test-seam", "--no-fail-fast", "--test-threads 2",
-                       "running 0 tests", "HOME=", "XDG_CONFIG_HOME="):
+                       "running 0 tests", "HOME=", "XDG_CONFIG_HOME=",
+                       "--features test-seam --lib --no-fail-fast",
+                       "CARGO_BUILD_TARGET_DIR", "unset CARGO_TARGET_DIR"):
             self.assertIn(needle, runner)
         selected = subprocess.run([str(ROOT / "scripts/result-test-args")],
                                   capture_output=True, text=True, check=True).stdout.split()
@@ -116,6 +119,102 @@ class CleanupTests(unittest.TestCase):
                                             env=env, capture_output=True, text=True)
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
+
+# CAD-1105: scripts/run-result-tests against a stub cargo. The stub answers
+# `cargo metadata` with one test target and logs every `cargo test` call
+# with the environment the test binaries would inherit.
+STUB_CARGO = r"""#!/bin/sh
+case "$1" in
+metadata)
+  printf '%s' '{"packages":[{"targets":[{"name":"floor","kind":["test"]}]}]}'
+  exit 0 ;;
+test)
+  printf '%s|PATH=%s|CTD=%s|CBTD=%s|HOME=%s\n' "$*" "$PATH" \
+    "${CARGO_TARGET_DIR-unset}" "${CARGO_BUILD_TARGET_DIR-unset}" "$HOME" >> "$STUB_LOG"
+  case " $* " in
+  *" --lib "*)
+    [ -n "${STUB_LIB_SILENT:-}" ] || echo "running ${STUB_LIB_N:-3} tests"
+    exit "${STUB_LIB_RC:-0}" ;;
+  *)
+    echo "running 2 tests"
+    [ -z "${STUB_INT_ZERO:-}" ] || echo "running 0 tests"
+    exit "${STUB_INT_RC:-0}" ;;
+  esac ;;
+esac
+exit 1
+"""
+SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+class RunResultTestsRunner(unittest.TestCase):
+    def run_runner(self, root, toolchain_extra=(), **env_extra):
+        toolchain = Path(root) / "toolchain"
+        host = Path(root) / "host-bin"
+        for d in (toolchain, host):
+            d.mkdir(exist_ok=True)
+        (toolchain / "cargo").write_text(STUB_CARGO)
+        (toolchain / "cargo").chmod(0o755)
+        # Host provider CLIs outside the toolchain dir, as on a dev box.
+        for name in ("claude", "codex", "cursor-agent", "pi"):
+            (host / name).write_text("#!/bin/sh\nexit 0\n")
+            (host / name).chmod(0o755)
+        for name in toolchain_extra:
+            (toolchain / name).write_text("#!/bin/sh\nexit 0\n")
+            (toolchain / name).chmod(0o755)
+        log = Path(root) / "cargo-test.log"
+        env = {"PATH": f"{toolchain}:{host}:/usr/bin:/bin", "RUNNER_TEMP": root,
+               "STUB_LOG": str(log), "CARGO_HOME": str(Path(root) / "cargo-home"),
+               "RUSTUP_HOME": str(Path(root) / "rustup-home"), "HOME": root}
+        env.update(env_extra)
+        result = subprocess.run([str(ROOT / "scripts/run-result-tests")], cwd=root,
+                                env=env, capture_output=True, text=True)
+        calls = log.read_text().splitlines() if log.exists() else []
+        return result, calls, toolchain
+
+    def test_lib_suite_runs_isolated_after_the_integration_targets(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as root:
+            result, calls, toolchain = self.run_runner(root, CARGO_TARGET_DIR="rel/tgt")
+            out = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, out)
+            self.assertEqual(len(calls), 2, calls)
+            integration, lib = calls
+            self.assertIn("--test floor", integration)
+            self.assertNotIn("--lib", integration)
+            for needle in ("test --locked --features test-seam --lib --no-fail-fast",
+                           "-- --test-threads 2"):
+                self.assertIn(needle, lib)
+            # The lib suite's PATH is the toolchain dir plus system dirs only.
+            self.assertIn(f"|PATH={toolchain}:{SYSTEM_PATH}|", lib)
+            self.assertNotIn("host-bin", lib)
+            for call in calls:
+                self.assertIn("|CTD=unset|", call)
+                self.assertIn(f"|CBTD={root}/rel/tgt|", call)
+                self.assertIn(f"|HOME={root}/result-tests.", call)
+
+    def test_provider_cli_beside_cargo_refuses_before_any_test_runs(self):
+        for cli in ("claude", "codex", "cursor-agent", "pi", "devin"):
+            with self.subTest(cli=cli), tempfile.TemporaryDirectory(dir="/tmp") as root:
+                result, calls, _ = self.run_runner(root, toolchain_extra=(cli,))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"provider CLI {cli} resolves", result.stderr)
+                self.assertEqual(calls, [])
+
+    def test_red_lib_or_red_integration_fails_and_both_still_run(self):
+        for env in ({"STUB_LIB_RC": "101"}, {"STUB_INT_RC": "101"}):
+            with self.subTest(env=env), tempfile.TemporaryDirectory(dir="/tmp") as root:
+                result, calls, _ = self.run_runner(root, **env)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(len(calls), 2, calls)
+                self.assertIn("--lib", calls[1])
+
+    def test_target_that_runs_no_tests_fails(self):
+        # One of several targets at 0 still fails; so does a lib with none.
+        for env in ({"STUB_LIB_N": "0"}, {"STUB_LIB_SILENT": "1"}, {"STUB_INT_ZERO": "1"}):
+            with self.subTest(env=env), tempfile.TemporaryDirectory(dir="/tmp") as root:
+                result, calls, _ = self.run_runner(root, **env)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("ran 0 tests", result.stderr)
+                self.assertEqual(len(calls), 2, calls)
 
 
 if __name__ == "__main__":

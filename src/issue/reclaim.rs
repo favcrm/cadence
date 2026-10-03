@@ -206,7 +206,7 @@ fn reclaim_target(lane: &Path, cargo_target: Option<&str>) -> Result<Option<Path
     if git_dir == common || lane_c == root_c {
         return refuse("not a linked worktree (the main checkout is never reclaimed)".to_string());
     }
-    let wt_parent = root_c.join(".cadence").join("wt");
+    let wt_parent = crate::worktree::layout::worktrees_dir(&root_c);
     if lane_c == wt_parent || !lane_c.starts_with(&wt_parent) {
         return refuse(format!("not under {}", wt_parent.display()));
     }
