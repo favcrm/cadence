@@ -803,7 +803,7 @@ impl Store {
             // The turn this nudge would steer: the report-owing row's
             // token, same rule `take_queued`'s hold uses.
             let running_turn: Option<(String, String)> = tx
-                .query_row(
+                .query_opt(
                     &format!(
                         "SELECT id,turn_id FROM messages WHERE alias=? AND state='running'
                          AND source NOT IN {TURNLESS_SOURCES_SQL}
@@ -811,8 +811,7 @@ impl Store {
                     ),
                     [&target.alias],
                     |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
+                )?;
             let (duplicate, _) = self.enqueue_tx(
                 &tx,
                 &target.alias,

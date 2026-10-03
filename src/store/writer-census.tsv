@@ -77,7 +77,6 @@ store/crm_smtp.rs	guarded-store-and-read-queries	execute	4
 store/crm_smtp.rs	guarded-store-and-read-queries	guarded_write	4
 store/delivery.rs	guarded-store-and-read-queries	execute	15
 store/delivery.rs	guarded-store-and-read-queries	guarded_write	13
-store/delivery.rs	guarded-store-and-read-queries	prepare	1
 store/effects.rs	guarded-store-and-read-queries	execute	8
 store/effects.rs	guarded-store-and-read-queries	guarded_write	7
 store/effects.rs	guarded-store-and-read-queries	prepare	1

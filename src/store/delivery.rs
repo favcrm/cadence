@@ -309,12 +309,12 @@ impl Store {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let stale: Vec<(String, String)> = tx
-                .prepare(
+                .query_vec(
                     "SELECT id, alias FROM messages
                      WHERE source='nudge' AND state='submitting'",
-                )?
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
             let mut closed = Vec::new();
             for (id, alias) in stale {
                 let result = json!({"status": "unknown", "via": format!("{reason}_unconfirmed"),
