@@ -1636,9 +1636,11 @@ mod tests {
                     verify_receipt_format(&env, &kr, now, 10).is_err(),
                     "weak/noncanonical R (sign {sign_bit}) must refuse"
                 );
-                // Record raw ring's verdict on the key form for the report —
-                // the assertion that matters is the consumer refusal above.
-                let _raw = UnparsedPublicKey::new(&ED25519, &pk).verify(&msg, &i1.signature);
+                // Record raw ring's actual verdict on BOTH the weak key form
+                // and the tampered-R signature for the report — the binding
+                // assertion is the consumer refusal above.
+                let _raw_key = UnparsedPublicKey::new(&ED25519, &pk).verify(&msg, &i1.signature);
+                let _raw_r = UnparsedPublicKey::new(&ED25519, &i1.public_key).verify(&msg, &sig);
             }
         }
     }
@@ -1690,6 +1692,25 @@ mod tests {
             verify_receipt_format(&env, &kr, now, 10).is_err(),
             "signature with scalar S = L must refuse (raw ring ok={})",
             raw.is_ok()
+        );
+        // Boundary cases: S = L+1 and a much-larger S (L + 2^252) also refuse.
+        let mut l_plus_1 = L_LE;
+        l_plus_1[0] = l_plus_1[0].wrapping_add(1); // L is even-safe; L+1 LE = L's low byte +1
+        let mut sig = i1.signature.clone();
+        sig[32..].copy_from_slice(&l_plus_1);
+        let env = format!("{}.{}.{}", segs[0], segs[1], b64(&sig));
+        assert!(
+            verify_receipt_format(&env, &kr, now, 10).is_err(),
+            "signature with S = L+1 must refuse"
+        );
+        let mut s_big = L_LE;
+        s_big[31] = 0x20; // top byte 0x20 → a value well above L
+        let mut sig = i1.signature.clone();
+        sig[32..].copy_from_slice(&s_big);
+        let env = format!("{}.{}.{}", segs[0], segs[1], b64(&sig));
+        assert!(
+            verify_receipt_format(&env, &kr, now, 10).is_err(),
+            "signature with S > L must refuse"
         );
     }
 

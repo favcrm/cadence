@@ -52,6 +52,18 @@ I2 `a15f212362eab9f1`, I3 `1aafb7cb743005dd`, I4 `19280393965df1b4`. This is a
 *test-only baseline* for the same public vectors — a per-finding pin, not a
 path or rule allowlist; the scan and its assertion are unchanged.
 
+## Finite point/scalar encoding gates
+
+The verifier mirrors the platform owner's `point()`/`strictSignature()`
+policy with finite byte-encoding checks before `ring` verify: a trusted
+public key and the signature's `R` must be a canonical, non-small-order point
+(`y < p = 2^255-19`, `y ∉ {0, 1, p-1, 2707…027, 5518…927}`, sign bit cleared
+on a copy) and `S < L`. These gates exist because raw `ring`'s ref10 verifier
+*accepts* the identity-key forgery (`R = identity, S = 0` under `A =
+identity` collapses `s·B = R + h·A` to `0 = 0`); the consumer refuses what
+raw ring would admit. No curve engine and no new dependency — byte checks
+only.
+
 ## Security posture
 
 - The crypto here is **diagnostic/format evidence only** — verify-only. It
