@@ -3,12 +3,13 @@
 use crate::adapter::registry;
 use crate::error::{Error, Result};
 use crate::proto::identifier;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
 use super::agents::Agent;
 use super::schema::Take;
+use super::StoreConn;
 use super::{now, Sender, Store};
 
 // Deterministic cost evidence for recurring read paths. Thread-local so
@@ -411,67 +412,67 @@ impl Store {
         refs: Option<&Value>,
         app: Option<&Value>,
     ) -> Result<(bool, String)> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let mut named: Vec<&str> = Vec::new();
-        for m in steer.supersedes {
-            if !named.contains(&m.as_str()) {
-                named.push(m);
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let mut named: Vec<&str> = Vec::new();
+            for m in steer.supersedes {
+                if !named.contains(&m.as_str()) {
+                    named.push(m);
+                }
             }
-        }
-        let retry = self.message_in(&tx, id)?.is_some();
-        let superseded = if retry {
-            // The envelope itself is compared by `enqueue_tx`; the
-            // superseded set is part of it.
-            let mut replaced = Self::superseded_by_in(&tx, id)?;
-            replaced.sort();
-            let mut wanted: Vec<String> = named.iter().map(|m| m.to_string()).collect();
-            wanted.sort();
-            if replaced != wanted {
-                return Err(Error::rejected(
-                    "Message id was already used with different content",
-                ));
-            }
-            Vec::new()
-        } else {
-            named
-                .iter()
-                .map(|m| self.supersedable_in(&tx, alias, m))
-                .collect::<Result<Vec<_>>>()?
-        };
-        let out = self.enqueue_tx(
-            &tx,
-            alias,
-            body,
-            reply_to,
-            id,
-            source,
-            task_id,
-            issue,
-            worktree,
-            sender,
-            steer.priority,
-            refs,
-            app,
-        )?;
-        for old in &superseded {
-            self.supersede_in(&tx, old, id, steer)?;
-        }
-        self.notify_superseded(&tx, &superseded, id, steer)?;
-        if !retry && steer.is_steering() {
-            Self::event_scoped(
+            let retry = self.message_in(&tx, id)?.is_some();
+            let superseded = if retry {
+                // The envelope itself is compared by `enqueue_tx`; the
+                // superseded set is part of it.
+                let mut replaced = Self::superseded_by_in(&tx, id)?;
+                replaced.sort();
+                let mut wanted: Vec<String> = named.iter().map(|m| m.to_string()).collect();
+                wanted.sort();
+                if replaced != wanted {
+                    return Err(Error::rejected(
+                        "Message id was already used with different content",
+                    ));
+                }
+                Vec::new()
+            } else {
+                named
+                    .iter()
+                    .map(|m| self.supersedable_in(&tx, alias, m))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let out = self.enqueue_tx(
                 &tx,
                 alias,
-                "steered",
-                json!({"message": id, "priority": steer.priority.as_str(),
-                       "supersedes": named, "by": steer.by,
-                       "by_kind": steer.by_kind}),
-                None,
+                body,
+                reply_to,
+                id,
+                source,
                 task_id,
+                issue,
+                worktree,
+                sender,
+                steer.priority,
+                refs,
+                app,
             )?;
-        }
-        tx.commit()?;
-        Ok(out)
+            for old in &superseded {
+                self.supersede_in(&tx, old, id, steer)?;
+            }
+            self.notify_superseded(&tx, &superseded, id, steer)?;
+            if !retry && steer.is_steering() {
+                Self::event_scoped(
+                    &tx,
+                    alias,
+                    "steered",
+                    json!({"message": id, "priority": steer.priority.as_str(),
+                                   "supersedes": named, "by": steer.by,
+                                   "by_kind": steer.by_kind}),
+                    None,
+                    task_id,
+                )?;
+            }
+            Ok(out)
+        })
     }
 
     /// CAD-445: a message the daemon itself originates — a master wake,
@@ -523,44 +524,48 @@ impl Store {
                 "a daemon message needs a daemon id and source, not {id}/{source}"
             )));
         }
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let out = self.enqueue_tx_as(
-            &tx,
-            alias,
-            body,
-            None,
-            id,
-            source,
-            task_id,
-            None,
-            None,
-            &Sender::Unattributed,
-            Priority::Normal,
-            true,
-            None,
-            None,
-        )?;
-        tx.commit()?;
-        Ok(out)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let out = self.enqueue_tx_as(
+                &tx,
+                alias,
+                body,
+                None,
+                id,
+                source,
+                task_id,
+                None,
+                None,
+                &Sender::Unattributed,
+                Priority::Normal,
+                true,
+                None,
+                None,
+            )?;
+            Ok(out)
+        })
     }
 
     /// The ids a steering send superseded, oldest first.
-    fn superseded_by_in(tx: &Connection, id: &str) -> Result<Vec<String>> {
-        let mut stmt = tx.prepare(
+    fn superseded_by_in(tx: &impl super::StoreConn, id: &str) -> Result<Vec<String>> {
+        let ids = tx.query_vec(
             "SELECT id FROM messages WHERE state='cancelled'
              AND json_extract(result,'$.superseded_by')=? ORDER BY seq",
+            [id],
+            |r| r.get::<_, String>(0),
         )?;
-        let ids = stmt
-            .query_map([id], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(ids)
     }
 
     /// CAD-158 fail-closed gate: `id` may be superseded by a send to
     /// `alias` only while it is `alias`'s own still-`queued` instruction.
     /// The refusal names the id and what it is.
-    fn supersedable_in(&self, tx: &Connection, alias: &str, id: &str) -> Result<Message> {
+    fn supersedable_in(
+        &self,
+        tx: &impl super::StoreConn,
+        alias: &str,
+        id: &str,
+    ) -> Result<Message> {
         let refuse = |why: String| {
             Error::rejected(format!(
                 "--supersedes refused, nothing changed: message '{id}' {why} — only \
@@ -599,7 +604,7 @@ impl Store {
     /// caller's transaction then rolls back the whole send.
     fn supersede_in(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         message: &Message,
         new_id: &str,
         steer: &Steer,
@@ -651,7 +656,7 @@ impl Store {
     /// replaced row per recipient.
     fn notify_superseded(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         superseded: &[Message],
         new_id: &str,
         steer: &Steer,
@@ -727,177 +732,177 @@ impl Store {
         sender: &Sender,
         steer: &Steer,
     ) -> Result<(bool, String, Option<String>)> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        // The live row, not the caller's snapshot: every check below is
-        // against what is durable now, in the write transaction.
-        let current = self.agent_in(&tx, &target.alias)?;
-        if !current.enabled {
-            return Err(Error::rejected(format!(
-                "native steer refused, nothing changed: agent '{}' is disabled",
-                target.alias
-            )));
-        }
-        if !matches!(current.state.as_str(), "idle" | "busy") {
-            return Err(Error::rejected(format!(
-                "native steer refused, nothing changed: agent '{}' is {} — only a live \
-                 idle|busy endpoint takes exact-turn input",
-                target.alias, current.state
-            )));
-        }
-        let live_endpoint = current.endpoint.as_deref().filter(|e| !e.is_empty());
-        // Stdio-managed sessions have no network endpoint address. Their
-        // owned process and native session/thread identify the live runtime.
-        let native_process = current.pid.is_some()
-            && (current.session_id.as_deref().is_some_and(|s| !s.is_empty())
-                || current.thread_id.as_deref().is_some_and(|s| !s.is_empty()));
-        if live_endpoint.is_none() && !native_process {
-            return Err(Error::rejected(format!(
-                "native steer refused, nothing changed: agent '{}' has no live endpoint",
-                target.alias
-            )));
-        }
-        // The snapshot the steer was authorized against must still be
-        // the row: a re-open or restart that moved generation,
-        // endpoint, session or thread makes the old target a different
-        // endpoint, and steering it would land nowhere provable.
-        let drift = [
-            (
-                "generation",
-                target.generation.as_deref(),
-                current.generation.as_deref(),
-            ),
-            (
-                "endpoint",
-                target.endpoint.as_deref(),
-                current.endpoint.as_deref(),
-            ),
-            (
-                "session_id",
-                target.session_id.as_deref(),
-                current.session_id.as_deref(),
-            ),
-            (
-                "thread_id",
-                target.thread_id.as_deref(),
-                current.thread_id.as_deref(),
-            ),
-        ]
-        .iter()
-        .filter(|(_, was, now)| was != now)
-        .map(|(field, _, _)| *field)
-        .collect::<Vec<_>>();
-        if !drift.is_empty() || target.pid != current.pid || target.pid_start != current.pid_start {
-            return Err(Error::rejected(format!(
-                "native steer refused, nothing changed: agent '{}' no longer matches \
-                 the authorized target ({} changed)",
-                target.alias,
-                drift.join(", ")
-            )));
-        }
-        // The turn this nudge would steer: the report-owing row's
-        // token, same rule `take_queued`'s hold uses.
-        let running_turn: Option<(String, String)> = tx
-            .query_row(
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            // The live row, not the caller's snapshot: every check below is
+            // against what is durable now, in the write transaction.
+            let current = self.agent_in(&tx, &target.alias)?;
+            if !current.enabled {
+                return Err(Error::rejected(format!(
+                    "native steer refused, nothing changed: agent '{}' is disabled",
+                    target.alias
+                )));
+            }
+            if !matches!(current.state.as_str(), "idle" | "busy") {
+                return Err(Error::rejected(format!(
+                    "native steer refused, nothing changed: agent '{}' is {} — only a live \
+                     idle|busy endpoint takes exact-turn input",
+                    target.alias, current.state
+                )));
+            }
+            let live_endpoint = current.endpoint.as_deref().filter(|e| !e.is_empty());
+            // Stdio-managed sessions have no network endpoint address. Their
+            // owned process and native session/thread identify the live runtime.
+            let native_process = current.pid.is_some()
+                && (current.session_id.as_deref().is_some_and(|s| !s.is_empty())
+                    || current.thread_id.as_deref().is_some_and(|s| !s.is_empty()));
+            if live_endpoint.is_none() && !native_process {
+                return Err(Error::rejected(format!(
+                    "native steer refused, nothing changed: agent '{}' has no live endpoint",
+                    target.alias
+                )));
+            }
+            // The snapshot the steer was authorized against must still be
+            // the row: a re-open or restart that moved generation,
+            // endpoint, session or thread makes the old target a different
+            // endpoint, and steering it would land nowhere provable.
+            let drift = [
+                (
+                    "generation",
+                    target.generation.as_deref(),
+                    current.generation.as_deref(),
+                ),
+                (
+                    "endpoint",
+                    target.endpoint.as_deref(),
+                    current.endpoint.as_deref(),
+                ),
+                (
+                    "session_id",
+                    target.session_id.as_deref(),
+                    current.session_id.as_deref(),
+                ),
+                (
+                    "thread_id",
+                    target.thread_id.as_deref(),
+                    current.thread_id.as_deref(),
+                ),
+            ]
+            .iter()
+            .filter(|(_, was, now)| was != now)
+            .map(|(field, _, _)| *field)
+            .collect::<Vec<_>>();
+            if !drift.is_empty()
+                || target.pid != current.pid
+                || target.pid_start != current.pid_start
+            {
+                return Err(Error::rejected(format!(
+                    "native steer refused, nothing changed: agent '{}' no longer matches \
+                     the authorized target ({} changed)",
+                    target.alias,
+                    drift.join(", ")
+                )));
+            }
+            // The turn this nudge would steer: the report-owing row's
+            // token, same rule `take_queued`'s hold uses.
+            let running_turn: Option<(String, String)> = tx.query_opt(
                 &format!(
                     "SELECT id,turn_id FROM messages WHERE alias=? AND state='running'
-                     AND source NOT IN {TURNLESS_SOURCES_SQL}
-                     AND turn_id IS NOT NULL AND turn_id != '' ORDER BY seq LIMIT 1"
+                         AND source NOT IN {TURNLESS_SOURCES_SQL}
+                         AND turn_id IS NOT NULL AND turn_id != '' ORDER BY seq LIMIT 1"
                 ),
                 [&target.alias],
                 |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let (duplicate, _) = self.enqueue_tx(
-            &tx,
-            &target.alias,
-            body,
-            None,
-            id,
-            NUDGE_SOURCE,
-            None,
-            None,
-            None,
-            sender,
-            steer.priority,
-            None,
-            None,
-        )?;
-        if duplicate {
-            // The stored row is authoritative: the retry learns the
-            // bound turn and the state it is already in, never a
-            // second enqueue. A conflicting envelope already refused
-            // above.
-            let stored = self
-                .message_in(&tx, id)?
-                .ok_or_else(|| Error::internal("deduped native nudge row vanished"))?;
-            tx.commit()?;
-            return Ok((true, stored.state, stored.turn_id));
-        }
-        let out = if let Some((target_message, turn)) = running_turn {
-            // `submitting` in the same transaction the row was created
-            // in: the claim gate and every nudge sweep see only
-            // `queued`/`submitting`, so nothing can take or cancel the
-            // row between its insert and this bind.
-            let n = tx.execute(
-                "UPDATE messages SET state='submitting',turn_id=?,started=?,result=?
-                 WHERE id=? AND state='queued'",
-                params![
-                    turn,
-                    now(),
-                    json!({"target_message": target_message, "application": "unconfirmed"})
-                        .to_string(),
-                    id
-                ],
             )?;
-            if n != 1 {
-                return Err(Error::internal(format!(
-                    "native nudge {id} left queued state before its turn bind committed"
-                )));
-            }
-            Self::event(
+            let (duplicate, _) = self.enqueue_tx(
                 &tx,
                 &target.alias,
-                "native_steer_submitting",
-                json!({"message": id, "turn": turn.clone(), "target_message": target_message,
-                       "by": steer.by, "by_kind": steer.by_kind}),
+                body,
+                None,
+                id,
+                NUDGE_SOURCE,
+                None,
+                None,
+                None,
+                sender,
+                steer.priority,
+                None,
+                None,
             )?;
-            // The returned token is the caller's steer target — the
-            // same turn the event payload records.
-            (false, "submitting".to_string(), Some(turn))
-        } else {
-            // No turn to steer: `skipped` is the durable outcome —
-            // cancelled, never replayed, with the Codex
-            // `skipped_inactive` via and the native-steer delivery
-            // label. `nudge_cancelled` is the same event the other
-            // nudge exits record.
-            let result = json!({
-                "status": "skipped",
-                "via": "skipped_inactive",
-                "delivery": "native_turn_steering",
-                "reason": "no running turn to steer — a nudge is never replayed",
-            });
-            let n = tx.execute(
-                "UPDATE messages SET state='cancelled',result=?,completed=?
-                 WHERE id=? AND state='queued'",
-                params![result.to_string(), now(), id],
-            )?;
-            if n != 1 {
-                return Err(Error::internal(format!(
-                    "native nudge {id} left queued state before its skip committed"
-                )));
+            if duplicate {
+                // The stored row is authoritative: the retry learns the
+                // bound turn and the state it is already in, never a
+                // second enqueue. A conflicting envelope already refused
+                // above.
+                let stored = self
+                    .message_in(&tx, id)?
+                    .ok_or_else(|| Error::internal("deduped native nudge row vanished"))?;
+                return Ok((true, stored.state, stored.turn_id));
             }
-            Self::event(
-                &tx,
-                &target.alias,
-                "nudge_cancelled",
-                json!({"message": id, "was": "queued", "state": "cancelled",
-                       "reason": "skipped_inactive"}),
-            )?;
-            (false, "cancelled".to_string(), None)
-        };
-        tx.commit()?;
-        Ok(out)
+            let out = if let Some((target_message, turn)) = running_turn {
+                // `submitting` in the same transaction the row was created
+                // in: the claim gate and every nudge sweep see only
+                // `queued`/`submitting`, so nothing can take or cancel the
+                // row between its insert and this bind.
+                let n = tx.execute(
+                    "UPDATE messages SET state='submitting',turn_id=?,started=?,result=?
+                     WHERE id=? AND state='queued'",
+                    params![
+                        turn,
+                        now(),
+                        json!({"target_message": target_message, "application": "unconfirmed"})
+                            .to_string(),
+                        id
+                    ],
+                )?;
+                if n != 1 {
+                    return Err(Error::internal(format!(
+                        "native nudge {id} left queued state before its turn bind committed"
+                    )));
+                }
+                Self::event(
+                    &tx,
+                    &target.alias,
+                    "native_steer_submitting",
+                    json!({"message": id, "turn": turn.clone(), "target_message": target_message,
+                           "by": steer.by, "by_kind": steer.by_kind}),
+                )?;
+                // The returned token is the caller's steer target — the
+                // same turn the event payload records.
+                (false, "submitting".to_string(), Some(turn))
+            } else {
+                // No turn to steer: `skipped` is the durable outcome —
+                // cancelled, never replayed, with the Codex
+                // `skipped_inactive` via and the native-steer delivery
+                // label. `nudge_cancelled` is the same event the other
+                // nudge exits record.
+                let result = json!({
+                    "status": "skipped",
+                    "via": "skipped_inactive",
+                    "delivery": "native_turn_steering",
+                    "reason": "no running turn to steer — a nudge is never replayed",
+                });
+                let n = tx.execute(
+                    "UPDATE messages SET state='cancelled',result=?,completed=?
+                     WHERE id=? AND state='queued'",
+                    params![result.to_string(), now(), id],
+                )?;
+                if n != 1 {
+                    return Err(Error::internal(format!(
+                        "native nudge {id} left queued state before its skip committed"
+                    )));
+                }
+                Self::event(
+                    &tx,
+                    &target.alias,
+                    "nudge_cancelled",
+                    json!({"message": id, "was": "queued", "state": "cancelled",
+                           "reason": "skipped_inactive"}),
+                )?;
+                (false, "cancelled".to_string(), None)
+            };
+            Ok(out)
+        })
     }
 
     /// CAD-1015: record what the provider's exact-turn steer answered
@@ -958,54 +963,54 @@ impl Store {
                 )))
             }
         };
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let Some(message) = self.message_in(&tx, id)? else {
-            return Err(Error::rejected(format!("No such message '{id}'")));
-        };
-        if message.source != NUDGE_SOURCE {
-            return Err(Error::rejected(format!(
-                "Message '{id}' is source '{}' — only a native nudge takes a \
-                 steer disposition",
-                message.source
-            )));
-        }
-        if let Some(target_message) = message
-            .result
-            .as_ref()
-            .and_then(|value| value.get("target_message"))
-        {
-            result["target_message"] = target_message.clone();
-        }
-        // The guard that makes this exactly-once and terminal-safe: the
-        // row must still be the `submitting` row `begin_native_nudge`
-        // wrote, bound to a real turn. `n = 0` means stop/restart or a
-        // reconcile already moved it — that terminal evidence stands,
-        // and the disposition still lands on the event stream below so
-        // the provider's answer is never silently dropped.
-        let bound = message
-            .turn_id
-            .as_deref()
-            .filter(|t| !t.is_empty())
-            .map(str::to_string);
-        let n = match bound.as_deref() {
-            Some(turn) => tx.execute(
-                "UPDATE messages SET state=?,result=?,completed=?
-                 WHERE id=? AND state='submitting' AND source=? AND turn_id=?",
-                params![to_state, result.to_string(), now(), id, NUDGE_SOURCE, turn],
-            )?,
-            None => 0,
-        };
-        Self::event(
-            &tx,
-            &message.alias,
-            "native_steer_disposition",
-            json!({"message": id, "disposition": disposition,
-                   "reason": reason, "turn": bound,
-                   "recorded": n == 1}),
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let Some(message) = self.message_in(&tx, id)? else {
+                return Err(Error::rejected(format!("No such message '{id}'")));
+            };
+            if message.source != NUDGE_SOURCE {
+                return Err(Error::rejected(format!(
+                    "Message '{id}' is source '{}' — only a native nudge takes a \
+                     steer disposition",
+                    message.source
+                )));
+            }
+            if let Some(target_message) = message
+                .result
+                .as_ref()
+                .and_then(|value| value.get("target_message"))
+            {
+                result["target_message"] = target_message.clone();
+            }
+            // The guard that makes this exactly-once and terminal-safe: the
+            // row must still be the `submitting` row `begin_native_nudge`
+            // wrote, bound to a real turn. `n = 0` means stop/restart or a
+            // reconcile already moved it — that terminal evidence stands,
+            // and the disposition still lands on the event stream below so
+            // the provider's answer is never silently dropped.
+            let bound = message
+                .turn_id
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            let n = match bound.as_deref() {
+                Some(turn) => tx.execute(
+                    "UPDATE messages SET state=?,result=?,completed=?
+                     WHERE id=? AND state='submitting' AND source=? AND turn_id=?",
+                    params![to_state, result.to_string(), now(), id, NUDGE_SOURCE, turn],
+                )?,
+                None => 0,
+            };
+            Self::event(
+                &tx,
+                &message.alias,
+                "native_steer_disposition",
+                json!({"message": id, "disposition": disposition,
+                       "reason": reason, "turn": bound,
+                       "recorded": n == 1}),
+            )?;
+            Ok(())
+        })
     }
 
     /// Transactional enqueue — validation, idempotent dedupe, insert,
@@ -1016,7 +1021,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn enqueue_tx(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         alias: &str,
         body: &str,
         reply_to: Option<&str>,
@@ -1039,7 +1044,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     fn enqueue_tx_as(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         alias: &str,
         body: &str,
         reply_to: Option<&str>,
@@ -1138,7 +1143,11 @@ impl Store {
         Ok((false, "queued".to_string()))
     }
 
-    pub(super) fn message_in(&self, conn: &Connection, id: &str) -> Result<Option<Message>> {
+    pub(super) fn message_in(
+        &self,
+        conn: &impl super::StoreConn,
+        id: &str,
+    ) -> Result<Option<Message>> {
         match conn.query_row("SELECT * FROM messages WHERE id=?", [id], row_message) {
             Ok(m) => Ok(Some(m)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1151,18 +1160,18 @@ impl Store {
     /// no schema column or migration is needed for this handoff proof.
     fn queued_recipient_identity(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         alias: &str,
         message_id: &str,
         source: &str,
     ) -> Result<Option<Value>> {
-        let mut stmt = tx.prepare(
+        let raws = tx.query_vec(
             "SELECT payload FROM events
              WHERE alias=? AND kind='queued' ORDER BY seq",
+            [alias],
+            |row| row.get::<_, String>(0),
         )?;
-        let mut rows = stmt.query([alias])?;
-        while let Some(row) = rows.next()? {
-            let payload: String = row.get(0)?;
+        for payload in raws {
             let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
                 continue;
             };
@@ -1205,7 +1214,7 @@ impl Store {
 
     pub(super) fn recipient_binding(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         source_alias: &str,
         source_message: &str,
         source: &str,
@@ -1226,16 +1235,16 @@ impl Store {
 
     pub(super) fn handoff_unresolved_exists(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         delivery: &str,
     ) -> Result<bool> {
-        let mut stmt = tx.prepare(
+        let raws = tx.query_vec(
             "SELECT payload FROM events
              WHERE alias=? AND kind='handoff_unresolved' ORDER BY seq",
+            [Self::DAEMON_STREAM],
+            |row| row.get::<_, String>(0),
         )?;
-        let mut rows = stmt.query([Self::DAEMON_STREAM])?;
-        while let Some(row) = rows.next()? {
-            let payload: String = row.get(0)?;
+        for payload in raws {
             let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
                 continue;
             };
@@ -1252,7 +1261,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn handoff_unresolved(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         task_id: Option<&str>,
         recipient: &str,
         delivery: &str,
@@ -1298,7 +1307,7 @@ impl Store {
 
     fn fail_unresolved_routed(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         message: &Message,
         recipient: &Agent,
         expected: Option<&Value>,
@@ -1346,192 +1355,196 @@ impl Store {
         alias: &str,
         proof: Option<(&str, &str)>,
     ) -> Result<Take> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let agent = self.agent_in(&tx, alias)?;
-        if !agent.enabled {
-            return Ok(Take::Stop);
-        }
-        // CAD-250: the actor serializes report-owing turns. While one is
-        // `running` (delivered, its report still owed), only routed
-        // notifications and nudges — fire-and-forget, complete at paste —
-        // may be claimed; every other delivery stays `queued`, never refused,
-        // until that turn is reported, reconciled or bounded to
-        // `unknown`.
-        // CAD-565: the running turn's token rides along — a nudge binds
-        // to it at claim (below) and is rechecked against it, in this
-        // same transaction, on every later claim.
-        let running_turn: Option<String> = tx
-            .query_row(
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let agent = self.agent_in(&tx, alias)?;
+            if !agent.enabled {
+                return Ok(Take::Stop);
+            }
+            // CAD-250: the actor serializes report-owing turns. While one is
+            // `running` (delivered, its report still owed), only routed
+            // notifications and nudges — fire-and-forget, complete at paste —
+            // may be claimed; every other delivery stays `queued`, never refused,
+            // until that turn is reported, reconciled or bounded to
+            // `unknown`.
+            // CAD-565: the running turn's token rides along — a nudge binds
+            // to it at claim (below) and is rechecked against it, in this
+            // same transaction, on every later claim.
+            let running_turn: Option<String> = tx.query_opt(
                 &format!(
                     "SELECT turn_id FROM messages WHERE alias=? AND state='running'
-                     AND source NOT IN {TURNLESS_SOURCES_SQL} ORDER BY seq LIMIT 1"
+                                 AND source NOT IN {TURNLESS_SOURCES_SQL} ORDER BY seq LIMIT 1"
                 ),
                 [alias],
                 |r| r.get(0),
-            )
-            .optional()?;
-        let holding = running_turn.is_some();
-        let next_sql = if holding {
-            format!(
-                "SELECT * FROM messages WHERE alias=? AND state='queued'
-                 AND source IN {TURNLESS_SOURCES_SQL} {QUEUE_ORDER_SQL} LIMIT 1"
-            )
-        } else {
-            format!(
-                "SELECT * FROM messages WHERE alias=? AND state='queued'
-                 {QUEUE_ORDER_SQL} LIMIT 1"
-            )
-        };
-        loop {
-            let next = tx.query_row(&next_sql, [alias], row_message).ok();
-            let Some(message) = next else {
-                // A prior routed row in this same transaction may have
-                // been failed as unresolved before the queue became empty.
-                // Commit that durable evidence even though no message is
-                // returned to the actor.
-                tx.commit()?;
-                return Ok(Take::Empty);
+            )?;
+            let holding = running_turn.is_some();
+            let next_sql = if holding {
+                format!(
+                    "SELECT * FROM messages WHERE alias=? AND state='queued'
+                             AND source IN {TURNLESS_SOURCES_SQL} {QUEUE_ORDER_SQL} LIMIT 1"
+                )
+            } else {
+                format!(
+                    "SELECT * FROM messages WHERE alias=? AND state='queued'
+                             {QUEUE_ORDER_SQL} LIMIT 1"
+                )
             };
-            if message.source == "app_run_dispatch" {
-                let (expected, bundle) = proof.ok_or_else(|| {
-                    Error::rejected("app claim requires fresh filesystem installation proof")
-                })?;
-                if expected != message.id {
-                    return Err(Error::rejected("app claim head changed"));
-                }
-                self.app_message_admit_in(&tx, &message, bundle)?;
-            }
-            if message.is_routed() {
-                let expected =
-                    self.queued_recipient_identity(&tx, alias, &message.id, &message.source)?;
-                let reason = match expected.as_ref() {
-                    None => Some("recipient_identity_unavailable"),
-                    Some(expected) if !Self::identity_matches(expected, &agent) => {
-                        Some("recipient_identity_changed")
-                    }
-                    Some(_) => None,
+            loop {
+                let next = tx.query_row(&next_sql, [alias], row_message).ok();
+                let Some(message) = next else {
+                    // A prior routed row in this same transaction may have
+                    // been failed as unresolved before the queue became empty.
+                    // Commit that durable evidence even though no message is
+                    // returned to the actor.
+                    return Ok(Take::Empty);
                 };
-                if let Some(reason) = reason {
-                    self.fail_unresolved_routed(&tx, &message, &agent, expected.as_ref(), reason)?;
-                    continue;
+                if message.source == "app_run_dispatch" {
+                    let (expected, bundle) = proof.ok_or_else(|| {
+                        Error::rejected("app claim requires fresh filesystem installation proof")
+                    })?;
+                    if expected != message.id {
+                        return Err(Error::rejected("app claim head changed"));
+                    }
+                    self.app_message_admit_in(&tx, &message, bundle)?;
                 }
-            }
-            if message.is_nudge() {
-                // CAD-565: a nudge enters the turn that was running when
-                // it was claimed — bound to it here, atomically, and the
-                // binding is rechecked on every claim. Only while *that*
-                // turn still runs does the nudge pass; an idle agent has
-                // nothing to steer and a nudge bound to an ended turn
-                // must never land in a later one. Skipped means
-                // `cancelled` with a persisted `skipped_inactive`
-                // result — Codex's `SkippedInactive` shape — so the
-                // delivery outcome is durable and readable.
-                let live = running_turn.as_deref();
-                let bound = message.turn_id.as_deref();
-                if bound.map_or(live.is_none(), |t| Some(t) != live) {
-                    let result = json!({
-                        "status": "skipped",
-                        "via": "skipped_inactive",
-                        "reason": "no running turn to steer — a nudge is never replayed",
-                    });
-                    let n = tx.execute(
-                        "UPDATE messages SET state='cancelled',result=?,completed=?
-                         WHERE id=? AND state='queued'",
-                        params![result.to_string(), now(), message.id],
-                    )?;
-                    if n == 1 {
-                        Self::event(
+                if message.is_routed() {
+                    let expected =
+                        self.queued_recipient_identity(&tx, alias, &message.id, &message.source)?;
+                    let reason = match expected.as_ref() {
+                        None => Some("recipient_identity_unavailable"),
+                        Some(expected) if !Self::identity_matches(expected, &agent) => {
+                            Some("recipient_identity_changed")
+                        }
+                        Some(_) => None,
+                    };
+                    if let Some(reason) = reason {
+                        self.fail_unresolved_routed(
                             &tx,
-                            alias,
-                            "nudge_cancelled",
-                            json!({"message": message.id, "was": "queued",
-                                   "state": "cancelled",
-                                   "reason": "skipped_inactive"}),
+                            &message,
+                            &agent,
+                            expected.as_ref(),
+                            reason,
+                        )?;
+                        continue;
+                    }
+                }
+                if message.is_nudge() {
+                    // CAD-565: a nudge enters the turn that was running when
+                    // it was claimed — bound to it here, atomically, and the
+                    // binding is rechecked on every claim. Only while *that*
+                    // turn still runs does the nudge pass; an idle agent has
+                    // nothing to steer and a nudge bound to an ended turn
+                    // must never land in a later one. Skipped means
+                    // `cancelled` with a persisted `skipped_inactive`
+                    // result — Codex's `SkippedInactive` shape — so the
+                    // delivery outcome is durable and readable.
+                    let live = running_turn.as_deref();
+                    let bound = message.turn_id.as_deref();
+                    if bound.map_or(live.is_none(), |t| Some(t) != live) {
+                        let result = json!({
+                            "status": "skipped",
+                            "via": "skipped_inactive",
+                            "reason": "no running turn to steer — a nudge is never replayed",
+                        });
+                        let n = tx.execute(
+                            "UPDATE messages SET state='cancelled',result=?,completed=?
+                                     WHERE id=? AND state='queued'",
+                            params![result.to_string(), now(), message.id],
+                        )?;
+                        if n == 1 {
+                            Self::event(
+                                &tx,
+                                alias,
+                                "nudge_cancelled",
+                                json!({"message": message.id, "was": "queued",
+                                               "state": "cancelled",
+                                               "reason": "skipped_inactive"}),
+                            )?;
+                        }
+                        continue;
+                    }
+                    if bound.is_none() {
+                        tx.execute(
+                            "UPDATE messages SET turn_id=? WHERE id=? AND state='queued'",
+                            params![live.unwrap_or_default(), message.id],
                         )?;
                     }
-                    continue;
                 }
-                if bound.is_none() {
-                    tx.execute(
-                        "UPDATE messages SET turn_id=? WHERE id=? AND state='queued'",
-                        params![live.unwrap_or_default(), message.id],
-                    )?;
-                }
+                tx.execute(
+                    "UPDATE messages SET state='submitting',started=? WHERE id=?",
+                    params![now(), message.id],
+                )?;
+                tx.execute(
+                    "UPDATE agents SET state='busy',updated=? WHERE alias=?",
+                    params![now(), alias],
+                )?;
+                Self::event(&tx, alias, "submitting", json!({"message": message.id}))?;
+                return Ok(Take::Message(Box::new(message)));
             }
-            tx.execute(
-                "UPDATE messages SET state='submitting',started=? WHERE id=?",
-                params![now(), message.id],
-            )?;
-            tx.execute(
-                "UPDATE agents SET state='busy',updated=? WHERE alias=?",
-                params![now(), alias],
-            )?;
-            Self::event(&tx, alias, "submitting", json!({"message": message.id}))?;
-            tx.commit()?;
-            return Ok(Take::Message(Box::new(message)));
-        }
+        })
     }
 
     /// Record that the provider acknowledged a turn start.
     pub fn mark_running(&self, message_id: &str, turn_id: &str) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE messages SET state='running',turn_id=? WHERE id=?",
-            params![turn_id, message_id],
-        )?;
-        let alias: String =
-            tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
-                r.get(0)
-            })?;
-        Self::event(
-            &tx,
-            &alias,
-            "turn_started",
-            json!({"message": message_id, "turn_id": turn_id}),
-        )?;
-        // Task edge: a task-attached kickoff observed running moves the
-        // task dispatched → running (guarded — cancelled/advanced tasks
-        // are untouched).
-        self.task_on_running(&tx, message_id, &alias)?;
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            tx.execute(
+                "UPDATE messages SET state='running',turn_id=? WHERE id=?",
+                params![turn_id, message_id],
+            )?;
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            Self::event(
+                &tx,
+                &alias,
+                "turn_started",
+                json!({"message": message_id, "turn_id": turn_id}),
+            )?;
+            // Task edge: a task-attached kickoff observed running moves the
+            // task dispatched → running (guarded — cancelled/advanced tasks
+            // are untouched).
+            self.task_on_running(&tx, message_id, &alias)?;
+            Ok(())
+        })
     }
 
     /// Return a `submitting` message to `queued` — the submission gate
     /// refused before any paste, so retry is safe.
     pub fn requeue(&self, message_id: &str) -> Result<()> {
-        let conn = self.write_conn()?;
-        conn.execute(
-            "UPDATE messages SET state='queued',started=NULL
-             WHERE id=? AND state='submitting'",
-            [message_id],
-        )?;
-        Ok(())
+        self.write_tx(|conn| {
+            conn.execute(
+                "UPDATE messages SET state='queued',started=NULL
+                         WHERE id=? AND state='submitting'",
+                [message_id],
+            )?;
+            Ok(())
+        })
     }
 
     /// PTY submission was accepted by the terminal: the message stays
     /// `running` (turn_id already recorded) with a durable `submitted`
     /// marker until an explicit ack/result report lands.
     pub fn mark_submitted(&self, message: &Message) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE messages SET result=? WHERE id=? AND state='running'",
-            params![
-                json!({"status": "submitted", "ack": Value::Null}).to_string(),
-                message.id
-            ],
-        )?;
-        Self::event(
-            &tx,
-            &message.alias,
-            "submitted",
-            json!({"message": message.id, "turn_id": message.turn_id}),
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            tx.execute(
+                "UPDATE messages SET result=? WHERE id=? AND state='running'",
+                params![
+                    json!({"status": "submitted", "ack": Value::Null}).to_string(),
+                    message.id
+                ],
+            )?;
+            Self::event(
+                &tx,
+                &message.alias,
+                "submitted",
+                json!({"message": message.id, "turn_id": message.turn_id}),
+            )?;
+            Ok(())
+        })
     }
 
     /// Explicit acknowledgement for a running message; it stays
@@ -1540,49 +1553,48 @@ impl Store {
     /// pty-style (explicitly reported) turn carries the `submitted`
     /// marker, so a managed ack never makes its turn `awaiting_report`.
     pub fn mark_ack(&self, message: &Message, text: Option<&str>) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let turn_result = tx
-            .query_row(
-                "SELECT provider, endpoint_kind FROM agents WHERE alias=?",
-                [&message.alias],
-                |r| {
-                    Ok(registry::reports_turn_result(
-                        &r.get::<_, String>(0)?,
-                        &r.get::<_, String>(1)?,
-                    ))
-                },
-            )
-            .optional()?
-            .unwrap_or(false);
-        let status = if turn_result {
-            "acknowledged"
-        } else {
-            "submitted"
-        };
-        let n = tx.execute(
-            "UPDATE messages SET result=? WHERE id=? AND state='running'",
-            params![
-                json!({"status": status,
-                       "ack": {"text": text, "at": now()}})
-                .to_string(),
-                message.id
-            ],
-        )?;
-        if n == 0 {
-            return Err(Error::rejected(format!(
-                "Message {} is not awaiting a report (state {})",
-                message.id, message.state
-            )));
-        }
-        Self::event(
-            &tx,
-            &message.alias,
-            "acknowledged",
-            json!({"message": message.id, "turn_id": message.turn_id}),
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let turn_result = tx
+                .query_opt(
+                    "SELECT provider, endpoint_kind FROM agents WHERE alias=?",
+                    [&message.alias],
+                    |r| {
+                        Ok(registry::reports_turn_result(
+                            &r.get::<_, String>(0)?,
+                            &r.get::<_, String>(1)?,
+                        ))
+                    },
+                )?
+                .unwrap_or(false);
+            let status = if turn_result {
+                "acknowledged"
+            } else {
+                "submitted"
+            };
+            let n = tx.execute(
+                "UPDATE messages SET result=? WHERE id=? AND state='running'",
+                params![
+                    json!({"status": status,
+                                   "ack": {"text": text, "at": now()}})
+                    .to_string(),
+                    message.id
+                ],
+            )?;
+            if n == 0 {
+                return Err(Error::rejected(format!(
+                    "Message {} is not awaiting a report (state {})",
+                    message.id, message.state
+                )));
+            }
+            Self::event(
+                &tx,
+                &message.alias,
+                "acknowledged",
+                json!({"message": message.id, "turn_id": message.turn_id}),
+            )?;
+            Ok(())
+        })
     }
 
     /// Count an agent's queued inbound messages (`cadence self` for an
@@ -1817,28 +1829,30 @@ impl Store {
     /// so each probe is an index seek on `msg_queue(alias,state,…)`,
     /// never a scan of the history.
     pub fn running_turn_tokens(&self) -> Result<Vec<(String, String)>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT a.alias, m.turn_id
-             FROM agents a JOIN messages m ON m.alias = a.alias AND m.state = 'running'
-             WHERE m.turn_id IS NOT NULL AND m.turn_id != ''",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        self.read_tx(|conn| {
+            let stmt_sql = "SELECT a.alias, m.turn_id
+                         FROM agents a JOIN messages m ON m.alias = a.alias AND m.state = 'running'
+                         WHERE m.turn_id IS NOT NULL AND m.turn_id != ''";
+            let rows = conn
+                .query_vec(stmt_sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
     }
 
     /// Queued deliveries that are turns of their own — what an
     /// unreported turn holds back (routed notifications still pass).
     pub fn queued_turns(&self, alias: &str) -> Result<i64> {
-        let conn = self.conn();
-        Ok(conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'
-                 AND source NOT IN {TURNLESS_SOURCES_SQL}"
-            ),
-            [alias],
-            |r| r.get(0),
-        )?)
+        self.read_tx(|conn| {
+            Ok(conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'
+                             AND source NOT IN {TURNLESS_SOURCES_SQL}"
+                ),
+                [alias],
+                |r| r.get(0),
+            )?)
+        })
     }
 
     /// Providers with at least one *live* in-flight turn — the WAL
@@ -1848,50 +1862,52 @@ impl Store {
     /// report bound has not run out at `now`: a stale row on a dead actor
     /// or an overdue one never defers a checkpoint.
     pub fn busy_providers(&self, live: &HashSet<String>, now: f64) -> Result<HashSet<String>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT a.provider AS agent_provider, a.params AS agent_params,
-                    a.endpoint_kind AS agent_kind, m.*
-             FROM agents a JOIN messages m ON m.alias = a.alias
-             WHERE m.state IN ('submitting','running')",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let params: Option<String> = r.get("agent_params")?;
-            Ok((
-                r.get::<_, String>("agent_provider")?,
-                params.and_then(|p| serde_json::from_str::<Value>(&p).ok()),
-                r.get::<_, String>("agent_kind")? == "pty",
-                row_message(r)?,
-            ))
-        })?;
-        let mut busy = HashSet::new();
-        for row in rows {
-            let (provider, params, pty, message) = row?;
-            if !live.contains(&message.alias) {
-                continue;
+        self.read_tx(|conn| {
+            let stmt_sql = "SELECT a.provider AS agent_provider, a.params AS agent_params,
+                                a.endpoint_kind AS agent_kind, m.*
+                         FROM agents a JOIN messages m ON m.alias = a.alias
+                         WHERE m.state IN ('submitting','running')";
+            let rows = conn
+                .query_vec(stmt_sql, [], |r| {
+                    let params: Option<String> = r.get("agent_params")?;
+                    Ok((
+                        r.get::<_, String>("agent_provider")?,
+                        params.and_then(|p| serde_json::from_str::<Value>(&p).ok()),
+                        r.get::<_, String>("agent_kind")? == "pty",
+                        row_message(r)?,
+                    ))
+                })
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
+            let mut busy = HashSet::new();
+            for row in rows {
+                let (provider, params, pty, message) = row?;
+                if !live.contains(&message.alias) {
+                    continue;
+                }
+                // The report bound is a pty rule: a managed turn is live
+                // while its provider call runs, however long.
+                if pty && message.report_overdue(report_timeout_secs(params.as_ref()), now) {
+                    continue;
+                }
+                busy.insert(provider);
             }
-            // The report bound is a pty rule: a managed turn is live
-            // while its provider call runs, however long.
-            if pty && message.report_overdue(report_timeout_secs(params.as_ref()), now) {
-                continue;
-            }
-            busy.insert(provider);
-        }
-        Ok(busy)
+            Ok(busy)
+        })
     }
 
     /// Bound a non-agent event stream to its newest `keep` rows — the
     /// daemon's `wal_checkpointed` stream has no agents row, so the
     /// agent-removal `DELETE` never reaches it.
     pub fn prune_stream(&self, alias: &str, keep: i64) -> Result<()> {
-        let conn = self.write_conn()?;
-        conn.execute(
-            "DELETE FROM events WHERE alias=?1 AND seq NOT IN (
-                 SELECT seq FROM events WHERE alias=?1
-                 ORDER BY seq DESC LIMIT ?2)",
-            params![alias, keep],
-        )?;
-        Ok(())
+        self.write_tx(|conn| {
+            conn.execute(
+                "DELETE FROM events WHERE alias=?1 AND seq NOT IN (
+                             SELECT seq FROM events WHERE alias=?1
+                             ORDER BY seq DESC LIMIT ?2)",
+                params![alias, keep],
+            )?;
+            Ok(())
+        })
     }
 
     /// The next still-waiting message for the agent — `queued` or

@@ -173,9 +173,8 @@
         );
 
         // A pty row reads back through the pane map with its start.
-        s.conn()
-            .execute("UPDATE agents SET endpoint_kind='pty' WHERE alias='w1'", [])
-            .unwrap();
+        s.fixture_write(|c| c.execute("UPDATE agents SET endpoint_kind='pty' WHERE alias='w1'", [])
+            .map_err(Into::into)).unwrap();
         assert_eq!(
             s.pty_pane_pids().unwrap(),
             vec![("w1".to_string(), child.id(), child_start.map(|t| t as u64))]

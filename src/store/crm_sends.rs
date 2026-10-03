@@ -41,13 +41,15 @@ impl Store {
     /// the send row itself already refused — this insert is its
     /// core witness.
     pub fn crm_send_open(&self, install: &str, context: &str, send_id: &str) -> Result<()> {
-        let conn = self.write_conn()?;
-        conn.execute(
-            "INSERT INTO crm_sends(install_id,context_id,send_id,state,created,updated) VALUES(?,?,?, 'sending', ?, ?)",
-            params![install, context, send_id, now(), now()],
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
-        Ok(())
+        self.write_tx(|conn| {
+
+                    conn.execute(
+                        "INSERT INTO crm_sends(install_id,context_id,send_id,state,created,updated) VALUES(?,?,?, 'sending', ?, ?)",
+                        params![install, context, send_id, now(), now()],
+                    )
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                    Ok(())
+        })
     }
 
     /// Transition one send's durable state. `completed` and `closed`
@@ -60,30 +62,31 @@ impl Store {
         state: &str,
     ) -> Result<()> {
         debug_assert!(matches!(state, "completed" | "closed"));
-        let conn = self.write_conn()?;
-        conn.execute(
-            "UPDATE crm_sends SET state=?, updated=? WHERE install_id=? AND context_id=? AND send_id=?",
-            params![state, now(), install, context, send_id],
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
-        Ok(())
+        self.write_tx(|conn| {
+
+                    conn.execute(
+                        "UPDATE crm_sends SET state=?, updated=? WHERE install_id=? AND context_id=? AND send_id=?",
+                        params![state, now(), install, context, send_id],
+                    )
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                    Ok(())
+        })
     }
 
     /// Every send whose durable intent is still live — the boot-time
     /// sweep's worklist.
     pub fn crm_sends_sending(&self) -> Result<Vec<(String, String, String)>> {
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare("SELECT install_id,context_id,send_id FROM crm_sends WHERE state='sending' ORDER BY created")
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(|e| Error::internal(e.to_string()))?);
-        }
-        Ok(out)
+        self.read_tx(|conn| {
+
+                    let stmt_sql = "SELECT install_id,context_id,send_id FROM crm_sends WHERE state='sending' ORDER BY created";
+                    let rows = conn.query_vec(stmt_sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))
+                        .map_err(|e| Error::internal(e.to_string()))?;
+                    let mut out = Vec::new();
+                    for row in rows {
+                        out.push(row.map_err(|e| Error::internal(e.to_string()))?);
+                    }
+                    Ok(out)
+        })
     }
 
     /// Record one unsubscribe token's home. `token_hash` is the
@@ -95,13 +98,15 @@ impl Store {
         install: &str,
         context: &str,
     ) -> Result<()> {
-        let conn = self.write_conn()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO crm_unsubscribe_index(token_hash,install_id,context_id) VALUES(?,?,?)",
-            params![token_hash, install, context],
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
-        Ok(())
+        self.write_tx(|conn| {
+
+                    conn.execute(
+                        "INSERT OR IGNORE INTO crm_unsubscribe_index(token_hash,install_id,context_id) VALUES(?,?,?)",
+                        params![token_hash, install, context],
+                    )
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                    Ok(())
+        })
     }
 
     /// Where a token's suppression rows belong, if it is one of ours.
@@ -111,33 +116,35 @@ impl Store {
         &self,
         token_hash: &str,
     ) -> Result<Option<(String, String)>> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT install_id,context_id FROM crm_unsubscribe_index WHERE token_hash=?",
-            params![token_hash],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        )
-        .optional()
-        .map_err(|e| Error::internal(e.to_string()))
+        self.read_tx(|conn| {
+            conn.query_opt(
+                "SELECT install_id,context_id FROM crm_unsubscribe_index WHERE token_hash=?",
+                params![token_hash],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .map_err(|e| Error::internal(e.to_string()))
+        })
     }
 
     /// One persisted operator setting — key/value in `crm_settings`.
     /// `None` clears it.
     pub fn crm_setting_set(&self, key: &str, value: Option<&str>, by: &str) -> Result<()> {
-        let conn = self.write_conn()?;
-        match value {
-            Some(value) => conn
-                .execute(
-                    "INSERT INTO crm_settings(key,value,by,updated) VALUES(?,?,?,?)
-                     ON CONFLICT(key) DO UPDATE SET value=excluded.value, by=excluded.by, updated=excluded.updated",
-                    params![key, value, by, now()],
-                )
-                .map(|_| ()),
-            None => conn
-                .execute("DELETE FROM crm_settings WHERE key=?", params![key])
-                .map(|_| ()),
-        }
-        .map_err(|e| Error::internal(e.to_string()))
+        self.write_tx(|conn| {
+
+                    match value {
+                        Some(value) => conn
+                            .execute(
+                                "INSERT INTO crm_settings(key,value,by,updated) VALUES(?,?,?,?)
+                                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, by=excluded.by, updated=excluded.updated",
+                                params![key, value, by, now()],
+                            )
+                            .map(|_| ()),
+                        None => conn
+                            .execute("DELETE FROM crm_settings WHERE key=?", params![key])
+                            .map(|_| ()),
+                    }
+                    .map_err(|e| Error::internal(e.to_string()))
+        })
     }
 
     /// The current value of one persisted operator setting.
@@ -155,22 +162,15 @@ impl Store {
     /// Best-effort audit for the unsubscribe origin — the origin is
     /// public configuration, never a secret.
     pub fn note_crm_send_origin(&self, origin: Option<&str>) {
-        let guard = match self.write_conn() {
-            Ok(guard) => guard,
-            Err(error) => {
-                eprintln!("send origin audit event skipped: {error}");
-                return;
-            }
-        };
-        if Self::event(
-            &guard,
-            Self::DAEMON_STREAM,
-            "crm_send_origin_set",
-            json!({"unsubscribe_origin": origin}),
-        )
-        .is_err()
-        {
-            eprintln!("send origin audit event skipped: event write refused");
+        if let Err(e) = self.write_tx(|tx| {
+            Self::event(
+                &*tx,
+                Self::DAEMON_STREAM,
+                "crm_send_origin_set",
+                json!({"unsubscribe_origin": origin}),
+            )
+        }) {
+            eprintln!("store: best-effort CRM send origin audit failed: {e}");
         }
     }
 }

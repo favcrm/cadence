@@ -20,6 +20,7 @@ use super::app_records::{
     email_shape_valid, source_shape_valid, tag_valid, CustomerProfile, ProfileRefused, RecordStore,
 };
 use super::app_runs::material_digest;
+use super::StoreConn;
 use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -247,22 +248,22 @@ struct Computation {
 }
 
 impl RecordStore {
-    fn customers_in(conn: &Connection, context: &str) -> Result<Vec<CustomerRow>> {
-        let mut stmt = conn
-            .prepare("SELECT id,revision,body FROM app_records WHERE context_id=? ORDER BY id")
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let found = stmt
-            .query_map([context], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
+    fn customers_in(conn: &impl super::StoreConn, context: &str) -> Result<Vec<CustomerRow>> {
+        let found = conn
+            .query_vec(
+                "SELECT id,revision,body FROM app_records WHERE context_id=? ORDER BY id",
+                [context],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
             .map_err(|e| Error::internal(e.to_string()))?;
         let mut rows = Vec::new();
-        for row in found {
-            let (id, revision, body) = row.map_err(|e| Error::internal(e.to_string()))?;
+        for (id, revision, body) in found {
             let profile = serde_json::from_str::<Value>(&body)
                 .ok()
                 .and_then(|stored| CustomerProfile::parse(&stored).ok());
@@ -276,24 +277,22 @@ impl RecordStore {
     }
 
     fn suppressions_in(
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         context: &str,
     ) -> Result<(
         std::collections::HashSet<String>,
         std::collections::HashSet<String>,
     )> {
-        let mut stmt = conn
-            .prepare("SELECT kind,key FROM app_suppressions WHERE context_id=?")
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let found = stmt
-            .query_map([context], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
+        let found = conn
+            .query_vec(
+                "SELECT kind,key FROM app_suppressions WHERE context_id=?",
+                [context],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
             .map_err(|e| Error::internal(e.to_string()))?;
         let mut emails = std::collections::HashSet::new();
         let mut customers = std::collections::HashSet::new();
-        for row in found {
-            let (kind, key) = row.map_err(|e| Error::internal(e.to_string()))?;
+        for (kind, key) in found {
             if kind == "email" {
                 emails.insert(key);
             } else {
@@ -303,26 +302,21 @@ impl RecordStore {
         Ok((emails, customers))
     }
 
-    fn suppression_digest_in(conn: &Connection, context: &str) -> Result<String> {
-        let mut stmt = conn
-            .prepare("SELECT kind,key FROM app_suppressions WHERE context_id=? ORDER BY kind,key")
+    fn suppression_digest_in(conn: &impl super::StoreConn, context: &str) -> Result<String> {
+        let rows = conn
+            .query_vec(
+                "SELECT kind,key FROM app_suppressions WHERE context_id=? ORDER BY kind,key",
+                [context],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
             .map_err(|e| Error::internal(e.to_string()))?;
-        let found = stmt
-            .query_map([context], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let mut rows = Vec::new();
-        for row in found {
-            rows.push(row.map_err(|e| Error::internal(e.to_string()))?);
-        }
         Ok(material_digest(
             &json!({"domain": "cadence-app-suppressions-v1", "rows": rows}),
         ))
     }
 
     fn segment_in(
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         context: &str,
         segment_id: &str,
     ) -> Result<(i64, String, Vec<Predicate>, String)> {
@@ -351,7 +345,7 @@ impl RecordStore {
     }
 
     fn exclusion_in(
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         context: &str,
         list_id: &str,
     ) -> Result<(i64, String, Vec<String>, String)> {
@@ -387,7 +381,7 @@ impl RecordStore {
     /// prepare and show-verification share one computation.
     fn compute_audience(
         &self,
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         context: &str,
         base: &AudienceBase,
         exclusion_list_id: Option<&str>,
@@ -526,7 +520,12 @@ impl RecordStore {
         })
     }
 
-    fn sample_in(&self, conn: &Connection, context: &str, ids: &[String]) -> Result<Vec<Value>> {
+    fn sample_in(
+        &self,
+        conn: &impl super::StoreConn,
+        context: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>> {
         let mut sample = Vec::new();
         for id in ids.iter().take(SAMPLE_MAX) {
             let name: String = conn
@@ -552,7 +551,7 @@ impl RecordStore {
 
     fn preview_json(
         &self,
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         context: &str,
         base: &AudienceBase,
         exclusion_list_id: Option<&str>,
@@ -613,65 +612,62 @@ impl RecordStore {
         }));
         let stored =
             serde_json::to_string(&definition).map_err(|e| Error::internal(e.to_string()))?;
-        let conn = self.conn();
-        // IMMEDIATE: a racing saver blocks on the write lock first,
-        // so exactly one revision wins and the loser is stale.
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| Error::internal(e.to_string()))?;
-        let current: Option<i64> = tx
-            .query_row(
-                "SELECT revision FROM app_segments WHERE context_id=? AND id=?",
-                params![context, segment_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let revision = match (current, expected_revision) {
-            (None, None) => 1,
-            (None, Some(_)) => {
-                return Err(Error::rejected(
-                    "audience segment is unknown; save without an expected revision",
-                ));
-            }
-            (Some(_), None) => {
-                return Err(Error::rejected(
-                    "audience segment already exists; name the observed revision",
-                ));
-            }
-            (Some(current), Some(expected)) => {
-                if current != expected {
-                    return Err(Error::rejected("audience segment revision is stale"));
-                }
-                current
-                    .checked_add(1)
-                    .ok_or_else(|| Error::rejected("audience segment revision exhausted"))?
-            }
-        };
-        if current.is_none() {
-            tx.execute(
-                "INSERT INTO app_segments(context_id,id,revision,name,definition,digest,created,updated) VALUES(?,?,?,?,?,?,?,?)",
-                params![context, segment_id, revision, name, stored, digest, now(), now()],
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        } else {
-            let changed = tx
-                .execute(
-                    "UPDATE app_segments SET revision=?,name=?,definition=?,digest=?,updated=? WHERE context_id=? AND id=? AND revision=?",
-                    params![revision, name, stored, digest, now(), context, segment_id, current],
+        // `write_tx` holds `BEGIN IMMEDIATE` across the check + writes:
+        // a racing saver blocks on the write lock first, so exactly one
+        // revision wins and the loser is stale.
+        self.write_tx(|tx| {
+            let current: Option<i64> = tx
+                .query_opt(
+                    "SELECT revision FROM app_segments WHERE context_id=? AND id=?",
+                    params![context, segment_id],
+                    |r| r.get(0),
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
-            if changed != 1 {
-                return Err(Error::rejected("audience segment revision is stale"));
+            let revision = match (current, expected_revision) {
+                (None, None) => 1,
+                (None, Some(_)) => {
+                    return Err(Error::rejected(
+                        "audience segment is unknown; save without an expected revision",
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(Error::rejected(
+                        "audience segment already exists; name the observed revision",
+                    ));
+                }
+                (Some(current), Some(expected)) => {
+                    if current != expected {
+                        return Err(Error::rejected("audience segment revision is stale"));
+                    }
+                    current
+                        .checked_add(1)
+                        .ok_or_else(|| Error::rejected("audience segment revision exhausted"))?
+                }
+            };
+            if current.is_none() {
+                tx.execute(
+                    "INSERT INTO app_segments(context_id,id,revision,name,definition,digest,created,updated) VALUES(?,?,?,?,?,?,?,?)",
+                    params![context, segment_id, revision, name, stored, digest, now(), now()],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            } else {
+                let changed = tx
+                    .execute(
+                        "UPDATE app_segments SET revision=?,name=?,definition=?,digest=?,updated=? WHERE context_id=? AND id=? AND revision=?",
+                        params![revision, name, stored, digest, now(), context, segment_id, current],
+                    )
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                if changed != 1 {
+                    return Err(Error::rejected("audience segment revision is stale"));
+                }
             }
-        }
-        tx.execute(
-            "INSERT INTO app_segment_revisions(context_id,segment_id,revision,definition,digest,actor,at) VALUES(?,?,?,?,?,'operator',?)",
-            params![context, segment_id, revision, stored, digest, now()],
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
-        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-        drop(conn);
+            tx.execute(
+                "INSERT INTO app_segment_revisions(context_id,segment_id,revision,definition,digest,actor,at) VALUES(?,?,?,?,?,'operator',?)",
+                params![context, segment_id, revision, stored, digest, now()],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+            Ok(revision)
+        })?;
         Ok(json!({"segment": self.app_segment_show(context, segment_id)?["segment"]}))
     }
 
@@ -753,63 +749,62 @@ impl RecordStore {
             "member_ids": members,
         }));
         let stored = serde_json::to_string(&members).map_err(|e| Error::internal(e.to_string()))?;
-        let conn = self.conn();
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| Error::internal(e.to_string()))?;
-        let current: Option<i64> = tx
-            .query_row(
-                "SELECT revision FROM app_exclusions WHERE context_id=? AND id=?",
-                params![context, list_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let revision = match (current, expected_revision) {
-            (None, None) => 1,
-            (None, Some(_)) => {
-                return Err(Error::rejected(
-                    "audience exclusion list is unknown; save without an expected revision",
-                ));
-            }
-            (Some(_), None) => {
-                return Err(Error::rejected(
-                    "audience exclusion list already exists; name the observed revision",
-                ));
-            }
-            (Some(current), Some(expected)) => {
-                if current != expected {
-                    return Err(Error::rejected("audience exclusion revision is stale"));
-                }
-                current
-                    .checked_add(1)
-                    .ok_or_else(|| Error::rejected("audience exclusion revision exhausted"))?
-            }
-        };
-        if current.is_none() {
-            tx.execute(
-                "INSERT INTO app_exclusions(context_id,id,revision,name,member_ids,digest,created,updated) VALUES(?,?,?,?,?,?,?,?)",
-                params![context, list_id, revision, name, stored, digest, now(), now()],
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        } else {
-            let changed = tx
-                .execute(
-                    "UPDATE app_exclusions SET revision=?,name=?,member_ids=?,digest=?,updated=? WHERE context_id=? AND id=? AND revision=?",
-                    params![revision, name, stored, digest, now(), context, list_id, current],
+        // `write_tx` holds `BEGIN IMMEDIATE` across the check + writes:
+        // a racing saver blocks on the write lock first, so exactly one
+        // revision wins and the loser is stale.
+        self.write_tx(|tx| {
+            let current: Option<i64> = tx
+                .query_opt(
+                    "SELECT revision FROM app_exclusions WHERE context_id=? AND id=?",
+                    params![context, list_id],
+                    |r| r.get(0),
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
-            if changed != 1 {
-                return Err(Error::rejected("audience exclusion revision is stale"));
+            let revision = match (current, expected_revision) {
+                (None, None) => 1,
+                (None, Some(_)) => {
+                    return Err(Error::rejected(
+                        "audience exclusion list is unknown; save without an expected revision",
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(Error::rejected(
+                        "audience exclusion list already exists; name the observed revision",
+                    ));
+                }
+                (Some(current), Some(expected)) => {
+                    if current != expected {
+                        return Err(Error::rejected("audience exclusion revision is stale"));
+                    }
+                    current
+                        .checked_add(1)
+                        .ok_or_else(|| Error::rejected("audience exclusion revision exhausted"))?
+                }
+            };
+            if current.is_none() {
+                tx.execute(
+                    "INSERT INTO app_exclusions(context_id,id,revision,name,member_ids,digest,created,updated) VALUES(?,?,?,?,?,?,?,?)",
+                    params![context, list_id, revision, name, stored, digest, now(), now()],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            } else {
+                let changed = tx
+                    .execute(
+                        "UPDATE app_exclusions SET revision=?,name=?,member_ids=?,digest=?,updated=? WHERE context_id=? AND id=? AND revision=?",
+                        params![revision, name, stored, digest, now(), context, list_id, current],
+                    )
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                if changed != 1 {
+                    return Err(Error::rejected("audience exclusion revision is stale"));
+                }
             }
-        }
-        tx.execute(
-            "INSERT INTO app_exclusion_revisions(context_id,list_id,revision,member_ids,digest,actor,at) VALUES(?,?,?,?,?,'operator',?)",
-            params![context, list_id, revision, stored, digest, now()],
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
-        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-        drop(conn);
+            tx.execute(
+                "INSERT INTO app_exclusion_revisions(context_id,list_id,revision,member_ids,digest,actor,at) VALUES(?,?,?,?,?,'operator',?)",
+                params![context, list_id, revision, stored, digest, now()],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+            Ok(revision)
+        })?;
         Ok(json!({"exclusion": self.app_exclusion_show(context, list_id)?["exclusion"]}))
     }
 
@@ -1146,22 +1141,16 @@ impl Store {
     /// committed inside its installation file. Advisory like
     /// `note_app_record`: counts and digests only, never member IDs.
     pub fn note_app_audience(&self, install: &str, context: &str, action: &str, digest: &str) {
-        let guard = match self.write_conn() {
-            Ok(guard) => guard,
-            Err(error) => {
-                eprintln!("audience audit event skipped: {error}");
-                return;
-            }
-        };
-        if Self::event(
-            &guard,
-            Self::DAEMON_STREAM,
-            "app_audience_changed",
-            json!({"install_id": install, "context_id": context, "action": action, "digest": digest, "actor": "operator"}),
-        )
-        .is_err()
+        if let Err(e) = self.write_tx(|tx| {
+                Self::event(
+                    &*tx,
+                    Self::DAEMON_STREAM,
+                    "app_audience_changed",
+                    json!({"install_id": install, "context_id": context, "action": action, "digest": digest, "actor": "operator"}),
+                )
+            })
         {
-            eprintln!("audience audit event skipped: event write refused");
+            eprintln!("audience audit event skipped: {e}");
         }
     }
 }

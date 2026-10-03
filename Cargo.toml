@@ -45,7 +45,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_yaml = "0.9"
 # `backup`: the SQLite online backup API for `cadence backup`/`export` (CAD-314).
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup", "hooks"] }
 uuid = { version = "1", features = ["v4", "v5"] }
 sha2 = "0.10"
 libc = "0.2"

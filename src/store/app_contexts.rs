@@ -1,4 +1,5 @@
 //! Operator-owned bounded content defaults. These confer no execution authority.
+use super::StoreConn;
 use super::*;
 use crate::store::app_runs::material_digest;
 use rusqlite::{params, OptionalExtension};
@@ -70,7 +71,11 @@ pub struct ContextProof {
 }
 
 impl Store {
-    pub(super) fn app_context_show_in(conn: &Connection, install: &str, id: &str) -> Result<Value> {
+    pub(super) fn app_context_show_in(
+        conn: &impl super::StoreConn,
+        install: &str,
+        id: &str,
+    ) -> Result<Value> {
         let (revision,state,encoded,digest): (i64,String,String,String) = conn.query_row(
             "SELECT revision,state,config_json,config_digest FROM app_contexts WHERE id=? AND install_id=?",
             params![id,install], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
@@ -88,48 +93,50 @@ impl Store {
         )
     }
     pub fn app_context_show(&self, install: &str, id: &str) -> Result<Value> {
-        Ok(json!({"context":Self::app_context_show_in(&self.conn(),install,id)?}))
+        {
+            self.read_tx(|conn| Ok(json!({"context":Self::app_context_show_in(&conn,install,id)?})))
+        }
     }
     pub fn app_context_list(&self, install: &str) -> Result<Value> {
-        let conn = self.conn();
-        let ids = conn
-            .prepare(
-                "SELECT id FROM app_contexts WHERE install_id=? ORDER BY created,id LIMIT 101",
-            )?
-            .query_map([install], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if ids.len() > CONTEXT_LIMIT as usize {
-            return Err(Error::rejected(
-                "context inventory exceeds its supported bound",
-            ));
-        }
-        Ok(
-            json!({"contexts":ids.iter().map(|id|Self::app_context_show_in(&conn,install,id)).collect::<Result<Vec<_>>>()?}),
-        )
+        self.read_tx(|conn| {
+
+                    let ids = conn.query_vec("SELECT id FROM app_contexts WHERE install_id=? ORDER BY created,id LIMIT 101", [install], |r| r.get::<_, String>(0)).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    if ids.len() > CONTEXT_LIMIT as usize {
+                        return Err(Error::rejected(
+                            "context inventory exceeds its supported bound",
+                        ));
+                    }
+                    Ok(
+                        json!({"contexts":ids.iter().map(|id|Self::app_context_show_in(&conn,install,id)).collect::<Result<Vec<_>>>()?}),
+                    )
+        })
     }
     pub fn app_context_proof(
         &self,
         install: &str,
         id: &str,
     ) -> Result<(ContextConfig, ContextProof)> {
-        let row = Self::app_context_show_in(&self.conn(), install, id)?;
-        if row["state"] != "active" {
-            return Err(Error::rejected("context is archived"));
-        }
-        let config = serde_json::from_value(row["config"].clone())
-            .map_err(|_| Error::rejected("context integrity refused"))?;
-        Ok((
-            config,
-            ContextProof {
-                id: id.to_string(),
-                install_id: install.to_string(),
-                revision: row["revision"].as_i64().unwrap(),
-                digest: row["digest"].as_str().unwrap().to_string(),
-            },
-        ))
+        self.read_tx(|conn| {
+            let row = Self::app_context_show_in(&conn, install, id)?;
+            if row["state"] != "active" {
+                return Err(Error::rejected("context is archived"));
+            }
+            let config = serde_json::from_value(row["config"].clone())
+                .map_err(|_| Error::rejected("context integrity refused"))?;
+            Ok((
+                config,
+                ContextProof {
+                    id: id.to_string(),
+                    install_id: install.to_string(),
+                    revision: row["revision"].as_i64().unwrap(),
+                    digest: row["digest"].as_str().unwrap().to_string(),
+                },
+            ))
+        })
     }
     pub(super) fn app_context_proof_current_in(
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         install: &str,
         proof: &ContextProof,
     ) -> Result<()> {
@@ -156,46 +163,46 @@ impl Store {
         crate::proto::identifier(install, "installation ID")?;
         crate::proto::identifier(request, "context request ID")?;
         let digest = config.digest(install)?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        if let Some(id) = tx
-            .query_row(
-                "SELECT id FROM app_contexts WHERE install_id=? AND request_id=?",
-                params![install, request],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            let existing = Self::app_context_show_in(&tx, install, &id)?;
-            if existing["digest"].as_str() != Some(digest.as_str()) || existing["state"] != "active"
-            {
-                return Err(Error::rejected(
-                    "context request ID already has different or archived configuration",
-                ));
-            }
-            return Ok(json!({"context":existing}));
-        }
-        let count: i64 = tx.query_row(
-            "SELECT count(*) FROM app_contexts WHERE install_id=?",
-            [install],
-            |r| r.get(0),
-        )?;
-        if count >= CONTEXT_LIMIT {
-            return Err(Error::rejected(
-                "installation has reached its context limit",
-            ));
-        }
-        let id = format!("ctx-{}", uuid::Uuid::new_v4().simple());
-        tx.execute("INSERT INTO app_contexts(id,install_id,request_id,revision,state,config_json,config_digest,created,updated) VALUES(?,?,?,1,'active',?,?,?,?)",params![id,install,request,serde_json::to_string(config).map_err(|e|Error::internal(e.to_string()))?,digest,now(),now()])?;
-        Self::event(
-            &tx,
-            Self::DAEMON_STREAM,
-            "app_context_created",
-            json!({"context_id":id,"install_id":install,"revision":1,"digest":digest,"actor":"operator"}),
-        )?;
-        let result = json!({"context":Self::app_context_show_in(&tx,install,&id)?});
-        tx.commit()?;
-        Ok(result)
+        self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    if let Some(id) = tx
+                        .query_opt(
+                            "SELECT id FROM app_contexts WHERE install_id=? AND request_id=?",
+                            params![install, request],
+                            |r| r.get::<_, String>(0),
+                        )?
+                    {
+                        let existing = Self::app_context_show_in(&tx, install, &id)?;
+                        if existing["digest"].as_str() != Some(digest.as_str()) || existing["state"] != "active"
+                        {
+                            return Err(Error::rejected(
+                                "context request ID already has different or archived configuration",
+                            ));
+                        }
+                        return Ok(json!({"context":existing}));
+                    }
+                    let count: i64 = tx.query_row(
+                        "SELECT count(*) FROM app_contexts WHERE install_id=?",
+                        [install],
+                        |r| r.get(0),
+                    )?;
+                    if count >= CONTEXT_LIMIT {
+                        return Err(Error::rejected(
+                            "installation has reached its context limit",
+                        ));
+                    }
+                    let id = format!("ctx-{}", uuid::Uuid::new_v4().simple());
+                    tx.execute("INSERT INTO app_contexts(id,install_id,request_id,revision,state,config_json,config_digest,created,updated) VALUES(?,?,?,1,'active',?,?,?,?)",params![id,install,request,serde_json::to_string(config).map_err(|e|Error::internal(e.to_string()))?,digest,now(),now()])?;
+                    Self::event(
+                        &tx,
+                        Self::DAEMON_STREAM,
+                        "app_context_created",
+                        json!({"context_id":id,"install_id":install,"revision":1,"digest":digest,"actor":"operator"}),
+                    )?;
+                    let result = json!({"context":Self::app_context_show_in(&tx,install,&id)?});
+                    Ok(result)
+        })
     }
     pub fn app_context_update(
         &self,
@@ -221,45 +228,46 @@ impl Store {
                 "expected context revision must be positive",
             ));
         }
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let row = Self::app_context_show_in(&tx, install, id)?;
-        if row["revision"].as_i64() != Some(expected) {
-            return Err(Error::rejected("context revision is stale"));
-        }
-        if row["state"] == "archived" {
-            return if config.is_none() {
-                Ok(json!({"context":row}))
-            } else {
-                Err(Error::rejected("archived context cannot be updated"))
-            };
-        }
-        let revision = expected
-            .checked_add(1)
-            .ok_or_else(|| Error::rejected("context revision exhausted"))?;
-        if let Some(config) = config {
-            tx.execute("UPDATE app_contexts SET revision=?,config_json=?,config_digest=?,updated=? WHERE id=? AND install_id=? AND revision=? AND state='active'",params![revision,serde_json::to_string(config).map_err(|e|Error::internal(e.to_string()))?,config.digest(install)?,now(),id,install,expected])?;
-        } else {
-            tx.execute("UPDATE app_contexts SET revision=?,state='archived',updated=? WHERE id=? AND install_id=? AND revision=? AND state='active'",params![revision,now(),id,install,expected])?;
-        }
-        let runs = tx.prepare("SELECT id FROM app_runs WHERE install_id=? AND context_id=? AND state IN ('awaiting_approval','approved','running')")?
-            .query_map(params![install,id],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        for run in runs {
-            self.app_run_invalidate_in(&tx, &run)?;
-        }
-        Self::app_effect_invalidate_in(&tx, install, Some(id), None, None)?;
-        Self::event(
-            &tx,
-            Self::DAEMON_STREAM,
-            if config.is_some() {
-                "app_context_updated"
-            } else {
-                "app_context_archived"
-            },
-            json!({"context_id":id,"install_id":install,"revision":revision,"actor":"operator"}),
-        )?;
-        let result = json!({"context":Self::app_context_show_in(&tx,install,id)?});
-        tx.commit()?;
-        Ok(result)
+        self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let row = Self::app_context_show_in(&tx, install, id)?;
+                    if row["revision"].as_i64() != Some(expected) {
+                        return Err(Error::rejected("context revision is stale"));
+                    }
+                    if row["state"] == "archived" {
+                        return if config.is_none() {
+                            Ok(json!({"context":row}))
+                        } else {
+                            Err(Error::rejected("archived context cannot be updated"))
+                        };
+                    }
+                    let revision = expected
+                        .checked_add(1)
+                        .ok_or_else(|| Error::rejected("context revision exhausted"))?;
+                    if let Some(config) = config {
+                        tx.execute("UPDATE app_contexts SET revision=?,config_json=?,config_digest=?,updated=? WHERE id=? AND install_id=? AND revision=? AND state='active'",params![revision,serde_json::to_string(config).map_err(|e|Error::internal(e.to_string()))?,config.digest(install)?,now(),id,install,expected])?;
+                    } else {
+                        tx.execute("UPDATE app_contexts SET revision=?,state='archived',updated=? WHERE id=? AND install_id=? AND revision=? AND state='active'",params![revision,now(),id,install,expected])?;
+                    }
+                    let runs = tx.query_vec("SELECT id FROM app_runs WHERE install_id=? AND context_id=? AND state IN ('awaiting_approval','approved','running')",
+                        params![install,id],|r|r.get::<_,String>(0))?;
+                    for run in runs {
+                        self.app_run_invalidate_in(&tx, &run)?;
+                    }
+                    Self::app_effect_invalidate_in(&tx, install, Some(id), None, None)?;
+                    Self::event(
+                        &tx,
+                        Self::DAEMON_STREAM,
+                        if config.is_some() {
+                            "app_context_updated"
+                        } else {
+                            "app_context_archived"
+                        },
+                        json!({"context_id":id,"install_id":install,"revision":revision,"actor":"operator"}),
+                    )?;
+                    let result = json!({"context":Self::app_context_show_in(&tx,install,id)?});
+                    Ok(result)
+        })
     }
 }

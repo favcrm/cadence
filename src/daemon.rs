@@ -600,7 +600,7 @@ impl Shared {
         // unchanged. `open_adopting` repeats the same check.
         crate::rollout::authorize_migration(&db_path)?;
         let (mut store, recovered) = Store::open_adopting(&db_path, marker)?;
-        store.shutdown_entries_hook = opts.shutdown_entries_hook.clone();
+        store.set_shutdown_entries_hook(opts.shutdown_entries_hook.clone())?;
         if let Some(ms) = opts.shutdown_backoff_ms_for_test {
             store.shutdown_backoff_ms = ms;
         }
@@ -4673,7 +4673,9 @@ pub struct ServeOptions {
     /// transaction with that attempt's live tx — a test can mutate rows
     /// or return a synthetic sqlite error, proving rollback and the
     /// retry bound without wedging the store a restart then opens.
-    /// Never set from RPC, PM, or the environment.
+    /// Never set from RPC, PM, or the environment. `pub(crate)` — the
+    /// hook type references the crate-internal `WriteTxn` facade and is
+    /// not a public/producer authority surface.
     pub shutdown_entries_hook: Option<crate::store::ShutdownEntriesHook>,
     /// CAD-313: the operator-auth clock (epoch seconds) — `None` is the
     /// wall clock; tests inject one they advance past a link's TTL.

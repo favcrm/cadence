@@ -1,4 +1,5 @@
 //! Configured app bindings are immutable scoped receipts, never grants.
+use super::StoreConn;
 use super::*;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -181,7 +182,7 @@ pub fn binding_drift(old: &Value, new: &Value) -> BindingDrift {
     }
 }
 
-fn binding_in(conn: &Connection, install: &str, id: &str) -> Result<Value> {
+fn binding_in(conn: &impl super::StoreConn, install: &str, id: &str) -> Result<Value> {
     let row = conn.query_row(
         "SELECT context_id,slot,revision,state,config,digest FROM app_bindings WHERE install_id=? AND id=?",
         params![install,id], |r| Ok((r.get::<_,Option<String>>(0)?,r.get::<_,String>(1)?,
@@ -198,7 +199,7 @@ fn binding_in(conn: &Connection, install: &str, id: &str) -> Result<Value> {
 }
 
 pub(crate) fn binding_current_in(
-    conn: &Connection,
+    conn: &impl super::StoreConn,
     install: &str,
     context: Option<&str>,
     slot: &str,
@@ -263,32 +264,35 @@ impl Store {
     /// derivation (any app, any install) still covers it, so a rebind
     /// never cuts another install's grant and never keeps this one's.
     pub(super) fn app_install_grants_drop_in(
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         install_id: &str,
         by: &str,
     ) -> Result<()> {
-        let apps: Vec<String> = tx
-            .prepare("SELECT DISTINCT app FROM app_grants WHERE install_id=?")?
-            .query_map([install_id], |r| r.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let apps: Vec<String> = tx.query_vec(
+            "SELECT DISTINCT app FROM app_grants WHERE install_id=?",
+            [install_id],
+            |r| r.get(0),
+        )?;
         for app in apps {
-            let rows: Vec<(String, String, String, Vec<String>)> = {
-                let mut stmt = tx.prepare(
-                    "SELECT agent, platform, account, scopes FROM app_grants WHERE app=? AND install_id=?",
-                )?;
-                let mapped = stmt.query_map(params![app, install_id], |r| {
+            let raws: Vec<(String, String, String, String)> = tx.query_vec(
+                "SELECT agent, platform, account, scopes FROM app_grants WHERE app=? AND install_id=?",
+                params![app, install_id],
+                |r| {
                     let raw: String = r.get(3)?;
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, raw))
-                })?;
-                let mut rows: Vec<(String, String, String, Vec<String>)> = Vec::new();
-                for row in mapped {
-                    let (agent, plat, account, raw): (String, String, String, String) = row?;
-                    let scopes: Vec<String> = serde_json::from_str(&raw)
-                        .map_err(|_| Error::internal("derived grant receipt is corrupt"))?;
-                    rows.push((agent, plat, account, scopes));
-                }
-                rows
-            };
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        raw,
+                    ))
+                },
+            )?;
+            let mut rows: Vec<(String, String, String, Vec<String>)> = Vec::new();
+            for (agent, plat, account, raw) in raws {
+                let scopes: Vec<String> = serde_json::from_str(&raw)
+                    .map_err(|_| Error::internal("derived grant receipt is corrupt"))?;
+                rows.push((agent, plat, account, scopes));
+            }
             if rows.is_empty() {
                 continue;
             }
@@ -298,14 +302,13 @@ impl Store {
             )?;
             for (agent, plat, account, derived) in &rows {
                 let still: Vec<String> = {
-                    let mut stmt = tx.prepare(
+                    let raws = tx.query_vec(
                         "SELECT scopes FROM app_grants WHERE agent=? AND platform=? AND account=?",
+                        params![agent, plat, account],
+                        |r| r.get::<_, String>(0),
                     )?;
-                    let mapped =
-                        stmt.query_map(params![agent, plat, account], |r| r.get::<_, String>(0))?;
                     let mut still: Vec<String> = Vec::new();
-                    for row in mapped {
-                        let raw: String = row?;
+                    for raw in raws {
                         still
                             .extend(serde_json::from_str::<Vec<String>>(&raw).map_err(|_| {
                                 Error::internal("derived grant receipt is corrupt")
@@ -313,13 +316,11 @@ impl Store {
                     }
                     still
                 };
-                let existing: Option<String> = tx
-                    .query_row(
-                        "SELECT scopes FROM platform_grants WHERE agent=? AND platform=? AND account=?",
-                        params![agent, plat, account],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
+                let existing: Option<String> = tx.query_opt(
+                    "SELECT scopes FROM platform_grants WHERE agent=? AND platform=? AND account=?",
+                    params![agent, plat, account],
+                    |r| r.get(0),
+                )?;
                 let Some(raw) = existing else {
                     continue;
                 };
@@ -364,25 +365,15 @@ impl Store {
     /// longer matches) until the operator binds it again; the
     /// installation's approval is the install consent and stays.
     pub(super) fn app_binding_approvals_withdraw_for_credential_in(
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         platform_name: &str,
         account: &str,
     ) -> Result<()> {
-        let rows: Vec<(String, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT install_id, id FROM app_bindings WHERE state='configured' AND json_extract(config,'$.provider')=? AND json_extract(config,'$.account')=?",
-            )?;
-            let mapped = stmt.query_map(params![platform_name, account], |r| {
-                let install: String = r.get(0)?;
-                let binding: String = r.get(1)?;
-                Ok((install, binding))
-            })?;
-            let mut rows: Vec<(String, String)> = Vec::new();
-            for row in mapped {
-                rows.push(row?);
-            }
-            rows
-        };
+        let rows: Vec<(String, String)> = tx.query_vec(
+            "SELECT install_id, id FROM app_bindings WHERE state='configured' AND json_extract(config,'$.provider')=? AND json_extract(config,'$.account')=?",
+            params![platform_name, account],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         if rows.is_empty() {
             return Ok(());
         }
@@ -444,16 +435,16 @@ impl Store {
     /// Upgrade compatibility must inspect every configured binding, including
     /// rows intentionally hidden by the bounded operator inventory.
     pub fn app_binding_upgrade_configured(&self, install: &str) -> Result<Vec<Value>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id FROM app_bindings WHERE install_id=? AND state='configured' ORDER BY id",
-        )?;
-        let ids = stmt
-            .query_map([install], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        ids.iter()
-            .map(|id| binding_in(&conn, install, id))
-            .collect()
+        self.read_tx(|conn| {
+            let ids: Vec<String> = conn.query_vec(
+                "SELECT id FROM app_bindings WHERE install_id=? AND state='configured' ORDER BY id",
+                [install],
+                |row| row.get::<_, String>(0),
+            )?;
+            ids.iter()
+                .map(|id| binding_in(&*conn, install, id))
+                .collect()
+        })
     }
 
     /// Called under the PM upgrade lock before any journal write. Every
@@ -467,36 +458,38 @@ impl Store {
         if slots.is_empty() {
             return Ok(());
         }
-        let conn = self.conn();
-        let total: i64 = conn.query_row(
-            "SELECT count(*) FROM app_bindings WHERE install_id=?",
-            [install],
-            |r| r.get(0),
-        )?;
-        let active: i64 = conn.query_row(
-            "SELECT count(*) FROM app_bindings WHERE install_id=? AND state='configured'
-             AND json_extract(config,'$.bundle_digest')=?",
-            params![install, bundle_digest],
-            |r| r.get(0),
-        )?;
-        let mut missing = 0;
-        for slot in slots {
-            let present: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND state='configured'
-                 AND json_extract(config,'$.bundle_digest')=? AND slot=?)",
-                params![install, bundle_digest, slot],
-                |r| r.get(0),
-            )?;
-            if !present {
-                missing += 1;
-            }
-        }
-        if total + missing > LIFETIME_MAX || active + missing > ACTIVE_BUNDLE_MAX {
-            return Err(Error::rejected(
-                "binding capacity cannot reserve the new package's declared slots; retain evidence or choose another installation",
-            ));
-        }
-        Ok(())
+        self.read_tx(|conn| {
+
+                    let total: i64 = conn.query_row(
+                        "SELECT count(*) FROM app_bindings WHERE install_id=?",
+                        [install],
+                        |r| r.get(0),
+                    )?;
+                    let active: i64 = conn.query_row(
+                        "SELECT count(*) FROM app_bindings WHERE install_id=? AND state='configured'
+                         AND json_extract(config,'$.bundle_digest')=?",
+                        params![install, bundle_digest],
+                        |r| r.get(0),
+                    )?;
+                    let mut missing = 0;
+                    for slot in slots {
+                        let present: bool = conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND state='configured'
+                             AND json_extract(config,'$.bundle_digest')=? AND slot=?)",
+                            params![install, bundle_digest, slot],
+                            |r| r.get(0),
+                        )?;
+                        if !present {
+                            missing += 1;
+                        }
+                    }
+                    if total + missing > LIFETIME_MAX || active + missing > ACTIVE_BUNDLE_MAX {
+                        return Err(Error::rejected(
+                            "binding capacity cannot reserve the new package's declared slots; retain evidence or choose another installation",
+                        ));
+                    }
+                    Ok(())
+        })
     }
 
     pub fn app_binding_create(
@@ -510,81 +503,80 @@ impl Store {
         validate_config(install, context, config)?;
         crate::proto::identifier(slot, "publication slot")?;
         crate::proto::identifier(request, "binding request id")?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let existing = tx
-            .query_row(
-                "SELECT id FROM app_bindings WHERE install_id=? AND request_id=?",
-                params![install, request],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?;
-        if let Some(id) = existing {
-            let row = binding_in(&tx, install, &id)?;
-            if row["context_id"] != json!(context)
-                || row["slot"] != slot
-                || row["config"] != *config
-            {
-                return Err(Error::rejected(
-                    "binding request id is already used for different material",
-                ));
-            }
-            tx.commit()?;
-            return Ok(json!({"binding":row}));
-        }
-        let total: i64 = tx.query_row(
-            "SELECT count(*) FROM app_bindings WHERE install_id=?",
-            [install],
-            |r| r.get(0),
-        )?;
-        if total >= LIFETIME_MAX {
-            return Err(Error::rejected(
-                "installation has reached its lifetime binding capacity",
-            ));
-        }
-        let active: i64 = tx.query_row(
-            "SELECT count(*) FROM app_bindings WHERE install_id=? AND state='configured'
-             AND json_extract(config,'$.bundle_digest')=?",
-            params![install, config["bundle_digest"].as_str()],
-            |r| r.get(0),
-        )?;
-        if active >= ACTIVE_BUNDLE_MAX {
-            return Err(Error::rejected(
-                "this package version has reached its configured binding capacity",
-            ));
-        }
-        let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND coalesce(json_extract(config,'$.bundle_digest'),'')=coalesce(?,'') AND state='configured')",params![install,scope_key(context),slot,config["bundle_digest"].as_str()],|r| r.get(0))?;
-        if occupied {
-            return Err(Error::rejected(
-                "this scope already has a configured binding for this slot",
-            ));
-        }
-        let id = format!("binding-{}", uuid::Uuid::new_v4().simple());
-        let digest = config_digest(install, context, slot, config);
-        tx.execute(
-            "INSERT INTO app_bindings VALUES(?,?,?,?,?,1,'configured',?,?,?, ?,?)",
-            params![
-                id,
-                install,
-                context,
-                scope_key(context),
-                slot,
-                config.to_string(),
-                digest,
-                request,
-                now(),
-                now()
-            ],
-        )?;
-        Self::event(
-            &tx,
-            "app_bindings",
-            "app_binding_configured",
-            json!({"install_id":install,"binding_id":id,"revision":1,"digest":digest}),
-        )?;
-        let row = binding_in(&tx, install, &id)?;
-        tx.commit()?;
-        Ok(json!({"binding":row}))
+        self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let existing = tx
+                        .query_opt(
+                            "SELECT id FROM app_bindings WHERE install_id=? AND request_id=?",
+                            params![install, request],
+                            |r| r.get::<_, String>(0),
+                        )?;
+                    if let Some(id) = existing {
+                        let row = binding_in(&tx, install, &id)?;
+                        if row["context_id"] != json!(context)
+                            || row["slot"] != slot
+                            || row["config"] != *config
+                        {
+                            return Err(Error::rejected(
+                                "binding request id is already used for different material",
+                            ));
+                        }
+                        return Ok(json!({"binding":row}));
+                    }
+                    let total: i64 = tx.query_row(
+                        "SELECT count(*) FROM app_bindings WHERE install_id=?",
+                        [install],
+                        |r| r.get(0),
+                    )?;
+                    if total >= LIFETIME_MAX {
+                        return Err(Error::rejected(
+                            "installation has reached its lifetime binding capacity",
+                        ));
+                    }
+                    let active: i64 = tx.query_row(
+                        "SELECT count(*) FROM app_bindings WHERE install_id=? AND state='configured'
+                         AND json_extract(config,'$.bundle_digest')=?",
+                        params![install, config["bundle_digest"].as_str()],
+                        |r| r.get(0),
+                    )?;
+                    if active >= ACTIVE_BUNDLE_MAX {
+                        return Err(Error::rejected(
+                            "this package version has reached its configured binding capacity",
+                        ));
+                    }
+                    let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND coalesce(json_extract(config,'$.bundle_digest'),'')=coalesce(?,'') AND state='configured')",params![install,scope_key(context),slot,config["bundle_digest"].as_str()],|r| r.get(0))?;
+                    if occupied {
+                        return Err(Error::rejected(
+                            "this scope already has a configured binding for this slot",
+                        ));
+                    }
+                    let id = format!("binding-{}", uuid::Uuid::new_v4().simple());
+                    let digest = config_digest(install, context, slot, config);
+                    tx.execute(
+                        "INSERT INTO app_bindings VALUES(?,?,?,?,?,1,'configured',?,?,?, ?,?)",
+                        params![
+                            id,
+                            install,
+                            context,
+                            scope_key(context),
+                            slot,
+                            config.to_string(),
+                            digest,
+                            request,
+                            now(),
+                            now()
+                        ],
+                    )?;
+                    Self::event(
+                        &tx,
+                        "app_bindings",
+                        "app_binding_configured",
+                        json!({"install_id":install,"binding_id":id,"revision":1,"digest":digest}),
+                    )?;
+                    let row = binding_in(&tx, install, &id)?;
+                    Ok(json!({"binding":row}))
+        })
     }
 
     pub fn app_binding_update(
@@ -594,8 +586,8 @@ impl Store {
         expected: i64,
         config: &Value,
     ) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
         let row = binding_in(&tx, install, id)?;
         let revision = row["revision"]
             .as_i64()
@@ -640,8 +632,8 @@ impl Store {
             json!({"install_id":install,"binding_id":id,"revision":revision+1,"digest":digest}),
         )?;
         let next = binding_in(&tx, install, id)?;
-        tx.commit()?;
         Ok(json!({"binding":next}))
+        })
     }
 
     /// CAD-1119: carry a binding onto its connection's re-derived receipt
@@ -658,8 +650,8 @@ impl Store {
         proof: &BindingProof,
         config: &Value,
     ) -> Result<BindingProof> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
         let row = binding_in(&tx, install, &proof.id)?;
         if row["state"] != "configured"
             || row["revision"] != proof.revision
@@ -695,7 +687,6 @@ impl Store {
                    "actor":"daemon"}),
         )?;
         let next = binding_in(&tx, install, &proof.id)?;
-        tx.commit()?;
         Ok(BindingProof {
             id: proof.id.clone(),
             revision: next["revision"]
@@ -704,11 +695,12 @@ impl Store {
             digest,
             config: config.clone(),
         })
+        })
     }
 
     pub fn app_binding_revoke(&self, install: &str, id: &str, expected: i64) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
         let row = binding_in(&tx, install, id)?;
         let revision = row["revision"]
             .as_i64()
@@ -732,8 +724,8 @@ impl Store {
             json!({"install_id":install,"binding_id":id,"revision":revision+1}),
         )?;
         let next = binding_in(&tx, install, id)?;
-        tx.commit()?;
         Ok(json!({"binding":next}))
+        })
     }
 
     pub fn app_binding_for_slot(

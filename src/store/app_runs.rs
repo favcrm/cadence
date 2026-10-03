@@ -1,4 +1,5 @@
 //! Project-free, broker-local text runs. This is not provider tool confinement.
+use super::StoreConn;
 use super::*;
 use crate::issue::{parse, plan, workflow};
 use rusqlite::{params, OptionalExtension};
@@ -196,7 +197,7 @@ pub struct LocalRunProvenance<'a> {
 }
 
 impl Store {
-    pub(super) fn refuse_app_task(conn: &Connection, task_id: &str) -> Result<()> {
+    pub(super) fn refuse_app_task(conn: &impl super::StoreConn, task_id: &str) -> Result<()> {
         if conn
             .query_row(
                 "SELECT 1 FROM app_run_steps WHERE task_id=?",
@@ -212,7 +213,7 @@ impl Store {
         }
         Ok(())
     }
-    pub(super) fn refuse_app_job(conn: &Connection, job_id: &str) -> Result<()> {
+    pub(super) fn refuse_app_job(conn: &impl super::StoreConn, job_id: &str) -> Result<()> {
         if conn.query_row("SELECT 1 FROM app_run_steps s JOIN tasks t ON t.id=s.task_id WHERE t.job_id=? LIMIT 1",[job_id], |_| Ok(())).optional()?.is_some() {
             return Err(Error::rejected("app-owned jobs use the app run lifecycle"));
         }
@@ -252,15 +253,14 @@ impl Store {
         approve: bool,
         audit: Value,
     ) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
         let previous: Option<(String, String)> = tx
-            .query_row(
+            .query_opt(
                 "SELECT digest,state FROM app_install_capabilities WHERE install_id=?",
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+            )?;
         tx.execute("INSERT INTO app_install_capabilities VALUES(?,1,?,?,?) ON CONFLICT(install_id) DO UPDATE SET epoch=epoch+1,digest=excluded.digest,state=excluded.state,created=excluded.created",params![id,digest,if approve{"approved"}else{"revoked"},now()])?;
         let epoch: i64 = tx.query_row(
             "SELECT epoch FROM app_install_capabilities WHERE install_id=?",
@@ -308,10 +308,10 @@ impl Store {
                 event
             },
         )?;
-        tx.commit()?;
         Ok(
             json!({"install_id":id,"epoch":epoch,"digest":digest,"approved":approve,"capabilities":["local.text.produce","local.text.review"],"outward_release":false}),
         )
+        })
     }
 }
 
@@ -370,281 +370,277 @@ impl Store {
         let verified_source = selected_source
             .map(|(receipt, _)| self.app_capability_result(receipt))
             .transpose()?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        if let Some(proof) = context {
-            Self::app_context_proof_current_in(&tx, install_id, proof)?;
-        }
-        if let Some(proof) = binding {
-            let slot = workflow
-                .publication_slot
-                .as_deref()
-                .ok_or_else(|| Error::rejected("binding requires a selected publication slot"))?;
-            if proof.config["bundle_digest"] != bundle_digest
-                || !super::app_bindings::binding_current_in(
-                    &tx,
-                    install_id,
-                    context.map(|c| c.id.as_str()),
-                    slot,
-                    proof,
-                )?
-            {
-                return Err(Error::rejected(
-                    "publication binding is stale or belongs to a different scope",
-                ));
-            }
-        }
-        if capabilities.len() != workflow.capability_slots.len()
-            || quotes.len() != workflow.capability_slots.len()
-        {
-            return Err(Error::rejected(
-                "every declared run capability needs an exact binding",
-            ));
-        }
-        for slot in &workflow.capability_slots {
-            if !quotes
-                .get(slot)
-                .is_some_and(crate::platform::AppCapabilityQuote::valid)
-            {
-                return Err(Error::rejected(
-                    "run capability needs a valid frozen price quote",
-                ));
-            }
-            let proof = capabilities
-                .get(slot)
-                .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
-            if proof.config["bundle_digest"] != bundle_digest
-                || !super::app_bindings::binding_current_in(
-                    &tx,
-                    install_id,
-                    context.map(|c| c.id.as_str()),
-                    slot,
-                    proof,
-                )?
-                || !matches!(
-                    proof.config["mapping"]["effect"].as_str(),
-                    Some("read" | "draft")
-                )
-            {
-                return Err(Error::rejected(
-                    "run capability binding is stale or belongs to a different scope",
-                ));
-            }
-        }
-        let source = if let Some((receipt_id, post_id)) = selected_source {
-            let row = tx.query_row(
-                "SELECT r.run_id,r.slot,r.binding_digest,r.result,r.result_digest,a.install_id,a.context_id,a.state
-                 FROM app_capability_results r JOIN app_runs a ON a.id=r.run_id WHERE r.id=?",
-                [receipt_id], |r| Ok((
-                    r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,
-                    r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,
-                    r.get::<_,Option<String>>(6)?,r.get::<_,String>(7)?
-                )),
-            ).optional()?.ok_or_else(||Error::rejected("source receipt is unavailable"))?;
-            if row.5 != install_id
-                || row.6.as_deref() != context.map(|c| c.id.as_str())
-                || !matches!(row.7.as_str(), "succeeded" | "failed")
-            {
-                return Err(Error::rejected(
-                    "source receipt is outside this installation/context or incomplete",
-                ));
-            }
-            let source_run = Self::app_run_show_in(&tx, &row.0)?;
-            Self::app_completed_current_in(&tx, &source_run)?;
-            super::app_capabilities::source_receipt_recoverable_in(
-                &tx,
-                &source_run,
-                verified_source
-                    .as_ref()
-                    .ok_or_else(|| Error::rejected("source receipt is unavailable"))?,
-            )?;
-            let source_binding = &source_run["snapshot"]["capabilities"][&row.1];
-            if source_binding["digest"] != row.2
-                || source_binding["config"]["mapping"]["effect"] != "read"
-            {
-                return Err(Error::rejected(
-                    "source receipt lacks a current read binding",
-                ));
-            }
-            let result: Value = serde_json::from_str(&row.3)?;
-            if verified_source.as_ref().is_none_or(|receipt| {
-                receipt["digest"] != row.4
-                    || receipt["result"] != result
-                    || receipt["run_id"] != row.0
-                    || receipt["slot"] != row.1
-                    || receipt["binding_digest"] != row.2
-            }) {
-                return Err(Error::rejected("selected source receipt has changed"));
-            }
-            let posts = result["posts"]
-                .as_array()
-                .ok_or_else(|| Error::rejected("source receipt has no normalized posts"))?;
-            let mut matches = posts
-                .iter()
-                .filter(|post| post["id"].as_str() == Some(post_id));
-            let selected = matches
-                .next()
-                .ok_or_else(|| Error::rejected("selected post is absent from source receipt"))?;
-            if matches.next().is_some() {
-                return Err(Error::rejected(
-                    "selected post id is ambiguous in source receipt",
-                ));
-            }
-            let caption = selected["caption"]
-                .as_str()
-                .ok_or_else(|| Error::rejected("selected post has no normalized caption"))?;
-            let display = workflow::source_input_line(caption)?;
-            if inputs.get("source").map(String::as_str) != Some(display.as_str()) {
-                return Err(Error::rejected(
-                    "run source input differs from the selected provider post",
-                ));
-            }
-            Some(json!({"receipt_id":receipt_id,"receipt_digest":row.4,
-                "source_run_id":row.0,"binding_digest":row.2,
-                "post_id":post_id,"post":selected,
-                "post_digest":material_digest(selected)}))
-        } else {
-            None
-        };
-        let epoch:i64=tx.query_row("SELECT epoch FROM app_install_capabilities WHERE install_id=? AND digest=? AND state='approved'",params![install_id,bundle_digest],|r|r.get(0)).optional()?.ok_or_else(||Error::rejected("installation capability approval is absent or stale"))?;
-        let owner = self.agent_in(&tx, owner_pm)?;
-        if owner.role != "pm" {
-            return Err(Error::rejected("run owner must be an existing PM"));
-        }
-        let mut assignments = BTreeMap::new();
-        for step in &workflow.steps {
-            let agent = self.agent_in(&tx, &step.assignee)?;
-            if !(agent.enabled || Self::agent_auto_parked_in(&tx, &agent)?)
-                || agent.role != "worker"
-                || !matches!(
-                    (agent.provider.as_str(), agent.endpoint_kind.as_str()),
-                    ("codex", "managed" | "managed-ws")
-                        | ("claude", "managed")
-                        | ("pi", "managed")
-                        | ("fake", "fake")
-                )
-                || !crate::adapter::registry::spec_opt(&agent.provider, &agent.endpoint_kind)
-                    .is_some_and(|s| s.has_actor)
-                || agent.session_id.is_none()
-            {
-                return Err(Error::rejected(
-                    "local team needs an enabled registered managed local worker; PTY and remote endpoints are unsupported",
-                ));
-            }
-            let generation = material_digest(&Self::app_binding_identity(&agent));
-            let group = agent
-                .params
-                .as_ref()
-                .and_then(|p| p.get("upstream"))
-                .and_then(Value::as_str);
-            if agent.alias == owner_pm || group != Some(owner_pm) {
-                return Err(Error::rejected(
-                    "local worker must belong to the run owner group",
-                ));
-            }
-            assignments.insert(step.id.clone(),json!({"alias":agent.alias,"identity_digest":generation,"identity":Self::app_binding_identity(&agent),"role":agent.role,"provider":agent.provider,"endpoint_kind":agent.endpoint_kind}));
-        }
-        let mut snapshot = json!({"schema":1,"install_id":install_id,"bundle_digest":bundle_digest,"epoch":epoch,"workflow":workflow,"inputs":inputs,"assignments":assignments,"owner_pm":owner_pm,"project_link":project_link,"artifact_policy":{"types":["text/plain","text/markdown"],"max_bytes":ARTIFACT_BYTES,"aggregate_bytes":RUN_ARTIFACT_BYTES}});
-        if !input_origins.is_empty() {
-            snapshot["input_origins"] = json!(input_origins);
-        }
-        if let Some(proof) = context {
-            snapshot["schema"] = json!(2);
-            snapshot["context"] =
-                json!({"id":proof.id,"revision":proof.revision,"digest":proof.digest});
-        }
-        if let Some(slot) = &workflow.publication_slot {
-            snapshot["schema"] = json!(3);
-            if context.is_none() {
-                snapshot["context"] = Value::Null;
-            }
-            snapshot["publication"] = json!({"slot":slot,"binding":binding});
-        }
-        if !workflow.capability_slots.is_empty() {
-            snapshot["schema"] = json!(4);
-            if context.is_none() {
-                snapshot["context"] = Value::Null;
-            }
-            snapshot["capabilities"] = json!(capabilities);
-            snapshot["quotes"] = json!(quotes);
-        }
-        if let Some(source) = source {
-            snapshot["schema"] = json!(4);
-            if context.is_none() {
-                snapshot["context"] = Value::Null;
-            }
-            snapshot["capabilities"] = json!(capabilities);
-            snapshot["quotes"] = json!(quotes);
-            snapshot["workflow"]["capability_slots"] = json!(workflow.capability_slots);
-            snapshot["source"] = source;
-        }
-        let digest = material_digest(&snapshot);
-        if let Some((id, existing)) = tx
-            .query_row(
-                "SELECT id,snapshot_digest FROM app_runs WHERE install_id=? AND request_id=?",
-                params![install_id, request_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()?
-        {
-            if existing != digest {
-                return Err(Error::rejected(
-                    "request ID already has a different immutable snapshot",
-                ));
-            }
-            tx.commit()?;
-            drop(conn);
-            return self.app_run_show(&id);
-        }
-        let id = format!("run-{}", uuid::Uuid::new_v4().simple());
-        tx.execute("INSERT INTO jobs(id,title,spec_path,spec_sha256,pm_alias,state,max_revisions,created,updated) VALUES(?,?,?,?,?,'open',1,?,?)",params![id,"App run","app-run",digest,owner_pm,now(),now()])?;
-        tx.execute(
-            "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,project_link,owner_pm,request_id,state,approved_digest,created,updated,context_id) VALUES(?,?,?,?,?,?,?,?,?,'awaiting_approval',NULL,?,?,?)",
-            params![
-                id,
-                install_id,
-                epoch,
-                bundle_digest,
-                snapshot.to_string(),
-                digest,
-                project_link,
-                owner_pm,
-                request_id,
-                now(),
-                now(),
-                context.map(|proof|proof.id.as_str())
-            ],
-        )?;
-        for step in &workflow.steps {
-            let task = format!("{id}-{}", step.id);
-            let generation = assignments[&step.id]["identity_digest"].as_str().unwrap();
-            tx.execute("INSERT INTO tasks(id,job_id,role,assignee,state,created,updated) VALUES(?,?,?,?,'draft',?,?)",params![task,id,step.kind,step.assignee,now(),now()])?;
-            tx.execute(
-                "INSERT INTO app_run_steps VALUES(?,?,?,?,?,'pending',NULL,NULL)",
-                params![
-                    id,
-                    step.id,
-                    task,
-                    serde_json::to_string(step).map_err(|e| Error::internal(e.to_string()))?,
-                    generation
-                ],
-            )?;
-        }
-        Self::event(
-            &tx,
-            Self::DAEMON_STREAM,
-            "app_run_created",
-            json!({"run_id":id,"install_id":install_id,"snapshot_digest":digest,"actor":"operator"}),
-        )?;
-        tx.commit()?;
-        drop(conn);
-        self.app_run_show(&id)
+        self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    if let Some(proof) = context {
+                        Self::app_context_proof_current_in(&tx, install_id, proof)?;
+                    }
+                    if let Some(proof) = binding {
+                        let slot = workflow
+                            .publication_slot
+                            .as_deref()
+                            .ok_or_else(|| Error::rejected("binding requires a selected publication slot"))?;
+                        if proof.config["bundle_digest"] != bundle_digest
+                            || !super::app_bindings::binding_current_in(
+                                &tx,
+                                install_id,
+                                context.map(|c| c.id.as_str()),
+                                slot,
+                                proof,
+                            )?
+                        {
+                            return Err(Error::rejected(
+                                "publication binding is stale or belongs to a different scope",
+                            ));
+                        }
+                    }
+                    if capabilities.len() != workflow.capability_slots.len()
+                        || quotes.len() != workflow.capability_slots.len()
+                    {
+                        return Err(Error::rejected(
+                            "every declared run capability needs an exact binding",
+                        ));
+                    }
+                    for slot in &workflow.capability_slots {
+                        if !quotes
+                            .get(slot)
+                            .is_some_and(crate::platform::AppCapabilityQuote::valid)
+                        {
+                            return Err(Error::rejected(
+                                "run capability needs a valid frozen price quote",
+                            ));
+                        }
+                        let proof = capabilities
+                            .get(slot)
+                            .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
+                        if proof.config["bundle_digest"] != bundle_digest
+                            || !super::app_bindings::binding_current_in(
+                                &tx,
+                                install_id,
+                                context.map(|c| c.id.as_str()),
+                                slot,
+                                proof,
+                            )?
+                            || !matches!(
+                                proof.config["mapping"]["effect"].as_str(),
+                                Some("read" | "draft")
+                            )
+                        {
+                            return Err(Error::rejected(
+                                "run capability binding is stale or belongs to a different scope",
+                            ));
+                        }
+                    }
+                    let source = if let Some((receipt_id, post_id)) = selected_source {
+                        let row = tx.query_opt(
+                            "SELECT r.run_id,r.slot,r.binding_digest,r.result,r.result_digest,a.install_id,a.context_id,a.state
+                             FROM app_capability_results r JOIN app_runs a ON a.id=r.run_id WHERE r.id=?",
+                            [receipt_id], |r| Ok((
+                                r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,
+                                r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,
+                                r.get::<_,Option<String>>(6)?,r.get::<_,String>(7)?
+                            )),
+                        )?.ok_or_else(||Error::rejected("source receipt is unavailable"))?;
+                        if row.5 != install_id
+                            || row.6.as_deref() != context.map(|c| c.id.as_str())
+                            || !matches!(row.7.as_str(), "succeeded" | "failed")
+                        {
+                            return Err(Error::rejected(
+                                "source receipt is outside this installation/context or incomplete",
+                            ));
+                        }
+                        let source_run = Self::app_run_show_in(&tx, &row.0)?;
+                        Self::app_completed_current_in(&tx, &source_run)?;
+                        super::app_capabilities::source_receipt_recoverable_in(
+                            &tx,
+                            &source_run,
+                            verified_source
+                                .as_ref()
+                                .ok_or_else(|| Error::rejected("source receipt is unavailable"))?,
+                        )?;
+                        let source_binding = &source_run["snapshot"]["capabilities"][&row.1];
+                        if source_binding["digest"] != row.2
+                            || source_binding["config"]["mapping"]["effect"] != "read"
+                        {
+                            return Err(Error::rejected(
+                                "source receipt lacks a current read binding",
+                            ));
+                        }
+                        let result: Value = serde_json::from_str(&row.3)?;
+                        if verified_source.as_ref().is_none_or(|receipt| {
+                            receipt["digest"] != row.4
+                                || receipt["result"] != result
+                                || receipt["run_id"] != row.0
+                                || receipt["slot"] != row.1
+                                || receipt["binding_digest"] != row.2
+                        }) {
+                            return Err(Error::rejected("selected source receipt has changed"));
+                        }
+                        let posts = result["posts"]
+                            .as_array()
+                            .ok_or_else(|| Error::rejected("source receipt has no normalized posts"))?;
+                        let mut matches = posts
+                            .iter()
+                            .filter(|post| post["id"].as_str() == Some(post_id));
+                        let selected = matches
+                            .next()
+                            .ok_or_else(|| Error::rejected("selected post is absent from source receipt"))?;
+                        if matches.next().is_some() {
+                            return Err(Error::rejected(
+                                "selected post id is ambiguous in source receipt",
+                            ));
+                        }
+                        let caption = selected["caption"]
+                            .as_str()
+                            .ok_or_else(|| Error::rejected("selected post has no normalized caption"))?;
+                        let display = workflow::source_input_line(caption)?;
+                        if inputs.get("source").map(String::as_str) != Some(display.as_str()) {
+                            return Err(Error::rejected(
+                                "run source input differs from the selected provider post",
+                            ));
+                        }
+                        Some(json!({"receipt_id":receipt_id,"receipt_digest":row.4,
+                            "source_run_id":row.0,"binding_digest":row.2,
+                            "post_id":post_id,"post":selected,
+                            "post_digest":material_digest(selected)}))
+                    } else {
+                        None
+                    };
+                    let epoch:i64=tx.query_opt("SELECT epoch FROM app_install_capabilities WHERE install_id=? AND digest=? AND state='approved'",params![install_id,bundle_digest],|r|r.get(0))?.ok_or_else(||Error::rejected("installation capability approval is absent or stale"))?;
+                    let owner = self.agent_in(&tx, owner_pm)?;
+                    if owner.role != "pm" {
+                        return Err(Error::rejected("run owner must be an existing PM"));
+                    }
+                    let mut assignments = BTreeMap::new();
+                    for step in &workflow.steps {
+                        let agent = self.agent_in(&tx, &step.assignee)?;
+                        if !(agent.enabled || Self::agent_auto_parked_in(&tx, &agent)?)
+                            || agent.role != "worker"
+                            || !matches!(
+                                (agent.provider.as_str(), agent.endpoint_kind.as_str()),
+                                ("codex", "managed" | "managed-ws")
+                                    | ("claude", "managed")
+                                    | ("pi", "managed")
+                                    | ("fake", "fake")
+                            )
+                            || !crate::adapter::registry::spec_opt(&agent.provider, &agent.endpoint_kind)
+                                .is_some_and(|s| s.has_actor)
+                            || agent.session_id.is_none()
+                        {
+                            return Err(Error::rejected(
+                                "local team needs an enabled registered managed local worker; PTY and remote endpoints are unsupported",
+                            ));
+                        }
+                        let generation = material_digest(&Self::app_binding_identity(&agent));
+                        let group = agent
+                            .params
+                            .as_ref()
+                            .and_then(|p| p.get("upstream"))
+                            .and_then(Value::as_str);
+                        if agent.alias == owner_pm || group != Some(owner_pm) {
+                            return Err(Error::rejected(
+                                "local worker must belong to the run owner group",
+                            ));
+                        }
+                        assignments.insert(step.id.clone(),json!({"alias":agent.alias,"identity_digest":generation,"identity":Self::app_binding_identity(&agent),"role":agent.role,"provider":agent.provider,"endpoint_kind":agent.endpoint_kind}));
+                    }
+                    let mut snapshot = json!({"schema":1,"install_id":install_id,"bundle_digest":bundle_digest,"epoch":epoch,"workflow":workflow,"inputs":inputs,"assignments":assignments,"owner_pm":owner_pm,"project_link":project_link,"artifact_policy":{"types":["text/plain","text/markdown"],"max_bytes":ARTIFACT_BYTES,"aggregate_bytes":RUN_ARTIFACT_BYTES}});
+                    if !input_origins.is_empty() {
+                        snapshot["input_origins"] = json!(input_origins);
+                    }
+                    if let Some(proof) = context {
+                        snapshot["schema"] = json!(2);
+                        snapshot["context"] =
+                            json!({"id":proof.id,"revision":proof.revision,"digest":proof.digest});
+                    }
+                    if let Some(slot) = &workflow.publication_slot {
+                        snapshot["schema"] = json!(3);
+                        if context.is_none() {
+                            snapshot["context"] = Value::Null;
+                        }
+                        snapshot["publication"] = json!({"slot":slot,"binding":binding});
+                    }
+                    if !workflow.capability_slots.is_empty() {
+                        snapshot["schema"] = json!(4);
+                        if context.is_none() {
+                            snapshot["context"] = Value::Null;
+                        }
+                        snapshot["capabilities"] = json!(capabilities);
+                        snapshot["quotes"] = json!(quotes);
+                    }
+                    if let Some(source) = source {
+                        snapshot["schema"] = json!(4);
+                        if context.is_none() {
+                            snapshot["context"] = Value::Null;
+                        }
+                        snapshot["capabilities"] = json!(capabilities);
+                        snapshot["quotes"] = json!(quotes);
+                        snapshot["workflow"]["capability_slots"] = json!(workflow.capability_slots);
+                        snapshot["source"] = source;
+                    }
+                    let digest = material_digest(&snapshot);
+                    if let Some((id, existing)) = tx
+                        .query_opt(
+                            "SELECT id,snapshot_digest FROM app_runs WHERE install_id=? AND request_id=?",
+                            params![install_id, request_id],
+                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                        )?
+                    {
+                        if existing != digest {
+                            return Err(Error::rejected(
+                                "request ID already has a different immutable snapshot",
+                            ));
+                        }
+                        return Self::app_run_show_in(&tx, &id);
+                    }
+                    let id = format!("run-{}", uuid::Uuid::new_v4().simple());
+                    tx.execute("INSERT INTO jobs(id,title,spec_path,spec_sha256,pm_alias,state,max_revisions,created,updated) VALUES(?,?,?,?,?,'open',1,?,?)",params![id,"App run","app-run",digest,owner_pm,now(),now()])?;
+                    tx.execute(
+                        "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,project_link,owner_pm,request_id,state,approved_digest,created,updated,context_id) VALUES(?,?,?,?,?,?,?,?,?,'awaiting_approval',NULL,?,?,?)",
+                        params![
+                            id,
+                            install_id,
+                            epoch,
+                            bundle_digest,
+                            snapshot.to_string(),
+                            digest,
+                            project_link,
+                            owner_pm,
+                            request_id,
+                            now(),
+                            now(),
+                            context.map(|proof|proof.id.as_str())
+                        ],
+                    )?;
+                    for step in &workflow.steps {
+                        let task = format!("{id}-{}", step.id);
+                        let generation = assignments[&step.id]["identity_digest"].as_str().unwrap();
+                        tx.execute("INSERT INTO tasks(id,job_id,role,assignee,state,created,updated) VALUES(?,?,?,?,'draft',?,?)",params![task,id,step.kind,step.assignee,now(),now()])?;
+                        tx.execute(
+                            "INSERT INTO app_run_steps VALUES(?,?,?,?,?,'pending',NULL,NULL)",
+                            params![
+                                id,
+                                step.id,
+                                task,
+                                serde_json::to_string(step).map_err(|e| Error::internal(e.to_string()))?,
+                                generation
+                            ],
+                        )?;
+                    }
+                    Self::event(
+                        &tx,
+                        Self::DAEMON_STREAM,
+                        "app_run_created",
+                        json!({"run_id":id,"install_id":install_id,"snapshot_digest":digest,"actor":"operator"}),
+                    )?;
+                    Self::app_run_show_in(&*tx, &id)
+        })
     }
     pub fn app_run_show(&self, id: &str) -> Result<Value> {
-        let conn = self.conn();
-        Self::app_run_show_in(&conn, id)
+        self.read_tx(|conn| Self::app_run_show_in(&conn, id))
     }
-    pub(super) fn app_run_show_in(conn: &Connection, id: &str) -> Result<Value> {
+    pub(super) fn app_run_show_in(conn: &impl super::StoreConn, id: &str) -> Result<Value> {
         let mut value=conn.query_row("SELECT install_id,epoch,snapshot,snapshot_digest,project_link,state,approved_digest FROM app_runs WHERE id=?",[id],|r|Ok(json!({"id":id,"install_id":r.get::<_,String>(0)?,"epoch":r.get::<_,i64>(1)?,"snapshot":r.get::<_,String>(2)?,"snapshot_digest":r.get::<_,String>(3)?,"project_link":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"approved_digest":r.get::<_,Option<String>>(6)?}))).optional()?.ok_or_else(||Error::rejected("unknown app run"))?;
         value["snapshot"] = serde_json::from_str(value["snapshot"].as_str().unwrap())
             .map_err(|e| Error::internal(e.to_string()))?;
@@ -653,9 +649,9 @@ impl Store {
             [id],
             |r| r.get::<_, Option<String>>(0)
         )?);
-        value["steps"]=Value::Array(conn.prepare("SELECT step_id,task_id,state,message_id FROM app_run_steps WHERE run_id=? ORDER BY step_id")?.query_map([id],|r|Ok(json!({"step_id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"message_id":r.get::<_,Option<String>>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
-        value["artifacts"]=Value::Array(conn.prepare("SELECT id,step_id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? ORDER BY step_id")?.query_map([id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"step_id":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"media_type":r.get::<_,String>(3)?,"size":r.get::<_,i64>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
-        value["reviews"]=Value::Array(conn.prepare("SELECT step_id,artifact_digest,reviewer,decision,rationale,asset_receipt_id,asset_digest FROM app_run_reviews WHERE run_id=?")?.query_map([id],|r|{
+        value["steps"]=Value::Array(conn.query_vec("SELECT step_id,task_id,state,message_id FROM app_run_steps WHERE run_id=? ORDER BY step_id",[id],|r|Ok(json!({"step_id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"message_id":r.get::<_,Option<String>>(3)?})))?);
+        value["artifacts"]=Value::Array(conn.query_vec("SELECT id,step_id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? ORDER BY step_id",[id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"step_id":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"media_type":r.get::<_,String>(3)?,"size":r.get::<_,i64>(4)?})))?);
+        value["reviews"]=Value::Array(conn.query_vec("SELECT step_id,artifact_digest,reviewer,decision,rationale,asset_receipt_id,asset_digest FROM app_run_reviews WHERE run_id=?",[id],|r|{
             let mut review=json!({"step_id":r.get::<_,String>(0)?,"artifact_digest":r.get::<_,String>(1)?,"reviewer":r.get::<_,String>(2)?,"decision":r.get::<_,String>(3)?,"rationale":r.get::<_,String>(4)?});
             let asset:Option<String>=r.get(5)?;
             let digest:Option<String>=r.get(6)?;
@@ -664,7 +660,7 @@ impl Store {
                 review["asset_digest"]=json!(digest);
             }
             Ok(review)
-        })?.collect::<rusqlite::Result<Vec<_>>>()?);
+        })?);
         Ok(value)
     }
     pub fn app_run_list(&self, install_id: Option<&str>) -> Result<Value> {
@@ -698,57 +694,64 @@ impl Store {
         cancel: bool,
         current_bundle: Option<&str>,
     ) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let run = Self::app_run_show_in(&tx, id)?;
-        let state = run["state"].as_str().unwrap();
-        if cancel {
-            if matches!(state, "succeeded" | "failed" | "cancelled") {
-                return Err(Error::rejected("run is already terminal"));
-            }
-            tx.execute(
-                "UPDATE app_runs SET state='cancelled',approved_digest=NULL,updated=? WHERE id=?",
-                params![now(), id],
-            )?;
-            tx.execute(
-                "UPDATE jobs SET state='cancelled',updated=? WHERE id=?",
-                params![now(), id],
-            )?;
-        } else {
-            if state != "awaiting_approval" || digest != run["snapshot_digest"].as_str() {
-                return Err(Error::rejected(
-                    "execution decision needs the pending immutable snapshot digest",
-                ));
-            }
-            Self::app_current_in(
-                &tx,
-                &run,
-                current_bundle.ok_or_else(|| {
-                    Error::rejected("execution approval requires current installation proof")
-                })?,
-            )?;
-            tx.execute("UPDATE app_runs SET state='approved',approved_digest=snapshot_digest,updated=? WHERE id=?",params![now(),id])?;
-        }
-        Self::event(
-            &tx,
-            Self::DAEMON_STREAM,
-            if cancel {
-                "app_run_cancelled"
-            } else {
-                "app_run_execution_approved"
-            },
-            json!({"run_id":id,"digest":run["snapshot_digest"],"actor":"operator"}),
-        )?;
-        tx.commit()?;
-        drop(conn);
-        self.app_run_show(id)
+        self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let run = Self::app_run_show_in(&tx, id)?;
+                    let state = run["state"].as_str().unwrap();
+                    if cancel {
+                        if matches!(state, "succeeded" | "failed" | "cancelled") {
+                            return Err(Error::rejected("run is already terminal"));
+                        }
+                        tx.execute(
+                            "UPDATE app_runs SET state='cancelled',approved_digest=NULL,updated=? WHERE id=?",
+                            params![now(), id],
+                        )?;
+                        tx.execute(
+                            "UPDATE jobs SET state='cancelled',updated=? WHERE id=?",
+                            params![now(), id],
+                        )?;
+                    } else {
+                        if state != "awaiting_approval" || digest != run["snapshot_digest"].as_str() {
+                            return Err(Error::rejected(
+                                "execution decision needs the pending immutable snapshot digest",
+                            ));
+                        }
+                        Self::app_current_in(
+                            &tx,
+                            &run,
+                            current_bundle.ok_or_else(|| {
+                                Error::rejected("execution approval requires current installation proof")
+                            })?,
+                        )?;
+                        tx.execute("UPDATE app_runs SET state='approved',approved_digest=snapshot_digest,updated=? WHERE id=?",params![now(),id])?;
+                    }
+                    Self::event(
+                        &tx,
+                        Self::DAEMON_STREAM,
+                        if cancel {
+                            "app_run_cancelled"
+                        } else {
+                            "app_run_execution_approved"
+                        },
+                        json!({"run_id":id,"digest":run["snapshot_digest"],"actor":"operator"}),
+                    )?;
+                    Self::app_run_show_in(&tx, id)
+        })
     }
-    pub(super) fn app_current_in(conn: &Connection, run: &Value, bundle: &str) -> Result<()> {
+    pub(super) fn app_current_in(
+        conn: &impl super::StoreConn,
+        run: &Value,
+        bundle: &str,
+    ) -> Result<()> {
         Self::app_authority_in(conn, run, bundle, false)
     }
     /// Completed material retains its original approval epoch across package
     /// upgrades. It is never used for a new/active run or worker dispatch.
-    pub(super) fn app_completed_current_in(conn: &Connection, run: &Value) -> Result<()> {
+    pub(super) fn app_completed_current_in(
+        conn: &impl super::StoreConn,
+        run: &Value,
+    ) -> Result<()> {
         if !matches!(run["state"].as_str(), Some("succeeded" | "failed"))
             || run["approved_digest"] != run["snapshot_digest"]
         {
@@ -762,7 +765,7 @@ impl Store {
         Self::app_authority_in(conn, run, bundle, true)
     }
     fn app_authority_in(
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         run: &Value,
         bundle: &str,
         historical: bool,
@@ -911,7 +914,7 @@ impl Store {
         }
         Ok(())
     }
-    fn app_context_current_in(conn: &Connection, run: &Value) -> Result<()> {
+    fn app_context_current_in(conn: &impl super::StoreConn, run: &Value) -> Result<()> {
         let context = run["context_id"].as_str();
         if let Some(id) = context {
             let snapshot = &run["snapshot"];
@@ -967,7 +970,10 @@ impl Store {
     /// false. Only the daemon's idle timer writes that record, so no
     /// caller can mark a stopped worker as parked. A parked worker is
     /// woken by the CAD-413 auto-resume once its kickoff is queued.
-    pub(super) fn agent_auto_parked_in(conn: &Connection, agent: &Agent) -> Result<bool> {
+    pub(super) fn agent_auto_parked_in(
+        conn: &impl super::StoreConn,
+        agent: &Agent,
+    ) -> Result<bool> {
         if agent.enabled || agent.state != "stopped" {
             return Ok(false);
         }
@@ -993,116 +999,115 @@ impl Store {
     /// Called only while the daemon holds the installation's PM lock. SQL
     /// rechecks the epoch and dependency state in the enqueue transaction.
     pub fn app_run_dispatch(&self, id: &str, current_bundle: &str) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let run = Self::app_run_show_in(&tx, id)?;
-        Self::app_current_in(&tx, &run, current_bundle)?;
-        if !matches!(run["state"].as_str(), Some("approved" | "running"))
-            || run["approved_digest"] != run["snapshot_digest"]
-        {
-            return Err(Error::rejected("run execution approval is absent or stale"));
-        }
-        for assignment in run["snapshot"]["assignments"].as_object().unwrap().values() {
-            let alias = assignment["alias"].as_str().unwrap();
-            let worker = self.agent_in(&tx, alias)?;
-            if !(worker.enabled || Self::agent_auto_parked_in(&tx, &worker)?)
-                || Self::app_binding_identity(&worker) != assignment["identity"]
-            {
-                return Err(Error::rejected("registered app assignment changed"));
-            }
-        }
-        let rows=tx.prepare("SELECT step_id,task_id,spec,identity_digest FROM app_run_steps WHERE run_id=? AND state='pending' ORDER BY step_id")?.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        for (step_id, task_id, spec, generation) in rows {
-            let step: LocalStep =
-                serde_json::from_str(&spec).map_err(|e| Error::internal(e.to_string()))?;
-            let mut dependencies = Vec::new();
-            let mut ready = true;
-            for dep in &step.dependencies {
-                let state: String = tx.query_row(
-                    "SELECT state FROM app_run_steps WHERE run_id=? AND step_id=?",
-                    params![id, dep],
-                    |r| r.get(0),
-                )?;
-                if state != "succeeded" {
-                    ready = false;
-                    break;
-                }
-                if let Some(artifact)=tx.query_row("SELECT id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? AND step_id=?",params![id,dep],|r|Ok(json!({"artifact_id":r.get::<_,String>(0)?,"producer_step_id":dep,"revision":1,"sha256":r.get::<_,String>(1)?,"media_type":r.get::<_,String>(2)?,"size":r.get::<_,i64>(3)?}))).optional()? {dependencies.push(artifact);}
-            }
-            if !ready {
-                continue;
-            }
-            let worker = self.agent_in(&tx, &step.assignee)?;
-            let expected = &run["snapshot"]["assignments"][&step_id];
-            if material_digest(&Self::app_binding_identity(&worker)) != generation
-                || worker.role != expected["role"].as_str().unwrap()
-                || worker.provider != expected["provider"].as_str().unwrap()
-                || worker.endpoint_kind != expected["endpoint_kind"].as_str().unwrap()
-                || worker
-                    .params
-                    .as_ref()
-                    .and_then(|p| p.get("upstream"))
-                    .and_then(Value::as_str)
-                    != run["snapshot"]["owner_pm"].as_str()
-            {
-                return Err(Error::rejected(
-                    "registered assignment identity or group changed; create a new approved run",
-                ));
-            }
-            let message = format!("app-{id}-{step_id}-r1");
-            let envelope = json!({"schema":1,"run_id":id,"step_id":step_id,"revision":1,"kind":step.kind,"instruction":step.instruction,"dependencies":dependencies,
-                "source":run["snapshot"]["source"],
-                "capability_slots":run["snapshot"]["workflow"]["capability_slots"],
-                "required_asset_slot":run["snapshot"]["workflow"]["required_asset_slot"],
-                "result_contract":"Return exactly one complete JSON envelope as your final text, with no prose, heading, or Markdown fence. It must have schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
-            let body = envelope.to_string();
-            if body.len() > super::ENQUEUE_BYTES {
-                return Err(Error::rejected(
-                    "encoded app kickoff exceeds transport byte limit",
-                ));
-            }
-            self.enqueue_tx(
-                &tx,
-                &step.assignee,
-                &body,
-                None,
-                &message,
-                "app_run_dispatch",
-                Some(&task_id),
-                None,
-                None,
-                &Sender::Unattributed,
-                super::Priority::Normal,
-                None,
-                None,
-            )?;
-            tx.execute("UPDATE tasks SET state='dispatched',revision=1,dispatch_message=?,updated=? WHERE id=? AND state='draft'",params![message,now(),task_id])?;
-            tx.execute("UPDATE app_run_steps SET state='dispatched',message_id=? WHERE run_id=? AND step_id=? AND state='pending'",params![message,id,step_id])?;
-            Self::event(
-                &tx,
-                Self::DAEMON_STREAM,
-                "app_run_step_dispatched",
-                json!({"run_id":id,"step_id":step_id,"message_id":message,"snapshot_digest":run["snapshot_digest"],"assignee":step.assignee}),
-            )?;
-        }
-        tx.execute(
-            "UPDATE app_runs SET state='running',updated=? WHERE id=?",
-            params![now(), id],
-        )?;
-        tx.commit()?;
-        drop(conn);
-        self.app_run_show(id)
+        self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let run = Self::app_run_show_in(&tx, id)?;
+                    Self::app_current_in(&tx, &run, current_bundle)?;
+                    if !matches!(run["state"].as_str(), Some("approved" | "running"))
+                        || run["approved_digest"] != run["snapshot_digest"]
+                    {
+                        return Err(Error::rejected("run execution approval is absent or stale"));
+                    }
+                    for assignment in run["snapshot"]["assignments"].as_object().unwrap().values() {
+                        let alias = assignment["alias"].as_str().unwrap();
+                        let worker = self.agent_in(&tx, alias)?;
+                        if !(worker.enabled || Self::agent_auto_parked_in(&tx, &worker)?)
+ || Self::app_binding_identity(&worker) != assignment["identity"] {
+                            return Err(Error::rejected("registered app assignment changed"));
+                        }
+                    }
+                    let rows=tx.query_vec("SELECT step_id,task_id,spec,identity_digest FROM app_run_steps WHERE run_id=? AND state='pending' ORDER BY step_id",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?;
+                    for (step_id, task_id, spec, generation) in rows {
+                        let step: LocalStep =
+                            serde_json::from_str(&spec).map_err(|e| Error::internal(e.to_string()))?;
+                        let mut dependencies = Vec::new();
+                        let mut ready = true;
+                        for dep in &step.dependencies {
+                            let state: String = tx.query_row(
+                                "SELECT state FROM app_run_steps WHERE run_id=? AND step_id=?",
+                                params![id, dep],
+                                |r| r.get(0),
+                            )?;
+                            if state != "succeeded" {
+                                ready = false;
+                                break;
+                            }
+                            if let Some(artifact)=tx.query_opt("SELECT id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? AND step_id=?",params![id,dep],|r|Ok(json!({"artifact_id":r.get::<_,String>(0)?,"producer_step_id":dep,"revision":1,"sha256":r.get::<_,String>(1)?,"media_type":r.get::<_,String>(2)?,"size":r.get::<_,i64>(3)?})))? {dependencies.push(artifact);}
+                        }
+                        if !ready {
+                            continue;
+                        }
+                        let worker = self.agent_in(&tx, &step.assignee)?;
+                        let expected = &run["snapshot"]["assignments"][&step_id];
+                        if material_digest(&Self::app_binding_identity(&worker)) != generation
+                            || worker.role != expected["role"].as_str().unwrap()
+                            || worker.provider != expected["provider"].as_str().unwrap()
+                            || worker.endpoint_kind != expected["endpoint_kind"].as_str().unwrap()
+                            || worker
+                                .params
+                                .as_ref()
+                                .and_then(|p| p.get("upstream"))
+                                .and_then(Value::as_str)
+                                != run["snapshot"]["owner_pm"].as_str()
+                        {
+                            return Err(Error::rejected(
+                                "registered assignment identity or group changed; create a new approved run",
+                            ));
+                        }
+                        let message = format!("app-{id}-{step_id}-r1");
+                        let envelope = json!({"schema":1,"run_id":id,"step_id":step_id,"revision":1,"kind":step.kind,"instruction":step.instruction,"dependencies":dependencies,
+                            "source":run["snapshot"]["source"],
+                            "capability_slots":run["snapshot"]["workflow"]["capability_slots"],
+                            "required_asset_slot":run["snapshot"]["workflow"]["required_asset_slot"],
+                            "result_contract":"Return exactly one complete JSON envelope as your final text, with no prose, heading, or Markdown fence. It must have schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
+                        let body = envelope.to_string();
+                        if body.len() > super::ENQUEUE_BYTES {
+                            return Err(Error::rejected(
+                                "encoded app kickoff exceeds transport byte limit",
+                            ));
+                        }
+                        self.enqueue_tx(
+                            &tx,
+                            &step.assignee,
+                            &body,
+                            None,
+                            &message,
+                            "app_run_dispatch",
+                            Some(&task_id),
+                            None,
+                            None,
+                            &Sender::Unattributed,
+                            super::Priority::Normal,
+                            None,
+                            None,
+                        )?;
+                        tx.execute("UPDATE tasks SET state='dispatched',revision=1,dispatch_message=?,updated=? WHERE id=? AND state='draft'",params![message,now(),task_id])?;
+                        tx.execute("UPDATE app_run_steps SET state='dispatched',message_id=? WHERE run_id=? AND step_id=? AND state='pending'",params![message,id,step_id])?;
+                        Self::event(
+                            &tx,
+                            Self::DAEMON_STREAM,
+                            "app_run_step_dispatched",
+                            json!({"run_id":id,"step_id":step_id,"message_id":message,"snapshot_digest":run["snapshot_digest"],"assignee":step.assignee}),
+                        )?;
+                    }
+                    tx.execute(
+                        "UPDATE app_runs SET state='running',updated=? WHERE id=?",
+                        params![now(), id],
+                    )?;
+                    Self::app_run_show_in(&tx, id)
+        })
     }
     /// Authority loss is terminal; existing artifacts and turn receipts remain
     /// immutable. This never retries uncertain provider work.
     pub fn app_run_invalidate(&self, id: &str) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        self.app_run_invalidate_in(&tx, id)?;
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            self.app_run_invalidate_in(&tx, id)?;
+            Ok(())
+        })
     }
-    pub(super) fn app_run_invalidate_in(&self, tx: &Connection, id: &str) -> Result<()> {
+    pub(super) fn app_run_invalidate_in(&self, tx: &impl super::StoreConn, id: &str) -> Result<()> {
         let changed = tx.execute("UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state IN ('awaiting_approval','approved','running')", params![now(), id])?;
         if changed != 0 {
             tx.execute(
@@ -1366,7 +1371,7 @@ impl Store {
     /// transaction records durable eligibility; it never acquires the PM lock.
     pub(super) fn app_run_finished_in(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         message: &Message,
         status: &str,
         result: &Value,
@@ -1641,7 +1646,7 @@ impl Store {
     }
     fn app_step_failed_in(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         run: &str,
         step: &str,
         task: &str,
@@ -1783,11 +1788,16 @@ impl Store {
     }
 
     pub fn app_message_installation(&self, message: &str) -> Result<Option<(String, String)>> {
-        Ok(self.conn().query_row("SELECT r.id,r.install_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.message_id=?",[message],|r|Ok((r.get(0)?,r.get(1)?))).optional()?)
+        {
+            self.read_tx(|conn| {
+
+                            Ok(conn.query_opt("SELECT r.id,r.install_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.message_id=?",[message],|r|Ok((r.get(0)?,r.get(1)?)))?)
+            })
+        }
     }
     pub(super) fn app_message_admit_in(
         &self,
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         message: &Message,
         bundle: &str,
     ) -> Result<()> {
@@ -1821,38 +1831,38 @@ impl Store {
         Ok(())
     }
     pub fn app_message_admit(&self, message: &Message, bundle: &str) -> Result<()> {
-        self.app_message_admit_in(&self.conn(), message, bundle)
+        self.read_tx(|conn| self.app_message_admit_in(&conn, message, bundle))
     }
     pub fn reject_app_submission(&self, message: &str) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        if let Some((run, step, task)) = tx
-            .query_row(
-                "SELECT run_id,step_id,task_id FROM app_run_steps WHERE message_id=?",
-                [message],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-        {
-            let changed=tx.execute("UPDATE messages SET state='failed',error='app submission authorization changed',completed=? WHERE id=? AND state IN ('queued','submitting')",params![now(),message])?;
-            if changed > 0 {
-                self.app_step_failed_in(
-                    &tx,
-                    &run,
-                    &step,
-                    &task,
-                    "app submission authorization changed",
-                )?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    if let Some((run, step, task)) = tx
+                        .query_opt(
+                            "SELECT run_id,step_id,task_id FROM app_run_steps WHERE message_id=?",
+                            [message],
+                            |r| {
+                                Ok((
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, String>(1)?,
+                                    r.get::<_, String>(2)?,
+                                ))
+                            },
+                        )?
+                    {
+                        let changed=tx.execute("UPDATE messages SET state='failed',error='app submission authorization changed',completed=? WHERE id=? AND state IN ('queued','submitting')",params![now(),message])?;
+                        if changed > 0 {
+                            self.app_step_failed_in(
+                                &tx,
+                                &run,
+                                &step,
+                                &task,
+                                "app submission authorization changed",
+                            )?;
+                        }
+                    }
+                    Ok(())
+        })
     }
 }
 
@@ -1941,7 +1951,7 @@ pub(super) enum AppCompletionProof {
 impl Store {
     pub(super) fn app_completion_proof(
         &self,
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         message: &Message,
         result: &Value,
     ) -> Result<AppCompletionProof> {

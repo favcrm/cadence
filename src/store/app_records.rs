@@ -18,6 +18,7 @@
 //! files are created, corrupt or foreign files are refused, never
 //! deleted).
 
+use super::StoreConn;
 use super::*;
 use crate::store::app_runs::material_digest;
 use uuid::Uuid;
@@ -854,54 +855,82 @@ impl RecordStore {
         }
     }
 
-    fn history_in(conn: &Connection, context: &str, id: &str) -> rusqlite::Result<Vec<Value>> {
-        let mut stmt = conn.prepare(
-            "SELECT revision,body_digest,actor,at FROM app_record_revisions WHERE context_id=? AND record_id=? ORDER BY revision",
-        )?;
-        let rows = stmt.query_map(params![context, id], |r| {
-            Ok(json!({"revision": r.get::<_, i64>(0)?, "digest": r.get::<_, String>(1)?, "actor": r.get::<_, String>(2)?, "at": r.get::<_, f64>(3)?}))
-        })?;
-        rows.collect()
+    /// One `BEGIN IMMEDIATE` write against this record file: guard held,
+    /// `f` runs on the live `Transaction`, commit on `Ok`, rollback on
+    /// `Err`/panic (the `Transaction` drops). The record-file DB is a
+    /// separate file from `cadence.sqlite3` — it is NOT under `Store`'s
+    /// producer seal; this is `RecordStore`'s own write shape, not the
+    /// daemon witness.
+    pub(crate) fn write_tx<R>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<R>,
+    ) -> Result<R> {
+        let conn = self.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| Error::internal(e.to_string()))?;
+        let out = f(&tx)?;
+        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+        drop(conn);
+        Ok(out)
     }
 
-    fn ids_in(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<Vec<String>> {
-        conn.prepare(sql)
-            .map_err(|e| Error::internal(e.to_string()))?
-            .query_map(params, |r| r.get::<_, String>(0))
-            .map_err(|e| Error::internal(e.to_string()))?
-            .collect::<rusqlite::Result<Vec<_>>>()
+    fn history_in(
+        conn: &impl super::StoreConn,
+        context: &str,
+        id: &str,
+    ) -> rusqlite::Result<Vec<Value>> {
+        conn.query_vec(
+            "SELECT revision,body_digest,actor,at FROM app_record_revisions WHERE context_id=? AND record_id=? ORDER BY revision",
+            params![context, id],
+            |r| {
+                Ok(json!({"revision": r.get::<_, i64>(0)?, "digest": r.get::<_, String>(1)?, "actor": r.get::<_, String>(2)?, "at": r.get::<_, f64>(3)?}))
+            },
+        )
+    }
+
+    fn ids_in(
+        conn: &impl super::StoreConn,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<String>> {
+        conn.query_vec(sql, params, |r| r.get::<_, String>(0))
             .map_err(|e| Error::internal(e.to_string()))
     }
 
-    fn consent_history_in(conn: &Connection, context: &str, id: &str) -> rusqlite::Result<Value> {
+    fn consent_history_in(
+        conn: &impl super::StoreConn,
+        context: &str,
+        id: &str,
+    ) -> rusqlite::Result<Value> {
         // Per-channel consent transitions derived from the attributed
         // revision bodies: each entry names the revision, channel,
         // resulting state, actor and time. Unparseable bodies are
         // skipped — integrity of the live row is proven separately.
-        let mut stmt = conn.prepare(
+        let rows = conn.query_vec(
             "SELECT revision,body,actor,at FROM app_record_revisions WHERE context_id=? AND record_id=? ORDER BY revision",
+            params![context, id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, f64>(3)?,
+                ))
+            },
         )?;
-        let rows = stmt.query_map(params![context, id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, f64>(3)?,
-            ))
-        })?;
         let mut provenance: std::collections::HashMap<i64, (String, Option<String>)> =
             std::collections::HashMap::new();
-        let mut prov_stmt = conn.prepare(
+        for row in conn.query_vec(
             "SELECT revision,method,note FROM app_record_consent_provenance WHERE context_id=? AND record_id=?",
-        )?;
-        for row in prov_stmt.query_map(params![context, id], |r| {
+            params![context, id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
             ))
         })? {
-            let (revision, method, note) = row?;
+            let (revision, method, note) = row;
             provenance.insert(revision, (method, note));
         }
         let with_provenance = |mut entry: Value, revision: i64| {
@@ -916,8 +945,7 @@ impl RecordStore {
         let mut history = Vec::new();
         let mut email: Option<&str> = None;
         let mut sms: Option<&str> = None;
-        for row in rows {
-            let (revision, body, actor, at) = row?;
+        for (revision, body, actor, at) in rows {
             let Ok(profile) = serde_json::from_str::<CustomerProfile>(&body) else {
                 continue;
             };
@@ -937,7 +965,7 @@ impl RecordStore {
         Ok(Value::Array(history))
     }
 
-    fn show_in(&self, conn: &Connection, context: &str, id: &str) -> Result<Value> {
+    fn show_in(&self, conn: &impl super::StoreConn, context: &str, id: &str) -> Result<Value> {
         let (revision, kind, body, digest): (i64, String, String, String) = conn
             .query_row(
                 "SELECT revision,kind,body,body_digest FROM app_records WHERE context_id=? AND id=?",
@@ -999,63 +1027,57 @@ impl RecordStore {
         crate::proto::identifier(record_id, "record ID")?;
         let digest = profile.digest(&self.install_id, context)?;
         let body = serde_json::to_string(profile).map_err(|e| Error::internal(e.to_string()))?;
-        let conn = self.conn();
-        // IMMEDIATE, not deferred: the normalized-email check below
-        // must see a racing writer's commit. A sibling create blocks
-        // on the write lock first, so exactly one ID wins an address
-        // and the loser is refused with no second live row.
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| Error::internal(e.to_string()))?;
-        if let Some(existing) = tx
-            .query_row(
-                "SELECT body_digest FROM app_records WHERE context_id=? AND id=?",
-                params![context, record_id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|e| Error::internal(e.to_string()))?
-        {
-            if existing != digest {
-                return Err(Error::rejected("record ID already holds different content"));
+        // `write_tx` holds `BEGIN IMMEDIATE` across the
+        // normalized-email check + writes: a sibling create blocks on
+        // the write lock first, so exactly one ID wins an address and
+        // the loser is refused with no second live row.
+        let result = self.write_tx(|tx| {
+            if let Some(existing) = tx
+                .query_opt(
+                    "SELECT body_digest FROM app_records WHERE context_id=? AND id=?",
+                    params![context, record_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?
+            {
+                if existing != digest {
+                    return Err(Error::rejected("record ID already holds different content"));
+                }
+                return Ok(json!({"record": self.show_in(tx, context, record_id)?}));
             }
-            let result = json!({"record": self.show_in(&tx, context, record_id)?});
-            tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-            return Ok(result);
-        }
-        // One address, one live row per context: a new ID behind a
-        // held normalized email is refused, never merged. Profiles
-        // without an address skip the check.
-        Self::email_conflict_in(&tx, context, record_id, profile)?;
-        let count: i64 = tx
-            .query_row(
-                "SELECT count(*) FROM app_records WHERE context_id=?",
-                [context],
-                |r| r.get(0),
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        if count >= RECORD_LIMIT {
-            return Err(Error::rejected("context has reached its record limit"));
-        }
-        tx.execute(
-            "INSERT INTO app_records(context_id,id,kind,revision,body,body_digest,created,updated) VALUES(?, ?, 'customer', 1, ?, ?, ?, ?)",
-            params![context, record_id, body, digest, now(), now()],
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
-        tx.execute(
-            "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at) VALUES(?, ?, 1, ?, ?, 'operator', ?)",
-            params![context, record_id, body, digest, now()],
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
-        if let Some(provenance) = provenance {
+            // One address, one live row per context: a new ID behind a
+            // held normalized email is refused, never merged. Profiles
+            // without an address skip the check.
+            Self::email_conflict_in(tx, context, record_id, profile)?;
+            let count: i64 = tx
+                .query_row(
+                    "SELECT count(*) FROM app_records WHERE context_id=?",
+                    [context],
+                    |r| r.get(0),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            if count >= RECORD_LIMIT {
+                return Err(Error::rejected("context has reached its record limit"));
+            }
             tx.execute(
-                "INSERT INTO app_record_consent_provenance(context_id,record_id,revision,method,note) VALUES(?, ?, 1, ?, ?)",
-                params![context, record_id, provenance.method.as_str(), provenance.note],
+                "INSERT INTO app_records(context_id,id,kind,revision,body,body_digest,created,updated) VALUES(?, ?, 'customer', 1, ?, ?, ?, ?)",
+                params![context, record_id, body, digest, now(), now()],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
-        }
-        let result = json!({"record": self.show_in(&tx, context, record_id)?});
-        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at) VALUES(?, ?, 1, ?, ?, 'operator', ?)",
+                params![context, record_id, body, digest, now()],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+            if let Some(provenance) = provenance {
+                tx.execute(
+                    "INSERT INTO app_record_consent_provenance(context_id,record_id,revision,method,note) VALUES(?, ?, 1, ?, ?)",
+                    params![context, record_id, provenance.method.as_str(), provenance.note],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            }
+            Ok(json!({"record": self.show_in(tx, context, record_id)?}))
+        })?;
         Ok(result)
     }
 
@@ -1177,63 +1199,58 @@ impl RecordStore {
         }
         let digest = profile.digest(&self.install_id, context)?;
         let body = serde_json::to_string(profile).map_err(|e| Error::internal(e.to_string()))?;
-        let conn = self.conn();
-        // IMMEDIATE, like create: the normalized-email check below
-        // must see a racing writer's commit before this update lands.
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+        self.write_tx(|tx| {
+            let current = self.show_in(&tx, context, record_id)?;
+            if current["revision"].as_i64() != Some(expected) {
+                return Err(Error::rejected("record revision is stale"));
+            }
+            // A move onto another live row's normalized email is refused,
+            // never merged; the row itself is excluded from the check.
+            Self::email_conflict_in(&tx, context, record_id, profile)?;
+            let before: CustomerProfile = serde_json::from_value(current["profile"].clone())
+                .map_err(|_| Error::rejected("record integrity refused"))?;
+            let transition = consent_transition(&before.consent, &profile.consent);
+            let implied = ConsentProvenance {
+                method: ConsentMethod::Imported,
+                note: None,
+            };
+            let provenance = match (transition, provenance) {
+                (ConsentTransition::Grant, None) if from_import => Some(&implied),
+                (ConsentTransition::Grant, None) => {
+                    return Err(Error::rejected("granting consent requires a method"))
+                }
+                (ConsentTransition::None, Some(_)) => {
+                    return Err(Error::rejected("consent provenance needs a consent change"))
+                }
+                (_, given) => given,
+            };
+            let revision = expected
+                .checked_add(1)
+                .ok_or_else(|| Error::rejected("record revision exhausted"))?;
+            let changed = tx
+                .execute(
+                    "UPDATE app_records SET revision=?, body=?, body_digest=?, updated=? WHERE context_id=? AND id=? AND revision=?",
+                    params![revision, body, digest, now(), context, record_id, expected],
+                )
                 .map_err(|e| Error::internal(e.to_string()))?;
-        let current = self.show_in(&tx, context, record_id)?;
-        if current["revision"].as_i64() != Some(expected) {
-            return Err(Error::rejected("record revision is stale"));
-        }
-        // A move onto another live row's normalized email is refused,
-        // never merged; the row itself is excluded from the check.
-        Self::email_conflict_in(&tx, context, record_id, profile)?;
-        let before: CustomerProfile = serde_json::from_value(current["profile"].clone())
-            .map_err(|_| Error::rejected("record integrity refused"))?;
-        let transition = consent_transition(&before.consent, &profile.consent);
-        let implied = ConsentProvenance {
-            method: ConsentMethod::Imported,
-            note: None,
-        };
-        let provenance = match (transition, provenance) {
-            (ConsentTransition::Grant, None) if from_import => Some(&implied),
-            (ConsentTransition::Grant, None) => {
-                return Err(Error::rejected("granting consent requires a method"))
+            if changed != 1 {
+                return Err(Error::rejected("record revision is stale"));
             }
-            (ConsentTransition::None, Some(_)) => {
-                return Err(Error::rejected("consent provenance needs a consent change"))
-            }
-            (_, given) => given,
-        };
-        let revision = expected
-            .checked_add(1)
-            .ok_or_else(|| Error::rejected("record revision exhausted"))?;
-        let changed = tx
-            .execute(
-                "UPDATE app_records SET revision=?, body=?, body_digest=?, updated=? WHERE context_id=? AND id=? AND revision=?",
-                params![revision, body, digest, now(), context, record_id, expected],
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        if changed != 1 {
-            return Err(Error::rejected("record revision is stale"));
-        }
-        tx.execute(
-            "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at) VALUES(?, ?, ?, ?, ?, 'operator', ?)",
-            params![context, record_id, revision, body, digest, now()],
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
-        if let Some(provenance) = provenance {
             tx.execute(
-                "INSERT INTO app_record_consent_provenance(context_id,record_id,revision,method,note) VALUES(?, ?, ?, ?, ?)",
-                params![context, record_id, revision, provenance.method.as_str(), provenance.note],
+                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at) VALUES(?, ?, ?, ?, ?, 'operator', ?)",
+                params![context, record_id, revision, body, digest, now()],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
-        }
-        let result = json!({"record": self.show_in(&tx, context, record_id)?});
-        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
-        Ok(result)
+            if let Some(provenance) = provenance {
+                tx.execute(
+                    "INSERT INTO app_record_consent_provenance(context_id,record_id,revision,method,note) VALUES(?, ?, ?, ?, ?)",
+                    params![context, record_id, revision, provenance.method.as_str(), provenance.note],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            }
+            let result = json!({"record": self.show_in(&tx, context, record_id)?});
+            Ok(result)
+        })
     }
 }
 
@@ -1708,7 +1725,7 @@ impl RecordStore {
     /// an IMMEDIATE transaction, so a sibling writer blocks on the
     /// write lock and commits first — then this read sees it.
     fn email_conflict_in(
-        tx: &rusqlite::Transaction<'_>,
+        tx: &impl super::StoreConn,
         context: &str,
         record_id: &str,
         profile: &CustomerProfile,
@@ -1716,16 +1733,14 @@ impl RecordStore {
         let Some(address) = profile.email.as_deref().map(str::to_lowercase) else {
             return Ok(());
         };
-        let mut stmt = tx
-            .prepare("SELECT id,body FROM app_records WHERE context_id=?")
+        let found = tx
+            .query_vec(
+                "SELECT id,body FROM app_records WHERE context_id=?",
+                [context],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
             .map_err(|e| Error::internal(e.to_string()))?;
-        let found = stmt
-            .query_map([context], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(|e| Error::internal(e.to_string()))?;
-        for row in found {
-            let (id, body) = row.map_err(|e| Error::internal(e.to_string()))?;
+        for (id, body) in found {
             if id == record_id {
                 continue;
             }
@@ -1749,7 +1764,10 @@ impl RecordStore {
         Ok(())
     }
 
-    fn import_receipt_in(conn: &Connection, request_id: &str) -> Result<Option<CsvReceipt>> {
+    fn import_receipt_in(
+        conn: &impl super::StoreConn,
+        request_id: &str,
+    ) -> Result<Option<CsvReceipt>> {
         conn.query_row(
             "SELECT context_id,preview_token,result,state,decisions_digest FROM app_record_csv_imports WHERE request_id=?",
             [request_id],
@@ -1805,7 +1823,7 @@ impl RecordStore {
     /// duplicate and revision comparison; writes nothing.
     fn plan_csv_in(
         &self,
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         context: &str,
         csv_text: &str,
     ) -> Result<(String, Vec<PlanRow>)> {
@@ -1977,22 +1995,21 @@ impl RecordStore {
         let mut by_email: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         {
-            let mut stmt = conn
-                .prepare("SELECT id,revision,body_digest,body FROM app_records WHERE context_id=?")
+            let found = conn
+                .query_vec(
+                    "SELECT id,revision,body_digest,body FROM app_records WHERE context_id=?",
+                    [context],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    },
+                )
                 .map_err(|e| Error::internal(e.to_string()))?;
-            let found = stmt
-                .query_map([context], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                })
-                .map_err(|e| Error::internal(e.to_string()))?;
-            for row in found {
-                let (id, revision, digest, body) =
-                    row.map_err(|e| Error::internal(e.to_string()))?;
+            for (id, revision, digest, body) in found {
                 let email = serde_json::from_str::<Value>(&body).ok().and_then(|value| {
                     value
                         .get("email")
@@ -2733,26 +2750,14 @@ impl Store {
         digest: &str,
         created: bool,
     ) {
-        let guard = match self.write_conn() {
-            Ok(guard) => guard,
-            Err(error) => {
-                eprintln!("record audit event skipped: {error}");
-                return;
-            }
-        };
-        if Self::event(
-            &guard,
-            Self::DAEMON_STREAM,
+        if let Err(e) = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
             if created {
                 "app_record_created"
             } else {
                 "app_record_updated"
             },
-            json!({"record_id": record, "install_id": install, "context_id": context, "revision": revision, "digest": digest, "actor": "operator"}),
-        )
-        .is_err()
-        {
-            eprintln!("record audit event skipped: event write refused");
+            json!({"record_id": record, "install_id": install, "context_id": context, "revision": revision, "digest": digest, "actor": "operator"}),)) {
+            eprintln!("store: best-effort app record audit failed: {e}");
         }
     }
 
@@ -2769,22 +2774,10 @@ impl Store {
         skipped: i64,
         failed: i64,
     ) {
-        let guard = match self.write_conn() {
-            Ok(guard) => guard,
-            Err(error) => {
-                eprintln!("record CSV audit event skipped: {error}");
-                return;
-            }
-        };
-        if Self::event(
-            &guard,
-            Self::DAEMON_STREAM,
+        if let Err(e) = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
             "app_record_csv_imported",
-            json!({"install_id": install, "context_id": context, "request_id": request, "applied": applied, "skipped": skipped, "failed": failed, "actor": "operator"}),
-        )
-        .is_err()
-        {
-            eprintln!("record CSV audit event skipped: event write refused");
+            json!({"install_id": install, "context_id": context, "request_id": request, "applied": applied, "skipped": skipped, "failed": failed, "actor": "operator"}),)) {
+            eprintln!("store: best-effort app record audit failed: {e}");
         }
     }
 }

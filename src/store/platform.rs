@@ -14,6 +14,7 @@ use crate::error::{Error, Result};
 use crate::proto::identifier;
 
 use super::events::{APPROVAL_STREAM, APP_APPROVED_EVENT};
+use super::StoreConn;
 use super::{now, Store};
 
 /// The platform custody audit stream (§5.5). Like `audit:approvals`
@@ -197,7 +198,7 @@ fn credential_row(row: &rusqlite::Row) -> rusqlite::Result<CredentialRecord> {
 /// platform grant actually changed, so the caller can drain the waiting
 /// effects that lost coverage.
 fn subtract_derived(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &impl super::StoreConn,
     app: &str,
     rows: &[(String, String, String, Vec<String>)],
     keep_install: Option<&str>,
@@ -221,18 +222,19 @@ fn subtract_derived(
         // dropping a previous install's rows without taking the current
         // install's scopes with them. `None` is the whole-app revoke:
         // no row of this app counts.
-        let still: Vec<String> = {
-            let mut stmt = tx.prepare(
+        let still: Vec<String> = tx
+            .query_vec(
                 "SELECT scopes FROM app_grants WHERE agent=?2 AND platform=?3 \
                  AND account=?4 AND (app<>?1 OR (?5 IS NOT NULL AND install_id=?5))",
-            )?;
-            let rows =
-                stmt.query_map(params![app, agent, platform, account, keep_install], |r| {
+                params![app, agent, platform, account, keep_install],
+                |r| {
                     let raw: String = r.get(0)?;
                     Ok(scopes_of(&raw))
-                })?;
-            rows.flatten().flatten().collect()
-        };
+                },
+            )?
+            .into_iter()
+            .flatten()
+            .collect();
         let kept: Vec<String> = existing
             .scopes
             .iter()
@@ -263,7 +265,7 @@ fn subtract_derived(
 /// The latest `app_approved` payload for `app` (`"<project>/<name>"`),
 /// read on the caller's transaction so a revoke that committed under
 /// the same write lock is visible (CAD-577 review 344, note 3).
-fn latest_app_approval(tx: &rusqlite::Connection, app: &str) -> Result<Option<Value>> {
+fn latest_app_approval(tx: &impl super::StoreConn, app: &str) -> Result<Option<Value>> {
     let Some((project, name)) = app.split_once('/') else {
         return Ok(None);
     };
@@ -356,21 +358,25 @@ pub(crate) type Derived = (String, String, String, Vec<String>);
 /// narrower scope — the caller drains a waiting effect only when the
 /// surviving grant no longer covers that effect's scopes.
 fn apply_derived(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &impl super::StoreConn,
     app: &str,
     install_id: &str,
     grants: &[Derived],
     by: &str,
 ) -> Result<Vec<(String, String, String)>> {
-    let prior: Vec<Derived> = {
-        let mut stmt =
-            tx.prepare("SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1")?;
-        let rows = stmt.query_map(params![app], |r| {
+    let prior: Vec<Derived> = tx.query_vec(
+        "SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1",
+        params![app],
+        |r| {
             let raw: String = r.get(3)?;
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&raw)))
-        })?;
-        rows.flatten().collect()
-    };
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                scopes_of(&raw),
+            ))
+        },
+    )?;
     tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
     let changed = subtract_derived(tx, app, &prior, None)?;
     if !prior.is_empty() {
@@ -464,19 +470,23 @@ fn apply_derived(
 /// Drop this app's derived rows and subtract their scopes, on the
 /// caller's transaction. A scope another app still derives is kept.
 fn revoke_derived(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &impl super::StoreConn,
     app: &str,
     by: &str,
 ) -> Result<Vec<(String, String, String)>> {
-    let rows: Vec<Derived> = {
-        let mut stmt =
-            tx.prepare("SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1")?;
-        let rows = stmt.query_map(params![app], |r| {
+    let rows: Vec<Derived> = tx.query_vec(
+        "SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1",
+        params![app],
+        |r| {
             let scopes: String = r.get(3)?;
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&scopes)))
-        })?;
-        rows.flatten().collect()
-    };
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                scopes_of(&scopes),
+            ))
+        },
+    )?;
     tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
     let changed = subtract_derived(tx, app, &rows, None)?;
     for (agent, platform, account, derived) in &rows {
@@ -498,27 +508,29 @@ impl Store {
         platform: &str,
         account: &str,
     ) -> Result<Option<CredentialRecord>> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT * FROM platform_credentials WHERE platform=?1 AND account=?2",
-            params![platform, account],
-            credential_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        self.read_tx(|conn| {
+            conn.query_opt(
+                "SELECT * FROM platform_credentials WHERE platform=?1 AND account=?2",
+                params![platform, account],
+                credential_row,
+            )
+            .map_err(Into::into)
+        })
     }
 
     /// Every enrolled credential record, sorted by platform/account.
     pub fn platform_credentials(&self) -> Result<Vec<CredentialRecord>> {
-        let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT * FROM platform_credentials ORDER BY platform, account")?;
-        let rows = stmt.query_map([], credential_row)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
+        self.read_tx(|conn| {
+            let stmt_sql = "SELECT * FROM platform_credentials ORDER BY platform, account";
+            let rows = conn
+                .query_vec(stmt_sql, [], credential_row)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
     }
 
     /// Insert the custody record for `(platform, account)` and its
@@ -544,90 +556,90 @@ impl Store {
         if record.credential_revision > i64::MAX as u64 {
             return Err(Error::rejected("connection revision exceeds storage bound"));
         }
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let existing: Option<(String, String, u64)> = tx
-            .query_row(
-                "SELECT fingerprint,connection_id,credential_revision FROM platform_credentials \
-                 WHERE platform=?1 AND account=?2",
-                params![record.platform, record.account],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        match (existing, rotated) {
-            (Some(_), false) => {
-                return Err(Error::rejected(format!(
-                    "platform '{}' account '{}' is already enrolled — \
-                     `platform rotate` replaces its credential",
-                    record.platform, record.account
-                )))
-            }
-            // A revoke landing between the caller's check and this
-            // transaction must not resurrect the account — rotate into
-            // a missing record refuses; enroll is the verb.
-            (None, true) => {
-                return Err(Error::rejected(format!(
-                    "no credential is enrolled for {}/{} — `platform enroll` it first",
-                    record.platform, record.account
-                )))
-            }
-            (Some((old, id, revision)), true) => {
-                if record.connection_id != id
-                    || revision.checked_add(1) != Some(record.credential_revision)
-                {
-                    return Err(Error::rejected(
-                        "connection rotation receipt is stale or inconsistent",
-                    ));
-                }
-                Self::event(
-                    &tx,
-                    PLATFORM_STREAM,
-                    CREDENTIAL_REVOKED_EVENT,
-                    json!({"platform": record.platform, "account": record.account,
-                           "fingerprint": old, "reason": "rotated",
-                           "by": record.by}),
-                )?;
-            }
-            (None, _) => {
-                if record.credential_revision != 1 {
-                    return Err(Error::rejected("new connection revision must be one"));
-                }
-            }
-        }
-        tx.execute(
-            "INSERT INTO platform_credentials
-             (platform, account, scopes, fingerprint, custody, exchange, enrolled_at, by, connection_id, credential_revision)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(platform,account) DO UPDATE SET scopes=excluded.scopes,fingerprint=excluded.fingerprint,custody=excluded.custody,exchange=excluded.exchange,enrolled_at=excluded.enrolled_at,by=excluded.by,connection_id=excluded.connection_id,credential_revision=excluded.credential_revision",
-            params![
-                record.platform,
-                record.account,
-                scopes_json(&record.scopes)?,
-                record.fingerprint,
-                record.custody,
-                record.exchange,
-                record.enrolled_at,
-                record.by,
-                record.connection_id,
-                record.credential_revision,
-            ],
-        )?;
-        let mut payload = record.to_json();
-        if rotated {
-            payload["rotated"] = json!(true);
-            // CAD-796: the revision bump stales every binding on this
-            // credential — withdraw affected approvals with the record.
-            Self::app_binding_approvals_withdraw_for_credential_in(
-                &tx,
-                &record.platform,
-                &record.account,
-            )?;
-        }
-        if let Some(risk) = risk {
-            payload["custody_risk_accepted"] = json!(risk);
-        }
-        Self::event(&tx, PLATFORM_STREAM, PLATFORM_CONNECTED_EVENT, payload)?;
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let existing: Option<(String, String, u64)> = tx
+                        .query_opt(
+                            "SELECT fingerprint,connection_id,credential_revision FROM platform_credentials \
+                             WHERE platform=?1 AND account=?2",
+                            params![record.platform, record.account],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )?;
+                    match (existing, rotated) {
+                        (Some(_), false) => {
+                            return Err(Error::rejected(format!(
+                                "platform '{}' account '{}' is already enrolled — \
+                                 `platform rotate` replaces its credential",
+                                record.platform, record.account
+                            )))
+                        }
+                        // A revoke landing between the caller's check and this
+                        // transaction must not resurrect the account — rotate into
+                        // a missing record refuses; enroll is the verb.
+                        (None, true) => {
+                            return Err(Error::rejected(format!(
+                                "no credential is enrolled for {}/{} — `platform enroll` it first",
+                                record.platform, record.account
+                            )))
+                        }
+                        (Some((old, id, revision)), true) => {
+                            if record.connection_id != id
+                                || revision.checked_add(1) != Some(record.credential_revision)
+                            {
+                                return Err(Error::rejected(
+                                    "connection rotation receipt is stale or inconsistent",
+                                ));
+                            }
+                            Self::event(
+                                &tx,
+                                PLATFORM_STREAM,
+                                CREDENTIAL_REVOKED_EVENT,
+                                json!({"platform": record.platform, "account": record.account,
+                                       "fingerprint": old, "reason": "rotated",
+                                       "by": record.by}),
+                            )?;
+                        }
+                        (None, _) => {
+                            if record.credential_revision != 1 {
+                                return Err(Error::rejected("new connection revision must be one"));
+                            }
+                        }
+                    }
+                    tx.execute(
+                        "INSERT INTO platform_credentials
+                         (platform, account, scopes, fingerprint, custody, exchange, enrolled_at, by, connection_id, credential_revision)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(platform,account) DO UPDATE SET scopes=excluded.scopes,fingerprint=excluded.fingerprint,custody=excluded.custody,exchange=excluded.exchange,enrolled_at=excluded.enrolled_at,by=excluded.by,connection_id=excluded.connection_id,credential_revision=excluded.credential_revision",
+                        params![
+                            record.platform,
+                            record.account,
+                            scopes_json(&record.scopes)?,
+                            record.fingerprint,
+                            record.custody,
+                            record.exchange,
+                            record.enrolled_at,
+                            record.by,
+                            record.connection_id,
+                            record.credential_revision,
+                        ],
+                    )?;
+                    let mut payload = record.to_json();
+                    if rotated {
+                        payload["rotated"] = json!(true);
+                        // CAD-796: the revision bump stales every binding on this
+                        // credential — withdraw affected approvals with the record.
+                        Self::app_binding_approvals_withdraw_for_credential_in(
+                            &tx,
+                            &record.platform,
+                            &record.account,
+                        )?;
+                    }
+                    if let Some(risk) = risk {
+                        payload["custody_risk_accepted"] = json!(risk);
+                    }
+                    Self::event(&tx, PLATFORM_STREAM, PLATFORM_CONNECTED_EVENT, payload)?;
+                    Ok(())
+        })
     }
 
     /// Revoke `(platform, account)`'s credential: custody row gone,
@@ -645,70 +657,62 @@ impl Store {
         reason: Option<&str>,
         effects_closed: &[String],
     ) -> Result<Option<(CredentialRecord, Vec<Grant>)>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let record: Option<CredentialRecord> = tx
-            .query_row(
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let record: Option<CredentialRecord> = tx.query_opt(
                 "SELECT * FROM platform_credentials WHERE platform=?1 AND account=?2",
                 params![platform, account],
                 credential_row,
-            )
-            .optional()?;
-        let Some(record) = record else {
-            return Ok(None);
-        };
-        let grants: Vec<Grant> = {
-            let mut stmt = tx.prepare(
-                "SELECT * FROM platform_grants WHERE platform=?1 AND account=?2 \
-                 ORDER BY agent",
             )?;
-            let rows = stmt.query_map(params![platform, account], grant_row)?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r?);
+            let Some(record) = record else {
+                return Ok(None);
+            };
+            let grants: Vec<Grant> = tx.query_vec(
+                "SELECT * FROM platform_grants WHERE platform=?1 AND account=?2 \
+                         ORDER BY agent",
+                params![platform, account],
+                grant_row,
+            )?;
+            tx.execute(
+                "DELETE FROM platform_grants WHERE platform=?1 AND account=?2",
+                params![platform, account],
+            )?;
+            tx.execute(
+                "DELETE FROM platform_credentials WHERE platform=?1 AND account=?2",
+                params![platform, account],
+            )?;
+            // A revoked default stops resolving — the operator re-picks.
+            tx.execute(
+                "DELETE FROM platform_defaults WHERE platform=?1 AND account=?2",
+                params![platform, account],
+            )?;
+            // CAD-796: every configured binding on this credential goes stale
+            // with the record — withdraw each affected installation's approval
+            // and close its waiting effects in the same transaction.
+            Self::app_binding_approvals_withdraw_for_credential_in(&tx, platform, account)?;
+            for grant in &grants {
+                let mut payload = grant.to_json();
+                payload["reason"] = json!(reason.unwrap_or("credential revoked"));
+                Self::event(&tx, PLATFORM_STREAM, SCOPE_REVOKED_EVENT, payload)?;
             }
-            out
-        };
-        tx.execute(
-            "DELETE FROM platform_grants WHERE platform=?1 AND account=?2",
-            params![platform, account],
-        )?;
-        tx.execute(
-            "DELETE FROM platform_credentials WHERE platform=?1 AND account=?2",
-            params![platform, account],
-        )?;
-        // A revoked default stops resolving — the operator re-picks.
-        tx.execute(
-            "DELETE FROM platform_defaults WHERE platform=?1 AND account=?2",
-            params![platform, account],
-        )?;
-        // CAD-796: every configured binding on this credential goes stale
-        // with the record — withdraw each affected installation's approval
-        // and close its waiting effects in the same transaction.
-        Self::app_binding_approvals_withdraw_for_credential_in(&tx, platform, account)?;
-        for grant in &grants {
-            let mut payload = grant.to_json();
-            payload["reason"] = json!(reason.unwrap_or("credential revoked"));
-            Self::event(&tx, PLATFORM_STREAM, SCOPE_REVOKED_EVENT, payload)?;
-        }
-        Self::event(
-            &tx,
-            PLATFORM_STREAM,
-            CREDENTIAL_REVOKED_EVENT,
-            json!({"platform": platform, "account": account,
-                   "fingerprint": record.fingerprint,
-                   "reason": reason, "by": by}),
-        )?;
-        Self::event(
-            &tx,
-            PLATFORM_STREAM,
-            PLATFORM_DISCONNECTED_EVENT,
-            json!({"platform": platform, "account": account,
-                   "fingerprint": record.fingerprint,
-                   "effects_closed": effects_closed, "by": by}),
-        )?;
-        tx.commit()?;
-        Ok(Some((record, grants)))
+            Self::event(
+                &tx,
+                PLATFORM_STREAM,
+                CREDENTIAL_REVOKED_EVENT,
+                json!({"platform": platform, "account": account,
+                               "fingerprint": record.fingerprint,
+                               "reason": reason, "by": by}),
+            )?;
+            Self::event(
+                &tx,
+                PLATFORM_STREAM,
+                PLATFORM_DISCONNECTED_EVENT,
+                json!({"platform": platform, "account": account,
+                               "fingerprint": record.fingerprint,
+                               "effects_closed": effects_closed, "by": by}),
+            )?;
+            Ok(Some((record, grants)))
+        })
     }
 
     /// The grant `(agent, platform, account)` currently holds.
@@ -718,39 +722,44 @@ impl Store {
         platform: &str,
         account: &str,
     ) -> Result<Option<Grant>> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
-            params![agent, platform, account],
-            grant_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        self.read_tx(|conn| {
+            conn.query_opt(
+                "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
+                params![agent, platform, account],
+                grant_row,
+            )
+            .map_err(Into::into)
+        })
     }
 
     /// Grants — all of them, or one agent's.
     pub fn platform_grants(&self, agent: Option<&str>) -> Result<Vec<Grant>> {
-        let conn = self.conn();
-        let mut out = Vec::new();
-        match agent {
-            Some(agent) => {
-                let mut stmt = conn.prepare(
-                    "SELECT * FROM platform_grants WHERE agent=?1 \
-                     ORDER BY platform, account",
-                )?;
-                for r in stmt.query_map(params![agent], grant_row)? {
-                    out.push(r?);
+        self.read_tx(|conn| {
+            let mut out = Vec::new();
+            match agent {
+                Some(agent) => {
+                    let stmt_sql = "SELECT * FROM platform_grants WHERE agent=?1 \
+                                 ORDER BY platform, account";
+                    for r in conn
+                        .query_vec(stmt_sql, params![agent], grant_row)
+                        .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
+                    {
+                        out.push(r?);
+                    }
+                }
+                None => {
+                    let stmt_sql =
+                        "SELECT * FROM platform_grants ORDER BY agent, platform, account";
+                    for r in conn
+                        .query_vec(stmt_sql, [], grant_row)
+                        .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
+                    {
+                        out.push(r?);
+                    }
                 }
             }
-            None => {
-                let mut stmt = conn
-                    .prepare("SELECT * FROM platform_grants ORDER BY agent, platform, account")?;
-                for r in stmt.query_map([], grant_row)? {
-                    out.push(r?);
-                }
-            }
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     /// Record `(agent, platform, account, scopes)` — the operator's
@@ -766,88 +775,84 @@ impl Store {
         by: &str,
     ) -> Result<Grant> {
         identifier(agent, "Agent")?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        // The credential must exist — a grant on nothing is a latent
-        // privilege the next enroll would silently arm. The built-in
-        // `local/local` account is the exception (CAD-577): it is always
-        // available with no enrollment, so a grant on it is recordable.
-        let enrolled: Option<i64> = tx
-            .query_row(
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            // The credential must exist — a grant on nothing is a latent
+            // privilege the next enroll would silently arm. The built-in
+            // `local/local` account is the exception (CAD-577): it is always
+            // available with no enrollment, so a grant on it is recordable.
+            let enrolled: Option<i64> = tx.query_opt(
                 "SELECT 1 FROM platform_credentials WHERE platform=?1 AND account=?2",
                 params![platform, account],
                 |r| r.get(0),
-            )
-            .optional()?;
-        if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
-            return Err(Error::rejected(format!(
-                "platform '{platform}' account '{account}' is not enrolled — \
-                 `platform enroll` first"
-            )));
-        }
-        let existing: Option<Grant> = tx
-            .query_row(
+            )?;
+            if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
+                return Err(Error::rejected(format!(
+                    "platform '{platform}' account '{account}' is not enrolled — \
+                             `platform enroll` first"
+                )));
+            }
+            let existing: Option<Grant> = tx.query_opt(
                 "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
                 params![agent, platform, account],
                 grant_row,
-            )
-            .optional()?;
-        let merged: Vec<String> = match &existing {
-            Some(g) => {
-                let mut all = g.scopes.clone();
-                for s in scopes {
-                    if !all.contains(s) {
-                        all.push(s.clone());
+            )?;
+            let merged: Vec<String> = match &existing {
+                Some(g) => {
+                    let mut all = g.scopes.clone();
+                    for s in scopes {
+                        if !all.contains(s) {
+                            all.push(s.clone());
+                        }
                     }
+                    all.sort();
+                    all
                 }
-                all.sort();
-                all
-            }
-            None => {
-                let mut s = scopes.to_vec();
-                s.sort();
-                s
-            }
-        };
-        let grant = Grant {
-            agent: agent.to_string(),
-            platform: platform.to_string(),
-            account: account.to_string(),
-            scopes: merged,
-            granted_at: existing.as_ref().map_or(now(), |g| g.granted_at),
-            by: by.to_string(),
-        };
-        tx.execute(
-            "INSERT OR REPLACE INTO platform_grants
-             (agent, platform, account, scopes, granted_at, by)
-             VALUES(?1,?2,?3,?4,?5,?6)",
-            params![
-                grant.agent,
-                grant.platform,
-                grant.account,
-                scopes_json(&grant.scopes)?,
-                grant.granted_at,
-                grant.by,
-            ],
-        )?;
-        // Audit names the scopes this call added, not the merged set.
-        let added: Vec<&String> = match &existing {
-            Some(g) => grant
-                .scopes
-                .iter()
-                .filter(|s| !g.scopes.contains(s))
-                .collect(),
-            None => grant.scopes.iter().collect(),
-        };
-        Self::event(
-            &tx,
-            PLATFORM_STREAM,
-            SCOPE_GRANTED_EVENT,
-            json!({"agent": agent, "platform": platform, "account": account,
-                   "scopes": added, "by": by}),
-        )?;
-        tx.commit()?;
-        Ok(grant)
+                None => {
+                    let mut s = scopes.to_vec();
+                    s.sort();
+                    s
+                }
+            };
+            let grant = Grant {
+                agent: agent.to_string(),
+                platform: platform.to_string(),
+                account: account.to_string(),
+                scopes: merged,
+                granted_at: existing.as_ref().map_or(now(), |g| g.granted_at),
+                by: by.to_string(),
+            };
+            tx.execute(
+                "INSERT OR REPLACE INTO platform_grants
+                         (agent, platform, account, scopes, granted_at, by)
+                         VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    grant.agent,
+                    grant.platform,
+                    grant.account,
+                    scopes_json(&grant.scopes)?,
+                    grant.granted_at,
+                    grant.by,
+                ],
+            )?;
+            // Audit names the scopes this call added, not the merged set.
+            let added: Vec<&String> = match &existing {
+                Some(g) => grant
+                    .scopes
+                    .iter()
+                    .filter(|s| !g.scopes.contains(s))
+                    .collect(),
+                None => grant.scopes.iter().collect(),
+            };
+            Self::event(
+                &tx,
+                PLATFORM_STREAM,
+                SCOPE_GRANTED_EVENT,
+                json!({"agent": agent, "platform": platform, "account": account,
+                               "scopes": added, "by": by}),
+            )?;
+            Ok(grant)
+        })
     }
 
     /// Revoke `scopes` from `(agent, platform, account)`'s grant —
@@ -862,59 +867,57 @@ impl Store {
         scopes: Option<&[String]>,
         by: &str,
     ) -> Result<(bool, Option<Grant>)> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let existing: Option<Grant> = tx
-            .query_row(
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let existing: Option<Grant> = tx.query_opt(
                 "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
                 params![agent, platform, account],
                 grant_row,
-            )
-            .optional()?;
-        let Some(grant) = existing else {
-            return Ok((false, None));
-        };
-        let (kept, revoked): (Vec<String>, Vec<String>) = match scopes {
-            None => (Vec::new(), grant.scopes.clone()),
-            Some(drop) => grant
-                .scopes
-                .iter()
-                .cloned()
-                .partition(|s| !drop.contains(s)),
-        };
-        if kept.is_empty() {
-            tx.execute(
-                "DELETE FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
-                params![agent, platform, account],
             )?;
-        } else {
-            tx.execute(
-                "UPDATE platform_grants SET scopes=?4 \
-                 WHERE agent=?1 AND platform=?2 AND account=?3",
-                params![agent, platform, account, scopes_json(&kept)?],
-            )?;
-        }
-        if !revoked.is_empty() {
-            Self::event(
-                &tx,
-                PLATFORM_STREAM,
-                SCOPE_REVOKED_EVENT,
-                json!({"agent": agent, "platform": platform, "account": account,
-                       "scopes": revoked, "by": by}),
-            )?;
-        }
-        tx.commit()?;
-        Ok((
-            true,
+            let Some(grant) = existing else {
+                return Ok((false, None));
+            };
+            let (kept, revoked): (Vec<String>, Vec<String>) = match scopes {
+                None => (Vec::new(), grant.scopes.clone()),
+                Some(drop) => grant
+                    .scopes
+                    .iter()
+                    .cloned()
+                    .partition(|s| !drop.contains(s)),
+            };
             if kept.is_empty() {
-                None
+                tx.execute(
+                    "DELETE FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
+                    params![agent, platform, account],
+                )?;
             } else {
-                Some(Grant {
-                    scopes: kept,
-                    ..grant
-                })
-            },
-        ))
+                tx.execute(
+                    "UPDATE platform_grants SET scopes=?4 \
+                             WHERE agent=?1 AND platform=?2 AND account=?3",
+                    params![agent, platform, account, scopes_json(&kept)?],
+                )?;
+            }
+            if !revoked.is_empty() {
+                Self::event(
+                    &tx,
+                    PLATFORM_STREAM,
+                    SCOPE_REVOKED_EVENT,
+                    json!({"agent": agent, "platform": platform, "account": account,
+                                   "scopes": revoked, "by": by}),
+                )?;
+            }
+            Ok((
+                true,
+                if kept.is_empty() {
+                    None
+                } else {
+                    Some(Grant {
+                        scopes: kept,
+                        ..grant
+                    })
+                },
+            ))
+        })
     }
 
     /// Record `project`'s default account for `platform`. The account
@@ -927,40 +930,38 @@ impl Store {
         account: &str,
         by: &str,
     ) -> Result<ProjectDefault> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let enrolled: Option<i64> = tx
-            .query_row(
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let enrolled: Option<i64> = tx.query_opt(
                 "SELECT 1 FROM platform_credentials WHERE platform=?1 AND account=?2",
                 params![platform, account],
                 |r| r.get(0),
-            )
-            .optional()?;
-        if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
-            return Err(Error::rejected(format!(
-                "platform '{platform}' account '{account}' is not enrolled — \
-                 `platform enroll` first"
-            )));
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO platform_defaults
-             (project, platform, account, set_at, by) VALUES(?1,?2,?3,?4,?5)",
-            params![project, platform, account, now(), by],
-        )?;
-        Self::event(
-            &tx,
-            PLATFORM_STREAM,
-            PLATFORM_DEFAULT_EVENT,
-            json!({"project": project, "platform": platform,
-                   "account": account, "by": by}),
-        )?;
-        tx.commit()?;
-        Ok(ProjectDefault {
-            project: project.to_string(),
-            platform: platform.to_string(),
-            account: account.to_string(),
-            set_at: now(),
-            by: by.to_string(),
+            )?;
+            if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
+                return Err(Error::rejected(format!(
+                    "platform '{platform}' account '{account}' is not enrolled — \
+                             `platform enroll` first"
+                )));
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO platform_defaults
+                         (project, platform, account, set_at, by) VALUES(?1,?2,?3,?4,?5)",
+                params![project, platform, account, now(), by],
+            )?;
+            Self::event(
+                &tx,
+                PLATFORM_STREAM,
+                PLATFORM_DEFAULT_EVENT,
+                json!({"project": project, "platform": platform,
+                               "account": account, "by": by}),
+            )?;
+            Ok(ProjectDefault {
+                project: project.to_string(),
+                platform: platform.to_string(),
+                account: account.to_string(),
+                set_at: now(),
+                by: by.to_string(),
+            })
         })
     }
 
@@ -970,43 +971,45 @@ impl Store {
         project: &str,
         platform: &str,
     ) -> Result<Option<ProjectDefault>> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT * FROM platform_defaults WHERE project=?1 AND platform=?2",
-            params![project, platform],
-            |row| {
-                Ok(ProjectDefault {
-                    project: row.get("project")?,
-                    platform: row.get("platform")?,
-                    account: row.get("account")?,
-                    set_at: row.get("set_at")?,
-                    by: row.get("by")?,
-                })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
+        self.read_tx(|conn| {
+            conn.query_opt(
+                "SELECT * FROM platform_defaults WHERE project=?1 AND platform=?2",
+                params![project, platform],
+                |row| {
+                    Ok(ProjectDefault {
+                        project: row.get("project")?,
+                        platform: row.get("platform")?,
+                        account: row.get("account")?,
+                        set_at: row.get("set_at")?,
+                        by: row.get("by")?,
+                    })
+                },
+            )
+            .map_err(Into::into)
+        })
     }
 
     /// Every project default — `platform_defaults` lists them.
     pub fn platform_defaults(&self) -> Result<Vec<ProjectDefault>> {
-        let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT * FROM platform_defaults ORDER BY project, platform")?;
-        let rows = stmt.query_map([], |row| {
-            Ok(ProjectDefault {
-                project: row.get("project")?,
-                platform: row.get("platform")?,
-                account: row.get("account")?,
-                set_at: row.get("set_at")?,
-                by: row.get("by")?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
+        self.read_tx(|conn| {
+            let stmt_sql = "SELECT * FROM platform_defaults ORDER BY project, platform";
+            let rows = conn
+                .query_vec(stmt_sql, [], |row| {
+                    Ok(ProjectDefault {
+                        project: row.get("project")?,
+                        platform: row.get("platform")?,
+                        account: row.get("account")?,
+                        set_at: row.get("set_at")?,
+                        by: row.get("by")?,
+                    })
+                })
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
     }
 
     // ---------- CAD-577: app-derived grants ----------
@@ -1030,11 +1033,11 @@ impl Store {
         grants: &[(String, String, String, Vec<String>)],
         by: &str,
     ) -> Result<Vec<(String, String, String)>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let changed = apply_derived(&tx, app, install_id, grants, by)?;
-        tx.commit()?;
-        Ok(changed)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let changed = apply_derived(&tx, app, install_id, grants, by)?;
+            Ok(changed)
+        })
     }
 
     /// Re-derive or revoke under one write lock, re-reading the approval
@@ -1049,21 +1052,21 @@ impl Store {
         grants: &[Derived],
         by: &str,
     ) -> Result<Vec<(String, String, String)>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let approval = latest_app_approval(&tx, app)?;
-        let live = digest.is_some_and(|d| {
-            approval
-                .as_ref()
-                .is_some_and(|p| approval_covers(p, d, install_id))
-        });
-        let changed = if live {
-            apply_derived(&tx, app, install_id, grants, by)?
-        } else {
-            revoke_derived(&tx, app, by)?
-        };
-        tx.commit()?;
-        Ok(changed)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let approval = latest_app_approval(&tx, app)?;
+            let live = digest.is_some_and(|d| {
+                approval
+                    .as_ref()
+                    .is_some_and(|p| approval_covers(p, d, install_id))
+            });
+            let changed = if live {
+                apply_derived(&tx, app, install_id, grants, by)?
+            } else {
+                revoke_derived(&tx, app, by)?
+            };
+            Ok(changed)
+        })
     }
 
     /// Record an approval and derive its grants in one transaction, so a
@@ -1076,17 +1079,17 @@ impl Store {
         grants: &[Derived],
         by: &str,
     ) -> Result<Vec<(String, String, String)>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let install_id = approval
-            .get("install_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        Self::event(&tx, APPROVAL_STREAM, APP_APPROVED_EVENT, approval)?;
-        let changed = apply_derived(&tx, app, &install_id, grants, by)?;
-        tx.commit()?;
-        Ok(changed)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let install_id = approval
+                .get("install_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Self::event(&tx, APPROVAL_STREAM, APP_APPROVED_EVENT, approval)?;
+            let changed = apply_derived(&tx, app, &install_id, grants, by)?;
+            Ok(changed)
+        })
     }
 
     /// Record a withdrawn approval and subtract its derived grants in
@@ -1098,12 +1101,12 @@ impl Store {
         app: &str,
         by: &str,
     ) -> Result<Vec<(String, String, String)>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        Self::event(&tx, APPROVAL_STREAM, APP_APPROVED_EVENT, approval)?;
-        let changed = revoke_derived(&tx, app, by)?;
-        tx.commit()?;
-        Ok(changed)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            Self::event(&tx, APPROVAL_STREAM, APP_APPROVED_EVENT, approval)?;
+            let changed = revoke_derived(&tx, app, by)?;
+            Ok(changed)
+        })
     }
 
     /// Every app key that still holds derived grant rows (CAD-577) —
@@ -1111,10 +1114,13 @@ impl Store {
     /// removed from the tracker, so a removal can never leave a
     /// standing grant behind.
     pub fn app_grants_apps(&self) -> Result<Vec<String>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT DISTINCT app FROM app_grants ORDER BY app")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        Ok(rows.flatten().collect())
+        self.read_tx(|conn| {
+            let stmt_sql = "SELECT DISTINCT app FROM app_grants ORDER BY app";
+            let rows = conn
+                .query_vec(stmt_sql, [], |r| r.get::<_, String>(0))
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
+            Ok(rows.flatten().collect())
+        })
     }
 
     /// Drop grant rows for `app` whose install id is not `install_id`,
@@ -1127,51 +1133,52 @@ impl Store {
         install_id: &str,
         by: &str,
     ) -> Result<Vec<(String, String, String)>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let rows: Vec<Derived> = {
-            let mut stmt = tx.prepare(
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let rows: Vec<Derived> = tx.query_vec(
                 "SELECT agent, platform, account, scopes FROM app_grants \
-                 WHERE app=?1 AND install_id<>?2",
+                         WHERE app=?1 AND install_id<>?2",
+                params![app, install_id],
+                |r| {
+                    let scopes: String = r.get(3)?;
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&scopes)))
+                },
             )?;
-            let mapped = stmt.query_map(params![app, install_id], |r| {
-                let scopes: String = r.get(3)?;
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&scopes)))
-            })?;
-            mapped.flatten().collect()
-        };
-        if rows.is_empty() {
-            tx.commit()?;
-            return Ok(Vec::new());
-        }
-        tx.execute(
-            "DELETE FROM app_grants WHERE app=?1 AND install_id<>?2",
-            params![app, install_id],
-        )?;
-        let changed = subtract_derived(&tx, app, &rows, Some(install_id))?;
-        for (agent, platform, account, derived) in &rows {
-            Store::event(
-                &tx,
-                PLATFORM_STREAM,
-                APP_GRANTS_REVOKED_EVENT,
-                json!({"app": app, "agent": agent, "platform": platform,
-                       "account": account, "scopes": derived, "by": by,
-                       "install_id": install_id}),
+            if rows.is_empty() {
+                return Ok(Vec::new());
+            }
+            tx.execute(
+                "DELETE FROM app_grants WHERE app=?1 AND install_id<>?2",
+                params![app, install_id],
             )?;
-        }
-        tx.commit()?;
-        Ok(changed)
+            let changed = subtract_derived(&tx, app, &rows, Some(install_id))?;
+            for (agent, platform, account, derived) in &rows {
+                Store::event(
+                    &tx,
+                    PLATFORM_STREAM,
+                    APP_GRANTS_REVOKED_EVENT,
+                    json!({"app": app, "agent": agent, "platform": platform,
+                                   "account": account, "scopes": derived, "by": by,
+                                   "install_id": install_id}),
+                )?;
+            }
+            Ok(changed)
+        })
     }
 
     /// Every derived-grant row's `(app, install_id)`. The sweep uses
     /// this to find a grant whose install is no longer the current one,
     /// including a row whose approval derived nothing else to list.
     pub fn app_grant_installs(&self) -> Result<Vec<(String, String)>> {
-        let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT DISTINCT app, install_id FROM app_grants ORDER BY app")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        Ok(rows.flatten().collect())
+        self.read_tx(|conn| {
+            let stmt_sql = "SELECT DISTINCT app, install_id FROM app_grants ORDER BY app";
+            let rows = conn
+                .query_vec(stmt_sql, [], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
+            Ok(rows.flatten().collect())
+        })
     }
 
     /// Revoke every grant an app's approval derived: the `app_grants`
@@ -1182,11 +1189,11 @@ impl Store {
     /// account)` triples whose platform grant changed, so the caller
     /// can drain the waiting effects that lost a scope (CAD-506).
     pub fn app_grants_revoke(&self, app: &str, by: &str) -> Result<Vec<(String, String, String)>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let changed = revoke_derived(&tx, app, by)?;
-        tx.commit()?;
-        Ok(changed)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let changed = revoke_derived(&tx, app, by)?;
+            Ok(changed)
+        })
     }
 }
 

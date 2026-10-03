@@ -17,11 +17,12 @@
 //! `refuse_leak` check against the enrolled credential before it
 //! lands.
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 
+use super::StoreConn;
 use super::{now, Store};
 
 /// §5.5 effect event names — all on [`super::platform::PLATFORM_STREAM`]
@@ -239,172 +240,174 @@ impl Store {
     /// whether it already existed (the dedupe), so the caller omits a
     /// second `request_opened` event.
     pub fn effect_stage(&self, row: &EffectRow) -> Result<(EffectRow, bool)> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let existing: Option<EffectRow> = tx
-            .query_row(
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let existing: Option<EffectRow> = tx.query_opt(
                 "SELECT * FROM platform_effects WHERE request=?1",
                 params![row.request],
                 EffectRow::from_row,
-            )
-            .optional()?;
-        if let Some(existing) = existing {
-            // The dedupe must be genuine: a same-named handle carrying a
-            // different call is a conflict, not a retry — refuse it so a
-            // caller cannot squat a handle and disguise a second effect.
-            let same = existing.agent == row.agent
-                && existing.platform == row.platform
-                && existing.account == row.account
-                && existing.tool == row.tool
-                && existing.input == row.input;
-            if !same {
-                return Err(Error::rejected(format!(
-                    "effect request '{}' already names a different staged call",
-                    row.request
-                )));
+            )?;
+            if let Some(existing) = existing {
+                // The dedupe must be genuine: a same-named handle carrying a
+                // different call is a conflict, not a retry — refuse it so a
+                // caller cannot squat a handle and disguise a second effect.
+                let same = existing.agent == row.agent
+                    && existing.platform == row.platform
+                    && existing.account == row.account
+                    && existing.tool == row.tool
+                    && existing.input == row.input;
+                if !same {
+                    return Err(Error::rejected(format!(
+                        "effect request '{}' already names a different staged call",
+                        row.request
+                    )));
+                }
+                return Ok((existing, true));
             }
-            return Ok((existing, true));
-        }
-        tx.execute(
-            "INSERT INTO platform_effects
-             (effect_id, request, agent, platform, account, tool, label,
-              input, input_summary, preview, source_name, source_hash,
-              scopes, task, state, staged_at, updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'waiting',?15,?15)",
-            params![
-                row.effect_id,
-                row.request,
-                row.agent,
-                row.platform,
-                row.account,
-                row.tool,
-                row.label,
-                serde_json::to_string(&row.input)?,
-                row.input_summary,
-                row.preview,
-                row.source_name,
-                row.source_hash,
-                serde_json::to_string(&row.scopes)?,
-                row.task,
-                now(),
-            ],
-        )?;
-        Self::event(
-            &tx,
-            super::platform::PLATFORM_STREAM,
-            EFFECT_REQUESTED_EVENT,
-            json!({"request": row.request, "effect_id": row.effect_id,
-                   "agent": row.agent, "platform": row.platform,
-                   "account": row.account, "tool": row.tool,
-                   "input_summary": row.input_summary}),
-        )?;
-        tx.commit()?;
-        Ok((row.clone(), false))
+            tx.execute(
+                "INSERT INTO platform_effects
+                         (effect_id, request, agent, platform, account, tool, label,
+                          input, input_summary, preview, source_name, source_hash,
+                          scopes, task, state, staged_at, updated_at)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'waiting',?15,?15)",
+                params![
+                    row.effect_id,
+                    row.request,
+                    row.agent,
+                    row.platform,
+                    row.account,
+                    row.tool,
+                    row.label,
+                    serde_json::to_string(&row.input)?,
+                    row.input_summary,
+                    row.preview,
+                    row.source_name,
+                    row.source_hash,
+                    serde_json::to_string(&row.scopes)?,
+                    row.task,
+                    now(),
+                ],
+            )?;
+            Self::event(
+                &tx,
+                super::platform::PLATFORM_STREAM,
+                EFFECT_REQUESTED_EVENT,
+                json!({"request": row.request, "effect_id": row.effect_id,
+                               "agent": row.agent, "platform": row.platform,
+                               "account": row.account, "tool": row.tool,
+                               "input_summary": row.input_summary}),
+            )?;
+            Ok((row.clone(), false))
+        })
     }
 
     /// One row by brokered handle.
     pub fn effect_by_request(&self, request: &str) -> Result<Option<EffectRow>> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT * FROM platform_effects WHERE request=?1",
-            params![request],
-            EffectRow::from_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        self.read_tx(|conn| {
+            conn.query_opt(
+                "SELECT * FROM platform_effects WHERE request=?1",
+                params![request],
+                EffectRow::from_row,
+            )
+            .map_err(Into::into)
+        })
     }
 
     /// One row by durable id.
     pub fn effect_by_id(&self, effect_id: &str) -> Result<Option<EffectRow>> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT * FROM platform_effects WHERE effect_id=?1",
-            params![effect_id],
-            EffectRow::from_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        self.read_tx(|conn| {
+            conn.query_opt(
+                "SELECT * FROM platform_effects WHERE effect_id=?1",
+                params![effect_id],
+                EffectRow::from_row,
+            )
+            .map_err(Into::into)
+        })
     }
 
     /// Pending-effect records — all of them, or one agent's.
     pub fn platform_effects(&self, agent: Option<&str>) -> Result<Vec<EffectRow>> {
-        let conn = self.conn();
-        let mut out = Vec::new();
-        match agent {
-            Some(agent) => {
-                let mut stmt = conn.prepare(
-                    "SELECT * FROM platform_effects WHERE agent=?1 AND authorization_kind='agent_grant' \
-                     ORDER BY staged_at, effect_id",
-                )?;
-                for r in stmt.query_map(params![agent], EffectRow::from_row)? {
-                    out.push(r?);
-                }
-            }
-            None => {
-                let mut stmt =
-                    conn.prepare("SELECT * FROM platform_effects WHERE authorization_kind='agent_grant' ORDER BY staged_at, effect_id")?;
-                for r in stmt.query_map([], EffectRow::from_row)? {
-                    out.push(r?);
-                }
-            }
-        }
-        Ok(out)
+        self.read_tx(|conn| {
+
+                    let mut out = Vec::new();
+                    match agent {
+                        Some(agent) => {
+                            let stmt_sql = "SELECT * FROM platform_effects WHERE agent=?1 AND authorization_kind='agent_grant' \
+                                 ORDER BY staged_at, effect_id";
+                            for r in conn.query_vec(stmt_sql, params![agent], EffectRow::from_row).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))? {
+                                out.push(r?);
+                            }
+                        }
+                        None => {
+                            let stmt_sql = "SELECT * FROM platform_effects WHERE authorization_kind='agent_grant' ORDER BY staged_at, effect_id";
+                            for r in conn.query_vec(stmt_sql, [], EffectRow::from_row).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))? {
+                                out.push(r?);
+                            }
+                        }
+                    }
+                    Ok(out)
+        })
     }
 
     /// The draft log — the information-only "ran without you" rows.
     /// `limit` bounds the listing; newest first.
     pub fn platform_drafts(&self, agent: Option<&str>, limit: usize) -> Result<Vec<DraftRow>> {
-        let conn = self.conn();
-        let mut out = Vec::new();
-        let sql = match agent {
-            Some(_) => {
-                "SELECT * FROM platform_drafts WHERE agent=?1 \
-                        ORDER BY id DESC LIMIT ?2"
+        self.read_tx(|conn| {
+            let mut out = Vec::new();
+            let sql = match agent {
+                Some(_) => {
+                    "SELECT * FROM platform_drafts WHERE agent=?1 \
+                                    ORDER BY id DESC LIMIT ?2"
+                }
+                None => "SELECT * FROM platform_drafts ORDER BY id DESC LIMIT ?2",
+            };
+            let stmt_sql = sql;
+            for r in conn
+                .query_vec(
+                    stmt_sql,
+                    params![agent.unwrap_or_default(), limit as i64],
+                    DraftRow::from_row,
+                )
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
+            {
+                out.push(r?);
             }
-            None => "SELECT * FROM platform_drafts ORDER BY id DESC LIMIT ?2",
-        };
-        let mut stmt = conn.prepare(sql)?;
-        for r in stmt.query_map(
-            params![agent.unwrap_or_default(), limit as i64],
-            DraftRow::from_row,
-        )? {
-            out.push(r?);
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     /// Record one `draft` execution — row and `effect_executed` audit in
     /// one transaction (§5.5 audits drafts too; there is no pending row).
     pub fn draft_record(&self, row: &DraftRow, verified_ok: &Value) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO platform_drafts
-             (agent, platform, account, tool, label, input_summary, artifact, ran_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![
-                row.agent,
-                row.platform,
-                row.account,
-                row.tool,
-                row.label,
-                row.input_summary,
-                row.artifact,
-                row.ran_at,
-            ],
-        )?;
-        Self::event(
-            &tx,
-            super::platform::PLATFORM_STREAM,
-            EFFECT_EXECUTED_EVENT,
-            json!({"effect": "draft", "agent": row.agent,
-                   "platform": row.platform, "account": row.account,
-                   "tool": row.tool, "label": row.label,
-                   "input_summary": row.input_summary,
-                   "result": verified_ok, "verified": true}),
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            tx.execute(
+                "INSERT INTO platform_drafts
+                         (agent, platform, account, tool, label, input_summary, artifact, ran_at)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    row.agent,
+                    row.platform,
+                    row.account,
+                    row.tool,
+                    row.label,
+                    row.input_summary,
+                    row.artifact,
+                    row.ran_at,
+                ],
+            )?;
+            Self::event(
+                &tx,
+                super::platform::PLATFORM_STREAM,
+                EFFECT_EXECUTED_EVENT,
+                json!({"effect": "draft", "agent": row.agent,
+                               "platform": row.platform, "account": row.account,
+                               "tool": row.tool, "label": row.label,
+                               "input_summary": row.input_summary,
+                               "result": verified_ok, "verified": true}),
+            )?;
+            Ok(())
+        })
     }
 
     /// The press — `accept` or `decline`. One atomic guarded update is
@@ -422,32 +425,32 @@ impl Store {
         accept: bool,
         decision: &Value,
     ) -> Result<Option<EffectRow>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let state = if accept { "decided" } else { "declined" };
-        let n = tx.execute(
-            "UPDATE platform_effects SET state=?2, decision=?3, updated_at=?4
-             WHERE request=?1 AND state='waiting'",
-            params![request, state, serde_json::to_string(decision)?, now()],
-        )?;
-        if n == 0 {
-            return Ok(None);
-        }
-        Self::event(
-            &tx,
-            super::platform::PLATFORM_STREAM,
-            EFFECT_DECIDED_EVENT,
-            json!({"request": request,
-                   "decision": if accept { "accept" } else { "decline" },
-                   "by": decision["by"], "reason": decision["reason"]}),
-        )?;
-        let row = tx.query_row(
-            "SELECT * FROM platform_effects WHERE request=?1",
-            params![request],
-            EffectRow::from_row,
-        )?;
-        tx.commit()?;
-        Ok(Some(row))
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let state = if accept { "decided" } else { "declined" };
+            let n = tx.execute(
+                "UPDATE platform_effects SET state=?2, decision=?3, updated_at=?4
+                         WHERE request=?1 AND state='waiting'",
+                params![request, state, serde_json::to_string(decision)?, now()],
+            )?;
+            if n == 0 {
+                return Ok(None);
+            }
+            Self::event(
+                &tx,
+                super::platform::PLATFORM_STREAM,
+                EFFECT_DECIDED_EVENT,
+                json!({"request": request,
+                               "decision": if accept { "accept" } else { "decline" },
+                               "by": decision["by"], "reason": decision["reason"]}),
+            )?;
+            let row = tx.query_row(
+                "SELECT * FROM platform_effects WHERE request=?1",
+                params![request],
+                EffectRow::from_row,
+            )?;
+            Ok(Some(row))
+        })
     }
 
     /// `decided` → `executing`, immediately before the platform call.
@@ -455,13 +458,14 @@ impl Store {
     /// distinguishable from "executing" at restart — both reconcile,
     /// but the record says exactly where the run stopped.
     pub fn effect_executing(&self, effect_id: &str) -> Result<()> {
-        let conn = self.write_conn()?;
-        conn.execute(
-            "UPDATE platform_effects SET state='executing', updated_at=?2
-             WHERE effect_id=?1 AND state='decided'",
-            params![effect_id, now()],
-        )?;
-        Ok(())
+        self.write_tx(|conn| {
+            conn.execute(
+                "UPDATE platform_effects SET state='executing', updated_at=?2
+                         WHERE effect_id=?1 AND state='decided'",
+                params![effect_id, now()],
+            )?;
+            Ok(())
+        })
     }
 
     /// The platform outcome: `executing` → `done`|`failed` with the
@@ -474,47 +478,47 @@ impl Store {
         outcome: &Value,
         summary: &str,
     ) -> Result<EffectRow> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let needs_you = outcome["verified"] == json!(false);
-        tx.execute(
-            "UPDATE platform_effects SET state=?2, outcome=?3, needs_you=?4,
-             updated_at=?5 WHERE effect_id=?1 AND state='executing'",
-            params![
-                effect_id,
-                if ok { "done" } else { "failed" },
-                serde_json::to_string(outcome)?,
-                needs_you as i64,
-                now()
-            ],
-        )?;
-        Self::event(
-            &tx,
-            super::platform::PLATFORM_STREAM,
-            if ok {
-                EFFECT_EXECUTED_EVENT
-            } else {
-                EFFECT_FAILED_EVENT
-            },
-            json!({"effect_id": effect_id,
-                   "result": summary, "verified": outcome["verified"]}),
-        )?;
-        if needs_you {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let needs_you = outcome["verified"] == json!(false);
+            tx.execute(
+                "UPDATE platform_effects SET state=?2, outcome=?3, needs_you=?4,
+                         updated_at=?5 WHERE effect_id=?1 AND state='executing'",
+                params![
+                    effect_id,
+                    if ok { "done" } else { "failed" },
+                    serde_json::to_string(outcome)?,
+                    needs_you as i64,
+                    now()
+                ],
+            )?;
             Self::event(
                 &tx,
                 super::platform::PLATFORM_STREAM,
-                EFFECT_NEEDS_YOU_EVENT,
+                if ok {
+                    EFFECT_EXECUTED_EVENT
+                } else {
+                    EFFECT_FAILED_EVENT
+                },
                 json!({"effect_id": effect_id,
-                       "reason": "read-back does not match the approved input"}),
+                               "result": summary, "verified": outcome["verified"]}),
             )?;
-        }
-        let row = tx.query_row(
-            "SELECT * FROM platform_effects WHERE effect_id=?1",
-            params![effect_id],
-            EffectRow::from_row,
-        )?;
-        tx.commit()?;
-        Ok(row)
+            if needs_you {
+                Self::event(
+                    &tx,
+                    super::platform::PLATFORM_STREAM,
+                    EFFECT_NEEDS_YOU_EVENT,
+                    json!({"effect_id": effect_id,
+                                   "reason": "read-back does not match the approved input"}),
+                )?;
+            }
+            let row = tx.query_row(
+                "SELECT * FROM platform_effects WHERE effect_id=?1",
+                params![effect_id],
+                EffectRow::from_row,
+            )?;
+            Ok(row)
+        })
     }
 
     /// Cancel a `waiting` (or `reconcile`) row: `closed` with the
@@ -545,45 +549,43 @@ impl Store {
         reason: &str,
         states: &[&'static str],
     ) -> Result<Option<EffectRow>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let (where_by, arg): (&str, String) = match key {
-            EffectKey::Request(r) => ("request", r),
-            EffectKey::Id(id) => ("effect_id", id),
-        };
-        let list = states
-            .iter()
-            .map(|s| format!("'{s}'"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let row: Option<EffectRow> = tx
-            .query_row(
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let (where_by, arg): (&str, String) = match key {
+                EffectKey::Request(r) => ("request", r),
+                EffectKey::Id(id) => ("effect_id", id),
+            };
+            let list = states
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let row: Option<EffectRow> = tx.query_opt(
                 &format!(
                     "SELECT * FROM platform_effects WHERE {where_by}=?1 \
-                     AND state IN ({list})"
+                                 AND state IN ({list})"
                 ),
                 params![arg],
                 EffectRow::from_row,
-            )
-            .optional()?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        tx.execute(
-            "UPDATE platform_effects SET state='closed', close_reason=?2,
-             decision=NULL, outcome=NULL, needs_you=0, updated_at=?3
-             WHERE effect_id=?1",
-            params![row.effect_id, reason, now()],
-        )?;
-        Self::event(
-            &tx,
-            super::platform::PLATFORM_STREAM,
-            EFFECT_CANCELLED_EVENT,
-            json!({"effect_id": row.effect_id, "request": row.request,
-                   "reason": reason}),
-        )?;
-        tx.commit()?;
-        Ok(Some(row))
+            )?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE platform_effects SET state='closed', close_reason=?2,
+                         decision=NULL, outcome=NULL, needs_you=0, updated_at=?3
+                         WHERE effect_id=?1",
+                params![row.effect_id, reason, now()],
+            )?;
+            Self::event(
+                &tx,
+                super::platform::PLATFORM_STREAM,
+                EFFECT_CANCELLED_EVENT,
+                json!({"effect_id": row.effect_id, "request": row.request,
+                               "reason": reason}),
+            )?;
+            Ok(Some(row))
+        })
     }
 
     /// §5.4 step 8 — restart reconciliation, inside `recover`'s
@@ -592,12 +594,15 @@ impl Store {
     /// platform, so it becomes `reconcile` for a human — never
     /// re-fired. `waiting` rows survive untouched; the request listing
     /// reads them from this table, so nothing needs re-parking.
-    pub fn reconcile_effects_in(&self, tx: &rusqlite::Connection) -> Result<Vec<EffectRow>> {
-        let mut stmt =
-            tx.prepare("SELECT * FROM platform_effects WHERE state IN ('decided','executing')")?;
-        let rows: Vec<EffectRow> = stmt
-            .query_map([], EffectRow::from_row)?
-            .collect::<std::result::Result<_, _>>()?;
+    pub(super) fn reconcile_effects_in(
+        &self,
+        tx: &impl super::StoreConn,
+    ) -> Result<Vec<EffectRow>> {
+        let rows: Vec<EffectRow> = tx.query_vec(
+            "SELECT * FROM platform_effects WHERE state IN ('decided','executing')",
+            [],
+            EffectRow::from_row,
+        )?;
         if rows.is_empty() {
             return Ok(rows);
         }
@@ -625,30 +630,29 @@ impl Store {
     /// state); only the row bookkeeping clears. Answers `None` when
     /// the row is not a flagged terminal.
     pub fn effect_ack(&self, effect_id: &str) -> Result<Option<EffectRow>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let n = tx.execute(
-            "UPDATE platform_effects SET needs_you=0, updated_at=?2 \
-             WHERE effect_id=?1 AND state IN ('done','failed') AND needs_you=1",
-            params![effect_id, now()],
-        )?;
-        if n == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        Self::event(
-            &tx,
-            super::platform::PLATFORM_STREAM,
-            "effect_acknowledged",
-            json!({"effect_id": effect_id}),
-        )?;
-        let row = tx.query_row(
-            "SELECT * FROM platform_effects WHERE effect_id=?1",
-            params![effect_id],
-            EffectRow::from_row,
-        )?;
-        tx.commit()?;
-        Ok(Some(row))
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let n = tx.execute(
+                "UPDATE platform_effects SET needs_you=0, updated_at=?2 \
+                         WHERE effect_id=?1 AND state IN ('done','failed') AND needs_you=1",
+                params![effect_id, now()],
+            )?;
+            if n == 0 {
+                return Ok(None);
+            }
+            Self::event(
+                &tx,
+                super::platform::PLATFORM_STREAM,
+                "effect_acknowledged",
+                json!({"effect_id": effect_id}),
+            )?;
+            let row = tx.query_row(
+                "SELECT * FROM platform_effects WHERE effect_id=?1",
+                params![effect_id],
+                EffectRow::from_row,
+            )?;
+            Ok(Some(row))
+        })
     }
 
     /// `waiting` rows re-park as live pending entries after restart.
