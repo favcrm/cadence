@@ -1,5 +1,5 @@
 use super::super::app_audiences::{AudienceBase, Predicate};
-use super::super::app_records::{record_db_path, CustomerProfile, RecordStore};
+use super::super::app_records::{record_db_path, ConsentProvenance, CustomerProfile, RecordStore};
 use super::super::app_runs::material_digest;
 use super::*;
 
@@ -241,7 +241,7 @@ fn cad780_freeze_drift_invalidates() {
     // Consent drift on the frozen member invalidates the freeze.
     let denied = profile("Amina", Some("amina@example.com"), "denied", &["vip"]);
     store
-        .app_record_update("ctx-1", "customer-a", 1, &denied)
+        .app_record_update("ctx-1", "customer-a", 1, &denied, None)
         .unwrap();
     let drifted = store.app_audience_show("ctx-1", "freeze-1").unwrap();
     assert_eq!(drifted["valid"], false);
@@ -249,7 +249,13 @@ fn cad780_freeze_drift_invalidates() {
     // So does a segment revision change behind a fresh freeze.
     let granted = profile("Amina", Some("amina@example.com"), "granted", &["vip"]);
     store
-        .app_record_update("ctx-1", "customer-a", 2, &granted)
+        .app_record_update(
+            "ctx-1",
+            "customer-a",
+            2,
+            &granted,
+            Some(&ConsentProvenance::parse(&json!({"method": "in_person"})).unwrap()),
+        )
         .unwrap();
     store
         .app_audience_prepare("ctx-1", "freeze-2", &base, None, 50)

@@ -103,6 +103,8 @@ struct Create {
 struct Update {
     expected_revision: u64,
     profile: Value,
+    #[serde(default)]
+    consent_provenance: Option<Value>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -278,6 +280,9 @@ pub(super) fn handle(
                 "expected_revision": revision,
             });
             params["profile"] = body.profile;
+            if let Some(provenance) = body.consent_provenance {
+                params["consent_provenance"] = provenance;
+            }
             ("app_record_update", params)
         }
         Route::CsvPreview(install, context) => {

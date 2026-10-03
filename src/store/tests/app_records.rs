@@ -1,5 +1,5 @@
 use super::super::app_records::{
-    record_db_path, CsvAction, CsvDecision, CustomerProfile, RecordStore,
+    record_db_path, ConsentProvenance, CsvAction, CsvDecision, CustomerProfile, RecordStore,
 };
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -64,7 +64,8 @@ fn cad753_record_files_are_physical_per_installation() {
             "ctx-1",
             "customer-1",
             9,
-            &customer("Stale", "stale@example.com")
+            &customer("Stale", "stale@example.com"),
+            None
         )
         .is_err());
     assert_eq!(
@@ -77,6 +78,7 @@ fn cad753_record_files_are_physical_per_installation() {
             "customer-1",
             1,
             &customer("Amina B", "amina@example.com"),
+            None,
         )
         .unwrap();
     assert_eq!(updated["record"]["revision"], 2);
@@ -132,6 +134,7 @@ fn cad753_record_file_reopens_with_its_contents() {
             "customer-1",
             1,
             &customer("Amina B", "amina@example.com"),
+            None,
         )
         .unwrap();
     drop(reopened);
@@ -326,7 +329,13 @@ fn cad779_update_cannot_move_customer_onto_another_email() {
         .unwrap();
     let before = store.app_record_show("ctx-1", "customer-b").unwrap();
     let refused = store
-        .app_record_update("ctx-1", "customer-b", 1, &customer("B", "HELD@example.com"))
+        .app_record_update(
+            "ctx-1",
+            "customer-b",
+            1,
+            &customer("B", "HELD@example.com"),
+            None,
+        )
         .unwrap_err()
         .to_string();
     assert!(
@@ -609,4 +618,161 @@ fn cad780_open_on_a_forever_table_less_file_refuses_corrupt() {
         !refused.contains("in progress"),
         "exhausted wait leaked the transient signal: {refused}"
     );
+}
+
+fn with_consent(email: &str, sms: Option<&str>) -> CustomerProfile {
+    let mut consent = json!({"email": email});
+    if let Some(sms) = sms {
+        consent["sms"] = json!(sms);
+    }
+    CustomerProfile::parse(&json!({"schema": 1, "display_name": "Amina", "email": "amina@example.com", "tags": [], "consent": consent})).unwrap()
+}
+
+fn provenance(value: Value) -> ConsentProvenance {
+    ConsentProvenance::parse(&value).unwrap()
+}
+
+#[test]
+fn cad1053_granting_consent_requires_a_method_and_records_it() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    store
+        .app_record_create("ctx-1", "c1", &with_consent("unknown", None))
+        .unwrap();
+    // A grant with no method is refused and leaves the row untouched.
+    let refused = store
+        .app_record_update("ctx-1", "c1", 1, &with_consent("granted", None), None)
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("requires a method"),
+        "{refused}"
+    );
+    assert_eq!(
+        store.app_record_show("ctx-1", "c1").unwrap()["record"]["revision"],
+        1
+    );
+    // An SMS-only grant is a grant too.
+    assert!(store
+        .app_record_update(
+            "ctx-1",
+            "c1",
+            1,
+            &with_consent("unknown", Some("granted")),
+            None
+        )
+        .is_err());
+    // With a method it lands, and the method and note show in history.
+    let granted = store
+        .app_record_update(
+            "ctx-1",
+            "c1",
+            1,
+            &with_consent("granted", None),
+            Some(&provenance(
+                json!({"method": "in_person", "note": "  Asked at the counter  "}),
+            )),
+        )
+        .unwrap();
+    let entry = granted["record"]["consent_history"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(entry["state"], "granted");
+    assert_eq!(entry["method"], "in_person");
+    assert_eq!(entry["note"], "Asked at the counter");
+    assert_eq!(entry["actor"], "operator");
+}
+
+#[test]
+fn cad1053_withdrawing_needs_no_method_and_orphan_provenance_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    store
+        .app_record_create("ctx-1", "c1", &with_consent("granted", None))
+        .unwrap();
+    // Withdrawal without a method is accepted; history has no method.
+    let withdrawn = store
+        .app_record_update("ctx-1", "c1", 1, &with_consent("denied", None), None)
+        .unwrap();
+    let history = withdrawn["record"]["consent_history"].as_array().unwrap();
+    assert_eq!(history.last().unwrap()["state"], "denied");
+    assert!(history.last().unwrap().get("method").is_none());
+    // Provenance on an update that changes no consent is refused: no
+    // orphan provenance rows.
+    let orphan = store
+        .app_record_update(
+            "ctx-1",
+            "c1",
+            2,
+            &with_consent("denied", None),
+            Some(&provenance(json!({"method": "written"}))),
+        )
+        .unwrap_err();
+    assert!(
+        orphan.to_string().contains("needs a consent change"),
+        "{orphan}"
+    );
+    // A non-consent edit without provenance still works.
+    store
+        .app_record_update("ctx-1", "c1", 2, &with_consent("denied", None), None)
+        .unwrap();
+}
+
+#[test]
+fn cad1053_provenance_shape_is_bounded_and_never_echoed() {
+    for bad in [
+        json!({"method": "telepathy"}),
+        json!({}),
+        json!({"method": "written", "note": "x".repeat(281)}),
+        json!({"method": "written", "note": "line\u{0007}bell"}),
+        json!({"method": "written", "note": 7}),
+        json!({"method": "written", "actor": "operator"}),
+        json!("in_person"),
+    ] {
+        let error = ConsentProvenance::parse(&bad).unwrap_err().to_string();
+        assert!(
+            !error.contains("telepathy") && !error.contains("xxxx"),
+            "{error}"
+        );
+    }
+    assert!(
+        ConsentProvenance::parse(&json!({"method": "web_form", "note": "x".repeat(280)})).is_ok()
+    );
+}
+
+#[test]
+fn cad1053_csv_update_that_grants_records_the_imported_method() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    store
+        .app_record_create("ctx-1", "c1", &with_consent("unknown", None))
+        .unwrap();
+    let csv = "record_id,display_name,email,consent_email\nc1,Amina,amina@example.com,granted\n";
+    let preview = store.app_record_csv_preview("ctx-1", csv).unwrap();
+    let token = preview["preview_token"].as_str().unwrap();
+    let imported = store
+        .app_record_csv_import(
+            "ctx-1",
+            csv,
+            token,
+            "req-1",
+            Some(vec![CsvDecision {
+                row: 1,
+                action: CsvAction::Update,
+                expected_revision: Some(1),
+            }]),
+            None,
+        )
+        .unwrap();
+    assert_eq!(imported["summary"]["applied"], 1, "{imported}");
+    let shown = store.app_record_show("ctx-1", "c1").unwrap();
+    let last = shown["record"]["consent_history"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(last["state"], "granted");
+    assert_eq!(last["method"], "imported");
 }

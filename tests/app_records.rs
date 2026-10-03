@@ -927,3 +927,71 @@ fn cad753_cli_record_namespace_roundtrip() {
     );
     assert!(!stale.status.success(), "stale CLI write was accepted");
 }
+
+#[test]
+fn cad1053_rpc_consent_grant_provenance_and_agent_refusal() {
+    let w = Records::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-1");
+    let context_id = context["id"].as_str().unwrap();
+    w.create(
+        install,
+        context_id,
+        "customer-1",
+        Records::profile(PROFILE_B),
+    );
+    let before = w.show(install, context_id, "customer-1");
+    let update = |provenance: Value| {
+        let mut params = json!({"install_id": install, "context_id": context_id, "record_id": "customer-1", "expected_revision": 1, "profile": Records::profile(PROFILE_A)});
+        if !provenance.is_null() {
+            params["consent_provenance"] = provenance;
+        }
+        params
+    };
+
+    // Operator grant without a method, with a bad method, with an
+    // oversized note, or with a forged field: all refused untouched.
+    for bad in [
+        Value::Null,
+        json!({"method": "telepathy"}),
+        json!({"method": "written", "note": "x".repeat(281)}),
+        json!({"method": "written", "actor": "operator"}),
+    ] {
+        assert!(w
+            .daemon
+            .operator_rpc("app_record_update", update(bad))
+            .is_err());
+    }
+    assert_eq!(w.show(install, context_id, "customer-1"), before);
+
+    // An agent with a valid method is refused at the operator gate.
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "consent-worker", "claude", None, lane.pid());
+    let frame = lane.rpc(
+        &w.daemon.state,
+        "app_record_update",
+        update(json!({"method": "in_person"})),
+    );
+    assert_eq!(frame["ok"], false, "agent set consent: {frame}");
+    assert!(frame.to_string().contains("operator"), "{frame}");
+    assert_eq!(w.show(install, context_id, "customer-1"), before);
+
+    // The operator with a method succeeds; the receipt carries it.
+    let updated = w
+        .daemon
+        .operator_rpc(
+            "app_record_update",
+            update(json!({"method": "in_person", "note": "Counter signup"})),
+        )
+        .unwrap();
+    let last = updated["record"]["consent_history"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(last["method"], "in_person");
+    assert_eq!(last["note"], "Counter signup");
+    assert_eq!(last["actor"], "operator");
+}
