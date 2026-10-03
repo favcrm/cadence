@@ -1,16 +1,26 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { sessionHeaders } from "../../../lib/sessionKey";
-import { parseMount, ScreenChannel, type AssetLoader } from "./screenLifecycle";
+import { parseMount, ScreenChannel, type AssetLoader, type ScreenActions } from "./screenLifecycle";
+import { type SlotView } from "./screenSlot";
+import ScreenSlotLayer from "./ScreenSlotLayer";
 import type { ScreenPush } from "./screenProtocol";
 
 /** App code lives in its independently installed bundle, never in the board. */
-export default function ScreenOutlet({ projection, fallback, loadAsset }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader }) {
+export default function ScreenOutlet({ projection, fallback, loadAsset, actions }: {
+  projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader;
+  /** The operator's verbs for this frame (HP3); absent for a non-operator, so every `call`/`slot` closes it. */
+  actions?: Pick<ScreenActions, "call" | "planner">;
+}) {
   const container = useRef<HTMLDivElement>(null);
   const channel = useRef<ScreenChannel | null>(null);
   const latest = useRef(projection);
   latest.current = projection;
   const loader = useRef(loadAsset);
   loader.current = loadAsset;
+  const acting = useRef(actions);
+  acting.current = actions;
+  const [slot, setSlot] = useState<SlotView | null>(null);
+  const [link, setLink] = useState<string | null>(null);
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
   const scope = JSON.stringify([projection.install_id, projection.digest, projection.tag, projection.context_id]);
   useLayoutEffect(() => {
@@ -19,6 +29,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset }: { proj
     let owned: ScreenChannel | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
     setState("loading");
+    setSlot(null); setLink(null);
     const fail = () => { if (!retired) setState("fallback"); };
     const onMessage = (event: MessageEvent) => owned?.receive(event);
     window.addEventListener("message", onMessage);
@@ -45,7 +56,13 @@ export default function ScreenOutlet({ projection, fallback, loadAsset }: { proj
         if (!frame.contentWindow) throw new Error("Screen frame unavailable");
         owned = new ScreenChannel(frame.contentWindow, receipt, latest.current,
           () => frame.remove(), fail, () => { if (!retired) { clearTimeout(timer); setState("ready"); } },
-          ref => loader.current ? loader.current(ref) : Promise.resolve(null));
+          ref => loader.current ? loader.current(ref) : Promise.resolve(null),
+          acting.current ? {
+            call: (verb, args, ui) => acting.current!.call(verb, args, ui),
+            planner: (verb, args) => acting.current!.planner(verb, args),
+            onSlot: view => { if (!retired) setSlot(view); },
+            onLink: url => { if (!retired) setLink(url); },
+          } : undefined);
         channel.current = owned;
         frame.addEventListener("load", () => owned?.load());
         timer = setTimeout(() => { owned?.close(true); }, 10000);
@@ -60,12 +77,17 @@ export default function ScreenOutlet({ projection, fallback, loadAsset }: { proj
       window.removeEventListener("message", onMessage);
       owned?.close();
       channel.current = null;
+      setSlot(null); setLink(null);
       container.current?.replaceChildren();
     };
   }, [scope]);
   useEffect(() => { channel.current?.update(projection); }, [projection]);
   return <>
-    <div ref={container} aria-label="Installed app screen" style={{ flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "fallback" ? "none" : "block" }} />
+    <div aria-label="Installed app screen" style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "fallback" ? "none" : "block" }}>
+      <div ref={container} style={{ position: "absolute", inset: 0 }} />
+      <ScreenSlotLayer view={slot} link={link} onDismissLink={() => setLink(null)}
+        onTap={(token, trusted, at) => { channel.current?.tapSlot(token, trusted, at); }} />
+    </div>
     {state === "loading" && <p role="status">Loading installed app…</p>}
     {state === "fallback" && fallback}
   </>;

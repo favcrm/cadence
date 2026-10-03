@@ -12,7 +12,7 @@ export interface Installation {
   capabilities: Record<string, SlotDeclaration> | null;
   /** Untyped legacy slots from `needs.connections`, kept working as before. */
   connection_slots: string[];
-  workflows?: { name: string; source_digest?: string; inputs: { name: string; default?: string | null; context_default?: boolean }[] }[];
+  workflows?: { name: string; source_digest?: string; label?: string | null; capability_slots?: string[]; distinct?: string[]; inputs: { name: string; default?: string | null; context_default?: boolean }[] }[];
 }
 /** One declared `needs.capabilities` slot: the result the app needs. Reviewed providers own the matching tools. */
 export interface SlotDeclaration {
@@ -131,6 +131,14 @@ export interface CreateRun {
   request_id: string; owner_pm: string; context_id?: string;
   source_receipt_id?: string; selected_post_id?: string;
 }
+/** CAD-1123 HP2: one operator gesture. Owner PM and worker roles come from the install team. */
+export interface StartRun {
+  install_id: string; workflow: string; inputs: Record<string, string>;
+  request_id: string; expected_quotes: Record<string, CapabilityQuote["quote"]>; context_id?: string;
+  source_receipt_id?: string; selected_post_id?: string;
+}
+/** The installation's default team (owner PM and one worker alias per workflow role). */
+export interface InstallTeam { owner_pm: string; roles: Record<string, string>; revision: number }
 export interface WorkspaceOutbox {
   item: {
     effect_id: string; project: null; title: string; published_at: string;
@@ -186,6 +194,9 @@ export const workspaceApps = {
   createBinding: async (id: string, body: BindingCreate) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings`, undefined, body)).binding,
   updateBinding: async (id: string, bindingId: string, body: { expected_revision: number; connection_id: string }) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings/${part(bindingId)}/update`, undefined, body)).binding,
   createRun: (body: CreateRun) => request<WorkspaceRun>("/api/app-runs", undefined, body),
+  startRun: (body: StartRun) => request<WorkspaceRun>("/api/app-runs/start", undefined, body),
+  team: async (id: string, signal?: AbortSignal) => (await request<{ team: InstallTeam | null }>(`${installation(id)}/team`, signal)).team,
+  setTeam: async (id: string, body: { owner_pm: string; roles: Record<string, string>; expected_revision: number }) => (await request<{ team: InstallTeam }>(`${installation(id)}/team`, undefined, body)).team,
   approveRun: (id: string, digest: string) => request<WorkspaceRun>(`${run(id)}/approve`, undefined, { digest }),
   dispatchRun: (id: string) => request<WorkspaceRun>(`${run(id)}/dispatch`, undefined, {}),
   capabilityResults: async (id: string, signal?: AbortSignal) => (await request<{ results: SourceReceipt[] }>(`${run(id)}/capability-results`, signal)).results,

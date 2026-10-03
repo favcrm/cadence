@@ -371,6 +371,39 @@ mod tests {
     }
 
     #[test]
+    fn start_and_team_routes_are_exact_and_start_is_write_only() {
+        assert!(matches!(route("/api/app-runs/start"), Some(Route::Start)));
+        assert!(!route("/api/app-runs/start").unwrap().is_read());
+        assert!(matches!(
+            route("/api/app-installations/install-a/team"),
+            Some(Route::Team("install-a"))
+        ));
+        for path in [
+            "/api/app-runs/start/x",
+            "/api/app-installations/install-a/team/x",
+            "/api/app-installations//team",
+        ] {
+            assert!(route(path).is_none(), "route admitted {path}");
+        }
+        // The frame-facing request carries no owner, project or role fields.
+        for body in [
+            r#"{"install_id":"i","workflow":"w","inputs":{},"request_id":"r","expected_quotes":{},"owner_pm":"p"}"#,
+            r#"{"install_id":"i","workflow":"w","inputs":{},"request_id":"r","expected_quotes":{},"project_link":"x"}"#,
+            r#"{"install_id":"i","workflow":"w","inputs":{},"request_id":"r"}"#,
+        ] {
+            assert!(serde_json::from_str::<Start>(body).is_err(), "{body}");
+        }
+        assert!(serde_json::from_str::<Start>(
+            r#"{"install_id":"i","workflow":"w","inputs":{},"request_id":"r","expected_quotes":{}}"#
+        )
+        .is_ok());
+        assert!(serde_json::from_str::<TeamSet>(
+            r#"{"owner_pm":"p","roles":{},"expected_revision":0,"install_id":"other"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn request_schema_rejects_duplicate_and_identity_fields() {
         assert!(serde_json::from_str::<Decision>(r#"{"digest":"a","digest":"b"}"#).is_err());
         assert!(serde_json::from_str::<Decision>(r#"{"digest":"a","operator":true}"#).is_err());

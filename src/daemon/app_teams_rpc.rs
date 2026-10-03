@@ -59,7 +59,9 @@ pub(super) fn team_of(state: &Path, install: &str) -> Result<Option<Team>> {
 fn view(team: Option<&Team>) -> Value {
     match team {
         None => json!({"team": null}),
-        Some(t) => json!({"team": {"owner_pm": t.owner_pm, "roles": t.roles, "revision": t.revision}}),
+        Some(t) => {
+            json!({"team": {"owner_pm": t.owner_pm, "roles": t.roles, "revision": t.revision}})
+        }
     }
 }
 

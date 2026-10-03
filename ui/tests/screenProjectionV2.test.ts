@@ -104,7 +104,7 @@ const receipt: SourceReceipt = { id: `${SECRET}-receipt-id`, run_id: "run-read",
         media_kind: "carousel", preview_url: "https://evil.example/two.jpg" }] } };
 const extras = (over: Partial<ScreenExtras> = {}): ScreenExtras => ({
   installId: "inst-1", contextId: "ctx-a", bindings: [binding("source", "ctx-a"), binding("image", "ctx-a"), binding("image", "ctx-b")],
-  workers: 2, quotes: { source: quote(10000), image: quote(60000), publication: quote(1) },
+  workers: 2,
   source: { runId: "run-read", receipts: [receipt] }, texts: new Map([["art-1", "我哋今日開咗新酒。" + "y".repeat(800)]]),
   ...over });
 const project = (ext: ScreenExtras | undefined = extras()) =>
@@ -147,10 +147,10 @@ void (async () => {
   check(ip.v === 1 && !("sources" in ip) && !("actions" in ip) && ip.runs.every(r => !("phase" in r) && !("created" in r) && keys(r.workflow) === "title") &&
     ip.publish_intents!.rows.every(r => !("refusal" in r) && !("permalink" in r)), "a publish-intents.v1 child keeps its exact shape");
 
-  // 2. A v2 child receives phase, caption excerpt, refusal, permalink, defaults and prices.
+  // 2. A v2 child receives phase, caption excerpt, refusal, permalink and defaults (no price).
   const v2 = mount(full); v2.port.receive({ v: 1, op: "ready", accepts: ["screen.v2"] });
   const p = v2.port.sent[0] as ScreenPush;
-  check(p.v === 2 && Array.isArray(p.actions) && p.actions.length === 0 && !!p.publish_intents, "v2 envelope: v 2, intents kept, no actions yet");
+  check(p.v === 2 && p.actions!.join() === "read.run,context.defaults.save,open-link,run.start" && !!p.publish_intents, "v2 envelope: v 2, intents kept, the closed verb list for an operator view");
   const byId = new Map(p.runs.map(r => [r.id, r]));
   check(byId.get("run-ready")!.phase === "ready" && byId.get("run-writing")!.phase === "working:produce_text" &&
     byId.get("run-checking")!.phase === "checking" && byId.get("run-failed")!.phase === "failed", "phase from real step receipts");
@@ -160,8 +160,8 @@ void (async () => {
   check(!("caption_excerpt" in byId.get("run-writing")!), "no excerpt before a review approves the text");
   check(ready.workflow.name === "draft" && ready.workflow.kind === "draft" && byId.get("run-read")!.workflow.kind === "read",
     "workflow name from the installed digest, kind from declared slot effects");
-  check(keys(ready.price!.image) === "amount,currency" && ready.price!.image.amount === "0.06" && ready.price!.image.currency === "USD",
-    "run price from frozen quotes, as a decimal string");
+  check(!("price" in ready) && !("prices" in p) && !/"(price|prices|amount|currency|total_price_micros|unit_price_micros|price_revision)"/.test(JSON.stringify(p)),
+    "no cost or price is pushed to the frame (CAD-1129 #8)");
   check(ready.created === 1_790_000_000 && ready.closed === 1_790_000_100 && !("closed" in byId.get("run-writing")!), "run epochs");
   check(ready.approved!.by_display === "Operator" && ready.approved!.at === 1_790_000_010 && !("approved" in byId.get("run-writing")!),
     "approval display and time from the recorded approval");
@@ -191,8 +191,6 @@ void (async () => {
     p.defaults!.values.image_prompt === "One photo." && keys(p.defaults!) === "context_id,revision,values" &&
     keys(p.defaults!.values) === "content_prompt,image_prompt",
     "defaults: context value over app default, context_default keys only");
-  check(keys(p.prices!) === "image,source" && p.prices!.source.amount === "0.01" && p.prices!.source.currency === "USD",
-    "prices for bound read and draft slots only");
   check(p.sources!.handle === "sakeboyhk" && p.sources!.run_id === "run-read" &&
     p.sources!.fetched_at === 1_790_000_500 && p.sources!.posts.length === 2, "sources from the newest read run");
   const [post1, post2, post3] = p.sources!.posts;
@@ -208,7 +206,7 @@ void (async () => {
   check(p.contexts.map(c => c.id).join() === "ctx-a,ctx-b" && p.context_id === "ctx-a", "contexts list is labels only");
   const foreignExtras = screenProjection(installation, "main", "ctx-a", [context], runs, effects, intents,
     extras({ contextId: "ctx-b" }));
-  check(!("sources" in foreignExtras) && keys(foreignExtras.prices!) === "" &&
+  check(!("sources" in foreignExtras) && foreignExtras.actions!.length === 0 &&
     foreignExtras.runs.every(r => !("caption_excerpt" in r)), "board reads tagged for another context are never pushed");
   check(!("sources" in screenProjection(installation, "main", "ctx-a", [context], runs, effects, intents, extras({ installId: "inst-2" }))),
     "board reads tagged for another install are never pushed");

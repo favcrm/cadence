@@ -38,7 +38,9 @@ impl Fx {
 fn start_needs_a_team_then_creates_approves_and_dispatches_once() {
     let fx = Fx::new();
     fx.start_team();
-    assert!(refusal(fx.operator("app_run_start", fx.start_params("s1"))).contains("no default team"));
+    assert!(
+        refusal(fx.operator("app_run_start", fx.start_params("s1"))).contains("no default team")
+    );
     fx.set_team().unwrap();
     let run = fx.operator("app_run_start", fx.start_params("s1")).unwrap();
     assert_eq!(run["state"], "running", "{run}");
@@ -80,7 +82,11 @@ fn start_refuses_forged_roles_owner_quotes_and_extra_fields() {
     let listed = fx
         .operator("app_run_list", json!({"install_id": fx.install}))
         .unwrap();
-    assert_eq!(listed["runs"].as_array().map_or(0, Vec::len), 0, "nothing was created");
+    assert_eq!(
+        listed["runs"].as_array().map_or(0, Vec::len),
+        0,
+        "nothing was created"
+    );
 }
 
 #[test]
@@ -106,7 +112,10 @@ fn start_and_team_are_operator_only() {
                 .map_err(|e| e)
                 .expect_err(&format!("{who:?} {method} was admitted"))
                 .to_string();
-            assert!(error.contains("operator") || error.contains("unproven"), "{who:?} {method}: {error}");
+            assert!(
+                error.contains("operator") || error.contains("unproven"),
+                "{who:?} {method}: {error}"
+            );
         }
     }
     // Stale team revision loses the compare-and-swap.

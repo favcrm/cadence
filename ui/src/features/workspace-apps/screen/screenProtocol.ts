@@ -50,7 +50,37 @@ export interface ScreenInit {
 export type ChildToHost =
   | { v: 1; op: "ready"; accepts?: Accept[] | [typeof CHAT_DIRECTIVE_V1] }
   | { v: 1; op: "state"; data: string }
-  | { v: 2; op: "asset"; ref: string };
+  | { v: 2; op: "asset"; ref: string }
+  | CallRequest
+  | SlotRequest;
+
+/** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
+ *  port. `call` verbs never spend or publish; every spend or publish verb is a
+ *  `slot` verb and waits for a tap on a host-drawn button. The `publish.*` slot
+ *  verbs arrive with HP4: add them here and in the host's dispatch table. */
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link"] as const;
+export const SLOT_VERBS = ["run.start"] as const;
+export type CallVerb = (typeof CALL_VERBS)[number];
+export type SlotVerb = (typeof SLOT_VERBS)[number];
+/** The verbs a screen.v2 PUSH advertises in `actions`. */
+export const ACTION_VERBS: string[] = [...CALL_VERBS, ...SLOT_VERBS];
+export const ACTION_ID = /^[A-Za-z0-9_-]{1,64}$/;
+export const ACTION_ARGS_BYTES = 16 * 1024;
+/** Where the frame asks the host to draw its button: a rectangle in the
+ *  frame's own viewport (host clamps it to the frame), or the host footer bar. */
+export type SlotAnchor = { x: number; y: number; w: number; h: number } | "footer";
+export type ActionArgs = Record<string, unknown>;
+export interface CallRequest { v: 2; op: "call"; id: string; verb: CallVerb; args: ActionArgs }
+export interface SlotRequest { v: 2; op: "slot"; id: string; verb: SlotVerb; args: ActionArgs; anchor: SlotAnchor }
+/** A refusal a person can read: a short code and one plain line (no price,
+ *  no daemon detail). */
+export interface ActionRefusal { code: string; text: string }
+export type ActionResult = { ok: true; data: unknown } | { ok: false; refusal: ActionRefusal };
+export type SlotStateName = "pending" | "done" | "refused";
+export type ReplyMessage =
+  | { v: 2; op: "reply"; id: string; ok: true; data: unknown }
+  | { v: 2; op: "reply"; id: string; ok: false; refusal: ActionRefusal }
+  | { v: 2; op: "slot-state"; id: string; state: SlotStateName; refusal?: ActionRefusal };
 
 /** CAD-1123 HP1 — the generic read projection v2. A child opts in with
  *  `{v:1, op:"ready", accepts:["screen.v2"]}` (it may also list
@@ -142,8 +172,6 @@ export interface ScreenRunV2 {
   caption_excerpt?: string;
   artifact_id?: string;
   review?: { decision: string; rationale: string };
-  /** Frozen quotes by slot. */
-  price?: Record<string, ScreenPrice>;
   approved?: { by_display: string; at: number };
   source_post_id?: string;
   refusal?: ScreenRefusal;
@@ -151,8 +179,6 @@ export interface ScreenRunV2 {
    *  the only thing a child may request over the asset channel. */
   image_ref?: string;
 }
-/** A price as a decimal string in an ISO-4217 currency, e.g. "0.06" USD. */
-export interface ScreenPrice { amount: string; currency: string }
 export interface ScreenSourcePost {
   id: string; caption: string; published_at: number; permalink: string;
   media_kind: string;
@@ -239,11 +265,9 @@ export interface ScreenPush {
   sources?: ScreenSources;
   /** screen.v2 only: effective `context_default` values for this scope. */
   defaults?: ScreenDefaults;
-  /** screen.v2 only: current quotes for the bound read and draft slots. */
-  prices?: Record<string, ScreenPrice>;
   /** screen.v2 only: plain blocker codes; `ok` when there are none. */
   readiness?: { ok: boolean; blockers: string[] };
-  /** screen.v2 only: verbs this host lets the frame use; none in H1. */
+  /** screen.v2 only: verbs this host lets this viewer's frame use (none for a non-operator). */
   actions?: string[];
   /** Server epoch seconds for day-row alignment. */
   now: number;
@@ -251,7 +275,7 @@ export interface ScreenPush {
   resume?: string;
 }
 
-export type HostToChild = ScreenPush | AssetReply;
+export type HostToChild = ScreenPush | AssetReply | ReplyMessage;
 
 /** Parse a window message into a `ScreenInit`, or `null`. The port is a
  *  `MessagePort` in `event.ports[0]` — the caller checks `event.origin`
@@ -280,6 +304,26 @@ export function parseInit(data: unknown): ScreenInit | null {
   return null;
 }
 
+/** A plain-object argument bag within its byte bound (JSON-only: no function, undefined or cycle). */
+function actionArgs(value: unknown): ActionArgs | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  try {
+    const text = JSON.stringify(value);
+    return text !== undefined && new TextEncoder().encode(text).byteLength <= ACTION_ARGS_BYTES ? value as ActionArgs : null;
+  } catch { return null; }
+}
+const COORD_MAX = 16384;
+function slotAnchor(value: unknown): SlotAnchor | null {
+  if (value === "footer") return "footer";
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const a = value as Record<string, unknown>;
+  if (Object.keys(a).sort().join() !== "h,w,x,y") return null;
+  const [x, y, w, h] = [a.x, a.y, a.w, a.h];
+  if (![x, y, w, h].every(n => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= COORD_MAX) ||
+      (w as number) <= 0 || (h as number) <= 0) return null;
+  return { x: x as number, y: y as number, w: w as number, h: h as number };
+}
+
 /** Parse a port message into a `ChildToHost`, or `null` (caller closes
  *  the port). `state.data` is bounded at ≤ 32 KiB here so a hostile or
  *  buggy child cannot push an unbounded snapshot. */
@@ -301,6 +345,19 @@ export function parseChild(data: unknown): ChildToHost | null {
       typeof d.ref === "string" && ASSET_REF.test(d.ref)) {
     return { v: 2, op: "asset", ref: d.ref };
   }
+  if (d.v === 2 && d.op === "call" && Object.keys(d).sort().join() === "args,id,op,v,verb") {
+    const args = actionArgs(d.args);
+    if (typeof d.id === "string" && ACTION_ID.test(d.id) && (CALL_VERBS as readonly unknown[]).includes(d.verb) && args)
+      return { v: 2, op: "call", id: d.id, verb: d.verb as CallVerb, args };
+    return null;
+  }
+  if (d.v === 2 && d.op === "slot" && Object.keys(d).sort().join() === "anchor,args,id,op,v,verb") {
+    const args = actionArgs(d.args);
+    const anchor = slotAnchor(d.anchor);
+    if (typeof d.id === "string" && ACTION_ID.test(d.id) && (SLOT_VERBS as readonly unknown[]).includes(d.verb) && args && anchor)
+      return { v: 2, op: "slot", id: d.id, verb: d.verb as SlotVerb, args, anchor };
+    return null;
+  }
   if (
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
     Array.isArray(d.accepts) && d.accepts.length === 1 && d.accepts[0] === CHAT_DIRECTIVE_V1
@@ -320,9 +377,9 @@ export function parseChild(data: unknown): ChildToHost | null {
   return null;
 }
 
-const V2_TOP = ["sources", "defaults", "prices", "readiness", "actions"] as const;
+const V2_TOP = ["sources", "defaults", "readiness", "actions"] as const;
 const V2_RUN = ["created", "closed", "phase", "steps", "inputs_used", "caption_excerpt", "artifact_id",
-  "review", "price", "approved", "source_post_id", "refusal", "image_ref"] as const;
+  "review", "approved", "source_post_id", "refusal", "image_ref"] as const;
 /** The publish-intents.v1 shape: every screen.v2 field is removed. */
 export function intentsPush(push: ScreenPush): ScreenPush {
   const top: Record<string, unknown> = { ...push, v: 1 };
