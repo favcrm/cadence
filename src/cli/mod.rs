@@ -45,6 +45,7 @@ mod overview;
 mod plan;
 mod platform;
 mod project;
+mod remote;
 mod remote_result;
 mod report;
 mod restore;
@@ -143,6 +144,10 @@ pub(crate) struct Cli {
     /// managed caller (`CADENCE_ALIAS`) cannot use it.
     #[arg(long, global = true, value_name = "ORG")]
     org: Option<String>,
+    /// Seconds a remote command waits while its org's container wakes
+    /// (CAD-1019 slice 2). Only used when the selected org is remote.
+    #[arg(long, global = true, default_value_t = cadence_agent::remote_cli::WAKE_TIMEOUT_DEFAULT)]
+    wake_timeout: u64,
     #[command(subcommand)]
     command: Commands,
 }

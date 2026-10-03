@@ -101,6 +101,16 @@ impl Error {
             revision: None,
         })
     }
+    /// Resource contention with a stable code — still `busy` (75).
+    /// `waking` names the remote-org wake budget specifically.
+    pub fn busy_coded(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Structured(Structured {
+            kind: "busy",
+            code: code.to_string(),
+            message: message.into(),
+            revision: None,
+        })
+    }
     /// A standing refusal with a stable code: no retry helps until an
     /// operator clears the reason (exit 4, never the retryable `busy`).
     pub fn gate_coded(code: &'static str, message: impl Into<String>) -> Self {
