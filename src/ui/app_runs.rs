@@ -19,6 +19,8 @@ pub(super) enum Route<'a> {
     Artifact(&'a str),
     CapabilityResults(&'a str),
     CapabilityResult(&'a str),
+    /// CAD-1123: the retained image bytes of one receipt (operator read).
+    CapabilityAsset(&'a str),
     InstallDecision(&'a str, bool),
     RunDecision(&'a str),
     Cancel(&'a str),
@@ -38,8 +40,11 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     if let Some(id) = path.strip_prefix("/api/app-run-artifacts/") {
         return segment(id).then_some(Route::Artifact(id));
     }
-    if let Some(id) = path.strip_prefix("/api/app-capability-results/") {
-        return segment(id).then_some(Route::CapabilityResult(id));
+    if let Some(tail) = path.strip_prefix("/api/app-capability-results/") {
+        if let Some(id) = tail.strip_suffix("/asset") {
+            return segment(id).then_some(Route::CapabilityAsset(id));
+        }
+        return segment(tail).then_some(Route::CapabilityResult(tail));
     }
     if let Some(tail) = path.strip_prefix("/api/app-runs/") {
         if let Some((id, verb)) = tail.split_once('/') {
@@ -76,6 +81,7 @@ impl Route<'_> {
                 | Self::Artifact(_)
                 | Self::CapabilityResults(_)
                 | Self::CapabilityResult(_)
+                | Self::CapabilityAsset(_)
         )
     }
 }
@@ -170,6 +176,7 @@ pub(super) fn handle(
         Route::Artifact(id) => ("app_run_artifact", json!({"artifact_id":id})),
         Route::CapabilityResults(id) => ("app_run_capability_results", json!({"run_id":id})),
         Route::CapabilityResult(id) => ("app_run_capability_result", json!({"receipt_id":id})),
+        Route::CapabilityAsset(id) => ("app_run_capability_asset", json!({"receipt_id":id})),
         Route::Create => {
             let bytes = match read_body(request, BODY_CAP) {
                 Ok(bytes) => bytes,
@@ -275,6 +282,11 @@ mod tests {
             Some(Route::CapabilityResult("receipt-a"))
         ));
         assert!(matches!(
+            route("/api/app-capability-results/receipt-a/asset"),
+            Some(Route::CapabilityAsset("receipt-a"))
+        ));
+        assert!(route("/api/app-capability-results/receipt-a/asset").is_some_and(|r| r.is_read()));
+        assert!(matches!(
             route("/api/app-installations/install-a/approve"),
             Some(Route::InstallDecision("install-a", true))
         ));
@@ -285,7 +297,10 @@ mod tests {
             "/api/app-run-artifacts/a/b",
             "/api/app-runs/",
             "/api/app-runs/run-a/capability-results/other",
-            "/api/app-capability-results/receipt-a/asset",
+            "/api/app-capability-results/receipt-a/asset/x",
+            "/api/app-capability-results/a/b/asset",
+            "/api/app-capability-results//asset",
+            "/api/app-capability-results/../asset",
         ] {
             assert!(route(path).is_none(), "route admitted {path}");
         }

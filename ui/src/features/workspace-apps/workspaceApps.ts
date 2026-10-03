@@ -12,7 +12,7 @@ export interface Installation {
   capabilities: Record<string, SlotDeclaration> | null;
   /** Untyped legacy slots from `needs.connections`, kept working as before. */
   connection_slots: string[];
-  workflows?: { name: string; inputs: { name: string; default?: string | null }[] }[];
+  workflows?: { name: string; source_digest?: string; inputs: { name: string; default?: string | null; context_default?: boolean }[] }[];
 }
 /** One declared `needs.capabilities` slot: the result the app needs. Reviewed providers own the matching tools. */
 export interface SlotDeclaration {
@@ -64,7 +64,7 @@ export interface WorkspaceRun {
   id: string; install_id: string; context_id: string | null; state: string;
   snapshot_digest: string; approved_digest: string | null;
   snapshot: {
-    workflow: { title: string; steps: { id: string; kind: string; assignee: string; dependencies: string[]; instruction: string }[]; publication_slot?: string | null }; inputs: Record<string, string>; owner_pm: string;
+    workflow: { title: string; source_digest?: string; steps: { id: string; kind: string; assignee: string; dependencies: string[]; instruction: string }[]; publication_slot?: string | null }; inputs: Record<string, string>; owner_pm: string;
     context?: { id: string; revision: number; digest: string } | null;
     publication?: { slot: string; binding: { id: string; revision: number; digest: string } | null };
     capabilities?: Record<string, { id: string; revision: number; digest: string }>;
@@ -74,6 +74,10 @@ export interface WorkspaceRun {
     input_origins?: Record<string, "app_default" | "context_default" | "run_override">;
   };
   steps: { step_id: string; task_id: string; state: string; message_id: string | null }[];
+  /** Run epochs in seconds (CAD-1123). */
+  created?: number; updated?: number;
+  /** The recorded execution approval, when there is one (CAD-1123 R4). */
+  approval?: { by: string; at: number };
   artifacts: ArtifactReceipt[];
   reviews: { step_id: string; artifact_digest: string; reviewer: string; decision: string; rationale: string; asset_receipt_id?: string; asset_digest?: string }[];
 }

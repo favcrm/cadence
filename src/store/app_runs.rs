@@ -11,6 +11,9 @@ use std::collections::BTreeMap;
 pub const ARTIFACT_BYTES: usize = 256 * 1024;
 pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
 
+/// CAD-1123 R4: the stream that keeps each app run's approval record.
+/// Not an agent alias and not the pruned daemon stream, so it survives.
+pub const APP_RUN_APPROVAL_STREAM: &str = "app-run-approvals";
 pub fn artifact_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
@@ -649,6 +652,28 @@ impl Store {
             [id],
             |r| r.get::<_, Option<String>>(0)
         )?);
+        let (created, updated): (f64, f64) = conn.query_row(
+            "SELECT created,updated FROM app_runs WHERE id=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        value["created"] = json!(created as i64);
+        value["updated"] = json!(updated as i64);
+        // CAD-1123 R4: the latest approval of this run, when recorded.
+        if let Some((payload, at)) = conn
+            .query_row(
+                "SELECT payload,at FROM events WHERE job_id=?1 AND alias=?2 AND kind='app_run_approved' ORDER BY seq DESC LIMIT 1",
+                params![id, APP_RUN_APPROVAL_STREAM],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)),
+            )
+            .optional()?
+        {
+            let by = serde_json::from_str::<Value>(&payload)
+                .ok()
+                .and_then(|v| v["by"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "operator".into());
+            value["approval"] = json!({"by": by, "at": at as i64});
+        }
         value["steps"]=Value::Array(conn.query_vec("SELECT step_id,task_id,state,message_id FROM app_run_steps WHERE run_id=? ORDER BY step_id",[id],|r|Ok(json!({"step_id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"message_id":r.get::<_,Option<String>>(3)?})))?);
         value["artifacts"]=Value::Array(conn.query_vec("SELECT id,step_id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? ORDER BY step_id",[id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"step_id":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"media_type":r.get::<_,String>(3)?,"size":r.get::<_,i64>(4)?})))?);
         value["reviews"]=Value::Array(conn.query_vec("SELECT step_id,artifact_digest,reviewer,decision,rationale,asset_receipt_id,asset_digest FROM app_run_reviews WHERE run_id=?",[id],|r|{
@@ -725,6 +750,17 @@ impl Store {
                             })?,
                         )?;
                         tx.execute("UPDATE app_runs SET state='approved',approved_digest=snapshot_digest,updated=? WHERE id=?",params![now(),id])?;
+                        // CAD-1123 R4: a durable, run-indexed approval record on its
+                        // own stream (the daemon stream is pruned). The actor is the
+                        // daemon-derived class, never a caller-supplied name.
+                        Self::event_scoped(
+                            &tx,
+                            APP_RUN_APPROVAL_STREAM,
+                            "app_run_approved",
+                            json!({"run_id":id,"digest":run["snapshot_digest"],"by":"operator"}),
+                            Some(id),
+                            None,
+                        )?;
                     }
                     Self::event(
                         &tx,

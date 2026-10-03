@@ -185,16 +185,39 @@ pub(super) fn frame(
     resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
     resp.add_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap());
     resp.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
-    let csp = format!(
-        "default-src 'none'; script-src 'nonce-{csp}'; style-src 'unsafe-inline'; \
-         img-src data:; font-src data:; connect-src 'none'; media-src 'none'; \
-         object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; \
-         form-action 'none'; frame-ancestors {origin}",
-        csp = csp_nonce,
-        origin = origin_str,
-    );
+    let remote_images: Vec<String> = out["remote_images"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    let csp = frame_csp(&csp_nonce, &origin_str, &remote_images);
     resp.add_header(Header::from_bytes("Content-Security-Policy", csp).unwrap());
     resp
+}
+
+/// The frame document's CSP. `img-src` is `data:` only, plus — for a
+/// screen whose verified declaration opts into a host-listed remote
+/// image set (CAD-1123, operator decision Q1) — exactly that set's
+/// https origins, so the browser loads them straight into the frame.
+/// The daemon never fetches them, and `connect-src` stays `'none'`. A
+/// name the host does not list adds nothing.
+fn frame_csp(csp_nonce: &str, origin: &str, remote_images: &[String]) -> String {
+    let mut img_src = String::from("data:");
+    for name in remote_images {
+        for host in crate::issue::app_screen_decl::remote_image_sources(name).unwrap_or(&[]) {
+            if !img_src.split(' ').any(|have| have == *host) {
+                img_src.push(' ');
+                img_src.push_str(host);
+            }
+        }
+    }
+    format!(
+        "default-src 'none'; script-src 'nonce-{csp_nonce}'; style-src 'unsafe-inline'; \
+         img-src {img_src}; font-src data:; connect-src 'none'; media-src 'none'; \
+         object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; \
+         form-action 'none'; frame-ancestors {origin}"
+    )
 }
 
 /// The board's own origin for `frame-ancestors` and the child's
@@ -331,5 +354,31 @@ mod tests {
             origin_for(None, &plain),
             format!("http://{}", operator::board_host(8080))
         );
+    }
+
+    #[test]
+    fn cad1123_csp_admits_instagram_cdn_only_for_a_declaring_screen() {
+        let base = frame_csp("n", "http://h", &[]);
+        assert!(base.contains("img-src data:;"), "{base}");
+        assert!(!base.contains("cdninstagram") && !base.contains("fbcdn"));
+        let declared = frame_csp("n", "http://h", &["instagram-cdn".to_string()]);
+        assert!(
+            declared.contains("img-src data: https://*.cdninstagram.com https://*.fbcdn.net;"),
+            "{declared}"
+        );
+        // Everything else stays closed: no fetch/XHR egress, no frames.
+        assert!(declared.contains("connect-src 'none'") && declared.contains("frame-src 'none'"));
+        // A name the host does not list, or a raw host, adds nothing.
+        for forged in ["https://evil.example", "*", "instagram-cdn ", "cdn"] {
+            let csp = frame_csp("n", "http://h", &[forged.to_string()]);
+            assert_eq!(csp, base, "unlisted image set widened the CSP: {forged}");
+        }
+        // A repeated declaration does not repeat hosts.
+        let twice = frame_csp(
+            "n",
+            "http://h",
+            &["instagram-cdn".to_string(), "instagram-cdn".to_string()],
+        );
+        assert_eq!(twice, declared);
     }
 }

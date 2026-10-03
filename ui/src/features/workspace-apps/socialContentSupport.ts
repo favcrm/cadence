@@ -11,6 +11,9 @@ const socialContentWorkflows = new Map<string, readonly string[]>([
   // workflows byte-identical; 0.5.2 is live and 0.5.3 is next.
   ["0.5.2", fiveWorkflows],
   ["0.5.3", fiveWorkflows],
+  // CAD-1123 (operator decision Q4): the interim simple-UX package keeps the
+  // same five workflows and the `?screen=native` back door until H4.
+  ["0.5.4", fiveWorkflows],
 ]);
 
 export function supportsSocialContentWorkspace(installation: Pick<Installation, "name" | "version" | "files">): boolean {

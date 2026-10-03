@@ -365,6 +365,7 @@ impl Shared {
             "bridge_nonce": cap.bridge_nonce,
             "manifest": pkg.manifest,
             "assets": pkg.assets,
+            "remote_images": pkg.remote_images,
         }))
     }
 
@@ -412,6 +413,24 @@ impl Shared {
     }
 }
 
+/// CAD-1123 HP1: the host UI kit every frame document carries — the
+/// board's generated tokens (`design/tokens.css`, kept in step with
+/// `ui/src/styles.css` by `scripts/design-kit --check`), the design kit's
+/// component classes (`design/kit.css`: `.btn`, `.chip`, `.field`,
+/// `.card`, `.tabs`, `.scrim`, `.toast`, …) and the frame additions
+/// (`.drawer`, `.seg`, `.sheet`). Packages use it instead of vendoring
+/// host CSS; its version is stamped on `<html data-cadence-kit>` and in
+/// the `#cadence-screen-kit` JSON block.
+pub const SCREEN_KIT_CSS: &str = concat!(
+    include_str!("../../design/tokens.css"),
+    "\n",
+    include_str!("../../design/kit.css"),
+    "\n",
+    include_str!("screen_kit.css"),
+);
+/// The kit contract version a package can feature-detect.
+pub const SCREEN_KIT_VERSION: &str = "cadence-kit/1";
+
 /// Rendered-frame HTML: the static wrapper document carrying the CSP
 /// nonce, the bootstrap JSON block, the approved CSS and the approved
 /// IIFE — every byte host-verified so the package's own text can never
@@ -444,18 +463,26 @@ pub fn render_frame_html(
     })
     .to_string();
     let boot = escape_json_script(&boot);
+    // The kit version lives in its own block: the CAD-1006 boot block is
+    // a closed shape that shipped packages validate key by key.
+    let kit_boot = escape_json_script(&json!({ "kit": SCREEN_KIT_VERSION }).to_string());
     let js = check_script_text(js)?;
     let css = check_style_text(css)?;
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\">\
+        "<!doctype html><html data-cadence-kit=\"{kit}\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <script nonce=\"{csp}\" type=\"application/json\" id=\"cadence-screen-boot\">{boot}</script>\
+<script nonce=\"{csp}\" type=\"application/json\" id=\"cadence-screen-kit\">{kit_boot}</script>\
+<style id=\"cadence-kit\">{kit_css}</style>\
 <style>{css}</style>\
 </head><body><div id=\"root\"></div>\
 <script nonce=\"{csp}\">{js}</script>\
 </body></html>",
         csp = csp_nonce,
         boot = boot,
+        kit = SCREEN_KIT_VERSION,
+        kit_boot = kit_boot,
+        kit_css = SCREEN_KIT_CSS,
         css = css,
         js = js,
     );
@@ -570,5 +597,51 @@ mod tests {
         assert!(!nonce_ok(&"A".repeat(64)));
         assert!(!nonce_ok(&"g".repeat(64)));
         assert!(!nonce_ok(""));
+    }
+
+    #[test]
+    fn cad1123_frame_document_carries_the_host_kit_without_package_css() {
+        let h =
+            render_frame_html("csp", "main", &"b".repeat(64), 1, "", "x()", "http://h").unwrap();
+        assert!(
+            h.contains("<html data-cadence-kit=\"cadence-kit/1\">"),
+            "{h}"
+        );
+        assert!(h.contains("id=\"cadence-screen-kit\">{\"kit\":\"cadence-kit/1\"}</script>"));
+        // The board's generated tokens and the design kit, verbatim.
+        let kit_start = h.find("<style id=\"cadence-kit\">").unwrap();
+        let kit = &h[kit_start..kit_start + h[kit_start..].find("</style>").unwrap()];
+        assert!(kit.contains(include_str!("../../design/tokens.css")));
+        assert!(kit.contains(include_str!("../../design/kit.css")));
+        for class in [
+            ".btn {",
+            ".field {",
+            ".chip {",
+            ".card {",
+            ".toast {",
+            ".scrim",
+            ".tabs",
+            ".drawer {",
+            ".seg {",
+            ".sheet {",
+        ] {
+            assert!(kit.contains(class), "kit lacks {class}");
+        }
+        for token in [
+            "--color-accent:",
+            "prefers-color-scheme: light",
+            "[data-theme=\"light\"]",
+        ] {
+            assert!(kit.contains(token), "kit lacks {token}");
+        }
+        // The kit precedes the package stylesheet so the package can
+        // override it, and the closed CAD-1006 boot block is unchanged.
+        assert!(kit_start < h.rfind("<style>").unwrap());
+        let boot_start = h.find("cadence-screen-boot\">").unwrap() + "cadence-screen-boot\">".len();
+        let boot_end = boot_start + h[boot_start..].find("</script>").unwrap();
+        let boot: Value = serde_json::from_str(&h[boot_start..boot_end]).unwrap();
+        let mut keys: Vec<_> = boot.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["bridge_nonce", "generation", "parent_origin", "tag"]);
     }
 }

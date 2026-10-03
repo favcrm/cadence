@@ -41,6 +41,7 @@ import { forgetContext, initialContext, rememberedContext, rememberContext } fro
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
 import ScreenHost from "./screen/ScreenHost";
+import { useScreenExtras } from "./screen/useScreenExtras";
 import { screenTag, screenProjection, settleIntentRead, type IntentRead } from "./screen/screenProjection";
 import { socialPublish } from "./socialPublish";
 import { supportsSocialContentWorkspace } from "./socialContentSupport";
@@ -308,6 +309,13 @@ export default function WorkspaceApp({
           agent.endpoint_kind === "managed") ||
         (agent.provider === "fake" && agent.endpoint_kind === "fake")),
   );
+  // CAD-1123 HP1: the board reads behind the screen.v2 projection.
+  const screenExtras = useScreenExtras({
+    enabled: !!screenInstall && screenInstall === installId && !accessDenied && viewer.operator,
+    installation: data?.installation ?? null, installId, contextId,
+    runs: data?.runs ?? [], bindings: data?.bindings ?? [], workers: data ? workers.length : null,
+    onDenied: clearPrivate,
+  });
   const managers = agents.filter(
     (agent) => agent.role === "pm" && !agent.dead && !agent.fenced,
   );
@@ -549,11 +557,11 @@ export default function WorkspaceApp({
   const tag = data && screenTag(data.installation);
   let projection = null;
   if (data && tag && !accessDenied) {
-    try { projection = screenProjection(data.installation, tag, contextId, data.contexts, data.runs, data.effects, intentRead); }
+    try { projection = screenProjection(data.installation, tag, contextId, data.contexts, data.runs, data.effects, intentRead, screenExtras.extras); }
     catch { /* Oversized/unavailable scope retains the existing native outlet. */ }
   }
   const screen = (fallback: React.ReactNode) => projection
-    ? <ScreenHost projection={projection} fallback={fallback} /> : fallback;
+    ? <ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} /> : fallback;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>

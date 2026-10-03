@@ -44,12 +44,41 @@ export interface ScreenInit {
   generation: number;
 }
 
-/** The only two messages the child may ever send over the port. Anything
+/** The only messages the child may ever send over the port. Anything
  *  else closes the port. `state` is the child's opaque draft snapshot
- *  (≤ 32 KiB string), held host-side in memory only. */
+ *  (≤ 32 KiB string), held host-side in memory only; `asset` is screen.v2. */
 export type ChildToHost =
-  | { v: 1; op: "ready"; accepts?: [typeof PUBLISH_INTENTS_V1] | [typeof CHAT_DIRECTIVE_V1] }
-  | { v: 1; op: "state"; data: string };
+  | { v: 1; op: "ready"; accepts?: Accept[] | [typeof CHAT_DIRECTIVE_V1] }
+  | { v: 1; op: "state"; data: string }
+  | { v: 2; op: "asset"; ref: string };
+
+/** CAD-1123 HP1 — the generic read projection v2. A child opts in with
+ *  `{v:1, op:"ready", accepts:["screen.v2"]}` (it may also list
+ *  `publish-intents.v1`, which v2 includes). Its PUSH is the v1 envelope
+ *  with `v: 2`. Only a v2 child may send `{v:2, op:"asset", ref}`, and only
+ *  for an `image_ref` the last PUSH carried. */
+export const SCREEN_V2 = "screen.v2";
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2;
+/** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
+ *  publish-intents.v1, or the v2 projection. */
+export type Shape = "v1" | "intents" | "v2";
+/** A workspace screen's shape for its `ready` opt-in, or `null` for an
+ *  opt-in it cannot honour (the chat-only `chat-directive.v1`). */
+export function shapeOf(accepts: Accept[] | [typeof CHAT_DIRECTIVE_V1] | undefined): Shape | null {
+  if (!accepts) return "v1";
+  if (accepts.some(a => a === CHAT_DIRECTIVE_V1)) return null;
+  return accepts.some(a => a === SCREEN_V2) ? "v2" : "intents";
+}
+/** An asset ref is host-minted (`image:<run id>`), never a receipt id. */
+export const ASSET_REF = /^image:[A-Za-z0-9_-]{1,128}$/;
+/** The host's one reply to an asset request: a downscaled data URL. A ref
+ *  the host cannot load now gets no reply (the frame keeps its placeholder). */
+export type AssetReply = { v: 2; op: "asset"; ref: string; data_url: string };
+/** Each asset reply's data URL is at most this many bytes (96 KiB), of an
+ *  image no larger than 512 px on its longer side. */
+export const ASSET_BYTES_MAX = 96 * 1024;
+export const ASSET_PX_MAX = 512;
+export const ASSET_DATA_URL = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+=*$/;
 
 /** CAD-1025 — the one optional PUSH extension. A child opts in by sending
  *  `{v:1, op:"ready", accepts:["publish-intents.v1"]}`; a child that sends
@@ -89,6 +118,55 @@ export interface ScreenIntent {
   destination_id: string;
   due_epoch: number;
   timezone: string;
+  /** screen.v2 only, omitted when none: why the send was refused or held. */
+  refusal?: ScreenRefusal;
+  /** screen.v2 only, omitted when none: the posted https Instagram permalink. */
+  permalink?: string;
+}
+
+/** A refusal reason a person can read: a short code and one plain line. */
+export interface ScreenRefusal { code: string; text: string }
+
+/** screen.v2 — one run's host-derived progress and material, read-only.
+ *  A field the host cannot state is omitted, never invented. */
+export interface ScreenRunV2 {
+  /** Run epochs in seconds; `closed` only once the run is terminal. */
+  created?: number;
+  closed?: number;
+  /** awaiting | working:<step kind> | checking | ready | failed | cancelled */
+  phase: string;
+  steps?: { id: string; kind: string; state: string }[];
+  /** Effective values of the workflow's `context_default` inputs, with origin. */
+  inputs_used?: Record<string, { value: string; origin: string }>;
+  /** First ≤ 600 chars of the reviewer-approved text artifact. */
+  caption_excerpt?: string;
+  artifact_id?: string;
+  review?: { decision: string; rationale: string };
+  /** Frozen quotes by slot. */
+  price?: Record<string, ScreenPrice>;
+  approved?: { by_display: string; at: number };
+  source_post_id?: string;
+  refusal?: ScreenRefusal;
+  /** Host-minted ref (`image:<run id>`) for the reviewed generated image;
+   *  the only thing a child may request over the asset channel. */
+  image_ref?: string;
+}
+/** A price as a decimal string in an ISO-4217 currency, e.g. "0.06" USD. */
+export interface ScreenPrice { amount: string; currency: string }
+export interface ScreenSourcePost {
+  id: string; caption: string; published_at: number; permalink: string;
+  media_kind: string;
+  /** https URL on the Instagram CDN. Only a screen whose declaration opts
+   *  into `remote_images: ["instagram-cdn"]` may load it (frame CSP). */
+  thumb_url?: string;
+}
+export interface ScreenSources {
+  handle: string; run_id: string; fetched_at?: number;
+  posts: ScreenSourcePost[];
+}
+export interface ScreenDefaults {
+  context_id: string; revision: number;
+  values: Record<string, string>;
 }
 
 /** `ok`: the complete scoped list (empty rows = honestly nothing planned).
@@ -108,7 +186,8 @@ export interface ScreenIntents {
  *  fabricated: a run with no real timestamps omits them, and artifact
  *  bytes are absent in MVP rather than filled with placeholders. */
 export interface ScreenPush {
-  v: 1;
+  /** 2 for a screen.v2 child, 1 otherwise. */
+  v: 1 | 2;
   op: "screen";
   /** Host-stamped install id — the verified route's install. */
   install_id: string;
@@ -131,17 +210,19 @@ export interface ScreenPush {
   contexts: { id: string; label: string }[];
   /** Runs inside the pushed scope — real ids/states/titles only. A run's
    *  `created`/`closed` are real epoch seconds or omitted when unknown. */
-  runs: {
+  runs: ({
     id: string;
     state: string;
     title: string;
     snapshot_digest: string;
-    workflow: { title: string };
+    /** v2 adds `name` (the installed workflow file, `null` when the
+     *  workflow changed since) and `kind` (`read` | `draft`). */
+    workflow: { title: string; name?: string | null; kind?: string };
     created?: number;
     closed?: number;
     /** publish-intents.v1 only: the run's context, `""` = none. */
     context_id?: string;
-  }[];
+  } & Partial<ScreenRunV2>)[];
   /** Scoped effects/outbox/calendar-intent receipts — real rows only. */
   outbox: {
     effect_id: string;
@@ -154,13 +235,23 @@ export interface ScreenPush {
   }[];
   /** publish-intents.v1 only. */
   publish_intents?: ScreenIntents;
+  /** screen.v2 only: the latest finished read of a source slot. */
+  sources?: ScreenSources;
+  /** screen.v2 only: effective `context_default` values for this scope. */
+  defaults?: ScreenDefaults;
+  /** screen.v2 only: current quotes for the bound read and draft slots. */
+  prices?: Record<string, ScreenPrice>;
+  /** screen.v2 only: plain blocker codes; `ok` when there are none. */
+  readiness?: { ok: boolean; blockers: string[] };
+  /** screen.v2 only: verbs this host lets the frame use; none in H1. */
+  actions?: string[];
   /** Server epoch seconds for day-row alignment. */
   now: number;
   /** The child's own last `state` snapshot, replayed on remount. */
   resume?: string;
 }
 
-export type HostToChild = ScreenPush;
+export type HostToChild = ScreenPush | AssetReply;
 
 /** Parse a window message into a `ScreenInit`, or `null`. The port is a
  *  `MessagePort` in `event.ports[0]` — the caller checks `event.origin`
@@ -200,9 +291,15 @@ export function parseChild(data: unknown): ChildToHost | null {
   }
   if (
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
-    Array.isArray(d.accepts) && d.accepts.length === 1 && d.accepts[0] === PUBLISH_INTENTS_V1
+    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 2 &&
+    new Set(d.accepts).size === d.accepts.length &&
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2)
   ) {
-    return { v: 1, op: "ready", accepts: [PUBLISH_INTENTS_V1] };
+    return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
+  }
+  if (Object.keys(d).sort().join() === "op,ref,v" && d.v === 2 && d.op === "asset" &&
+      typeof d.ref === "string" && ASSET_REF.test(d.ref)) {
+    return { v: 2, op: "asset", ref: d.ref };
   }
   if (
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
@@ -223,16 +320,47 @@ export function parseChild(data: unknown): ChildToHost | null {
   return null;
 }
 
+const V2_TOP = ["sources", "defaults", "prices", "readiness", "actions"] as const;
+const V2_RUN = ["created", "closed", "phase", "steps", "inputs_used", "caption_excerpt", "artifact_id",
+  "review", "price", "approved", "source_post_id", "refusal", "image_ref"] as const;
+/** The publish-intents.v1 shape: every screen.v2 field is removed. */
+export function intentsPush(push: ScreenPush): ScreenPush {
+  const top: Record<string, unknown> = { ...push, v: 1 };
+  for (const key of V2_TOP) delete top[key];
+  const out = top as unknown as ScreenPush;
+  out.runs = push.runs.map(run => {
+    const row: Record<string, unknown> = { ...run, workflow: { title: run.workflow.title } };
+    for (const key of V2_RUN) delete row[key];
+    return row as ScreenPush["runs"][number];
+  });
+  if (push.publish_intents) out.publish_intents = { ...push.publish_intents,
+    rows: push.publish_intents.rows.map(({ refusal: _r, permalink: _p, ...row }) => row) };
+  return out;
+}
 /** The exact CAD-1006 v1 shape for a child that did not opt in: every
- *  publish-intents.v1 field is removed, nothing else changes. */
+ *  publish-intents.v1 and screen.v2 field is removed, nothing else changes. */
 export function legacyPush(push: ScreenPush): ScreenPush {
-  const { publish_intents: _intents, ...rest } = push;
+  const { publish_intents: _intents, ...rest } = intentsPush(push);
   return {
     ...rest,
-    runs: push.runs.map(({ context_id: _context, ...run }) => run),
-    outbox: push.outbox.map(({ run_id: _run, context_id: _context, ...row }) => row),
+    runs: rest.runs.map(({ context_id: _context, ...run }) => run),
+    outbox: rest.outbox.map(({ run_id: _run, context_id: _context, ...row }) => row),
   };
 }
+
+/** The screen.v2 sections, dropped in this order when the PUSH is over its
+ *  byte cap: each step keeps the screen, and an absent section reads as
+ *  unavailable to the frame. */
+const omit = (key: string) => (p: ScreenPush): ScreenPush => ({ ...p, runs: p.runs.map(r => {
+  const row: Record<string, unknown> = { ...r }; delete row[key]; return row as ScreenPush["runs"][number]; }) });
+const DEGRADE: ((push: ScreenPush) => ScreenPush)[] = [
+  omit("caption_excerpt"),
+  ({ sources: _s, ...p }) => p,
+  omit("inputs_used"),
+  p => ({ ...p, publish_intents: { status: "unavailable", withheld: 0, rows: [] } }),
+  omit("steps"),
+  omit("review"),
+];
 
 export function pushBytes(push: ScreenPush): number {
   return new TextEncoder().encode(JSON.stringify(push)).byteLength;
@@ -247,15 +375,31 @@ const linkId = (value: string | undefined, required: boolean) =>
  *  linkage ids must meet the app's bounds (fail closed otherwise), and when
  *  the intent rows alone push it over the cap they are replaced by an honest
  *  `unavailable` block rather than dropping the screen. */
-export function shapeFor(push: ScreenPush, intents: boolean): ScreenPush | null {
-  if (!intents) {
+export function shapeFor(push: ScreenPush, level: boolean | Shape): ScreenPush | null {
+  const shape: Shape = level === true ? "intents" : level === false ? "v1" : level;
+  if (shape === "v1") {
     const legacy = legacyPush(push);
     return pushBytes(legacy) <= PUSH_BYTES_MAX ? legacy : null;
   }
   if (!push.publish_intents ||
       !push.runs.every(run => linkId(run.context_id, false)) ||
       !push.outbox.every(row => linkId(row.run_id, true) && linkId(row.context_id, false))) return null;
-  if (pushBytes(push) <= PUSH_BYTES_MAX) return push;
-  const degraded: ScreenPush = { ...push, publish_intents: { status: "unavailable", withheld: 0, rows: [] } };
-  return pushBytes(degraded) <= PUSH_BYTES_MAX ? degraded : null;
+  if (shape === "intents") {
+    const intents = intentsPush(push);
+    if (pushBytes(intents) <= PUSH_BYTES_MAX) return intents;
+    const degraded: ScreenPush = { ...intents, publish_intents: { status: "unavailable", withheld: 0, rows: [] } };
+    return pushBytes(degraded) <= PUSH_BYTES_MAX ? degraded : null;
+  }
+  if (!push.runs.every(run => typeof run.phase === "string")) return null;
+  let v2: ScreenPush = { ...push, v: 2 };
+  for (const degrade of DEGRADE) {
+    if (pushBytes(v2) <= PUSH_BYTES_MAX) return v2;
+    v2 = degrade(v2);
+  }
+  return pushBytes(v2) <= PUSH_BYTES_MAX ? v2 : null;
+}
+
+/** The image refs one sent PUSH carries — the only refs its child may ask for. */
+export function pushedAssetRefs(push: ScreenPush): Set<string> {
+  return new Set(push.runs.map(run => run.image_ref).filter((ref): ref is string => typeof ref === "string"));
 }
