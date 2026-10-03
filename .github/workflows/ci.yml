@@ -169,7 +169,12 @@ jobs:
       - name: Test contributor documentation checker
         run: python3 -m unittest discover -s scripts -p 'test_check_doc_links.py'
       - name: Verify doctor/host split-map consistency
-        run: scripts/split-doctor-host --check
+        run: |
+          if [ -f tests/split-map-doctor.toml ] || [ -f tests/split-map-host.toml ]; then
+            scripts/split-doctor-host --check
+          else
+            echo 'split-doctor-host: manifests retired under CAD-1073; nothing to check.'
+          fi
 
   clippy:
     needs: [queue-evidence]
