@@ -11,7 +11,7 @@ import Detail from "./shared/Detail";
 import DataTable from "./shared/DataTable";
 import Field from "./shared/Field";
 import { EmptyState, ErrorNotice, Loading, Notice } from "./shared/States";
-import { useDrawerClose } from "./shared/useDrawerClose";
+import DrawerShell, { type DrawerTab } from "./shared/DrawerShell";
 import {
   buildCustomerProfile,
   consentEntries,
@@ -376,7 +376,7 @@ function CustomerList({
 }
 
 const CONSENT_OPTIONS: { value: string; label: string }[] = [
-  { value: "unknown", label: "Unknown — no marketing until granted" },
+  { value: "unknown", label: "Unknown" },
   { value: "granted", label: "Granted" },
   { value: "denied", label: "Denied" },
 ];
@@ -386,10 +386,13 @@ function CustomerForm({
   submitLabel,
   pending,
   formError,
+  formId,
   onSubmit,
 }: {
   initial: CustomerFormFields;
   submitLabel: string;
+  /** Set when a drawer footer owns the Save button; the form then has none. */
+  formId?: string;
   pending: boolean;
   formError: string | null;
   onSubmit: (fields: CustomerFormFields) => void;
@@ -402,7 +405,8 @@ function CustomerForm({
   };
   return (
     <form
-      className="card px-4 py-4 grid gap-3"
+      id={formId}
+      className={formId ? "grid gap-3" : "card px-4 py-4 grid gap-3"}
       onSubmit={(e) => {
         e.preventDefault();
         try {
@@ -484,7 +488,7 @@ function CustomerForm({
         </Field>
       </div>
       <div className="crm-field-row">
-        <Field label="Email consent (explicit)" id="crm-consent-email" className="crm-field">
+        <Field label="Email consent (explicit)" id="crm-consent-email" hint="No marketing until granted" className="crm-field">
           {(c) => (
             <Select
               id={c.id}
@@ -496,7 +500,7 @@ function CustomerForm({
             />
           )}
         </Field>
-        <Field label="SMS consent (explicit)" id="crm-consent-sms" className="crm-field">
+        <Field label="SMS consent (explicit)" id="crm-consent-sms" hint="No marketing until granted" className="crm-field">
           {(c) => (
             <Select
               id={c.id}
@@ -512,11 +516,13 @@ function CustomerForm({
       {(fieldError ?? formError) && (
         <ErrorNotice bare>{fieldError ?? formError}</ErrorNotice>
       )}
-      <div>
-        <Button type="submit" variant="primary" loading={pending} disabled={pending}>
-          {submitLabel}
-        </Button>
-      </div>
+      {formId === undefined && (
+        <div>
+          <Button type="submit" variant="primary" loading={pending} disabled={pending}>
+            {submitLabel}
+          </Button>
+        </div>
+      )}
     </form>
   );
 }
@@ -607,22 +613,6 @@ function CustomerDrawer({
   const [editing, setEditing] = useState(false);
   const [pending, setPending] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-  const headRef = useRef<HTMLHeadingElement | null>(null);
-
-  // Land on the drawer heading; useDrawerClose returns focus to the
-  // opener (or the list heading) when the drawer closes.
-  useEffect(() => {
-    headRef.current?.focus();
-  }, []);
-  const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") requestClose();
-    };
-    addEventListener("keydown", onKey);
-    return () => removeEventListener("keydown", onKey);
-  }, [requestClose]);
-
   const reloadToken = `${scope.installId}:${scope.contextId}:${recordId}`;
   useEffect(() => {
     const controller = new AbortController();
@@ -648,112 +638,143 @@ function CustomerDrawer({
   const revisions = record ? revisionEntries(record) : [];
   const consentTrail = record ? consentEntries(record) : [];
 
+  const initials = view
+    ? view.displayName.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]?.toUpperCase()).join("")
+    : "";
+  const reload = () => {
+    setError(null);
+    setLoading(true);
+    hostActions
+      .show(scope, recordId)
+      .then(setRecord)
+      .catch((e: unknown) => setError(friendlyError(e)))
+      .finally(() => setLoading(false));
+  };
+  const ready = !loading && error === null && record !== null && view !== null;
+
+  const tabs: DrawerTab[] =
+    ready && record !== null && view !== null
+      ? [
+          {
+            id: "overview",
+            label: "Overview",
+            panel: (
+              <>
+                <p className="text-micro text-ink-500 mb-2">
+                  Selection is chat context only — the server re-proves scope on every send.
+                </p>
+                <Detail
+                  className="crm-detail"
+                  label="Customer fields"
+                  items={[
+                    { key: "email", term: "Email", value: <span className="num">{view.email ?? "—"}</span> },
+                    { key: "phone", term: "Phone", value: <span className="num">{view.phone ?? "—"}</span> },
+                    { key: "tags", term: "Tags", value: view.tags.length > 0 ? view.tags.join(", ") : "—" },
+                    { key: "source", term: "Source", value: view.source ?? "—" },
+                    {
+                      key: "consent-email",
+                      term: "Email consent",
+                      value: <span className="chip">{view.consentEmail}</span>,
+                    },
+                    {
+                      key: "consent-sms",
+                      term: "SMS consent",
+                      value: <span className="chip">{view.consentSms ?? "unknown"}</span>,
+                    },
+                  ]}
+                />
+              </>
+            ),
+          },
+          {
+            id: "activity",
+            label: "Activity",
+            panel: (
+              <>
+                {consentTrail.length > 0 && (
+                  <section aria-label="Consent history">
+                    <h4 className="text-label font-medium text-ink-200">Consent history</h4>
+                    <ol className="crm-history">
+                      {consentTrail.map((entry) => (
+                        <li key={`${entry.revision}-${entry.channel}`} className="num text-label text-ink-300">
+                          r{entry.revision} · {entry.channel}: {entry.state} · {entry.actor} ·{" "}
+                          {new Date(entry.at * 1000).toISOString().slice(0, 10)}
+                        </li>
+                      ))}
+                    </ol>
+                  </section>
+                )}
+                {revisions.length > 0 && (
+                  <section aria-label="Revision history" className="mt-3">
+                    <h4 className="text-label font-medium text-ink-200">Revision history</h4>
+                    <ol className="crm-history">
+                      {revisions.map((entry) => (
+                        <li key={entry.revision} className="num text-label text-ink-300">
+                          r{entry.revision} · {entry.actor} · {entry.digest.slice(0, 18)}… ·{" "}
+                          {new Date(entry.at * 1000).toISOString().slice(0, 10)}
+                        </li>
+                      ))}
+                    </ol>
+                  </section>
+                )}
+                {consentTrail.length === 0 && revisions.length === 0 && (
+                  <p className="text-secondary text-ink-400">No activity recorded yet.</p>
+                )}
+              </>
+            ),
+          },
+          {
+            id: "details",
+            label: "Details",
+            panel: (
+              <section aria-label="Record diagnostics">
+                <p className="num text-micro text-ink-500">
+                  Record <span className="num">{recordId}</span> · revision r{record.revision} · digest{" "}
+                  {record.digest.slice(0, 18)}… · scope <span className="num">{scope.contextId || "none"}</span>
+                </p>
+              </section>
+            ),
+          },
+        ]
+      : [];
+
   return (
-    <div
-      className="crm-drawer"
-      role="dialog"
-      aria-modal="false"
-      aria-label="Customer details"
-      data-drawer="customer"
-      data-closing={closing || undefined}
-      onTransitionEnd={onTransitionEnd}
-    >
-      <div className="crm-drawer-head">
-        <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1}>
-          {loading ? "Customer details" : (view?.displayName ?? "Customer details")}
-        </h3>
-        <Button size="sm" onClick={requestClose} aria-label="Close customer details">
-          Close
-        </Button>
-      </div>
-      <p className="text-micro text-ink-500">
-        Selection is chat context only — the server re-proves scope on every send.
-      </p>
-      <details className="crm-diag">
-        <summary className="text-micro text-ink-500">Record diagnostics</summary>
-        <p className="num text-micro text-ink-500 mt-1">
-          Record <span className="num">{recordId}</span>
-          {record !== null && (
-            <> · revision r{record.revision} · digest {record.digest.slice(0, 18)}…</>
-          )}{" "}
-          · scope <span className="num">{scope.contextId || "none"}</span>
-        </p>
-      </details>
-      {loading && (
-        <Loading className="mt-2">Reading the record…</Loading>
-      )}
-      {error !== null && !loading && (
-        <ErrorNotice
-          className="mt-2"
-          onRetry={() => {
-            setError(null);
-            setLoading(true);
-            hostActions
-              .show(scope, recordId)
-              .then(setRecord)
-              .catch((e: unknown) => setError(friendlyError(e)))
-              .finally(() => setLoading(false));
-          }}
-        >
-          {error}
-        </ErrorNotice>
-      )}
-      {!loading && error === null && record !== null && view !== null && (
-        <>
-          <Detail
-            className="crm-detail mt-2"
-            label="Customer fields"
-            items={[
-              { key: "email", term: "Email", value: <span className="num">{view.email ?? "—"}</span> },
-              { key: "phone", term: "Phone", value: <span className="num">{view.phone ?? "—"}</span> },
-              { key: "tags", term: "Tags", value: view.tags.length > 0 ? view.tags.join(", ") : "—" },
-              { key: "source", term: "Source", value: view.source ?? "—" },
-              {
-                key: "consent-email",
-                term: "Email consent",
-                value: <span className="chip">{view.consentEmail}</span>,
-              },
-              {
-                key: "consent-sms",
-                term: "SMS consent",
-                value: <span className="chip">{view.consentSms ?? "unknown"}</span>,
-              },
-            ]}
-          />
-          {consentTrail.length > 0 && (
-            <section aria-label="Consent history" className="mt-3">
-              <h4 className="text-label font-medium text-ink-200">Consent history</h4>
-              <ol className="crm-history">
-                {consentTrail.map((entry) => (
-                  <li key={`${entry.revision}-${entry.channel}`} className="num text-label text-ink-300">
-                    r{entry.revision} · {entry.channel}: {entry.state} · {entry.actor} ·{" "}
-                    {new Date(entry.at * 1000).toISOString().slice(0, 10)}
-                  </li>
-                ))}
-              </ol>
-            </section>
-          )}
-          {revisions.length > 0 && (
-            <section aria-label="Revision history" className="mt-3">
-              <h4 className="text-label font-medium text-ink-200">Revision history</h4>
-              <ol className="crm-history">
-                {revisions.map((entry) => (
-                  <li key={entry.revision} className="num text-label text-ink-300">
-                    r{entry.revision} · {entry.actor} · {entry.digest.slice(0, 18)}… ·{" "}
-                    {new Date(entry.at * 1000).toISOString().slice(0, 10)}
-                  </li>
-                ))}
-              </ol>
-            </section>
-          )}
-          {canWrite ? (
-            editing ? (
-              <div className="mt-3">
-                <h4 className="text-label font-medium text-ink-200 mb-2">
-                  Edit — saving is refused if the record changed since you opened it
-                </h4>
+    <DrawerShell
+      kind="customer"
+      label="Customer details"
+      title={loading ? "Customer details" : (view?.displayName ?? "Customer details")}
+      avatar={initials || undefined}
+      subtitle={view?.email ?? undefined}
+      pills={
+        view && ready ? (
+          <>
+            <span className="chip" title="Email consent">Email: {view.consentEmail}</span>
+            <span className="chip" title="SMS consent">SMS: {view.consentSms ?? "unknown"}</span>
+            {view.tags.map((tag) => (
+              <span key={tag} className="chip">{tag}</span>
+            ))}
+          </>
+        ) : undefined
+      }
+      tabs={tabs}
+      state={
+        loading ? (
+          <Loading>Reading the record…</Loading>
+        ) : error !== null ? (
+          <ErrorNotice onRetry={reload}>{error}</ErrorNotice>
+        ) : undefined
+      }
+      edit={
+        editing && canWrite && ready && record !== null
+          ? {
+              formId: "crm-customer-edit",
+              title: "Edit profile — saving is refused if the record changed since you opened it",
+              pending,
+              onCancel: () => setEditing(false),
+              body: (
                 <CustomerForm
                   key={record.revision}
+                  formId="crm-customer-edit"
                   initial={formFromProfile(record.profile)}
                   submitLabel="Save changes"
                   pending={pending}
@@ -779,26 +800,28 @@ function CustomerDrawer({
                       .finally(() => setPending(false));
                   }}
                 />
-                <p className="mt-2">
-                  <button type="button" className="lnk text-label" onClick={() => setEditing(false)}>
-                    Discard edit
-                  </button>
-                </p>
-              </div>
-            ) : (
-              <p className="mt-3">
-                <Button size="sm" onClick={() => { setEditing(true); setFormError(null); }}>
-                  Edit profile
-                </Button>
-              </p>
-            )
-          ) : (
-            <p className="text-label text-ink-400 mt-3" data-state="read-only">
-              Read-only view. {viewer.operator ? "Edits are disabled on this board." : "Sign in as the operator to edit."}
-            </p>
-          )}
-        </>
-      )}
-    </div>
+              ),
+            }
+          : null
+      }
+      menu={
+        ready && view?.email
+          ? [{ key: "copy-email", label: "Copy email", onSelect: () => void navigator.clipboard?.writeText(view.email ?? "") }]
+          : []
+      }
+      primary={
+        ready && canWrite ? (
+          <Button size="sm" variant="primary" onClick={() => { setEditing(true); setFormError(null); }}>
+            Edit profile
+          </Button>
+        ) : undefined
+      }
+      note={
+        ready && !canWrite
+          ? `Read-only view. ${viewer.operator ? "Edits are disabled on this board." : "Sign in as the operator to edit."}`
+          : undefined
+      }
+      onClose={onClose}
+    />
   );
 }
