@@ -109,4 +109,9 @@ equal(lo.includes("text-warn"), true, "loopback warning span for [::1]");
 equal(render("[x](//example.com/a)").includes("<a "), true, "//example.com stays an anchor");
 equal(render("[x](//[::1]/a)").includes("<a "), false, "//[::1] is not an anchor");
 
+// CAD-1078: react-markdown blanks a backslash network path, so Md renders
+// plain text exactly as before; isLoopbackHref's backslash rule is defence in depth.
+const bs = render("[x](\\\\[::1]/x)");
+equal(bs, "<p>x</p>", "backslash network path renders as plain text");
+
 console.log("md issue link checks passed");

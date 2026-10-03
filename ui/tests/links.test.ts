@@ -41,6 +41,16 @@ for (const href of [
   "http://[::ffff:127.255.1.2]/",
   " http://%5B::1%5D/",
   "\thttp://[::1]/",
+  // CAD-1078: backslash network paths (browsers treat `\` like `/`).
+  "\\\\[::1]/x",
+  "/\\[::1]/x",
+  "\\/localhost/",
+  "\\\\localhost/",
+  "\\\\127.0.0.1/",
+  "\\\\%5B::1%5D/x",
+  // Unparseable even against the base: the fail-closed rule must catch it.
+  "\\\\[::1/x",
+  "/\\[::1/x",
 ]) {
   equal(isLoopbackHref(href), true, href);
 }
@@ -61,6 +71,13 @@ for (const href of [
   "//example.com/x",
   "http://[::ffff:8.8.8.8]/",
   " https://example.com/",
+  "\\\\example.com/x",
+  "/\\example.com/x",
+  "/rel",
+  "./a",
+  "../a",
+  "#f",
+  "?q",
 ]) {
   equal(isLoopbackHref(href), false, href);
 }
