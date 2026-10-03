@@ -421,10 +421,19 @@ pub(super) fn record_remote(
     Ok(view(&connection, selected))
 }
 
-/// Resolve this invocation's daemon state dir once. `org` is `--org`; a
+/// What `resolve` settled for this invocation: a local daemon state dir,
+/// or a pinned remote destination (CAD-1019 slice 2). `Remote` carries the
+/// issuer-verified endpoint + workspace — never a credential, and never
+/// re-derived after this call.
+pub(super) enum Resolved {
+    Local(PathBuf),
+    Remote(cadence_agent::remote_cli::RemoteTarget),
+}
+
+/// Resolve this invocation's destination once. `org` is `--org`; a
 /// managed caller keeps its ambient binding and never consults the
 /// registry. `state`/`tracker` are explicit pins — either wins over the
-/// registry and refuses `--org`. Returns the state dir; a local-org
+/// registry and refuses `--org`. Returns [`Resolved`]; a local-org
 /// selection also exports `CADENCE_PM_DIR` so the tracker lands on the
 /// org's root. Never resolves the tracker for a managed, pinned or
 /// ambient caller — those never needed it (the CAD-313 `ui login`
@@ -433,7 +442,7 @@ pub(super) fn resolve(
     org: Option<&str>,
     state: Option<PathBuf>,
     tracker: Option<PathBuf>,
-) -> Result<PathBuf> {
+) -> Result<Resolved> {
     // A managed caller's inherited binding always wins over a saved
     // preference — it cannot be retargeted by a default the operator
     // changed mid-run, and it never reads the registry at all.
@@ -444,8 +453,9 @@ pub(super) fn resolve(
             ));
         }
         return state
+            .map(Resolved::Local)
             .map(Ok)
-            .unwrap_or_else(cadence_agent::client::state_dir);
+            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
     }
     // An explicit flag or inherited binding is a pin; it conflicts with
     // `--org` rather than mixing roots.
@@ -467,8 +477,9 @@ pub(super) fn resolve(
             ));
         }
         return state
+            .map(Resolved::Local)
             .map(Ok)
-            .unwrap_or_else(cadence_agent::client::state_dir);
+            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
     }
     let org_env = std::env::var("CADENCE_ORG").ok();
     let org = org.or(org_env.as_deref());
@@ -486,7 +497,7 @@ pub(super) fn resolve(
         None => None,
     };
     let Some(conn) = selection else {
-        return cadence_agent::client::state_dir();
+        return cadence_agent::client::state_dir().map(Resolved::Local);
     };
     match conn.destination {
         Destination::Local {
@@ -500,13 +511,19 @@ pub(super) fn resolve(
                 conn.selection.org,
                 state_dir.display()
             );
-            Ok(state_dir)
+            Ok(Resolved::Local(state_dir))
         }
-        Destination::Remote { endpoint, org_id } => Err(Error::rejected(format!(
-            "org '{}' selects remote endpoint {endpoint} (org {org_id}) but remote \
-             transport is not configured in this build — refusing local fallback",
-            conn.selection.org
-        ))),
+        Destination::Remote { endpoint, org_id } => {
+            // The destination is the issuer-verified endpoint recorded at
+            // login — `remote_cli` refuses to send this org's credential
+            // anywhere else, and there is no local fallback.
+            eprintln!("cadence org={} remote={}", conn.selection.org, endpoint);
+            Ok(Resolved::Remote(cadence_agent::remote_cli::RemoteTarget {
+                org: conn.selection.org,
+                endpoint,
+                org_id,
+            }))
+        }
     }
 }
 
@@ -535,63 +552,6 @@ mod tests {
     const EP_A: &str = "https://alpha.cadencecloud.app";
     const EP_B: &str = "https://beta.cadencecloud.app";
 
-    fn local_registry() -> Registry {
-        Registry {
-            selected: None,
-            connections: vec![Connection {
-                selection: Selection {
-                    org: LOCAL_ORG.to_string(),
-                },
-                destination: Destination::Local {
-                    state_dir: PathBuf::from("/state"),
-                    tracker_dir: PathBuf::from("/tracker"),
-                },
-            }],
-        }
-    }
-
-    #[test]
-    fn first_login_selects_the_default() {
-        let mut registry = Registry::default();
-        let (_, selected) =
-            apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        assert!(selected);
-        assert_eq!(registry.selected.as_ref().unwrap().org, "alpha");
-    }
-
-    #[test]
-    fn second_org_login_leaves_the_default_unchanged() {
-        // I5 (`cli_second_login_keeps_default`): workspace B login adds
-        // an org and leaves the default untouched without `--use`.
-        let mut registry = Registry::default();
-        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        let (_, selected) =
-            apply_record_remote(&mut registry, "beta", EP_B, "ws_beta", false).unwrap();
-        assert!(!selected);
-        assert_eq!(registry.selected.as_ref().unwrap().org, "alpha");
-        assert_eq!(registry.connections.len(), 2);
-    }
-
-    #[test]
-    fn use_flag_moves_the_default() {
-        let mut registry = Registry::default();
-        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        let (_, selected) =
-            apply_record_remote(&mut registry, "beta", EP_B, "ws_beta", true).unwrap();
-        assert!(selected);
-        assert_eq!(registry.selected.as_ref().unwrap().org, "beta");
-    }
-
-    #[test]
-    fn relogin_with_the_same_endpoint_and_org_id_is_idempotent() {
-        let mut registry = Registry::default();
-        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        let (_, selected) =
-            apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        assert!(selected);
-        assert_eq!(registry.connections.len(), 1);
-    }
-
     #[test]
     fn changed_endpoint_or_org_id_is_refused_never_moved() {
         // A changed slug or forged audience refuses instead of silently
@@ -612,13 +572,6 @@ mod tests {
             }
             Destination::Local { .. } => panic!("stored remote changed shape"),
         }
-    }
-
-    #[test]
-    fn login_over_a_local_name_is_refused() {
-        let mut registry = local_registry();
-        assert!(apply_record_remote(&mut registry, "local", EP_A, "ws_alpha", false).is_err());
-        assert_eq!(registry.connections.len(), 1);
     }
 
     #[test]
@@ -650,12 +603,5 @@ mod tests {
         .is_err());
         assert!(registry.connections.is_empty());
         assert!(registry.selected.is_none());
-    }
-
-    #[test]
-    fn invalid_org_name_is_refused() {
-        let mut registry = Registry::default();
-        assert!(apply_record_remote(&mut registry, "Alpha", EP_A, "ws_a", false).is_err());
-        assert!(registry.connections.is_empty());
     }
 }

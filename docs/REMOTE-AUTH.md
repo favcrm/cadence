@@ -68,6 +68,53 @@ token or terminate remote sessions. Device credentials currently expire after
 30 days; the protocol has no refresh token or token expiry introspection field.
 For imported tokens, expiry is unknown locally and checked by the issuer.
 
+## Remote org transport (CAD-1019)
+
+`cadence login --issuer <api-origin> --org <workspace-id> --slug <slug>`
+runs the hosted-cadence owner-consent device grant (PKCE, `hcd_` device
+code, `hct_` bridge credential) and records an org whose connection is
+`Remote { endpoint: https://<slug>.cadencecloud.app, org_id }` — slug,
+endpoint and org id all come from the issuer's verified grant, never
+derived from each other. A first login selects the org as the default;
+a second workspace adds its org without moving the default unless
+`--use` is passed. The `hct_` is stored at
+`$XDG_CONFIG_HOME/cadence/remote-auth/cli-<slug>.json` (0600) and is
+bound to the org id and endpoint it was issued for — it is never sent
+to another host.
+
+When the resolved org is remote (`--org` > `CADENCE_ORG` > saved
+default), an allowlisted command runs against the remote daemon instead
+of the local socket:
+
+```sh
+cadence --org acme issue ls --status doing
+cadence --org acme agent list
+cadence --org acme status --json
+```
+
+The transport is the AgenticOS `POST /__platform/cli/{authorize,call}`
+relay (AOS-128). Each command first exchanges the stored `hct_` for a
+server-minted `cli actor envelope` at `/__platform/cli/authorize`
+(≤300 s, `aud` = the board host, `organization_id` = the org's
+workspace), then POSTs `{version, envelope, verb, arguments}` to
+`/__platform/cli/call`. The worker re-verifies the signature, org,
+audience and live bearer before any runtime is resolved or woken; the
+container independently re-verifies the envelope before dispatching the
+verb. `verb` is one of a fixed allowlist — `status`, `agent_list`,
+`agent_show`, `issue_ls`, `issue_show`, `issue_history`, `message_read`,
+`message_inbox` — and `arguments` is a strict per-verb payload. Any
+other command is refused locally and never sent.
+
+A sleeping company answers `503 {"state":"waking","retry_after_s":N}`
+plus `Retry-After`; the CLI waits and retries inside `--wake-timeout`
+(default 120 s), printing `waking <org>… (Ns)` on stderr while stdout
+stays JSON. The budget lapses into exit 75 (`busy`). `wake_failed`, an
+unavailable remote, a redirect, or a refused credential (`401`/`403`)
+end the command with a `cadence login` hint — there is never a fallback
+to local or another org, and no token is ever printed. Operator-only
+and every unlisted verb stay refused remotely; the remote path carries
+no operator proof.
+
 ## Issuer-bound service enrollment (CAD-717)
 
 The separate `cadence remote enrollment` commands prepare a local implementer

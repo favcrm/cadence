@@ -148,11 +148,20 @@ pub(crate) fn run() -> Result<i32> {
     {
         return app::run_dev(name, source, *port, host, allow_host);
     }
-    let state_dir = org::resolve(
+    let resolved = org::resolve(
         cli.org.as_deref(),
         cli.state_dir.clone(),
         std::env::var_os("CADENCE_PM_DIR").map(PathBuf::from),
     )?;
+    let state_dir = match resolved {
+        org::Resolved::Local(state_dir) => state_dir,
+        org::Resolved::Remote(target) => {
+            // CAD-1019 slice 2: a remote org never opens local state or
+            // adopts a sandbox profile — the allowlisted verb goes over
+            // HTTPS; everything else refuses inside `remote::run`.
+            return remote::run(target, cli.command, cli.wake_timeout);
+        }
+    };
     // CAD-310: a sandbox's state dir decides its profile and tracker,
     // not the caller's env. `sandbox` verbs resolve their own roots.
     if !matches!(cli.command, Commands::Sandbox { .. }) {

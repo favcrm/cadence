@@ -51,6 +51,7 @@ pub mod proc;
 pub mod proto;
 pub mod reaper;
 pub mod remote_auth;
+pub mod remote_cli;
 pub mod remote_enrollment;
 pub mod remote_result_outbox;
 pub mod review;
