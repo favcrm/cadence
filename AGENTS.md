@@ -207,35 +207,42 @@ These are working instructions, not a claim of new automated enforcement.
   failure paths. Keep implemented, reviewed, merged, installed and operationally
   verified distinct; do not touch production to obtain acceptance evidence.
 
-#### Replace accumulated tests by contract, not by age
+#### Rebuild tests from current contracts, not legacy inheritance
 
-Retain executable protection for distinct behavioral contracts and known
-regressions. Consolidate redundant setups/cases and replace implementation-
-coupled assertions with behavior checks; do not bulk-delete the suite because
-it is old or large. A family-scoped replacement PR must:
+Existing tests are migration evidence, not the specification of intended
+behavior and not an automatic reason to retain them. A clean-slate family
+replacement may remove obsolete or implementation-coupled tests, but it does
+not reduce the protected contracts or merge gates. A replacement PR must:
 
-1. Map each removed test/assertion to its protected behavior and retained or
-   replacement check, including relevant refusal, boundary and regression cases.
-   A genuinely obsolete contract requires an explicit reviewed spec change;
-   age, passing coverage percentages and fewer tests do not establish equivalence.
-2. Demonstrate that the replacement catches the relevant wrong behavior. Use
-   the historical reproduction, a deliberate guard mutation or another concrete
-   counterexample; the failure must come from the behavioral assertion, not
-   broken setup. Independent reviewers verify the mapping and execution evidence
-   before removal. Temporary exploration probes alone are not retained coverage.
-3. Preserve security/identity, agent and detached-child refusals, concurrency
+1. Name the current intended behaviors, forbidden effects and required controls
+   it covers. Security/identity, agent and detached-child refusals, concurrency
    and exactly-once behavior, RPC/HTTP parity, persistence/migration/recovery,
-   timing bounds, test isolation and fail-closed defaults. Gate inputs, inventory
-   contracts, default-feature refusal proofs and release test-seam exclusion are
-   protected too; a logic fake cannot replace a required boundary proof.
-4. Update affected inventory/split maps and required gate wiring without silently
-   reducing the protected contracts. Classify the replacement PR from its own
-   diff under the existing risk/review rules; this policy grants no approval or
-   exception to them. Never skip, ignore or weaken checks merely to get green.
-5. Measure cost on comparable runs: distinguish compile/setup, test execution,
-   admission/runner waits and workflow wall time. Diagnose fixture failures rather
-   than masking them with retries. Optimize feedback time without losing the
-   behavior being proved; do not claim a speedup from test count alone.
+   timing bounds, test isolation and fail-closed defaults remain required where
+   the system enforces them; gate inputs, inventory contracts, default-feature
+   refusal proofs and release test-seam exclusion are protected too. A logic
+   fake cannot replace a required boundary proof.
+2. In the same family-scoped PR, provide behavior checks for every still-
+   required contract it retires, or state the operator-approved reduced-
+   coverage transition and its exclusions. An authorization or delivery gate
+   may never retain an unprotected production effect merely because its legacy
+   test was removed. A genuinely obsolete contract needs a reviewed spec change.
+3. Demonstrate that a replacement catches the relevant wrong behavior with the
+   historical reproduction, a deliberate guard mutation or another concrete
+   counterexample; the failure must come from the behavioral assertion, not
+   broken setup. Independent reviewers verify the contract mapping and
+   execution evidence before removal. Temporary exploration probes alone are
+   not retained coverage.
+4. New development rebuilds checks for the behavior it changes rather than
+   recreating implementation-coupled suites. Consolidate redundant setup/cases
+   by shared behavior and update affected inventory/split maps and required
+   gate wiring without silently reducing protected contracts. Classify each
+   replacement PR from its own diff under existing risk/review rules; this
+   policy grants no approval or exception to them. Never skip, ignore or weaken
+   checks merely to get green.
+5. Do not claim equivalence or speed from deletion alone. Measure the
+   replacement on comparable runs, distinguish compile/setup, test execution,
+   admission/runner waits and workflow wall time, and list residual unprotected
+   contracts. Diagnose fixture failures rather than masking them with retries.
 
 ### Checks: trust exit codes, not filtered text
 - A shell hook routes commands through `rtk`, which can print "clean" or
