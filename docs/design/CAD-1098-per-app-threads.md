@@ -1,6 +1,6 @@
 # Design contract: CAD-1098 per-app assistant conversations
 
-Status: draft (rev 2, operator decisions of 2026-10-03 applied) for
+Status: draft (rev 3: spec REVISE 826a80da applied) for
 Spec/security review. No product code in this PR. Human trigger 1 (message
 delivery, scoped-turn context, token delivery).
 
@@ -78,16 +78,58 @@ them, customer/segment subjects, parallel turns.
   in its own install and context. Its hint's context must verify against the
   conversation's stored context; a scoped verb in it naming another campaign,
   install or company is refused.
-- I6 (scoped powers): a master connection acting on a running message whose
-  conversation is app-scoped may call only `MASTER_APP_ALLOWED` = the scoped
-  `cadence app` verbs plus read-only board status (`health`, `agent_list`,
-  `agent_show`, `thread_read`, `job_*`, `monitor_*`...). Setup/admin powers
-  (agent register, permission requests, `project_new`, `plan_propose`,
-  `master_dispatch`, escalate) work only when the running message is in home.
-  Enforced in `master_policy` (`src/daemon/master_rpc.rs`): after
-  `caller_is_master`, resolve the master's running message from the store
-  (never a param) and its conversation; app-scoped selects the narrower
-  allowlist. An unresolvable running message fails closed to the narrower one.
+- I6 (scoped powers, two gates). A master turn whose running message is in an
+  app conversation has only scoped powers. `master_policy` alone cannot give
+  that: it sees daemon RPCs from the master's process tree, not (a) approved
+  commands run by the daemon with a grant token as operator evidence, (b) local
+  tracker writes (`cadence issue new`, `cadence report file` write the PM dir
+  directly), (c) local home reads (`issue ls/show/log`, epic/project, `plan
+  ls/show`), or (d) the static Pi guard rules and Claude `--allowedTools`.
+  So:
+  - **Gate 1, per-session tool profile (primary).** The session is already
+    per conversation (I7). The adapter chooses its rule set at session open
+    from the conversation scope: an **app profile** generates the Claude
+    `--allowedTools` and the Pi guard RULES from only the nine scoped `cadence
+    app ...` verbs (`scoped_verb_stems()`) plus `cadence daemon health`; no
+    `issue`, `plan`, `report`, `wiki`, `agent`, `master`, `overview`, `status`,
+    `thread show` or `project` verb. The app session's confinement also drops
+    read access to the PM dir and wiki where Landlock is available. The profile
+    is fixed at launch from the daemon-held conversation row, never from the
+    prompt or a param; a Home session keeps today's rules.
+  - **Gate 2, `master_policy` (daemon).** After `caller_is_master`, resolve the
+    master's running message from the store (never a param) and its
+    conversation; an app-scoped one may call only `MASTER_APP_ALLOWED`,
+    enumerated: the nine scoped RPCs (`app_record_csv_assistant_import`,
+    `app_record_csv_assistant_preview`, `app_segment_assistant_save`,
+    `app_segment_assistant_list`, `app_segment_assistant_show`,
+    `app_segment_assistant_preview`, `app_content_assistant_draft`,
+    `app_content_assistant_proposals`, `app_content_assistant_proposal_show`),
+    `health`, `message_report` (own running message only, needed to finish a
+    turn) and `thread_read` **only for the running message's own conversation**
+    (a different or absent conversation is refused). Everything else is
+    refused, in particular `master_ask_permission`, `master_peek_grant`,
+    `master_permission_use` (so `run_approved` never starts from an app
+    conversation, standing `always` rules included), `agent_*`, `job_*`,
+    `task_show`, `monitor_*`, `delivery_list`, `wiki_*` (incl. `wiki_write`),
+    `project_new`, `plan_propose`, `master_dispatch`, `question_escalate`,
+    `interrupt`, `answer_route`. An unresolvable running message fails closed
+    to this set.
+  - Setup/admin work (registering or joining agents) is not a master RPC
+    (`agent_register` is not in `MASTER_ALLOWED`); it is reachable only through
+    an approved command (a grant). Gate 1 and Gate 2 together keep grants out
+    of app conversations; a grant already issued in Home is not usable there
+    because `master_permission_use` is refused and the app profile lacks the
+    CLI verb.
+  - CLI belt: the session sets `CADENCE_CONVERSATION=app` and the CLI-side
+    master checks (`issue new`, `report file`, local reads) refuse when it is
+    set. This is defense in depth only; the control is Gate 1.
+- I11 (no spill across conversations): the master's tmp dir is per
+  conversation (`master/tmp/<conversation id>`), or cleared on a conversation
+  switch, so spilled tool output and the Pi read tool cannot reach another
+  conversation's files.
+- I12 (no persistent leak): app turns cannot write the wiki (including
+  `agents/master/knowledge/`); USER.md reaches app packs read-only and holds no
+  home or plan content; the app profile has no tool that writes it.
 - I7: a session serves one conversation; a pack contains only that
   conversation's delivered entries (so `/new` carries no prior content).
 - I8: operator-only actions (approvals, `audit approve`, effect
@@ -154,9 +196,16 @@ them, customer/segment subjects, parallel turns.
 | `conversation_switch_opens_new_provider_session` | I7 | switch rule | session reused, sees both |
 | `redeem_refuses_token_for_other_install_conversation` | I3 | install check | Social token redeems against CRM |
 | `delivery_drops_hint_and_slot_on_scope_mismatch` | I4 | delivery recheck | slot delivered for a mismatch |
-| `admin_verbs_refused_in_app_conversation` | I6 | `master_policy` narrowed allowlist | master registers an agent or proposes a plan from CRM chat |
+| `admin_rpcs_refused_in_app_conversation` | I6 | Gate 2 narrowed allowlist | `plan_propose`, `project_new`, `master_dispatch` succeed from CRM chat |
+| `permission_use_and_standing_rule_refused_in_app_conversation` | I6 | Gate 2 excludes `master_ask_permission`/`peek_grant`/`permission_use` | a standing `always` rule runs an approved command (e.g. `agent register`) with operator authority from an app turn |
+| `issue_new_and_report_file_refused_in_app_conversation` | I6 | Gate 1 app profile (Claude allowedTools and Pi guard) | the turn writes the tracker via `issue new` / `report file` |
+| `tracker_and_plan_reads_refused_in_app_conversation` | I6 | Gate 1 app profile; PM dir unreadable | `issue show` / `plan show` pulls home plan content into the app turn |
+| `app_profile_generated_per_session_from_conversation_row` | I6 | profile chosen at open from the stored scope | an app session launches with the Home rule set, or a prompt/param picks the profile |
+| `thread_read_limited_to_own_conversation` | I6 | Gate 2 conversation check | an app turn reads home or another app's conversation |
 | `unresolvable_running_message_fails_closed_to_app_allowlist` | I6 | fail-closed | admin call passes with no resolvable conversation |
-| `master_allowlist_exhaustive_per_scope` | I6 | table test over all methods | a new method is silently open to app turns |
+| `master_allowlist_exhaustive_per_scope` | I6 | table test over every daemon method, pins `MASTER_APP_ALLOWED` | a new method is silently open to app turns |
+| `wiki_write_refused_in_app_conversation` | I12 | Gate 1 and 2 exclude `wiki_*` | customer data persists into master knowledge read by home turns |
+| `master_tmp_not_shared_across_conversations` | I11 | per-conversation tmp / clear on switch | a CRM turn reads a home turn's spilled `issue show` output |
 | `detached_child_cannot_redeem_in_app_conversation` | I1,I3 | endpoint-session bind | setsid child redeems |
 | `agent_cannot_send_or_create_conversation` | I1 | `rpc_thread_send` and create proof | agent writes into an operator thread |
 | `concurrent_first_send_to_campaign_makes_one_conversation` | I2 | partial unique index | two rows or a lost send |
