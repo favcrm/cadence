@@ -484,18 +484,107 @@ fn cad565_message_read_refuses_forged_identity_fields() {
     assert_eq!(own.unwrap()["text"], "hi", "own read");
 }
 
+/// CAD-985: doctor probes `probe_bins` by fixed program name, so the
+/// smoke test gives it the setup.rs shape — a fake-CLI PATH and an
+/// isolated HOME — and counts the recorded invocations. Without the
+/// stub PATH this ran the host's real claude/codex/pi/devin/
+/// cursor-agent and tmux.
 #[test]
 fn cli_doctor_smoke() {
     let dir = TempDir::new().unwrap();
+    let fake_bin = dir.path().join("bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    // Every registry probe name is a stub; argv is recorded per program
+    // in calls/<name>. A probe_bins entry with no stub reports absent
+    // and leaves nothing in calls/ — the assertion below fails it.
+    for name in ["claude", "codex", "pi", "devin", "cursor-agent", "tmux"] {
+        let file = fake_bin.join(name);
+        std::fs::write(
+            &file,
+            format!("#!/bin/sh\necho \"$@\" >> \"$TMPDIR/calls/{name}\"\necho '{name} 0.0.0'\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // The support tools a stub's shell and doctor may reach for; each
+    // logs its own invocation, so nothing runs uncounted.
+    for name in ["sh", "echo", "git", "timeout"] {
+        let file = fake_bin.join(name);
+        std::fs::write(
+            &file,
+            format!("#!/bin/sh\necho \"$@\" >> \"$TMPDIR/calls/{name}\"\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let calls = dir.path().join("calls");
+    std::fs::create_dir_all(&calls).unwrap();
+    // PATH is the stub dir alone: any fixed-name program outside
+    // probe_bins (or a support tool we did not stub) reports absent
+    // instead of reaching the host's real binary.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
         .args(["--state-dir"])
-        .arg(dir.path())
+        .arg(dir.path().join("state"))
         .arg("doctor")
+        .env("HOME", dir.path().join("home"))
+        .env("TMPDIR", dir.path())
+        .env("PATH", &fake_bin)
+        .env_remove("CADENCE_PM_DIR")
+        .env_remove("CADENCE_HOME")
+        .env_remove("CADENCE_STATE_DIR")
+        .env_remove("CADENCE_ALIAS")
+        .env_remove("TMUX")
         .output()
         .unwrap();
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "doctor failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["checks"]["storage"]["ok"], true);
+    // Only the stubs ran: every probe_bins program reports the stub's
+    // version line, and calls/ holds exactly the probe argv.
+    let mut probed = std::collections::BTreeSet::new();
+    for spec in cadence_agent::adapter::registry::SPECS {
+        for (program, args) in spec.probe_bins {
+            probed.insert(*program);
+            assert_eq!(
+                report["checks"][program]["version"].as_str(),
+                Some(format!("{program} 0.0.0").as_str()),
+                "{program} was not the stub: {}",
+                report["checks"][program]
+            );
+            let expected = args.join(" ");
+            let recorded = std::fs::read_to_string(calls.join(program)).unwrap_or_default();
+            assert_eq!(
+                recorded.lines().filter(|l| *l == expected).count(),
+                1,
+                "{program} stub saw {recorded:?}, expected one `{expected}`"
+            );
+        }
+    }
+    let ran: std::collections::BTreeSet<String> = std::fs::read_dir(&calls)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    // Every probed program ran (asserted above); anything else in
+    // calls/ is either an allowlisted support tool or a fixed-name
+    // launch this test exists to catch.
+    let unexpected: Vec<&String> = ran
+        .iter()
+        .filter(|n| {
+            !probed.contains(n.as_str()) && !["sh", "echo", "git", "timeout"].contains(&n.as_str())
+        })
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "doctor launched an unlisted fixed-name program: {unexpected:?}"
+    );
 }
 
 /// The live entries a mock-claude sessions dir holds: `(pid, sessionId)`.
