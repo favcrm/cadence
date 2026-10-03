@@ -1771,7 +1771,7 @@ function CampaignWorkspace({
   // switches to General. Runs per campaign, never on every render.
   useEffect(() => {
     if (scope.contextId === "" || !viewer.operator) return;
-    void autoSelectCampaignConversation(scope.installId, campaignId, !viewer.readOnly).catch(() => undefined);
+    void autoSelectCampaignConversation(scope.installId, scope.contextId, campaignId, !viewer.readOnly).catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope.installId, scope.contextId, campaignId]);
   const seenAssistantSeq = useRef(0);

@@ -134,7 +134,7 @@ for (const forged of ["subject", "scope", "thread", "install_id", "is_general"])
 // /new and /clear create a fresh conversation, never a message.
 await type("/new");
 equal(messagePosts.length, 1, "/new is not sent as a message");
-equal(createPosts, [{ install: "install-crm", body: {} }], "/new creates one conversation with no subject");
+equal(createPosts, [{ install: "install-crm", body: { context_id: "ctx-a" } }], "/new creates one conversation with no subject");
 equal(picker().value, "new-1", "the fresh conversation is selected");
 assert(optionLabels().length === 3 && optionLabels().includes("General"), "older conversations stay listed");
 equal(box().value, "", "the command is cleared from the composer");
@@ -144,7 +144,7 @@ equal(createPosts.length, 2, "/clear creates another conversation");
 await React.act(async () => { newButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
 equal(createPosts.length, 3, "+ New is the same call");
-equal(createPosts.map((p) => p.body), [{}, {}, {}], "New never carries a subject");
+equal(createPosts.map((p) => p.body), [{ context_id: "ctx-a" }, { context_id: "ctx-a" }, { context_id: "ctx-a" }], "New never carries a subject");
 
 // Queued notice: the master is on another conversation's message while this one waits.
 await pick("c-camp");

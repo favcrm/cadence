@@ -146,7 +146,7 @@ export default function NewCampaignDialog({
         try {
           // CAD-1098: the brief goes to this campaign's own conversation
           // (opened idempotently, then selected for the chat panel).
-          const conversation = await openCampaignConversation(scope.installId, campaignId);
+          const conversation = await openCampaignConversation(scope.installId, scope.contextId, campaignId);
           await api.threadSend(
             MASTER,
             text,

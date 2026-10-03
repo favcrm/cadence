@@ -7,17 +7,20 @@ import type { MasterState } from "../../lib/types";
 import { EMPTY_THREAD, loadThread, type PageReader, type ThreadEntry, type ThreadState, type PendingMessage } from "../home/thread";
 
 /**
- * CAD-1098 S3: the UI's one view of per-app assistant conversations
+ * CAD-1098: the UI's one view of per-app assistant conversations
  * (docs/design/CAD-1098-per-app-threads.md). Every wire shape lives
- * here and in the four `api.ts` call sites it wraps, so wiring to the
- * daemon's final shapes is a change to this file.
+ * here and in the four `api.ts` call sites it wraps.
  *
- * Assumed wire (reconcile with S1):
+ * Wire (the daemon's final shapes):
  * - `GET  /api/app-installations/<install>/conversations`
- *     -> `{ conversations: [{ id, title?, subject?, is_general, archived?, updated? }] }`
- *     The list always carries the install's General conversation.
- * - `POST /api/app-installations/<install>/conversations` `{ subject? }`
- *     -> `{ conversation: {...} }` (idempotent per subject; none = always new).
+ *     -> `{ alias, install_id, general, conversations: [{ id, title, subject,
+ *        context_id, is_general, archived, created, updated }] }`
+ *     The list always carries the install's General conversation (the
+ *     daemon ensures it). An unknown install is 404.
+ * - `POST /api/app-installations/<install>/conversations`
+ *     `{ context_id, subject?, general? }` -> `{ conversation, created }`
+ *     (operator-only; idempotent per subject; none = always new; the daemon
+ *     proves install, context and campaign).
  * - `GET  /api/threads/master?conversation=<id>` and the stream take the id.
  * - `POST /api/threads/master/messages` body `conversation: <id>` — a selector
  *   only; the daemon resolves install, subject and scope.
@@ -94,12 +97,16 @@ const inflight = new Map<string, Promise<Conversation>>();
 
 /** Create (or, for a subject, open) a conversation, then refresh the list.
  *  Concurrent calls for the same install and subject share one request. */
-export function createConversation(installId: string, subject?: string): Promise<Conversation> {
+export function createConversation(
+  installId: string,
+  contextId: string,
+  subject?: string,
+): Promise<Conversation> {
   const key = `${installId}|${subject ?? ""}`;
   const pending = inflight.get(key);
   if (pending && subject) return pending;
   const run = api
-    .conversationCreate(installId, subject)
+    .conversationCreate(installId, contextId, subject)
     .then((raw) => {
       const c = parseConversation(raw.conversation);
       if (!c) throw new Error("The assistant did not return a conversation.");
@@ -117,9 +124,13 @@ export function createConversation(installId: string, subject?: string): Promise
 
 /** The campaign's conversation id (created idempotently); null when the
  *  daemon predates conversations, so the caller keeps the home thread. */
-export async function openCampaignConversation(installId: string, campaignId: string): Promise<string | null> {
+export async function openCampaignConversation(
+  installId: string,
+  contextId: string,
+  campaignId: string,
+): Promise<string | null> {
   try {
-    return (await createConversation(installId, campaignSubject(campaignId))).id;
+    return (await createConversation(installId, contextId, campaignSubject(campaignId))).id;
   } catch (e) {
     if (e instanceof ApiError && e.status === 404) return null;
     throw e;
@@ -131,6 +142,7 @@ export async function openCampaignConversation(installId: string, campaignId: st
  *  existing one. Failure leaves the current selection (never blocks the page). */
 export async function autoSelectCampaignConversation(
   installId: string,
+  contextId: string,
   campaignId: string,
   canCreate: boolean,
 ): Promise<void> {
@@ -138,7 +150,7 @@ export async function autoSelectCampaignConversation(
   if (res.get().data === null) await res.refresh();
   const existing = res.get().data?.conversations.find((c) => c.subject === campaignSubject(campaignId));
   if (existing) return selectConversation(installId, existing.id);
-  if (canCreate && res.get().data?.legacy === false) await createConversation(installId, campaignSubject(campaignId));
+  if (canCreate && res.get().data?.legacy === false) await createConversation(installId, contextId, campaignSubject(campaignId));
 }
 
 // --- threads -------------------------------------------------------------

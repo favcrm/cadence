@@ -820,7 +820,7 @@ function ChatPane({
     if (!canCreate || creating) return;
     setCreating(true);
     setSendError(null);
-    createConversation(installId)
+    createConversation(installId, binding.scope?.context_id ?? "")
       .catch((e: unknown) => setSendError(e instanceof ApiError ? e.message : String(e)))
       .finally(() => setCreating(false));
   };

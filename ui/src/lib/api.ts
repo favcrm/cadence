@@ -392,11 +392,15 @@ export const api = {
   /** `GET /api/app-installations/<id>/conversations` (CAD-1098; wire shape owned by conversationClient). */
   conversationList: (installId: string) =>
     get<Record<string, unknown>>(`/api/app-installations/${encodeURIComponent(installId)}/conversations`),
-  /** `POST` the same path: `subject` (`campaign:<id>`) is idempotent, none always makes a new one. */
-  conversationCreate: (installId: string, subject?: string) =>
+  /**
+   * `POST` the same path: `context_id` is the proven context the
+   * conversation is made under (the daemon proves install, context and
+   * campaign); `subject` (`campaign:<id>`) is idempotent, none always makes a new one.
+   */
+  conversationCreate: (installId: string, contextId: string, subject?: string) =>
     post<Record<string, unknown>>(
       `/api/app-installations/${encodeURIComponent(installId)}/conversations`,
-      subject ? { subject } : {},
+      subject ? { context_id: contextId, subject } : { context_id: contextId },
     ),
   /**
    * `POST /api/needs/<verb>` — the rail's snooze/dismiss (CAD-574);
