@@ -118,3 +118,8 @@ codegen-units = 256
 debug = 0
 incremental = false
 lto = false
+
+# Dependencies keep opt-level 1; the one workspace crate is front-end bound,
+# so skipping its LLVM optimisation is the cheap win (CAD-1103 measurements).
+[profile.ci.package.cadence-agent]
+opt-level = 0
