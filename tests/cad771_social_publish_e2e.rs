@@ -421,6 +421,8 @@ struct HttpSender {
     /// CAD-1041: a one-shot hook run while `key` stages — a test moves the
     /// row between the send-now staging and its claim.
     during_stage: Mutex<HashMap<String, StageHook>>,
+    /// CAD-1041: scripted status refusals by key (no wire call).
+    status_refusals: Mutex<HashMap<String, &'static str>>,
 }
 
 type StageHook = Box<dyn FnOnce() + Send>;
@@ -441,7 +443,15 @@ impl HttpSender {
             preflights: Mutex::new(HashMap::new()),
             execute_refusals: Mutex::new(HashMap::new()),
             during_stage: Mutex::new(HashMap::new()),
+            status_refusals: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn script_status_refusal(&self, key: &str, code: &'static str) {
+        self.status_refusals
+            .lock()
+            .unwrap()
+            .insert(key.into(), code);
     }
 
     fn on_stage(&self, key: &str, hook: StageHook) {
@@ -643,6 +653,14 @@ impl cadence_agent::platform::agenticos_external::publish::PublishSender for Htt
     > {
         if let Some(forged) = self.status_forgeries.lock().unwrap().get(key) {
             return Ok(forged.clone());
+        }
+        if let Some(code) = self.status_refusals.lock().unwrap().get(key) {
+            return Err(
+                cadence_agent::platform::agenticos_external::publish::Refusal::new(
+                    *code,
+                    "scripted: status unavailable",
+                ),
+            );
         }
         let verdict = self.post("/v1/device/publish/status", &json!({"key": key}));
         let empty = SendBinding {
@@ -3103,6 +3121,39 @@ fn cad1041_board_send_now_refuses_agent_and_member_sessions() {
     );
     assert_eq!(door.stages(), 0, "a refused write staged");
     assert_eq!(*door.calls.lock().unwrap(), 0, "a refused write sent");
+}
+
+/// CAD-1041 (should-fix): when the send lost its response and the one
+/// status read is refused, the row stays processing (never a second
+/// send) and the reply names the refusal instead of dropping it.
+#[test]
+fn cad1041_refused_status_read_is_reported_not_dropped() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snstat");
+    let (id, key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-stat",
+        epoch_now(),
+    );
+    sender.set_behavior(&key, FakeProviderBehavior::LoseResponseAfterAccept);
+    sender.script_status_refusal(&key, "reconnect_needed");
+    let out = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap();
+    assert_eq!(out["intent"]["state"], "processing", "{out}");
+    let error = out["status_error"].as_str().unwrap_or("");
+    assert!(error.contains("reconnect_needed"), "{out}");
+    assert_eq!(*door.calls.lock().unwrap(), 1, "the one exec POST only");
 }
 
 #[test]

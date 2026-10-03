@@ -526,8 +526,15 @@ impl Shared {
         }
         // Still processing and no settled upstream: one status read.
         let key = after["intent"]["request"].as_str().unwrap_or("").to_owned();
-        let Ok(outcome) = sender.status(&key) else {
-            return Ok(after);
+        // A refused status read leaves the row processing (safe: no second
+        // send); the reply names the refusal so the operator sees why.
+        let outcome = match sender.status(&key) {
+            Ok(outcome) => outcome,
+            Err(refusal) => {
+                let mut after = after;
+                after["status_error"] = json!(refusal.to_string());
+                return Ok(after);
+            }
         };
         let settled = self
             .store
