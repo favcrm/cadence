@@ -27,6 +27,13 @@ this workflow exactly.
   stack a PR on an unmerged branch: squash merges break the stack. Before
   asking for review, `git fetch origin && git rebase origin/main` so the
   reviewed head is current; after approval, rebase only if the PR conflicts.
+- Size PRs by what works, not by line count (CAD-1107). One PR delivers the
+  ticket's acceptance end to end, usually a few hundred to about 1,000
+  lines. Tickets may stay small for tracking, but sub-tickets of one feature
+  ship in ONE PR that names them all. Split only (a) per repository, or (b)
+  to keep a small trigger 1/3 part on the two-review path so the rest needs
+  one. Review fixes and finished follow-up parts go into the same open PR,
+  not a new slice. A PM or brief never sets a per-PR line cap.
 
 ### Design note in the PR (CAD-957, revised by CAD-1099)
 When a change touches a daemon-enforced rule (gate, lease, lock, fence,
