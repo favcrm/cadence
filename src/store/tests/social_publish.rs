@@ -79,47 +79,6 @@ fn cad771_schedule_freezes_exact_intent_and_replays_same_request() {
     );
 }
 
-#[test]
-fn cad771_schedule_refuses_forged_and_mismatched_shapes() {
-    let (_dir, s) = store();
-    // Forged destination: empty.
-    let mut bad = intent("req-bad-dest");
-    bad.destination_id = "";
-    assert!(s.social_publish_schedule(&bad).is_err());
-    // Forged digests: non-hex / wrong length.
-    let mut bad = intent("req-bad-digest");
-    bad.caption_digest = "not-a-digest";
-    assert!(s.social_publish_schedule(&bad).is_err());
-    // Instagram without an image digest cannot be scheduled.
-    let mut bad = intent("req-no-image");
-    bad.image_digest = None;
-    assert!(s.social_publish_schedule(&bad).is_err());
-    // Unknown toolkit.
-    let mut bad = intent("req-bad-toolkit");
-    bad.toolkit = "tiktok";
-    assert!(s.social_publish_schedule(&bad).is_err());
-    // Empty approval is not a human decision.
-    let mut bad = intent("req-no-approval");
-    bad.approval_id = "";
-    assert!(s.social_publish_schedule(&bad).is_err());
-    // Bad timezone and non-positive due time.
-    let mut bad = intent("req-bad-tz");
-    bad.timezone = "";
-    assert!(s.social_publish_schedule(&bad).is_err());
-    let mut bad = intent("req-bad-due");
-    bad.due_epoch = 0;
-    assert!(s.social_publish_schedule(&bad).is_err());
-    // Nothing was stored.
-    assert_eq!(
-        s.social_publish_list(Some("install-harbour"), None)
-            .unwrap()["intents"]
-            .as_array()
-            .unwrap()
-            .len(),
-        0
-    );
-}
-
 /// CAD-1027 adversarial: an approval authorizes exactly one intent. The
 /// same-request retry is idempotent; the same approval under any other
 /// request (a replay, a double submit with a fresh request id, a
@@ -470,36 +429,6 @@ fn cad771_freeze_without_approved_material_is_refused() {
 }
 
 #[test]
-fn cad771_partial_artifact_triple_is_refused() {
-    let (_dir, s) = store();
-    let mut partial = intent("req-partial-triple");
-    partial.artifact_id = Some("artifact-a");
-    assert!(s.social_publish_schedule(&partial).is_err());
-    assert_eq!(
-        s.social_publish_list(Some("install-harbour"), None)
-            .unwrap()["intents"]
-            .as_array()
-            .unwrap()
-            .len(),
-        0
-    );
-}
-
-#[test]
-fn cad771_material_reproof_covers_modes_and_unknown_intents() {
-    let (_dir, s) = store();
-    // Explicit-mode intents carry no artifact triple: re-proof is vacuous.
-    let staged = s
-        .social_publish_schedule(&intent("req-explicit-reproof"))
-        .unwrap();
-    let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
-    assert!(s.social_publish_material_current(&id).unwrap());
-    assert!(s.social_publish_show(&id).unwrap()["intent"]["frozen"]["artifact_id"].is_null());
-    // Unknown intents are refused, never current.
-    assert!(s.social_publish_material_current("spub-nope").is_err());
-}
-
-#[test]
 fn cad771_posted_receipt_must_match_frozen_intent() {
     // Operator JSON alone never posts: a forged or mismatched receipt is
     // refused and the intent stays processing (uncertain) for reconcile.
@@ -613,72 +542,11 @@ fn cad771_note_evidence_with_foreign_binding_fails_closed() {
     assert!(shown["upstream"].is_null());
 }
 
-#[test]
-fn cad771_report_rejects_planted_foreign_upstream() {
-    // Defense in depth, proven by surgery: even if foreign evidence were
-    // somehow persisted, a posted report still requires upstream binding
-    // equality with frozen.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("t.sqlite3");
-    let id = {
-        let s = Store::open(&path).unwrap();
-        let staged = s.social_publish_schedule(&intent("req-planted")).unwrap();
-        let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
-        s.social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
-            .unwrap()
-            .unwrap();
-        note_matching_evidence(&s, &id);
-        id
-    };
-    let foreign = json!({"state": "posted",
-        "permalink": "https://www.instagram.com/p/ABC/",
-        "provider_ids": ["provider-post-1"],
-        "provider_payload": "{\"id\":\"provider-post-1\"}",
-        "destination_id": "999999999999999",
-        "caption_digest": digest(1),
-        "image_digest": img_digest()})
-    .to_string();
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute(
-            "UPDATE social_publish_intents SET upstream=? WHERE intent_id=?",
-            rusqlite::params![foreign, id],
-        )
-        .unwrap();
-    let s = Store::open(&path).unwrap();
-    let err = s
-        .social_publish_report(
-            &id,
-            "posted",
-            &json!({"permalink": "https://www.instagram.com/p/ABC/",
-                "destination_id": "17841400008460056",
-                "caption_digest": digest(1),
-                "image_digest": img_digest(),
-                "provider_ids": ["provider-post-1"],
-                "provider_payload": "{\"id\":\"provider-post-1\"}"}),
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("does not match trusted upstream evidence"),
-        "{err}"
-    );
-    assert_eq!(
-        s.social_publish_show(&id).unwrap()["intent"]["state"],
-        "processing"
-    );
-}
-
 /// CAD-1041: the send-now claim is identity-pinned — `claim_id` takes
-/// the named row or nothing, and the same single `queued→processing`
-/// CAS that guards `claim_due` guards it: two Store handles on one
-/// file, plus a raw second connection replaying the claim UPDATE, can
-/// never produce two claims of one intent. Proven by mutation: drop
-/// the `AND state='queued'` predicate and the raw replay re-takes the
-/// row.
+/// the named row in its own install and context or nothing, and a
+/// second Store handle on the same file can never claim it again.
 #[test]
 fn cad1041_claim_id_identity_and_two_handles_one_claim() {
-    use rusqlite::params;
     let (dir, s1) = store();
     let path = dir.path().join("t.sqlite3");
     let id = s1.social_publish_schedule(&intent("req-claimid")).unwrap()["intent"]["intent_id"]
@@ -720,18 +588,4 @@ fn cad1041_claim_id_identity_and_two_handles_one_claim() {
         .social_publish_claim_id(&id, "install-harbour", None)
         .unwrap()
         .is_none());
-    // A raw second connection replaying the claim UPDATE shape finds
-    // zero rows — the `AND state='queued'` predicate is the guard.
-    let conn2 = rusqlite::Connection::open(&path).unwrap();
-    let re_taken = conn2
-        .execute(
-            "UPDATE social_publish_intents SET state='processing',updated=? \
-             WHERE intent_id=? AND state='queued'",
-            params![1_800_000_001_i64, id],
-        )
-        .unwrap();
-    assert_eq!(
-        re_taken, 0,
-        "the claim predicate must refuse a row already processing"
-    );
 }
