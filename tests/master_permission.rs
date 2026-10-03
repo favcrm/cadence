@@ -453,7 +453,7 @@ fn a_rejected_history_is_retried_once_then_fails() {
     let m = settled(d, "h1");
     assert_eq!(m["state"], "failed", "{m}");
     assert!(m.to_string().contains("invalid_request"), "{m}");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Settled is final: the reset and the retry both precede it.
     assert_eq!(new_sessions(d), before + 1, "one reset for h1");
     let resets = d
         .events("master")
