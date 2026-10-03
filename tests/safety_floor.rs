@@ -167,7 +167,7 @@ fn safety_floor_suite_lock_serializes_review() {
     let ready = host.path("gate-ready");
     let ran = host.path("suite-ran");
     std::fs::write(repo.join("cadence-review.toml"), format!(
-        "prepare = []\ngates = ['touch {}']\nfull_suite = 'touch {}'\ntest_globs = ['tests/**']\ntest_command = 'echo {test}'\n",
+        "prepare = []\ngates = ['touch {}']\nfull_suite = 'touch {}'\ntest_globs = ['tests/**']\ntest_command = 'echo {{test}}'\n",
         ready.display(), ran.display()
     )).unwrap();
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
