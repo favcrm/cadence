@@ -900,6 +900,11 @@ fn ui_relative_state_dir_board_is_found_from_any_cwd() {
     );
     assert!(ok, "{out}");
     let board = out["pid"].as_i64().unwrap();
+    let (_, out) = cli_run(pm.path(), &st, Some(pm.path()), &["ui", "status"], none);
+    assert_eq!(out["state"], "running", "{out}");
+    assert_eq!(out["pid"], board);
+    // The argv itself is absolute too, so a reader that cannot see the
+    // board's cwd still matches it.
     let argv = std::fs::read(format!("/proc/{board}/cmdline")).unwrap();
     let argv: Vec<&[u8]> = argv.split(|b| *b == 0).collect();
     let dir = argv.iter().position(|a| *a == b"--state-dir").unwrap() + 1;
@@ -907,7 +912,4 @@ fn ui_relative_state_dir_board_is_found_from_any_cwd() {
         argv[dir].starts_with(b"/"),
         "relative --state-dir in board argv"
     );
-    let (_, out) = cli_run(pm.path(), &st, Some(pm.path()), &["ui", "status"], none);
-    assert_eq!(out["state"], "running", "{out}");
-    assert_eq!(out["pid"], board);
 }
