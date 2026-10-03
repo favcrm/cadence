@@ -1810,3 +1810,31 @@ fn fixture_third_app_installs_and_serves_its_own_chat_descriptor_and_screen() {
     .unwrap();
     assert_eq!(pkg.app, "notes-fixture");
 }
+
+/// CAD-1123 HP1 image channel: the board reads a generated image through
+/// `GET /api/app-capability-results/<id>/asset`, relayed to the daemon's
+/// `app_run_capability_asset` behind the same operator-read gate as the
+/// other app-run reads. An agent caller and a request with no operator
+/// session are refused at the board; the operator's session reaches the
+/// daemon (an unknown receipt is the daemon's refusal, not a missing route).
+#[test]
+fn cad1123_board_capability_asset_route_is_an_operator_read() {
+    let (board, _state, _rest) = http::start(gx_with(false));
+    let path = "/api/app-capability-results/receipt-none/asset";
+    let (status, reply) = board.call("agent:w1", "GET", path, None);
+    assert!(
+        matches!(status, 401 | 403),
+        "agent read the asset route: {status} {reply}"
+    );
+    let (status, reply) = board.call("anonymous", "GET", path, None);
+    assert!(
+        matches!(status, 401 | 403),
+        "sessionless read of the asset route: {status} {reply}"
+    );
+    let (status, reply) = board.call("operator", "GET", path, None);
+    let error = reply["error"].as_str().unwrap_or_default();
+    assert!(
+        status == 400 && error.contains("capability asset"),
+        "operator did not reach app_run_capability_asset: {status} {reply}"
+    );
+}
