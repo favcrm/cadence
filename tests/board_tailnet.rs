@@ -837,7 +837,8 @@ fn ui_pidfile_names_only_this_state_dirs_board() {
         std::fs::write(&pidf, pid.to_string()).unwrap();
         cli_env(pm.path(), st, &["ui", "status"], none).1
     };
-    let mut other = Command::new("sleep").arg("600").spawn().unwrap();
+    // Killed on drop, a panic included.
+    let other = UiProc(Command::new("sleep").arg("600").spawn().unwrap());
     let (tx, rx) = std::sync::mpsc::channel();
     let (done, wait) = std::sync::mpsc::channel::<()>();
     let t = thread::spawn(move || {
@@ -846,7 +847,7 @@ fn ui_pidfile_names_only_this_state_dirs_board() {
         let _ = wait.recv();
     });
     let own_tid = rx.recv().unwrap();
-    for pid in [other.id() as i32, own_tid, 1] {
+    for pid in [other.0.id() as i32, own_tid, 1] {
         let out = status(pid);
         assert_eq!(out["state"], "stopped", "planted pid {pid}: {out}");
         assert!(!pidf.exists(), "planted pid {pid} kept as the board");
@@ -856,11 +857,10 @@ fn ui_pidfile_names_only_this_state_dirs_board() {
 
     // The incident: a stale live pid must not stand in for the board.
     let _ui = DetachedUi(st.to_path_buf());
-    std::fs::write(&pidf, other.id().to_string()).unwrap();
+    std::fs::write(&pidf, other.0.id().to_string()).unwrap();
     let port = port.to_string();
     let (ok, out) = cli_env(pm.path(), st, &["ui", "start", "--port", &port], none);
-    let _ = other.kill();
-    let _ = other.wait();
+    drop(other);
     assert!(ok, "{out}");
     assert_eq!(out["state"], "started", "{out}");
     let board = out["pid"].as_i64().unwrap() as i32;
