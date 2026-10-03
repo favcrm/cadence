@@ -32,7 +32,7 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const AppShell = require("../src/features/app-shell/AppShell").default;
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
-const { parseSlash } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
+const { parseSlash, autoSelectCampaignConversation } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
 
 equal([parseSlash("/new"), parseSlash(" /CLEAR "), parseSlash("/new now"), parseSlash("hello")], ["new", "new", null, null], "only the bare commands are commands");
 
@@ -145,6 +145,21 @@ await React.act(async () => { newButton().dispatchEvent(new MouseEvent("click", 
 await settle();
 equal(createPosts.length, 3, "+ New is the same call");
 equal(createPosts.map((p) => p.body), [{ context_id: "ctx-a" }, { context_id: "ctx-a" }, { context_id: "ctx-a" }], "New never carries a subject");
+
+// Create-on-first-send: opening a campaign page creates nothing; the first message
+// creates the conversation (idempotent subject) and is sent to the returned id.
+{
+  const createsBefore = createPosts.length, sendsBefore = messagePosts.length;
+  await React.act(async () => { await autoSelectCampaignConversation("install-crm", "cmp-fresh"); });
+  await settle();
+  equal(createPosts.length, createsBefore, "opening a campaign page creates no conversation");
+  assert(optionLabels().includes("New campaign conversation (unsaved)"), "the campaign conversation shows as new");
+  await type("first brief");
+  equal(createPosts.length, createsBefore + 1, "exactly one create on first send");
+  equal(createPosts[createPosts.length - 1].body, { context_id: "ctx-a", subject: "campaign:cmp-fresh" }, "the create names the campaign subject");
+  equal(messagePosts.length, sendsBefore + 1, "the first message is sent");
+  equal(messagePosts[messagePosts.length - 1].conversation, `new-${created}`, "sent to the id the create returned");
+}
 
 // Queued notice: the master is on another conversation's message while this one waits.
 await pick("c-camp");

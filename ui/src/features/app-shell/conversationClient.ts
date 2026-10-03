@@ -137,20 +137,18 @@ export async function openCampaignConversation(
   }
 }
 
-/** Campaign page entry: switch the chat to this campaign's conversation.
- *  A writer creates it if missing; a read-only viewer only selects an
- *  existing one. Failure leaves the current selection (never blocks the page). */
+/** Campaign page entry: switch the chat to this campaign's conversation
+ *  if it exists; otherwise show it as new (unsaved). Opening a page never
+ *  creates a conversation — the first send does (create-on-first-send). */
 export async function autoSelectCampaignConversation(
   installId: string,
-  contextId: string,
   campaignId: string,
-  canCreate: boolean,
 ): Promise<void> {
   const res = conversationList(installId);
   if (res.get().data === null) await res.refresh();
   const existing = res.get().data?.conversations.find((c) => c.subject === campaignSubject(campaignId));
   if (existing) return selectConversation(installId, existing.id);
-  if (canCreate && res.get().data?.legacy === false) await createConversation(installId, contextId, campaignSubject(campaignId));
+  if (res.get().data?.legacy === false) setDraftSubject(installId, campaignSubject(campaignId));
 }
 
 // --- threads -------------------------------------------------------------
@@ -202,7 +200,19 @@ const subscribe = (l: () => void) => {
   return () => void listeners.delete(l);
 };
 
+// An unsaved campaign conversation per install (client state only).
+const drafts = new Map<string, string>();
+export function setDraftSubject(installId: string, subject: string | null) {
+  if (subject === null) drafts.delete(installId);
+  else drafts.set(installId, subject);
+  notify();
+}
+export function useDraftSubject(installId: string): string | null {
+  return useSyncExternalStore(subscribe, () => drafts.get(installId) ?? null);
+}
+
 export function selectConversation(installId: string, id: string) {
+  drafts.delete(installId);
   writeKey(`chat-conv:${installId}`, id);
   notify();
 }
@@ -232,6 +242,8 @@ export interface ActiveConversation {
   error: string | null;
   conversations: Conversation[];
   selected: Conversation | null;
+  /** `campaign:<id>` while the chat shows a not-yet-created campaign conversation. */
+  draftSubject: string | null;
   /** The thread store the chat shows; null until a conversation resolves. */
   store: Resource<ThreadState> | null;
   retry: () => void;
@@ -242,25 +254,28 @@ export function useActiveConversation(installId: string): ActiveConversation {
   const res = conversationList(installId);
   const list = useQuery(res);
   const stored = useSelectedConversationId(installId);
+  const draft = useDraftSubject(installId);
   const retry = useCallback(() => void res.refresh(), [res]);
   const data = list.data;
   if (data === null && daemonLegacy) {
-    return { state: "legacy", error: null, conversations: [], selected: null, store: resources.masterThread, retry };
+    return { state: "legacy", error: null, conversations: [], selected: null, draftSubject: null, store: resources.masterThread, retry };
   }
   if (data === null) {
     const failed = list.status === "failed";
-    return { state: failed ? "failed" : "loading", error: failed ? (list.error ?? "request failed") : null, conversations: [], selected: null, store: null, retry };
+    return { state: failed ? "failed" : "loading", error: failed ? (list.error ?? "request failed") : null, conversations: [], selected: null, draftSubject: null, store: null, retry };
   }
   if (data.legacy) {
-    return { state: "legacy", error: null, conversations: [], selected: null, store: resources.masterThread, retry };
+    return { state: "legacy", error: null, conversations: [], selected: null, draftSubject: null, store: resources.masterThread, retry };
   }
-  const selected = resolveSelected(data.conversations, stored);
+  const draftOpen = draft !== null && !data.conversations.some((c) => c.subject === draft);
+  const selected = draftOpen ? null : resolveSelected(data.conversations, stored);
   return {
     state: "ready",
     error: null,
     conversations: data.conversations,
     selected,
-    store: selected ? conversationThread(selected.id) : null,
+    draftSubject: draftOpen ? draft : null,
+    store: draftOpen ? idleThread : selected ? conversationThread(selected.id) : null,
     retry,
   };
 }

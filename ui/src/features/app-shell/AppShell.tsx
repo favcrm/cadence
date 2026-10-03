@@ -27,6 +27,7 @@ import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from 
 import {
   QUEUED_NOTICE,
   conversationLabel,
+  conversationThread,
   conversationStreamUrl,
   createConversation,
   idleThread,
@@ -781,13 +782,15 @@ function ChatPane({
   const [sendError, setSendError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const loaded = thread.data !== null;
-  const usable = active.state === "legacy" || (active.state === "ready" && convId !== null);
+  const draftSubject = active.draftSubject;
+  const usable =
+    active.state === "legacy" || (active.state === "ready" && (convId !== null || draftSubject !== null));
 
   useEffect(() => {
     if (usable && !loaded) void store.refresh();
   }, [usable, loaded, store]);
   useEffect(() => {
-    if (!usable || !loaded || thread.data?.missing === true) return;
+    if (!usable || !loaded || thread.data?.missing === true || draftSubject !== null) return;
     const sub = streamInto(store, reduceFrame, {
       url: convId === null ? `/api/threads/${MASTER}/stream` : conversationStreamUrl(convId),
       events: ["entry"],
@@ -795,7 +798,7 @@ function ChatPane({
       onError: () => undefined,
     });
     return () => sub.close();
-  }, [store, usable, convId, loaded, thread.data?.missing]);
+  }, [store, usable, convId, loaded, thread.data?.missing, draftSubject]);
 
   const items = threadItems(thread.data);
   const tail = items.slice(-8);
@@ -840,18 +843,33 @@ function ChatPane({
     }
     const message = newMessageId();
     setSendError(null);
-    store.write((s) => addPending(s, message, body, Date.now()));
-    api
-      .threadSend(MASTER, body, message, undefined, binding.scope ?? undefined, convId ?? undefined)
-      .then(() => {
-        store.write((s) => settlePending(s, message, { ok: true }));
-        void resources.masterState.refresh();
-      })
-      .catch((e: ApiError) => {
-        setSendError(e.message ?? String(e));
-        store.write((s) => settlePending(s, message, { ok: false, error: e.message ?? String(e) }));
-      });
+    // Create-on-first-send: an unsaved campaign conversation is made
+    // (idempotently) right before its first message, then the message
+    // goes to the returned id.
+    const target: Promise<{ id: string | null; store: typeof store }> =
+      draftSubject !== null
+        ? createConversation(installId, binding.scope?.context_id ?? "", draftSubject).then((c) => ({
+            id: c.id,
+            store: conversationThread(c.id),
+          }))
+        : Promise.resolve({ id: convId, store });
     setDraft("");
+    void target.then(
+      ({ id, store: dest }) => {
+        dest.write((s) => addPending(s, message, body, Date.now()));
+        return api
+          .threadSend(MASTER, body, message, undefined, binding.scope ?? undefined, id ?? undefined)
+          .then(() => {
+            dest.write((s) => settlePending(s, message, { ok: true }));
+            void resources.masterState.refresh();
+          })
+          .catch((e: ApiError) => {
+            setSendError(e.message ?? String(e));
+            dest.write((s) => settlePending(s, message, { ok: false, error: e.message ?? String(e) }));
+          });
+      },
+      (e: unknown) => setSendError(e instanceof ApiError ? e.message : String(e)),
+    );
   };
 
   return (
@@ -887,10 +905,11 @@ function ChatPane({
             className="app-chat-conv-select text-secondary"
             aria-label="Conversation"
             value={convId ?? ""}
-            disabled={active.state !== "ready" || active.conversations.length === 0}
-            onChange={(e) => selectConversation(installId, e.target.value)}
+            disabled={active.state !== "ready" || (active.conversations.length === 0 && draftSubject === null)}
+            onChange={(e) => e.target.value !== "" && selectConversation(installId, e.target.value)}
           >
-            {active.conversations.length === 0 && <option value="">General</option>}
+            {active.conversations.length === 0 && draftSubject === null && <option value="">General</option>}
+            {draftSubject !== null && <option value="">New campaign conversation (unsaved)</option>}
             {active.conversations.map((c, i) => (
               <option key={c.id} value={c.id}>
                 {conversationLabel(c, i)}

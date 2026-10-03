@@ -825,8 +825,26 @@ impl Shared {
                     .and_then(|s| s.strip_prefix(crate::store::SUBJECT_CAMPAIGN));
                 records.app_content_proposal_list(&scoped.context, named.or(own))
             }
-            "app_content_assistant_proposal_show" => records
-                .app_content_proposal_show(&scoped.context, required_str(params, "proposal_id")?),
+            "app_content_assistant_proposal_show" => {
+                let shown = records.app_content_proposal_show(
+                    &scoped.context,
+                    required_str(params, "proposal_id")?,
+                )?;
+                // CAD-1098 I5: in a campaign conversation only that
+                // campaign's proposals are readable, whichever id is named.
+                if let Some(campaign) = shown
+                    .pointer("/proposal/campaign_id")
+                    .or_else(|| shown.get("campaign_id"))
+                    .and_then(Value::as_str)
+                {
+                    scoped.require_campaign(campaign)?;
+                } else if scoped.subject.is_some() {
+                    return Err(Error::rejected(
+                        "this conversation is about one campaign; the proposal names none",
+                    ));
+                }
+                Ok(shown)
+            }
             _ => Err(Error::rejected("unknown app assistant read method")),
         }
     }
