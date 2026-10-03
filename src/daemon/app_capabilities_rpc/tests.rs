@@ -11,7 +11,7 @@ fn fixture() -> (
     BindingProof,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let metadata = DeploymentMetadata::parse(br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@2","transport":"hosted-media-lease@1"}]}"#).unwrap();
+    let metadata = DeploymentMetadata::parse(br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#).unwrap();
     let mut opts = ServeOptions::default();
     opts.platforms.insert(
         agenticos_external::PLATFORM.into(),
@@ -97,10 +97,7 @@ fn cad868_builtin_discovery_binding_and_app_credential_are_registration_dependen
     assert_eq!(source["account"], "hosted");
     assert_eq!(source["connection_kind"], "builtin");
     assert_eq!(source["mapping"]["capability"], "social.read");
-    assert_eq!(
-        source["mapping"]["tool"],
-        "scrapecreators.instagram.user.posts"
-    );
+    assert_eq!(source["mapping"]["tool"], "read_instagram_posts");
     assert_eq!(source["mapping"]["effect"], "read");
     assert!(shared
         .app_capability_credential(&source)

@@ -25,8 +25,10 @@ use crate::platform::{AppCapabilityAsset, AppCapabilityOutput, AppCapabilityQuot
 use image::{image_mime, image_prompt, ASSET_LIMIT};
 
 pub const PLATFORM: &str = "agenticos_external";
-pub const MANIFEST_PIN: &str = "agenticos-external-provider-tools@2";
-const POSTS_TOOL: &str = "scrapecreators.instagram.user.posts";
+pub const MANIFEST_PIN: &str = "agenticos-external-provider-tools@3";
+/// CAD-1096: the generic workspace-visible source tool (AOS-140). The raw
+/// provider slug stays hidden from workspaces (AOS-103).
+const POSTS_TOOL: &str = "read_instagram_posts";
 const IMAGE_TOOL: &str = "generate_image";
 /// The only model the image slot may run; the price read and every job must
 /// echo it back.
@@ -56,9 +58,9 @@ pub(crate) fn image_plan_preflight(
 
 const TABLE_JSON: &str = r#"{
     "platform":"agenticos_external",
-    "manifest_version":"agenticos-external-provider-tools@2",
+    "manifest_version":"agenticos-external-provider-tools@3",
     "tools":[
-        {"tool":"scrapecreators.instagram.user.posts","effect":"read","scopes":["provider.read"],"label":"Read public Instagram profile posts"},
+        {"tool":"read_instagram_posts","effect":"read","scopes":["provider.read"],"label":"Read public Instagram profile posts"},
         {"tool":"generate_image","effect":"draft","scopes":["provider.draft"],"label":"Generate an image draft"}
     ]
 }"#;
@@ -1364,7 +1366,7 @@ mod tests {
     }
 
     fn hosted_adapter() -> AgenticosExternalAdapter {
-        let metadata = super::super::deployments::DeploymentMetadata::parse(br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@2","transport":"hosted-media-lease@1"}]}"#).unwrap();
+        let metadata = super::super::deployments::DeploymentMetadata::parse(br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#).unwrap();
         AgenticosExternalAdapter::hosted_media(metadata.hosted_media().unwrap()).unwrap()
     }
 
@@ -1834,6 +1836,8 @@ mod tests {
     }
 
     mod hosted_source;
+    #[cfg(feature = "test-seam")]
+    mod hosted_source_board;
 
     /// Poll, deadline and drift paths need the short test-seam clock.
     #[cfg(feature = "test-seam")]
@@ -2074,10 +2078,7 @@ mod tests {
                     Some("Bearer test-token")
                 );
                 if index == 0 {
-                    assert_eq!(
-                        request.url(),
-                        "/v1/runtime/tools/scrapecreators.instagram.user.posts"
-                    );
+                    assert_eq!(request.url(), "/v1/runtime/tools/read_instagram_posts");
                     request
                         .respond(tiny_http::Response::from_string(
                             json!({

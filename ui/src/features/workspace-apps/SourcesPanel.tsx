@@ -12,7 +12,9 @@ function verifiedReceipt(receipt: SourceReceipt, run: WorkspaceRun): boolean {
     && receipt.binding_digest === run.snapshot.capabilities?.source?.digest
     && result?.schema === 1 && result.kind === "social.source.posts"
     && result.provider === "agenticos_external"
-    && result.source_tool === "scrapecreators.instagram.user.posts"
+    // CAD-1096: receipts name the generic tool; older ones the raw slug.
+    && (result.source_tool === "read_instagram_posts"
+      || result.source_tool === "scrapecreators.instagram.user.posts")
     && result.handle === run.snapshot.inputs.profile_handle && Array.isArray(result.posts)
     && result.posts.length <= 24
     && (result.profile_verified === true || (result.profile_verified === false && result.posts.length === 0))
