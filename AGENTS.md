@@ -172,6 +172,106 @@ Bot reviews (Devin Review, CodeRabbit and similar) are advisory:
   to the new head, only after that head passes review.
 - Use `--admin` only in a declared emergency, never as routine.
 
+### Behavior-first verification and delivery outcomes (CAD-1071)
+
+Verify the promised behavior, not the shape of the implementation or the
+number of tests. A green suite is regression evidence, not product acceptance.
+These are working instructions, not a claim of new automated enforcement.
+
+- Before implementation, derive acceptance from the issue and reviewed design
+  contract: given state/input, expected observable result, relevant refusal or
+  recovery result, and forbidden side effects. Resolve consequential ambiguity;
+  do not derive expected results solely from the code the agent just wrote.
+- Map each promised outcome to an executable check or observed demonstration
+  in the appropriate isolated environment. Existing checks may suffice; do not
+  add a case just because a function changed. For bug fixes, run a reproduction
+  that fails on the defective behavior and passes after the fix. Setup/build
+  failures and empty selections are not evidence that the behavior was caught.
+- Iterate with focused behavior checks and sandbox probes, inspect actual
+  execution feedback, then repair. Prefer cheap state/property checks for logic;
+  use real process, RPC/HTTP, persistence and browser boundaries when their
+  wiring is the contract. Fakes cannot establish real-provider compatibility.
+  Do not turn every assertion into a slow end-to-end journey.
+- Select checks by the changed contract AND its consumers, not only changed
+  test filenames: a new CLI verb can affect help snapshots; a shared model can
+  break another target's compilation. Mandatory pre-push, admission/isolation,
+  independent review, Browser QA and required CI/merge-queue gates still apply.
+  A focused pass, temporary probe or LLM judgment does not replace those gates.
+- At handoff, record who ran each check, actual revision and any uncommitted
+  tree changes, command, selected scope and test count (where applicable), exit
+  status/result, and evidence artifact or log. Label earlier-head, stacked-head
+  and simulated-environment results explicitly; do not call them exact-final-
+  head or live-system proof. State skipped checks and limitations. If execution
+  is blocked, report it and use an authorized runner; never narrate an unrun pass.
+- Acceptance links each promised outcome to that evidence, including material
+  failure paths. Keep implemented, reviewed, merged, installed and operationally
+  verified distinct; do not touch production to obtain acceptance evidence.
+
+#### Rebuild tests from current contracts, not legacy inheritance
+
+Existing tests are migration evidence, not the specification of intended
+behavior and not an automatic reason to retain them. A clean-slate family
+replacement may remove obsolete or implementation-coupled tests, but it does
+not reduce the protected contracts or merge gates. A replacement PR must:
+
+1. Name the current intended behaviors, forbidden effects and required controls
+   it covers. Security/identity, agent and detached-child refusals, concurrency
+   and exactly-once behavior, RPC/HTTP parity, persistence/migration/recovery,
+   timing bounds, test isolation and fail-closed defaults remain required where
+   the system enforces them; gate inputs, inventory contracts, default-feature
+   refusal proofs and release test-seam exclusion are protected too. A logic
+   fake cannot replace a required boundary proof.
+2. In the same family-scoped PR, provide behavior checks for every still-
+   required contract it retires, or state the operator-approved reduced-
+   coverage transition and its exclusions. An authorization or delivery gate
+   may never retain an unprotected production effect merely because its legacy
+   test was removed. A genuinely obsolete contract needs a reviewed spec change.
+3. Demonstrate that a replacement catches the relevant wrong behavior with the
+   historical reproduction, a deliberate guard mutation or another concrete
+   counterexample; the failure must come from the behavioral assertion, not
+   broken setup. Independent reviewers verify the contract mapping and
+   execution evidence before removal. Temporary exploration probes alone are
+   not retained coverage.
+4. New development rebuilds checks for the behavior it changes rather than
+   recreating implementation-coupled suites. Consolidate redundant setup/cases
+   by shared behavior and update affected inventory/split maps and required
+   gate wiring without silently reducing protected contracts. Classify each
+   replacement PR from its own diff under existing risk/review rules; this
+   policy grants no approval or exception to them. Never skip, ignore or weaken
+   checks merely to get green.
+5. Do not claim equivalence or speed from deletion alone. Measure the
+   replacement on comparable runs, distinguish compile/setup, test execution,
+   admission/runner waits and workflow wall time, and list residual unprotected
+   contracts. Diagnose fixture failures rather than masking them with retries.
+
+#### Emergency clean-slate transition
+
+When the operator wants to retire the legacy suite without waiting for a full
+replacement, an explicit operator-approved ticket may declare a time-bounded
+transition and its merge gate. The declaration must name the deleted test scope,
+the reduced checks allowed to merge, residual controls, duration and how the
+normal gates return. An agent or PR may not grant that exception to itself.
+
+- During the window, an approved PR may remove the named legacy tests and merge
+  through only the approved reduced gate. The exception does not delete
+  production effects, authorization or enforcement code; it changes which
+  retained tests and required checks may be suspended for the named scope. A
+  documentation-only/non-logic diff may use the declared reduced gate instead
+  of the heavy compile/test pipeline where that gate has been explicitly
+  approved and wired; this section by itself does not alter required CI.
+- Changes merged under the transition must not produce release or production
+  artifacts, and cleanup cannot depend on unverified state. A check that still
+  protects a residual control remains mandatory; unknown or uncontrollable
+  effects stay outside the window.
+- Every reduced-gate PR still identifies the intended behavior and residual
+  unprotected contracts, records executed checks and limitations, and receives
+  the reviews/approval its own diff requires. A temporary gate cannot waive
+  the risk classification itself.
+- At expiry the declared restore criteria apply: the replacement behavior
+  checks or the restored mandatory controls must be present before ordinary
+  delivery resumes. The exception is evidence for a controlled transition, not
+  proof that the removed coverage was safe or equivalent.
+
 ### Checks: trust exit codes, not filtered text
 - A shell hook routes commands through `rtk`, which can print "clean" or
   nothing at all when a check really failed. It has hidden a
