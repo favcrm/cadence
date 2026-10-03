@@ -1640,9 +1640,9 @@ mod tests {
         assert!(!out.contains("never-in-the-message"));
         let date = out.lines().find(|l| l.starts_with("Date: ")).unwrap();
         assert!(date.ends_with(" +0000") && date.contains(", "), "{date}");
-        assert_eq!(sender_domain("x@y"), "y");
-        assert_eq!(sender_domain("no-at"), "cadence.invalid");
-        assert_eq!(sender_domain("a@b c"), "cadence.invalid");
+        let mut forged = message;
+        forged.idempotency_key = Some("k\r\nBcc: x@evil.test".into());
+        assert!(assemble_message(&envelope, &forged, "sha256:d").is_err());
     }
 
     #[test]
