@@ -253,7 +253,11 @@ impl Shared {
                     .unwrap_or_else(|e| e.into_inner());
                 let rows = self.connection_list_locked()?;
                 if method == "connection_list" {
-                    return Ok(json!({"connections":rows}));
+                    // `hosted_smtp`: enrolled senders send through the
+                    // hosted `smtp.internal` pass-through (CAD-1126).
+                    return Ok(
+                        json!({"connections":rows,"hosted_smtp":self.smtp_internal.is_some()}),
+                    );
                 }
                 let id = connection_id(params)?;
                 let row = rows

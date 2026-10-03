@@ -95,7 +95,8 @@ fn serve(mut stream: TcpStream, log: Arc<Mutex<Vec<Seen>>>, password: &str) {
         }
         buf.extend_from_slice(&chunk[..n]);
     }
-    let body: Value = serde_json::from_slice(&buf[head_end..head_end + length]).unwrap_or(Value::Null);
+    let body: Value =
+        serde_json::from_slice(&buf[head_end..head_end + length]).unwrap_or(Value::Null);
     let path = head
         .lines()
         .next()
@@ -129,7 +130,11 @@ fn serve(mut stream: TcpStream, log: Arc<Mutex<Vec<Seen>>>, password: &str) {
         );
     }
     if path == "/v1/verify" {
-        return reply(&mut stream, 200, &json!({"ok": true, "data": {"verified": true}}));
+        return reply(
+            &mut stream,
+            200,
+            &json!({"ok": true, "data": {"verified": true}}),
+        );
     }
     let to = body["envelope"]["to"].clone();
     reply(
@@ -342,7 +347,11 @@ fn scan_for(dir: &Path, needle: &[u8], hits: &mut Vec<PathBuf>) {
 #[test]
 fn hosted_smtp_goes_only_through_smtp_internal_and_the_secret_never_leaves_the_daemon() {
     // Built at runtime; never a literal in the source.
-    let password = format!("pw-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
+    let password = format!(
+        "pw-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
     let wrong = format!("bad-{}", uuid::Uuid::new_v4().simple());
     let relay = Fake::start(password.clone());
     let fx = Fx::start(Some(&relay));
@@ -351,12 +360,22 @@ fn hosted_smtp_goes_only_through_smtp_internal_and_the_secret_never_leaves_the_d
     // A wrong password is refused at connect, in plain words, with a
     // typed code, before anything is stored; the relay saw `/v1/verify`.
     let refused = fx
-        .rpc(Asserted::Operator, "connection_create", smtp_params("smtp.gmail.com", &wrong))
+        .rpc(
+            Asserted::Operator,
+            "connection_create",
+            smtp_params("smtp.gmail.com", &wrong),
+        )
         .unwrap_err();
     let refused_text = format!("{refused:?} {refused}");
-    assert!(refused_text.contains("check the app password"), "{refused_text}");
+    assert!(
+        refused_text.contains("check the app password"),
+        "{refused_text}"
+    );
     assert!(refused_text.contains("smtp_auth"), "{refused_text}");
-    assert!(!refused_text.contains(&wrong), "the error echoed the secret");
+    assert!(
+        !refused_text.contains(&wrong),
+        "the error echoed the secret"
+    );
     assert!(
         !fx.op("connection_list", json!({}))["connections"]
             .to_string()
@@ -369,14 +388,23 @@ fn hosted_smtp_goes_only_through_smtp_internal_and_the_secret_never_leaves_the_d
     // bind, read, nor send; the relay sees nothing more from them.
     let (install, context) = fx.campaign();
     let before = relay.count();
-    let connected = fx.op("connection_create", smtp_params("smtp.gmail.com", &password));
+    let connected = fx.op(
+        "connection_create",
+        smtp_params("smtp.gmail.com", &password),
+    );
     assert_eq!(relay.count(), before + 1, "enrolment verifies exactly once");
     let id = connected["connection"]["id"].as_str().unwrap().to_string();
     let before = relay.count();
     for who in [Asserted::Agent("writer".into()), Asserted::Unproven] {
         for (method, params) in [
-            ("connection_create", smtp_params("smtp.gmail.com", &password)),
-            ("connection_rotate", json!({"connection_id": id, "secret": password})),
+            (
+                "connection_create",
+                smtp_params("smtp.gmail.com", &password),
+            ),
+            (
+                "connection_rotate",
+                json!({"connection_id": id, "secret": password}),
+            ),
             ("connection_show", json!({"connection_id": id})),
             ("connection_list", json!({})),
             (
@@ -392,7 +420,11 @@ fn hosted_smtp_goes_only_through_smtp_internal_and_the_secret_never_leaves_the_d
             assert!(refusal.is_err(), "{method} must refuse {}", who.as_str());
         }
     }
-    assert_eq!(relay.count(), before, "a refused caller reached smtp.internal");
+    assert_eq!(
+        relay.count(),
+        before,
+        "a refused caller reached smtp.internal"
+    );
 
     // (a) The operator binds and test-sends: the relay receives the
     // RFC 5322 message and the credential, and no socket was dialled.
@@ -406,14 +438,27 @@ fn hosted_smtp_goes_only_through_smtp_internal_and_the_secret_never_leaves_the_d
         json!({"install_id": install, "context_id": context, "campaign_id": "launch-1", "to_email": RECIPIENT}),
     );
     assert_eq!(sent["receipt"]["accepted"], true, "{sent}");
-    let call = relay.seen().into_iter().rfind(|s| s.path == "/v1/send").unwrap();
+    let call = relay
+        .seen()
+        .into_iter()
+        .rfind(|s| s.path == "/v1/send")
+        .unwrap();
     assert_eq!(call.body["server"]["host"], "smtp.gmail.com");
     assert_eq!(call.body["server"]["password"], password.as_str());
     assert_eq!(call.body["envelope"]["from"], SENDER);
     assert_eq!(call.body["envelope"]["to"], json!([RECIPIENT]));
-    let message =
-        String::from_utf8(STANDARD.decode(call.body["message_b64"].as_str().unwrap()).unwrap()).unwrap();
-    for header in ["Date: ", "Message-ID: <", "MIME-Version: 1.0", "Subject: Spring launch"] {
+    let message = String::from_utf8(
+        STANDARD
+            .decode(call.body["message_b64"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    for header in [
+        "Date: ",
+        "Message-ID: <",
+        "MIME-Version: 1.0",
+        "Subject: Spring launch",
+    ] {
         assert!(message.contains(header), "missing {header}:\n{message}");
     }
     assert!(message.contains(&format!("To: <{RECIPIENT}>")));
@@ -446,9 +491,12 @@ fn hosted_smtp_goes_only_through_smtp_internal_and_the_secret_never_leaves_the_d
         .into_iter()
         .find(|s| s.body["envelope"]["to"] == json!(["amina@example.com"]))
         .unwrap();
-    let campaign_message =
-        String::from_utf8(STANDARD.decode(campaign.body["message_b64"].as_str().unwrap()).unwrap())
-            .unwrap();
+    let campaign_message = String::from_utf8(
+        STANDARD
+            .decode(campaign.body["message_b64"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
     assert!(campaign_message.contains("List-Unsubscribe: <https://board.example/unsubscribe/"));
     assert_eq!(
         cadence_agent::platform::smtp::direct_dial_count(),
@@ -468,5 +516,8 @@ fn hosted_smtp_goes_only_through_smtp_internal_and_the_secret_never_leaves_the_d
     let mut hits = Vec::new();
     scan_for(fx.root.path(), password.as_bytes(), &mut hits);
     scan_for(fx.root.path(), wrong.as_bytes(), &mut hits);
-    assert!(hits.is_empty(), "secret found on disk outside custody: {hits:?}");
+    assert!(
+        hits.is_empty(),
+        "secret found on disk outside custody: {hits:?}"
+    );
 }

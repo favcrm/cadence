@@ -228,6 +228,20 @@ pub(super) fn handle(
                     "custody_unprotected",
                     "the daemon refused to store the credential: custody is not isolated from managed agents — enrol only if you accept the same-user custody risk (the form's custody-risk acceptance), or isolate custody first",
                 ),
+                // CAD-1126: a hosted SMTP enrolment is verified live; its
+                // refusals carry a typed `smtp_*` code and the board speaks
+                // fixed words per code, never the daemon's text.
+                Some(code)
+                    if crate::platform::smtp_internal::wire_message(code).is_some() =>
+                {
+                    let message = crate::platform::smtp_internal::wire_message(code)
+                        .unwrap_or_default();
+                    let body = serde_json::to_vec_pretty(&json!({"error": message, "code": code}))
+                        .unwrap_or_default();
+                    let mut resp = Response::from_data(body).with_status_code(StatusCode(409));
+                    resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+                    return resp;
+                }
                 _ => {
                     let status = match error {
                         Error::Rejected(_) | Error::Structured(_) => 409,

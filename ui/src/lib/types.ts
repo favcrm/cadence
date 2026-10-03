@@ -1438,6 +1438,9 @@ export interface Connection {
 
 export interface ConnectionsPayload {
   connections: Connection[];
+  /** CAD-1126: enrolled SMTP senders send through the hosted
+   *  `smtp.internal` pass-through (a hosted workspace). */
+  hosted_smtp?: boolean;
 }
 
 export interface ConnectionPayload {

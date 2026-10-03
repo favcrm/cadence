@@ -184,7 +184,7 @@ impl SmtpInternal {
             // The relay's own message is advisory text; the words the
             // operator reads come from the typed code and step alone.
             return Reply::Failed {
-                message: plain_message(&code, &step),
+                message: plain_message(&code, &step).to_string(),
                 code,
                 step,
             };
@@ -241,7 +241,7 @@ fn error_code(code: &str) -> &'static str {
 
 /// Plain words for a `{code, step}` pair. The text never carries the
 /// server's banner, the address list or any secret.
-pub fn plain_message(code: &str, step: &str) -> String {
+pub fn plain_message(code: &str, step: &str) -> &'static str {
     match (code, step) {
         ("auth", _) => "Couldn't sign in: check the app password (and the username).",
         ("tls", _) => "Couldn't make a secure connection to the mail server. Check the security setting and port.",
@@ -260,7 +260,28 @@ pub fn plain_message(code: &str, step: &str) -> String {
         (_, "connect") => "Couldn't reach the mail server.",
         _ => "The mail server could not be used.",
     }
-    .to_string()
+}
+
+/// The board's fixed wording for one of this module's wire codes
+/// (`smtp_auth`, ...). `None` for any other code. The board never relays
+/// the daemon's message, only this table.
+pub fn wire_message(wire_code: &str) -> Option<&'static str> {
+    let code = match wire_code {
+        "smtp_auth" => "auth",
+        "smtp_tls" => "tls",
+        "smtp_connect" => "connect",
+        "smtp_dns" => "dns",
+        "smtp_private_host" => "private_host",
+        "smtp_port" => "port_not_allowed",
+        "smtp_timeout" => "timeout",
+        "smtp_rate" => "rejected",
+        "smtp_not_provisioned" => "not_provisioned",
+        "smtp_invalid" => "invalid",
+        "smtp_unreachable" => "unreachable",
+        "smtp_failed" | "smtp_unknown" => "",
+        _ => return None,
+    };
+    Some(plain_message(code, ""))
 }
 
 fn bounded(text: &str) -> String {
@@ -301,7 +322,7 @@ fn classify_sent(data: &Value, to: &str, secret: &[u8]) -> SmtpOutcome {
     if !rejected.is_empty() {
         return SmtpOutcome::Rejected {
             code: 550,
-            message: plain_message("recipient", "rcpt"),
+            message: plain_message("recipient", "rcpt").to_string(),
         };
     }
     SmtpOutcome::Uncertain {
@@ -335,10 +356,7 @@ mod tests {
     fn plain_words_never_echo_the_relay_text() {
         assert!(plain_message("auth", "auth").starts_with("Couldn't sign in"));
         assert!(plain_message("zzz", "auth").starts_with("Couldn't sign in"));
-        assert_eq!(
-            plain_message("", ""),
-            "The mail server could not be used."
-        );
+        assert_eq!(plain_message("", ""), "The mail server could not be used.");
     }
 
     #[test]
