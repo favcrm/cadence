@@ -272,19 +272,14 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 4
         run: cargo test --doc --locked
-      # CAD-1090: every top-level tests/*.rs target (safety_floor and the
-      # result tests), picked up by glob so a new file needs no edit here.
+      # CAD-1090: every cargo test target (scripts/result-test-args), with
+      # the test seam on and a 0-test target treated as a failure.
       - name: Run every integration test target
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         env:
           CARGO_BUILD_JOBS: 4
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
-          TMPDIR: ${{ runner.temp }}
-        run: |
-          targets=$(scripts/result-test-args)
-          echo "integration targets:" $(echo "$targets" | grep -v '^--test$')
-          # shellcheck disable=SC2086
-          cargo test --locked $targets -- --test-threads 2
+        run: scripts/run-result-tests
 
   build:
     needs: [queue-evidence, change-scope]
@@ -427,7 +422,7 @@ jobs:
   # Nothing `needs` it and it never fails the run.
   # CAD-926: it is also the ONLY saver of the gate jobs' rust-cache. One leg
   # per profile, each with its own target dir and the shared key the gates
-  # restore (gate-test: test-shard + test-once; gate-release: build + ui;
+  # restore (gate-test: test; gate-release: build + ui;
   # gate-clippy: clippy). The rust-cache step precedes `ci-sccache enable`
   # exactly as in the gates, because the cache key hashes RUST* env vars and
   # enable exports RUSTC_WRAPPER. The builds run without sccache too (the saved

@@ -41,8 +41,12 @@ class CleanupTests(unittest.TestCase):
         test = job(ci, "test")
         self.assertIn("cargo test --doc --locked", test)
         # CAD-1090: every tests/*.rs target, via the shared selection script.
-        self.assertIn("scripts/result-test-args", test)
-        self.assertIn("cargo test --locked $targets -- --test-threads 2", test)
+        self.assertIn("scripts/run-result-tests", test)
+        runner = (ROOT / "scripts/run-result-tests").read_text()
+        self.assertIn("scripts/result-test-args", runner)
+        for needle in ("--features test-seam", "--no-fail-fast", "--test-threads 2",
+                       "running 0 tests", "HOME=", "XDG_CONFIG_HOME="):
+            self.assertIn(needle, runner)
         selected = subprocess.run([str(ROOT / "scripts/result-test-args")],
                                   capture_output=True, text=True, check=True).stdout.split()
         self.assertIn("safety_floor", selected)
