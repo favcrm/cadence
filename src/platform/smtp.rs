@@ -1109,6 +1109,11 @@ pub enum SmtpOutcome {
     /// before a reply was read — acceptance is unknowable, so the
     /// row is NEVER retried; the operator resolves it.
     Uncertain { message: String },
+    /// CAD-1063: only the hosted platform path produces this — the
+    /// platform's approval ledger holds the key until the owner (or a
+    /// standing grant) clears it. Nothing was sent and nothing failed;
+    /// the same bytes under the same key may be presented again.
+    PendingApproval { message: String },
 }
 
 /// Where a dialog step failed.
@@ -1200,6 +1205,9 @@ pub fn send_outcome(
         Err(SmtpOutcome::Uncertain { message }) => SmtpOutcome::Uncertain {
             message: screened(&message, &envelope.secret),
         },
+        Err(SmtpOutcome::PendingApproval { message }) => SmtpOutcome::PendingApproval {
+            message: screened(&message, &envelope.secret),
+        },
     })
 }
 
@@ -1222,7 +1230,8 @@ pub fn send(
         SmtpOutcome::Deferred { message, .. }
         | SmtpOutcome::Rejected { message, .. }
         | SmtpOutcome::NotSubmitted { message }
-        | SmtpOutcome::Uncertain { message } => Err(Error::rejected(message)),
+        | SmtpOutcome::Uncertain { message }
+        | SmtpOutcome::PendingApproval { message } => Err(Error::rejected(message)),
     }
 }
 

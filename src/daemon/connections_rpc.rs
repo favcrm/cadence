@@ -47,18 +47,7 @@ impl Shared {
         let builtin = record.is_none();
         let id = match record {
             Some(r) => r.connection_id.clone(),
-            None => format!(
-                "builtin-{}",
-                uuid::Uuid::new_v5(
-                    &uuid::Uuid::NAMESPACE_OID,
-                    format!(
-                        "{}:{provider}:{account}",
-                        self.store.connection_workspace_id()?
-                    )
-                    .as_bytes()
-                )
-                .simple()
-            ),
+            None => self.builtin_connection_id(provider, account)?,
         };
         let custody_available = record.is_none()
             || platform::load_credential(&self.store, &self.platform_custody, provider, account)
@@ -68,19 +57,62 @@ impl Shared {
         // is never swallowed: the row stays an SMTP sender
         // (`smtp_sender`, decided from the exchange shape) with
         // `smtp: null` and a typed, secret-free `smtp_error`.
-        let smtp_sender =
-            matches!(record, Some(r) if r.exchange == platform::smtp::ENROLLMENT_SHAPE);
+        // CAD-1063: the hosted built-in `agenticos` account is the CRM
+        // sender on a hosted daemon. The platform sends, so it has no
+        // credential: never rotatable, never a typed custody fault.
+        let hosted_sender = record.is_none()
+            && provider == platform::agenticos::PLATFORM
+            && account == platform::agenticos::HOSTED_ACCOUNT
+            && self.hosted_email.is_some();
+        let smtp_sender = hosted_sender
+            || matches!(record, Some(r) if r.exchange == platform::smtp::ENROLLMENT_SHAPE);
         let (smtp, smtp_error) = match record {
             Some(record) if smtp_sender => match self.smtp_projection_typed(record) {
                 Ok(projection) => (Some(projection.to_json()), None),
                 Err(fault) => (None, Some(fault.code())),
             },
+            None if hosted_sender => (
+                self.hosted_email.as_ref().map(|h| h.projection().to_json()),
+                None,
+            ),
             _ => (None, None),
         };
         Ok(
             json!({"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"smtp":smtp,"smtp_sender":smtp_sender,"smtp_error":smtp_error,"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
         )
     }
+    /// The id of a built-in (credential-less) connection row.
+    pub(super) fn builtin_connection_id(&self, provider: &str, account: &str) -> Result<String> {
+        Ok(format!(
+            "builtin-{}",
+            uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!(
+                    "{}:{provider}:{account}",
+                    self.store.connection_workspace_id()?
+                )
+                .as_bytes()
+            )
+            .simple()
+        ))
+    }
+
+    /// CAD-1063: `Some` when `connection_id` names the hosted platform
+    /// sender on a daemon that has the hosted email door.
+    pub(super) fn hosted_sender(
+        &self,
+        connection_id: &str,
+    ) -> Result<Option<&crate::platform::hosted_email::HostedEmail>> {
+        let Some(hosted) = self.hosted_email.as_ref() else {
+            return Ok(None);
+        };
+        let id = self.builtin_connection_id(
+            platform::agenticos::PLATFORM,
+            platform::agenticos::HOSTED_ACCOUNT,
+        )?;
+        Ok((id == connection_id).then_some(hosted))
+    }
+
     /// Live non-secret SMTP material for one enrolled record.
     /// Custody-only: the secret never enters the projection by
     /// construction, and the projection is screened before return.
