@@ -285,8 +285,6 @@ fn reject_unknown_fields(params: &Value, allowed: &[&str], verb: &str) -> Result
 mod tests {
     use std::collections::BTreeMap;
 
-    use rusqlite::Connection;
-
     use super::*;
     use crate::store::app_content::Draft;
     use crate::store::app_contexts::ContextConfig;
@@ -403,14 +401,6 @@ mod tests {
             self.as_operator("thread_send", params)
         }
 
-        fn db(&self) -> Connection {
-            Connection::open(crate::rollout::db_file(self.dir.path())).unwrap()
-        }
-
-        fn count(&self, sql: &str) -> i64 {
-            self.db().query_row(sql, [], |r| r.get(0)).unwrap()
-        }
-
         fn entries_of(&self, thread: &str) -> Vec<store::ThreadEntry> {
             self.shared.store.thread_entries_of(thread, 0, 100).unwrap()
         }
@@ -519,5 +509,11 @@ mod tests {
             1
         );
         assert_ne!(list("install-2")["general"], list("install-1")["general"]);
+        let social = conv_id(&fx.create("install-2", &fx.social, json!({})).unwrap());
+        assert_eq!(
+            list("install-2")["conversations"].as_array().unwrap().len(),
+            2
+        );
+        assert!(fx.entries_of(&social).is_empty());
     }
 }
