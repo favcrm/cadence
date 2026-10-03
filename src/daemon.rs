@@ -1210,6 +1210,12 @@ impl Shared {
     /// CAD-1076: the provider refused this session's history and the
     /// adapter started a fresh session. Record why, and answer the
     /// retry's prompt: the same message behind a continuity pack.
+    ///
+    /// Known limit: a body near the 48 000-byte enqueue cap plus the
+    /// pack (up to `continuity::PACK_MAX`) can exceed the gateway's
+    /// 64 000-character per-message limit, so that one retry is refused
+    /// too and the message fails with the provider's 400. It never
+    /// loops. Lifting the limit depends on AOS-136 (gateway limits).
     fn after_session_reset(
         &self,
         agent: &store::Agent,
