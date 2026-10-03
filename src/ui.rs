@@ -1101,30 +1101,30 @@ pub(crate) fn board_identity(proc_root: &Path, pid: i32, state_dir: &Path) -> Bo
     }
 }
 
-/// `argv` is `<…/cadence> [--state-dir <dir>] … ui run …`. A board for
-/// another state dir is not ours; one with no `--state-dir` (an older
-/// spawn) is accepted on the rest of its argv.
-pub(crate) fn board_argv_matches(argv: &[String], state_dir: &Path) -> bool {
-    let Some((exe, args)) = argv.split_first() else {
-        return false;
-    };
+/// The `--state-dir` of a board argv — `<…/cadence> … --state-dir
+/// <dir> … ui run …`, as `start_inner` has always spawned it — or
+/// `None` for anything else, an argv without `--state-dir` included.
+pub(crate) fn board_argv_state_dir(argv: &[String]) -> Option<PathBuf> {
+    let (exe, args) = argv.split_first()?;
     if Path::new(exe).file_name().and_then(|n| n.to_str()) != Some("cadence")
         || !args.windows(2).any(|w| w[0] == "ui" && w[1] == "run")
     {
-        return false;
+        return None;
     }
-    let dir = args
-        .iter()
+    args.iter()
         .position(|a| a == "--state-dir")
         .and_then(|i| args.get(i + 1).cloned())
         .or_else(|| {
             args.iter()
                 .find_map(|a| a.strip_prefix("--state-dir=").map(str::to_string))
-        });
-    dir.is_none_or(|d| {
-        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        canon(Path::new(&d)) == canon(state_dir)
-    })
+        })
+        .map(PathBuf::from)
+}
+
+/// Is `argv` a board for `state_dir`?
+pub(crate) fn board_argv_matches(argv: &[String], state_dir: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    board_argv_state_dir(argv).is_some_and(|d| canon(&d) == canon(state_dir))
 }
 
 /// Tiny blocking GET — enough for health checks without an HTTP client
@@ -2500,7 +2500,8 @@ mod pidfile_tests {
         };
         assert!(ok(&["/r/cadence", "--state-dir", s, "ui", "run"]));
         assert!(ok(&["cadence", &format!("--state-dir={s}"), "ui", "run"]));
-        assert!(ok(&["cadence", "ui", "run", "--host", "127.0.0.1"]));
+        // No `--state-dir`: an allowlist names the dir, never assumes it.
+        assert!(!ok(&["cadence", "ui", "run", "--host", "127.0.0.1"]));
         assert!(!ok(&["/sbin/init", "splash"]));
         assert!(!ok(&["cadence", "--state-dir", s, "ui", "start"]));
         assert!(!ok(&["cadence", "--state-dir", "/elsewhere", "ui", "run"]));
