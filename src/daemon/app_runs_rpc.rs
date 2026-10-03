@@ -731,6 +731,8 @@ impl Shared {
 #[cfg(test)]
 mod cad1120_tests;
 #[cfg(test)]
+mod cad1123_acceptance;
+#[cfg(test)]
 mod cad1123_tests;
 
 #[cfg(test)]

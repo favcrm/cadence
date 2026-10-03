@@ -109,6 +109,12 @@ impl Fx {
         self.shared.store.agent(alias).unwrap()
     }
 
+    /// The fixture's daemon state dir (for sibling check files that open
+    /// the store or run a socket daemon over it).
+    pub(super) fn state(&self) -> std::path::PathBuf {
+        self._dir.path().to_path_buf()
+    }
+
     pub(super) fn owned(&self, alias: &str) -> bool {
         self.shared.lifecycle.lock().unwrap().owned(alias)
     }
