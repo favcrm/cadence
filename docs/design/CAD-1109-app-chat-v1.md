@@ -332,6 +332,11 @@ What chat adds (CAD-1110 implements; a host-side extension in the style of
   replaced by the plain-text rendering of the message.
 - Frame failure (mount refused, bad receipt, digest mismatch, timeout, port
   closed) falls back to plain text of the message and fires nothing else.
+- v1 chat frames are text and layout only. A frame cannot fetch (no session,
+  no URL, no ids), so it cannot show real images or slides. Image and asset
+  previews need a host-side asset push (the host fetches an approved asset of
+  that installation and pushes a bounded thumbnail), tracked in CAD-1114 under
+  the same declare-and-approve rule; see Out of scope.
 - The screen is part of the approved bundle: what it can do is what its
   bundle digest was approved to do, and in the board origin it can do nothing.
 
@@ -716,6 +721,8 @@ cc13-pm). No open decisions remain.
   id (CRM's section ids today), never to app-views view ids.
 - D6 Tier 2 in v1: DECIDED. A directive may declare `render: "screen:<tag>"`
   and the host mounts the app's own sandboxed screen inline via CAD-1006.
+- D8 `chat-directive.v1`: DECIDED (operator, 2026-10-03). The opt-in directive
+  push for chat frames is adopted exactly as specified in Tier 2.
 - D7 Tier 3 direction: DECIDED as direction only (Out of scope below).
 
 ## Use cases
@@ -742,8 +749,11 @@ its own screen); no core change for any of them.
 - Package install/approval pipeline generally (CAD-811). The `app-chat.json`
   validator-at-install and the `chat-descriptor` daemon/board read are in
   CAD-1110 (D1).
-- Tier 3 (direction, not built, forward reference: a later CAD-1108 follow-up
-  ticket to be filed): capabilities (attachments) and any future data-changing
+- v1 chat frames are text and layout only (a frame cannot fetch). Real image,
+  asset and slide previews need a host-side asset push of a bounded thumbnail
+  of an approved asset of the installation: CAD-1114, under the same
+  declare-and-approve rule as Tier 3.
+- Tier 3 (direction, not built, forward reference: CAD-1114): capabilities (attachments) and any future data-changing
   card actions will be declared in the package manifest and approved by the
   operator with the bundle digest, replacing the host-code-only registries; a
   capability the package does not declare stays unavailable. v1 keeps the host
