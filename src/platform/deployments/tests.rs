@@ -160,9 +160,10 @@ fn hosted_media_transport_assertion_refuses_malformed_or_mismatched_composition(
             "manifest_pin",
             serde_json::json!("agenticos-external-manifest@1"),
         ),
+        // CAD-1096: an image still baking @2 refuses against this build.
         (
             "manifest_pin",
-            serde_json::json!("agenticos-external-provider-tools@3"),
+            serde_json::json!("agenticos-external-provider-tools@2"),
         ),
     ] {
         let mut invalid = config.clone();
