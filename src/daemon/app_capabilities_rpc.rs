@@ -7,6 +7,30 @@ use crate::issue::app_catalog::workspace;
 use crate::store::app_bindings::BindingProof;
 use crate::store::app_runs;
 
+const PRICE_REFUSED: &str = "bound capability price discovery refused";
+
+/// CAD-1096: the operator sees why the door refused a quote. Only an
+/// `[A-Za-z0-9_]{1,64}` code after the adapter's "refused: " crosses here.
+fn price_refusal(error: &str) -> String {
+    match error
+        .rsplit_once("refused: ")
+        .filter(|(_, code)| refusal_code(code))
+    {
+        Some((_, code)) => format!("{PRICE_REFUSED}: {code}"),
+        None => PRICE_REFUSED.into(),
+    }
+}
+
+fn refusal_code(code: &str) -> bool {
+    (1..=64).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The board relays a quote refusal only in the exact [`price_refusal`] shape.
+pub(crate) fn operator_price_refusal(message: &str) -> Option<&str> {
+    let code = message.strip_prefix(PRICE_REFUSED)?;
+    (code.is_empty() || code.strip_prefix(": ").is_some_and(refusal_code)).then_some(message)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -104,7 +128,7 @@ impl Shared {
         let credential = self.app_capability_credential(config)?;
         let quote = adapter
             .quote_app_capability(&credential, &serde_json::to_value(proof)?)
-            .map_err(|_| Error::rejected("bound capability price discovery refused"))?;
+            .map_err(|error| Error::rejected(price_refusal(&error)))?;
         if !quote.valid() {
             return Err(Error::rejected("bound capability price quote is invalid"));
         }

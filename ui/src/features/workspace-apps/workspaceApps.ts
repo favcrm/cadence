@@ -80,7 +80,7 @@ export interface SourceReceipt {
   id: string; run_id: string; slot: string; digest: string; binding_digest: string;
   result: {
     schema: 1; kind: "social.source.posts"; provider: "agenticos_external";
-    source_tool: "scrapecreators.instagram.user.posts"; handle: string;
+    source_tool: "read_instagram_posts" | "scrapecreators.instagram.user.posts"; handle: string;
     profile_verified: boolean; empty_reason: string | null;
     posts: SourcePost[]; more_available: boolean;
     charge?: { currency: string; scale: number; amount: string } | null;

@@ -265,7 +265,17 @@ pub(super) fn handle(
                     _ => 503,
                 }
             };
-            err_response(code, "app release management refused or unavailable")
+            // CAD-1096: a quote refusal names the door's sanitized code.
+            let reason = match &error {
+                Error::Rejected(message) if code == 409 => {
+                    crate::daemon::operator_price_refusal(message)
+                }
+                _ => None,
+            };
+            err_response(
+                code,
+                reason.unwrap_or("app release management refused or unavailable"),
+            )
         }
     }
 }

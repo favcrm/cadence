@@ -117,6 +117,7 @@ pub use master_rpc::MASTER_ALLOWED;
 // CAD-1006: the frame-document renderer the board's consume route uses.
 // `pub(crate)` — the UI frame route calls it; unit tests live in the
 // module, not as a public API.
+pub(crate) use app_capabilities_rpc::operator_price_refusal;
 pub(crate) use app_screens_rpc::render_frame_html;
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
