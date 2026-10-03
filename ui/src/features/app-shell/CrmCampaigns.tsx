@@ -3075,7 +3075,11 @@ function CampaignNew({
 }) {
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const [campaignId, setCampaignId] = useState(() => newAudienceId("cmp"));
-  const [pick, setPick] = useState<AudiencePick>({ base: { mode: "all" }, exclusionListId: null });
+  // CAD-1054: "Use in campaign" from the segment drawer preselects its segment.
+  const [pick, setPick] = useState<AudiencePick>(() => {
+    const seg = new URLSearchParams(window.location.search).get("segment");
+    return { base: seg ? { mode: "segment", segmentId: seg } : { mode: "all" }, exclusionListId: null };
+  });
   const [, setAudiencePreview] = useState<AudiencePreview | null>(null);
   const [doc, setDoc] = useState<ContentDoc | null>(null);
   const [freezeId, setFreezeId] = useState("");
