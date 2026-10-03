@@ -132,6 +132,13 @@ pub fn binding_drift(old: &Value, new: &Value) -> BindingDrift {
     if old == new {
         return BindingDrift::Same;
     }
+    // A receipt is a JSON object. Anything else cannot be classified, so it
+    // never migrates (no keys would mean "nothing widened": fail closed).
+    if !old.is_object() || !new.is_object() {
+        return BindingDrift::NeedsConfirm(vec![
+            json!({"field": "receipt", "from": old, "to": new}),
+        ]);
+    }
     let (mut compatible, mut widened) = (Vec::new(), Vec::new());
     let mut note = |field: String, from: &Value, to: &Value, allowed: bool| {
         let change = json!({"field": field, "from": from, "to": to});
@@ -143,22 +150,26 @@ pub fn binding_drift(old: &Value, new: &Value) -> BindingDrift {
     };
     for key in drift_keys(old, new) {
         let (from, to) = (&old[&key], &new[&key]);
-        if from == to {
+        // `null` and absent index the same; presence is part of the receipt.
+        if from == to && old.get(&key).is_some() == new.get(&key).is_some() {
             continue;
         }
         if key == "mapping" && from.is_object() && to.is_object() {
             for sub in drift_keys(from, to) {
-                if from[&sub] != to[&sub] {
-                    let allowed = MIGRATABLE_MAPPING.contains(&sub.as_str());
+                let both = from.get(&sub).is_some() && to.get(&sub).is_some();
+                if from[&sub] != to[&sub] || (!both && from.get(&sub) != to.get(&sub)) {
+                    // An added or removed field is never bookkeeping.
+                    let allowed = both && MIGRATABLE_MAPPING.contains(&sub.as_str());
                     note(format!("mapping.{sub}"), &from[&sub], &to[&sub], allowed);
                 }
             }
         } else {
+            let both = old.get(&key).is_some() && new.get(&key).is_some();
             note(
                 key.clone(),
                 from,
                 to,
-                MIGRATABLE_RECEIPT.contains(&key.as_str()),
+                both && MIGRATABLE_RECEIPT.contains(&key.as_str()),
             );
         }
     }

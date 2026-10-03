@@ -84,7 +84,7 @@ impl PlatformAdapter for Moving {
             schema: 1,
             provider: PROVIDER.into(),
             revision: s.revision.into(),
-            enrollment_shapes: vec![],
+            enrollment_shapes: vec!["token".into()],
             builtin_accounts: vec!["hosted".into()],
             capabilities: vec![CapabilityDescriptor {
                 id: "probe.read".into(),
@@ -780,4 +780,56 @@ fn r5_spend_and_publish_approvals_are_still_required() {
     assert_eq!(approved["state"], "approved", "{approved}");
     let effects = fx.op("app_effect_list", json!({"install_id": install}));
     assert_eq!(effects["effects"], json!([]), "{effects}");
+}
+
+/// R3 (credential): rotating the enrolled credential under a bound slot
+/// moves `connection_revision`, which is the connection itself, not
+/// provider bookkeeping. The slot needs the operator: the listing names the
+/// change, quote and run refuse, and nothing migrates until the operator
+/// confirms by re-binding; then the app runs again.
+#[test]
+fn r3_rotated_credential_needs_the_operator_before_runs_resume() {
+    let fx = Fx::start();
+    let install = fx.install()["install_id"].as_str().unwrap().to_string();
+    // Secret-shaped material is built at runtime and only rides the RPC.
+    let token = || format!("probe-{}", uuid::Uuid::new_v4().simple());
+    let created = fx.op(
+        "connection_create",
+        json!({"provider": PROVIDER, "account": "acct",
+        "shape": "token", "token": token(), "scopes": ["provider.read"],
+        "accept_same_uid_risk": true}),
+    );
+    let connection = created["connection"]["id"].as_str().unwrap().to_string();
+    let bind = json!({"install_id": install, "slot": "source",
+        "connection_id": connection, "request_id": "bind-rotate"});
+    let bound = fx.op("app_binding_create", bind)["binding"].clone();
+    fx.quote(Asserted::Operator, &install).unwrap();
+    fx.op(
+        "connection_rotate",
+        json!({"connection_id": connection, "token": token(),
+        "scopes": ["provider.read"], "accept_same_uid_risk": true}),
+    );
+    let listed = fx.binding(&install);
+    assert_eq!(listed["drift"]["state"], "needs_confirm", "{listed}");
+    let fields: Vec<&str> = listed["drift"]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["field"].as_str())
+        .collect();
+    assert!(fields.contains(&"connection_revision"), "{listed}");
+    let quote = fx
+        .quote(Asserted::Operator, &install)
+        .unwrap_err()
+        .to_string();
+    assert!(quote.contains("connection_revision"), "{quote}");
+    assert!(fx.run(Asserted::Operator, &install, "run-rot-a").is_err());
+    assert_eq!(fx.binding(&install)["revision"], 1, "nothing migrated");
+    let confirm = json!({"install_id": install, "binding_id": bound["id"],
+        "expected_revision": 1, "connection_id": connection});
+    let confirmed = fx.op("app_binding_update", confirm)["binding"].clone();
+    assert_eq!(confirmed["config"]["connection_revision"], 2, "{confirmed}");
+    fx.quote(Asserted::Operator, &install).unwrap();
+    let run = fx.run(Asserted::Operator, &install, "run-rot-b").unwrap();
+    assert_eq!(run["state"], "awaiting_approval", "{run}");
 }

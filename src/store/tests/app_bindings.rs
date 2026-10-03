@@ -449,3 +449,170 @@ fn cad796_corrupt_grant_row_rolls_back_rebind() {
         "approved"
     );
 }
+
+/// A full binding receipt as `app_binding_config` derives it.
+fn cad1119_receipt() -> Value {
+    json!({"schema":1,"install_id":"install-a","context":null,
+        "bundle_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "workspace_id":"ws","connection_id":"conn-a","provider":"fixture","account":"work",
+        "connection_kind":"enrolled","connection_revision":1,
+        "registration_digest":"sha256:reg-1","sink_registration":"sink-1",
+        "descriptor_revision":"fixture-connections/2","reviewed_pin":"tools@2","reported_pin":"tools@2",
+        "mapping":{"capability":"probe.read","version":1,"action":"list_items",
+            "resource_kind":"connection_account","tool":"old_tool","scopes":["provider.read"],
+            "effect":"read","semantics":"metadata_read","input_contract":"in@1","output_contract":"out@1"},
+        "declaration":{"schema":1,"capability":"probe.read","version":1,"action":"list_items",
+            "resource_kind":"connection_account","effect":"read"}})
+}
+
+/// CAD-1119 adversarial: the migration allowlist is the only thing between a
+/// changed connection and a silent migration, so every field outside it —
+/// top-level and `mapping.*`, an unknown, added or removed field, and a
+/// receipt or mapping that is not an object — needs the operator. Only the
+/// allowlisted bookkeeping fields migrate.
+#[test]
+fn cad1119_binding_drift_allows_only_bookkeeping_to_migrate() {
+    use crate::store::app_bindings::{binding_drift, BindingDrift};
+    let base = cad1119_receipt();
+    let changed = |path: &[&str], value: Value| {
+        let mut next = base.clone();
+        let mut at = &mut next;
+        for key in &path[..path.len() - 1] {
+            at = &mut at[*key];
+        }
+        at[path[path.len() - 1]] = value;
+        next
+    };
+    let removed = |path: &[&str]| {
+        let mut next = base.clone();
+        let mut at = &mut next;
+        for key in &path[..path.len() - 1] {
+            at = &mut at[*key];
+        }
+        at.as_object_mut().unwrap().remove(path[path.len() - 1]);
+        next
+    };
+    let mut widened: Vec<(String, Value)> = Vec::new();
+    for key in [
+        "schema",
+        "install_id",
+        "context",
+        "bundle_digest",
+        "workspace_id",
+        "connection_id",
+        "provider",
+        "account",
+        "connection_kind",
+        "connection_revision",
+        "declaration",
+    ] {
+        widened.push((key.into(), changed(&[key], json!("changed"))));
+        widened.push((format!("{key} removed"), removed(&[key])));
+    }
+    for key in [
+        "capability",
+        "version",
+        "action",
+        "resource_kind",
+        "scopes",
+        "effect",
+        "semantics",
+        "input_contract",
+        "output_contract",
+    ] {
+        widened.push((
+            format!("mapping.{key}"),
+            changed(&["mapping", key], json!("changed")),
+        ));
+        widened.push((format!("mapping.{key} removed"), removed(&["mapping", key])));
+    }
+    widened.push((
+        "unknown top-level".into(),
+        changed(&["future_field"], json!(1)),
+    ));
+    widened.push((
+        "unknown mapping".into(),
+        changed(&["mapping", "future_field"], json!(1)),
+    ));
+    widened.push(("mapping.tool removed".into(), removed(&["mapping", "tool"])));
+    widened.push((
+        "registration removed".into(),
+        removed(&["registration_digest"]),
+    ));
+    widened.push((
+        "mapping not an object".into(),
+        changed(&["mapping"], json!("x")),
+    ));
+    widened.push(("receipt not an object".into(), json!([1])));
+    for (case, next) in &widened {
+        assert!(
+            matches!(binding_drift(&base, next), BindingDrift::NeedsConfirm(_)),
+            "{case} must need the operator"
+        );
+    }
+    assert!(matches!(
+        binding_drift(&json!([1]), &json!([2])),
+        BindingDrift::NeedsConfirm(_)
+    ));
+    assert_eq!(binding_drift(&base, &base), BindingDrift::Same);
+    for key in [
+        "registration_digest",
+        "sink_registration",
+        "descriptor_revision",
+        "reviewed_pin",
+        "reported_pin",
+    ] {
+        assert!(
+            matches!(
+                binding_drift(&base, &changed(&[key], json!("moved"))),
+                BindingDrift::Compatible(_)
+            ),
+            "{key} is bookkeeping"
+        );
+    }
+    assert!(matches!(
+        binding_drift(&base, &changed(&["mapping", "tool"], json!("new_tool"))),
+        BindingDrift::Compatible(_)
+    ));
+}
+
+/// CAD-1119 adversarial: the store re-checks the classification. A widened
+/// receipt never migrates, even with an exact compare-and-swap proof; a
+/// bookkeeping change does.
+#[test]
+fn cad1119_store_migrate_refuses_a_widened_receipt_with_a_valid_proof() {
+    let (_dir, s) = store();
+    s.conn()
+        .execute_batch(crate::store::app_bindings::SCHEMA)
+        .unwrap();
+    let config = cad1119_receipt();
+    let created = s
+        .app_binding_create("install-a", None, "source", &config, "cad1119-migrate")
+        .unwrap()["binding"]
+        .clone();
+    let proof: crate::store::app_bindings::BindingProof = serde_json::from_value(json!({
+        "id": created["id"], "revision": created["revision"],
+        "digest": created["digest"], "config": created["config"]}))
+    .unwrap();
+    for (field, value) in [
+        ("connection_revision", json!(2)),
+        ("account", json!("other")),
+    ] {
+        let mut widened = config.clone();
+        widened[field] = value;
+        let refused = s.app_binding_migrate("install-a", &proof, &widened);
+        assert!(refused.is_err(), "{field} migrated");
+    }
+    let mut effect = config.clone();
+    effect["mapping"]["effect"] = json!("draft");
+    assert!(s.app_binding_migrate("install-a", &proof, &effect).is_err());
+    assert_eq!(
+        s.app_binding_show("install-a", &proof.id).unwrap()["binding"]["revision"],
+        1,
+        "nothing migrated"
+    );
+    let mut moved = config.clone();
+    moved["descriptor_revision"] = json!("fixture-connections/3");
+    let next = s.app_binding_migrate("install-a", &proof, &moved).unwrap();
+    assert_eq!(next.revision, 2);
+}
