@@ -12,10 +12,12 @@ Required contexts explicitly report not-applicable commands rather than
 claiming to build. Governance, workflow, scripts, dependency manifests, mixed
 or unknown changes run all gates. Merge groups always run the full current
 validation (including the reduced floor); fast PR feedback is not evidence
-for skipping integration validation. The committed `.github/reduced-gates`
-marker and `scripts/require-full-gates` refuse release artifacts, candidate
-staging and promotion from a reduced-gate source SHA. Do not remove them as a
-CI-speed optimization.
+for skipping integration validation. `scripts/require-full-gates` refuses
+release artifacts, candidate staging and promotion from any source SHA that
+commits `.github/reduced-gates`. CAD-1102 ended the CAD-1073 window by
+re-declaring the current gate as permanent, and removed the marker; a future
+transition window may add it again under an operator-approved declaration.
+Never remove a marker as a CI-speed optimization.
 
 The shard/inventory benchmarks and old fixture journeys described below are
 historical full-gate design, not current measurements or restored coverage.
