@@ -507,29 +507,28 @@ pub(super) fn admit_operator_read(
     opts: &ServeOpts,
 ) -> Result<(), HttpResp> {
     let caller = board_caller(request, state_dir, opts, false)?;
+    let what = format!(
+        "GET {}",
+        request.url().split('?').next().unwrap_or_default()
+    );
     match &caller {
         Caller::Agent(alias) => Err(guard_fail(
             "operator_only",
             &format!(
-                "GET /api/master/permissions is the operator's decision — this request comes \
+                "{what} is the operator's decision — this request comes \
                  from agent '{alias}'; decide from the operator's browser"
             ),
         )),
         Caller::Named(named) if !named.operator => Err(guard_fail(
             "member_role",
             &format!(
-                "GET /api/master/permissions needs the board owner's role — this session is \
+                "{what} needs the board owner's role — this session is \
                  {}'s, mapped `member`",
                 named.actor
             ),
         )),
         Caller::Named(_) => Ok(()),
-        Caller::Operator(_) => super::home::prove_operator_peer(
-            request,
-            state_dir,
-            opts,
-            "GET /api/master/permissions",
-        ),
+        Caller::Operator(_) => super::home::prove_operator_peer(request, state_dir, opts, &what),
     }
 }
 

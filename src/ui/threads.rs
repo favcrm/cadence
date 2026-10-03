@@ -10,9 +10,11 @@
 //! - `GET  /api/threads/<alias>/stream[?after=<seq>]` — server-sent
 //!   events, one `entry` frame per entry with `id: <seq>`; a reconnect
 //!   resumes from `Last-Event-ID` (preferred) or `after`.
-//! - `GET  /api/threads/<alias>/conversations?install=<id>` — the
-//!   installation's conversations (CAD-1098): `{alias, install_id,
-//!   general, conversations: [...]}`; an unknown installation is 404.
+//! - `GET  /api/app-installations/<id>/conversations` — the master's
+//!   conversations for that installation (CAD-1098; operator-gated in
+//!   serve.rs): `{alias, install_id, general, conversations: [...]}`;
+//!   an unknown installation is 404. There is no `/api/threads/...`
+//!   GET for it.
 //! - `POST /api/threads/<alias>/conversations` `{"install_id",
 //!   "context_id", "subject"?, "general"?}` — make or find a
 //!   conversation (operator-only, like the messages POST); answers
@@ -340,7 +342,7 @@ pub(super) fn post_message(
     }
 }
 
-/// `GET /api/threads/<alias>/conversations?install=<id>` — relays the
+/// `GET /api/app-installations/<id>/conversations` — relays the
 /// daemon's `conversation_list` (which proves the installation).
 pub(super) fn conversations(
     state_dir: &std::path::Path,

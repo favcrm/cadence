@@ -1617,9 +1617,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                         send(request, err_response(405, "stream is GET only"))
                     }
                     Some("stream") => threads::stream(request, state_dir, alias, &query),
-                    Some("conversations") => {
-                        send(request, threads::conversations(state_dir, alias, &query))
-                    }
                     Some(_) => send(request, err_response(404, "no such thread route")),
                 }
                 return;
