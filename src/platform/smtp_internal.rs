@@ -364,7 +364,15 @@ mod tests {
     #[test]
     fn any_failure_at_step_data_is_never_retried() {
         for code in [
-            "connect", "rejected", "tls", "auth", "invalid", "recipient", "data", "timeout", "",
+            "connect",
+            "rejected",
+            "tls",
+            "auth",
+            "invalid",
+            "recipient",
+            "data",
+            "timeout",
+            "",
             "zzz",
         ] {
             assert!(
