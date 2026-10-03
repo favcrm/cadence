@@ -11,6 +11,10 @@
 use super::app_bindings_rpc::strict_fields;
 use super::*;
 
+/// CAD-1041: how far past its due time an intent may still be sent now.
+/// Over it, send-now refuses and the row stays queued — re-schedule it.
+pub(crate) const SEND_NOW_MAX_LATENESS_SECS: i64 = 15 * 60;
+
 impl Shared {
     pub(super) fn rpc_social_publish(
         self: &Arc<Self>,
@@ -424,12 +428,12 @@ impl Shared {
     /// preflight-staged before the claim so a door blip leaves it
     /// queued, dispatched exactly once through `dispatch_claimed`, then
     /// reconciled once via `status` (never a second provider send).
-    /// Refuses a row more than `MAX_LATENESS` overdue — re-schedule it
+    /// Refuses a row more than `SEND_NOW_MAX_LATENESS_SECS` overdue on the
+    /// operator clock — re-schedule it
     /// first. There is no background loop: the operator's click is the
     /// only trigger.
     fn send_now_social_publish(&self, params: &Value) -> Result<Value> {
         use crate::platform::agenticos_external::publish::Preflight;
-        const MAX_LATENESS_SECS: i64 = 900;
         let id = Self::required_segment(params, "intent_id")?.to_owned();
         // CAD-1027 scope, as cancel: the intent's own install and exact
         // context. An out-of-scope request refuses here, before staging,
@@ -448,14 +452,11 @@ impl Shared {
         // the claim SQL selects on), never the frozen doc — a forged
         // column can't hide an over-stale row behind a healthy frozen.
         let due = shown["intent"]["due_epoch"].as_i64().unwrap_or(i64::MAX);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        if now - due > MAX_LATENESS_SECS {
-            return Err(Error::rejected(
-                "intent is more than 15 minutes overdue — re-schedule it before send-now",
-            ));
+        if self.operator_now() - due > SEND_NOW_MAX_LATENESS_SECS {
+            return Err(Error::rejected(format!(
+                "intent is more than {} minutes overdue — re-schedule it before send-now",
+                SEND_NOW_MAX_LATENESS_SECS / 60
+            )));
         }
         let Some(sender) = self.social_publish_sender.clone() else {
             return Err(Error::rejected("no dispatch sender registered"));

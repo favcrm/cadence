@@ -776,10 +776,19 @@ fn resolver_only_release(door: &FakeDoor) -> Release {
 }
 
 fn e2e_release(door: &FakeDoor) -> (Release, Arc<HttpSender>) {
+    e2e_release_with(door, |_| {})
+}
+
+/// `e2e_release` with further daemon option overrides.
+fn e2e_release_with(
+    door: &FakeDoor,
+    configure: impl FnOnce(&mut cadence_agent::daemon::ServeOptions),
+) -> (Release, Arc<HttpSender>) {
     let sender = Arc::new(HttpSender::new(format!("http://{}", door.addr)));
     let registered = Arc::clone(&sender);
     let dest_base = format!("http://{}", door.addr);
     let h = Release::with_options(move |opts, _| {
+        configure(opts);
         opts.social_publish_sender = Some(registered);
         // CAD-979 v9: the schedule/import path resolves the remote AOS
         // `connectionId` under a read credential — here a real
@@ -2961,6 +2970,46 @@ fn cad1041_overdue_intent_refuses_until_rescheduled() {
         .operator_rpc("social_publish_show", json!({"intent_id": id}))
         .unwrap();
     assert_eq!(shown["intent"]["state"], "queued");
+}
+
+/// CAD-1041 (should-fix): the lateness bound reads the daemon's operator
+/// clock, not the wall clock: 15 minutes and one second past due refuses
+/// (row queued, nothing sent); exactly 15 minutes past due still sends.
+#[test]
+fn cad1041_lateness_bound_reads_the_operator_clock() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let clock = Arc::new(AtomicI64::new(epoch_now()));
+    let reading = Arc::clone(&clock);
+    let (h, _s) = e2e_release_with(&door, move |opts| {
+        opts.operator_clock = Some(Arc::new(move || reading.load(Ordering::SeqCst)));
+    });
+    let (context, run, bundle, install) = approved_run(&h, "snclock");
+    // Due an hour ahead on the wall clock: only the operator clock can
+    // make it overdue.
+    let due = epoch_now() + 3600;
+    let (id, _key) = send_now_fixture(&h, &context, &run, &bundle, &install, "cad1041-clock", due);
+    clock.store(due + 15 * 60 + 1, Ordering::SeqCst);
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("more than 15 minutes overdue"), "{err}");
+    assert_eq!(*door.calls.lock().unwrap(), 0);
+    clock.store(due + 15 * 60, Ordering::SeqCst);
+    let out = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap();
+    assert_eq!(out["intent"]["state"], "posted", "{out}");
 }
 
 #[test]
