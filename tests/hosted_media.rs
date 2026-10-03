@@ -11,6 +11,9 @@ use std::path::Path;
 #[cfg(feature = "test-seam")]
 #[path = "hosted_media/native.rs"]
 mod native;
+#[cfg(feature = "test-seam")]
+#[path = "hosted_media/source_native.rs"]
+mod source_native;
 
 #[test]
 fn cad868_hosted_connection_binding_and_broker_keep_operator_and_turn_gates() {
