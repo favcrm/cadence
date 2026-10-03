@@ -273,7 +273,7 @@ assert(text().includes("All apps") && text().includes("Reports"), "← All apps 
 assert(text().includes("No records yet"), "generic outlet is truthfully empty, never fake rows");
 assert(text().includes("not installed yet") && !text().includes("CAD-781"), "non-CRM outlet copy stays neutral");
 assert(text().includes("Master answer stays connected"), "the left pane shows the real master thread");
-assert(text().includes("✓ ctx-a"), "the read-back verified stamp renders, never a sent claim");
+assert(!text().includes("ctx-a"), "CAD-1051: internal context ids never render in the chat");
 equal(panes(), 1, "exactly one chat pane in the document");
 equal(boxes(), 1, "exactly one chat draft box id in the document");
 equal(eventSources, 1, "exactly one SSE subscription for the shell");

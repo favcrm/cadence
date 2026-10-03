@@ -13,7 +13,6 @@ import {
   newMessageId,
   reduceFrame,
   settlePending,
-  stepSummary,
   threadItems,
 } from "../home/thread";
 import type { Viewer } from "../projects/work";
@@ -21,6 +20,7 @@ import { workspaceApps, type AppContext, type Installation } from "../workspace-
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
 import ChatCsvImport from "./ChatCsvImport";
+import { ChatRow, chatContext, type ChatPage } from "./chatRender";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
@@ -95,6 +95,8 @@ export default function AppShell({
   const crmSection: CrmSection =
     rawSection === "segments" || rawSection === "campaigns" ? rawSection : "customers";
   const [chatOpen, setChatOpen] = useState(false);
+  // CAD-1051: desktop rail. Narrow widths keep the drawer above.
+  const [chatCollapsed, setChatCollapsed] = useState(false);
   // CAD-861: the app-views/v1 contract preview is a dev-only overlay
   // keyed by `contract-preview` in the URL — it never mounts in a
   // production bundle and never replaces the trusted outlet by default.
@@ -436,7 +438,7 @@ export default function AppShell({
         </button>
       </div>
 
-      <div className="app-shell-grid">
+      <div className="app-shell-grid" data-chat-collapsed={chatCollapsed || undefined}>
         <div
           id="app-shell-chat"
           ref={chatPaneRef}
@@ -459,6 +461,10 @@ export default function AppShell({
             contextLabel={isSocial ? null : contextLabel(contexts, contextId)}
             binding={binding}
             crm={installation !== null && installation.name === "crm"}
+            page={installation !== null && installation.name === "crm" ? crmSection : null}
+            recordOpen={recordId !== null}
+            collapsed={chatCollapsed}
+            onCollapsed={setChatCollapsed}
           />
         </div>
         <section className="app-shell-outlet" aria-label={`${title} workspace`}>
@@ -730,11 +736,19 @@ function ChatPane({
   contextLabel,
   binding,
   crm,
+  page,
+  recordOpen,
+  collapsed,
+  onCollapsed,
 }: {
   viewer: Viewer;
   contextLabel: string | null;
   binding: ChatBinding;
   crm?: boolean;
+  page: ChatPage | null;
+  recordOpen: boolean;
+  collapsed: boolean;
+  onCollapsed: (next: boolean) => void;
 }) {
   const thread = useQuery(resources.masterThread);
   const [draft, setDraft] = useState("");
@@ -758,6 +772,11 @@ function ChatPane({
   const items = threadItems(thread.data);
   const tail = items.slice(-8);
   const canSend = viewer.operator && !viewer.readOnly;
+  // Waiting dot: the thread grew while the rail was collapsed.
+  const seen = useRef(items.length);
+  if (!collapsed) seen.current = items.length;
+  const waiting = collapsed && items.length > seen.current;
+  const ctx = page === null ? null : chatContext(page, recordOpen);
 
   const send = () => {
     const body = draft.trim();
@@ -783,10 +802,32 @@ function ChatPane({
   };
 
   return (
-    <div className="app-chat" data-chat-pane>
-      <p className="text-micro text-ink-500">
-        Master thread{contextLabel ? ` · ${contextLabel}` : ""} — context for this turn, never access proof.
-      </p>
+    <div className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
+      <button
+        type="button"
+        className="btn btn-ghost btn-sm app-chat-rail"
+        aria-label="Expand assistant chat"
+        aria-expanded={!collapsed}
+        onClick={() => onCollapsed(false)}
+        data-waiting={waiting || undefined}
+      >
+        {waiting && <span className="app-chat-dot" role="status" aria-label="New reply waiting" />}
+        <span className="app-chat-rail-label text-micro text-ink-400">ASSISTANT</span>
+      </button>
+      <div className="app-chat-head">
+        <p className="text-micro text-ink-500">
+          Assistant{contextLabel ? ` · ${contextLabel}` : ""} — context for this turn, never access proof.
+        </p>
+        <button
+          type="button"
+          className="btn btn-ghost btn-sm app-chat-collapse"
+          aria-label="Collapse assistant chat"
+          aria-expanded={!collapsed}
+          onClick={() => onCollapsed(true)}
+        >
+          ⇤
+        </button>
+      </div>
       {thread.status === "failed" && (
         <p className="text-label text-fail" role="alert">
           The thread could not be read — {thread.error}{" "}
@@ -807,7 +848,7 @@ function ChatPane({
       )}
       <ol className="app-chat-list" aria-label="Recent master messages">
         {tail.map((item) => (
-          <li key={item.key} className="text-secondary text-ink-300 break-words">
+          <li key={item.key} className="text-secondary text-ink-300 break-words" data-chat-item>
             <ChatRow item={item} />
           </li>
         ))}
@@ -849,6 +890,24 @@ function ChatPane({
           send();
         }}
       >
+        {ctx !== null && (
+          <div className="app-chat-ctx" data-chat-context>
+            <span className="app-chat-chip text-micro text-ink-300">
+              Context <b className="font-medium text-ink-100">{ctx.label}</b>
+            </span>
+            {ctx.prompts.map((p) => (
+              <button
+                key={p}
+                type="button"
+                className="app-chat-prompt text-micro"
+                disabled={!canSend}
+                onClick={() => setDraft(p)}
+              >
+                {p}
+              </button>
+            ))}
+          </div>
+        )}
         <label className="sr-only" htmlFor="app-shell-chat-box">
           Message to the master
         </label>
@@ -874,35 +933,4 @@ function ChatPane({
       </form>
     </div>
   );
-}
-
-function ChatRow({ item }: { item: ReturnType<typeof threadItems>[number] }) {
-  if (item.type === "operator" || item.type === "pending") {
-    const text = item.type === "operator" ? item.entry.text : item.pending.text;
-    const bound = item.type === "operator" ? entryApp(item.entry.payload) : null;
-    return (
-      <p>
-        <strong className="text-ink-200">You:</strong> {text}
-        {bound && (
-          <span className="chip ml-2" title={`Server-verified App context: ${bound.install_id}`}>
-            ✓ {bound.context_id}
-          </span>
-        )}
-      </p>
-    );
-  }
-  if (item.type === "answer") {
-    return (
-      <p>
-        <strong className="text-ink-200">Master:</strong> {(stepSummary(item.entry.text) || item.entry.text).slice(0, 280)}
-      </p>
-    );
-  }
-  if (item.type === "commentary") {
-    return <p className="italic text-ink-400">{item.entry.text.slice(0, 280)}</p>;
-  }
-  if (item.type === "system") {
-    return <p className="text-micro text-ink-500">· {stepSummary(item.entry.text).slice(0, 160)}</p>;
-  }
-  return <p className="text-micro text-ink-500">· {item.entries.length} tool steps</p>;
 }

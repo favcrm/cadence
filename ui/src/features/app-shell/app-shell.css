@@ -931,3 +931,99 @@ p.sfield-hint {
 .sloading {
   margin: 0;
 }
+/* CAD-1051: collapsible chat rail (desktop). The pane stays on the
+   left; collapsed it is a thin rail with a waiting dot. */
+.app-chat-rail {
+  display: none;
+}
+.app-chat-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.app-chat-collapse {
+  display: none;
+}
+.app-chat-me {
+  justify-self: end;
+  max-width: 90%;
+  background: var(--color-ink-800);
+  border-radius: 0.5rem 0.5rem 0.15rem 0.5rem;
+  padding: 0.4rem 0.6rem;
+}
+.app-chat-ai > :first-child {
+  margin-top: 0;
+}
+.app-chat-ai > :last-child {
+  margin-bottom: 0;
+}
+.app-chat-card {
+  padding: 0.5rem 0.65rem;
+  background: var(--color-ink-850);
+}
+.app-chat-ctx {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+.app-chat-prompt {
+  border: 1px dashed var(--color-ink-600);
+  background: transparent;
+  border-radius: 0.25rem;
+  padding: 0.1rem 0.45rem;
+  color: var(--color-ink-400);
+}
+.app-chat-prompt:hover:not(:disabled) {
+  border-style: solid;
+  color: var(--color-ink-200);
+}
+.app-chat-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--color-warn);
+}
+
+@media (min-width: 1024px) {
+  .app-chat-collapse {
+    display: inline-flex;
+  }
+  .app-shell-grid {
+    transition: grid-template-columns 0.2s ease;
+  }
+  .app-shell-grid[data-chat-collapsed] {
+    grid-template-columns: 2.75rem minmax(0, 1fr);
+  }
+  .app-chat[data-collapsed] {
+    padding: 0.5rem 0;
+    align-items: center;
+  }
+  .app-chat[data-collapsed] > :not(.app-chat-rail) {
+    display: none;
+  }
+  .app-chat[data-collapsed] .app-chat-rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    height: auto;
+  }
+  .app-chat-rail-label {
+    writing-mode: vertical-rl;
+    letter-spacing: 0.08em;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-shell-grid {
+    transition: none;
+  }
+}
+.app-chat-chip {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-items: center;
+  border: 1px solid var(--color-ink-600);
+  border-radius: 0.25rem;
+  padding: 0.1rem 0.4rem;
+}
