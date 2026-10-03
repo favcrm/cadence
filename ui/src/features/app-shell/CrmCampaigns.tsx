@@ -56,6 +56,8 @@ import "./crm-campaign.css";
 import CampaignTabs from "./campaign/CampaignTabs";
 import EmailPane from "./campaign/EmailPane";
 import OverviewPane from "./campaign/OverviewPane";
+import EligibilityFunnel from "./campaign/EligibilityFunnel";
+import ActivityPane from "./campaign/ActivityPane";
 import { audienceSummary } from "./campaign/audienceSummary";
 import {
   APPROVAL_ANCHOR,
@@ -438,6 +440,7 @@ function AudienceSection({
   onPick,
   onPreview,
   freezeSlot,
+  layout = "full",
 }: {
   scope: AudienceScope;
   viewer: Viewer;
@@ -446,6 +449,10 @@ function AudienceSection({
   onPreview: (preview: AudiencePreview | null) => void;
   /** Optional freeze controls rendered under the preview. */
   freezeSlot?: React.ReactNode;
+  /** CAD-1055: `detail` is the saved campaign's Audience tab — the
+   *  picker and an eligibility funnel up front, exclusions and
+   *  suppressions behind an Advanced disclosure. */
+  layout?: "full" | "detail";
 }) {
   const canWrite = viewer.operator && !viewer.readOnly;
   const [segments, setSegments] = useState<{ id: string; name: string }[]>([]);
@@ -598,7 +605,9 @@ function AudienceSection({
 
   return (
     <section aria-label="Audience" className="card px-4 py-4 grid gap-3">
-      <h4 className="text-cardtitle font-medium text-ink-100">Audience — one base mode</h4>
+      <h4 className="text-cardtitle font-medium text-ink-100">
+        {layout === "detail" ? "Send to" : "Audience — one base mode"}
+      </h4>
       {listsError && (
         <p className="text-label text-fail" role="alert">
           {listsError}
@@ -662,6 +671,210 @@ function AudienceSection({
           />
         </div>
       )}
+      {layout === "detail" ? (
+        <>
+          <EligibilityFunnel
+            preview={preview}
+            loading={previewLoading}
+            error={previewError}
+            onRetry={() => setPreviewToken((count) => count + 1)}
+          />
+          <details className="crm-diag" data-advanced>
+            <summary className="text-label text-ink-300">Advanced: exclusions and suppressions</summary>
+            <div className="grid gap-3 mt-2">
+      <div className="crm-field">
+        <label className="text-label text-ink-300" htmlFor="aud-exclusion">
+          Saved exclusion list (applies on every base mode)
+        </label>
+        <Select
+          id="aud-exclusion"
+          value={pick.exclusionListId ?? ""}
+          onChange={(value) => onPick({ ...pick, exclusionListId: value === "" ? null : value })}
+          options={[
+            { value: "", label: "No exclusion list" },
+            ...exclusions.map((row) => ({ value: row.id, label: `${row.name} · ${row.id}` })),
+          ]}
+          aria-label="Saved exclusion list"
+          disabled={!canWrite}
+          full
+        />
+      </div>
+      {canWrite && !showExclusionForm && (
+        <p>
+          <button type="button" className="lnk text-label" onClick={() => setShowExclusionForm(true)}>
+            + New exclusion list
+          </button>
+        </p>
+      )}
+      {canWrite && showExclusionForm && (
+        <form
+          className="card px-3 py-3 grid gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            setExclusionError(null);
+            const ids = parseIds(exclusionIds);
+            if (exclusionName.trim() === "" || ids.length === 0 || ids.length > 100) {
+              setExclusionError("an exclusion list needs a name and 1 to 100 customer IDs");
+              return;
+            }
+            setExclusionPending(true);
+            const listId = newAudienceId("exc");
+            void audienceClient
+              .exclusionSave(scope, { listId, name: exclusionName.trim(), memberIds: ids })
+              .then(() => {
+                setShowExclusionForm(false);
+                setExclusionName("");
+                setExclusionIds("");
+                setSuppressionToken((count) => count + 1);
+                onPick({ ...pick, exclusionListId: listId });
+              })
+              .catch((err: unknown) => setExclusionError(friendlyAudienceError(err)))
+              .finally(() => setExclusionPending(false));
+          }}
+        >
+          <div className="crm-field-row">
+            <div className="crm-field">
+              <label className="text-label text-ink-300" htmlFor="aud-exc-name">
+                List name
+              </label>
+              <input
+                id="aud-exc-name"
+                className="field"
+                value={exclusionName}
+                onChange={(e) => setExclusionName(e.target.value)}
+                maxLength={80}
+                autoComplete="off"
+                disabled={exclusionPending}
+              />
+            </div>
+            <div className="crm-field">
+              <label className="text-label text-ink-300" htmlFor="aud-exc-ids">
+                Member customer IDs
+              </label>
+              <input
+                id="aud-exc-ids"
+                className="field"
+                value={exclusionIds}
+                onChange={(e) => setExclusionIds(e.target.value)}
+                maxLength={8000}
+                autoComplete="off"
+                disabled={exclusionPending}
+                placeholder="cust-abc123, cust-def456"
+              />
+            </div>
+          </div>
+          {exclusionError && (
+            <p className="text-label text-fail" role="alert">
+              {exclusionError}
+            </p>
+          )}
+          <div className="crm-toolbar">
+            <Button type="submit" size="sm" loading={exclusionPending} disabled={exclusionPending}>
+              Save exclusion list
+            </Button>
+            <button type="button" className="lnk text-label" onClick={() => setShowExclusionForm(false)}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
+      <section aria-label="Suppressions" className="mt-1">
+        <h4 className="text-label font-medium text-ink-200">
+          Suppressions ({suppressions.length}) — always excluded, even from custom IDs
+        </h4>
+        {suppressionError !== null ? (
+          <p className="text-label text-fail" role="alert">
+            {suppressionError}{" "}
+            <button type="button" className="lnk" onClick={() => setSuppressionToken((count) => count + 1)}>
+              Retry
+            </button>
+          </p>
+        ) : suppressions.length === 0 ? (
+          <p className="text-label text-ink-400">No suppressions in this context.</p>
+        ) : (
+          <ol className="crm-history">
+            {suppressions.slice(0, 10).map((row) => (
+              <li key={`${row.kind}:${row.key}`} className="num text-label text-ink-300">
+                {row.kind} · {row.key} · {row.reason}
+              </li>
+            ))}
+            {suppressions.length > 10 && (
+              <li className="num text-label text-ink-500">…and {suppressions.length - 10} more</li>
+            )}
+          </ol>
+        )}
+        {canWrite && (
+          <form
+            className="crm-field-row mt-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              setSuppressError(null);
+              if (suppressEmail.trim() === "" || suppressReason.trim() === "") {
+                setSuppressError("a suppression needs an email address and a reason");
+                return;
+              }
+              setSuppressPending(true);
+              void audienceClient
+                .suppressionAdd(scope, { email: suppressEmail.trim(), reason: suppressReason.trim() })
+                .then(() => {
+                  setSuppressEmail("");
+                  setSuppressReason("");
+                  setSuppressionToken((count) => count + 1);
+                  setPreviewToken((count) => count + 1);
+                })
+                .catch((err: unknown) => setSuppressError(friendlyAudienceError(err)))
+                .finally(() => setSuppressPending(false));
+            }}
+          >
+            <div className="crm-field">
+              <label className="text-label text-ink-300" htmlFor="aud-suppress-email">
+                Suppress an email
+              </label>
+              <input
+                id="aud-suppress-email"
+                className="field"
+                type="email"
+                value={suppressEmail}
+                onChange={(e) => setSuppressEmail(e.target.value)}
+                maxLength={254}
+                autoComplete="off"
+                disabled={suppressPending}
+                placeholder="name@example.com"
+              />
+            </div>
+            <div className="crm-field">
+              <label className="text-label text-ink-300" htmlFor="aud-suppress-reason">
+                Reason
+              </label>
+              <input
+                id="aud-suppress-reason"
+                className="field"
+                value={suppressReason}
+                onChange={(e) => setSuppressReason(e.target.value)}
+                maxLength={80}
+                autoComplete="off"
+                disabled={suppressPending}
+                placeholder="opted out by phone"
+              />
+            </div>
+            {suppressError && (
+              <p className="text-label text-fail" role="alert">
+                {suppressError}
+              </p>
+            )}
+            <div>
+              <Button type="submit" size="sm" loading={suppressPending} disabled={suppressPending}>
+                Add suppression
+              </Button>
+            </div>
+          </form>
+        )}
+      </section>
+            </div>
+          </details>
+        </>
+      ) : (
+        <>
       <div className="crm-field">
         <label className="text-label text-ink-300" htmlFor="aud-exclusion">
           Saved exclusion list (applies on every base mode)
@@ -857,6 +1070,8 @@ function AudienceSection({
           </form>
         )}
       </section>
+        </>
+      )}
       {freezeSlot}
     </section>
   );
@@ -2851,7 +3066,17 @@ function CampaignWorkspace({
         />
       )}
       {activeTab === "audience" && audienceSlot}
-      {activeTab === "activity" && activitySlot}
+      {activeTab === "activity" && (
+        <ActivityPane
+          campaignId={campaignId}
+          contextId={scope.contextId}
+          doc={doc}
+          proposals={proposals}
+          render={render}
+          binding={binding}
+          sends={activitySlot}
+        />
+      )}
     </CampaignTabs>
   );
 }
@@ -3465,18 +3690,6 @@ function CampaignDetail({
           </button>{" "}
           <span className="num">· {campaignId}</span>
         </p>
-        <details className="crm-diag">
-          <summary className="text-micro text-ink-500">Record diagnostics</summary>
-          <p className="num text-micro text-ink-500 mt-1">
-            Campaign <span className="num">{campaignId}</span> · workspace{" "}
-            <span className="num">{scope.contextId || "none"}</span>
-            {doc !== null && (
-              <>
-                {" "}· revision r{doc.revision} · digest {doc.contentDigest.slice(0, 18)}…
-              </>
-            )}
-          </p>
-        </details>
       </div>
       {loading && (
         <p className="text-secondary text-ink-400" role="status">
@@ -3524,80 +3737,84 @@ function CampaignDetail({
             audienceLabel={audienceSummary(pick, audiencePreview)}
             activitySlot={<CampaignSends scope={scope} viewer={viewer} campaignId={campaignId} />}
             audienceSlot={
-              <section aria-label="Frozen audience" className="card px-4 py-4 grid gap-3">
-            <h4 className="text-cardtitle font-medium text-ink-100">Audience &amp; freeze</h4>
-            <p className="text-label text-ink-400">
-              Freezes are named workspace rows the operator addresses by ID — the host stores no
-              campaign-to-audience link, so this panel names the freeze explicitly (default{" "}
-              <span className="num">{campaignId}-freeze-1</span>) and rechecks its live validity.
-              Any segment, exclusion, consent or suppression drift reports invalid.
-            </p>
-            <AudienceSection
-              scope={scope}
-              viewer={viewer}
-              pick={pick}
-              onPick={setPick}
-              onPreview={setAudiencePreview}
-            />
-            <div className="crm-field-row">
-              <div className="crm-field">
-                <label className="text-label text-ink-300" htmlFor="cmp-detail-freeze">
-                  Freeze ID to recheck
-                </label>
-                <input
-                  id="cmp-detail-freeze"
-                  className="field"
-                  value={freezeId}
-                  onChange={(e) => setFreezeId(e.target.value)}
-                  maxLength={128}
-                  autoComplete="off"
-                  disabled={freezePending}
+              <div className="crm-cgrid">
+                <AudienceSection
+                  scope={scope}
+                  viewer={viewer}
+                  pick={pick}
+                  onPick={setPick}
+                  onPreview={setAudiencePreview}
+                  layout="detail"
                 />
+                <section aria-label="Frozen audience" className="card px-4 py-4 grid gap-3">
+                  <h4 className="text-cardtitle font-medium text-ink-100">Freeze</h4>
+                  <p className="text-label text-ink-400">
+                    A freeze snapshots exactly who receives this campaign, so later customer
+                    changes do not affect it. Name the freeze this campaign sends to and recheck
+                    that it is still valid before sending.
+                  </p>
+                  <div className="crm-field-row">
+                    <div className="crm-field">
+                      <label className="text-label text-ink-300" htmlFor="cmp-detail-freeze">
+                        Freeze ID to recheck
+                      </label>
+                      <input
+                        id="cmp-detail-freeze"
+                        className="field"
+                        value={freezeId}
+                        onChange={(e) => setFreezeId(e.target.value)}
+                        maxLength={128}
+                        autoComplete="off"
+                        disabled={freezePending}
+                      />
+                    </div>
+                    <div>
+                      <span className="text-label text-ink-300">Validity</span>
+                      <div className="mt-1">
+                        <Button size="sm" loading={freezePending} disabled={freezePending} onClick={checkFreeze}>
+                          Recheck freeze
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                  {freezeError && (
+                    <p className="text-label text-fail" role="alert">
+                      {freezeError}
+                    </p>
+                  )}
+                  {freeze && (
+                    <>
+                      <dl className="crm-detail" aria-label="Freeze validity">
+                        <div>
+                          <dt>Frozen recipients</dt>
+                          <dd className="num">{freeze.finalCount}</dd>
+                        </div>
+                        <div>
+                          <dt>Current recount</dt>
+                          <dd className="num">{freeze.currentCount ?? "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>Validity</dt>
+                          <dd>
+                            <span
+                              className="chip"
+                              title={freeze.drift ?? "The frozen digest still matches the live audience"}
+                            >
+                              {freeze.valid === true ? "Valid" : freeze.valid === false ? `Invalid — ${freeze.drift}` : "Unknown"}
+                            </span>
+                          </dd>
+                        </div>
+                      </dl>
+                      <details className="crm-diag">
+                        <summary className="text-micro text-ink-500">Technical details</summary>
+                        <p className="num text-micro text-ink-500 mt-1" title="Frozen audience digest">
+                          Digest {freeze.digest}
+                        </p>
+                      </details>
+                    </>
+                  )}
+                </section>
               </div>
-              <div>
-                <span className="text-label text-ink-300">Validity</span>
-                <div className="mt-1">
-                  <Button size="sm" loading={freezePending} disabled={freezePending} onClick={checkFreeze}>
-                    Recheck freeze
-                  </Button>
-                </div>
-              </div>
-            </div>
-            {freezeError && (
-              <p className="text-label text-fail" role="alert">
-                {freezeError}
-              </p>
-            )}
-            {freeze && (
-              <dl className="crm-detail" aria-label="Freeze validity">
-                <div>
-                  <dt>Frozen recipients</dt>
-                  <dd className="num">{freeze.finalCount}</dd>
-                </div>
-                <div>
-                  <dt>Current recount</dt>
-                  <dd className="num">{freeze.currentCount ?? "—"}</dd>
-                </div>
-                <div>
-                  <dt>Validity</dt>
-                  <dd>
-                    <span
-                      className="chip"
-                      title={freeze.drift ?? "The frozen digest still matches the live audience"}
-                    >
-                      {freeze.valid === true ? "Valid" : freeze.valid === false ? `Invalid — ${freeze.drift}` : "Unknown"}
-                    </span>
-                  </dd>
-                </div>
-                <div>
-                  <dt>Digest</dt>
-                  <dd className="num" title="Frozen audience digest">
-                    {freeze.digest.slice(0, 18)}…
-                  </dd>
-                </div>
-              </dl>
-            )}
-              </section>
             }
           />
         </>

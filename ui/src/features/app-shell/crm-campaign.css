@@ -161,3 +161,63 @@
 .crm-inbox .crm-preview {
   border-radius: 0 0 0.5rem 0.5rem;
 }
+
+.crm-funnel {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+.crm-funnel li {
+  display: grid;
+  grid-template-columns: minmax(8rem, 1fr) minmax(4rem, 2fr) 3rem;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: var(--text-secondary);
+  color: var(--color-ink-300);
+}
+.crm-funnel .num {
+  text-align: right;
+}
+.crm-funnel-bar {
+  display: block;
+  height: 0.4rem;
+  border-radius: 0.25rem;
+  background: var(--color-ink-700);
+  overflow: hidden;
+}
+.crm-funnel-bar i {
+  display: block;
+  height: 100%;
+  background: var(--color-accent);
+}
+.crm-funnel li[data-drop] .crm-funnel-bar i {
+  background: var(--color-warn);
+}
+
+.crm-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.6rem;
+}
+.crm-timeline li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  font-size: var(--text-secondary);
+  color: var(--color-ink-200);
+  overflow-wrap: anywhere;
+}
+.crm-dot {
+  flex: none;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--color-ink-500);
+}
+.crm-timeline li[data-accent] .crm-dot {
+  background: var(--color-accent);
+}
