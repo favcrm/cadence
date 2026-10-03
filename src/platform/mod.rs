@@ -16,6 +16,7 @@ pub mod deployments;
 pub mod hosted_email;
 pub mod local;
 pub mod smtp;
+pub mod smtp_internal;
 
 pub use adapter::{AppArtifactError, PlatformAdapter};
 

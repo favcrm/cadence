@@ -178,6 +178,11 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions, hosted: &crate::lease::Hos
     if lease_is_on(hosted) && opts.hosted_email.is_none() {
         opts.hosted_email = super::hosted_email::HostedEmail::from_env(&base)?;
     }
+    // CAD-1126: the same real lease routes enrolled SMTP senders
+    // through the `smtp.internal` pass-through (no direct socket).
+    if lease_is_on(hosted) && opts.smtp_internal.is_none() {
+        opts.smtp_internal = Some(super::smtp_internal::SmtpInternal::from_env()?);
+    }
     register_from_composition(opts, &base, lease_is_on(hosted))
 }
 
