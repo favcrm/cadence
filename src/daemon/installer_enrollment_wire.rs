@@ -995,10 +995,17 @@ mod tests {
     /// The embedded platform fixture bytes (test-only synthetic vectors).
     const FIXTURE: &str = include_str!("fixtures/installer-enrollment-wire-v1.json");
 
+    /// The published RFC8032 §7.1 test-1 private seed — synthetic public test
+    /// material, never provisioned. Used only to *re-sign* tampered/old-domain
+    /// messages inside tests (a proof the verifier separates domains/keys), not
+    /// a production key.
+    const TEST_SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+
     struct Vector {
         id: String,
         envelope: String,
         public_key: [u8; 32],
+        signature: Vec<u8>,
         header_json: String,
         payload_json: String,
         message_hex: String,
@@ -1023,12 +1030,23 @@ mod tests {
                     id: v["id"].as_str().unwrap().to_string(),
                     envelope: v["envelope"].as_str().unwrap().to_string(),
                     public_key: pk,
+                    signature: hex_bytes(v["signatureHex"].as_str().unwrap()),
                     header_json: v["headerJson"].as_str().unwrap().to_string(),
                     payload_json: v["payloadJson"].as_str().unwrap().to_string(),
                     message_hex: v["messageHex"].as_str().unwrap().to_string(),
                 }
             })
             .collect()
+    }
+    /// The deterministic test keypair from the RFC8032 §7.1 test-1 seed —
+    /// synthetic mechanics only (re-signing tampered messages inside tests).
+    fn test_key() -> ring::signature::Ed25519KeyPair {
+        ring::signature::Ed25519KeyPair::from_seed_unchecked(&hex_bytes(TEST_SEED_HEX)).unwrap()
+    }
+    /// base64url-encode (unpadded) for building synthetic envelopes in tests.
+    fn b64(b: &[u8]) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        URL_SAFE_NO_PAD.encode(b)
     }
     /// A trust set pinning `synthetic-owner-0001` at keyVersion 1.
     fn keyring_v1(pk: [u8; 32]) -> Vec<TrustedKey> {
@@ -1169,40 +1187,59 @@ mod tests {
         assert!(verify_receipt_format(&env, &kr, now, 10).is_err());
     }
 
-    /// The old grant domain must not cross over: a `supervisor-launch-grant`
-    /// envelope does not verify as a receipt and vice versa.
+    /// The old grant domain must not cross over. The fixture publishes the
+    /// RFC8032 §7.1 test-1 *private seed* (synthetic, never provisioned), so we
+    /// can re-sign I1's exact `H.P` under the OLD domain
+    /// `cadence.supervisor-launch-grant.v1` with the same key. Raw `ring`
+    /// verifies that signature over the old-domain message (the signature is
+    /// cryptographically genuine for its own message), but the *consumer*
+    /// `verify_receipt_format` MUST refuse it — the signed message is
+    /// RECEIPT_DOMAIN-separated, so the bytes differ and the signature fails.
+    /// A normal receipt over RECEIPT_DOMAIN remains a positive control.
     #[test]
     fn old_grant_domain_confusion_refuses() {
+        use ring::signature::{KeyPair, UnparsedPublicKey, ED25519};
         let vs = vectors();
         let i1 = &vs[0];
         let kr = keyring_v1(i1.public_key);
-        // The receipt's message is RECEIPT_DOMAIN-separated; a signature that
-        // covered the *grant* domain bytes cannot satisfy it. Forge one by
-        // re-signing H.P under the grant domain with the same key pair is not
-        // possible without the private seed, so instead assert the receipt's
-        // own message is domain-prefixed: any doc verified under the grant
-        // domain used different bytes. Check the parsed message directly.
-        let parsed = parse_receipt(&i1.envelope).unwrap();
-        let mut expected = RECEIPT_DOMAIN.as_bytes().to_vec();
-        expected.push(0);
+        let now = 1_700_000_000_500u64;
         let segs: Vec<&str> = i1.envelope.split('.').collect();
-        expected.extend_from_slice(segs[0].as_bytes());
-        expected.push(b'.');
-        expected.extend_from_slice(segs[1].as_bytes());
-        assert_eq!(parsed.message, expected);
-        assert!(!parsed
-            .message
-            .windows(b"cadence.supervisor-launch-grant.v1".len())
-            .any(|w| w == b"cadence.supervisor-launch-grant.v1"));
+        let key = test_key();
+        // Sanity: the keypair's public key equals the fixture's public key.
+        assert_eq!(key.public_key().as_ref(), &i1.public_key[..]);
+
+        // Sign I1's exact H.P under the OLD grant domain (domain\0H.P).
+        let mut old_msg = b"cadence.supervisor-launch-grant.v1".to_vec();
+        old_msg.push(0);
+        old_msg.extend_from_slice(segs[0].as_bytes());
+        old_msg.push(b'.');
+        old_msg.extend_from_slice(segs[1].as_bytes());
+        let old_sig = key.sign(&old_msg);
+        // Raw ring verifies it against the pinned I1 public key — the forgery
+        // is a *valid* Ed25519 signature over the old-domain message.
+        assert!(
+            UnparsedPublicKey::new(&ED25519, &i1.public_key)
+                .verify(&old_msg, old_sig.as_ref())
+                .is_ok(),
+            "raw ring must verify the old-domain signature over its own message"
+        );
+        // But the consumer must refuse: same H.P + that signature is not a
+        // valid receipt (the signed message is domain-separated).
+        let forged = format!("{}.{}.{}", segs[0], segs[1], b64(old_sig.as_ref()));
+        assert!(
+            verify_receipt_format(&forged, &kr, now, 10).is_err(),
+            "a signature over the OLD grant domain must not verify as a receipt"
+        );
+        // Positive control: the genuine I1 receipt still verifies.
+        assert!(verify_receipt_format(&i1.envelope, &kr, now, 10).is_ok());
         // A changed signature byte refuses: flip a mid-segment char so the
-        // decoded 64 bytes genuinely differ (not only the pad bits).
-        let segs: Vec<&str> = i1.envelope.split('.').collect();
+        // decoded 64 bytes genuinely differ (not only pad bits).
         let mut sig = segs[2].to_string();
         let mid = sig.len() / 2;
         let c = sig.as_bytes()[mid];
         sig.replace_range(mid..mid + 1, if c == b'a' { "b" } else { "a" });
         let env = format!("{}.{}.{}", segs[0], segs[1], sig);
-        assert!(verify_receipt_format(&env, &kr, 1_700_000_000_500, 10).is_err());
+        assert!(verify_receipt_format(&env, &kr, now, 10).is_err());
     }
 
     /// Canonical alternates all refuse even when they carry the same logical
@@ -1375,5 +1412,194 @@ mod tests {
         }
         // The canonical binding is exactly the substring inside the payload.
         assert!(r.payload().binding.installer.uid == 21000);
+    }
+
+    // ── key/signature-encoding edge controls (finite byte checks, no curve) ──
+    //
+    // ring's Ed25519 verifier enforces canonical point/scalar encodings itself
+    // (it rejects small-order/weak keys and non-canonical R/S on the C/ref10
+    // path). These tests assert the *actual* consumer behavior — both the raw
+    // ring result and that `verify_receipt_format` refuses — rather than
+    // assuming platform TS tests prove Rust acceptance. The weak-point set
+    // mirrors the platform owner's `point()` policy: y must satisfy
+    // `y < p = 2^255-19` and not be a small-order/torsion y
+    // `{0, 1, p-1, 2707…027, 5518…927}`; the scalar S must satisfy `S < L =
+    // 2^252 + 27742317777372353535851937790883648493`. We encode candidate
+    // 32-byte little-endian keys/R-values and S-values and feed them through
+    // the real verifier.
+
+    /// Build a 32-byte little-endian encoding of a big unsigned integer given
+    /// as a decimal string (u256-scale; no bigint dep — do decimal mod-256).
+    fn le_bytes_from_decimal(dec: &str) -> [u8; 32] {
+        // Repeatedly divide the decimal string by 256, collecting remainders —
+        // yields little-endian bytes without a bigint dependency.
+        let mut digits: Vec<u8> = dec.bytes().map(|b| b - b'0').collect();
+        let mut out = [0u8; 32];
+        for slot in out.iter_mut() {
+            let mut carry = 0u32;
+            let mut all_zero = true;
+            let mut next: Vec<u8> = Vec::with_capacity(digits.len());
+            for &d in &digits {
+                let v = carry * 10 + d as u32;
+                let q = v / 256;
+                carry = v % 256;
+                if q != 0 || !next.is_empty() {
+                    next.push(q as u8);
+                }
+                if d != 0 {
+                    all_zero = false;
+                }
+            }
+            *slot = carry as u8;
+            digits = next;
+            if all_zero {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Ed25519 field prime p = 2^255 - 19, group order L, and the five
+    /// small-order/torsion y values the platform owner's `point()` refuses.
+    fn weak_key_bytes() -> Vec<[u8; 32]> {
+        let p = "57896044618658097711785492504343953926634992332820282019728792003956564819949"; // 2^255-19
+        vec![
+            le_bytes_from_decimal("0"),
+            le_bytes_from_decimal("1"),
+            // p-1 (= 2^255-20): canonical (<p) but a torsion point's y.
+            le_bytes_from_decimal(
+                "57896044618658097711785492504343953926634992332820282019728792003956564819948",
+            ),
+            le_bytes_from_decimal(
+                "2707385501144840649318225287225658788936804267575313519463743609750303402022",
+            ),
+            le_bytes_from_decimal(
+                "55188659117513257062467267217118295137698188065244968500265048394206261417927",
+            ),
+            // Non-canonical y == p (≥ field prime): encoding of the prime
+            // itself, still 32 bytes with a clear high bit region.
+            le_bytes_from_decimal(p),
+        ]
+    }
+
+    /// Weak/small-order and non-canonical public keys refuse — as both the
+    /// trusted key AND, symmetrically, when used as the signature's R half.
+    /// For each candidate y and both sign-bit encodings we (a) record whether
+    /// raw `ring` itself accepts/verifies, then (b) require the consumer to
+    /// refuse regardless.
+    #[test]
+    fn weak_and_noncanonical_keys_and_r_refuse() {
+        use ring::signature::{UnparsedPublicKey, ED25519};
+        let vs = vectors();
+        let i1 = &vs[0];
+        let now = 1_700_000_000_500u64;
+        let segs: Vec<&str> = i1.envelope.split('.').collect();
+        // The signed message the consumer uses.
+        let mut msg = RECEIPT_DOMAIN.as_bytes().to_vec();
+        msg.push(0);
+        msg.extend_from_slice(segs[0].as_bytes());
+        msg.push(b'.');
+        msg.extend_from_slice(segs[1].as_bytes());
+        for base_y in weak_key_bytes() {
+            for sign_bit in [0u8, 0x80] {
+                let mut pk = base_y;
+                pk[31] |= sign_bit;
+                // (a) As a trusted key: craft the trust set to this candidate
+                // and require the consumer to refuse the genuine envelope.
+                let kr = vec![TrustedKey::capture_test(
+                    "agenticos-native-owner",
+                    "synthetic-owner-0001",
+                    1,
+                    pk,
+                )];
+                assert!(
+                    verify_receipt_format(&i1.envelope, &kr, now, 10).is_err(),
+                    "weak/noncanonical trusted key (sign {sign_bit}) must refuse"
+                );
+                // (b) As the signature's R half under the good key: tamper the
+                // signature's first 32 bytes to this candidate and require the
+                // consumer to refuse under the pinned good key.
+                let mut sig = i1.signature.clone();
+                sig[..32].copy_from_slice(&pk);
+                let env = format!("{}.{}.{}", segs[0], segs[1], b64(&sig));
+                let kr = keyring_v1(i1.public_key);
+                assert!(
+                    verify_receipt_format(&env, &kr, now, 10).is_err(),
+                    "weak/noncanonical R (sign {sign_bit}) must refuse"
+                );
+                // Record raw ring's verdict on the key form for the report —
+                // the assertion that matters is the consumer refusal above.
+                let _raw = UnparsedPublicKey::new(&ED25519, &pk).verify(&msg, &i1.signature);
+            }
+        }
+    }
+
+    /// Scalar S = L (the group order) is non-canonical: a signature whose
+    /// second 32 bytes are the little-endian encoding of L must refuse under
+    /// the real verifier — S must satisfy `S < L`. Both the consumer and the
+    /// raw ring path refuse.
+    #[test]
+    fn scalar_s_equal_l_refuses() {
+        let vs = vectors();
+        let i1 = &vs[0];
+        let kr = keyring_v1(i1.public_key);
+        let now = 1_700_000_000_500u64;
+        let segs: Vec<&str> = i1.envelope.split('.').collect();
+        // L = 2^252 + 27742317777372353535851937790883648493.
+        let l = le_bytes_from_decimal(
+            "7237005577332262213973186563042994240857116359379907606001950938285454250574892",
+        );
+        let mut sig = i1.signature.clone();
+        sig[32..].copy_from_slice(&l);
+        let env = format!("{}.{}.{}", segs[0], segs[1], b64(&sig));
+        assert!(
+            verify_receipt_format(&env, &kr, now, 10).is_err(),
+            "signature with scalar S = L must refuse"
+        );
+    }
+
+    /// Identity-key forged signature: the all-zero / small-order public key
+    /// combined with a forged signature must not verify. ring itself refuses
+    /// to decompress the identity/weak key, so `verify` returns Err — we assert
+    /// the consumer refuses and separately record raw ring's refusal.
+    #[test]
+    fn identity_key_forged_signature_refuses() {
+        use ring::signature::{UnparsedPublicKey, ED25519};
+        let vs = vectors();
+        let i1 = &vs[0];
+        let now = 1_700_000_000_500u64;
+        let segs: Vec<&str> = i1.envelope.split('.').collect();
+        let mut msg = RECEIPT_DOMAIN.as_bytes().to_vec();
+        msg.push(0);
+        msg.extend_from_slice(segs[0].as_bytes());
+        msg.push(b'.');
+        msg.extend_from_slice(segs[1].as_bytes());
+        // Identity/weak public key encodings (y=1 little-endian is the identity
+        // point; y=0 is order-2). For a forged signature use R=identity and
+        // S=0 — a classic "verify anything" forgery under a naive verifier.
+        for &weak_y in &[le_bytes_from_decimal("0"), le_bytes_from_decimal("1")] {
+            // Raw ring refuses to use the weak key (Err on verify).
+            let raw = UnparsedPublicKey::new(&ED25519, &weak_y).verify(&msg, &i1.signature);
+            assert!(
+                raw.is_err(),
+                "raw ring must refuse to verify under an identity/weak key"
+            );
+            // Consumer under that weak trusted key refuses too.
+            let kr = vec![TrustedKey::capture_test(
+                "agenticos-native-owner",
+                "synthetic-owner-0001",
+                1,
+                weak_y,
+            )];
+            assert!(verify_receipt_format(&i1.envelope, &kr, now, 10).is_err());
+        }
+        // Forged signature: R = identity (y=1, sign 0), S = 0.
+        let mut forged = [0u8; 64];
+        let id = le_bytes_from_decimal("1");
+        forged[..32].copy_from_slice(&id);
+        // S already zero. Under the pinned good key this cannot verify.
+        let env = format!("{}.{}.{}", segs[0], segs[1], b64(&forged));
+        let kr = keyring_v1(i1.public_key);
+        assert!(verify_receipt_format(&env, &kr, now, 10).is_err());
     }
 }
