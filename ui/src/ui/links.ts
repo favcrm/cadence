@@ -9,11 +9,17 @@
  * plain node.
  */
 export function isLoopbackHref(href: string): boolean {
+  // react-markdown hands the href percent-encoded (`http://%5B::1%5D/`),
+  // which URL rejects; decode only the bracket escapes of an absolute href.
+  const absolute = /^([a-z][a-z0-9+.-]*:|\/\/)/i.test(href);
+  const candidate = absolute ? href.replace(/%5b/gi, "[").replace(/%5d/gi, "]") : href;
   let url: URL;
   try {
-    url = new URL(href);
+    url = new URL(candidate);
   } catch {
-    return false; // relative: this board's own origin
+    // An http(s) or network-path href that will not parse fails CLOSED
+    // (CAD-1075). Only a genuinely relative href is this board's own origin.
+    return /^(https?:|\/\/)/i.test(href);
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return false;
   const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
