@@ -22,11 +22,18 @@ this workflow exactly.
   carry a different id.
 - Work in the lane worktree that `cadence issue start <ID>` creates,
   never on main.
-- One PR per feature (behind a flag if it must land incomplete), not a chain
-  of small slices; each extra PR repeats review, approval and queue. Don't
-  stack a PR on an unmerged branch: squash merges break the stack. Before
-  asking for review, `git fetch origin && git rebase origin/main` so the
-  reviewed head is current; after approval, rebase only if the PR conflicts.
+- One PR per feature (CAD-1099, CAD-1107), behind a flag if it must land
+  incomplete, not a chain of small slices: each extra PR repeats CI, review,
+  approval and queue. Size a PR by what it delivers (the ticket's acceptance
+  end to end), never by a line cap. Sub-tickets of one feature ship in that
+  one PR under the parent ticket's id in the title; the body lists them.
+  Split only per repository, or to keep a small trigger 1/3 part on the
+  two-review path so the rest needs one. Unfinished parts go into the open
+  PR before review; REVISE fixes go into the same PR; notes on a PASS go to
+  a follow-up PR (see "Notes never block"). Don't stack a PR on an unmerged
+  branch: squash merges break the stack. Before asking for review,
+  `git fetch origin && git rebase origin/main` so the reviewed head is
+  current; after approval, rebase only if the PR conflicts.
 
 ### Design note in the PR (CAD-957, revised by CAD-1099)
 When a change touches a daemon-enforced rule (gate, lease, lock, fence,
