@@ -1517,6 +1517,24 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 send(request, response);
                 return;
             }
+            // CAD-1098: `/api/app-installations/<id>/conversations` — the
+            // master's conversations for that installation.
+            if let Some(install) = path
+                .strip_prefix("/api/app-installations/")
+                .and_then(|tail| tail.strip_suffix("/conversations"))
+                .filter(|id| !id.is_empty() && !id.contains('/'))
+            {
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                let response =
+                    threads::conversations(state_dir, crate::master::ALIAS, &|key: &str| {
+                        (key == "install").then(|| install.to_string())
+                    });
+                send(request, response);
+                return;
+            }
             if path == "/api/app-installations"
                 || path
                     .strip_prefix("/api/app-installations/")
@@ -1599,6 +1617,9 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                         send(request, err_response(405, "stream is GET only"))
                     }
                     Some("stream") => threads::stream(request, state_dir, alias, &query),
+                    Some("conversations") => {
+                        send(request, threads::conversations(state_dir, alias, &query))
+                    }
                     Some(_) => send(request, err_response(404, "no such thread route")),
                 }
                 return;

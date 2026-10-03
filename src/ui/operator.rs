@@ -257,6 +257,18 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
+    // CAD-1098: making a conversation is the operator's chat, like the
+    // message POST — the daemon proves the connection again.
+    route(
+        "POST",
+        "/api/threads/*/conversations",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/conversations",
+        RouteClass::OperatorOnly,
+    ),
     // CAD-551: the composer's slash commands and Stop — the daemon's
     // `master_command` is operator-only, so the relay is too.
     route("POST", "/api/master/command", RouteClass::OperatorOnly),
@@ -2082,6 +2094,24 @@ mod tests {
             route_class("POST", "/api/session/device/poll"),
             RouteClass::Session
         );
+        // CAD-1098: making a conversation is the operator's chat, on
+        // either path; the board is never less strict than the RPC.
+        for path in [
+            "/api/threads/master/conversations",
+            "/api/app-installations/install-1/conversations",
+        ] {
+            assert_eq!(
+                route_class("POST", path),
+                RouteClass::OperatorOnly,
+                "{path}"
+            );
+            assert!(
+                WRITE_ROUTES.iter().any(|r| r.method == "POST"
+                    && r.class == RouteClass::OperatorOnly
+                    && matches(r.pattern, path)),
+                "{path} must be listed, not left to the fail-closed default"
+            );
+        }
         // Unlisted writes are operator-only.
         assert_eq!(route_class("POST", "/api/launch"), RouteClass::OperatorOnly);
         assert_eq!(

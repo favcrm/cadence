@@ -33,6 +33,7 @@ mod area_rpc;
 mod caller_rule;
 mod checkup;
 mod connections_rpc;
+mod conversations_rpc;
 mod crm_send_rpc;
 mod crm_smtp_rpc;
 mod delivery_rpc;
@@ -2834,6 +2835,8 @@ impl Shared {
             "agent_ask" => self.rpc_ask(params, peer_pid),
             "thread_read" => self.rpc_thread_read(params),
             "thread_send" => self.rpc_thread_send(params, peer_pid),
+            "conversation_list" => self.rpc_conversation_list(params, peer_pid),
+            "conversation_create" => self.rpc_conversation_create(params, peer_pid),
             "agent_events" => self.rpc_events(params),
             // CAD-886: read-only wait with `agent_show` visibility.
             "agent_wait" => self.rpc_wait(params, peer_pid),

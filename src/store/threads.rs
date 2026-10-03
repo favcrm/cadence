@@ -101,6 +101,17 @@ pub struct Thread {
     pub alias: String,
     pub created: f64,
     pub updated: f64,
+    /// CAD-1098: the app installation an app conversation belongs to.
+    /// `None` is the home thread (the master's own chat).
+    pub install_id: Option<String>,
+    /// The context a conversation was created (and, for a subject,
+    /// proven) under. Binding only for a subject conversation.
+    pub context_id: Option<String>,
+    /// `campaign:<id>` for a campaign conversation, else `None`.
+    pub subject: Option<String>,
+    pub is_general: bool,
+    pub archived: bool,
+    pub title: Option<String>,
 }
 
 impl Thread {
@@ -110,8 +121,37 @@ impl Thread {
             "alias": self.alias,
             "created": self.created,
             "updated": self.updated,
+            "install_id": self.install_id,
+            "context_id": self.context_id,
+            "subject": self.subject,
+            "general": self.is_general,
+            "is_general": self.is_general,
+            "archived": self.archived,
+            "title": self.title,
         })
     }
+
+    /// Home is the master's own chat: no installation scope.
+    pub fn is_home(&self) -> bool {
+        self.install_id.is_none()
+    }
+}
+
+/// A campaign conversation's subject prefix (v1's only subject kind).
+pub const SUBJECT_CAMPAIGN: &str = "campaign:";
+/// At most this many conversations per (alias, installation): a
+/// "New conversation" button must not grow the table without bound.
+pub const CONVERSATION_LIMIT: i64 = 200;
+
+/// Which conversation `conversation_create` makes or finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationKind<'a> {
+    /// The app's default conversation: idempotent per (alias, install).
+    General,
+    /// "New conversation", `/new`, `/clear`: always a fresh row.
+    Fresh,
+    /// `campaign:<id>`: idempotent per (alias, install, subject).
+    Subject(&'a str),
 }
 
 #[derive(Debug, Clone)]
@@ -163,9 +203,18 @@ pub struct NewEntry<'a> {
 fn row_thread(row: &rusqlite::Row) -> rusqlite::Result<Thread> {
     Ok(Thread {
         id: row.get("id")?,
-        alias: row.get("alias")?,
+        alias: row
+            .get::<_, Option<String>>("alias")?
+            .or(row.get::<_, Option<String>>("archived_alias")?)
+            .unwrap_or_default(),
         created: row.get("created")?,
         updated: row.get("updated")?,
+        install_id: row.get("install_id")?,
+        context_id: row.get("context_id")?,
+        subject: row.get("subject")?,
+        is_general: row.get::<_, i64>("is_general")? != 0,
+        archived: row.get::<_, i64>("archived")? != 0,
+        title: row.get("title")?,
     })
 }
 
@@ -201,6 +250,52 @@ pub(super) const SCHEMA_V13: &str = "CREATE TABLE IF NOT EXISTS threads(
         message_id TEXT,
         created REAL NOT NULL);
      CREATE INDEX IF NOT EXISTS thread_entries_thread ON thread_entries(thread_id, seq);";
+
+/// CAD-1098 v32: the conversation columns and partial unique indexes.
+/// Runs inside the caller's transaction. A store whose `threads` already
+/// has `install_id` (a half-applied earlier attempt) skips the rebuild
+/// and only (re)creates the indexes.
+pub(super) fn migrate_v32(tx: &Connection) -> Result<()> {
+    let rebuilt = tx
+        .prepare("PRAGMA table_info(threads)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == "install_id");
+    if !rebuilt {
+        tx.execute_batch(
+            "CREATE TABLE threads_v32(
+                id TEXT PRIMARY KEY,
+                alias TEXT,
+                archived_alias TEXT,
+                created REAL NOT NULL,
+                updated REAL NOT NULL,
+                install_id TEXT,
+                context_id TEXT,
+                subject TEXT,
+                is_general INTEGER NOT NULL DEFAULT 0 CHECK(is_general IN (0,1)),
+                archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+                title TEXT,
+                CHECK(install_id IS NOT NULL
+                      OR (subject IS NULL AND context_id IS NULL AND is_general=0)),
+                CHECK(subject IS NULL OR is_general=0));
+             INSERT INTO threads_v32(id,alias,archived_alias,created,updated)
+                SELECT id,alias,archived_alias,created,updated FROM threads;
+             DROP TABLE threads;
+             ALTER TABLE threads_v32 RENAME TO threads;",
+        )?;
+    }
+    tx.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS threads_home_alias
+            ON threads(alias) WHERE install_id IS NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS threads_general
+            ON threads(alias, install_id) WHERE is_general=1;
+         CREATE UNIQUE INDEX IF NOT EXISTS threads_subject
+            ON threads(alias, install_id, subject) WHERE subject IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS threads_conv
+            ON threads(alias, install_id, created);",
+    )?;
+    Ok(())
+}
 
 /// Redact then bound one stored text. A scan that cannot run withholds
 /// the text: the entry still lands, the value never does.
@@ -355,6 +450,12 @@ fn message_entry<'a>(
     }
 }
 
+struct Binding<'a> {
+    install: &'a str,
+    context: &'a str,
+    conversation: Option<&'a str>,
+}
+
 impl Store {
     /// The alias's thread, created on first use. The agent must exist.
     pub fn ensure_thread(&self, alias: &str) -> Result<Thread> {
@@ -384,6 +485,12 @@ impl Store {
             alias: alias.to_string(),
             created: at,
             updated: at,
+            install_id: None,
+            context_id: None,
+            subject: None,
+            is_general: false,
+            archived: false,
+            title: None,
         })
     }
 
@@ -394,7 +501,7 @@ impl Store {
     /// thread.
     pub(super) fn thread_detach_in(tx: &Connection, alias: &str) -> Result<()> {
         let Some(thread) = Self::thread_in(tx, alias)? else {
-            return Ok(());
+            return Self::conversations_detach_in(tx, alias);
         };
         Self::thread_append_in(
             tx,
@@ -413,6 +520,19 @@ impl Store {
             "UPDATE threads SET alias=NULL, archived_alias=? WHERE id=?",
             params![alias, thread.id],
         )?;
+        Self::conversations_detach_in(tx, alias)?;
+        Ok(())
+    }
+
+    /// The agent's app conversations go with it: archived (read-only,
+    /// kept), their alias moved to `archived_alias` so a reused alias
+    /// starts fresh, like the home thread.
+    fn conversations_detach_in(tx: &Connection, alias: &str) -> Result<()> {
+        tx.execute(
+            "UPDATE threads SET alias=NULL, archived_alias=?1, archived=1
+             WHERE alias=?1 AND install_id IS NOT NULL",
+            [alias],
+        )?;
         Ok(())
     }
 
@@ -424,8 +544,216 @@ impl Store {
 
     fn thread_in(conn: &Connection, alias: &str) -> Result<Option<Thread>> {
         Ok(conn
-            .query_row("SELECT * FROM threads WHERE alias=?", [alias], row_thread)
+            .query_row(
+                "SELECT * FROM threads WHERE alias=? AND install_id IS NULL",
+                [alias],
+                row_thread,
+            )
             .optional()?)
+    }
+
+    fn thread_by_id_in(conn: &Connection, id: &str) -> Result<Option<Thread>> {
+        Ok(conn
+            .query_row("SELECT * FROM threads WHERE id=?", [id], row_thread)
+            .optional()?)
+    }
+
+    /// One thread (home or conversation) by id; `None` when unknown.
+    pub fn thread_by_id(&self, id: &str) -> Result<Option<Thread>> {
+        let conn = self.conn();
+        Self::thread_by_id_in(&conn, id)
+    }
+
+    /// The thread a message's entries live in: where its enqueue note
+    /// landed, `None` when the message left none (daemon traffic to an
+    /// unthreaded alias). Every later entry for the message — assistant
+    /// text, tools, turn result — follows it (CAD-1098 I2). `alias`
+    /// bounds the lookup so a message id of another agent never steers
+    /// an entry out of its own threads.
+    fn message_thread_in(conn: &Connection, alias: &str, id: &str) -> Result<Option<Thread>> {
+        Ok(conn
+            .query_row(
+                "SELECT t.* FROM thread_entries e JOIN threads t ON t.id=e.thread_id
+                 WHERE e.message_id=?1 AND (t.alias=?2 OR t.archived_alias=?2)
+                 ORDER BY e.seq LIMIT 1",
+                params![id, alias],
+                row_thread,
+            )
+            .optional()?)
+    }
+
+    /// The conversation `message_id` belongs to: `Some(thread)` (home
+    /// included) when its enqueue note exists, `None` otherwise.
+    pub fn message_conversation(&self, alias: &str, message_id: &str) -> Result<Option<Thread>> {
+        let conn = self.conn();
+        Self::message_thread_in(&conn, alias, message_id)
+    }
+
+    /// Is `install` one this store knows? An installation exists for the
+    /// store once it holds a context (the same proof `thread_app` uses
+    /// for the app binding).
+    pub fn app_install_known(&self, install: &str) -> Result<bool> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM app_contexts WHERE install_id=? LIMIT 1",
+                [install],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Every conversation of `alias` in `install`, General first, then
+    /// by creation. Reads only; creates nothing.
+    pub fn conversation_list(&self, alias: &str, install: &str) -> Result<Vec<Thread>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM threads WHERE alias=? AND install_id=?
+             ORDER BY is_general DESC, created, id LIMIT ?",
+        )?;
+        let rows = stmt
+            .query_map(params![alias, install, CONVERSATION_LIMIT + 1], row_thread)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Make or find a conversation (CAD-1098). The caller has already
+    /// proven the installation, the context and (for a subject) the
+    /// campaign. Idempotent kinds race the partial unique indexes plus
+    /// `INSERT OR IGNORE`: two concurrent first creates yield one row.
+    /// `Ok((thread, created))`.
+    pub fn conversation_create(
+        &self,
+        alias: &str,
+        install: &str,
+        context: &str,
+        kind: ConversationKind,
+    ) -> Result<(Thread, bool)> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        self.agent_in(&tx, alias)?;
+        let out = Self::conversation_make_in(&tx, alias, install, Some(context), kind)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// The app's General conversation, made if absent (idempotent; the
+    /// installation is already proven by the caller). The board's list
+    /// always shows it, so it exists before the first message.
+    pub fn conversation_ensure_general(&self, alias: &str, install: &str) -> Result<Thread> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        self.agent_in(&tx, alias)?;
+        let (thread, _) =
+            Self::conversation_make_in(&tx, alias, install, None, ConversationKind::General)?;
+        tx.commit()?;
+        Ok(thread)
+    }
+
+    fn conversation_make_in(
+        tx: &Connection,
+        alias: &str,
+        install: &str,
+        context: Option<&str>,
+        kind: ConversationKind,
+    ) -> Result<(Thread, bool)> {
+        let (general, subject) = match kind {
+            ConversationKind::General => (1_i64, None),
+            ConversationKind::Fresh => (0, None),
+            ConversationKind::Subject(subject) => (0, Some(subject)),
+        };
+        let at = now();
+        let id = Uuid::new_v4().simple().to_string();
+        let count: i64 = tx.query_row(
+            "SELECT count(*) FROM threads WHERE alias=? AND install_id=?",
+            params![alias, install],
+            |r| r.get(0),
+        )?;
+        let inserted = if kind == ConversationKind::Fresh {
+            if count >= CONVERSATION_LIMIT {
+                return Err(Error::rejected(format!(
+                    "this app already has {CONVERSATION_LIMIT} conversations"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO threads(id,alias,created,updated,install_id,context_id,subject,is_general)
+                 VALUES(?,?,?,?,?,?,NULL,0)",
+                params![id, alias, at, at, install, context],
+            )?
+        } else {
+            tx.execute(
+                "INSERT OR IGNORE INTO threads(id,alias,created,updated,install_id,context_id,subject,is_general)
+                 VALUES(?,?,?,?,?,?,?,?)",
+                params![id, alias, at, at, install, context, subject, general],
+            )?
+        };
+        let thread = match kind {
+            ConversationKind::General => tx.query_row(
+                "SELECT * FROM threads WHERE alias=? AND install_id=? AND is_general=1",
+                params![alias, install],
+                row_thread,
+            )?,
+            ConversationKind::Subject(subject) => tx.query_row(
+                "SELECT * FROM threads WHERE alias=? AND install_id=? AND subject=?",
+                params![alias, install, subject],
+                row_thread,
+            )?,
+            ConversationKind::Fresh => {
+                tx.query_row("SELECT * FROM threads WHERE id=?", [&id], row_thread)?
+            }
+        };
+        if inserted == 1 {
+            Self::event(
+                tx,
+                alias,
+                "conversation_created",
+                json!({"thread": thread.id, "install_id": install, "subject": subject,
+                       "general": general == 1}),
+            )?;
+        }
+        Ok((thread, inserted == 1))
+    }
+
+    /// The conversation a verified-app send lands in, inside the enqueue
+    /// transaction. `selector` is only a selector: it must name an
+    /// existing, unarchived conversation of this alias and installation,
+    /// and a subject conversation serves only the context it was proven
+    /// under. No selector means the app's General conversation (made on
+    /// first use). Nothing here trusts a client field for scope.
+    pub(super) fn conversation_resolve_in(
+        tx: &Connection,
+        alias: &str,
+        install: &str,
+        context: &str,
+        selector: Option<&str>,
+    ) -> Result<Thread> {
+        let thread = match selector {
+            None => {
+                Self::conversation_make_in(
+                    tx,
+                    alias,
+                    install,
+                    Some(context),
+                    ConversationKind::General,
+                )?
+                .0
+            }
+            Some(id) => Self::thread_by_id_in(tx, id)?
+                .filter(|t| t.alias == alias && t.install_id.as_deref() == Some(install))
+                .ok_or_else(|| Error::rejected("Unknown conversation for this app installation"))?,
+        };
+        if thread.archived {
+            return Err(Error::rejected(
+                "this conversation is archived and read-only",
+            ));
+        }
+        if thread.subject.is_some() && thread.context_id.as_deref() != Some(context) {
+            return Err(Error::rejected(
+                "this campaign conversation serves only the context it was created in",
+            ));
+        }
+        Ok(thread)
     }
 
     /// Append to the alias's thread. `Ok(None)` when it has none —
@@ -450,9 +778,9 @@ impl Store {
     ) -> Result<Option<i64>> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
-        if Self::thread_in(&tx, alias)?.is_none() {
-            return Ok(None);
-        }
+        // The entry follows the running MESSAGE's conversation, never
+        // "the alias's thread" (CAD-1098 I2): `thread_append_in` resolves
+        // it from the message id; with no running message it is home.
         let running = Self::running_message_in(&tx, alias)?;
         let seq = Self::thread_append_in(
             &tx,
@@ -482,9 +810,6 @@ impl Store {
     pub fn thread_hold_running(&self, alias: &str, text: &str, payload: Value) -> Result<()> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
-        if Self::thread_in(&tx, alias)?.is_none() {
-            return Ok(());
-        }
         let Some(running) = Self::running_message_in(&tx, alias)? else {
             Self::thread_append_in(
                 &tx,
@@ -546,9 +871,47 @@ impl Store {
                 entry.kind
             )));
         }
-        let Some(thread) = Self::thread_in(tx, alias)? else {
+        // CAD-1098: an entry tied to a message lands in that message's
+        // conversation; anything else is home.
+        let thread = match entry.message_id {
+            Some(id) => match Self::message_thread_in(tx, alias, id)? {
+                Some(thread) => Some(thread),
+                None => Self::thread_in(tx, alias)?,
+            },
+            None => Self::thread_in(tx, alias)?,
+        };
+        let Some(thread) = thread else {
             return Ok(None);
         };
+        Self::thread_write_in(tx, &thread, entry).map(Some)
+    }
+
+    /// Append to one specific thread (a conversation's pack or session
+    /// notes — entries tied to no message that must not land in home).
+    pub fn thread_append_to(&self, thread_id: &str, entry: NewEntry) -> Result<Option<i64>> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let Some(thread) = Self::thread_by_id_in(&tx, thread_id)? else {
+            return Ok(None);
+        };
+        let seq = Self::thread_write_in(&tx, &thread, entry)?;
+        tx.commit()?;
+        Ok(Some(seq))
+    }
+
+    fn thread_write_in(tx: &Connection, thread: &Thread, entry: NewEntry) -> Result<i64> {
+        if !ROLES.contains(&entry.role) {
+            return Err(Error::internal(format!(
+                "unknown thread role '{}'",
+                entry.role
+            )));
+        }
+        if !KINDS.contains(&entry.kind) {
+            return Err(Error::internal(format!(
+                "unknown thread entry kind '{}'",
+                entry.kind
+            )));
+        }
         let text = clean_text(entry.text, TEXT_CAP);
         let payload = entry.payload.map(|p| clean_payload(p).to_string());
         let at = now();
@@ -570,7 +933,7 @@ impl Store {
             "UPDATE threads SET updated=? WHERE id=?",
             params![at, thread.id],
         )?;
-        Ok(Some(seq))
+        Ok(seq)
     }
 
     /// The operator/system entry for a freshly queued message.
@@ -585,15 +948,43 @@ impl Store {
         refs: Option<&Value>,
         app: Option<&Value>,
     ) -> Result<()> {
+        let entry = message_entry(sender, source, body, id, refs, app);
+        // CAD-1098: a verified App binding lands the message in the
+        // conversation the server resolves (the client's selector is
+        // checked, never trusted). The thread is fixed here, in the
+        // enqueue transaction, together with the entry.
         if *sender == Sender::OperatorChat {
+            if let Some(binding) = app.and_then(Self::verified_binding) {
+                let thread = Self::conversation_resolve_in(
+                    tx,
+                    alias,
+                    binding.install,
+                    binding.context,
+                    binding.conversation,
+                )?;
+                Self::thread_write_in(tx, &thread, entry)?;
+                return Ok(());
+            }
             Self::ensure_thread_in(tx, alias)?;
         }
-        Self::thread_append_in(
-            tx,
-            alias,
-            message_entry(sender, source, body, id, refs, app),
-        )?;
+        Self::thread_append_in(tx, alias, entry)?;
         Ok(())
+    }
+
+    /// The `{install, context, conversation selector}` of a daemon-
+    /// normalized App binding; `None` unless the daemon stamped it
+    /// verified. The selector is the optional `conversation` the send
+    /// named — a selector only.
+    fn verified_binding(app: &Value) -> Option<Binding<'_>> {
+        let obj = app.as_object()?;
+        if obj.get("verified") != Some(&Value::Bool(true)) {
+            return None;
+        }
+        Some(Binding {
+            install: obj.get("install_id")?.as_str()?,
+            context: obj.get("context_id")?.as_str()?,
+            conversation: obj.get("conversation").and_then(Value::as_str),
+        })
     }
 
     /// The verified App binding the enqueue note for `id` recorded
@@ -777,13 +1168,34 @@ impl Store {
         let Some(thread) = Self::thread_in(&conn, alias)? else {
             return Ok(Vec::new());
         };
+        Self::entries_after_in(&conn, &thread.id, after, limit)
+    }
+
+    /// [`Self::thread_entries`] for one thread by id (home or an app
+    /// conversation).
+    pub fn thread_entries_of(
+        &self,
+        thread_id: &str,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<ThreadEntry>> {
+        let conn = self.conn();
+        Self::entries_after_in(&conn, thread_id, after, limit)
+    }
+
+    fn entries_after_in(
+        conn: &Connection,
+        thread_id: &str,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<ThreadEntry>> {
         let limit = limit.clamp(1, PAGE_MAX);
         let mut stmt = conn.prepare(
             "SELECT * FROM thread_entries WHERE thread_id=? AND seq>?
              ORDER BY seq LIMIT ?",
         )?;
         let rows = stmt
-            .query_map(params![thread.id, after, limit], row_entry)?
+            .query_map(params![thread_id, after, limit], row_entry)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -802,6 +1214,26 @@ impl Store {
         let Some(thread) = Self::thread_in(&conn, alias)? else {
             return Ok((Vec::new(), false));
         };
+        Self::entries_before_in(&conn, &thread.id, before, limit)
+    }
+
+    /// [`Self::thread_entries_before`] for one thread by id.
+    pub fn thread_entries_before_of(
+        &self,
+        thread_id: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<ThreadEntry>, bool)> {
+        let conn = self.conn();
+        Self::entries_before_in(&conn, thread_id, before, limit)
+    }
+
+    fn entries_before_in(
+        conn: &Connection,
+        thread_id: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<ThreadEntry>, bool)> {
         let limit = limit.clamp(1, PAGE_MAX);
         let mut stmt = conn.prepare(
             "SELECT * FROM thread_entries WHERE thread_id=? AND seq<?
@@ -809,7 +1241,7 @@ impl Store {
         )?;
         let mut rows = stmt
             .query_map(
-                params![thread.id, before.unwrap_or(i64::MAX), limit + 1],
+                params![thread_id, before.unwrap_or(i64::MAX), limit + 1],
                 row_entry,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -838,6 +1270,28 @@ impl Store {
         let Some(thread) = Self::thread_in(&conn, alias)? else {
             return Ok((Vec::new(), 0));
         };
+        Self::continuity_in(&conn, &thread.id, current, limit)
+    }
+
+    /// [`Self::continuity_entries`] for one conversation's thread: the
+    /// pack of a session that serves it carries only these entries
+    /// (CAD-1098 I7).
+    pub fn continuity_entries_of(
+        &self,
+        thread_id: &str,
+        current: &str,
+        limit: i64,
+    ) -> Result<(Vec<ThreadEntry>, i64)> {
+        let conn = self.conn();
+        Self::continuity_in(&conn, thread_id, current, limit)
+    }
+
+    fn continuity_in(
+        conn: &Connection,
+        thread_id: &str,
+        current: &str,
+        limit: i64,
+    ) -> Result<(Vec<ThreadEntry>, i64)> {
         let filter = format!(
             "e.thread_id=?1 AND (e.message_id IS NULL OR (e.message_id != ?2 AND
              EXISTS(SELECT 1 FROM messages m WHERE m.id=e.message_id
@@ -845,7 +1299,7 @@ impl Store {
         );
         let total: i64 = conn.query_row(
             &format!("SELECT COUNT(*) FROM thread_entries e WHERE {filter}"),
-            params![thread.id, current],
+            params![thread_id, current],
             |r| r.get(0),
         )?;
         let limit = limit.clamp(1, PAGE_MAX);
@@ -853,7 +1307,7 @@ impl Store {
             "SELECT e.* FROM thread_entries e WHERE {filter} ORDER BY e.seq DESC LIMIT ?3"
         ))?;
         let mut rows = stmt
-            .query_map(params![thread.id, current, limit], row_entry)?
+            .query_map(params![thread_id, current, limit], row_entry)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.reverse();
         let older = total - rows.len() as i64;
@@ -869,12 +1323,22 @@ impl Store {
         let Some(thread) = Self::thread_in(&conn, alias)? else {
             return Ok(false);
         };
+        Self::compaction_pending_in(&conn, &thread.id)
+    }
+
+    /// [`Self::compaction_pending`] for one thread by id.
+    pub fn compaction_pending_of(&self, thread_id: &str) -> Result<bool> {
+        let conn = self.conn();
+        Self::compaction_pending_in(&conn, thread_id)
+    }
+
+    fn compaction_pending_in(conn: &Connection, thread_id: &str) -> Result<bool> {
         let last = |event: &str| -> Result<i64> {
             Ok(conn.query_row(
                 "SELECT COALESCE(MAX(seq), 0) FROM thread_entries
                  WHERE thread_id=? AND role='system' AND message_id IS NULL
                  AND json_extract(payload,'$.event')=?",
-                params![thread.id, event],
+                params![thread_id, event],
                 |r| r.get(0),
             )?)
         };
@@ -1037,6 +1501,114 @@ mod tests {
         let s = Store::open(&db).unwrap();
         assert_eq!(s.thread_entries("m1", 0, 10).unwrap().len(), 1);
         assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
+    }
+
+    /// CAD-1098 (I10): v31 -> v32 rebuilds `threads` in one transaction;
+    /// every existing thread and entry stays exactly where it was (home),
+    /// the partial unique indexes bind afterwards, and a half-applied or
+    /// repeated run converges.
+    #[test]
+    fn v32_migration_keeps_history_home() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        let (thread_id, before) = {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "master", dir.path());
+            let thread = s.ensure_thread("master").unwrap();
+            s.enqueue("master", "history one", None, "h1", "user")
+                .unwrap();
+            s.enqueue_sent(
+                "master",
+                "history two",
+                None,
+                "h2",
+                "operator",
+                None,
+                &Sender::Operator,
+            )
+            .unwrap();
+            let entries = s.thread_entries("master", 0, 10).unwrap();
+            (
+                thread.id,
+                entries
+                    .iter()
+                    .map(|e| (e.seq, e.text.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // A genuine v31: the inline `alias UNIQUE` table, no conversation
+        // columns or indexes.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF; DROP INDEX threads_home_alias; DROP INDEX threads_general;
+                 DROP INDEX threads_subject; DROP INDEX threads_conv;
+                 CREATE TABLE threads_old(id TEXT PRIMARY KEY, alias TEXT UNIQUE,
+                    archived_alias TEXT, created REAL NOT NULL, updated REAL NOT NULL);
+                 INSERT INTO threads_old SELECT id,alias,archived_alias,created,updated FROM threads;
+                 DROP TABLE threads; ALTER TABLE threads_old RENAME TO threads;
+                 UPDATE schema_version SET version=31;",
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            let thread = s.thread("master").unwrap().expect("home thread kept");
+            assert_eq!(thread.id, thread_id);
+            assert!(thread.is_home() && !thread.is_general && !thread.archived);
+            let entries = s.thread_entries("master", 0, 10).unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|e| (e.seq, e.text.clone()))
+                    .collect::<Vec<_>>(),
+                before,
+                "history moved or rewritten"
+            );
+            assert!(entries.iter().all(|e| e.thread_id == thread_id));
+            assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
+            // Half-applied: version rolled back, objects present.
+            Connection::open(&db)
+                .unwrap()
+                .execute("UPDATE schema_version SET version=31", [])
+                .unwrap();
+        }
+        // The partial unique indexes bind: one home, one General, one
+        // subject conversation per (alias, install).
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE schema_version SET version=?",
+                [crate::rollout::SCHEMA_VERSION],
+            )
+            .unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let dup = |sql: &str| conn.execute(sql, []).is_err();
+        assert!(dup(
+            "INSERT INTO threads(id,alias,created,updated) VALUES('x','master',1,1)"
+        ));
+        let conv = "INSERT INTO threads(id,alias,created,updated,install_id,context_id,is_general,subject) \
+                    VALUES(?,'master',1,1,'i1','c1',?,?)";
+        conn.execute(conv, params!["g1", 1, None::<String>])
+            .unwrap();
+        assert!(conn
+            .execute(conv, params!["g2", 1, None::<String>])
+            .is_err());
+        conn.execute(conv, params!["s1", 0, Some("campaign:a")])
+            .unwrap();
+        assert!(conn
+            .execute(conv, params!["s2", 0, Some("campaign:a")])
+            .is_err());
+        conn.execute(conv, params!["n1", 0, None::<String>])
+            .unwrap();
+        conn.execute(conv, params!["n2", 0, None::<String>])
+            .unwrap();
+        // A subject cannot also be General, and home cannot carry a scope.
+        assert!(conn
+            .execute(conv, params!["bad", 1, Some("campaign:b")])
+            .is_err());
+        assert!(dup(
+            "INSERT INTO threads(id,alias,created,updated,is_general) VALUES('bad2','w9',1,1,1)"
+        ));
     }
 
     #[test]

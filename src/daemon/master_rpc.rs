@@ -1712,6 +1712,8 @@ mod tests {
             "agent_ask",
             "agent_stop",
             "thread_send",
+            "conversation_list",
+            "conversation_create",
             "plan_approve",
             "plan_reject",
             "slot_acquire",
