@@ -39,7 +39,14 @@ class CleanupTests(unittest.TestCase):
                 self.assertIn(f"needs.change-scope.outputs.{category} != 'false'", step)
         test = job(ci, "test")
         self.assertIn("cargo test --doc --locked", test)
-        self.assertIn("cargo test --locked --test safety_floor", test)
+        # CAD-1090: every tests/*.rs target, via the shared selection script.
+        self.assertIn("scripts/result-test-args", test)
+        self.assertIn("cargo test --locked $targets -- --test-threads 2", test)
+        selected = subprocess.run([str(ROOT / "scripts/result-test-args")],
+                                  capture_output=True, text=True, check=True).stdout.split()
+        self.assertIn("safety_floor", selected)
+        self.assertEqual(sorted(p.stem for p in (ROOT / "tests").glob("*.rs")),
+                         sorted(selected[1::2]))
         self.assertIn("scripts/split-doctor-host --check", job(ci, "fmt"))
 
     def test_scope_shell_defaults_full_on_missing_or_forged_policy(self):
