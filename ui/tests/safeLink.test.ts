@@ -29,6 +29,13 @@ function equal(actual: unknown, expected: unknown, what: string): void {
   if (a !== e) throw new Error(`${what}: expected ${e}, got ${a}`);
 }
 
+// Chrome strips leading C0 controls/spaces and TAB/LF/CR anywhere, so each of
+// these is a loopback network path to the browser.
+const SNEAKY = [
+  "\u0001//localhost:3138/x", "\u0000//localhost:3138/x", "\u001f//localhost:3138/x",
+  "/\t/localhost:3138/x", "/\n/localhost:3138/x", "/\r/localhost:3138/x",
+  "\u0001//127.0.0.1/", "//\tlocalhost/",
+];
 const LOOPBACK = ["http://127.0.0.1:3010/x", "http://[::1]/x", "http://cadence-3010.localhost:4000/x"];
 const GOOD = "https://github.com/o/r/pull/1";
 const noAnchor = (html: string, href: string, what: string) => {
@@ -79,6 +86,11 @@ const surfaces: Record<string, (href: string) => string> = {
 };
 for (const [name, render] of Object.entries(surfaces)) {
   for (const l of LOOPBACK) noAnchor(render(l), l, `${name} ${l}`);
+  for (const bad of SNEAKY) {
+    const html = render(bad);
+    equal(html.includes("<a "), false, `${name}: no anchor for ${JSON.stringify(bad)}`);
+  }
+  equal(render("/relative/path").includes("<a "), false, `${name}: relative href is plain text`);
   const ok = render(GOOD);
   equal(ok.includes(`<a `), true, `${name}: https stays an anchor`);
   equal(ok.includes(`href="${GOOD}"`) && ok.includes('target="_blank"') && ok.includes('rel="noreferrer"'), true, `${name}: https anchor attributes`);

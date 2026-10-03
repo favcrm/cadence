@@ -84,4 +84,13 @@ for (const href of [
   equal(isLoopbackHref(href), false, href);
 }
 
+// CAD-1080: the browser's URL pre-processing (strip C0/space ends, drop TAB/LF/CR).
+for (const href of [
+  "\u0001//localhost:3138/x", "\u0000//localhost/x", "\u001f//[::1]/x", "\u0001//127.0.0.1/",
+  "/\t/localhost:3138/x", "/\n/localhost/x", "/\r/localhost/x", "//\tlocalhost/", "ht\ttp://localhost/",
+]) {
+  equal(isLoopbackHref(href), true, JSON.stringify(href));
+}
+equal(isLoopbackHref("\u0001//example.com/x"), false, "stripped public network path");
+
 console.log("loopback link checks passed");

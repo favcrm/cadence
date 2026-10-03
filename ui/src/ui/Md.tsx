@@ -95,7 +95,7 @@ export default function Md({
               <>{children}</>
             )
           ) : (
-            <SafeLink className="lnk" href={href}>
+            <SafeLink className="lnk" href={href} encoded>
               {children}
             </SafeLink>
           );

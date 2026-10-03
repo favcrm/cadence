@@ -19,14 +19,32 @@ export default function SafeLink({
   className,
   role,
   warnClassName,
+  encoded,
   children,
   ...rest
 }: Omit<AnchorHTMLAttributes<HTMLAnchorElement>, "href" | "target" | "rel"> & {
   href: string | null | undefined;
   /** Extra classes for the loopback warning span (e.g. a menu item's). */
   warnClassName?: string;
+  /**
+   * Md only: the href already went through markdown's own encoding (which
+   * percent-encodes control characters), so the lenient path stands and Md's
+   * output is unchanged. Every other surface renders RAW tracker or agent
+   * text and takes the default strict path: the href must parse as an
+   * absolute http(s) URL, and the anchor follows the normalized `url.href`
+   * that was judged, never the raw string. Relative hrefs are plain text.
+   */
+  encoded?: boolean;
 }) {
-  const safe = href ? defaultUrlTransform(href) : "";
+  let safe = href ? defaultUrlTransform(href) : "";
+  if (safe && !encoded) {
+    try {
+      const url = new URL(safe);
+      safe = url.protocol === "http:" || url.protocol === "https:" ? url.href : "";
+    } catch {
+      safe = "";
+    }
+  }
   // A menu item keeps its role when it is not an anchor; Md passes none.
   if (!safe) return role ? <span role={role} className={warnClassName}>{children}</span> : <>{children}</>;
   if (isLoopbackHref(safe)) {

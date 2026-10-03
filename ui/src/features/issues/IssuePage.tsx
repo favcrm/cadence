@@ -236,7 +236,7 @@ function PageBody({
             <Button href={tabHref("conversation")}>Ask agent</Button>
           )}
           {pr?.href && (
-            <SafeLink className="btn" href={pr.href}>
+            <SafeLink className="btn" warnClassName="btn" href={pr.href}>
               Open pull request
             </SafeLink>
           )}
