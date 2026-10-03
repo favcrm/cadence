@@ -237,6 +237,7 @@ tests = [
     "forged_tailscale_headers_not_attributed",
     "tailnet_write_wrong_origin_refused",
     "ui_pidfile_names_only_this_state_dirs_board",
+    "ui_relative_state_dir_board_is_found_from_any_cwd",
 ]
 helpers = [
     "fake_ts",

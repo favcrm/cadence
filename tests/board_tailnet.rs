@@ -883,3 +883,36 @@ fn ui_pidfile_names_only_this_state_dirs_board() {
     assert_eq!(out["state"], "stopped", "board thread {board_tid}: {out}");
     assert_eq!(status(board)["state"], "running");
 }
+
+/// CAD-1081 r1: a board started with a relative `--state-dir` is still
+/// this state dir's board when read from any other cwd — its argv
+/// carries the absolute dir, so `ui status`/`ui stop` keep finding it.
+#[test]
+fn ui_relative_state_dir_board_is_found_from_any_cwd() {
+    let (pm, base) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let st = base.path().join("st");
+    std::fs::create_dir(&st).unwrap();
+    seed(pm.path(), &st);
+    let _ui = DetachedUi(st.clone());
+    let none: &[(&str, &str)] = &[];
+    let port = free_port().to_string();
+    let (ok, out) = cli_run(
+        pm.path(),
+        Path::new("st"),
+        Some(base.path()),
+        &["ui", "start", "--port", &port],
+        none,
+    );
+    assert!(ok, "{out}");
+    let board = out["pid"].as_i64().unwrap();
+    let argv = std::fs::read(format!("/proc/{board}/cmdline")).unwrap();
+    let argv: Vec<&[u8]> = argv.split(|b| *b == 0).collect();
+    let dir = argv.iter().position(|a| *a == b"--state-dir").unwrap() + 1;
+    assert!(
+        argv[dir].starts_with(b"/"),
+        "relative --state-dir in board argv"
+    );
+    let (_, out) = cli_run(pm.path(), &st, Some(pm.path()), &["ui", "status"], none);
+    assert_eq!(out["state"], "running", "{out}");
+    assert_eq!(out["pid"], board);
+}

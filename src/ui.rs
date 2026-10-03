@@ -1068,7 +1068,7 @@ pub(crate) fn board_identity(proc_root: &Path, pid: i32, state_dir: &Path) -> Bo
     if pid <= 0 {
         return BoardPid::NotBoard;
     }
-    let dir = proc_root.join(pid.to_string());
+    let dir = dir_of(proc_root, pid);
     let status = match proc_read(&dir, "status") {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
         Err(v) => return v,
@@ -1094,11 +1094,28 @@ pub(crate) fn board_identity(proc_root: &Path, pid: i32, state_dir: &Path) -> Bo
         .filter(|s| !s.is_empty())
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect();
-    if board_argv_matches(&argv, state_dir) {
+    let Some(dir) = board_argv_state_dir(&argv) else {
+        return BoardPid::NotBoard;
+    };
+    // A relative `--state-dir` is the board's, read from its own cwd —
+    // never the reader's.
+    let dir = if dir.is_relative() {
+        match std::fs::read_link(dir_of(proc_root, pid).join("cwd")) {
+            Ok(cwd) => cwd.join(dir),
+            Err(e) => return gone_or_unknown(&e),
+        }
+    } else {
+        dir
+    };
+    if same_dir(&dir, state_dir) {
         BoardPid::Board
     } else {
         BoardPid::NotBoard
     }
+}
+
+fn dir_of(proc_root: &Path, pid: i32) -> PathBuf {
+    proc_root.join(pid.to_string())
 }
 
 /// The `--state-dir` of a board argv — `<…/cadence> … --state-dir
@@ -1121,10 +1138,9 @@ pub(crate) fn board_argv_state_dir(argv: &[String]) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Is `argv` a board for `state_dir`?
-pub(crate) fn board_argv_matches(argv: &[String], state_dir: &Path) -> bool {
+fn same_dir(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    board_argv_state_dir(argv).is_some_and(|d| canon(&d) == canon(state_dir))
+    canon(a) == canon(b)
 }
 
 /// Tiny blocking GET — enough for health checks without an HTTP client
@@ -1324,7 +1340,9 @@ pub(crate) fn start_inner(
         .env_remove("CADENCE_DEVICE_LOGIN_SUBJECTS");
     command
         .arg("--state-dir")
-        .arg(state_dir)
+        // CAD-1081: absolute, so the board's argv names its state dir
+        // from any reader's cwd.
+        .arg(std::path::absolute(state_dir)?)
         .args(["ui", "run", "--host", &host, "--port"])
         .arg(port.to_string());
     if let Some(dist) = &eff.dist {
@@ -2447,7 +2465,7 @@ mod tests {
 /// the real binary in tests/board_tailnet.rs.
 #[cfg(test)]
 mod pidfile_tests {
-    use super::{board_argv_matches, board_identity, pid_file, read_pid_in, BoardPid};
+    use super::{board_argv_state_dir, board_identity, pid_file, read_pid_in, same_dir, BoardPid};
     use std::path::Path;
 
     /// A fake `/proc/<pid>` with the given `status` and argv.
@@ -2491,12 +2509,39 @@ mod pidfile_tests {
     }
 
     #[test]
+    fn relative_state_dir_resolves_against_the_boards_cwd() {
+        let (root, base) = (
+            tempfile::TempDir::new().unwrap(),
+            tempfile::TempDir::new().unwrap(),
+        );
+        let (root, st) = (root.path(), base.path().join("st"));
+        std::fs::create_dir(&st).unwrap();
+        let board = ["cadence", "--state-dir", "st", "ui", "run"];
+        fake_proc(root, 50, "State:\tS\nTgid:\t50\n", &board);
+        // No cwd entry: the process is gone.
+        assert_eq!(board_identity(root, 50, &st), BoardPid::NotBoard);
+        std::os::unix::fs::symlink(base.path(), root.join("50/cwd")).unwrap();
+        assert_eq!(board_identity(root, 50, &st), BoardPid::Board);
+        fake_proc(root, 51, "State:\tS\nTgid:\t51\n", &board);
+        std::os::unix::fs::symlink(root, root.join("51/cwd")).unwrap();
+        assert_eq!(
+            board_identity(root, 51, &st),
+            BoardPid::NotBoard,
+            "other cwd"
+        );
+        // An unreadable cwd link (not a link: EINVAL) is unproven.
+        fake_proc(root, 52, "State:\tS\nTgid:\t52\n", &board);
+        std::fs::write(root.join("52/cwd"), "").unwrap();
+        assert_eq!(board_identity(root, 52, &st), BoardPid::Unknown);
+    }
+
+    #[test]
     fn board_argv_names_cadence_ui_run_for_this_state_dir() {
         let state = tempfile::TempDir::new().unwrap();
         let s = state.path().to_str().unwrap();
         let ok = |a: &[&str]| {
             let argv: Vec<String> = a.iter().map(|x| x.to_string()).collect();
-            board_argv_matches(&argv, state.path())
+            board_argv_state_dir(&argv).is_some_and(|d| same_dir(&d, state.path()))
         };
         assert!(ok(&["/r/cadence", "--state-dir", s, "ui", "run"]));
         assert!(ok(&["cadence", &format!("--state-dir={s}"), "ui", "run"]));
