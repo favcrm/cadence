@@ -1768,3 +1768,57 @@ fn install_refuses_a_package_with_an_invalid_chat_descriptor() {
     let ok = install("ok", None, false).unwrap();
     assert!(ok["install_id"].is_string(), "control: {ok}");
 }
+
+/// CAD-1111: a third app, shipped as a package alone, installs through the
+/// same validator, is approved like any app, serves its own descriptor
+/// through the generic route, and its screen package passes the CAD-1006
+/// integrity proof the mount runs: no host code names it.
+///
+/// Guards: `app_chat::validate` at install, `app_screen_pkg::extract` (the
+/// mount's own re-proof) over the live bundle, the approved-digest pin.
+#[test]
+fn fixture_third_app_installs_and_serves_its_own_chat_descriptor_and_screen() {
+    let dir = tempfile::Builder::new().prefix("c11f").tempdir().unwrap();
+    let pm = dir.path().join("pm");
+    crate::issue::Pm::init(&pm).unwrap();
+    let opts = ServeOptions::default();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    let shared = Shared::new(dir.path(), &opts).unwrap();
+    let source = format!(
+        "{}/tests/fixtures/apps/notes-fixture",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let operator = |method: &str, params: Value| {
+        scoped(Asserted::Operator, || {
+            shared.dispatch(method, &params, pid())
+        })
+    };
+    let out = operator("app_workspace_install", json!({"source": source})).unwrap();
+    let (id, digest) = (out["install_id"].clone(), out["digest"].clone());
+    // Unapproved: no descriptor yet.
+    assert_eq!(
+        operator("app_chat_descriptor", json!({"install_id": id})).unwrap(),
+        json!({"found": false})
+    );
+    operator(
+        "app_local_install_approve",
+        json!({"install_id": id, "digest": digest}),
+    )
+    .unwrap();
+    let served = operator("app_chat_descriptor", json!({"install_id": id})).unwrap();
+    assert_eq!(served["app"], json!("notes-fixture"), "{served}");
+    assert_eq!(served["digest"], digest);
+    assert_eq!(
+        served["descriptor"]["directives"][1]["render"],
+        json!("screen:post-preview")
+    );
+    let pm = shared.pm_at(&shared.pm_dir().unwrap()).unwrap();
+    let pkg = crate::issue::app_catalog::workspace::with_runtime_snapshot(
+        &pm,
+        id.as_str().unwrap(),
+        |_, files| crate::issue::app_screen_pkg::extract(files, "post-preview"),
+    )
+    .unwrap();
+    assert_eq!(pkg.app, "notes-fixture");
+}
