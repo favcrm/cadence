@@ -78,7 +78,9 @@ export class ScreenChannel extends FrameChannel {
     super(source, receipt, removeFrame, failed, onReady);
   }
   protected accept(ready: Extract<ChildToHost, { op: "ready" }>): boolean {
-    this.intents = ready.accepts?.[0] === PUBLISH_INTENTS_V1;
+    // Only the opt-ins a workspace screen can honour; the chat opt-in closes it.
+    if (ready.accepts !== undefined && ready.accepts[0] !== PUBLISH_INTENTS_V1) return false;
+    this.intents = ready.accepts !== undefined;
     return true;
   }
   update(projection: ScreenPush): void {
