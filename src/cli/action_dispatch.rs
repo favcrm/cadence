@@ -49,12 +49,54 @@ pub(crate) fn run() -> Result<i32> {
         Commands::Login {
             issuer,
             org,
+            slug,
+            use_,
             token_stdin,
             no_open,
             auth_dir,
         } => {
+            // `--token-stdin` is the legacy AgenticOS token path, not org login.
             let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
-            return cadence_agent::remote_auth::login(issuer, org, &dir, *token_stdin, *no_open);
+            if *token_stdin {
+                return cadence_agent::remote_auth::login(issuer, org, &dir, true, *no_open);
+            }
+            let slug = slug
+                .as_deref()
+                .ok_or_else(|| Error::rejected("login needs --slug <org-slug>"))?;
+            let grant = cadence_agent::remote_enrollment::login_browser(
+                issuer,
+                org,
+                slug,
+                &dir,
+                |url, code| {
+                    eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
+                    if !no_open {
+                        let program = if cfg!(target_os = "macos") {
+                            "open"
+                        } else {
+                            "xdg-open"
+                        };
+                        let mut opener = std::process::Command::new(program);
+                        opener
+                            .arg(url)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null());
+                        let _ = cadence_agent::reaper::spawn(&mut opener);
+                    }
+                    Ok(())
+                },
+            )?;
+            // Record first: a refused registry write (changed endpoint, name
+            // taken by `local`) must leave no credential behind.
+            let view =
+                org::record_remote(&grant.slug, &grant.endpoint, &grant.organization_id, *use_)?;
+            grant.save_credential(&dir)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&view).unwrap_or_default()
+            );
+            return Ok(0);
         }
         Commands::Auth { action } => {
             return match action {

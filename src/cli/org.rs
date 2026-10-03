@@ -342,6 +342,85 @@ fn ensure_local(state_dir: &Path, tracker_dir: &Path) -> Result<()> {
     file.write(&registry)
 }
 
+/// Pure registry mutation for `cadence login` (CAD-1019 slice 1b), unit-tested
+/// without the registry file. `org_name` is the issuer-verified slug and
+/// `endpoint`/`org_id` come only from the verified grant. A stored remote is
+/// never re-pointed, a `local` row is never overwritten, and the new org is
+/// selected only when there is no default or `use_default`.
+fn apply_record_remote(
+    registry: &mut Registry,
+    org_name: &str,
+    endpoint: &str,
+    org_id: &str,
+    use_default: bool,
+) -> Result<(Connection, bool)> {
+    let org = cadence_agent::proto::identifier(org_name, "org")?;
+    let destination = Destination::Remote {
+        endpoint: endpoint.to_string(),
+        org_id: org_id.to_string(),
+    };
+    validate_destination(&destination)?;
+    let selection = Selection { org: org.clone() };
+    if let Some(existing) = registry
+        .connections
+        .iter()
+        .find(|c| c.selection == selection)
+    {
+        // Re-login must re-point at the same endpoint + org id — a changed
+        // slug or forged audience refuses, never silently moves the org.
+        match &existing.destination {
+            Destination::Remote {
+                endpoint: ep,
+                org_id: oid,
+            } if ep == endpoint && oid == org_id => {}
+            Destination::Remote { .. } => {
+                return Err(Error::rejected(
+                    "a different endpoint or org id is already stored for this org; \
+                     remove it first",
+                ));
+            }
+            Destination::Local { .. } => {
+                return Err(Error::rejected(
+                    "an org with this name exists as a local connection; pick another name",
+                ));
+            }
+        }
+    } else {
+        registry.connections.push(Connection {
+            selection: selection.clone(),
+            destination: destination.clone(),
+        });
+    }
+    let selected = if use_default || registry.selected.is_none() {
+        registry.selected = Some(selection.clone());
+        true
+    } else {
+        registry.selected.as_ref() == Some(&selection)
+    };
+    Ok((
+        Connection {
+            selection,
+            destination,
+        },
+        selected,
+    ))
+}
+
+/// File-locked wrapper over `apply_record_remote`; returns the stored view.
+pub(super) fn record_remote(
+    org_name: &str,
+    endpoint: &str,
+    org_id: &str,
+    use_default: bool,
+) -> Result<Value> {
+    let file = RegistryFile::open()?;
+    let mut registry = file.read()?;
+    let (connection, selected) =
+        apply_record_remote(&mut registry, org_name, endpoint, org_id, use_default)?;
+    file.write(&registry)?;
+    Ok(view(&connection, selected))
+}
+
 /// Resolve this invocation's daemon state dir once. `org` is `--org`; a
 /// managed caller keeps its ambient binding and never consults the
 /// registry. `state`/`tracker` are explicit pins — either wins over the
@@ -447,4 +526,136 @@ pub(crate) enum OrgAction {
         /// Org name; default is the saved/`CADENCE_ORG` selection.
         name: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EP_A: &str = "https://alpha.cadencecloud.app";
+    const EP_B: &str = "https://beta.cadencecloud.app";
+
+    fn local_registry() -> Registry {
+        Registry {
+            selected: None,
+            connections: vec![Connection {
+                selection: Selection {
+                    org: LOCAL_ORG.to_string(),
+                },
+                destination: Destination::Local {
+                    state_dir: PathBuf::from("/state"),
+                    tracker_dir: PathBuf::from("/tracker"),
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn first_login_selects_the_default() {
+        let mut registry = Registry::default();
+        let (_, selected) =
+            apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        assert!(selected);
+        assert_eq!(registry.selected.as_ref().unwrap().org, "alpha");
+    }
+
+    #[test]
+    fn second_org_login_leaves_the_default_unchanged() {
+        // I5 (`cli_second_login_keeps_default`): workspace B login adds
+        // an org and leaves the default untouched without `--use`.
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        let (_, selected) =
+            apply_record_remote(&mut registry, "beta", EP_B, "ws_beta", false).unwrap();
+        assert!(!selected);
+        assert_eq!(registry.selected.as_ref().unwrap().org, "alpha");
+        assert_eq!(registry.connections.len(), 2);
+    }
+
+    #[test]
+    fn use_flag_moves_the_default() {
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        let (_, selected) =
+            apply_record_remote(&mut registry, "beta", EP_B, "ws_beta", true).unwrap();
+        assert!(selected);
+        assert_eq!(registry.selected.as_ref().unwrap().org, "beta");
+    }
+
+    #[test]
+    fn relogin_with_the_same_endpoint_and_org_id_is_idempotent() {
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        let (_, selected) =
+            apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        assert!(selected);
+        assert_eq!(registry.connections.len(), 1);
+    }
+
+    #[test]
+    fn changed_endpoint_or_org_id_is_refused_never_moved() {
+        // A changed slug or forged audience refuses instead of silently
+        // re-pointing the stored remote at another workspace.
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        assert!(apply_record_remote(&mut registry, "alpha", EP_B, "ws_alpha", false).is_err());
+        assert!(apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).is_err());
+        let stored = registry
+            .connections
+            .iter()
+            .find(|c| c.selection.org == "alpha")
+            .unwrap();
+        match &stored.destination {
+            Destination::Remote { endpoint, org_id } => {
+                assert_eq!(endpoint, EP_A);
+                assert_eq!(org_id, "ws_alpha");
+            }
+            Destination::Local { .. } => panic!("stored remote changed shape"),
+        }
+    }
+
+    #[test]
+    fn login_over_a_local_name_is_refused() {
+        let mut registry = local_registry();
+        assert!(apply_record_remote(&mut registry, "local", EP_A, "ws_alpha", false).is_err());
+        assert_eq!(registry.connections.len(), 1);
+    }
+
+    #[test]
+    fn non_https_or_credentialed_endpoint_is_refused() {
+        let mut registry = Registry::default();
+        assert!(apply_record_remote(
+            &mut registry,
+            "alpha",
+            "http://evil.example/",
+            "ws_a",
+            false
+        )
+        .is_err());
+        assert!(apply_record_remote(
+            &mut registry,
+            "alpha",
+            "https://user:pass@evil.example/",
+            "ws_a",
+            false
+        )
+        .is_err());
+        assert!(apply_record_remote(
+            &mut registry,
+            "alpha",
+            "https://evil.example/?next=1",
+            "ws_a",
+            false
+        )
+        .is_err());
+        assert!(registry.connections.is_empty());
+        assert!(registry.selected.is_none());
+    }
+
+    #[test]
+    fn invalid_org_name_is_refused() {
+        let mut registry = Registry::default();
+        assert!(apply_record_remote(&mut registry, "Alpha", EP_A, "ws_a", false).is_err());
+        assert!(registry.connections.is_empty());
+    }
 }
