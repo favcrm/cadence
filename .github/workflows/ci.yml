@@ -214,6 +214,7 @@ jobs:
       - run: python3 scripts/test_workflow_cleanup.py
       - run: python3 scripts/test_ci_change_scope.py
       - run: python3 scripts/test_ci_fast_linker.py
+      - run: python3 scripts/test_release_reuse.py
       - run: python3 -m unittest scripts/test_enqueue_human_paths.py
       - run: python3 -m unittest scripts/test_enqueue_scope_approval.py
       - run: scripts/design-kit --check
@@ -434,7 +435,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: [test, release, clippy]
+        profile: [test, release, release-full, clippy]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: scripts/ci-rust-toolchain --profile minimal --component clippy
@@ -453,7 +454,7 @@ jobs:
         run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
       - name: Enable shared sccache (read-write; no-op without credentials)
         id: sccache
-        if: matrix.profile != 'clippy'
+        if: matrix.profile == 'test' || matrix.profile == 'release'
         env:
           SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RW_ACCESS_KEY_ID }}
           SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY }}
@@ -469,6 +470,25 @@ jobs:
       - name: Warm the ci profile
         if: matrix.profile == 'release' && (steps.cache.outputs.cache-hit != 'true' || steps.sccache.outputs.enabled == 'true')
         run: cargo build --profile ci --locked
+      # CAD-1131: the shipping profile, so the queue's release-queue-build
+      # restores warm dependencies (no fast linker or sccache: the same
+      # build as release-artifact).
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        if: matrix.profile == 'release-full' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: matrix.profile == 'release-full' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Warm the release profile (queue release build)
+        if: matrix.profile == 'release-full' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          (cd ui && pnpm install --frozen-lockfile && pnpm build)
+          cargo build --release --locked --features ui
       - name: Warm the clippy profile (not sccache-cacheable; rust-cache only)
         if: matrix.profile == 'clippy' && steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -477,6 +497,124 @@ jobs:
       - name: sccache statistics
         if: ${{ !cancelled() }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
+
+  # CAD-1131: build the release binary once per git TREE. A queue entry's
+  # merge_group run builds the shipping binary in parallel with the gates
+  # (`contents: read` only, like release-artifact; not a required check) and
+  # uploads it as `release-tree-<tree>`. The main push for that same sha
+  # reuses it through `release-reuse` instead of compiling again. No
+  # `overwrite`, so a later step of this run cannot replace the artifact.
+  release-queue-build:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Refuse reduced-gate release artifact before building
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: scripts/require-full-gates "$GITHUB_WORKSPACE" "$SOURCE_SHA"
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - run: scripts/ci-rust-toolchain --profile minimal
+      # Restore-only, from the key `cache-warm` (release-full) saves on main.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate-release-full
+          save-if: false
+      - run: pnpm install --frozen-lockfile
+        working-directory: ui
+      - run: pnpm build
+        working-directory: ui
+      - run: cargo build --release --locked --features ui
+      - name: Pack the binary with its tree-hash manifest
+        id: pack
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release-reuse.py pack --binary target/release/cadence \
+            --sha "$SOURCE_SHA" --dest dist --run-id "$RUN_ID" \
+            --rustc "$(rustc --version)" --cargo "$(cargo --version)"
+          echo "tree=$(jq -r .tree dist/manifest.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-tree-${{ steps.pack.outputs.tree }}
+          path: |
+            dist/cadence
+            dist/cadence.sha256
+            dist/manifest.json
+          if-no-files-found: error
+          retention-days: 2
+
+  # CAD-1131: reuse the queue run's build when, and only when, every check
+  # in scripts/release-reuse.py passes for this checkout's own tree hash
+  # (artifact named and manifested by tree, same commit, digest, shape).
+  # Any failure leaves `reused` unset and release-artifact rebuilds. It
+  # runs no repo build code and never executes the downloaded binary.
+  release-reuse:
+    needs: [queue-evidence]
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.queue-evidence.outputs.tested == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reused: ${{ steps.done.outputs.reused }}
+      sha256: ${{ steps.reuse.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Refuse reduced-gate release artifact before reusing
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: scripts/require-full-gates "$GITHUB_WORKSPACE" "$SOURCE_SHA"
+      - name: Fetch and verify the queue run's build of this tree
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          QUEUE_RUN_ID: ${{ needs.queue-evidence.outputs.run_id }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -uo pipefail
+          if python3 scripts/release-reuse.py reuse --repo "$REPO" --sha "$SOURCE_SHA" \
+              --queue-run-id "$QUEUE_RUN_ID" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
+              --dest dist; then
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+            echo "release reused from merge_group run $QUEUE_RUN_ID (tree verified)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::release reuse refused; release-artifact rebuilds"
+            echo "release rebuilt: reuse refused for $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: ${{ steps.reuse.outputs.verified == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-build-${{ github.sha }}
+          path: |
+            dist/cadence
+            dist/cadence.sha256
+            dist/manifest.json
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+      # Only after the upload: a failed upload leaves `reused` unset, so
+      # release-artifact rebuilds instead of leaving no release at all.
+      - name: Mark the reuse complete
+        id: done
+        if: ${{ steps.reuse.outputs.verified == 'true' }}
+        run: echo "reused=true" >> "$GITHUB_OUTPUT"
 
   # CAD-334: keep the exact tested main build. Runs only on a push to main
   # (never pull_request or merge_group), and only when every gate passed
@@ -499,9 +637,10 @@ jobs:
   # release build matches what was tested; the exact rustc/cargo versions
   # are recorded in manifest.json. Neither job is a required check.
   release-artifact:
-    needs: [queue-evidence, fmt, clippy, test, build, ui]
+    needs: [queue-evidence, release-reuse, fmt, clippy, test, build, ui]
     if: >-
       ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.release-reuse.outputs.reused != 'true' &&
       (needs.queue-evidence.outputs.tested == 'true' ||
       (needs.fmt.result == 'success' && needs.clippy.result == 'success' &&
       needs.test.result == 'success' && needs.build.result == 'success' &&
@@ -592,12 +731,15 @@ jobs:
           overwrite: true
 
   release-attest:
-    needs: [release-artifact]
+    needs: [release-artifact, release-reuse]
     # Explicit result check: release-artifact's skipped gate needs (queue
-    # evidence found) would fail the default success() here too.
+    # evidence found) would fail the default success() here too. Exactly
+    # one of release-artifact (built here) or release-reuse (verified from
+    # the queue run, CAD-1131) supplies the bytes and their digest.
     if: >-
       ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-      needs.release-artifact.result == 'success' }}
+      (needs.release-artifact.result == 'success' ||
+      (needs.release-reuse.result == 'success' && needs.release-reuse.outputs.reused == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -613,7 +755,7 @@ jobs:
         working-directory: dist
         env:
           SOURCE_SHA: ${{ github.sha }}
-          BUILT_SHA256: ${{ needs.release-artifact.outputs.sha256 }}
+          BUILT_SHA256: ${{ needs.release-reuse.outputs.sha256 || needs.release-artifact.outputs.sha256 }}
         run: |
           set -euo pipefail
           # The downloaded binary must be the bytes release-artifact built,
