@@ -173,7 +173,9 @@ impl Capsule {
 #[derive(Clone, Copy)]
 pub(super) struct Deadline(Instant);
 impl Deadline {
-    pub(super) fn until(until:Instant)->Self {Self(until)}
+    pub(super) fn until(until: Instant) -> Self {
+        Self(until)
+    }
     fn new(budget: Duration) -> Self {
         Self(Instant::now() + budget)
     }
@@ -463,7 +465,7 @@ pub(super) struct Enrollment {
     pub(super) generation: String,
     pub(super) digest: [u8; 32],
 }
-fn measured_process(pid: u32, enrollment: &Enrollment, generation: &str) -> Result<()> {
+pub(super) fn measured_process(pid: u32, enrollment: &Enrollment, generation: &str) -> Result<()> {
     if pid != enrollment.pid || generation != enrollment.generation || enrollment.digest == [0; 32]
     {
         return Err(unknown());
@@ -478,7 +480,11 @@ fn measured_process(pid: u32, enrollment: &Enrollment, generation: &str) -> Resu
     }
     Ok(())
 }
-pub(super) fn admit_supervisor(stream: &UnixStream, enrollment: &Enrollment, generation: &str) -> Result<()> {
+pub(super) fn admit_supervisor(
+    stream: &UnixStream,
+    enrollment: &Enrollment,
+    generation: &str,
+) -> Result<()> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
     if unsafe {

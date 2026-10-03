@@ -975,27 +975,42 @@ pub(super) fn check_transport_binding(
 
 /// Private signed-format evidence for the separate CAD-1113 enrolled route.
 /// No peer, consume, launch or enrollment authority; fields cannot be literal.
-pub(super) struct VerifiedEnvelope { claims: GrantClaims }
+pub(super) struct VerifiedEnvelope {
+    claims: GrantClaims,
+}
 impl VerifiedEnvelope {
-    pub(super) fn claims(&self) -> &GrantClaims { &self.claims }
+    pub(super) fn claims(&self) -> &GrantClaims {
+        &self.claims
+    }
 }
 pub(super) fn production_grant_keyring() -> Result<&'static [&'static [u8]]> {
-    let _=SUPERVISOR_KEYRING;
+    let _ = SUPERVISOR_KEYRING;
     Err(Error::unknown("grant keyring unavailable"))
 }
 /// Reuses BOTH existing parsers. The receipt binding bytes are already verified
 /// canonical; parsing its challenge preserves optional imageLane presence.
 /// Low-level dependency-explicit crypto mechanics, not an admission facade.
-pub(super) fn verify_enrolled_format(envelope:&str, keys:&[&[u8]], now:u64,
-    canonical_binding:&[u8]) -> Result<VerifiedEnvelope> {
-    let parsed=parse_envelope(envelope,now)?;
-    verify_signature_with(&parsed,keys)?;
-    let value:serde_json::Value=serde_json::from_slice(canonical_binding)
-        .map_err(|_|Error::unknown("canonical enrollment binding unavailable"))?;
-    let expected=parse_supervisor_challenge(value.get("challenge")
-        .ok_or_else(||Error::unknown("canonical challenge unavailable"))?)?;
-    if parsed.claims.challenge != expected {return Err(Error::unknown("full challenge mismatch"));}
-    Ok(VerifiedEnvelope {claims:parsed.claims})
+pub(super) fn verify_enrolled_format(
+    envelope: &str,
+    keys: &[&[u8]],
+    now: u64,
+    canonical_binding: &[u8],
+) -> Result<VerifiedEnvelope> {
+    let parsed = parse_envelope(envelope, now)?;
+    verify_signature_with(&parsed, keys)?;
+    let value: serde_json::Value = serde_json::from_slice(canonical_binding)
+        .map_err(|_| Error::unknown("canonical enrollment binding unavailable"))?;
+    let expected = parse_supervisor_challenge(
+        value
+            .get("challenge")
+            .ok_or_else(|| Error::unknown("canonical challenge unavailable"))?,
+    )?;
+    if parsed.claims.challenge != expected {
+        return Err(Error::unknown("full challenge mismatch"));
+    }
+    Ok(VerifiedEnvelope {
+        claims: parsed.claims,
+    })
 }
 
 // ─────────────────────────── the fixed action verbs ───────────────────────
@@ -1216,13 +1231,19 @@ impl GrantListener {
     #[cfg(target_arch = "x86_64")]
     pub(super) fn serve_enrolled_once(&self) -> Result<()> {
         // Missing authority refuses before accept/read, not after consume.
-        let until=std::time::Instant::now()+REQUEST_BUDGET;
-        let receiver=super::installer_enrolled::production_enrolled_receiver()?;
+        let until = std::time::Instant::now() + REQUEST_BUDGET;
+        let receiver = super::installer_enrolled::production_enrolled_receiver()?;
         // This separately typed loop owns the listener (no legacy dispatch).
-        self.listener.set_nonblocking(true).map_err(|_|Error::unknown("enrolled listener UNKNOWN"))?;
-        super::installer_client::Deadline::until(until).wait(self.listener.as_raw_fd(),libc::POLLIN)?;
-        let (stream,_)=self.listener.accept().map_err(|_|Error::unknown("enrolled accept UNKNOWN"))?;
-        receiver.serve_until(&stream,until)
+        self.listener
+            .set_nonblocking(true)
+            .map_err(|_| Error::unknown("enrolled listener UNKNOWN"))?;
+        super::installer_client::Deadline::until(until)
+            .wait(self.listener.as_raw_fd(), libc::POLLIN)?;
+        let (stream, _) = self
+            .listener
+            .accept()
+            .map_err(|_| Error::unknown("enrolled accept UNKNOWN"))?;
+        receiver.serve_until(&stream, until)
     }
 
     /// `#[cfg(test)]`-only bind at an arbitrary path — used by ordinary-uid
