@@ -2859,9 +2859,15 @@ mod tests {
             o.len() == keys.len()
                 && keys.iter().all(|k| o.contains_key(*k))
                 && body["version"] == DEVICE_VERSION
-                && body["audience"].as_str().is_some_and(|a| origin(a, false).is_ok())
-                && body["client_label"].as_str().is_some_and(|l| (1..=120).contains(&l.len()))
-                && body["code_challenge"].as_str().is_some_and(|c| c.len() == 43)
+                && body["audience"]
+                    .as_str()
+                    .is_some_and(|a| origin(a, false).is_ok())
+                && body["client_label"]
+                    .as_str()
+                    .is_some_and(|l| (1..=120).contains(&l.len()))
+                && body["code_challenge"]
+                    .as_str()
+                    .is_some_and(|c| c.len() == 43)
         })
     }
 
@@ -2938,7 +2944,11 @@ mod tests {
         let (out, dir, _root) = run_login(login_grant_body(), vec![]);
         let grant = out.unwrap();
         assert_eq!(
-            (grant.organization_id.as_str(), grant.slug.as_str(), grant.endpoint.as_str()),
+            (
+                grant.organization_id.as_str(),
+                grant.slug.as_str(),
+                grant.endpoint.as_str()
+            ),
             ("ws_real", "acme", LOGIN_ENDPOINT)
         );
         // Verification persists nothing; the caller records, then saves.
@@ -2996,10 +3006,25 @@ mod tests {
     fn login_refuses_a_slug_that_is_not_one_dns_label_before_any_request() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("e");
-        for bad in ["evil.example", "acme/x", "Acme", "-acme", "acme-", "", "a_b", "acme:443"] {
+        for bad in [
+            "evil.example",
+            "acme/x",
+            "Acme",
+            "-acme",
+            "acme-",
+            "",
+            "a_b",
+            "acme:443",
+        ] {
             // No listener exists: refusal must precede any network call.
             let out = login_browser("http://127.0.0.1:1", "ws_real", bad, &dir, |_, _| Ok(()));
-            assert!(out.is_err(), "{bad}");
+            assert!(
+                out.err()
+                    .unwrap()
+                    .to_string()
+                    .contains("Invalid hosted login request"),
+                "{bad}"
+            );
         }
     }
 
