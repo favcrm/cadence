@@ -419,16 +419,21 @@ def glob_list(toml_text, key_path):
     return node if isinstance(node, list) and all(isinstance(g, str) for g in node) else None
 
 
-def risk_line(text, skip_fences=False):
+def risk_line(text, ticket=False):
     """The one `Risk:` line (stripped, without the label), or None when there
     is none or MORE THAN ONE (fail closed: which one counts is unknowable).
-    `skip_fences` ignores lines inside fenced code blocks (a ticket body)."""
-    lines, fenced = [], False
+    `ticket` (a ticket body) counts EVERY line that contains `Risk:` once
+    Markdown markers are stripped, fenced code and HTML comments included:
+    the rendered page and this script cannot disagree on which line is the
+    one when none is skipped. That one line must itself start with `Risk:`."""
+    lines = []
     for raw in (text or "").splitlines():
         l = raw.strip()
-        if skip_fences and l.startswith(("```", "~~~")):
-            fenced = not fenced
-        elif not fenced and l.startswith("Risk:"):
+        if ticket:
+            l = re.sub(r"[*_`]", "", l).lstrip(" \t>-").strip()
+            if "Risk:" in l:
+                lines.append(l[5:].strip() if l.startswith("Risk:") else None)
+        elif l.startswith("Risk:"):
             lines.append(l[5:].strip())
     return lines[0] if len(lines) == 1 else None
 
@@ -506,7 +511,7 @@ def scope_reasons(issue, title, branch, ticket, paths, risk_text, one_text, verd
     if ticket.get("status") not in SCOPE_STATUSES:
         why.append(f"ticket {issue} status is {ticket.get('status')!r}; a scope approval covers only a ticket in {'/'.join(SCOPE_STATUSES)}")
     # The ticket declares its Risk triggers; the approval covers only those.
-    declared = risk_triggers(risk_line(body, True)) if isinstance(body, str) else None
+    declared = risk_triggers(risk_line(body, ticket=True)) if isinstance(body, str) else None
     pt, unmapped = path_triggers(paths, risk_text)
     if not declared:
         why.append(f"ticket {issue} declares no parseable `Risk: human (<numbers>)` line, so its scope is unknown")
