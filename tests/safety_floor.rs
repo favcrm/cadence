@@ -6,6 +6,7 @@
 //! the test-seam exclusion without depending on the retired fixture
 //! infrastructure.
 
+use cadence_agent::reaper;
 use std::process::Command;
 
 #[test]
@@ -13,14 +14,13 @@ fn safety_floor_test_seam_refuses_release_build() {
     // The release binary must never carry the test seam. This assertion is
     // checked by the CI build job's "Assert the release binary carries no
     // test seam" step; we mirror the check here so the floor itself can fail.
-    let output = Command::new("cargo")
-        .args(["check", "--release", "--locked", "--features", "test-seam"])
-        .output()
-        .expect("cargo check failed");
+    let mut cmd = Command::new("cargo");
+    cmd.args(["check", "--release", "--locked", "--features", "test-seam"]);
+    let out = reaper::output(&mut cmd).expect("cargo check failed");
     assert!(
-        !output.status.success(),
+        !out.status.success(),
         "test-seam release build must fail: {}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -28,11 +28,9 @@ fn safety_floor_test_seam_refuses_release_build() {
 fn safety_floor_cli_refuses_unknown_verb() {
     // Basic CLI refusal: unknown verbs exit non-zero. This proves the binary
     // still enforces its command surface during the clean-slate window.
-    let output = Command::new("target/debug/cadence")
-        .args(["nonexistent-verb"])
-        .output();
-    match output {
-        Ok(o) => assert!(!o.status.success(), "unknown verb must refuse"),
-        Err(_) => {} // binary not built yet in this lane — acceptable
+    let mut cmd = Command::new("target/debug/cadence");
+    cmd.args(["nonexistent-verb"]);
+    if let Ok(out) = reaper::output(&mut cmd) {
+        assert!(!out.status.success(), "unknown verb must refuse");
     }
 }
