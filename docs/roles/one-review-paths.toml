@@ -80,8 +80,11 @@ one_review_exclude = [
   "src/tailnet_proof.rs",
   "src/test_seam.rs",
   "src/master_perm.rs",
-  "src/agent_uid.rs",
+  "src/agent_uid/**",
   "src/cli/agent_uid.rs",
+  # risk-paths trigger 1's remote-CLI, board-auth and agent-exec names are
+  # already covered by the src/daemon/**, src/bin/** and src/platform/**
+  # directory excludes below; src/agent_uid/** above is the only new tree.
   # identity-heavy trees (risk-paths is not a complete map; by directory)
   "src/daemon/**",
   "src/bin/**",
@@ -105,4 +108,11 @@ one_review_exclude = [
   "src/secret/**",
   "src/cli/secret.rs",
   "src/cli/connection.rs",
+  # redaction code outside src/secret/** (CAD-1100)
+  "src/session.rs",
+  "src/backup/mod.rs",
+  "src/continuity.rs",
+  "src/doctor/host/util.rs",
+  "src/issue/report.rs",
+  "src/issue/areas.rs",
 ]

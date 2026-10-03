@@ -106,7 +106,7 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   limited to, every change to `.github/**`, `scripts/**` (except the
   allowlist in `docs/roles/risk-classes.md`), `Cargo.toml`,
   `Cargo.lock`, `ui/package.json`, `cadence-review.toml`,
-  `src/review.rs`, `docs/roles/**`, `docs/TEAM.md`, `docs/CHARTER.md`
+  `src/review.rs`, `docs/roles/**`, `docs/CHARTER.md`
   and this file. Most gates on a PR run from the PR's
   own workflow files, so review is the only control on a change to them.
   The operator decides. An agent the operator designates may prepare

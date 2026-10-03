@@ -60,6 +60,37 @@ class HumanPaths(unittest.TestCase):
             self.assertTrue(enq.is_human_path(p, RISK), p)
         self.assertFalse(enq.is_human_path("src/issue/reclaim.rs", RISK))
 
+    def test_every_human_path_maps_to_a_trigger(self):
+        """CAD-1100: a scope approval needs every human-class path in a
+        risk-paths schema/4/6/7 list, so is_human_path must imply a trigger
+        glob for the tracked tree AND the classifier's own synthetic space
+        (a nested .github/.cargo segment, a human basename anywhere)."""
+        doc = tomllib.loads(RISK_TEXT)
+        trigger_globs = [g for t in enq.PATH_TRIGGER_TABLES for g in doc[t[0]]["paths"]]
+        tracked = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
+                                 text=True, check=True).stdout.split()
+        candidates = set(tracked)
+        # The classifier's synthetic space: what it flags even when git
+        # tracks no such file today.
+        candidates.update([
+            "apps/x/package-lock.json", "apps/x/.github/workflows/w.yml",
+            "apps/x/.cargo/config.toml", "ui/sub/yarn.lock", "ui/sub/.npmrc",
+            "x/bun.lockb", "x/package.json", "x/pnpm-lock.yaml",
+            "x/build.rs", "x/rust-toolchain.toml", "config/new.json",
+            ".config/new.toml", ".github/new.yml", "docs/roles/new.md",
+            "scripts/new", "src/audit/x.rs", "src/delegation/x.rs",
+            "tests/common/x.rs", "tests/safety_floor.rs",
+            "Cargo.toml", "Cargo.lock", "ui/package.json",
+            "cadence-review.toml", "src/review.rs", "docs/CHARTER.md",
+            "AGENTS.md", "build.rs", "rust-toolchain.toml", "clippy.toml",
+            "src/cli/daemon.rs", "src/audit.rs", "src/delegation.rs",
+            "src/issue/delivery_policy.rs", "docs/AUDIT.md",
+        ])
+        unmapped = sorted(p for p in candidates
+                          if enq.is_human_path(p, RISK)
+                          and not any(enq.glob_match(g, p) for g in trigger_globs))
+        self.assertEqual(unmapped, [])
+
 
 if __name__ == "__main__":
     unittest.main()
