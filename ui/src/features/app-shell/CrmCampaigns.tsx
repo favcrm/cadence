@@ -52,6 +52,19 @@ import { friendlyAudienceError, newAudienceId } from "./segmentGrammar";
 import Field from "./shared/Field";
 import { isGenericRefusal } from "./shared/hostErrors";
 import { ErrorNotice } from "./shared/States";
+import "./crm-campaign.css";
+import CampaignTabs from "./campaign/CampaignTabs";
+import EmailPane from "./campaign/EmailPane";
+import OverviewPane from "./campaign/OverviewPane";
+import { audienceSummary } from "./campaign/audienceSummary";
+import {
+  APPROVAL_ANCHOR,
+  SENDER_ANCHOR,
+  TEST_ANCHOR,
+  missingReasons,
+  sendReadiness,
+  type CampaignTab,
+} from "./campaign/readiness";
 
 /**
  * Campaign screens inside the trusted CRM shell (CAD-784 over the
@@ -1614,31 +1627,7 @@ function FinalSendPanel({
   const [approveError, setApproveError] = useState<string | null>(null);
   const [approvedSendId, setApprovedSendId] = useState<string | null>(null);
 
-  const missing: string[] = [];
-  if (!doc.approval.valid || doc.approval.revision !== doc.revision) {
-    missing.push("content approved at the current revision");
-  }
-  if (freezeId.trim() === "") {
-    missing.push("a named audience freeze");
-  } else if (freeze === null) {
-    missing.push(`freeze ${freezeId.trim()} rechecked below (its validity is unverified)`);
-  } else if (freeze.valid !== true) {
-    missing.push(`freeze ${freezeId.trim()} reporting valid`);
-  }
-  if (binding === undefined) {
-    missing.push("the sender binding read (still loading)");
-  } else if (binding === null || binding.state !== "live") {
-    missing.push("a live SMTP sender binding");
-  }
-  if (testEvidence === null) {
-    missing.push("an accepted test send of this content and binding");
-  } else if (
-    binding !== null &&
-    binding !== undefined &&
-    (testEvidence.contentDigest !== doc.contentDigest || testEvidence.linkDigest !== binding.digest)
-  ) {
-    missing.push("a test send accepted against this exact content revision and binding");
-  }
+  const missing = missingReasons(sendReadiness({ doc, freezeId, freeze, binding, testEvidence }));
   const canPrepare = canWrite && missing.length === 0;
 
   const prepare = () => {
@@ -1858,6 +1847,10 @@ function CampaignWorkspace({
   freezeId,
   freeze,
   audienceSlot,
+  activitySlot,
+  audienceLabel,
+  tab,
+  onTab,
 }: {
   scope: AudienceScope;
   viewer: Viewer;
@@ -1873,6 +1866,12 @@ function CampaignWorkspace({
    *  approval → Audience → Sender → Test → Proposals → Final send.
    *  `undefined` on the new-campaign page, which keeps its own layout. */
   audienceSlot?: React.ReactNode;
+  /** CAD-1055: the saved campaign's Activity tab body, the one-line
+   *  audience summary for Overview and the controlled tab. */
+  activitySlot?: React.ReactNode;
+  audienceLabel?: string;
+  tab?: CampaignTab;
+  onTab?: (tab: CampaignTab) => void;
 }) {
   const canWrite = viewer.operator && !viewer.readOnly;
   const [subject, setSubject] = useState(doc?.subject ?? "");
@@ -2284,56 +2283,7 @@ function CampaignWorkspace({
     setFormError(null);
     setEditing(false);
   };
-  const contentForm = (
-      <div className="card px-4 py-4 grid gap-3" aria-label="Email content">
-        <h4 className="text-cardtitle font-medium text-ink-100">
-          Content {doc === null ? "— not drafted yet" : `— revision ${doc.revision}`}
-        </h4>
-        {doc === null && (
-          <p className="text-label text-ink-400" data-state="no-draft">
-            No email draft yet. Ask the assistant in the left chat to draft this campaign&apos;s
-            email, then Apply its verified proposal below to create revision 1 — or use the
-            inline editor after a draft exists.
-          </p>
-        )}
-        {!editing ? (
-          <>
-            {doc !== null && (
-              <dl className="sdetail" data-content-summary>
-                <div>
-                  <dt>Subject</dt>
-                  <dd>{doc.subject}</dd>
-                </div>
-                <div>
-                  <dt>Preheader</dt>
-                  <dd>{doc.preheader === "" ? "—" : doc.preheader}</dd>
-                </div>
-                <div>
-                  <dt>Blocks</dt>
-                  <dd>
-                    {doc.blocks.length} block{doc.blocks.length === 1 ? "" : "s"} ·{" "}
-                    {doc.contentDigest.slice(0, 18)}…
-                  </dd>
-                </div>
-              </dl>
-            )}
-            {canWrite && doc !== null && (
-              <div className="crm-toolbar">
-                <Button type="button" size="sm" onClick={startEdit}>
-                  Edit subject / text
-                </Button>
-                <span className="text-micro text-ink-500">
-                  Text corrections save a new revision and invalidate the current approval.
-                </span>
-              </div>
-            )}
-            {doc !== null && !canWrite && (
-              <p className="text-label text-ink-400" data-state="read-only">
-                Read-only view. A verified operator saves content revisions.
-              </p>
-            )}
-          </>
-        ) : (
+  const editForm = (
           <form className="grid gap-3" aria-label="Correct email text" onSubmit={save}>
             {staleEdit && (
               <p className="text-label text-warn" role="status" data-stale-edit>
@@ -2448,6 +2398,63 @@ function CampaignWorkspace({
               </Button>
             </div>
           </form>
+  );
+  const editControls = (
+    <>
+            {canWrite && doc !== null && (
+              <div className="crm-toolbar">
+                <Button type="button" size="sm" onClick={startEdit}>
+                  Edit subject / text
+                </Button>
+                <span className="text-micro text-ink-500">
+                  Text corrections save a new revision and invalidate the current approval.
+                </span>
+              </div>
+            )}
+            {doc !== null && !canWrite && (
+              <p className="text-label text-ink-400" data-state="read-only">
+                Read-only view. A verified operator saves content revisions.
+              </p>
+            )}
+    </>
+  );
+  const contentForm = (
+      <div className="card px-4 py-4 grid gap-3" aria-label="Email content">
+        <h4 className="text-cardtitle font-medium text-ink-100">
+          Content {doc === null ? "— not drafted yet" : `— revision ${doc.revision}`}
+        </h4>
+        {doc === null && (
+          <p className="text-label text-ink-400" data-state="no-draft">
+            No email draft yet. Ask the assistant in the left chat to draft this campaign&apos;s
+            email, then Apply its verified proposal below to create revision 1 — or use the
+            inline editor after a draft exists.
+          </p>
+        )}
+        {!editing ? (
+          <>
+            {doc !== null && (
+              <dl className="sdetail" data-content-summary>
+                <div>
+                  <dt>Subject</dt>
+                  <dd>{doc.subject}</dd>
+                </div>
+                <div>
+                  <dt>Preheader</dt>
+                  <dd>{doc.preheader === "" ? "—" : doc.preheader}</dd>
+                </div>
+                <div>
+                  <dt>Blocks</dt>
+                  <dd>
+                    {doc.blocks.length} block{doc.blocks.length === 1 ? "" : "s"} ·{" "}
+                    {doc.contentDigest.slice(0, 18)}…
+                  </dd>
+                </div>
+              </dl>
+            )}
+            {editControls}
+          </>
+        ) : (
+          editForm
         )}
         {!editing && savedNote && (
           <p className="text-label text-ok" role="status">
@@ -2458,7 +2465,7 @@ function CampaignWorkspace({
   );
 
   const approvalSection = doc !== null && (
-        <section aria-label="Content approval" className="card px-4 py-4 grid gap-2">
+        <section aria-label="Content approval" id={APPROVAL_ANCHOR} tabIndex={-1} className="card px-4 py-4 grid gap-2">
           <h4 className="text-cardtitle font-medium text-ink-100">Approval — content-only</h4>
           <p className="text-label text-ink-300">
             {doc.approval.valid ? (
@@ -2502,7 +2509,7 @@ function CampaignWorkspace({
   );
 
   const senderSection = doc !== null && (
-        <section aria-label="SMTP sender" className="card px-4 py-4 grid gap-2">
+        <section aria-label="SMTP sender" id={SENDER_ANCHOR} tabIndex={-1} className="card px-4 py-4 grid gap-2">
           <h4 className="text-cardtitle font-medium text-ink-100">Sender binding</h4>
           {binding === undefined && bindingError === null && (
             <p className="text-label text-ink-400" role="status">
@@ -2537,7 +2544,7 @@ function CampaignWorkspace({
   );
 
   const testSection = doc !== null && (
-        <section aria-label="Test send" className="card px-4 py-4 grid gap-2 crm-test">
+        <section aria-label="Test send" id={TEST_ANCHOR} tabIndex={-1} className="card px-4 py-4 grid gap-2 crm-test">
           <h4 className="text-cardtitle font-medium text-ink-100">
             Test send — one operator address, real SMTP
           </h4>
@@ -2647,6 +2654,24 @@ function CampaignWorkspace({
         </section>
   );
 
+  const applyProposal = (next: ContentDoc) => {
+    onDoc(next);
+    setProposalToken((count) => count + 1);
+    setRender(null);
+    setTestReceipt(null);
+    setProposalNote(
+      `Applied as revision ${next.revision} — content approval invalidated; re-approve before any send preparation.`,
+    );
+  };
+  const discardProposal = (id: string) => {
+    setProposalToken((count) => count + 1);
+    setProposalNote(
+      doc === null
+        ? `Proposal ${id} discarded — still no saved revision.`
+        : `Proposal ${id} discarded — draft unchanged at r${doc.revision} (${doc.contentDigest.slice(0, 18)}…).`,
+    );
+  };
+
   // CAD-1013: proposals stay available before revision 1 — the assistant
   // mint/apply path is the creation route now that the manual composer is
   // gone. expectedRevision is 0 for an unsaved campaign (source_revision=0).
@@ -2703,23 +2728,8 @@ function CampaignWorkspace({
                     proposal={row}
                     expectedRevision={doc === null ? 0 : doc.revision}
                     canWrite={canWrite}
-                    onApplied={(next) => {
-                      onDoc(next);
-                      setProposalToken((count) => count + 1);
-                      setRender(null);
-                      setTestReceipt(null);
-                      setProposalNote(
-                        `Applied as revision ${next.revision} — content approval invalidated; re-approve before any send preparation.`,
-                      );
-                    }}
-                    onDiscarded={(id) => {
-                      setProposalToken((count) => count + 1);
-                      setProposalNote(
-                        doc === null
-                          ? `Proposal ${id} discarded — still no saved revision.`
-                          : `Proposal ${id} discarded — draft unchanged at r${doc.revision} (${doc.contentDigest.slice(0, 18)}…).`,
-                      );
-                    }}
+                    onApplied={applyProposal}
+                    onDiscarded={discardProposal}
                     onError={setProposalError}
                   />
                 ))}
@@ -2760,22 +2770,89 @@ function CampaignWorkspace({
       </div>
     );
   }
-  // CAD-1008 saved campaign task order: Content+Preview → content
-  // approval → Audience/freeze → Sender → Test → Proposals → Final
-  // send. Outcomes (sends list) render on the detail page after this.
+  // CAD-1055 saved campaign: four tabs instead of one long scroll.
+  // Overview carries the ready-to-send checklist plus the approval,
+  // sender, test-send and final-send controls; Email is the view-only
+  // preview with the assistant proposal strip; Audience and Activity
+  // come from the owning page.
+  const activeTab = tab ?? "overview";
+  const setTab = onTab ?? (() => {});
+  const readiness = sendReadiness({
+    doc,
+    freezeId: freezeId ?? "",
+    freeze: freeze ?? null,
+    binding,
+    testEvidence: testReceipt,
+  });
+  const pendingProposals = proposals.filter((row) => row.state === "pending");
+  const emailBadge = pendingProposals.length > 0 ? `${pendingProposals.length} draft` : null;
+  const editAction = (
+    <>
+      {!editing && doc !== null && (
+        <div className="grid gap-2">
+          {editControls}
+        </div>
+      )}
+      {!editing && savedNote && (
+        <p className="text-label text-ok" role="status">
+          {savedNote}
+        </p>
+      )}
+    </>
+  );
   return (
-    <div className="grid gap-3">
-      <div className="crm-compose">
-        {contentForm}
-        {previewSection}
-      </div>
-      {approvalSection}
-      {audienceSlot}
-      {senderSection}
-      {testSection}
-      {proposalsSection}
-      {finalSend}
-    </div>
+    <CampaignTabs
+      tabs={[
+        { id: "overview", label: "Overview" },
+        { id: "email", label: "Email", badge: emailBadge },
+        { id: "audience", label: "Audience" },
+        { id: "activity", label: "Activity" },
+      ]}
+      active={activeTab}
+      onChange={setTab}
+    >
+      {activeTab === "overview" && (
+        <>
+          <OverviewPane
+            items={readiness}
+            doc={doc}
+            binding={binding}
+            audienceLabel={audienceLabel ?? "—"}
+            onTab={setTab}
+          />
+          {approvalSection}
+          {senderSection}
+          {testSection}
+          {finalSend}
+        </>
+      )}
+      {activeTab === "email" && (
+        <EmailPane
+          scope={scope}
+          canWrite={canWrite}
+          doc={doc}
+          render={render}
+          renderPending={renderPending}
+          renderError={renderError}
+          onRefresh={() => setRenderToken((count) => count + 1)}
+          sampleName={sampleName}
+          onSampleName={setSampleName}
+          dirty={dirty}
+          proposals={pendingProposals}
+          proposalsError={proposalsError}
+          proposalError={proposalError}
+          proposalNote={proposalNote}
+          onRefreshDrafts={() => setProposalToken((count) => count + 1)}
+          onApplied={applyProposal}
+          onDiscarded={discardProposal}
+          onProposalError={setProposalError}
+          editor={editing ? editForm : null}
+          editAction={editAction}
+        />
+      )}
+      {activeTab === "audience" && audienceSlot}
+      {activeTab === "activity" && activitySlot}
+    </CampaignTabs>
   );
 }
 
@@ -3289,7 +3366,8 @@ function CampaignDetail({
   // campaign and the saved content reads back absent.
   const [pendingOnly, setPendingOnly] = useState(false);
   const [pick, setPick] = useState<AudiencePick>({ base: { mode: "all" }, exclusionListId: null });
-  const [, setAudiencePreview] = useState<AudiencePreview | null>(null);
+  const [audiencePreview, setAudiencePreview] = useState<AudiencePreview | null>(null);
+  const [tab, setTab] = useState<CampaignTab>("overview");
   const [freezeId, setFreezeId] = useState(`${campaignId}-freeze-1`);
   const [freeze, setFreeze] = useState<{
     finalCount: number;
@@ -3374,7 +3452,12 @@ function CampaignDetail({
     <section aria-label="Campaign details" className="grid gap-3">
       <div>
         <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1} data-outlet-heading>
-          {loading ? "Campaign details" : (doc?.subject ?? "Campaign details")}
+          {loading ? "Campaign details" : (doc?.subject ?? "Campaign details")}{" "}
+          {doc !== null && (
+            <span className="chip align-middle" data-campaign-status>
+              {doc.approval.valid && doc.approval.revision === doc.revision ? "Approved" : "Draft"}
+            </span>
+          )}
         </h3>
         <p className="text-label text-ink-400 mt-1">
           <button type="button" className="lnk" onClick={onBack}>
@@ -3436,6 +3519,10 @@ function CampaignDetail({
             onDoc={setDoc}
             freezeId={freezeId}
             freeze={freeze}
+            tab={tab}
+            onTab={setTab}
+            audienceLabel={audienceSummary(pick, audiencePreview)}
+            activitySlot={<CampaignSends scope={scope} viewer={viewer} campaignId={campaignId} />}
             audienceSlot={
               <section aria-label="Frozen audience" className="card px-4 py-4 grid gap-3">
             <h4 className="text-cardtitle font-medium text-ink-100">Audience &amp; freeze</h4>
@@ -3513,7 +3600,6 @@ function CampaignDetail({
               </section>
             }
           />
-          <CampaignSends scope={scope} viewer={viewer} campaignId={campaignId} />
         </>
       )}
     </section>
