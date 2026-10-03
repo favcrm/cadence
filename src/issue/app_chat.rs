@@ -89,7 +89,7 @@ fn is_match(s: &str) -> bool {
 
 fn is_screen(s: &str) -> bool {
     s.strip_prefix("screen:")
-        .is_some_and(|tag| crate::issue::app_screen_pkg::valid_tag(tag))
+        .is_some_and(crate::issue::app_screen_pkg::valid_tag)
 }
 
 /// Bounds first, as the client does: depth, node count and forbidden keys
