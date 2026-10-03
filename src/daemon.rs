@@ -4613,6 +4613,10 @@ pub struct ServeOptions {
     /// comparisons — `None` is wall epoch. Tests pin it to schedule
     /// in the past/future without sleeping.
     pub social_publish_driver_clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
+    /// CAD-1020, lib tests only: runs inside the driver between a
+    /// committed claim and its send (the lease-loss window).
+    #[cfg(test)]
+    pub(crate) social_publish_driver_after_claim: Option<Arc<dyn Fn() + Send + Sync>>,
     /// CAD-979: retained-media import client resolved once at attach (same
     /// credential as the sender). Never set from PM, RPC, or worker input.
     pub social_media_importer:

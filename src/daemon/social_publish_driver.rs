@@ -94,6 +94,9 @@ pub(super) struct Driver {
     pub clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     /// One driver thread per daemon — the spawn guard.
     started: AtomicBool,
+    /// Lib tests only: runs between a committed claim and its send.
+    #[cfg(test)]
+    after_claim: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Observable status block for `health`/envelopes.
     state: Mutex<DriverState>,
     /// Transient per-intent errors — in-memory, bounded, cleared when
@@ -150,6 +153,8 @@ impl Driver {
                 .clone()
                 .unwrap_or_else(|| Arc::new(crate::issue::time::now_epoch)),
             started: AtomicBool::new(false),
+            #[cfg(test)]
+            after_claim: opts.social_publish_driver_after_claim.clone(),
             state: Mutex::new(DriverState::default()),
             last_errors: Mutex::new(HashMap::new()),
         }
@@ -578,6 +583,10 @@ impl Shared {
                     }
                 };
                 let cid = id.clone();
+                #[cfg(test)]
+                if let Some(hook) = &driver.after_claim {
+                    hook();
+                }
                 // Between claim and send — the fence can trip while the
                 // claim committed; the send must not follow it.
                 if let Some(reason) = self.lease.as_ref().and_then(|l| l.fence().check()) {

@@ -567,3 +567,103 @@ fn cad1020_uncertain_rows_ahead_never_starve_a_healthy_post() {
     daemon.wait_state(&healthy, "posted");
     assert_eq!(door.sent(), vec![key(&healthy)]);
 }
+
+/// Forbidden harm (trigger 6): the daemon posting on its own because a
+/// sender is attached. The driver is opt-in; without
+/// `CADENCE_SOCIAL_PUBLISH_DRIVER=on` a due intent stays queued.
+#[test]
+fn cad1020_sender_without_opt_in_publishes_nothing() {
+    assert!(
+        std::env::var(DRIVER_ENV).is_err(),
+        "run with {DRIVER_ENV} unset: this test proves the default"
+    );
+    let (dir, door, clock) = rig();
+    let daemon = Daemon::open(dir.path(), &door, &clock, |opts| {
+        opts.social_publish_driver_off = None;
+    })
+    .run();
+    let now = clock.load(Ordering::SeqCst);
+    let intent = approved_intent(&daemon.shared.store, "default", now - 1);
+    daemon.ticks(2);
+    assert_eq!(daemon.state(&intent), "queued");
+    assert!(
+        door.preflights.lock().unwrap().is_empty(),
+        "the door was never asked"
+    );
+    assert!(door.sent().is_empty(), "nothing was published");
+}
+
+/// Forbidden harm: the driver sending an explicit-mode intent, whose
+/// material it cannot re-prove. It is held for the operator, unsent.
+#[test]
+fn cad1020_explicit_mode_intent_is_held_never_driver_sent() {
+    let (dir, door, clock) = rig();
+    let daemon = Daemon::start(dir.path(), &door, &clock);
+    let digest = "a".repeat(64);
+    let intent = daemon
+        .shared
+        .store
+        .social_publish_schedule(&crate::store::social_publish::NewSocialPublish {
+            request_id: "explicit-1",
+            install_id: INSTALL,
+            context_id: None,
+            run_id: "run-explicit",
+            effect_id: "effect-explicit",
+            artifact_id: None,
+            bundle_digest: None,
+            slot: None,
+            connection_id: "builtin-local",
+            aos_connection_id: Some("connA_fake_wire"),
+            destination_id: "dest-fb",
+            toolkit: "facebook",
+            caption_digest: &digest,
+            image_digest: None,
+            media_key: None,
+            grant_id: "dpq_fake_grant",
+            approval_id: "explicit-1",
+            due_epoch: clock.load(Ordering::SeqCst) - 1,
+            timezone: "UTC",
+        })
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(daemon.settled(&intent), "held");
+    daemon.ticks(2);
+    assert!(door.sent().is_empty(), "nothing was published");
+}
+
+/// Forbidden harm: a daemon that lost its hosted lease after claiming a
+/// row still sends it, while the new holder may send it too.
+#[test]
+fn cad1020_lease_lost_after_claim_sends_nothing() {
+    let (dir, door, clock) = rig();
+    let fence: Arc<Mutex<Option<Arc<crate::lease::Fence>>>> = Arc::default();
+    let tripped = Arc::new(AtomicBool::new(false));
+    let lease = dir.path().join("lease.json");
+    let daemon = {
+        let (fence, tripped) = (fence.clone(), tripped.clone());
+        Daemon::open(dir.path(), &door, &clock, move |opts| {
+            opts.lease = Some(crate::lease::Hosted {
+                lease: Some(format!("file:{}", lease.display())),
+                ..Default::default()
+            });
+            opts.social_publish_driver_after_claim = Some(Arc::new(move || {
+                if let Some(fence) = fence.lock().unwrap().as_ref() {
+                    fence.trip("lease lost to another daemon");
+                    tripped.store(true, Ordering::SeqCst);
+                }
+            }));
+        })
+    };
+    *fence.lock().unwrap() = Some(daemon.shared.lease.as_ref().unwrap().fence());
+    let now = clock.load(Ordering::SeqCst);
+    let intent = approved_intent(&daemon.shared.store, "fenced", now - 1);
+    let daemon = daemon.run();
+    let until = Instant::now() + Duration::from_secs(20);
+    while !tripped.load(Ordering::SeqCst) {
+        assert!(Instant::now() < until, "the row was never claimed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    daemon.ticks(2);
+    assert!(door.sent().is_empty(), "nothing was published");
+    assert_eq!(daemon.state(&intent), "processing", "claimed, never sent");
+}
