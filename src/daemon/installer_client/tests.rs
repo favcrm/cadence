@@ -300,6 +300,9 @@ fn held_topology_connect_rechecks_leaf_and_parent_replacement() {
 #[test]
 fn topology_refuses_symlink_wrong_owner_and_writable_parent() {
     let dir = tempfile::tempdir().unwrap();
+    // tempfile inherits the process umask; establish the policy's valid
+    // positive fixture before testing wrong owner/mode and symlink refusal.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("grant.sock");
     let _listener = UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
