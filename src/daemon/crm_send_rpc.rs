@@ -31,6 +31,47 @@ use std::sync::Arc;
 /// Deferred/not-submitted rows retry bounded times, then `failed`.
 const DELIVERY_ATTEMPT_MAX: i64 = 3;
 
+/// CAD-1068: retry backoff, in multiples of the send interval. At the
+/// production 1 s interval a first retry waits 30 s (rides out a
+/// greylist/4xx blip), a second 2 min, a third 10 min; the bound is
+/// `DELIVERY_ATTEMPT_MAX`, so the longest wait is 10 min and a row
+/// never waits unboundedly. Scaling by the interval keeps fixtures
+/// that pin a millisecond interval fast.
+const RETRY_BACKOFF_FACTORS: [u64; 3] = [30, 120, 600];
+
+/// The wait before the next attempt, after `attempts` claimed ones.
+fn retry_backoff_ms(attempts: i64, interval_ms: u64) -> u64 {
+    let idx = (attempts.max(1) as usize - 1).min(RETRY_BACKOFF_FACTORS.len() - 1);
+    interval_ms.saturating_mul(RETRY_BACKOFF_FACTORS[idx])
+}
+
+/// Per-pass, in-memory not-before times for retried rows, on a
+/// caller-supplied clock so tests run on logical time. A restarted
+/// worker starts empty: a retried row is then simply claimable.
+#[derive(Default)]
+struct RetryGate {
+    not_before: std::collections::HashMap<String, u64>,
+}
+
+impl RetryGate {
+    fn defer(&mut self, id: &str, attempts: i64, now_ms: u64, interval_ms: u64) {
+        self.not_before.insert(
+            id.to_string(),
+            now_ms.saturating_add(retry_backoff_ms(attempts, interval_ms)),
+        );
+    }
+    fn ready(&self, id: &str, now_ms: u64) -> bool {
+        self.not_before.get(id).is_none_or(|t| *t <= now_ms)
+    }
+    /// Time until the earliest of `ids` becomes ready, if any waits.
+    fn next_wait_ms<'a>(&self, ids: impl Iterator<Item = &'a str>, now_ms: u64) -> Option<u64> {
+        ids.filter_map(|id| self.not_before.get(id))
+            .filter(|t| **t > now_ms)
+            .map(|t| t - now_ms)
+            .min()
+    }
+}
+
 /// The outcome of one claimed row, handed back across the scope
 /// proof so the caller can write the row's next state.
 enum Step {
@@ -734,6 +775,9 @@ impl Shared {
         let mut waiting: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut passed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut gate = RetryGate::default();
+        let started = std::time::Instant::now();
+        let interval_ms = self.crm_send_interval.as_millis() as u64;
         loop {
             // test-seam: a fixture budget parks the worker between
             // rows so mid-send mutations are deterministic.
@@ -742,12 +786,26 @@ impl Shared {
                 gate.take();
             }
             let deliveries = records.app_campaign_deliveries(context, send_id)?;
-            let Some(next) = deliveries
-                .iter()
-                .find(|d| d.state == "queued" && !passed.contains(&d.customer_id))
-            else {
+            let now_ms = started.elapsed().as_millis() as u64;
+            let Some(next) = deliveries.iter().find(|d| {
+                d.state == "queued"
+                    && !passed.contains(&d.customer_id)
+                    && gate.ready(&d.customer_id, now_ms)
+            }) else {
                 if deliveries.iter().any(|d| d.state == "queued") {
-                    std::thread::sleep(self.crm_send_pending_poll);
+                    let queued = deliveries
+                        .iter()
+                        .filter(|d| d.state == "queued")
+                        .map(|d| d.customer_id.as_str());
+                    let backoff = gate.next_wait_ms(queued, now_ms);
+                    let poll = self.crm_send_pending_poll.as_millis() as u64;
+                    let wait = match (passed.is_empty(), backoff) {
+                        (false, Some(b)) => b.min(poll),
+                        (false, None) => poll,
+                        (true, Some(b)) => b,
+                        (true, None) => poll,
+                    };
+                    std::thread::sleep(Duration::from_millis(wait));
                     passed.clear();
                     continue;
                 }
@@ -855,24 +913,30 @@ impl Shared {
                             )?;
                         }
                         crate::platform::smtp::SmtpOutcome::Deferred { code, message } => {
-                            self.crm_send_delivery_retry(
+                            if let Some(attempts) = self.crm_send_delivery_retry(
                                 &records,
                                 context,
                                 send_id,
                                 &customer_id,
                                 Some(code),
                                 &message,
-                            )?;
+                            )? {
+                                let now = started.elapsed().as_millis() as u64;
+                                gate.defer(&customer_id, attempts, now, interval_ms);
+                            }
                         }
                         crate::platform::smtp::SmtpOutcome::NotSubmitted { message } => {
-                            self.crm_send_delivery_retry(
+                            if let Some(attempts) = self.crm_send_delivery_retry(
                                 &records,
                                 context,
                                 send_id,
                                 &customer_id,
                                 None,
                                 &message,
-                            )?;
+                            )? {
+                                let now = started.elapsed().as_millis() as u64;
+                                gate.defer(&customer_id, attempts, now, interval_ms);
+                            }
                         }
                         // `crm_send_row_step` turns this into `Step::Waiting`.
                         crate::platform::smtp::SmtpOutcome::PendingApproval { .. } => {
@@ -1030,7 +1094,8 @@ impl Shared {
     /// A deferred or never-submitted row retries bounded times —
     /// back to `queued` with the evidence attached — then `failed`.
     /// `uncertain` never reaches here: retry can never resend a
-    /// maybe-delivered message.
+    /// maybe-delivered message. Returns the attempt count when the row
+    /// was requeued (the caller backs it off), `None` once it failed.
     fn crm_send_delivery_retry(
         &self,
         records: &RecordStore,
@@ -1039,7 +1104,7 @@ impl Shared {
         customer_id: &str,
         code: Option<u16>,
         message: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<i64>> {
         let attempts = records
             .app_campaign_delivery(context, send_id, customer_id)?
             .map(|d| d.attempts)
@@ -1056,7 +1121,9 @@ impl Shared {
                 None,
                 &["submitting"],
             )?;
-        } else {
+            return Ok(None);
+        }
+        {
             records.app_campaign_delivery_finish(
                 context,
                 send_id,
@@ -1069,7 +1136,7 @@ impl Shared {
                 &["submitting"],
             )?;
         }
-        Ok(())
+        Ok(Some(attempts))
     }
 }
 
@@ -1133,4 +1200,39 @@ fn unsubscribe_origin_valid(origin: &str) -> bool {
 fn send_request_id(params: &Value) -> Result<String> {
     let id = required_str(params, "request_id")?;
     crate::proto::identifier(id, "request ID")
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    #[test]
+    fn backoff_is_bounded_exponential_on_the_interval() {
+        // Production interval 1 s: 30 s, 2 min, 10 min, capped there.
+        assert_eq!(retry_backoff_ms(1, 1000), 30_000);
+        assert_eq!(retry_backoff_ms(2, 1000), 120_000);
+        assert_eq!(retry_backoff_ms(3, 1000), 600_000);
+        assert_eq!(retry_backoff_ms(9, 1000), 600_000);
+        assert_eq!(retry_backoff_ms(0, 1000), 30_000);
+        assert_eq!(retry_backoff_ms(2, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn gate_holds_a_retried_row_until_its_logical_deadline() {
+        let mut gate = RetryGate::default();
+        assert!(gate.ready("a", 0));
+        gate.defer("a", 1, 1_000, 1000);
+        assert!(!gate.ready("a", 1_000), "not retried at the send interval");
+        assert!(!gate.ready("a", 30_999));
+        assert!(gate.ready("a", 31_000));
+        assert!(gate.ready("b", 1_000), "other rows are unaffected");
+        assert_eq!(
+            gate.next_wait_ms(["a", "b"].into_iter(), 1_000),
+            Some(30_000)
+        );
+        assert_eq!(gate.next_wait_ms(["a"].into_iter(), 31_000), None);
+        gate.defer("a", 2, 31_000, 1000);
+        assert!(!gate.ready("a", 150_999));
+        assert!(gate.ready("a", 151_000));
+    }
 }
