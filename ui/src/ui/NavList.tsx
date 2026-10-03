@@ -38,9 +38,9 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
       {NAV.map((item) => {
         const here = navMatches(screen, item.screen);
         const apps = item.screen === "apps" && appMenu !== null ? appMenu.apps : [];
-        // A section list open under an app carries the accent; the parent
-        // stays current for assistive tech only.
-        const parent = apps.some((a) => a.current && a.sections !== null);
+        // With an app open under Apps the most specific row carries the accent;
+        // the parent stays current for assistive tech only.
+        const parent = here && apps.some((a) => a.current);
         return (
           <Fragment key={item.screen}>
             <Link
@@ -48,7 +48,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
               onClick={onNavigate}
               className="navlink"
               aria-current={here ? (parent ? "true" : "page") : undefined}
-              data-parent-current={here && parent ? "" : undefined}
+              data-parent-current={parent ? "" : undefined}
             >
               {NAV_ICONS[item.screen]}
               {item.label}
@@ -62,8 +62,8 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                       onClick={onNavigate}
                       className="navlink navlink-sub"
                       title={app.title}
-                      aria-current={app.current ? (app.sections ? "true" : "page") : undefined}
-                      data-parent-current={app.current && app.sections ? "" : undefined}
+                      aria-current={here && app.current ? (app.sections ? "true" : "page") : undefined}
+                      data-parent-current={here && app.current && app.sections ? "" : undefined}
                     >
                       <span className="truncate">{app.title}</span>
                     </Link>
