@@ -776,3 +776,54 @@ fn cad1053_csv_update_that_grants_records_the_imported_method() {
     assert_eq!(last["state"], "granted");
     assert_eq!(last["method"], "imported");
 }
+
+#[test]
+fn cad1072_create_records_optional_consent_provenance() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    // Granted with a method: lands at revision 1 with method and note.
+    let made = store
+        .app_record_create_with(
+            "ctx-1",
+            "c1",
+            &with_consent("granted", None),
+            Some(&provenance(
+                json!({"method": "web_form", "note": " Footer "}),
+            )),
+        )
+        .unwrap();
+    let entry = &made["record"]["consent_history"][0];
+    assert_eq!(entry["state"], "granted");
+    assert_eq!(entry["method"], "web_form");
+    assert_eq!(entry["note"], "Footer");
+    // Granted with no method stays allowed (optional on create).
+    let bare = store
+        .app_record_create_with("ctx-1", "c2", &customer("Boris", "boris@example.com"), None)
+        .unwrap();
+    assert!(bare["record"]["consent_history"][0].get("method").is_none());
+}
+
+#[test]
+fn cad1072_create_refuses_provenance_without_a_grant() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    for consent in [with_consent("unknown", None), with_consent("denied", None)] {
+        let refused = store
+            .app_record_create_with(
+                "ctx-1",
+                "c1",
+                &consent,
+                Some(&provenance(json!({"method": "written"}))),
+            )
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("needs a consent change"),
+            "{refused}"
+        );
+        // Nothing was written.
+        assert!(store.app_record_show("ctx-1", "c1").is_err());
+    }
+    // Bounds are the update path's: an oversized note is refused at parse.
+    let long = "x".repeat(281);
+    assert!(ConsentProvenance::parse(&json!({"method": "other", "note": long})).is_err());
+}

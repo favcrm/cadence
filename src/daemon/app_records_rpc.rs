@@ -142,7 +142,13 @@ impl Shared {
     ) -> Result<Value> {
         self.operator_connection("app record management", params, peer_pid)?;
         let allowed: &[&str] = match method {
-            "app_record_create" => &["install_id", "context_id", "record_id", "profile"],
+            "app_record_create" => &[
+                "install_id",
+                "context_id",
+                "record_id",
+                "profile",
+                "consent_provenance",
+            ],
             "app_record_list" => &["install_id", "context_id", "query", "limit", "cursor"],
             "app_record_show" => &["install_id", "context_id", "record_id"],
             "app_record_update" => &[
@@ -212,10 +218,11 @@ impl Shared {
             "app_record_show" => {
                 records.app_record_show(context, required_str(params, "record_id")?)
             }
-            "app_record_create" => records.app_record_create(
+            "app_record_create" => records.app_record_create_with(
                 context,
                 required_str(params, "record_id")?,
                 &record_profile(params)?,
+                record_provenance(params)?.as_ref(),
             ),
             "app_record_update" => records.app_record_update(
                 context,

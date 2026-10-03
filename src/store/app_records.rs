@@ -972,7 +972,30 @@ impl RecordStore {
         record_id: &str,
         profile: &CustomerProfile,
     ) -> Result<Value> {
+        self.app_record_create_with(context, record_id, profile, None)
+    }
+
+    /// Create with optional consent provenance (CAD-1072). Provenance is
+    /// optional here, unlike an update's grant, and is refused when the
+    /// new profile grants nothing: it describes a consent change from
+    /// the unknown default, never an orphan note.
+    pub fn app_record_create_with(
+        &self,
+        context: &str,
+        record_id: &str,
+        profile: &CustomerProfile,
+        provenance: Option<&ConsentProvenance>,
+    ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
+        let unset = CustomerConsent {
+            email: ConsentState::Unknown,
+            sms: None,
+        };
+        if provenance.is_some()
+            && consent_transition(&unset, &profile.consent) != ConsentTransition::Grant
+        {
+            return Err(Error::rejected("consent provenance needs a consent change"));
+        }
         crate::proto::identifier(record_id, "record ID")?;
         let digest = profile.digest(&self.install_id, context)?;
         let body = serde_json::to_string(profile).map_err(|e| Error::internal(e.to_string()))?;
@@ -1024,6 +1047,13 @@ impl RecordStore {
             params![context, record_id, body, digest, now()],
         )
         .map_err(|e| Error::internal(e.to_string()))?;
+        if let Some(provenance) = provenance {
+            tx.execute(
+                "INSERT INTO app_record_consent_provenance(context_id,record_id,revision,method,note) VALUES(?, ?, 1, ?, ?)",
+                params![context, record_id, provenance.method.as_str(), provenance.note],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+        }
         let result = json!({"record": self.show_in(&tx, context, record_id)?});
         tx.commit().map_err(|e| Error::internal(e.to_string()))?;
         Ok(result)

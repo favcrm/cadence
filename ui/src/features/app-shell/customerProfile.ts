@@ -276,6 +276,15 @@ export function buildConsentChange(
   return { profile: built, provenance };
 }
 
+/** Create-time provenance: optional. A note needs a method to describe. */
+export function buildCreateProvenance(method: ConsentMethod | "", rawNote: string): ConsentProvenance | null {
+  const note = rawNote.trim();
+  if (note.length > CONSENT_NOTE_MAX || hasControl(note)) {
+    throw new ApiError("Note is at most 280 characters", 400);
+  }
+  return method === "" ? null : { method, ...(note !== "" ? { note } : {}) };
+}
+
 export interface ActivityItem {
   key: string;
   text: string;

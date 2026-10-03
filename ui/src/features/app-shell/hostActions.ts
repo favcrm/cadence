@@ -59,7 +59,7 @@ export interface HostScope {
 }
 
 /** Body keys the HTTP peer accepts. Everything else is forged. */
-const CREATE_KEYS = ["record_id", "profile"] as const;
+const CREATE_KEYS = ["record_id", "profile", "consent_provenance"] as const;
 const UPDATE_KEYS = ["expected_revision", "profile", "consent_provenance"] as const;
 
 /** Authority-claiming fields that must never travel from the browser. */
@@ -207,10 +207,17 @@ export const hostActions = {
   async show(scope: HostScope, recordId: string): Promise<HostRecord> {
     return asRecord(await request<unknown>(recordPath(scope, recordId)));
   },
-  /** `POST …/records` — body is exactly `{record_id, profile}`. */
-  async create(scope: HostScope, recordId: string, profile: unknown): Promise<HostRecord> {
+  /** `POST …/records` — body is `{record_id, profile}` plus optional
+   *  `consent_provenance` when the new customer is created Granted. */
+  async create(
+    scope: HostScope,
+    recordId: string,
+    profile: unknown,
+    consentProvenance?: ConsentProvenance,
+  ): Promise<HostRecord> {
     assertRecordId(recordId);
     const body: Record<string, unknown> = { record_id: recordId, profile };
+    if (consentProvenance !== undefined) body.consent_provenance = consentProvenance;
     assertCleanBody(body, CREATE_KEYS);
     return asRecord(await request<unknown>(listPath(scope), body));
   },
