@@ -368,6 +368,15 @@ pub struct JwksCache {
 }
 
 impl JwksCache {
+    /// An empty cache — `static` holders need a const constructor.
+    pub const fn new() -> Self {
+        Self {
+            issuer: String::new(),
+            keys: Vec::new(),
+            fetched: 0,
+        }
+    }
+
     /// The public key named `kid`, refreshing the cache when it is
     /// stale or the kid is unknown. `Err` is fail-closed — a JWKS that
     /// cannot be fetched verifies nothing.
