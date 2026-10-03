@@ -24,6 +24,7 @@ doctor/host/pane_identity.rs	read-only-store-host-observation	prepare	2
 doctor/host/sessions.rs	read-only-store-session-observation	prepare	4
 doctor/host/tests.rs	test-fixtures	execute	8
 doctor/host/tests.rs	test-fixtures	open	3
+installer_bundle/carrier.rs	capability-seal-non-sqlite-prepare	prepare	2
 issue/app.rs	guarded-store-side-open-and-read-queries	open	1
 issue/app.rs	guarded-store-side-open-and-read-queries	prepare	3
 issue/retro.rs	read-only-store-retrospective	prepare	3

@@ -232,7 +232,7 @@ fn exe_stat(m: &libc::stat) -> ExeStat {
 /// refuses. Returns the digest. The caller separately re-checks the peer's
 /// live pid/starttime after this call (TOCTOU on the process itself).
 #[cfg(target_os = "linux")]
-fn peer_exe_digest(pid: u32) -> Result<[u8; 32]> {
+pub(super) fn peer_exe_digest(pid: u32) -> Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
     use std::os::unix::io::FromRawFd;
     let path = format!("/proc/{pid}/exe");
@@ -954,6 +954,65 @@ pub(crate) fn production_consume_factory() -> Result<()> {
     ))
 }
 
+/// Correlation preflight using the EXISTING grant parser, not a second codec.
+/// This is syntax/binding evidence only. Signature, kernel admission and durable
+/// consume remain mandatory in `GrantCore::install`; this never consumes.
+#[cfg(target_os = "linux")]
+pub(super) fn check_transport_binding(
+    envelope: &str,
+    now: u64,
+    operation: &str,
+    recipient_generation: &str,
+) -> Result<()> {
+    let parsed = parse_envelope(envelope, now)?;
+    if parsed.claims.challenge.launch.request.challenge != operation
+        || parsed.claims.challenge.recipient.generation != recipient_generation
+    {
+        return Err(Error::rejected("grant transport correlation mismatch"));
+    }
+    Ok(())
+}
+
+/// Private signed-format evidence for the separate CAD-1113 enrolled route.
+/// No peer, consume, launch or enrollment authority; fields cannot be literal.
+pub(super) struct VerifiedEnvelope {
+    claims: GrantClaims,
+}
+impl VerifiedEnvelope {
+    pub(super) fn claims(&self) -> &GrantClaims {
+        &self.claims
+    }
+}
+pub(super) fn production_grant_keyring() -> Result<&'static [&'static [u8]]> {
+    let _ = SUPERVISOR_KEYRING;
+    Err(Error::unknown("grant keyring unavailable"))
+}
+/// Reuses BOTH existing parsers. The receipt binding bytes are already verified
+/// canonical; parsing its challenge preserves optional imageLane presence.
+/// Low-level dependency-explicit crypto mechanics, not an admission facade.
+pub(super) fn verify_enrolled_format(
+    envelope: &str,
+    keys: &[&[u8]],
+    now: u64,
+    canonical_binding: &[u8],
+) -> Result<VerifiedEnvelope> {
+    let parsed = parse_envelope(envelope, now)?;
+    verify_signature_with(&parsed, keys)?;
+    let value: serde_json::Value = serde_json::from_slice(canonical_binding)
+        .map_err(|_| Error::unknown("canonical enrollment binding unavailable"))?;
+    let expected = parse_supervisor_challenge(
+        value
+            .get("challenge")
+            .ok_or_else(|| Error::unknown("canonical challenge unavailable"))?,
+    )?;
+    if parsed.claims.challenge != expected {
+        return Err(Error::unknown("full challenge mismatch"));
+    }
+    Ok(VerifiedEnvelope {
+        claims: parsed.claims,
+    })
+}
+
 // ─────────────────────────── the fixed action verbs ───────────────────────
 
 /// The verified grant — evidence a correctly-signed, kernel-admitted,
@@ -1167,6 +1226,26 @@ impl GrantListener {
         ))
     }
 
+    /// Separate typed enrolled route. No legacy UID0 admission is widened.
+    /// All production receiver factories refuse, before any request is read.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn serve_enrolled_once(&self) -> Result<()> {
+        // Missing authority refuses before accept/read, not after consume.
+        let until = std::time::Instant::now() + REQUEST_BUDGET;
+        let receiver = super::installer_enrolled::production_enrolled_receiver()?;
+        // This separately typed loop owns the listener (no legacy dispatch).
+        self.listener
+            .set_nonblocking(true)
+            .map_err(|_| Error::unknown("enrolled listener UNKNOWN"))?;
+        super::installer_client::Deadline::until(until)
+            .wait(self.listener.as_raw_fd(), libc::POLLIN)?;
+        let (stream, _) = self
+            .listener
+            .accept()
+            .map_err(|_| Error::unknown("enrolled accept UNKNOWN"))?;
+        receiver.serve_until(&stream, until)
+    }
+
     /// `#[cfg(test)]`-only bind at an arbitrary path — used by ordinary-uid
     /// socket tests to exercise the framing/admission mechanics without a
     /// provisioned supervisor dir. NOT a production authority path.
@@ -1226,6 +1305,9 @@ impl GrantListener {
                 Ok(n) => {
                     let got = &chunk[..n];
                     if let Some(pos) = got.iter().position(|&b| b == b'\n') {
+                        if pos + 1 != got.len() {
+                            return Err(Error::rejected("trailing grant request bytes"));
+                        }
                         buf.extend_from_slice(&got[..pos]);
                         break;
                     }
@@ -1266,7 +1348,7 @@ impl GrantListener {
             .set_write_timeout(Some(RESPONSE_BUDGET))
             .map_err(|e| Error::rejected(format!("grant write deadline failed: {e}")))?;
         let req = Self::read_request(&stream, REQUEST_BUDGET)?;
-        let req = req.trim_end();
+        let req = req.as_str(); // no whitespace normalization on correlated frames
         let mut parts = req.splitn(2, ' ');
         let verb = parts.next();
         let rest = parts.next().unwrap_or("");
@@ -1274,6 +1356,46 @@ impl GrantListener {
         // refusal must still send the framed `err` line to the peer, not
         // silently drop the connection via an early return.
         let resp: Result<String> = match verb {
+            Some("challenge-v1" | "install-v1") => (|| {
+                use super::installer_client::{Action, Request};
+                let request = Request::parse(req)?;
+                let correlation = &request.correlation;
+                if correlation.recipient_generation != core.enrolled.generation {
+                    return Err(Error::rejected("recipient generation correlation mismatch"));
+                }
+                match request.action {
+                    Action::Challenge => {
+                        core.challenge(&stream, &correlation.installer_generation)?;
+                    }
+                    Action::Install => {
+                        let envelope = request
+                            .envelope
+                            .ok_or_else(|| Error::rejected("missing grant"))?;
+                        check_transport_binding(
+                            envelope,
+                            now,
+                            &correlation.operation,
+                            &correlation.recipient_generation,
+                        )?;
+                        core.install(
+                            &stream,
+                            envelope,
+                            &correlation.installer_generation,
+                            ext,
+                            now,
+                        )?;
+                    }
+                }
+                // Only emitted AFTER the same legacy kernel/signature/consume
+                // guards. The two generations are never compared to each other.
+                let ack = request.acknowledgement(core.enrolled.pid, core.enrolled.starttime);
+                Ok(ack
+                    .strip_prefix("ok ")
+                    .expect("fixed ack prefix")
+                    .strip_suffix('\n')
+                    .expect("fixed ack terminator")
+                    .to_string())
+            })(),
             Some("challenge") => {
                 // `challenge <generation>` — admit the installer, echo the
                 // supervisor's recipient identity for the external enrollment.
@@ -1517,6 +1639,63 @@ mod tests {
         let mut tomb = TombstoneSet::default();
         assert_eq!(tomb.consume_once("op-1"), ConsumeOutcome::Consumed);
         assert_eq!(tomb.consume_once("op-1"), ConsumeOutcome::Unknown);
+    }
+
+    /// Versioned correlation must not bypass the existing UID0/pin admission.
+    /// These are real named sockets; the synthetic enrollment is not authority.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn correlated_listener_retains_kernel_admission_refusal() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("grant.sock");
+        let listener = GrantListener::bind_at(&sock).unwrap();
+        let claims = good_claims();
+        let sc = parse_supervisor_challenge(&claims["challenge"]).unwrap();
+        let operation = sc.launch.request.challenge.clone();
+        let ext = StubConsume {
+            enrolled_record: Some(sc),
+            consume: ConsumeOutcome::Consumed,
+            recheck_ok: true,
+            epoch: 7,
+        };
+        let enrolled =
+            SupervisorEnrollment::capture_test(std::process::id(), "b".repeat(32)).unwrap();
+        let mut core = GrantCore::new(enrolled);
+        let grant = envelope("k1", &claims, &fresh_key());
+        for frame in [
+            format!(
+                "challenge-v1 {operation} {} {}\n",
+                "a".repeat(32),
+                "b".repeat(32)
+            ),
+            format!(
+                "install-v1 {operation} {} {} {grant}\n",
+                "a".repeat(32),
+                "b".repeat(32)
+            ),
+        ] {
+            let mut client = UnixStream::connect(&sock).unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            client.write_all(frame.as_bytes()).unwrap();
+            let refusal = listener.serve_once(&mut core, &ext, 1050).unwrap_err();
+            if unsafe { libc::getuid() } != 0 {
+                assert!(refusal.to_string().contains("not root"));
+            } else {
+                assert!(refusal.to_string().contains("pin"));
+            }
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            assert!(
+                response.starts_with("err "),
+                "never an acknowledged consume"
+            );
+        }
+        assert!(production_consume_factory().is_err());
+        assert!(GrantListener::listen_production().is_err());
     }
 
     /// The production authority + self-enrollment factories are permanently

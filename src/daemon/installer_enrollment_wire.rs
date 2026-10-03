@@ -106,7 +106,12 @@ impl TrustedKey {
     /// `#[cfg(test)]`-only synthetic-key builder — explicit public test
     /// material, never a production keyring, signer or trust root.
     #[cfg(test)]
-    fn capture_test(issuer: &str, kid: &str, key_version: u64, public_key: [u8; 32]) -> Self {
+    pub(super) fn capture_test(
+        issuer: &str,
+        kid: &str,
+        key_version: u64,
+        public_key: [u8; 32],
+    ) -> Self {
         Self {
             issuer: issuer.to_string(),
             kid: kid.to_string(),

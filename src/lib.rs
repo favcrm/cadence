@@ -32,6 +32,8 @@ pub mod error;
 pub mod filter;
 pub mod home;
 pub mod inbox;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) mod installer_bundle;
 pub mod issue;
 pub mod lease;
 pub mod master;
@@ -74,3 +76,37 @@ pub mod wiki;
 pub mod worktree;
 
 pub use error::{Error, Result};
+
+/// Fixed no-argument non-setuid carrier entry, never a configurable exec API.
+pub fn installer_carrier_entry() -> Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        installer_bundle::carrier_entry()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        Err(Error::rejected("installer bundle requires Linux x86_64"))
+    }
+}
+/// Fixed host-stdin waiting entry; construction is not enrollment/release.
+pub fn installer_waiting_client_entry() -> Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        installer_bundle::client_entry()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        Err(Error::rejected("installer bundle requires Linux x86_64"))
+    }
+}
+/// Fixed host-only observer entry; bounded observations never elect authority.
+pub fn installer_observer_entry() -> Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        installer_bundle::observer_entry()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        Err(Error::rejected("installer bundle requires Linux x86_64"))
+    }
+}
