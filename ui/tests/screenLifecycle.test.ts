@@ -81,7 +81,7 @@ check(!("publish_intents" in (bare.port.sent[1] as object)), "later updates keep
 const forgedOptIn = mount(); forgedOptIn.channel.receive(forgedOptIn.event);
 forgedOptIn.port.receive({ v: 1, op: "ready", accepts: ["publish-intents.v1", "credentials"] });
 check(forgedOptIn.port.closed && forgedOptIn.port.sent.length === 0, "forged opt-in closes the mount with nothing sent");
-const chatOptIn = mount(); chatOptIn.channel.receive(chatOptIn.event); chatOptIn.port.receive({ v: 1, op: "ready", accepts: ["chat-directive.v1"] });
+const chatOptIn = mount(); chatOptIn.channel.update(extended); chatOptIn.channel.receive(chatOptIn.event); chatOptIn.port.receive({ v: 1, op: "ready", accepts: ["chat-directive.v1"] });
 check(chatOptIn.port.closed && chatOptIn.counts().failed === 1 && chatOptIn.port.sent.length === 0, "a workspace screen sending the chat opt-in is closed with nothing pushed");
 const unextended = mount(); unextended.channel.receive(unextended.event); unextended.port.receive({ v: 1, op: "ready", accepts: ["publish-intents.v1"] });
 check(unextended.port.closed && unextended.port.sent.length === 0, "an opted-in child never gets a push without publish_intents");
