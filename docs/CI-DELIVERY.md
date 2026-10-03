@@ -440,4 +440,30 @@ and the `cargo check --release --features test-seam` refusal probe. The
 (the flag is part of cargo's fingerprint). Not merged: `build` and `ui` stay two
 compiles (default features vs `--features ui`, different path scopes), and the
 two clippy passes stay (default vs `test-seam` lint different cfg code).
-Tree-hash artifact reuse is a follow-up.
+
+## Build once per tree (CAD-1131)
+
+A queue entry's `merge_group` run builds the shipping binary
+(`--release --features ui`) in `release-queue-build`, in parallel with the
+gates, and uploads `release-tree-<tree hash>` (binary, sha256, manifest with
+the tree). It is not a required check. On the main push for that sha,
+`release-reuse` downloads it from the merge_group run that `queue-evidence`
+found and `scripts/release-reuse.py` verifies, for this checkout's own tree:
+the artifact name and manifest tree, the source commit, the binary digest,
+the build shape (release, x86_64-linux, `ui`) and the commit baked into the
+binary. Any doubt (no artifact, build unfinished after 15 minutes, any
+mismatch) leaves `reused` unset and `release-artifact` rebuilds. The binary
+is never executed during reuse. `release-attest` then attests the verified
+bytes on main exactly as before (source ref `refs/heads/main`, digest
+= the main sha), so `cadence update`, staging and promotion verify the same
+attestation. The commit is baked into the binary (`build.rs`), so a tree
+reached by a different commit is rebuilt rather than misreporting its
+revision. `staging.yml` already downloads the attested artifact of the
+selected main CI run (`delivery-candidate.py prepare`: run, SHA, attempt,
+digest, attestation) and never rebuilds it; only its PR-only `rehearsal-check`
+compiles PR bytes, and those are never promoted. The `release-full` leg of
+`cache-warm` warms the release profile that `release-queue-build` restores.
+`scripts/test_release_reuse.py` proves a different tree never reuses an
+artifact. Residual: the artifact crosses jobs of the queue run, which also
+runs the entry's tests; the upload never overwrites, but the main attestation
+vouches for bytes the queue run built.
