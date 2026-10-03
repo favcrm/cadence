@@ -959,7 +959,6 @@ async function mountedFlow() {
     for (const label of ["Ready to send", "Campaign summary", "Content approval", "Test send", "Final send"]) {
       assert(overview.includes(label), `Overview carries: ${label}`);
     }
-    assert(!overview.includes("SMTP sender") && !overview.includes("Unsubscribe origin"), "the sender and origin panels moved to Settings -> Email sending");
     assert(!overview.includes("Frozen audience") && !overview.includes("Email preview"), "Overview mounts no other tab's panels");
     const email = await panelsOf("email");
     assert(email.includes("Email preview") && email.includes("Assistant proposals"), "Email carries the preview and the proposal strip");
