@@ -1222,12 +1222,14 @@ impl Shared {
             .error
             .as_deref()
             .unwrap_or("provider refused the request");
-        let _ = self.store.event_public(
+        if let Err(e) = self.store.event_public(
             alias,
             "provider_session_reset",
             json!({"message": message.id, "turn": refused.turn_id, "error": error}),
-        );
-        let _ = self.store.thread_append(
+        ) {
+            eprintln!("provider_session_reset event for '{alias}' failed: {e}");
+        }
+        if let Err(e) = self.store.thread_append(
             alias,
             store::NewEntry {
                 role: store::ROLE_SYSTEM,
@@ -1238,7 +1240,9 @@ impl Shared {
                 payload: Some(json!({"event": "provider_session_reset", "message": message.id})),
                 message_id: None,
             },
-        );
+        ) {
+            eprintln!("provider_session_reset note for '{alias}' failed: {e}");
+        }
         self.continuity_due
             .lock()
             .unwrap()
