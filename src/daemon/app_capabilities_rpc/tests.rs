@@ -90,9 +90,22 @@ fn cad868_builtin_discovery_binding_and_app_credential_are_registration_dependen
     )
     .is_err());
     let connection = proof.config["connection_id"].as_str().unwrap();
-    assert!(shared
+    // CAD-1060: the same builtin also binds the source read, credentialless.
+    let source = shared
         .app_binding_config("install868", None, "source", connection, &bundle, &files)
-        .is_err());
+        .unwrap();
+    assert_eq!(source["account"], "hosted");
+    assert_eq!(source["connection_kind"], "builtin");
+    assert_eq!(source["mapping"]["capability"], "social.read");
+    assert_eq!(
+        source["mapping"]["tool"],
+        "scrapecreators.instagram.user.posts"
+    );
+    assert_eq!(source["mapping"]["effect"], "read");
+    assert!(shared
+        .app_capability_credential(&source)
+        .unwrap()
+        .is_empty());
     assert!(shared
         .app_binding_config(
             "install868",
