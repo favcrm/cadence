@@ -389,8 +389,8 @@ export const api = {
         ...(conversation ? { conversation } : {}),
       },
     ),
-  /** `GET /api/app-installations/<id>/chat-descriptor` (CAD-1110): the approved
-   *  package's `app-chat.json`, pinned to the digest the operator approved. A
+  /** `GET /api/app-installations/<id>/chat-descriptor` (CAD-1110): the installed
+   *  package's `app-chat.json`, pinned to the digest its install consented to. A
    *  404 means no descriptor (plain shared chat). */
   appChatDescriptor: (installId: string) =>
     get<{ descriptor: unknown; digest: unknown; app: unknown }>(

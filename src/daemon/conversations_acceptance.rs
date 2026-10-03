@@ -22,8 +22,8 @@ use crate::store::NewAgent;
 use crate::test_seam::{scoped, Asserted};
 
 /// A fixture daemon: a master (managed Pi, so a turn token exists) and a
-/// worker, two REAL installations (CRM and Social Content, installed and
-/// approved through the daemon), the CRM with two companies and two
+/// worker, two REAL installations (CRM and Social Content, installed
+/// through the daemon), the CRM with two companies and two
 /// campaigns.
 struct Gx {
     dir: tempfile::TempDir,
@@ -45,11 +45,7 @@ fn install(shared: &Arc<Shared>, app: &str) -> String {
         shared.dispatch("app_workspace_install", &json!({"source": source}), pid())
     })
     .unwrap();
-    let approve = json!({"install_id": out["install_id"], "digest": out["digest"]});
-    scoped(Asserted::Operator, || {
-        shared.dispatch("app_local_install_approve", &approve, pid())
-    })
-    .unwrap();
+    // Install is consent (CAD-1119): no separate approve step.
     out["install_id"].as_str().unwrap().to_string()
 }
 
@@ -1546,7 +1542,7 @@ fn the_daemon_never_reads_the_conversation_env() {
 
 /// CAD-1110: the app-chat descriptor read, at the real daemon guard and on
 /// the board over real HTTP. The descriptor is served only to the operator,
-/// only from the APPROVED digest, install id from the path only, and every
+/// only from the consented (installed) digest, install id from the path only, and every
 /// "no descriptor" case is one 404 that names nothing. The agent caller is
 /// refused by the same proof as the sibling app reads (relay parity, I13),
 /// and refused BEFORE existence is decided, so the route is no oracle for
@@ -1555,9 +1551,9 @@ fn the_daemon_never_reads_the_conversation_env() {
 /// Guards: `Shared::operator_connection` in `rpc_app_chat_descriptor`
 /// (daemon/app_chat_rpc.rs), `admit_operator_read` before
 /// `app_chat::handle` (ui/serve.rs), the closed param set, and the
-/// `app_capability_status == approved` check at the live digest.
+/// consent check (`app_capability_status == approved`) at the live digest.
 #[test]
-fn chat_descriptor_is_operator_only_pinned_to_the_approved_digest_and_one_404() {
+fn chat_descriptor_is_operator_only_pinned_to_the_installed_digest_and_one_404() {
     let gx = gx_with(true);
     let read =
         |who: Asserted, id: &str| gx.call(who, "app_chat_descriptor", json!({"install_id": id}));
@@ -1602,7 +1598,7 @@ fn chat_descriptor_is_operator_only_pinned_to_the_approved_digest_and_one_404() 
         let none = read(Asserted::Operator, forged).unwrap();
         assert_eq!(none, json!({"found": false}), "{forged}");
     }
-    // Pinned: once the approval is revoked at the live digest, the bundle
+    // Pinned: once the consent is withdrawn at the live digest, the bundle
     // on disk is no longer served.
     let digest = crm["digest"].clone();
     gx.operator(
@@ -1613,7 +1609,7 @@ fn chat_descriptor_is_operator_only_pinned_to_the_approved_digest_and_one_404() 
     assert_eq!(
         read(Asserted::Operator, &gx.crm).unwrap(),
         json!({"found": false}),
-        "an unapproved installation serves no descriptor"
+        "an installation whose consent is withdrawn serves no descriptor"
     );
     assert!(read(Asserted::Operator, &gx.social).unwrap()["descriptor"].is_object());
 }
@@ -1621,8 +1617,8 @@ fn chat_descriptor_is_operator_only_pinned_to_the_approved_digest_and_one_404() 
 /// CAD-1110 relay parity: the board's `GET .../chat-descriptor` refuses an
 /// agent exactly like the daemon verb and like the sibling reads
 /// (`check: operator_only`, 403) even for a forged id, 404s a forged id and
-/// an unapproved installation for the operator with one body, and serves
-/// the approved descriptor `no-store`.
+/// an installation whose consent is withdrawn for the operator with one
+/// body, and serves the consented descriptor `no-store`.
 ///
 /// Guard: `operator::admit_operator_read` ahead of `app_chat::handle`
 /// (ui/serve.rs); `app_chat::route` takes the id from the path only.
@@ -1770,12 +1766,12 @@ fn install_refuses_a_package_with_an_invalid_chat_descriptor() {
 }
 
 /// CAD-1111: a third app, shipped as a package alone, installs through the
-/// same validator, is approved like any app, serves its own descriptor
+/// same validator, is consented by its install like any app, serves its own descriptor
 /// through the generic route, and its screen package passes the CAD-1006
 /// integrity proof the mount runs: no host code names it.
 ///
 /// Guards: `app_chat::validate` at install, `app_screen_pkg::extract` (the
-/// mount's own re-proof) over the live bundle, the approved-digest pin.
+/// mount's own re-proof) over the live bundle, the consented-digest pin.
 #[test]
 fn fixture_third_app_installs_and_serves_its_own_chat_descriptor_and_screen() {
     let dir = tempfile::Builder::new().prefix("c11f").tempdir().unwrap();
@@ -1796,16 +1792,8 @@ fn fixture_third_app_installs_and_serves_its_own_chat_descriptor_and_screen() {
     };
     let out = operator("app_workspace_install", json!({"source": source})).unwrap();
     let (id, digest) = (out["install_id"].clone(), out["digest"].clone());
-    // Unapproved: no descriptor yet.
-    assert_eq!(
-        operator("app_chat_descriptor", json!({"install_id": id})).unwrap(),
-        json!({"found": false})
-    );
-    operator(
-        "app_local_install_approve",
-        json!({"install_id": id, "digest": digest}),
-    )
-    .unwrap();
+    // Install is consent (CAD-1119): the descriptor serves at once, with no
+    // separate approve step.
     let served = operator("app_chat_descriptor", json!({"install_id": id})).unwrap();
     assert_eq!(served["app"], json!("notes-fixture"), "{served}");
     assert_eq!(served["digest"], digest);

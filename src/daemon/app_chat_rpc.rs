@@ -5,12 +5,12 @@
 //! `operator_connection`-gated like the sibling app reads: an agent pane,
 //! a detached child and a forged identity field are refused before any
 //! file is touched. The install id is the only input. The descriptor is
-//! read from the APPROVED bundle at its current digest through the same
+//! read from the installed bundle at the digest the install consented to through the same
 //! descriptor-confined resolver the screen mount uses
 //! (`workspace::with_runtime_snapshot`: no symlinks, no request path), and
-//! only when `app_capability_status` says the installation is approved at
-//! exactly that digest. Everything else — no such install, no descriptor,
-//! unapproved or stale approval, a bundle that moved during the read —
+//! only when `app_capability_status` says that digest is consented (CAD-1119:
+//! an operator install or update records it) and not withdrawn. Everything else — no such install, no descriptor,
+//! withdrawn consent, a stale digest, a bundle that moved during the read —
 //! answers `{"found": false}`, which the board turns into a 404 that names
 //! no other install and no path. The route never parses chat semantics
 //! beyond size and JSON validity; the grammar is the install validator's

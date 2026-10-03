@@ -6,8 +6,8 @@ test lands with this note. It ships inside the single CAD-1108 feature PR
 (CAD-1110 implements, CAD-1111's fixture app proves Tier 1 and Tier 2). Epic: CAD-1108. Companion contract:
 CAD-1098 (per-app conversations; contract PR #764 head 73bcf117, UI slice PR
 #771). Risk: this note changes no code. CAD-1110 adds a daemon read route, an install-time
-validator and Tier 2 frame mounting, and CRM/Social bundle digests need operator
-re-approval, so the implementation PR must be classified against
+validator and Tier 2 frame mounting, and CRM/Social bundle digests change, so
+the implementation PR must be classified against
 `docs/roles/risk-classes.md` and may be `human` class.
 
 ## Goals and non-goals
@@ -22,7 +22,7 @@ ref chips and retry/discard exist on Home only. A third app would add another
 branch.
 
 Guiding principle (operator): apps work like WordPress plugins, so the core
-must not limit apps. One package is installed and approved, extends the host
+must not limit apps. One package is installed (install is consent), extends the host
 through defined hooks, and adding an app needs no core change; the core keeps
 no list of apps. Unlike WP, no app code runs in the board origin, because the
 board holds the operator session. The three tiers: Tier 1 data (descriptor
@@ -214,26 +214,27 @@ never uses `dangerouslySetInnerHTML`, `Md`, an anchor, an `href`, `style` or
 ### Where it ships, how the host loads and pins it
 
 - Ships in the app package, next to `app.md` and the app-views descriptor
-  (`app-chat.json`), and is covered by the bundle digest the operator
-  approves. The install validator (CAD-811's package slice, extended in
+  (`app-chat.json`), and is covered by the bundle digest the operator's
+  install or update consents to (CAD-1119: install is consent). The install validator (CAD-811's package slice, extended in
   CAD-1110) runs the same grammar at install and update and refuses a package
-  whose `app-chat.json` fails it (an invalid descriptor is caught at approval
+  whose `app-chat.json` fails it (an invalid descriptor is caught at install
   time, and still fails closed at load time). Core keeps NO list of apps: no
   bundled descriptor map, no `installation.name` lookup anywhere (D1, I1).
 - CRM and Social Content packages each gain an `app-chat.json`. Their bundle
-  digests change, so the operator must re-approve each (the existing update
-  approval; nothing is auto-approved). Until re-approved, the old digest has
-  no descriptor, the route returns 404 and the pane shows plain shared chat.
+  digests change; an operator install or update of the new package records
+  consent for that digest, so no separate approval step exists. Until the
+  installation runs the new package, the old digest has no descriptor, the
+  route returns 404 and the pane shows plain shared chat.
 - Loading. `loadAppChat(installId)` calls the one generic read route (see
   Routing and APIs), validates the returned bytes with `parseAppChat`, and
   requires `descriptor.app` to equal the installation's kind (a CRM descriptor
   served for a Social install is a mismatch, fail closed).
 - Pinning. The route serves the descriptor from the bundle at the digest the
-  operator approved for that installation, never from a newer unapproved
-  bundle on disk. The cache key is `(installId, descriptor_digest)` where the
-  digest is the approved bundle digest (the same digest the CAD-1006 mount
+  installation consented to, never from a newer bundle on disk whose digest
+  has no consent. The cache key is `(installId, descriptor_digest)` where the
+  digest is the consented bundle digest (the same digest the CAD-1006 mount
   proves). The loader refetches whenever the installation's digest changes.
-  A response whose digest differs from the installation's current approved
+  A response whose digest differs from the installation's current consented
   digest is discarded: plain chat until it matches. The descriptor's own text
   never asserts a digest or revision (`digest`/`revision` are forbidden keys).
 - After an app upgrade, old messages render with the NEW descriptor: a
@@ -424,15 +425,15 @@ No new daemon RPC is defined by this contract. It reuses:
   re-run on the HTTP peer, with no extra input that widens it (relay parity,
   I13). A board adversarial test asserts parity for an agent caller, a
   forged/other install id and a removed install.
-- Response 200: `{"descriptor": <app-chat.json parsed>, "digest": "<approved
+- Response 200: `{"descriptor": <app-chat.json parsed>, "digest": "<consented
   bundle digest>", "app": "<installation kind>"}`, `Cache-Control: no-store`
   (the client caches by `(install, digest)`; the server never serves a
-  cacheable body). The descriptor is read from the approved bundle at that
+  cacheable body). The descriptor is read from the installed bundle at that
   digest, by the same confined resolver the screen mount uses (no symlinks, no
   path from the request), and is at most 16 KiB.
-- 404: the installation does not exist or is removed; its approved bundle has
-  no `app-chat.json`; the installation is unapproved or its approval is stale
-  (the bundle on disk differs from the approved digest). The body names no
+- 404: the installation does not exist or is removed; its bundle has
+  no `app-chat.json`; the installation's consent is withdrawn (revoked) or
+  stale (the bundle on disk differs from the consented digest). The body names no
   other install and no path. The client treats any 404 as "no descriptor":
   plain shared chat.
 - Mismatch: if the client already holds a descriptor for `(install, digest A)`
@@ -467,8 +468,8 @@ behaviour, no descriptor.
 | `hideIds` rewriting `ctx-…` to "this workspace" | Host constant in app mode (D4) |
 | Folded steps line "✓ Done · N steps" / "Working" / "Finished with an issue" | Host constant in app mode; Home keeps expandable `StepsGroup` (D4) |
 | System rows `· {stepSummary}` | Host |
-| Social chat: no chip, no prompts, no import, same pane | Social package ships a descriptor with `contexts: []`, `attachments: []`, `subjects: []` (or none: plain chat is identical). Its package digest changes and needs operator re-approval |
-| CRM package descriptor delivery | CRM package gains `app-chat.json`; new digest needs operator re-approval; no bundled map in core |
+| Social chat: no chip, no prompts, no import, same pane | Social package ships a descriptor with `contexts: []`, `attachments: []`, `subjects: []` (or none: plain chat is identical). Its package digest changes; the operator's install or update records consent for it (CAD-1119) |
+| CRM package descriptor delivery | CRM package gains `app-chat.json`; new digest is consented by the operator's install or update (CAD-1119); no bundled map in core |
 | (new) inline previews | Tier 2 `render: "screen:<tag>"`; no CRM/Social behaviour depends on it |
 | Collapse rail, waiting dot, composer disabled when read-only, empty/loading/failed states | Host |
 | CAD-1098 picker, `/new`, `/clear`, queued notice, "Earlier history is in Home" (#771) | Host, in the shared component |
@@ -515,7 +516,7 @@ table that CAD-1110 cannot place is a blocker, not a silent drop.
   that install, all host behaviours intact; it never throws into the pane and
   never partially applies.
 - I8 (pinning): the descriptor in use is the one the server reports for the
-  installation's current approved package revision; a stale or differing
+  installation's current consented package revision; a stale or differing
   revision or digest is discarded. After upgrade, a directive kind no longer
   declared renders as plain text.
 - I9 (capabilities are opt-in and host-checked): an attachment appears only if
@@ -584,7 +585,7 @@ table that CAD-1110 cannot place is a blocker, not a silent drop.
 - [ ] Relay paths (board or HTTP peer at least as strict as the daemon RPC):
   `GET …/chat-descriptor` takes the install id from the path only, needs the
   operator session like sibling `/api/app-installations/*` reads, returns
-  nothing for another install or an unapproved revision, and an adversarial
+  nothing for another install or a revision whose consent is withdrawn, and an adversarial
   test asserts the board returns the same 404/403 as the daemon read for an
   agent caller and a forged id (I13). Conversation routes are CAD-1098's.
 - [ ] Forged field (caller-supplied id, actor, head, token, path or
@@ -705,11 +706,11 @@ All decided by the operator on 2026-10-03 (CAD-1109 comment, relayed by
 cc13-pm). No open decisions remain.
 
 - D1 Descriptor source: DECIDED. It ships in the package (`app-chat.json` next
-  to `app.md`), covered by the approved bundle digest, served per installation
+  to `app.md`), covered by the consented bundle digest, served per installation
   through one generic operator-session-gated read-only route pinned to the
-  approved digest (specified in Routing and APIs). The bundled loader map is
+  consented digest (specified in Routing and APIs). The bundled loader map is
   rejected: core keeps no list of apps. CRM and Social packages gain
-  descriptors; their new digests need operator re-approval. CAD-1110 includes
+  descriptors; their new digests are consented by the operator's install or update (CAD-1119). CAD-1110 includes
   the route.
 - D2 Header: DECIDED. `presentation.showContext` (boolean, default false);
   Social keeps today's look.

@@ -4,7 +4,7 @@ import { parseAppChat, type AppChat } from "./contract";
 
 /**
  * Loads an installation's app-chat descriptor (CAD-1110). The daemon serves
- * it from the bundle at the digest the operator approved; this loader trusts
+ * it from the bundle at the digest the install consented to; this loader trusts
  * none of it: it validates the bytes with `parseAppChat`, requires the served
  * `digest` to equal the installation's CURRENT digest and the served and
  * declared `app` to equal the installation's kind, and caches by
@@ -38,7 +38,7 @@ export async function loadAppChat(installId: string, digest: string, kind: strin
 }
 
 /** The descriptor for the pane's installation, or `null` (plain chat) while
- *  it loads, when the installation is unknown or unapproved, or when the
+ *  it loads, when the installation is unknown or its consent is withdrawn, or when the
  *  served descriptor is refused. A late answer for a previous installation
  *  or digest is discarded. */
 export function useAppChat(installId: string, digest: string | null, kind: string | null): AppChat | null {
