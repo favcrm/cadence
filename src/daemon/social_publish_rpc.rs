@@ -485,7 +485,7 @@ impl Shared {
                         &json!({"error": refusal.to_string()}),
                     );
                 }
-                return Ok(json!({"sent": false, "intent_id": id}));
+                return self.not_sent(&id, "staging refused, and the intent left queued first");
             }
         }
         // Claim BY IDENTITY: only this exact row transitions. A
@@ -493,7 +493,7 @@ impl Shared {
         // gets `claimed: false`; the single CAS inside `claim_id` is
         // what makes a double-click one provider call, not two.
         let Some(claimed) = self.store.social_publish_claim_id(&id, install, context)? else {
-            return Ok(json!({"sent": false, "intent_id": id, "reason": "no longer queued"}));
+            return self.not_sent(&id, "the intent left queued before this claim");
         };
         if !self.store.social_publish_material_current(&id)? {
             return self.store.social_publish_report(
@@ -537,6 +537,16 @@ impl Shared {
             return self.store.social_publish_report(&id, "posted", &evidence);
         }
         Ok(settled)
+    }
+
+    /// A send-now that lost its claim to another send or a cancel: the
+    /// intent's current envelope, marked not sent with the reason, so a
+    /// client always reads `intent` (never a bare `{sent:false}`).
+    fn not_sent(&self, id: &str, reason: &str) -> Result<Value> {
+        let mut envelope = self.store.social_publish_show(id)?;
+        envelope["sent"] = json!(false);
+        envelope["reason"] = json!(reason);
+        Ok(envelope)
     }
 
     /// Reconcile one processing intent against the provider door: refresh

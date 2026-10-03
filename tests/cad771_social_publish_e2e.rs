@@ -418,7 +418,12 @@ struct HttpSender {
     /// CAD-1041: scripted execute refusals by key — the code returns
     /// before any wire call (e.g. `nothing_sent`).
     execute_refusals: Mutex<HashMap<String, &'static str>>,
+    /// CAD-1041: a one-shot hook run while `key` stages — a test moves the
+    /// row between the send-now staging and its claim.
+    during_stage: Mutex<HashMap<String, StageHook>>,
 }
+
+type StageHook = Box<dyn FnOnce() + Send>;
 
 /// A scripted staging verdict for one key.
 #[derive(Clone, Copy)]
@@ -435,7 +440,12 @@ impl HttpSender {
             status_forgeries: Mutex::new(HashMap::new()),
             preflights: Mutex::new(HashMap::new()),
             execute_refusals: Mutex::new(HashMap::new()),
+            during_stage: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn on_stage(&self, key: &str, hook: StageHook) {
+        self.during_stage.lock().unwrap().insert(key.into(), hook);
     }
 
     /// Script the staging verdict for `key`; `None` stages at the door.
@@ -601,6 +611,10 @@ impl cadence_agent::platform::agenticos_external::publish::PublishSender for Htt
         binding: &SendBinding,
     ) -> cadence_agent::platform::agenticos_external::publish::Preflight {
         use cadence_agent::platform::agenticos_external::publish::{Preflight, Refusal};
+        let hook = self.during_stage.lock().unwrap().remove(&binding.key);
+        if let Some(hook) = hook {
+            hook();
+        }
         match self.preflights.lock().unwrap().get(&binding.key).copied() {
             Some(Staging::Uncertain) => {
                 return Preflight::Uncertain(Refusal::new("refused", "scripted: staging timed out"))
@@ -2649,6 +2663,58 @@ fn cad1041_wrong_scope_never_stages_or_sends() {
     let (code, text) = board.post(&h, &path, &own);
     assert_eq!(code, 200, "in-scope send-now refused: {text}");
     assert!(text.contains("\"posted\""), "{text}");
+}
+
+/// CAD-1041 (should-fix): a send-now that loses its claim (the row left
+/// queued while it staged) returns the intent envelope marked not sent,
+/// never a bare `{sent:false}`, on the approved and the refused path.
+#[test]
+fn cad1041_lost_claim_returns_the_intent_envelope() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snlost");
+    for (tag, staging) in [
+        ("lost-ok", None),
+        ("lost-ref", Some(Staging::Refused("not_publishable"))),
+    ] {
+        let (id, key) = send_now_fixture(
+            &h,
+            &context,
+            &run,
+            &bundle,
+            &install,
+            &format!("cad1041-{tag}"),
+            epoch_now(),
+        );
+        sender.script_preflight(&key, staging);
+        let (db, moved) = (h.daemon.state.join("cadence.sqlite3"), id.clone());
+        sender.on_stage(
+            &key,
+            Box::new(move || {
+                rusqlite::Connection::open(db)
+                    .unwrap()
+                    .execute(
+                        "UPDATE social_publish_intents SET state='cancelled' WHERE intent_id=?",
+                        [&moved],
+                    )
+                    .unwrap();
+            }),
+        );
+        let out = h
+            .daemon
+            .operator_rpc(
+                "social_publish_send_now",
+                send_now_params(&id, &install, &context),
+            )
+            .unwrap();
+        assert_eq!(out["sent"], false, "{tag}: {out}");
+        assert_eq!(out["intent"]["intent_id"], id.as_str(), "{tag}: {out}");
+        assert_eq!(out["intent"]["state"], "cancelled", "{tag}: {out}");
+        let reason = out["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("left queued"), "{tag}: {out}");
+    }
+    assert_eq!(*door.calls.lock().unwrap(), 0, "a lost claim never sends");
 }
 
 #[test]
