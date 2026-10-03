@@ -1833,6 +1833,8 @@ mod tests {
         }
     }
 
+    mod hosted_source;
+
     /// Poll, deadline and drift paths need the short test-seam clock.
     #[cfg(feature = "test-seam")]
     mod media_poll_tests {
