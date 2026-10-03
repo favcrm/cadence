@@ -390,6 +390,7 @@ include!("agents.rs");
 include!("delivery.rs");
 include!("events.rs");
 include!("kickoff.rs");
+include!("native_nudge.rs");
 include!("plans.rs");
 include!("queue.rs");
 include!("schema.rs");

@@ -166,6 +166,16 @@ pub struct HostOverrides {
     /// reaps a forgotten hold (default 7200).
     pub build_slots: Option<u64>,
     pub suite_slots: Option<u64>,
+    /// CAD-1021: concurrent `check` grants (default 2) — the lane's
+    /// pre-push pool, admitted only via a kind=check recipe.
+    pub check_slots: Option<u64>,
+    /// CAD-1021 admission floors — a request below floor waits with
+    /// reason `memory`/`disk`, never refused. `slot_mem_min_available_*`
+    /// is MemAvailable bytes for build/test and for the check pool;
+    /// `slot_disk_min_free_bytes` is free bytes on the state fs.
+    pub slot_mem_min_available_bytes: Option<u64>,
+    pub slot_mem_min_available_check_bytes: Option<u64>,
+    pub slot_disk_min_free_bytes: Option<u64>,
     pub jobs_per_lane: Option<u64>,
     pub starve_secs: Option<u64>,
     pub priority_lanes: Option<Vec<String>>,

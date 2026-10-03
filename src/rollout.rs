@@ -263,12 +263,37 @@ pub fn resolve_caller(explicit_as: Option<&str>) -> Result<Caller> {
 pub fn resolve_caller_with(alias: Option<&str>, explicit_as: Option<&str>) -> Result<Caller> {
     let alias = alias.map(str::trim).filter(|s| !s.is_empty());
     let explicit = explicit_as.map(str::trim).filter(|s| !s.is_empty());
+    // CAD-1024: a `delegate:<alias>` `--as` is owned by the env alias it
+    // names — `delegate:w1` and `CADENCE_ALIAS=w1` are the same caller.
+    let explicit_matches_alias = |alias: &str, explicit: &str| {
+        alias == explicit
+            || explicit
+                .strip_prefix("delegate:")
+                .is_some_and(|d| d == alias)
+    };
     match (alias, explicit) {
-        (Some(alias), Some(explicit)) if alias != explicit => Err(Error::rejected(
-            "inside a cadence pane the lease holder is $CADENCE_ALIAS; \
-             --as must match it. Ownership is never taken from a path or HEAD",
-        )),
-        (Some(alias), _) => {
+        (Some(alias), Some(explicit)) if !explicit_matches_alias(alias, explicit) => {
+            Err(Error::rejected(
+                "inside a cadence pane the lease holder is $CADENCE_ALIAS; \
+                 --as must match it. Ownership is never taken from a path or HEAD",
+            ))
+        }
+        (Some(alias), explicit) => {
+            // A `delegate:` explicit that matched this alias carries the
+            // delegate shape (the lease holder is the literal `delegate:<a>`);
+            // a matching non-delegate explicit or none keeps the alias caller.
+            let delegate = explicit.and_then(|e| e.strip_prefix("delegate:"));
+            if let Some(d) = delegate {
+                if d.is_empty() || d.starts_with("operator") {
+                    return Err(Error::rejected(
+                        "--as delegate:<alias> needs the agent's alias, never operator:*",
+                    ));
+                }
+                return Ok(Caller {
+                    identity: explicit.unwrap().to_string(),
+                    source: "delegate",
+                });
+            }
             validate_identity(alias)?;
             Ok(Caller {
                 identity: alias.to_string(),
@@ -277,6 +302,22 @@ pub fn resolve_caller_with(alias: Option<&str>, explicit_as: Option<&str>) -> Re
         }
         (None, Some(explicit)) => {
             validate_identity(explicit)?;
+            // CAD-1024: `delegate:<alias>` is a third caller shape — the
+            // literal `delegate:<alias>` is the lease holder, and `op`
+            // admission is gated by `require_delegate_grant`, never by
+            // `operator_proof` (which a delegate must not pass and must not
+            // need). The bare `alias` is recovered by [`delegate_alias`].
+            if let Some(alias) = explicit.strip_prefix("delegate:") {
+                if alias.is_empty() || alias.starts_with("operator") {
+                    return Err(Error::rejected(
+                        "--as delegate:<alias> needs the agent's alias, never operator:*",
+                    ));
+                }
+                return Ok(Caller {
+                    identity: explicit.to_string(),
+                    source: "delegate",
+                });
+            }
             Ok(Caller {
                 identity: explicit.to_string(),
                 source: "as",
@@ -413,7 +454,29 @@ pub fn ensure_lease_tables(conn: &Connection) -> Result<()> {
             granted_at REAL NOT NULL,
             expires_at REAL,
             revoked_at REAL,
-            revoked_by TEXT);",
+            revoked_by TEXT);
+         -- CAD-1024: the staging-delegation allowlist and its grants.
+         -- `staging_instances` marks a state dir as staging (operator only;
+         -- `staging_register` writes it after the production allowlist).
+         -- `staging_grants` is the grant store — it admits nothing until
+         -- PR-3 adds the `delegate:` caller shape and `require_delegate_grant`.
+         CREATE TABLE IF NOT EXISTS staging_instances(
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            state_dir TEXT NOT NULL,
+            board_port INTEGER NOT NULL,
+            registered_by TEXT NOT NULL,
+            registered_at REAL NOT NULL);
+         CREATE TABLE IF NOT EXISTS staging_grants(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias TEXT NOT NULL,
+            ops TEXT NOT NULL,
+            state_dir TEXT NOT NULL,
+            granted_by TEXT NOT NULL,
+            granted_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            revoked_at REAL,
+            revoked_by TEXT,
+            last_used_at REAL);",
     )?;
     Ok(())
 }
@@ -476,6 +539,11 @@ pub fn authorize_spawn_for(state_dir: &Path, caller: Result<Caller>) -> Result<O
         return Ok(caller.ok().map(|c| c.identity));
     }
     let caller = caller?;
+    // CAD-1024: a `delegate:<alias>` start needs a live grant for
+    // `daemon_start` on this dir; an `operator:`/`alias` caller is unchanged.
+    if caller.source == "delegate" {
+        require_delegate_grant(state_dir, &caller, "daemon_start")?;
+    }
     match holder_block(&peek.conn, &caller, unix_now())? {
         None => Ok(Some(caller.identity)),
         Some(block) => {
@@ -648,6 +716,11 @@ pub fn recheck_restart(state_dir: &Path, ticket: &RestartTicket) -> Result<()> {
 /// it (`cadence rollout grant`). A lease without a live grant — an
 /// agent's handoff, a grant since revoked or expired — admits nobody.
 /// Read-only; no lease table (or no database yet) is no holder.
+///
+/// CAD-1024: a lease held by `delegate:<alias>` admits that delegate's bare
+/// `alias` for `daemon stop` when a live `staging_grants` row covers
+/// `daemon_stop` on this dir — returned as `alias` so the `Rule::Shutdown`
+/// comparison `lease_holder == caller_alias` admits the delegate's own pane.
 pub fn granted_lease_holder(state_dir: &Path) -> Result<Option<String>> {
     let path = db_file(state_dir);
     if !path.exists() {
@@ -658,7 +731,39 @@ pub fn granted_lease_holder(state_dir: &Path) -> Result<Option<String>> {
     let Some(lease) = active_lease(&conn)?.filter(|lease| lease.expires_at > now) else {
         return Ok(None);
     };
+    if let Some(alias) = lease.holder.strip_prefix("delegate:") {
+        if staging_grant_covers(&conn, state_dir, alias, "daemon_stop", now)? {
+            return Ok(Some(alias.to_string()));
+        }
+        return Ok(None);
+    }
     Ok(live_grant(&conn, &lease.holder, now)?.map(|_| lease.holder))
+}
+
+/// A live `staging_grants` row names `(alias, op)` on `state_dir` — the
+/// delegate-shutdown leg of [`granted_lease_holder`] and a shared read for
+/// the seams PR-3 adds.
+fn staging_grant_covers(
+    conn: &Connection,
+    state_dir: &Path,
+    alias: &str,
+    op: &str,
+    now: f64,
+) -> Result<bool> {
+    if !table_exists(conn, "staging_grants")? {
+        return Ok(false);
+    }
+    let canonical = crate::sandbox::resolved(state_dir)
+        .to_string_lossy()
+        .into_owned();
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM staging_grants g, json_each(g.ops) o
+          WHERE g.alias=?1 AND g.state_dir=?2 AND o.value=?3
+            AND g.revoked_at IS NULL AND g.expires_at > ?4)",
+        params![alias, canonical, op, now],
+        |r| r.get(0),
+    )
+    .map_err(Into::into)
 }
 
 /// The live grant for `alias` — not revoked, not expired — as
@@ -763,6 +868,359 @@ fn live_grants(conn: &Connection, now: f64) -> Result<Vec<Value>> {
         .map_err(Into::into)
 }
 
+/// The v1 staging-delegation ops allowlist (CAD-1024). `app_upgrade` is
+/// deliberately absent — app-only updates already use the authorized
+/// installation API, and `app_workspace_upgrade` is `operator_connection`-
+/// gated (no delegate seam exists in v1). Order is fixed for display.
+pub const STAGING_OPS: &[&str] = &[
+    "rollout_claim",
+    "daemon_start",
+    "daemon_stop",
+    "ui_start",
+    "ui_stop",
+];
+
+/// Register `state_dir` as a staging instance — the allowlist a grant
+/// requires (CAD-1024, contract I2/I5). Operator-only: the caller gate
+/// (`operator_connection`) runs in `staging_register`'s RPC handler before
+/// this. The production allowlist check happens here so a grant can never be
+/// created for a dir that is, or overlaps, the production state/PM paths.
+pub fn staging_register(state_dir: &Path, board_port: u16, by: &str) -> Result<Value> {
+    refuse_production_staging(state_dir)?;
+    if !(3110..=3199).contains(&board_port) {
+        return Err(Error::rejected(format!(
+            "staging board port {board_port} is not in 3110–3199"
+        )));
+    }
+    let conn = connect_ensured(&db_file(state_dir))?;
+    let now = unix_now();
+    let canonical = canonical_state_dir(state_dir)?;
+    let canonical_str = canonical.to_string_lossy().into_owned();
+    committed(immediate(&conn, |conn| {
+        conn.execute(
+            "INSERT INTO staging_instances(id,state_dir,board_port,registered_by,registered_at)
+             VALUES(1,?1,?2,?3,?4)
+             ON CONFLICT(id) DO UPDATE SET state_dir=excluded.state_dir,
+                board_port=excluded.board_port, registered_by=excluded.registered_by,
+                registered_at=excluded.registered_at",
+            params![canonical_str, i64::from(board_port), by, now],
+        )?;
+        insert_event(
+            conn,
+            "staging_register",
+            json!({"state_dir": canonical_str, "board_port": board_port, "by": by}),
+            now,
+        )?;
+        Ok(TxResult::Done(json!({
+            "registered": true, "state_dir": canonical_str, "board_port": board_port,
+        })))
+    }))
+}
+
+/// The production paths a staging registration — and so any grant — must
+/// never touch (CAD-1024, contract I5). Canonicalized, so a symlinked or
+/// `..`-spelled staging dir cannot alias a live one. `~/pm` is the
+/// production PM dir; `client::default_state_dir()`/`home::local_state_dir()`
+/// are the two spellings of the production state dir.
+fn refuse_production_staging(state_dir: &Path) -> Result<()> {
+    let ours = crate::sandbox::resolved(state_dir);
+    let mut forbidden: Vec<PathBuf> = Vec::new();
+    if let Ok(d) = crate::client::default_state_dir() {
+        forbidden.push(d);
+    }
+    if let Ok(d) = crate::home::local_state_dir() {
+        forbidden.push(d);
+    }
+    if let Ok(d) = crate::issue::home_default_dir() {
+        forbidden.push(d);
+    }
+    for live in forbidden {
+        let live = crate::sandbox::resolved(&live);
+        if ours.starts_with(&live) || live.starts_with(&ours) {
+            return Err(Error::rejected(format!(
+                "{} overlaps a production path {} — a staging instance can never be \
+                 registered there",
+                ours.display(),
+                live.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The canonical spelling of a state dir — each existing prefix resolved,
+/// `..` applied lexically — so a grant bound to one spelling binds the dir.
+pub fn canonical_state_dir(state_dir: &Path) -> Result<PathBuf> {
+    Ok(crate::sandbox::resolved(state_dir))
+}
+
+/// Is `state_dir` registered staging? Read by `staging delegate` before a
+/// grant is written — no instance row, no grant (contract I2/I3).
+fn is_staging(conn: &Connection, canonical: &str) -> Result<bool> {
+    if !table_exists(conn, "staging_instances")? {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT 1 FROM staging_instances WHERE id=1 AND state_dir=?1",
+        [canonical],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|o| o.is_some())
+    .map_err(Into::into)
+}
+
+/// `staging delegate` (CAD-1024): the operator grants `alias` the listed ops
+/// on this staging state dir for `ttl` (≤ 7d). The dir must be registered
+/// staging first; `ops` is validated against [`STAGING_OPS`]; the grant is
+/// bound to the canonical state dir. A new grant supersedes the alias's live
+/// one. Operator-only — the RPC handler gates on `operator_connection`.
+pub fn staging_delegate(
+    state_dir: &Path,
+    alias: &str,
+    ops: &[String],
+    ttl: Duration,
+    by: &str,
+) -> Result<Value> {
+    validate_identity(alias)?;
+    if ttl.is_zero() || ttl > MAX_TTL {
+        return Err(Error::rejected("a staging grant's --ttl must be 1s–7d"));
+    }
+    if ops.is_empty() {
+        return Err(Error::rejected("--ops must name at least one op"));
+    }
+    for op in ops {
+        if !STAGING_OPS.contains(&op.as_str()) {
+            return Err(Error::rejected(format!(
+                "op '{op}' is not in the v1 staging allowlist ({})",
+                STAGING_OPS.join(", ")
+            )));
+        }
+    }
+    let canonical = canonical_state_dir(state_dir)?;
+    let canonical = canonical.to_string_lossy().into_owned();
+    let conn = connect_ensured(&db_file(state_dir))?;
+    let now = unix_now();
+    committed(immediate(&conn, |conn| {
+        if !is_staging(conn, &canonical)? {
+            return Ok(TxResult::Refuse(format!(
+                "{canonical} is not a registered staging instance — run `cadence staging register` first"
+            )));
+        }
+        let until = now + ttl.as_secs_f64();
+        let ops_json = json!(ops).to_string();
+        conn.execute(
+            "UPDATE staging_grants SET revoked_at=?1, revoked_by='superseded'
+             WHERE alias=?2 AND revoked_at IS NULL",
+            params![now, alias],
+        )?;
+        conn.execute(
+            "INSERT INTO staging_grants(alias,ops,state_dir,granted_by,granted_at,expires_at)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![alias, ops_json, canonical, by, now, until],
+        )?;
+        let payload = json!({
+            "alias": alias, "ops": ops, "state_dir": canonical,
+            "by": by, "expires_at": until,
+        });
+        insert_event(conn, "staging_delegate", payload.clone(), now)?;
+        Ok(TxResult::Done(json!({
+            "granted": alias, "ops": ops, "state_dir": canonical,
+            "by": by, "granted_at": now, "expires_at": until,
+        })))
+    }))
+}
+
+/// `staging revoke` (CAD-1024): end `alias`'s live grant on this state dir.
+/// Operator-only, like [`staging_delegate`].
+pub fn staging_revoke(state_dir: &Path, alias: &str, by: &str) -> Result<Value> {
+    let conn = connect_ensured(&db_file(state_dir))?;
+    let now = unix_now();
+    committed(immediate(&conn, |conn| {
+        let n = conn.execute(
+            "UPDATE staging_grants SET revoked_at=?1, revoked_by=?2
+             WHERE alias=?3 AND revoked_at IS NULL AND expires_at > ?1",
+            params![now, by, alias],
+        )?;
+        if n == 0 {
+            return Ok(TxResult::Refuse(format!(
+                "'{alias}' holds no live staging grant"
+            )));
+        }
+        insert_event(
+            conn,
+            "staging_revoke",
+            json!({"alias": alias, "by": by}),
+            now,
+        )?;
+        Ok(TxResult::Done(
+            json!({"revoked": alias, "by": by, "at": now}),
+        ))
+    }))
+}
+
+/// `staging delegations` (CAD-1024): the live grants on this state dir.
+/// Read-only — the RPC rule is `Read`.
+pub fn staging_delegations(state_dir: &Path) -> Result<Value> {
+    let path = db_file(state_dir);
+    if !path.exists() {
+        return Ok(json!({"delegations": []}));
+    }
+    let conn = connect(&path)?;
+    let now = unix_now();
+    if !table_exists(&conn, "staging_grants")? {
+        return Ok(json!({"delegations": []}));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT alias, ops, state_dir, granted_by, granted_at, expires_at, last_used_at
+         FROM staging_grants WHERE revoked_at IS NULL AND expires_at > ?1 ORDER BY alias",
+    )?;
+    let rows = stmt.query_map(params![now], |row| {
+        Ok(json!({
+            "alias": row.get::<_, String>(0)?,
+            "ops": serde_json::from_str::<Value>(&row.get::<_, String>(1)?)
+                .unwrap_or(Value::Null),
+            "state_dir": row.get::<_, String>(2)?,
+            "by": row.get::<_, String>(3)?,
+            "granted_at": row.get::<_, f64>(4)?,
+            "expires_at": row.get::<_, f64>(5)?,
+            "last_used_at": row.get::<_, Option<f64>>(6)?,
+        }))
+    })?;
+    let delegations = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(json!({"delegations": delegations}))
+}
+
+/// The alias a `delegate:<alias>` caller claims, parsed out of the identity.
+/// `None` for any other caller shape.
+pub fn delegate_alias(caller: &Caller) -> Option<&str> {
+    if caller.source == "delegate" {
+        caller.identity.strip_prefix("delegate:")
+    } else {
+        None
+    }
+}
+
+/// The v1 delegate gate (CAD-1024, contract I3/I4): a `delegate:<alias>`
+/// caller may exercise `op` on `state_dir` only when (a) its process natively
+/// derives to `alias` and (b) a live `staging_grants` row names `alias`, `op`,
+/// and this dir's canonical path. Reads the caller's own env + `/proc`
+/// ancestry; every failure is `Err(rejected)`. Returns the bare `alias`.
+pub fn require_delegate_grant(state_dir: &Path, caller: &Caller, op: &str) -> Result<String> {
+    let env = env_nonempty("CADENCE_ALIAS");
+    require_delegate_grant_inner(state_dir, caller, op, env.as_deref(), std::process::id())
+}
+
+/// The delegate check with the caller's ambient alias and pid injected (the
+/// testable core of [`require_delegate_grant`]).
+fn require_delegate_grant_inner(
+    state_dir: &Path,
+    caller: &Caller,
+    op: &str,
+    env_alias: Option<&str>,
+    caller_pid: u32,
+) -> Result<String> {
+    let Some(alias) = delegate_alias(caller) else {
+        return Err(Error::rejected(format!(
+            "{op} as a delegate needs `--as delegate:<alias>`"
+        )));
+    };
+    // (a) The native identity binding — the alias is this process's own.
+    let env = env_alias.ok_or_else(|| {
+        Error::rejected(format!(
+            "{op} as delegate:{alias} refused: this process carries no CADENCE_ALIAS"
+        ))
+    })?;
+    if env != alias {
+        return Err(Error::rejected(format!(
+            "{op} as delegate:{alias} refused: this process's CADENCE_ALIAS is '{env}'"
+        )));
+    }
+    // `alias` must be registered in *this* state dir with a live endpoint on
+    // this process's ancestry — the caller's pane or managed root. An alias
+    // registered only in another state dir proves nothing here.
+    let chain = crate::adapter::pty::caller_chain(caller_pid)
+        .ok_or_else(|| Error::rejected(format!("{op}: /proc ancestry unreadable")))?;
+    let path = db_file(state_dir);
+    let peek = open_peek(&path)?;
+    if !table_exists(&peek.conn, "agents")? {
+        return Err(Error::rejected(format!(
+            "{op} as delegate:{alias} refused: no agents registered here"
+        )));
+    }
+    let has_start = peek
+        .conn
+        .prepare("SELECT 1 FROM pragma_table_info('agents') WHERE name='pid_start'")?
+        .exists([])?;
+    let start = if has_start { "pid_start" } else { "NULL" };
+    let row: Option<(i64, Option<i64>)> = peek
+        .conn
+        .query_row(
+            &format!("SELECT pid, {start} FROM agents WHERE alias=?1 AND pid IS NOT NULL"),
+            [alias],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((pid, start)) = row else {
+        return Err(Error::rejected(format!(
+            "{op} as delegate:{alias} refused: '{alias}' is not registered in this state dir"
+        )));
+    };
+    let pid = u32::try_from(pid)
+        .ok()
+        .filter(|p| chain.contains(p))
+        .ok_or_else(|| {
+            Error::rejected(format!(
+                "{op} as delegate:{alias} refused: its registered endpoint is not on this \
+                 process's ancestry (a forged CADENCE_ALIAS on an unregistered process derives \
+                 nothing)"
+            ))
+        })?;
+    // pid_start fencing: a reused pid denies nothing.
+    let proven = crate::peer::AgentPids::classify([(
+        alias.to_string(),
+        pid,
+        start.and_then(|s| u64::try_from(s).ok()),
+    )]);
+    if proven.fenced().is_empty() {
+        return Err(Error::rejected(format!(
+            "{op} as delegate:{alias} refused: its recorded pid {pid} was reused"
+        )));
+    }
+    // (b) The live grant for (alias, op, this dir).
+    let canonical = canonical_state_dir(state_dir)?
+        .to_string_lossy()
+        .into_owned();
+    let now = unix_now();
+    let live: Option<i64> = peek
+        .conn
+        .query_row(
+            "SELECT id FROM staging_grants
+             WHERE alias=?1 AND state_dir=?2 AND revoked_at IS NULL AND expires_at > ?3
+             ORDER BY id DESC LIMIT 1",
+            params![alias, canonical, now],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(grant_id) = live else {
+        return Err(Error::rejected(format!(
+            "{op} as delegate:{alias} refused: no live grant for '{alias}' on {canonical}"
+        )));
+    };
+    let covers: bool = peek.conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM staging_grants g, json_each(g.ops) o
+              WHERE g.id=?1 AND o.value=?2)",
+        params![grant_id, op],
+        |r| r.get(0),
+    )?;
+    if !covers {
+        return Err(Error::rejected(format!(
+            "{op} as delegate:{alias} refused: '{op}' is outside its grant"
+        )));
+    }
+    Ok(alias.to_string())
+}
+
 pub fn note_restart_proceeded(state_dir: &Path, ticket: &RestartTicket) -> Result<()> {
     let conn = connect(&db_file(state_dir))?;
     immediate(&conn, |tx| {
@@ -800,6 +1258,11 @@ pub fn claim(state_dir: &Path, req: &ClaimRequest<'_>) -> Result<Value> {
     // the transaction (the proof peeks the same database).
     if req.caller.source == "as" {
         require_operator_proof(state_dir, "rollout claim --as")?;
+    }
+    // CAD-1024: a `delegate:<alias>` holder is admitted only by a live grant
+    // for (alias, `rollout_claim`, this dir) — never by operator proof.
+    if req.caller.source == "delegate" {
+        require_delegate_grant(state_dir, req.caller, "rollout_claim")?;
     }
     let conn = connect_ensured(&db_file(state_dir))?;
     committed(immediate(&conn, |conn| claim_in(conn, req)))
@@ -3686,5 +4149,401 @@ mod tests {
         assert_eq!(released["forced"], true);
         assert_eq!(released["holder"], "alice");
         assert!(!status_at(&state)["held"].as_bool().unwrap());
+    }
+
+    // ---- CAD-1024 staging delegation: grant store + allowlist (PR-2) ----
+    // These admit nothing yet — PR-3 adds the `delegate:` caller shape. Each
+    // is written to fail without its guard; the mutation proofs are in the
+    // PR body.
+
+    fn staging_dir(dir: &tempfile::TempDir) -> PathBuf {
+        let state = dir.path().join("staging-state");
+        std::fs::create_dir_all(&state).unwrap();
+        Store::open(&db_file(&state)).unwrap();
+        state
+    }
+
+    fn ops(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// I2/I5: `staging delegate` refuses a state dir that was never
+    /// registered — there is no grant without the allowlist row.
+    #[test]
+    fn delegate_refuses_unregistered_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = staging_dir(&dir);
+        let err = staging_delegate(
+            &state,
+            "w1",
+            &ops(&["rollout_claim"]),
+            Duration::from_secs(3600),
+            "operator",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not a registered staging"),
+            "{err}"
+        );
+    }
+
+    /// I5: a staging dir overlapping the production state dir
+    /// (`$HOME/.local/state/cadence` when HOME is the temp root) or `~/pm` can
+    /// never be registered, so no grant can ever be created for it. Runs with
+    /// HOME pointed at a temp root so the production dir resolves inside it.
+    #[test]
+    fn staging_register_refuses_production_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        // Resolve the production dirs the way `refuse_production_staging`
+        // does: HOME-scoped `local_state_dir` and `home_default_dir` land
+        // under the temp HOME the harness exports, so a nested dir overlaps.
+        // Drive the guard directly for the deterministic assertion.
+        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+        let prod_state = crate::sandbox::resolved(&home.join(".local/state/cadence"));
+        // A dir nested inside the production state dir.
+        let nested = prod_state.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let err = refuse_production_staging(&nested).unwrap_err();
+        assert!(
+            err.to_string().contains("overlaps a production path"),
+            "{err}"
+        );
+        // And the production dir itself.
+        std::fs::create_dir_all(&prod_state).unwrap();
+        let err = refuse_production_staging(&prod_state).unwrap_err();
+        assert!(
+            err.to_string().contains("overlaps a production path"),
+            "{err}"
+        );
+        // A sibling outside production registers fine (proved in the
+        // lifecycle test); here just assert the guard does not refuse it.
+        let ok = dir.path().join("staging-state");
+        std::fs::create_dir_all(&ok).unwrap();
+        refuse_production_staging(&ok).unwrap();
+    }
+
+    /// I2: a board port outside 3110–3199 refuses registration — 3010 is the
+    /// production board and can never be staging.
+    #[test]
+    fn staging_register_refuses_production_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = staging_dir(&dir);
+        for port in [3010u16, 3109, 3200] {
+            let err = staging_register(&state, port, "operator").unwrap_err();
+            assert!(err.to_string().contains("3110"), "{port}: {err}");
+        }
+        staging_register(&state, 3150, "operator").unwrap();
+    }
+
+    /// I3/I6/I7: a grant binds `delegate:<alias>`'s ops + this state dir, is
+    /// superseded by a fresh grant, expires on `expires_at`, revokes, and
+    /// every transition lands an audit event.
+    #[test]
+    fn delegate_grant_lifecycle_and_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = staging_dir(&dir);
+        staging_register(&state, 3150, "operator").unwrap();
+
+        let ok = staging_delegate(
+            &state,
+            "w1",
+            &ops(&["rollout_claim", "daemon_start"]),
+            Duration::from_secs(3600),
+            "operator",
+        )
+        .unwrap();
+        assert_eq!(ok["granted"], "w1");
+        assert_eq!(ok["ops"][0], "rollout_claim");
+        assert!(ok["expires_at"].as_f64().unwrap() > unix_now());
+
+        // A non-allowlisted op refuses before any write.
+        let err = staging_delegate(
+            &state,
+            "w1",
+            &ops(&["ui_tailscale"]),
+            Duration::from_secs(3600),
+            "operator",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not in the v1 staging allowlist"),
+            "{err}"
+        );
+
+        // `staging delegations` lists the live grant, not a revoked one.
+        let listed = staging_delegations(&state).unwrap();
+        assert_eq!(listed["delegations"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["delegations"][0]["alias"], "w1");
+
+        // Revoke ends it; a second use (listed) is gone.
+        staging_revoke(&state, "w1", "operator").unwrap();
+        let listed = staging_delegations(&state).unwrap();
+        assert_eq!(listed["delegations"].as_array().unwrap().len(), 0);
+        let err = staging_revoke(&state, "w1", "operator").unwrap_err();
+        assert!(err.to_string().contains("no live staging grant"), "{err}");
+
+        // Audit: register + delegate + revoke events on the daemon stream.
+        let conn = Connection::open(db_file(&state)).unwrap();
+        let mut st = conn
+            .prepare("SELECT kind FROM events WHERE alias='daemon' AND kind LIKE 'staging%'")
+            .unwrap();
+        let kinds: Vec<String> = st
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for want in ["staging_register", "staging_delegate", "staging_revoke"] {
+            assert!(kinds.iter().any(|k| k == want), "{want} missing: {kinds:?}");
+        }
+    }
+
+    /// I3: a grant's `expires_at` in the past refuses listing (expired is not
+    /// live) — and a delegate with a 0s/oversized ttl is refused up front.
+    #[test]
+    fn delegate_ttl_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = staging_dir(&dir);
+        staging_register(&state, 3150, "operator").unwrap();
+        for ttl in [Duration::ZERO, Duration::from_secs(8 * 24 * 3600)] {
+            let err = staging_delegate(&state, "w1", &ops(&["rollout_claim"]), ttl, "operator")
+                .unwrap_err();
+            assert!(err.to_string().contains("ttl"), "{err}");
+        }
+    }
+
+    /// I3: a grant on dir A never applies to dir B — the grant row records
+    /// A's canonical dir, and `staging_delegations(B)` reads only B's store.
+    #[test]
+    fn delegate_use_binds_state_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        for s in [&a, &b] {
+            std::fs::create_dir_all(s).unwrap();
+            Store::open(&db_file(s)).unwrap();
+            staging_register(s, 3150, "operator").unwrap();
+        }
+        staging_delegate(
+            &a,
+            "w1",
+            &ops(&["rollout_claim"]),
+            Duration::from_secs(3600),
+            "operator",
+        )
+        .unwrap();
+        // The grant lives in A's store only; B's delegations list is empty.
+        assert_eq!(
+            staging_delegations(&b).unwrap()["delegations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            staging_delegations(&a).unwrap()["delegations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // ---- CAD-1024 PR-3: the delegate caller shape ----
+
+    /// The delegate caller for `alias`: `source:"delegate"`, literal
+    /// `delegate:<alias>` identity — the lease holder.
+    fn delegate(alias: &str) -> Caller {
+        Caller {
+            identity: format!("delegate:{alias}"),
+            source: "delegate",
+        }
+    }
+
+    /// Register `alias` in `state`'s agents table with the test process's pid
+    /// as its live endpoint — the I4 ancestry derivation then derives this
+    /// process to `alias`.
+    fn register_self_as(state: &Path, alias: &str) {
+        let conn = Connection::open(db_file(state)).unwrap();
+        let pid = std::process::id() as i64;
+        let start = crate::peer::proc_starttime(std::process::id()).unwrap() as i64;
+        conn.execute(
+            "INSERT INTO agents(alias,provider,endpoint_kind,role,cwd,sandbox,state,created,updated,pid,pid_start)
+             VALUES(?1,'fake','pty','worker','/','none','stopped',0,0,?2,?3)",
+            params![alias, pid, start],
+        )
+        .unwrap();
+    }
+
+    /// `resolve_caller` parses `delegate:<alias>` to `source:"delegate"` and
+    /// the literal `delegate:<alias>` identity; `delegate:` alone and
+    /// `delegate:operator:*` refuse.
+    #[test]
+    fn delegate_caller_shape() {
+        let c = resolve_caller_with(Some("w1"), Some("delegate:w1")).unwrap();
+        assert_eq!((c.identity.as_str(), c.source), ("delegate:w1", "delegate"));
+        assert_eq!(delegate_alias(&c), Some("w1"));
+        // env alias must match — a mismatch is the existing refusal.
+        let err = resolve_caller_with(Some("w1"), Some("delegate:w2")).unwrap_err();
+        assert!(err.to_string().contains("CADENCE_ALIAS"), "{err}");
+        // `delegate:` never names operator.
+        let err = resolve_caller_with(None, Some("delegate:operator:x")).unwrap_err();
+        assert!(err.to_string().contains("never operator"), "{err}");
+        let err = resolve_caller_with(None, Some("delegate:")).unwrap_err();
+        assert!(err.to_string().contains("delegate"), "{err}");
+    }
+
+    /// I3/I4: a delegate with a live grant for `op` is admitted; the same
+    /// delegate is refused on an op outside the grant, on another state dir,
+    /// and with a forged/mismatched env alias.
+    #[test]
+    fn require_delegate_grant_admits_and_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = staging_dir(&dir);
+        staging_register(&state, 3150, "operator").unwrap();
+        register_self_as(&state, "w1");
+        staging_delegate(
+            &state,
+            "w1",
+            &ops(&["rollout_claim", "daemon_start"]),
+            Duration::from_secs(3600),
+            "operator",
+        )
+        .unwrap();
+        let pid = std::process::id();
+        // Admitted on a granted op.
+        assert_eq!(
+            require_delegate_grant_inner(&state, &delegate("w1"), "rollout_claim", Some("w1"), pid)
+                .unwrap(),
+            "w1"
+        );
+        // An op outside the grant refuses.
+        let err = require_delegate_grant_inner(&state, &delegate("w1"), "ui_stop", Some("w1"), pid)
+            .unwrap_err();
+        assert!(err.to_string().contains("outside its grant"), "{err}");
+        // A forged env alias refuses.
+        let err =
+            require_delegate_grant_inner(&state, &delegate("w1"), "rollout_claim", Some("w2"), pid)
+                .unwrap_err();
+        assert!(err.to_string().contains("CADENCE_ALIAS"), "{err}");
+        // No env at all refuses.
+        let err = require_delegate_grant_inner(&state, &delegate("w1"), "rollout_claim", None, pid)
+            .unwrap_err();
+        assert!(err.to_string().contains("no CADENCE_ALIAS"), "{err}");
+        // A different delegate with no grant refuses.
+        register_self_as(&state, "w2");
+        let err =
+            require_delegate_grant_inner(&state, &delegate("w2"), "rollout_claim", Some("w2"), pid)
+                .unwrap_err();
+        assert!(err.to_string().contains("no live grant"), "{err}");
+    }
+
+    /// I4: `alias` registered only in dir B never proves the shell's identity
+    /// for dir A — the endpoint must be in *this* state dir's agents table.
+    #[test]
+    fn delegate_cross_statedir_alias_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        for s in [&a, &b] {
+            std::fs::create_dir_all(s).unwrap();
+            Store::open(&db_file(s)).unwrap();
+            staging_register(s, 3150, "operator").unwrap();
+        }
+        // `w1` registered only in B; a grant for `w1` on A still refuses
+        // because the ancestry endpoint is not A's.
+        register_self_as(&b, "w1");
+        staging_delegate(
+            &a,
+            "w1",
+            &ops(&["rollout_claim"]),
+            Duration::from_secs(3600),
+            "operator",
+        )
+        .unwrap();
+        let err = require_delegate_grant_inner(
+            &a,
+            &delegate("w1"),
+            "rollout_claim",
+            Some("w1"),
+            std::process::id(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not registered in this state dir"),
+            "{err}"
+        );
+    }
+
+    /// I3: an expired grant refuses; a revoked grant refuses a second call.
+    #[test]
+    fn delegate_expired_and_revoked_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = staging_dir(&dir);
+        staging_register(&state, 3150, "operator").unwrap();
+        register_self_as(&state, "w1");
+        let pid = std::process::id();
+        staging_delegate(
+            &state,
+            "w1",
+            &ops(&["rollout_claim"]),
+            Duration::from_secs(1),
+            "operator",
+        )
+        .unwrap();
+        // Force expiry by backdating the row.
+        let conn = Connection::open(db_file(&state)).unwrap();
+        conn.execute("UPDATE staging_grants SET expires_at=1", [])
+            .unwrap();
+        drop(conn);
+        let err =
+            require_delegate_grant_inner(&state, &delegate("w1"), "rollout_claim", Some("w1"), pid)
+                .unwrap_err();
+        assert!(err.to_string().contains("no live grant"), "{err}");
+        // A fresh grant, then revoke: the second call refuses.
+        staging_delegate(
+            &state,
+            "w1",
+            &ops(&["rollout_claim"]),
+            Duration::from_secs(3600),
+            "operator",
+        )
+        .unwrap();
+        staging_revoke(&state, "w1", "operator").unwrap();
+        let err =
+            require_delegate_grant_inner(&state, &delegate("w1"), "rollout_claim", Some("w1"), pid)
+                .unwrap_err();
+        assert!(err.to_string().contains("no live grant"), "{err}");
+    }
+
+    /// I3/I6: `claim` runs the delegate gate for a `delegate:` caller — here
+    /// the env binding refuses (no CADENCE_ALIAS in the test process), proving
+    /// `claim` reaches `require_delegate_grant` and never operator_proof.
+    #[test]
+    fn delegate_claim_runs_the_grant_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = staging_dir(&dir);
+        staging_register(&state, 3150, "operator").unwrap();
+        register_self_as(&state, "w1");
+        staging_delegate(
+            &state,
+            "w1",
+            &ops(&["rollout_claim"]),
+            Duration::from_secs(3600),
+            "operator",
+        )
+        .unwrap();
+        let err = claim(
+            &state,
+            &ClaimRequest {
+                caller: &delegate("w1"),
+                reason: "stage",
+                target: Some("abc1234"),
+                ttl: Duration::from_secs(3600),
+                takeover: false,
+                now: unix_now(),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("CADENCE_ALIAS"), "{err}");
     }
 }

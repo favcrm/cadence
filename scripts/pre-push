@@ -92,6 +92,24 @@ def contract_scripts(root):
     return seen
 
 
+def focused_tests(root, changed):
+    """CAD-1021: cheap invariant unit tests run when their input file
+    changes — a path → test-target map. Each entry is
+    (paths-it-watches, [cargo test filter args]). The test runs with
+    the same --test-threads budget as every other step."""
+    MAP = {
+        # CAD-1024: a new top-level verb in src/cli/commands.rs went red
+        # on CI — the help-bucket invariant lives in cli::help tests.
+        "src/cli/commands.rs": ["cargo", "test", "--bin", "cadence", "cli::help"],
+        "src/cli/help.rs": ["cargo", "test", "--bin", "cadence", "cli::help"],
+    }
+    out = []
+    for path, argv in MAP.items():
+        if changed is None or path in changed:
+            out.append((f"focused {path}", argv))
+    return out
+
+
 def required_features(root):
     """{test target: required-features} from Cargo.toml [[test]] tables."""
     try:
@@ -130,6 +148,9 @@ def plan(root, changed, with_tests):
     steps.append(("nextest wrapper", ["scripts/test-cadence-nextest"],
                   None if changed is None or wrapper & set(changed)
                   else "nextest wrapper scripts unchanged"))
+    # CAD-1021: cheap focused unit tests gated on the file they guard.
+    for name, argv in focused_tests(root, changed):
+        steps.append((name, argv, None))
     if not with_tests:
         steps.append(("tests", None, "pass --tests to run changed binaries"))
     elif changed is None:
@@ -162,6 +183,8 @@ def main(argv=None):
     ap.add_argument("--base", help="diff base ref (default origin/main, else main)")
     ap.add_argument("--root", default=os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), help="repo root (default: this checkout)")
+    ap.add_argument("--receipt", action="store_true",
+                    help="print one receipt line: head= lane= kind= steps=… rc= at=")
     args = ap.parse_args(argv)
     root = args.root
     changed = changed_files(root, args.base or default_base(root))
@@ -169,7 +192,20 @@ def main(argv=None):
     env = dict(os.environ)
     env.setdefault("CARGO_BUILD_JOBS", "4")
 
+    # CAD-1021: the receipt a lane's pre-push hook and report share.
+    # `head` binds the verdict to the pushed SHA; `lane` is CADENCE_ALIAS/
+    # USER; `kind` is the slot class the check ran under (the hook passes
+    # the acquired kind; unset here reads `none`).
+    def receipt(rc):
+        head = (git_lines(root, "rev-parse", "HEAD") or ["?"])[0]
+        lane = os.environ.get("CADENCE_ALIAS") or os.environ.get("USER", "?")
+        kind = os.environ.get("CADENCE_SLOT_KIND", "none")
+        codes = ",".join(f"{n}:{r}" for n, r in step_rcs)
+        print(f"head={head} lane={lane} kind={kind} steps={codes} "
+              f"rc={rc} at={int(time.time())}")
+
     ran = skipped = 0
+    step_rcs = []
     for name, argv_, skip in steps:
         if skip or args.list:
             label = "SKIP" if skip else "PLAN"
@@ -182,6 +218,7 @@ def main(argv=None):
             rc, out = r.returncode, (r.stdout + r.stderr)
         except OSError as e:
             rc, out = 127, f"{argv_[0]}: {e}\n"
+        step_rcs.append((name, rc))
         dt = time.monotonic() - t0
         if rc == 0:
             ran += 1
@@ -190,10 +227,14 @@ def main(argv=None):
         print(f"[FAIL] {name}: exit {rc} ({dt:.1f}s): {' '.join(argv_)}")
         sys.stdout.write("".join(out.splitlines(True)[-40:]))
         print(f"pre-push: FAILED at {name} ({ran} passed, {skipped} skipped)")
+        if args.receipt:
+            receipt(1)
         return 1
     if args.list:
         return 0
     print(f"pre-push: all ok ({ran} passed, {skipped} skipped)")
+    if args.receipt:
+        receipt(0)
     return 0
 
 

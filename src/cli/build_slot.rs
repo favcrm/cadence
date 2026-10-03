@@ -8,10 +8,12 @@ pub(crate) enum BuildSlotAction {
     /// is free, else this polls the daemon with a stable request id
     /// until granted or --wait-secs elapses. Prints the slot token.
     Acquire {
-        /// build, test or suite. `test` and `suite` can be claimed by
-        /// the configured priority lanes ahead of ordinary requests;
-        /// `suite` draws on its own pool so a full suite never jams
-        /// the build lanes.
+        /// build, test, suite or check. `test` and `suite` can be claimed
+        /// by the configured priority lanes ahead of ordinary requests;
+        /// `suite` and `check` draw on their own pools so a full suite or
+        /// a build wave never jams the build lanes or a lane's pre-push.
+        /// `check` additionally needs `--recipe <name>` — only a
+        /// `build.recipes` entry of kind `check` admits one.
         kind: String,
         /// The lane this slot is for (default: $CADENCE_ALIAS, else
         /// $USER, else "unknown").
@@ -23,6 +25,10 @@ pub(crate) enum BuildSlotAction {
         /// binds the real command itself.
         #[arg(long)]
         pid: u32,
+        /// The `build.recipes` entry a `check` slot runs — required for
+        /// kind=check, refused for the other kinds.
+        #[arg(long)]
+        recipe: Option<String>,
         /// Give up after <secs> waiting in the queue (0 = answer
         /// immediately, granted or not).
         #[arg(long, default_value_t = 0)]
@@ -37,12 +43,17 @@ pub(crate) enum BuildSlotAction {
     /// process itself, and its exit frees the slot. Wrap gates like
     /// `cadence build-slot run test -- cargo test --lib`.
     Run {
-        /// build, test or suite.
+        /// build, test, suite or check — `check` additionally needs
+        /// `--recipe <name>` (a `build.recipes` entry of kind `check`).
         kind: String,
         /// The lane this slot is for (default: $CADENCE_ALIAS, else
         /// $USER, else "unknown").
         #[arg(long)]
         lane: Option<String>,
+        /// The `build.recipes` entry a `check` slot runs — required for
+        /// kind=check, refused for the other kinds.
+        #[arg(long)]
+        recipe: Option<String>,
         /// Give up after <secs> waiting in the queue (0 = fail fast
         /// when nothing is free).
         #[arg(long, default_value_t = 600)]
@@ -136,7 +147,7 @@ pub(crate) enum BuildSlotAction {
 /// Aligned rendering of `slot_status` — the TTY default.
 pub(super) fn print_slot_status(s: &Value) {
     println!("{:<6} {:<8} HOLDERS", "POOL", "HELD");
-    for pool in ["build", "suite"] {
+    for pool in ["build", "suite", "check"] {
         let p = &s["pools"][pool];
         let cap = p["capacity"].as_u64().unwrap_or(0);
         let held: Vec<String> = p["held"]
@@ -197,8 +208,8 @@ pub(super) fn print_slot_status(s: &Value) {
         return;
     }
     println!(
-        "{:<4} {:<14} {:<6} {:<8} FLAGS",
-        "#", "LANE", "KIND", "WAITED"
+        "{:<4} {:<14} {:<6} {:<8} {:<8} FLAGS",
+        "#", "LANE", "KIND", "WAITED", "REASON"
     );
     for (i, w) in waiting.iter().enumerate() {
         let flags = if w["starved"].as_bool().unwrap_or(false) {
@@ -209,11 +220,12 @@ pub(super) fn print_slot_status(s: &Value) {
             ""
         };
         println!(
-            "{:<4} {:<14} {:<6} {:<8} {}",
+            "{:<4} {:<14} {:<6} {:<8} {:<8} {}",
             i + 1,
             w["lane"].as_str().unwrap_or("?"),
             w["kind"].as_str().unwrap_or("?"),
             cadence_agent::slots::fmt_wait(w["wait_secs"].as_f64().unwrap_or(0.0)),
+            w["wait_reason"].as_str().unwrap_or("capacity"),
             flags
         );
     }
@@ -221,6 +233,16 @@ pub(super) fn print_slot_status(s: &Value) {
 
 /// The shared acquire poll: `request_id` keeps a queued caller's
 /// place across polls; `--wait-secs 0` is the read-only probe so a
+/// One acquire's tuning knobs: whether the caller `exec`s into the
+/// holder (`run`), the `build.recipes` name a `check` slot binds to,
+/// and how long to wait.
+#[derive(Clone, Copy)]
+pub(super) struct AcquireOpts<'a> {
+    pub exec: bool,
+    pub recipe: Option<&'a str>,
+    pub wait_secs: u64,
+}
+
 /// fast-fail never leaves a waiter behind. Returns the grant payload.
 pub(super) fn slot_acquire_loop(
     state_dir: &Path,
@@ -228,37 +250,43 @@ pub(super) fn slot_acquire_loop(
     lane: &str,
     pid: u32,
     request_id: &str,
-    wait_secs: u64,
-    exec: bool,
+    opts: AcquireOpts<'_>,
 ) -> Result<Value> {
+    let wait_secs = opts.wait_secs;
     let deadline = Instant::now() + Duration::from_secs(wait_secs);
     let probe = wait_secs == 0;
     let mut announced = false;
     loop {
         let mut params = json!({"kind": kind, "lane": lane, "pid": pid,
                                 "request_id": request_id, "probe": probe});
-        if exec {
+        if opts.exec {
             params["exec"] = json!(true);
+        }
+        if let Some(r) = opts.recipe {
+            params["recipe"] = json!(r);
         }
         let r = client::rpc(state_dir, "slot_acquire", params)?;
         if r["granted"].as_bool().unwrap_or(false) {
             return Ok(r);
         }
         let position = r["position"].as_u64().unwrap_or(0);
+        // A resource floor (`memory`/`disk`) or a busy pool both read as
+        // `wait_reason` — surface it so a waiter knows WHY it queued.
+        let reason = r["wait_reason"].as_str().unwrap_or("capacity");
         if wait_secs == 0 {
             return Err(Error::rejected(format!(
-                "No {kind} slot free — position {position} in the queue. \
-                 `cadence build-slot status` shows holders and waiters"
+                "No {kind} slot free — position {position} in the queue \
+                 ({reason}). `cadence build-slot status` shows holders and waiters"
             )));
         }
         if !announced {
-            eprintln!("waiting for a {kind} slot (position {position})…");
+            eprintln!("waiting for a {kind} slot (position {position}, {reason})…");
             announced = true;
         }
         if Instant::now() >= deadline {
             return Err(Error::rejected(format!(
                 "Timed out after {wait_secs}s waiting for a {kind} slot \
-                 (still position {position})"
+                 (still position {position}, {reason})"
             )));
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -274,6 +302,7 @@ pub(super) fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Resu
             kind,
             lane,
             pid,
+            recipe,
             wait_secs,
             json: json_out,
         } => {
@@ -284,7 +313,18 @@ pub(super) fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Resu
                 .unwrap_or_else(cadence_agent::slots::default_lane);
             let pid = *pid;
             let request_id = Uuid::new_v4().simple().to_string();
-            let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs, false)?;
+            let r = slot_acquire_loop(
+                state_dir,
+                kind,
+                &lane,
+                pid,
+                &request_id,
+                AcquireOpts {
+                    exec: false,
+                    recipe: recipe.as_deref(),
+                    wait_secs: *wait_secs,
+                },
+            )?;
             if *json_out {
                 print_json(&json!({"token": r["token"],
                     "kind": parsed.as_str(),
@@ -297,6 +337,7 @@ pub(super) fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Resu
         BuildSlotAction::Run {
             kind,
             lane,
+            recipe,
             wait_secs,
             cmd,
         } => {
@@ -310,7 +351,18 @@ pub(super) fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Resu
             let request_id = Uuid::new_v4().simple().to_string();
             // `exec`: the daemon verifies this requester IS the holder
             // it records (CAD-230b) — never an ancestor.
-            let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs, true)?;
+            let r = slot_acquire_loop(
+                state_dir,
+                kind,
+                &lane,
+                pid,
+                &request_id,
+                AcquireOpts {
+                    exec: true,
+                    recipe: recipe.as_deref(),
+                    wait_secs: *wait_secs,
+                },
+            )?;
             let token = r["token"].as_str().unwrap_or_default().to_string();
             eprintln!(
                 "slot {token} acquired ({kind}, pid {pid}) — running {}",

@@ -184,12 +184,20 @@ pub enum UiAction {
         /// Forget the persisted options before applying flags.
         #[arg(long)]
         reset: bool,
+        /// CAD-1024: `delegate:<alias>` — start the board under a staging
+        /// grant for `ui_start` on this state dir.
+        #[arg(long = "as")]
+        as_identity: Option<String>,
     },
     /// Stop the detached UI server.
     Stop {
         /// Also remove the tailscale serve mapping cadence created.
         #[arg(long)]
         tailscale_off: bool,
+        /// CAD-1024: `delegate:<alias>` — stop the board under a staging
+        /// grant for `ui_stop` on this state dir.
+        #[arg(long = "as")]
+        as_identity: Option<String>,
     },
     /// Report UI server health and the persisted options.
     Status,
@@ -297,8 +305,21 @@ pub enum TailscaleAction {
 pub fn run_cli(state_dir: &Path, action: &UiAction) -> Result<i32> {
     match action {
         UiAction::Run { flags } => run(state_dir, flags),
-        UiAction::Start { flags, reset } => start(state_dir, flags, *reset),
-        UiAction::Stop { tailscale_off } => stop(state_dir, *tailscale_off),
+        UiAction::Start {
+            flags,
+            reset,
+            as_identity,
+        } => {
+            delegate_ui_gate(state_dir, as_identity.as_deref(), "ui_start")?;
+            start(state_dir, flags, *reset)
+        }
+        UiAction::Stop {
+            tailscale_off,
+            as_identity,
+        } => {
+            delegate_ui_gate(state_dir, as_identity.as_deref(), "ui_stop")?;
+            stop(state_dir, *tailscale_off)
+        }
         UiAction::Status => status(state_dir),
         UiAction::Login {
             tailnet,
@@ -314,6 +335,25 @@ pub fn run_cli(state_dir: &Path, action: &UiAction) -> Result<i32> {
         UiAction::DeviceLogin { action } => login::device_login(state_dir, action),
         UiAction::Tailscale { action } => tailscale_cli(state_dir, action),
     }
+}
+
+/// CAD-1024: the `delegate:<alias>` seam for `ui start`/`ui stop`. No `--as`
+/// (or one that is not `delegate:`) is the unchanged operator path — today
+/// these are local pidfile ops needing no identity. A `delegate:` `--as`
+/// requires a live grant for `op` on this state dir plus the I4 binding
+/// (`require_delegate_grant`), so a staging agent — not the operator — can
+/// bounce the board on a dir it is delegated for.
+fn delegate_ui_gate(state_dir: &Path, as_identity: Option<&str>, op: &str) -> Result<()> {
+    let Some(as_identity) = as_identity else {
+        return Ok(());
+    };
+    let caller = crate::rollout::resolve_caller(Some(as_identity))?;
+    if caller.source == "delegate" {
+        crate::rollout::require_delegate_grant(state_dir, &caller, op)?;
+    }
+    // A non-delegate `--as` is ignored for ui start/stop (no caller exists on
+    // this path); only `delegate:` grants admission, and only under a grant.
+    Ok(())
 }
 
 // ---------- persisted options (`<state>/ui.json`) ----------

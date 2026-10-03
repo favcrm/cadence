@@ -2214,7 +2214,7 @@ fn build_slot_cli_acquire_release_status() {
         ],
     );
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("build, test or suite"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("build, test, suite or check"));
 }
 
 /// `build-slot run` binds the hold to the REAL command process: the
@@ -2432,4 +2432,164 @@ impl Drop for KillOnDrop {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+// ---------- CAD-1021 slice 2: check pool + floors + forged pid ----------
+
+/// `slot_acquire` with an extra field merged in (e.g. `recipe`) —
+/// run under `lane`'s identity so `/proc/<pid>/cwd` names the lane's
+/// own cwd (the repo a `check` recipe resolves through).
+fn slot_acquire_extra(
+    lane: &mut LaneShell,
+    d: &TestDaemon,
+    lane_name: &str,
+    params: Value,
+) -> Value {
+    let mut p = json!({"kind": "check", "lane": lane_name,
+                       "pid": lane.pid(), "request_id": "r"});
+    p.as_object_mut()
+        .unwrap()
+        .extend(params.as_object().unwrap().clone());
+    lane.rpc(&d.state, "slot_acquire", p)
+}
+
+/// A `check` acquire with no recipe is refused — the slot is bound to
+/// the declared pre-push path, never to a bare `kind: check` claim.
+#[test]
+fn check_acquire_without_a_recipe_is_refused() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let mut lane = LaneShell::spawn(d.dir.path());
+    plant_pane(&d, "chk", lane.pid());
+    let r = slot_acquire_extra(&mut lane, &d, "chk", json!({}));
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(
+        r["error"]["message"].as_str().unwrap().contains("--recipe"),
+        "{r}"
+    );
+    // Nothing queued — read status as the lane (its identity is planted).
+    let s = lane.rpc(&d.state, "slot_status", json!({}));
+    assert!(s["result"]["waiting"].as_array().unwrap().is_empty());
+}
+
+/// A `check` acquire naming a recipe that is not `kind: check` — or
+/// that does not exist for the caller's project — is refused; the
+/// allowlist binds the grant to the declared pre-push recipe only.
+#[test]
+fn check_acquire_names_a_check_kind_recipe_only() {
+    let (dir, repo) = runner_project(
+        "    pre-push:
+      argv: [sh, -c, \"true\"]
+      kind: check
+      env: []
+    fullbuild:
+      argv: [sh, -c, \"true\"]
+      kind: build
+      env: []
+",
+    );
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let mut lane = LaneShell::spawn(d.dir.path());
+    plant_pane(&d, "chk", lane.pid());
+    // The lane's cwd is the repo — `/proc/<pid>/cwd` resolves project p.
+    lane.run(&format!("cd {}", repo.display()));
+    // A build-kind recipe is refused for the check pool.
+    let bad = slot_acquire_extra(&mut lane, &d, "chk", json!({"recipe": "fullbuild"}));
+    assert_eq!(bad["ok"], false, "{bad}");
+    // An unknown recipe is refused.
+    let unknown = slot_acquire_extra(&mut lane, &d, "chk", json!({"recipe": "nope"}));
+    assert_eq!(unknown["ok"], false, "{unknown}");
+    // The declared check recipe grants on the check pool.
+    let ok = slot_acquire_extra(&mut lane, &d, "chk", json!({"recipe": "pre-push"}));
+    assert_eq!(ok["ok"], true, "{ok}");
+    assert_eq!(ok["result"]["granted"], true, "{ok}");
+    assert_eq!(ok["result"]["kind"], "check", "{ok}");
+    // Grant sat on the check pool — the build pool stayed empty.
+    let s = lane.rpc(&d.state, "slot_status", json!({}));
+    assert_eq!(
+        s["result"]["pools"]["check"]["held"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(s["result"]["pools"]["build"]["held"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let _ = dir;
+}
+
+/// A `check` request while every build slot is held still grants —
+/// the whole point of the class is that pre-push never starves behind
+/// a full build wave.
+#[test]
+fn check_grants_while_build_pool_is_full() {
+    let (dir, repo) = runner_project(
+        "    pre-push:
+      argv: [sh, -c, \"true\"]
+      kind: check
+      env: []
+",
+    );
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let mut lane = LaneShell::spawn(d.dir.path());
+    plant_pane(&d, "chk", lane.pid());
+    lane.run(&format!("cd {}", repo.display()));
+    // Fill the build pool (capacity 1) so the next build request waits.
+    let g = slot_acquire(&d, "build", SELF_LANE, "b1");
+    assert_eq!(g["granted"], true);
+    let q = slot_acquire(&d, "build", SELF_LANE, "b2");
+    assert_eq!(q["granted"], false, "build pool full — the 4th waits");
+    assert_eq!(q["wait_reason"], "capacity", "{q}");
+    // A check request is still granted on its own pool.
+    let c = slot_acquire_extra(&mut lane, &d, "chk", json!({"recipe": "pre-push"}));
+    assert_eq!(c["result"]["granted"], true, "{c}");
+    let _ = dir;
+}
+
+/// A forged `CADENCE_BUILD_SLOT_PID` never adopts a hold. The shim
+/// pass-through exists only when the named pid is a REAL live holder
+/// and the requester is on that pid's chain — a caller that names a
+/// foreign live pid is refused, and a caller that claims a pid with a
+/// real hold is never queued as the holder.
+#[test]
+fn forged_slot_pid_does_not_skip_the_queue() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    // The real holder: the test process holds the one build slot.
+    let g1 = slot_acquire(&d, "build", SELF_LANE, "b1");
+    assert_eq!(g1["granted"], true);
+    // A different lane's shell is NOT a descendant of the holder; it
+    // tries to claim the holder's pid to skip the queue.
+    let mut other = LaneShell::spawn(d.dir.path());
+    plant_pane(&d, "other", other.pid());
+    let holder_pid = std::process::id();
+    // `other` claims the holder's pid — the holder is its ancestor, so
+    // the pid is validly on the caller chain, but that changes nothing:
+    // naming a live holder's pid does not grant the slot it holds.
+    let forged = other.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "lane": "other",
+               "pid": holder_pid, "request_id": "b2"}),
+    );
+    assert_eq!(
+        forged["result"]["granted"], false,
+        "naming the holder's pid grants nothing: {forged}"
+    );
+    assert_eq!(forged["result"]["position"], 1, "{forged}");
+    // The real hold is intact and still counted once.
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert_eq!(s["pools"]["build"]["held"].as_array().unwrap().len(), 1);
+    // The same caller honestly claiming its own pid also queues behind
+    // the real hold — no skip, just another waiter.
+    let honest = other.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "lane": "other",
+               "pid": other.pid(), "request_id": "b3"}),
+    );
+    assert_eq!(honest["result"]["granted"], false, "{honest}");
+    assert_eq!(honest["result"]["position"], 2, "{honest}");
 }

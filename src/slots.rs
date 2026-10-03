@@ -88,7 +88,26 @@ pub struct SlotConfig {
     /// dies without its pid dying, or simply forgets release, cannot
     /// wedge a pool forever.
     pub max_hold_secs: u64,
+    /// CAD-1021: `check` requests draw on this pool (default 2) — a
+    /// pre-push gate never queues behind a full build. A `check` grant
+    /// is admitted only through the recipe allowlist (see
+    /// [`Slots::check_admitted`]).
+    pub check_slots: usize,
+    /// Memory floor for a build/test grant: `MemAvailable` must be at
+    /// least this (default 4 GiB). Below it the request WAITS with
+    /// reason `memory` — never refused for being low.
+    pub slot_mem_min_available_bytes: u64,
+    /// The same floor for the lighter `check` pool (default 2 GiB).
+    pub slot_mem_min_available_check_bytes: u64,
+    /// Free disk on the worktree's filesystem for any grant (default
+    /// 15 GiB). Below it the request waits with reason `disk`.
+    pub slot_disk_min_free_bytes: u64,
 }
+
+/// A host-resource reading the daemon injects: `(mem_available_bytes,
+/// disk_free_bytes)`. `None` fields read as "unmeasurable" — a request
+/// waits rather than being refused on a probe failure.
+pub type ResourceProbe = fn() -> (Option<u64>, Option<u64>);
 
 impl Default for SlotConfig {
     fn default() -> Self {
@@ -99,9 +118,15 @@ impl Default for SlotConfig {
             starve_secs: 900,
             priority_lanes: Vec::new(),
             max_hold_secs: 7200,
+            check_slots: 2,
+            slot_mem_min_available_bytes: 4 * GIB,
+            slot_mem_min_available_check_bytes: 2 * GIB,
+            slot_disk_min_free_bytes: 15 * GIB,
         }
     }
 }
+
+const GIB: u64 = 1 << 30;
 
 /// Slot kinds map to pools: `build`/`test` share `build_slots`,
 /// `suite` owns `suite_slots`.
@@ -110,6 +135,10 @@ pub enum SlotKind {
     Build,
     Test,
     Suite,
+    /// CAD-1021: the light pre-push class — fmt, split-map, clippy
+    /// and `check` under `CARGO_BUILD_JOBS=4`. Its own pool so a full
+    /// `build`/`test` wave never starves a lane's pre-push gate.
+    Check,
 }
 
 impl SlotKind {
@@ -118,8 +147,9 @@ impl SlotKind {
             "build" => Ok(Self::Build),
             "test" => Ok(Self::Test),
             "suite" => Ok(Self::Suite),
+            "check" => Ok(Self::Check),
             _ => Err(Error::rejected(format!(
-                "Slot kind must be build, test or suite — got '{name}'"
+                "Slot kind must be build, test, suite or check — got '{name}'"
             ))),
         }
     }
@@ -129,14 +159,17 @@ impl SlotKind {
             Self::Build => "build",
             Self::Test => "test",
             Self::Suite => "suite",
+            Self::Check => "check",
         }
     }
 
-    /// The pool this kind draws on: suite is independent, build and
-    /// test share — `kind` still rides the queue for reporting.
+    /// The pool this kind draws on: suite is independent, check owns
+    /// its pool, and build/test share — `kind` still rides the queue
+    /// for reporting.
     fn pool(self) -> Pool {
         match self {
             Self::Suite => Pool::Suite,
+            Self::Check => Pool::Check,
             _ => Pool::Build,
         }
     }
@@ -146,6 +179,7 @@ impl SlotKind {
 enum Pool {
     Build,
     Suite,
+    Check,
 }
 
 impl Pool {
@@ -153,6 +187,7 @@ impl Pool {
         match self {
             Self::Build => "build",
             Self::Suite => "suite",
+            Self::Check => "check",
         }
     }
 }
@@ -162,6 +197,11 @@ fn other_pool(pool: Pool) -> Pool {
     match pool {
         Pool::Build => Pool::Suite,
         Pool::Suite => Pool::Build,
+        // A `check` hold blocks no other pool: it is the lane's own
+        // pre-push gate, and must never keep a build off the pool a
+        // suite request waits on (or vice-versa) — so it reports as
+        // having no other pool.
+        Pool::Check => Pool::Check,
     }
 }
 
@@ -171,6 +211,10 @@ struct SlotWait {
     lane: String,
     pid: u32,
     pid_start: Option<u64>,
+    /// CAD-1021: why this waiter is held — `capacity` (no free slot),
+    /// `memory` or `disk` (below the kind's floor). Surfaces in
+    /// `build-slot status`.
+    wait_reason: WaitReason,
     /// Seniority start — when this `(lane, kind)` began its current
     /// unserved wait, which may predate this request_id (a re-queued
     /// caller keeps the lane's place rather than restarting at the
@@ -419,6 +463,36 @@ pub struct Slots {
     /// (CAD-230b) — bounded, so a holder's later `release` still gets
     /// the soft `released:false` answer a same-call reap would give.
     recent_reaped: Vec<Reaped>,
+    /// CAD-1021: how the daemon reads host memory/disk before a grant.
+    /// `None` uses the live probe (`/proc/meminfo` + statvfs of the
+    /// state dir); tests inject a fixture. A probe returning `None`
+    /// for a resource means "unmeasurable" — a request waits, never
+    /// refuses, on an unreadable probe.
+    resources: Option<ResourceProbe>,
+    /// The state dir the disk floor probes — set by `persist_to` (the
+    /// daemon's slots.json lives under it, so it shares the daemon's
+    /// filesystem).
+    disk_probe_path: Option<PathBuf>,
+}
+
+/// Why a grant is held up — a `wait_reason` on the acquire answer and
+/// the status queue. `capacity` is the ordinary "no free slot" case;
+/// `memory`/`disk` are the resource floors.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WaitReason {
+    Capacity,
+    Memory,
+    Disk,
+}
+
+impl WaitReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Capacity => "capacity",
+            Self::Memory => "memory",
+            Self::Disk => "disk",
+        }
+    }
 }
 
 /// How many watcher-reaped holds `release` remembers for its soft answer.
@@ -434,15 +508,56 @@ impl Slots {
     }
 
     /// Where holds persist — the daemon points this at
-    /// `<state>/slots.json`; unit tests leave it unset.
+    /// `<state>/slots.json`; unit tests leave it unset. The same dir
+    /// is the disk-floor probe's filesystem.
     pub fn persist_to(&mut self, path: PathBuf) {
+        self.disk_probe_path = path.parent().map(|p| p.to_path_buf());
         self.persist_path = Some(path);
+    }
+
+    /// Inject a resource probe (tests); `None` restores the live probe.
+    #[cfg(test)]
+    pub(crate) fn use_resources(&mut self, probe: Option<ResourceProbe>) {
+        self.resources = probe;
+    }
+
+    /// The resource floor that would hold a grant of `kind`: `Some`
+    /// reason when below floor (or unmeasurable), `None` when a grant
+    /// is resource-safe. Never refuses — the caller waits.
+    fn resource_floor(&self, kind: SlotKind) -> Option<WaitReason> {
+        let (mem_min, disk_min) = (
+            match kind {
+                SlotKind::Check => self.config.slot_mem_min_available_check_bytes,
+                _ => self.config.slot_mem_min_available_bytes,
+            },
+            self.config.slot_disk_min_free_bytes,
+        );
+        let (mem, disk) = match self.resources {
+            Some(p) => p(),
+            None => crate::slots::probe::live(self.disk_probe_path.as_deref()),
+        };
+        // Unreadable does not gate: a probe we cannot read proves
+        // nothing either way, and a floor is protective, not
+        // authoritative — a host whose meminfo/statvfs fails must
+        // still build (the wait would never clear).
+        if let Some(m) = mem {
+            if m < mem_min {
+                return Some(WaitReason::Memory);
+            }
+        }
+        if let Some(d) = disk {
+            if d < disk_min {
+                return Some(WaitReason::Disk);
+            }
+        }
+        None
     }
 
     fn capacity(&self, pool: Pool) -> usize {
         match pool {
             Pool::Build => self.config.build_slots.max(1),
             Pool::Suite => self.config.suite_slots.max(1),
+            Pool::Check => self.config.check_slots.max(1),
         }
     }
 
@@ -1330,6 +1445,9 @@ impl Slots {
             // capacity free and the request next — but never joins
             // the queue and never touches seniority (`peek_stamp`
             // only reads).
+            // A fresh probe grants when it leads AND the floors hold —
+            // below floor it reports the resource reason, not a grant.
+            let resource = self.resource_floor(kind);
             let senior = self.peek_stamp(lane, kind, now);
             let w = SlotWait {
                 request_id: request_id.to_string(),
@@ -1339,12 +1457,15 @@ impl Slots {
                 pid_start: req.pid_start(),
                 queued_at: senior,
                 last_poll: now,
+                wait_reason: resource.unwrap_or(WaitReason::Capacity),
                 strict: req.strict.clone(),
             };
             self.waiting.push(w);
             let ranks = self.ranks(now);
             let idx = self.waiting.len() - 1;
-            let next = self.held_in(pool) < self.capacity(pool) && self.outranked(&ranks, idx) == 0;
+            let next = self.held_in(pool) < self.capacity(pool)
+                && self.outranked(&ranks, idx) == 0
+                && resource.is_none();
             let position = self.outranked(&ranks, idx) + 1;
             self.waiting.pop();
             self.prune_seniority(now);
@@ -1361,6 +1482,7 @@ impl Slots {
             }
             return Ok((
                 json!({"granted": false, "position": position,
+                       "wait_reason": resource.unwrap_or(WaitReason::Capacity).as_str(),
                        "held": self.held_in(pool),
                        "capacity": self.capacity(pool)}),
                 events,
@@ -1391,6 +1513,7 @@ impl Slots {
                     pid_start: req.pid_start(),
                     queued_at: senior,
                     last_poll: now,
+                    wait_reason: WaitReason::Capacity,
                     strict: req.strict.clone(),
                 });
                 (self.waiting.len() - 1, true)
@@ -1406,7 +1529,18 @@ impl Slots {
         }
 
         let ranks = self.ranks(now);
-        if self.held_in(pool) < self.capacity(pool) && self.outranked(&ranks, idx) == 0 {
+        // A grant needs capacity AND the resource floors — a host low on
+        // memory or disk holds the caller in the queue with a reason,
+        // never refuses it for being low.
+        let resource = self.resource_floor(kind);
+        // Refresh the waiter's reason each poll — a grant that ran
+        // into a floor updates it to memory/disk; a resource that
+        // recovered flips it back to capacity.
+        self.waiting[idx].wait_reason = resource.unwrap_or(WaitReason::Capacity);
+        if self.held_in(pool) < self.capacity(pool)
+            && self.outranked(&ranks, idx) == 0
+            && resource.is_none()
+        {
             let wait_secs = (now - self.waiting[idx].queued_at).max(0.0);
             // Grant first: a strict grant whose write fails leaves the
             // caller queued exactly where it was.
@@ -1430,6 +1564,7 @@ impl Slots {
         }
         let position = self.outranked(&ranks, idx) + 1;
         let wait_secs = (now - self.waiting[idx].queued_at).max(0.0);
+        let reason = resource.unwrap_or(WaitReason::Capacity).as_str();
         if created {
             // First poll and already queueing — tell observers the
             // wait started (re-polls don't repeat the event).
@@ -1437,12 +1572,13 @@ impl Slots {
                 lane.to_string(),
                 "slot_waited",
                 json!({"request_id": request_id, "kind": kind.as_str(),
-                       "pool": pool.as_str(), "pid": pid}),
+                       "pool": pool.as_str(), "pid": pid,
+                       "wait_reason": reason}),
             ));
         }
         Ok((
             json!({"granted": false, "position": position,
-                   "wait_secs": wait_secs,
+                   "wait_secs": wait_secs, "wait_reason": reason,
                    "held": self.held_in(pool), "capacity": self.capacity(pool)}),
             events,
         ))
@@ -1578,6 +1714,7 @@ impl Slots {
             "pools": {
                 "build": pool_json(Pool::Build),
                 "suite": pool_json(Pool::Suite),
+                "check": pool_json(Pool::Check),
             },
             "waiting": order.iter().map(|i| {
                 let w = &self.waiting[*i];
@@ -1585,15 +1722,20 @@ impl Slots {
                 json!({"request_id": w.request_id, "kind": w.kind.as_str(),
                        "lane": w.lane, "pid": w.pid,
                        "wait_secs": (now - w.queued_at).max(0.0),
+                       "wait_reason": w.wait_reason.as_str(),
                        "starved": rank == 0, "priority": rank == 1})
             }).collect::<Vec<_>>(),
             "config": {
                 "build_slots": self.config.build_slots,
                 "suite_slots": self.config.suite_slots,
+                "check_slots": self.config.check_slots,
                 "jobs_per_lane": self.config.jobs_per_lane,
                 "starve_secs": self.config.starve_secs,
                 "priority_lanes": self.config.priority_lanes,
                 "max_hold_secs": self.config.max_hold_secs,
+                "slot_mem_min_available_bytes": self.config.slot_mem_min_available_bytes,
+                "slot_mem_min_available_check_bytes": self.config.slot_mem_min_available_check_bytes,
+                "slot_disk_min_free_bytes": self.config.slot_disk_min_free_bytes,
             },
             "enrollments": self.enrollments.iter().map(Enrollment::to_json).collect::<Vec<_>>(),
             "strict": match &self.blocked {
@@ -2522,6 +2664,44 @@ pub fn default_lane() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// CAD-1021: the live host resource reading — `MemAvailable` from
+/// `/proc/meminfo` and free bytes on `path`'s filesystem via statvfs.
+/// Each field is `Option` so an unreadable probe is "unmeasurable"
+/// (the floor treats it as not-gating), never a refused admission.
+mod probe {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    fn meminfo_available() -> Option<u64> {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in text.lines() {
+            let (key, rest) = line.split_once(':')?;
+            if key.trim() == "MemAvailable" {
+                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb.saturating_mul(1024));
+            }
+        }
+        None
+    }
+
+    fn fs_free(path: &Path) -> Option<u64> {
+        let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut st = unsafe { std::mem::zeroed::<libc::statvfs>() };
+        if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        #[allow(clippy::useless_conversion)]
+        Some(u64::from(st.f_bavail).saturating_mul(u64::from(st.f_frsize)))
+    }
+
+    /// `(mem_available, disk_free)` — the daemon probes the state dir's
+    /// filesystem (where slots.json lives, so it shares its device).
+    pub(super) fn live(disk_path: Option<&Path>) -> (Option<u64>, Option<u64>) {
+        (meminfo_available(), disk_path.and_then(fs_free))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3314,5 +3494,115 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("deadlock guard"), "{err}");
         child.reap();
+    }
+
+    // ---------- CAD-1021: check pool + resource floors ----------
+
+    fn generous() -> ResourceProbe {
+        // A probe that always reports a comfortably-provisioned host.
+        fn g() -> (Option<u64>, Option<u64>) {
+            (Some(64 * GIB), Some(500 * GIB))
+        }
+        g
+    }
+
+    fn below_memory() -> ResourceProbe {
+        fn low() -> (Option<u64>, Option<u64>) {
+            (Some(512 * (1 << 20)), Some(500 * GIB))
+        }
+        low
+    }
+
+    fn below_disk() -> ResourceProbe {
+        fn low() -> (Option<u64>, Option<u64>) {
+            (Some(64 * GIB), Some(1 << 20))
+        }
+        low
+    }
+
+    #[test]
+    fn check_pool_is_independent_of_build_and_suite() {
+        // Three build holders + one suite fill both pools; a check
+        // request still grants on its own pool.
+        let mut s = slots(3, 1, 900, &[]);
+        s.use_resources(Some(generous()));
+        for i in 0..3 {
+            let r = acquire(&mut s, SlotKind::Build, "b", &format!("b{i}"), 0.0);
+            assert_eq!(r["granted"], true, "build {i}");
+        }
+        let q = acquire(&mut s, SlotKind::Build, "dev-x", "bx", 0.0);
+        assert_eq!(q["granted"], false);
+        // The 4th build waits on capacity; a check slot is free anyway.
+        let c = acquire(&mut s, SlotKind::Check, "dev-x", "c1", 0.0);
+        assert_eq!(c["granted"], true, "check granted on its own pool: {c}");
+        assert_eq!(c["kind"], "check");
+    }
+
+    #[test]
+    fn below_memory_floor_waits_with_reason_not_refused() {
+        let mut s = slots(3, 1, 900, &[]);
+        s.use_resources(Some(below_memory()));
+        let r = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        // Below floor: queued, never refused, reason=memory.
+        assert_eq!(r["granted"], false);
+        assert_eq!(r["wait_reason"], "memory", "{r}");
+        // The check pool uses its own (lower) floor — still under it.
+        let c = acquire(&mut s, SlotKind::Check, "dev-1", "c1", 0.0);
+        assert_eq!(c["granted"], false);
+        assert_eq!(c["wait_reason"], "memory", "{c}");
+    }
+
+    #[test]
+    fn below_memory_floor_recovers_when_memory_frees() {
+        let mut s = slots(3, 1, 900, &[]);
+        // Start low, then a later probe reports recovered memory — the
+        // same request id re-polls and is granted.
+        s.use_resources(Some(below_memory()));
+        assert_eq!(
+            acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0)["granted"],
+            false
+        );
+        s.use_resources(Some(generous()));
+        let r = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        assert_eq!(r["granted"], true, "recovered memory grants: {r}");
+    }
+
+    #[test]
+    fn below_disk_floor_waits_with_reason() {
+        let mut s = slots(3, 1, 900, &[]);
+        s.use_resources(Some(below_disk()));
+        let r = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        assert_eq!(r["granted"], false);
+        assert_eq!(r["wait_reason"], "disk", "{r}");
+        s.use_resources(Some(generous()));
+        let r = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        assert_eq!(r["granted"], true);
+    }
+
+    #[test]
+    fn unreadable_probe_does_not_gate() {
+        // A probe returning None for both resources means "cannot
+        // measure" — the floor is protective, not authoritative, so a
+        // host whose probe fails still builds.
+        fn none() -> (Option<u64>, Option<u64>) {
+            (None, None)
+        }
+        let mut s = slots(1, 1, 900, &[]);
+        s.use_resources(Some(none));
+        let r = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        assert_eq!(r["granted"], true, "unmeasurable probe grants: {r}");
+    }
+
+    #[test]
+    fn status_shows_check_pool_and_wait_reason() {
+        let mut s = slots(1, 1, 900, &[]);
+        s.use_resources(Some(below_memory()));
+        let _ = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        let status = s.status(sc("dev-1", &[me()]), 0.0).0;
+        // The check pool is reported; the waiter names its reason.
+        assert_eq!(status["pools"]["check"]["capacity"], 2);
+        assert_eq!(status["waiting"][0]["wait_reason"], "memory");
+        assert_eq!(status["config"]["check_slots"], 2);
+        assert!(status["config"]["slot_mem_min_available_bytes"].is_u64());
     }
 }

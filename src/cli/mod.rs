@@ -40,6 +40,7 @@ mod memory;
 mod message;
 mod milestone;
 mod monitor;
+mod org;
 mod overview;
 mod plan;
 mod platform;
@@ -57,6 +58,7 @@ mod send;
 mod session;
 mod setup;
 mod skill;
+mod staging;
 mod status;
 mod stop;
 mod test_cmd;
@@ -110,6 +112,7 @@ use serde_json::json;
 use serde_json::Value;
 use session::SessionAction;
 use skill::SkillAction;
+use staging::StagingAction;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::Read;
@@ -135,6 +138,11 @@ pub(crate) struct Cli {
     /// Runtime state directory (socket, database, logs).
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
+    /// Select an org for this command — pins the destination once. Conflicts
+    /// with an explicit `--state-dir` or an inherited local binding; a
+    /// managed caller (`CADENCE_ALIAS`) cannot use it.
+    #[arg(long, global = true, value_name = "ORG")]
+    org: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -901,6 +909,7 @@ pub(crate) fn daemon_restart(
             state_dir,
             &cadence_agent::ui::UiAction::Stop {
                 tailscale_off: false,
+                as_identity: None,
             },
         )?;
         // ui.json is the source of truth now; the /proc argv is only
@@ -929,6 +938,7 @@ pub(crate) fn daemon_restart(
             &cadence_agent::ui::UiAction::Start {
                 flags,
                 reset: false,
+                as_identity: None,
             },
         )?;
         println!("ui: restarted");

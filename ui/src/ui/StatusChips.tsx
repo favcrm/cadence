@@ -5,19 +5,14 @@ import { IconConnection, IconLock, IconRefresh, IconWarning } from "./icons";
 /** Quiet icon controls in the header; the phone menu keeps readable labels. */
 export default function StatusChips({
   readOnly,
-  mayWrite,
   health,
-  actor,
   onRefresh,
   variant,
   children,
 }: {
   /** The server refuses every write (meta.read_only) — the lock chip. */
   readOnly: boolean;
-  /** This client may write — the "writes: actor" chip. */
-  mayWrite: boolean;
   health: Health | null;
-  actor: string;
   onRefresh: () => void;
   variant: "header" | "menu";
   children?: ReactNode;
@@ -67,14 +62,6 @@ export default function StatusChips({
             <IconRefresh /><span>Refresh board</span>
           </button>
         </>
-      )}
-      {mayWrite && (
-        <span
-          className={`chip bg-ink-800 text-ink-400 ${header ? "hidden lg:inline-flex" : ""}`}
-          title={`writes commit to the tracker as ${actor}`}
-        >
-          writes: {actor}
-        </span>
       )}
     </>
   );

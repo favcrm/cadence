@@ -20,6 +20,56 @@ impl Shared {
         crate::rollout::revoke(&self.state_dir, required_str(params, "agent")?, "operator")
     }
 
+    /// `staging_register` (CAD-1024) — mark this state dir as staging so a
+    /// grant may name it. Operator only: `operator_connection` (positive
+    /// `operator_proof` — an agent, its detached child, or a forged
+    /// `--as operator:*` connection is refused). The production allowlist
+    /// (`rollout::staging_register`) runs after.
+    pub(super) fn rpc_staging_register(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("staging register", params, peer_pid)?;
+        let port = params
+            .get("board_port")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::rejected("Missing or non-numeric 'board_port'"))?;
+        let port =
+            u16::try_from(port).map_err(|_| Error::rejected("'board_port' is out of range"))?;
+        crate::rollout::staging_register(&self.state_dir, port, "operator")
+    }
+
+    /// `staging_delegate` (CAD-1024) — the operator grants `alias` the listed
+    /// ops on this staging state dir for `ttl_secs`. Operator only; the dir
+    /// must be registered staging. Admits nothing — PR-3 adds the caller.
+    pub(super) fn rpc_staging_delegate(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("staging delegate", params, peer_pid)?;
+        // `alias` is a reserved connection-bound field (OPERATOR_FIELDS) —
+        // the grantee arrives as `agent`, never `alias`.
+        let alias = required_str(params, "agent")?;
+        let ops = optional_strs(params, "ops")?;
+        let ttl_secs = params
+            .get("ttl_secs")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::rejected("Missing or non-numeric 'ttl_secs'"))?;
+        crate::rollout::staging_delegate(
+            &self.state_dir,
+            alias,
+            &ops,
+            std::time::Duration::from_secs(ttl_secs),
+            "operator",
+        )
+    }
+
+    /// `staging_revoke` (CAD-1024) — end `alias`'s live grant here.
+    /// Operator only.
+    pub(super) fn rpc_staging_revoke(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("staging revoke", params, peer_pid)?;
+        crate::rollout::staging_revoke(&self.state_dir, required_str(params, "agent")?, "operator")
+    }
+
+    /// `staging_delegations` (CAD-1024) — the live grants here. Read-only.
+    pub(super) fn rpc_staging_delegations(&self) -> Result<Value> {
+        crate::rollout::staging_delegations(&self.state_dir)
+    }
+
     /// `approval_record` — persist an operator's merge approval for one
     /// exact head as audit evidence (`id` optional: the store picks a
     /// fresh default, see `Store::record_approval`). It grants nothing: dispatch and

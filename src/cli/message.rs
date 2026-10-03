@@ -42,10 +42,11 @@ pub(crate) enum MessageAction {
         /// Force the ready claim past a busy probe verdict.
         #[arg(long, requires = "ready")]
         force: bool,
-        /// Mid-turn steering (pty only): paste into the live pane without
-        /// owning a turn — passes the one-running-turn hold, owes no
-        /// report, completes when the paste is confirmed, never replayed
-        /// after a daemon restart. Live pane only; at most 500 chars;
+        /// Exact-current-turn guidance: verified PTY paste or native
+        /// Codex/Pi input (requires a runtime turn guard). Owes no report;
+        /// native acceptance is not application or kickoff completion.
+        /// Idle/stale input is skipped, never replayed on the next turn.
+        /// Live endpoint only; at most 500 chars;
         /// takes no `--reply-to` or `--task`.
         #[arg(long, conflicts_with_all = ["ready", "reply_to", "task", "priority", "supersedes"])]
         nudge: bool,

@@ -255,7 +255,7 @@ pub static SPECS: &[EndpointSpec] = &[
         ],
         session_id_label: "Codex thread",
         respond_rejection: None,
-        capabilities: &["managed_codex_stdio"],
+        capabilities: &["managed_codex_stdio", "native_turn_steering"],
         doctor_caps: &["managed_codex_stdio"],
         probe_bins: &[("codex", &["--version"])],
         session_disposable: false,
@@ -290,7 +290,7 @@ pub static SPECS: &[EndpointSpec] = &[
         ],
         session_id_label: "Codex thread",
         respond_rejection: None,
-        capabilities: &["managed_codex_ws"],
+        capabilities: &["managed_codex_ws", "native_turn_steering"],
         doctor_caps: &["managed_codex_ws"],
         probe_bins: &[("codex", &["--version"])],
         session_disposable: false,
@@ -382,7 +382,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "managed pi endpoints broker no requests in slice 1 — extension UI \
              dialogs are auto-cancelled and recorded as pi_ui_request events",
         ),
-        capabilities: &["managed_pi_rpc"],
+        capabilities: &["managed_pi_rpc", "native_turn_steering"],
         doctor_caps: &["managed_pi_rpc"],
         probe_bins: &[("pi", &["--version"])],
         // The session file is cadence-owned state: if it is lost or
@@ -1730,6 +1730,11 @@ impl Attach {
 }
 
 impl EndpointSpec {
+    /// Potential support; the live adapter must also verify its runtime guard.
+    pub fn supports_native_turn_steering(&self) -> bool {
+        self.capabilities.contains(&"native_turn_steering")
+    }
+
     /// The `capabilities` object `agent show`/`agent list` emit.
     pub fn to_json(&self) -> Value {
         json!({
@@ -1745,6 +1750,7 @@ impl EndpointSpec {
                 Reporting::TurnResult => "turn_result",
             },
             "brokers_requests": self.brokers_requests,
+            "native_turn_steering": self.supports_native_turn_steering(),
             "resumable": self.resumable,
             "resume": self.resume_label,
             "live_settable_params": self.live_settable_params,
@@ -1766,6 +1772,27 @@ pub fn capabilities_json(provider: &str, kind: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_turn_steering_matrix_refuses_unverified_backends() {
+        for (provider, kind, expected) in [
+            ("codex", "managed", true),
+            ("codex", "managed-ws", true),
+            ("pi", "managed", true),
+            ("claude", "managed", false),
+            ("claude", "pty", false),
+            ("devin", "cloud", false),
+            ("fake", "fake", false),
+        ] {
+            assert_eq!(
+                spec(provider, kind)
+                    .unwrap()
+                    .supports_native_turn_steering(),
+                expected,
+                "{provider}/{kind}"
+            );
+        }
+    }
 
     #[test]
     fn every_factory_pair_has_a_spec_and_back() {
@@ -1825,6 +1852,7 @@ mod tests {
             "managed_codex_ws",
             "managed_claude_stream",
             "managed_pi_rpc",
+            "native_turn_steering",
             "pty_claude_tmux",
             "pty_devin_tmux",
             "pty_cursor_tmux",
@@ -1842,7 +1870,7 @@ mod tests {
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 20);
+        assert_eq!(caps.len(), 21);
     }
 
     #[test]

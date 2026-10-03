@@ -290,6 +290,27 @@ holds, naming the holder and the claim age. Do not route around it with a
 second lane: ask the holder, or pass `--take-over "<reason>"` for a stale or
 agreed hand-over (recorded on the issue).
 
+Every lane worktree `issue start` mints carries a per-worktree git `pre-push`
+hook (`<worktree-git-dir>/cadence-hooks/pre-push`, via `core.hooksPath` under
+`extensions.worktreeConfig`): `git push` runs `scripts/pre-push` and is
+refused when a step fails, and the hook leaves a receipt
+(`cadence-pre-push-receipt`, `head= lane= kind= steps=… rc= at=`) under the
+worktree's git dir. `--no-verify` still pushes, but the missing receipt is the
+detectable signal. The main checkout has no hook.
+
+The same push path draws on a dedicated `check` slot pool (default 2
+concurrent) that build/test work never fills: a lane's `git push` can run
+`scripts/pre-push` even while every build slot is held. A `check` slot is
+admitted only for a `build.recipes` entry whose `kind: check` —
+`cadence build-slot acquire check --recipe <name>` or
+`build-slot run check --recipe <name> -- <cmd>`; there is no way to name a
+free command under `kind: check`. Slot admission is also resource-aware:
+when the host's MemAvailable or the state filesystem's free bytes drop
+below the `[host]` floors (`slot_mem_min_available_bytes`,
+`slot_mem_min_available_check_bytes`, `slot_disk_min_free_bytes`), a slot
+request waits — `build-slot status` names the `wait_reason`
+(`capacity`/`memory`/`disk`) — and never fails the caller outright.
+
 Job work (the work axis over messages — see docs/JOBS.md):
 
 ```bash
@@ -382,6 +403,27 @@ owner/action.** Include what worked. Review requirement ambiguity, plan and
 ownership quality, implementation/resource practice, QA misses or false alarms,
 and acceptance gaps only where evidence warrants it. Do not generate a generic
 checklist report for every trivial edit or spend model turns on empty retros.
+
+## Refresh a delegated staging instance
+
+An operator can grant an agent a scoped, expiring delegation over a
+registered dev/demo staging instance (CAD-1024). If your pane's
+`CADENCE_ALIAS` has a live grant, you refresh the instance yourself — the
+grant is the authority, no operator proof needed.
+
+```bash
+cadence --state-dir <staging> staging refresh --as delegate:<you> --to <sha>
+```
+
+`staging refresh` claims the rollout lease, restarts the daemon and the
+board (`--no-ui` skips the board bounce), and releases the lease — one
+round-trip under your `delegate:<alias>` identity. Each step is admitted
+only by a live `staging_grants` row for that op on that dir, so a revoked
+or expired grant, a dir that is not registered staging, or a `--as` whose
+alias does not match your pane's `CADENCE_ALIAS` is refused. Your pane
+cannot widen the grant and cannot act as another agent. Operator runbook
+(register → delegate → refresh → revoke) is in
+`docs/design/staging-delegation.md`.
 
 ## Stress a flaky test in CI
 

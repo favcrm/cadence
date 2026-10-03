@@ -1,21 +1,10 @@
-import { Fragment, type ReactNode } from "react";
-import { countLabel, issueCounts } from "../lib/counts";
+import type { ReactNode } from "react";
 import type { ResourceState } from "../lib/cache";
 import type { AppMenu } from "../features/app-shell/CrmOutlet";
-import { navMatches } from "../features/issues/model";
-import { NAV, type Route, type Screen } from "../lib/router";
-import type { IssueCard, Project, Meta } from "../lib/types";
-import Link from "./Link";
+import type { Route, Screen } from "../lib/router";
+import type { IssueCard, Project } from "../lib/types";
 import { Logo } from "./Logo";
-import {
-  IconAgents,
-  IconApps,
-  IconHome,
-  IconOutbox,
-  IconProjects,
-  IconSettings,
-  IconWiki,
-} from "./icons";
+import { NavList, ProjectList } from "./NavList";
 
 interface Props {
   screen: Screen;
@@ -32,7 +21,10 @@ interface Props {
   projectsError?: string | null;
   /** CAD-313: this browser's operator session — null while unknown. */
   signedIn?: boolean | null;
-  sessionUser?: NonNullable<Meta["session"]>["user"];
+  /** The signed-in account row (an AccountMenu trigger="row"); App owns its data. */
+  account?: ReactNode;
+  /** The account dialog is open: raise the aside over the page's own layers, only then. */
+  accountOpen?: boolean;
   /** Nested submenu for the verified active installation, or null
    *  when no installation workspace is on screen. Host-owned App
    *  menu (CAD-784): sections arrive as data with real hrefs — the
@@ -40,105 +32,30 @@ interface Props {
   appMenu?: AppMenu | null;
 }
 
-const NAV_ICONS: Record<string, ReactNode> = {
-  home: <IconHome />,
-  projects: <IconProjects />,
-  wiki: <IconWiki />,
-  apps: <IconApps />,
-  agents: <IconAgents />,
-  outbox: <IconOutbox />,
-  settings: <IconSettings />,
-};
-
-export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, sessionUser, appMenu = null }: Props) {
-  // "…" until the cards load; a stale list keeps its numbers.
-  const count = (key: string) => {
-    if (!issues.data) return { n: issues.status === "failed" ? "!" : "…", title: issues.error ?? "loading issues" };
-    const c = issueCounts(issues.data, key);
-    return { n: String(c.open), title: countLabel(c) };
-  };
-  const all = count("all");
+export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null }: Props) {
   return (
-    <aside className="hidden lg:flex sticky top-0 h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[22px] pb-4 overflow-y-auto">
-      <div className="px-[7px] pb-[23px]">
-        <span className="inline-flex items-center gap-2 text-ink-100 text-[17px] font-semibold tracking-[-.035em]">
-          <Logo size={25} />
-          <span>
-            cadence<span className="text-ink-400 font-normal"> board</span>
-          </span>
-        </span>
-      </div>
-      <nav className="grid gap-[3px]" aria-label="Primary">
-        {NAV.map((item) => (
-          <Fragment key={item.screen}>
-            <Link
-              href={navHref(item.route)}
-              className="navlink"
-              aria-current={navMatches(screen, item.screen) ? "page" : undefined}
-            >
-              {NAV_ICONS[item.screen]}
-              {item.label}
-            </Link>
-            {item.screen === "apps" && appMenu && (
-              <div className="mt-[4px] mb-[2px]">
-                <div className="slabel mx-[11px] mb-[7px]">
-                  <span className="truncate" title={appMenu.title}>{appMenu.title}</span>
-                </div>
-                <nav aria-label={`${appMenu.title} sections`} className="grid gap-[2px] ml-[10px] border-l border-ink-700 pl-[6px]">
-                  {appMenu.sections.map((s) => (
-                    <Link
-                      key={s.label}
-                      href={s.href}
-                      className="navlink"
-                      aria-current={s.current ? "page" : undefined}
-                    >
-                      {s.label}
-                    </Link>
-                  ))}
-                </nav>
-              </div>
-            )}
-          </Fragment>
-        ))}
-      </nav>
-      <div className="slabel flex justify-between mx-[11px] mt-[22px] mb-[7px]">
-        <span>Projects</span>
-        <span className="text-[10px]">~/pm</span>
-      </div>
-      <div className="grid gap-[2px]">
-        <Link href={projectHref("all")} className={`proj ${project === "all" ? "on" : ""}`}>
-          <span className="truncate">All projects</span>
-          <span className="num text-micro text-ink-500" title={all.title}>{all.n}</span>
-        </Link>
-        {projects.map((p) => (
-          <Link
-            key={p.key}
-            href={projectHref(p.key)}
-            className={`proj ${project === p.key ? "on" : ""}`}
-          >
-            <span className="truncate">{p.key}</span>
-            <span className="num text-micro text-ink-500" title={count(p.key).title}>
-              {p.prefix} {count(p.key).n}
+    <aside data-account-open={accountOpen || undefined} className={`hidden lg:flex sticky top-0 ${accountOpen ? "z-[35]" : ""} h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[16px] pb-4`}>
+      {/* Only the nav scrolls: the footer's account dialog opens above its row and must not be clipped by a scroll container. */}
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="px-[7px] pb-[14px]">
+          <span className="inline-flex items-center gap-2 text-ink-100 text-[17px] font-semibold tracking-[-.035em]">
+            <Logo size={25} />
+            <span>
+              cadence<span className="text-ink-400 font-normal"> board</span>
             </span>
-          </Link>
-        ))}
-        {projectsError && (
-          <span className="mx-[11px] mt-1 text-micro text-fail" role="alert" title={projectsError}>
-            could not load projects
           </span>
-        )}
+        </div>
+        <NavList screen={screen} navHref={navHref} appMenu={appMenu} />
+        <div className="slabel flex justify-between mx-[11px] mt-[18px] mb-[5px]">
+          <span>Projects</span>
+          <span className="text-[10px]">~/pm</span>
+        </div>
+        <ProjectList project={project} projectHref={projectHref} projects={projects} issues={issues} projectsError={projectsError} />
       </div>
-      <div className="mt-auto pt-4 border-t border-ink-700 mx-1 text-ink-500 text-label leading-relaxed">
-        <div className="slabel mb-1">session</div>
-        {signedIn === true ? (
-          <div title={sessionUser?.email}>
-            <div className="truncate text-ink-300">{sessionUser?.name || sessionUser?.email || "operator"}</div>
-            {sessionUser && <div className="truncate text-micro">{sessionUser.email}</div>}
-            <div>{sessionUser?.role || "operator"} · signed in</div>
-          </div>
-        ) : signedIn === false ? "not signed in · read only" : "…"}
-        <br />
-        <span className="num text-micro">{location.host}</span>
+      <div data-sidebar-footer className="pt-2 border-t border-ink-700 text-label text-ink-500">
+        {signedIn === true ? account : (
+          <div className="px-2 py-1.5">{signedIn === false ? "not signed in · read only" : "…"}</div>
+        )}
       </div>
     </aside>
   );

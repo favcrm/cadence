@@ -477,6 +477,13 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             &root,
             worktree::shared_deps_enabled(&project)?,
         )?;
+        // CAD-1021: a reused lane still gets its pre-push hook installed
+        // (a lane created before the gate, or one whose git dir was
+        // wiped, re-heals here). Idempotent and per-worktree.
+        // CAD-1021: a reused lane still gets its pre-push hook installed
+        // (a lane created before the gate, or one whose git dir was
+        // wiped, re-heals here). Idempotent and per-worktree.
+        worktree::install_pre_push_hook(&wt_dir)?;
         // Idempotent: same lane — no commit, unless its refs need a
         // fix: a stale recorded cargo target (project config flipped,
         // an older cadence recorded a different layout), a closed
@@ -523,11 +530,18 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         worktree::ensure_cadence_ignored(&root)?;
         // A failed target setup leaves the lane behind — roll the git
         // side back so a retry starts clean.
-        match worktree::configure_cargo_target(
+        let setup = worktree::configure_cargo_target(
             &wt_dir,
             &root,
             worktree::shared_deps_enabled(&project)?,
-        ) {
+        )
+        .and_then(|t| {
+            // CAD-1021: install the lane's pre-push hook before the lane
+            // counts as minted — fail closed so a lane that cannot run the
+            // gate is never recorded. Same rollback as a target failure.
+            worktree::install_pre_push_hook(&wt_dir).map(|_| t)
+        });
+        match setup {
             Ok(target) => cargo_target = target,
             Err(e) => {
                 let _ = git(

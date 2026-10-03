@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, type WriteResp } from "./lib/api";
 import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
@@ -26,11 +26,14 @@ import Context from "./features/projects/Context";
 import { contextNavigationSearch } from "./features/projects/contextRoute";
 import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
+import { NavList, ProjectList } from "./ui/NavList";
 import Wiki from "./features/wiki/Wiki";
 import Link from "./ui/Link";
 import ProjectFilter from "./ui/ProjectFilter";
 import SectionTabs from "./ui/SectionTabs";
 import StatusChips from "./ui/StatusChips";
+import AccountMenu from "./ui/AccountMenu";
+import VersionLine from "./ui/VersionLine";
 import ThemeToggle from "./ui/ThemeToggle";
 import BuildUpdateNotice from "./ui/BuildUpdateNotice";
 import Setup from "./features/setup/Setup";
@@ -41,10 +44,10 @@ import { kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/aut
 import { WriteGate } from "./features/auth/WriteGate";
 import { sessionKey, setSessionKey } from "./lib/sessionKey";
 import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
+import { runningRelease } from "./lib/fmt";
 import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
 import Toast, { type ToastMsg } from "./ui/Toast";
 import { IconList } from "./ui/icons";
-import { countLabel, issueCounts } from "./lib/counts";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
 import { RESOURCE_NAMES } from "./lib/cache";
@@ -55,7 +58,6 @@ import { useMaybeResource, useResource } from "./lib/useResource";
 import {
   goTo,
   locationHref,
-  NAV,
   openProject,
   projectScope,
   readLocation,
@@ -148,6 +150,7 @@ export default function App() {
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
   // The serving build when it differs from this bundle's — drives the
   // reload banner (CAD-573).
   const [staleBuild, setStaleBuild] = useState<string | null>(null);
@@ -590,6 +593,15 @@ export default function App() {
   const crmSection: CrmSection =
     crmQuery === "segments" || crmQuery === "campaigns" ? crmQuery : "customers";
   const appMenu = activeCrm ? crmAppMenu(href, activeCrm.title, crmSection) : null;
+  // One element for both account menus (sidebar row, header avatar) so they cannot drift.
+  const versionLine = (
+    <VersionLine
+      release={runningRelease(meta)}
+      build={UI_BUILD}
+      href={hrefFor({ screen: "settings", section: "update" })}
+      updatePending={updateBanner !== null || staleBuild !== null}
+    />
+  );
 
   return (
     <WriteGate.Provider value={meta === null ? "Checking write access…" : block}>
@@ -609,7 +621,18 @@ export default function App() {
         issues={issuesState}
         projectsError={projectsState.status === "failed" ? projectsState.error : null}
         signedIn={meta?.signed_in ?? null}
-        sessionUser={meta?.session?.user}
+        accountOpen={accountOpen}
+        account={<AccountMenu
+          onOpenChange={setAccountOpen}
+          meta={meta}
+          actor={actor}
+          mayWrite={!readOnly}
+          onChange={refresh}
+          trigger="row"
+          placement="above-start"
+          settingsHref={hrefFor({ screen: "settings", section: "models" })}
+          footer={versionLine}
+        />}
       />
 
       {/* Workspaces fill the dynamic viewport; their panes own scrolling.
@@ -639,9 +662,7 @@ export default function App() {
             <StatusChips
               variant="header"
               readOnly={boardReadOnly}
-              mayWrite={!readOnly}
               health={health}
-              actor={actor}
               onRefresh={refresh}
             >
               <SignIn meta={meta} onChange={refresh} />
@@ -649,7 +670,17 @@ export default function App() {
                 <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
               )}
             </StatusChips>
-            <ThemeToggle />
+            {/* Desktop identity lives in the sidebar footer row; signed-out viewers keep the one-click theme button. */}
+            {meta?.signed_in === true ? <div className="flex lg:hidden"><AccountMenu
+              meta={meta}
+              actor={actor}
+              mayWrite={!readOnly}
+              onChange={refresh}
+              trigger="avatar"
+              placement="below-end"
+              settingsHref={hrefFor({ screen: "settings", section: "models" })}
+              footer={versionLine}
+            /></div> : <ThemeToggle />}
           </div>
         </header>
 
@@ -661,103 +692,39 @@ export default function App() {
         )}
 
         {menuOpen && (
-          <nav id="mobile-navigation" aria-label="Workspace" className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
-              {NAV.map((item) => (
-                <Fragment key={item.screen}>
-                  <Link
-                    href={hrefFor(item.route)}
-                    onClick={() => setMenuOpen(false)}
-                    aria-current={(screen === "workspaceApp" ? "apps" : screen) === item.screen ? "page" : undefined}
-                    className={`h-9 inline-flex items-center justify-center rounded text-secondary ${
-                      (screen === "workspaceApp" ? "apps" : screen) === item.screen
-                        ? "bg-accent/15 text-accent font-medium"
-                        : "bg-ink-800 text-ink-300"
-                    }`}
-                  >
-                    {item.label}
-                  </Link>
-                  {item.screen === "apps" && appMenu && (
-                    <div className="col-span-2 sm:col-span-4" role="group" aria-label={`${appMenu.title} sections`}>
-                      <div className="slabel pt-1 truncate" title={appMenu.title}>{appMenu.title}</div>
-                      <div className="grid gap-1 mt-1">
-                        {appMenu.sections.map((s) => (
-                          <Link
-                            key={s.label}
-                            href={s.href}
-                            onClick={() => setMenuOpen(false)}
-                            aria-current={s.current ? "page" : undefined}
-                            className={`flex items-center h-8 px-2.5 rounded text-label ${
-                              s.current
-                                ? "bg-accent/15 text-accent font-medium"
-                                : "text-ink-300 hover:bg-ink-800"
-                            }`}
-                          >
-                            {s.label}
-                          </Link>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </Fragment>
-              ))}
-            </div>
+          <div id="mobile-navigation" className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
+            <NavList
+              screen={screen === "workspaceApp" ? "apps" : screen}
+              navHref={hrefFor}
+              appMenu={appMenu}
+              label="Workspace"
+              onNavigate={() => setMenuOpen(false)}
+            />
             <div className="slabel pt-2">projects</div>
-            <div className="grid gap-1">
-              <Link
-                href={projectHref("all")}
-                onClick={() => setMenuOpen(false)}
-                className={`flex items-center justify-between h-8 px-2.5 rounded text-label ${
-                  navProject === "all"
-                    ? "bg-accent/15 text-accent"
-                    : "text-ink-300 hover:bg-ink-800"
-                }`}
-              >
-                All projects
-                <span
-                  className="num text-micro text-ink-500"
-                  title={issuesState.data ? countLabel(issueCounts(issues)) : undefined}
-                >
-                  {issuesState.data ? issueCounts(issues).open : "…"}
-                </span>
-              </Link>
-              {projects.map((p) => (
-                <Link
-                  key={p.key}
-                  href={projectHref(p.key)}
-                  onClick={() => setMenuOpen(false)}
-                  className={`flex items-center justify-between h-8 px-2.5 rounded text-label ${
-                    navProject === p.key
-                      ? "bg-accent/15 text-accent"
-                      : "text-ink-300 hover:bg-ink-800"
-                  }`}
-                >
-                  <span className="truncate">{p.key}</span>
-                  <span
-                    className="num text-micro text-ink-500"
-                    title={issuesState.data ? countLabel(issueCounts(issues, p.key)) : undefined}
-                  >
-                    {p.prefix} {issuesState.data ? issueCounts(issues, p.key).open : "…"}
-                  </span>
-                </Link>
-              ))}
-            </div>
+            <nav aria-label="Projects">
+              <ProjectList
+                project={navProject}
+                projectHref={projectHref}
+                projects={projects}
+                issues={issuesState}
+                projectsError={projectsState.status === "failed" ? projectsState.error : null}
+                onNavigate={() => setMenuOpen(false)}
+              />
+            </nav>
             {/* The header carries these as icons under lg — here they keep
                 their words, so the meaning is one tap away on touch. */}
             <div className="slabel pt-2">board</div>
-            <div className="flex flex-wrap items-center gap-1.5">
+            <div role="region" aria-label="Board" className="flex flex-wrap items-center gap-1.5">
               <StatusChips
                 variant="menu"
                 readOnly={boardReadOnly}
-                mayWrite={!readOnly}
                 health={health}
-                actor={actor}
                 onRefresh={refresh}
               >
                 <SignIn meta={meta} onChange={refresh} />
               </StatusChips>
             </div>
-          </nav>
+          </div>
         )}
 
         {projectScope(route) === "chips" && showProjectChoices(projects.length, project) && (

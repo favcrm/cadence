@@ -136,6 +136,11 @@ tests = [
     "dispatch_refusals_leave_nothing",
     "issue_claim_guards_start_and_take_over_is_recorded",
     "dispatch_respects_claims",
+    "issue_start_installs_per_worktree_pre_push_hook",
+    "issue_start_hook_is_idempotent_on_reuse",
+    "main_checkout_never_gets_the_hook",
+    "lane_push_blocks_on_failed_pre_push_and_allows_on_pass",
+    "lane_push_allowed_when_repo_has_no_pre_push_script",
 ]
 helpers = [
     "cli_dir",

@@ -727,6 +727,10 @@ impl Shared {
         // delivered; never resent) and a worker respawns for the
         // still-`queued` rest.
         shared.reconcile_crm_sends();
+        // CAD-1015: a `submitting` native nudge means the daemon died
+        // between the durable bind and the provider reply — it may have
+        // landed, so it closes non-fencing `unknown`, never replayed.
+        let _ = shared.store.orphan_submitting_nudges("crash");
         Ok(shared)
     }
 
@@ -2440,6 +2444,13 @@ impl Shared {
                     j["tasks"] = json!(tasks);
                     j["capabilities"] =
                         registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
+                    j["native_turn_steering_enabled"] = json!(
+                        agent.enabled
+                            && matches!(agent.state.as_str(), "idle" | "busy")
+                            && self
+                                .adapter_for(&agent.alias)
+                                .is_ok_and(|adapter| adapter.native_turn_steering())
+                    );
                     let (dead, resumable) = self.agent_liveness(&agent);
                     j["dead"] = json!(dead);
                     j["resumable"] = json!(resumable);
@@ -2529,6 +2540,13 @@ impl Shared {
                 let mut agent_json = agent.to_json();
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
+                agent_json["native_turn_steering_enabled"] = json!(
+                    agent.enabled
+                        && matches!(agent.state.as_str(), "idle" | "busy")
+                        && self
+                            .adapter_for(&agent.alias)
+                            .is_ok_and(|adapter| adapter.native_turn_steering())
+                );
                 let (dead, resumable) = self.agent_liveness(&agent);
                 agent_json["dead"] = json!(dead);
                 agent_json["resumable"] = json!(resumable);
@@ -2886,6 +2904,12 @@ impl Shared {
             "lane_reassign" => self.rpc_lane_reassign(params, peer_pid),
             "rollout_grant" => self.rpc_rollout_grant(params, peer_pid),
             "rollout_revoke" => self.rpc_rollout_revoke(params, peer_pid),
+            // CAD-1024: the staging allowlist and grant store. Register and
+            // delegate/revoke are operator-only; delegations is a read.
+            "staging_register" => self.rpc_staging_register(params, peer_pid),
+            "staging_delegate" => self.rpc_staging_delegate(params, peer_pid),
+            "staging_revoke" => self.rpc_staging_revoke(params, peer_pid),
+            "staging_delegations" => self.rpc_staging_delegations(),
             "project_work_approvals" => Ok(json!({
                 "approvals": self.store.work_approvals()?,
             })),

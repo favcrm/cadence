@@ -32,6 +32,7 @@ docs/guides/*
 !docs/EXTERNAL-TEST-RECIPE.md
 !docs/START-HERE.md
 !docs/INSTALL-AGENT.md
+!docs/NATIVE_MESSAGING.md
 !docs/RELEASING.md
 !docs/REMOTE-RESULT-OUTBOX.md
 docs/design/*
@@ -39,6 +40,7 @@ docs/roles/*
 !docs/design/DEVELOPMENT-TEAM.md
 !docs/design/hosted-migration.md
 !docs/design/CONTRACT-TEMPLATE.md
+!docs/design/remote-cli.md
 !docs/roles/risk-classes.md
 !docs/roles/one-review-paths.toml
 !docs/roles/risk-paths.toml

@@ -289,6 +289,7 @@ fn hosted_public_only_cannot_be_persisted_over_a_running_open_board() {
         &ui::UiAction::Start {
             flags,
             reset: false,
+            as_identity: None,
         },
     );
     assert!(
@@ -310,6 +311,7 @@ fn hosted_public_only_cannot_be_persisted_over_a_running_open_board() {
         &ui::UiAction::Start {
             flags: reset_flags,
             reset: true,
+            as_identity: None,
         },
     );
     assert!(
@@ -331,6 +333,7 @@ fn hosted_public_only_cannot_be_persisted_over_a_running_open_board() {
         &ui::UiAction::Start {
             flags: ui::UiFlags::default(),
             reset: false,
+            as_identity: None,
         },
     );
     assert!(
@@ -385,6 +388,7 @@ fn hosted_public_only_cannot_change_live_public_identity_without_restart() {
                 ..Default::default()
             },
             reset: false,
+            as_identity: None,
         },
     );
     assert!(

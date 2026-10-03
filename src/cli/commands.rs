@@ -32,6 +32,13 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Select an organization/connection preference (CAD-1019). The saved
+    /// default is a pointer only — running work stays pinned to where it
+    /// started, and a managed caller (`CADENCE_ALIAS`) cannot move it.
+    Org {
+        #[command(subcommand)]
+        action: crate::cli::org::OrgAction,
+    },
     /// Check environment, storage and provider CLIs. `--host` instead
     /// runs the read-only host watchdog — disk free, provider store and
     /// WAL growth, per-user pipe pressure, orphaned processes from
@@ -94,6 +101,13 @@ pub(crate) enum Commands {
     Rollout {
         #[command(subcommand)]
         action: RolloutAction,
+    },
+    /// CAD-1024: the staging-delegation allowlist and grant store
+    /// (operator-only register/delegate/revoke; delegations is a read).
+    /// A grant admits nothing until the `delegate:` caller shape lands.
+    Staging {
+        #[command(subcommand)]
+        action: StagingAction,
     },
     /// Back up the store with SQLite's online backup API. The running
     /// daemon is not blocked. The copy is integrity-checked, hashed and

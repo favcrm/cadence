@@ -4,6 +4,7 @@
 //! `cadence/<name>`, owned by [`layout`]) and the `.cadence/` ignore
 //! rule.
 
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -101,6 +102,101 @@ pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
 /// per worktree.
 pub fn shared_target_dir(root: &Path) -> PathBuf {
     root.join(".cadence").join("target").join("shared")
+}
+
+/// CAD-1021 slice 1: the lane's pre-push gate. Linked worktrees share
+/// the common `.git/hooks`, so the hook can never live there — it is a
+/// per-worktree `core.hooksPath` (written to the worktree's own
+/// `config.worktree`, never the shared `config`) pointing at a hooks
+/// dir under the worktree's own git dir. `extensions.worktreeConfig`
+/// is the one shared-config key the install sets (idempotent); the main
+/// checkout keeps no hook either way.
+pub const HOOKS_DIR: &str = "cadence-hooks";
+
+/// The hook script installed at `<git-dir>/cadence-hooks/pre-push`.
+/// Git runs pre-push hooks with GIT_DIR already pointed at the
+/// worktree's git dir and cwd at the worktree root, so the receipt and
+/// `scripts/pre-push` both resolve per-lane. The receipt is written
+/// atomically (tmp+rename) under the worktree's git dir — a `--no-verify`
+/// push leaves no receipt, which is the detection signal (contract D3).
+const PRE_PUSH_HOOK: &str = r#"#!/bin/sh
+# CAD-1021: run scripts/pre-push on every push; a non-zero step blocks it.
+# The receipt records the checked head, lane and per-step exit codes under
+# this worktree's git dir — a pushed head with no receipt was pushed with
+# --no-verify, and that absence is the audit signal.
+top=$(git rev-parse --show-toplevel) || exit 1
+gd=$(git rev-parse --absolute-git-dir) || exit 1
+cd "$top" || exit 1
+# git exports GIT_DIR/GIT_WORK_TREE/etc for the hook — unset them before
+# spawning scripts/pre-push so its own `git` calls (and any subprocess that
+# shells out to git, e.g. the contract tests) resolve the worktree normally
+# instead of running inside the bare-dir context the hook inherits.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX GIT_QUARANTINE_PATH
+tmp="$gd/cadence-pre-push-receipt.tmp"
+out="$gd/cadence-pre-push-receipt"
+# A worktree without scripts/pre-push (a fixture, a sparse lane, a repo that
+# never carried the script) has no gate to run — record that and let the push
+# through rather than blocking on a script that isn't there.
+if [ ! -x scripts/pre-push ]; then
+    printf 'head=%s lane=%s kind=none steps=skipped:no-pre-push rc=0 at=%s\n' \
+        "$(git rev-parse HEAD 2>/dev/null || echo '?')" \
+        "${CADENCE_ALIAS:-$USER}" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
+    exit 0
+fi
+line=$(scripts/pre-push --receipt ${PRE_PUSH_TESTS:+--tests})
+rc=$?
+printf '%s\n' "$line" > "$tmp" && mv "$tmp" "$out"
+exit $rc
+"#;
+
+/// Install the lane's pre-push hook: write `<git-dir>/cadence-hooks/
+/// pre-push` (0755) under the worktree's OWN git dir, enable
+/// `extensions.worktreeConfig` on the shared config once, then point
+/// this worktree's `config.worktree` `core.hooksPath` at that dir.
+/// Idempotent — a re-start re-heals; an identical hook is left alone.
+/// Fail-closed: `issue start` treats a failed install as a failed lane
+/// (same rollback as `configure_cargo_target`), because a lane that
+/// cannot enforce the gate must not be minted.
+pub fn install_pre_push_hook(wt_dir: &Path) -> Result<PathBuf> {
+    let git_dir = PathBuf::from(git(wt_dir, &["rev-parse", "--absolute-git-dir"])?);
+    let hooks = git_dir.join(HOOKS_DIR);
+    std::fs::create_dir_all(&hooks)?;
+    let script = hooks.join("pre-push");
+    // Write the script first (atomic tmp+rename), then config — a crash
+    // between the two leaves an unused flag or an un-pointed script, both
+    // re-healed by the next `issue start`.
+    let needs_write = match std::fs::read_to_string(&script) {
+        Ok(existing) => existing != PRE_PUSH_HOOK,
+        Err(_) => true,
+    };
+    if needs_write {
+        let tmp = hooks.join(".pre-push.tmp");
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o755)
+                .open(&tmp)?;
+            f.write_all(PRE_PUSH_HOOK.as_bytes())?;
+        }
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::rename(&tmp, &script)?;
+    }
+    // Shared config: enable per-worktree config (idempotent — already
+    // true is a no-op), then this worktree's own hooksPath.
+    git(wt_dir, &["config", "extensions.worktreeConfig", "true"])?;
+    git(
+        wt_dir,
+        &[
+            "config",
+            "--worktree",
+            "core.hooksPath",
+            &hooks.to_string_lossy(),
+        ],
+    )?;
+    Ok(script)
 }
 
 /// The `debug/` children cargo fills with *hashed* names —
