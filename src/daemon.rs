@@ -393,6 +393,11 @@ pub struct Shared {
     router_backlog: std::sync::atomic::AtomicUsize,
     /// CAD-339: serializes writers of the escalation record.
     escalation_lock: Mutex<()>,
+    /// CAD-1021: last time the reclaim pass (merged sweep + idle
+    /// `target/`) ran inside the checkup — the sweep is throttled to
+    /// [`checkup::RECLAIM_EVERY`] so a 60s checkup never re-runs a git
+    /// walk every tick.
+    reclaim_at: Mutex<Option<std::time::Instant>>,
     /// CAD-615: grant-execution token → the child this daemon spawned
     /// and the argv that child is allowed to run. A descendant, or a
     /// different argv, is not the operator.
@@ -677,6 +682,7 @@ impl Shared {
             checkup_dispatch: opts.checkup_dispatch.clone(),
             router_backlog: std::sync::atomic::AtomicUsize::new(0),
             escalation_lock: Mutex::new(()),
+            reclaim_at: Mutex::new(None),
             perm_exec: Mutex::new(HashMap::new()),
             dispatch_lock: Mutex::new(()),
             delivery_lock: Mutex::new(()),

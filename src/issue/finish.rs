@@ -461,7 +461,7 @@ struct Check {
 /// or a denied read just doesn't report. The cadence process itself
 /// is excluded; a parent shell standing in the worktree is not — that
 /// is exactly the open-shell case.
-fn pids_cwd_under(dir: &Path) -> Vec<u32> {
+pub(crate) fn pids_cwd_under(dir: &Path) -> Vec<u32> {
     let mut out = Vec::new();
     let Ok(dir) = dir.canonicalize() else {
         return out;
@@ -541,7 +541,7 @@ fn fmt_age(d: Duration) -> String {
 }
 
 /// Best-effort process name for a refusal message.
-fn comm_of(pid: u32) -> String {
+pub(crate) fn comm_of(pid: u32) -> String {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "?".to_string())
@@ -629,7 +629,7 @@ fn message_bound(view: &DaemonView, state_dir: &Path, msg: &Value, t: &Target) -
 /// not answer is a daemon that was there and stopped answering — its
 /// checks still block.
 pub(crate) struct DaemonView {
-    up: bool,
+    pub(crate) up: bool,
     /// task id → its `task` payload for every task any agent lists —
     /// the map `inspect` and `message_bound` share.
     tasks: std::collections::HashMap<String, Value>,
@@ -647,7 +647,7 @@ pub(crate) struct DaemonView {
     agents: Vec<Value>,
 }
 
-fn daemon_view(state_dir: &Path) -> DaemonView {
+pub(crate) fn daemon_view(state_dir: &Path) -> DaemonView {
     let mut v = DaemonView {
         up: client::socket_path(state_dir).exists(),
         tasks: std::collections::HashMap::new(),
@@ -1083,7 +1083,7 @@ fn cwd_on_worktree(wt_dir: &Path, cwd: &Path) -> bool {
 /// Aliases from `agent_list` whose cwd is this worktree. A missing
 /// list is not "nobody" — the caller already records that enumeration
 /// failure. Historical cwds are not retained here.
-fn cwd_holder_aliases(view: &DaemonView, wt_dir: Option<&Path>) -> Vec<String> {
+pub(crate) fn cwd_holder_aliases(view: &DaemonView, wt_dir: Option<&Path>) -> Vec<String> {
     let Some(dir) = wt_dir else {
         return Vec::new();
     };
