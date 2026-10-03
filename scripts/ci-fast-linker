@@ -1,0 +1,49 @@
+#!/bin/sh
+# CAD-1103: optional fast linker for the PR-gate `ci` cargo profile.
+#
+#   ci-fast-linker enable   install mold when missing (else fall back to an
+#                           existing lld), prove it links a trivial C program,
+#                           then append `-C link-arg=-fuse-ld=<linker>` to
+#                           RUSTFLAGS in $GITHUB_ENV for later steps
+#
+# Contract: a strict optimisation. `enable` never exits non-zero: a failed
+# install, a linker that cannot link, or a missing $GITHUB_ENV leaves
+# RUSTFLAGS untouched and the job links with the default linker exactly as
+# before. It only changes how the binary is linked, never what is compiled
+# or checked. Never used by release-artifact, staging or promotion builds.
+set -u
+
+note() { printf '%s\n' "ci-fast-linker: $*"; }
+
+works() {
+    tmp=$(mktemp -d) || return 1
+    printf 'int main(void){return 0;}\n' > "$tmp/t.c"
+    cc -fuse-ld="$1" -o "$tmp/t" "$tmp/t.c" >/dev/null 2>&1
+    rc=$?
+    rm -rf "$tmp"
+    return $rc
+}
+
+cmd_enable() {
+    [ -n "${GITHUB_ENV:-}" ] || { note "disabled: no GITHUB_ENV"; return 0; }
+    if ! command -v mold >/dev/null 2>&1 && ! command -v ld.lld >/dev/null 2>&1; then
+        sudo apt-get install -y --no-install-recommends mold >/dev/null 2>&1 \
+            || note "mold install failed"
+    fi
+    for linker in mold lld; do
+        bin=$linker
+        [ "$linker" = lld ] && bin=ld.lld
+        if command -v "$bin" >/dev/null 2>&1 && works "$linker"; then
+            echo "RUSTFLAGS=${RUSTFLAGS:-} -C link-arg=-fuse-ld=$linker" >> "$GITHUB_ENV"
+            note "enabled: $linker"
+            return 0
+        fi
+    done
+    note "disabled: no working mold or lld; default linker"
+}
+
+case "${1:-}" in
+    enable) cmd_enable ;;
+    *) echo "usage: ci-fast-linker enable" >&2; exit 2 ;;
+esac
+exit 0
