@@ -49,26 +49,19 @@ pub(crate) fn run() -> Result<i32> {
         Commands::Login {
             issuer,
             org,
-            audience,
             use_,
             token_stdin,
             no_open,
             auth_dir,
         } => {
-            // Hosted device grant → verified org id + audience → registry.
             // `--token-stdin` is the legacy AgenticOS token path, not org login.
+            let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
             if *token_stdin {
-                let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
                 return cadence_agent::remote_auth::login(issuer, org, &dir, true, *no_open);
             }
-            let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
-            let audience = audience.as_deref().ok_or_else(|| {
-                Error::rejected("login needs --audience https://<slug>.cadencecloud.app")
-            })?;
-            let (org_id, endpoint, _expires) = cadence_agent::remote_enrollment::login_browser(
+            let grant = cadence_agent::remote_enrollment::login_browser(
                 issuer,
                 org,
-                audience,
                 &dir,
                 |url, code| {
                     eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
@@ -89,10 +82,11 @@ pub(crate) fn run() -> Result<i32> {
                     Ok(())
                 },
             )?;
-            // The issuer verified org id + audience together; record_remote
-            // persists the org's remote connection. `--use` selects it;
-            // without it an existing default is kept.
-            let view = org::record_remote(org, &endpoint, &org_id, *use_)?;
+            // Record first: a refused registry write (changed endpoint, name
+            // taken by `local`) must leave no credential behind.
+            let view =
+                org::record_remote(&grant.slug, &grant.endpoint, &grant.organization_id, *use_)?;
+            grant.save_credential(&dir)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&view).unwrap_or_default()

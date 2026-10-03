@@ -342,15 +342,11 @@ fn ensure_local(state_dir: &Path, tracker_dir: &Path) -> Result<()> {
     file.write(&registry)
 }
 
-/// Record a remote connection from `cadence login` (CAD-1019 slice 1b).
-/// `org_name` is the registry name, `org_id`/`endpoint` come only from the
-/// issuer's verified grant — never derived. Never re-points a stored remote
-/// at a different endpoint/org-id, never collides with a `local` row, and
-/// selects the new org only when there is no default or `use_default`.
-/// Pure registry mutation for `record_remote` — the file-locked open
-/// stays in `record_remote`; this is unit-tested without the registry
-/// file so the default-selection and re-point rules are pinned.
-/// Returns the stored connection and whether it is now the default.
+/// Pure registry mutation for `cadence login` (CAD-1019 slice 1b), unit-tested
+/// without the registry file. `org_name` is the issuer-verified slug and
+/// `endpoint`/`org_id` come only from the verified grant. A stored remote is
+/// never re-pointed, a `local` row is never overwritten, and the new org is
+/// selected only when there is no default or `use_default`.
 fn apply_record_remote(
     registry: &mut Registry,
     org_name: &str,
@@ -410,6 +406,7 @@ fn apply_record_remote(
     ))
 }
 
+/// File-locked wrapper over `apply_record_remote`; returns the stored view.
 pub(super) fn record_remote(
     org_name: &str,
     endpoint: &str,
