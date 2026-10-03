@@ -816,3 +816,100 @@ fn tailnet_write_wrong_origin_refused() {
         "origin"
     );
 }
+
+/// CAD-1081 (D1.2): a restored `ui.pid` that names pid 1, another live
+/// process, or a thread id is stale — `ui status` says stopped and drops
+/// it, and `ui start` starts the board instead of answering
+/// `already_running`. Only the real board's leader pid counts; one of
+/// its own thread ids does not.
+#[test]
+fn ui_pidfile_names_only_this_state_dirs_board() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let st = state.path();
+    let pidf = st.join("ui.pid");
+    // A wrongly trusted pid makes `ui status` probe the saved port:
+    // keep that probe on this test's own port, never the default 3010.
+    let port = free_port();
+    seed_ui_port(st, port);
+    let none: &[(&str, &str)] = &[];
+    let status = |pid: i32| {
+        std::fs::write(&pidf, pid.to_string()).unwrap();
+        cli_env(pm.path(), st, &["ui", "status"], none).1
+    };
+    // Killed on drop, a panic included.
+    let other = UiProc(Command::new("sleep").arg("600").spawn().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (done, wait) = std::sync::mpsc::channel::<()>();
+    let t = thread::spawn(move || {
+        tx.send(unsafe { libc::syscall(libc::SYS_gettid) } as i32)
+            .unwrap();
+        let _ = wait.recv();
+    });
+    let own_tid = rx.recv().unwrap();
+    for pid in [other.0.id() as i32, own_tid, 1] {
+        let out = status(pid);
+        assert_eq!(out["state"], "stopped", "planted pid {pid}: {out}");
+        assert!(!pidf.exists(), "planted pid {pid} kept as the board");
+    }
+    drop(done);
+    t.join().unwrap();
+
+    // The incident: a stale live pid must not stand in for the board.
+    let _ui = DetachedUi(st.to_path_buf());
+    std::fs::write(&pidf, other.0.id().to_string()).unwrap();
+    let port = port.to_string();
+    let (ok, out) = cli_env(pm.path(), st, &["ui", "start", "--port", &port], none);
+    drop(other);
+    assert!(ok, "{out}");
+    assert_eq!(out["state"], "started", "{out}");
+    let board = out["pid"].as_i64().unwrap() as i32;
+    assert_eq!(status(board)["pid"], board, "the real board is the board");
+
+    // A thread of the real board shares its cmdline; only Tgid tells.
+    // A board that answered `ui start`'s health check already runs its
+    // server threads, so one read of its task list finds one.
+    let board_tid = std::fs::read_dir(format!("/proc/{board}/task"))
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .find(|t| *t != board)
+        .expect("a serving board has a second thread");
+    let out = status(board_tid);
+    assert_eq!(out["state"], "stopped", "board thread {board_tid}: {out}");
+    assert_eq!(status(board)["state"], "running");
+}
+
+/// CAD-1081 r1: a board started with a relative `--state-dir` is still
+/// this state dir's board when read from any other cwd — its argv
+/// carries the absolute dir, so `ui status`/`ui stop` keep finding it.
+#[test]
+fn ui_relative_state_dir_board_is_found_from_any_cwd() {
+    let (pm, base) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let st = base.path().join("st");
+    std::fs::create_dir(&st).unwrap();
+    seed(pm.path(), &st);
+    let _ui = DetachedUi(st.clone());
+    let none: &[(&str, &str)] = &[];
+    let port = free_port().to_string();
+    let (ok, out) = cli_run(
+        pm.path(),
+        Path::new("st"),
+        Some(base.path()),
+        &["ui", "start", "--port", &port],
+        none,
+    );
+    assert!(ok, "{out}");
+    let board = out["pid"].as_i64().unwrap();
+    let (_, out) = cli_run(pm.path(), &st, Some(pm.path()), &["ui", "status"], none);
+    assert_eq!(out["state"], "running", "{out}");
+    assert_eq!(out["pid"], board);
+    // The argv itself is absolute too, so a reader that cannot see the
+    // board's cwd still matches it.
+    let argv = std::fs::read(format!("/proc/{board}/cmdline")).unwrap();
+    let argv: Vec<&[u8]> = argv.split(|b| *b == 0).collect();
+    let dir = argv.iter().position(|a| *a == b"--state-dir").unwrap() + 1;
+    assert!(
+        argv[dir].starts_with(b"/"),
+        "relative --state-dir in board argv"
+    );
+}
