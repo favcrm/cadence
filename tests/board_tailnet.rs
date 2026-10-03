@@ -867,18 +867,13 @@ fn ui_pidfile_names_only_this_state_dirs_board() {
     assert_eq!(status(board)["pid"], board, "the real board is the board");
 
     // A thread of the real board shares its cmdline; only Tgid tells.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let board_tid = loop {
-        let tid = std::fs::read_dir(format!("/proc/{board}/task"))
-            .unwrap()
-            .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
-            .find(|t| *t != board);
-        if let Some(tid) = tid {
-            break tid;
-        }
-        assert!(std::time::Instant::now() < deadline, "board has no thread");
-        thread::sleep(Duration::from_millis(20));
-    };
+    // A board that answered `ui start`'s health check already runs its
+    // server threads, so one read of its task list finds one.
+    let board_tid = std::fs::read_dir(format!("/proc/{board}/task"))
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .find(|t| *t != board)
+        .expect("a serving board has a second thread");
     let out = status(board_tid);
     assert_eq!(out["state"], "stopped", "board thread {board_tid}: {out}");
     assert_eq!(status(board)["state"], "running");
