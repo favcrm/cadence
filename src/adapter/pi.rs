@@ -1383,11 +1383,23 @@ fn write_pi_guard(state_dir: &Path, agenticos_reads: bool) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// CAD-1076: the provider refused the request itself — a 400
-/// `invalid_request` (the AgenticOS gateway's answer to a history over
-/// its schema limits), never a rate limit or an outage.
+/// CAD-1076: the provider refused the request itself — HTTP 400 whose
+/// JSON body carries `code: "invalid_request"` (the AgenticOS gateway's
+/// answer to a history over its schema limits; Pi renders it as
+/// `400 {…}` or `400: {…}`). A rate limit, an outage, a credential
+/// error or any other code never matches.
 fn history_rejected(error: &str) -> bool {
-    error.contains("400") && error.contains("invalid_request")
+    let Some(body) = error.trim_start().strip_prefix("400") else {
+        return false;
+    };
+    let body = body.strip_prefix(':').unwrap_or(body).trim();
+    let Ok(body) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    body.get("code")
+        .or_else(|| body.pointer("/error/code"))
+        .and_then(Value::as_str)
+        == Some("invalid_request")
 }
 
 /// One in-flight command's response slot.

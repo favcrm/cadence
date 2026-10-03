@@ -2612,7 +2612,7 @@ fn only_a_rejected_history_resets_the_master() {
     );
     pi.open(&master_agent(state.path(), json!({"unconfined": true})))
         .unwrap();
-    for key in ["429", "502", "auth"] {
+    for key in ["429", "502", "auth", "loose400", "invalid500"] {
         let turn = pi
             .run_turn(&format!("fake-fail {key}"), "m", &|_| {})
             .unwrap();
@@ -2623,8 +2623,12 @@ fn only_a_rejected_history_resets_the_master() {
     let rpcs = std::fs::read_to_string(&journal).unwrap();
     assert!(!rpcs.contains("\"new_session\""), "{rpcs}");
     // Positive control: the gateway's exact 400 does reset.
-    let refused = pi.run_turn("fake-fail gateway400", "m", &|_| {}).unwrap();
-    assert!(pi.reset_rejected_session(&refused).unwrap());
+    for key in ["gateway400", "gateway400colon"] {
+        let refused = pi
+            .run_turn(&format!("fake-fail {key}"), "m", &|_| {})
+            .unwrap();
+        assert!(pi.reset_rejected_session(&refused).unwrap(), "{key}");
+    }
     pi.close();
 }
 

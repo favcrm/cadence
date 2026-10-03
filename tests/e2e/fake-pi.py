@@ -263,6 +263,10 @@ FAIL_SHAPES = {
     "502": '502 {"error":{"message":"The model provider could not complete the call.","type":"server_error","code":"upstream_unavailable"}}',
     "auth": "No API key found for agenticos. Use /login to sign in.",
     "gateway400": GATEWAY_400,
+    "gateway400colon": GATEWAY_400.replace("400 ", "400: ", 1),
+    # Both substrings, neither the gateway's status nor its code.
+    "loose400": '400 {"message":"invalid_request in tool schema","code":"invalid_tools"}',
+    "invalid500": '500 {"error":{"message":"x","code":"invalid_request"}}',
 }
 live_turn = False
 pending_dialog = None
