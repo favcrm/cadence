@@ -315,6 +315,43 @@ class ScopeApproval(unittest.TestCase):
                 self.c.store = [scope_rec(body=body)]
                 self.refused("declares no parseable")
 
+    def test_disguised_visible_risk_line_over_a_hidden_one_gives_no_scope(self):
+        # Escapes built at runtime so the file itself holds no lookalikes.
+        disguises = {
+            "fullwidth colon": "Risk" + chr(0xFF1A) + " human (7)",
+            "fullwidth R": chr(0xFF32) + "isk: human (7)",
+            "cyrillic i": "R" + chr(0x456) + "sk: human (7)",
+            "zero-width space": "Ri" + chr(0x200B) + "sk: human (7)",
+            "soft hyphen": "Ris" + chr(0xAD) + "k: human (7)",
+            "lowercase": "risk: human (7)",
+            "entity colon": "Risk&#58; human (7)",
+            "entity R": "&#82;isk: human (7)",
+            "named entity": "Risk&colon; human (7)",
+        }
+        self.c.paths = ["src/rollout.rs"]
+        self.set_risk("Risk: human (7) - x")
+        for name, vis in disguises.items():
+            for hidden in ("<!--\nRisk: human (4, 6, 7)\n-->\n", "<div hidden>\nRisk: human (4, 6, 7)\n</div>\n",
+                           '<p style="display:none">Risk: human (4, 6, 7)</p>\n'):
+                with self.subTest(name=name, hidden=hidden):
+                    self.c.ticket_body = hidden + vis + "\n"
+                    self.c.store = [scope_rec(body=self.c.ticket_body)]
+                    self.refused()
+
+    def test_loose_risk_pattern_counts_lookalike_lines_without_hiding_markup(self):
+        self.c.paths = ["src/rollout.rs"]
+        self.set_risk("Risk: human (7) - x")
+        for name, vis in (("fullwidth colon", "Risk" + chr(0xFF1A) + " human (4, 6, 7)"),
+                          ("cyrillic i", "R" + chr(0x456) + "sk: human (4, 6, 7)"),
+                          ("lowercase", "risk: human (4, 6, 7)")):
+            with self.subTest(name=name):
+                self.c.ticket_body = "Risk: human (7)\n" + vis + "\n"  # two counted lines
+                self.c.store = [scope_rec(body=self.c.ticket_body)]
+                self.refused("declares no parseable")
+                self.c.ticket_body = vis + "\n"  # one counted line, not the ASCII label
+                self.c.store = [scope_rec(body=self.c.ticket_body)]
+                self.refused("declares no parseable")
+
     def test_single_bold_or_quoted_risk_line_is_accepted(self):
         for body in ("## Goal\n**Risk:** human (4, 7)\n", "> _Risk: human (4, 7)_\n", "- `Risk: human (4, 7)`\n"):
             with self.subTest(body=body):

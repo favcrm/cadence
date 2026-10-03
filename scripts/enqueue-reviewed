@@ -43,6 +43,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import unicodedata
 
 ME = "enqueue-reviewed"
 DEFAULT_NOTES_DIR = "/var/www/agent-notes"
@@ -419,19 +420,35 @@ def glob_list(toml_text, key_path):
     return node if isinstance(node, list) and all(isinstance(g, str) for g in node) else None
 
 
+# A ticket body that can hide or disguise a line from the rendered page gives
+# no scope approval (a per-PR approval still works): a Unicode format
+# character, an HTML character reference, or hidden HTML.
+HIDING_HTML = re.compile(r"<!--|<[^>]*\bhidden\b|display\s*:\s*none", re.I)
+HTML_REF = re.compile(r"&(?:#\w+|[a-z][a-z0-9]*);", re.I)
+RISK_LOOSE = re.compile(r"r\w?s\W*k\W*:")
+
+
+def hides_text(text):
+    return (any(unicodedata.category(c) == "Cf" for c in text)
+            or HTML_REF.search(text) is not None or HIDING_HTML.search(text) is not None)
+
+
 def risk_line(text, ticket=False):
     """The one `Risk:` line (stripped, without the label), or None when there
     is none or MORE THAN ONE (fail closed: which one counts is unknowable).
-    `ticket` (a ticket body) counts EVERY line that contains `Risk:` once
-    Markdown markers are stripped, fenced code and HTML comments included:
-    the rendered page and this script cannot disagree on which line is the
-    one when none is skipped. That one line must itself start with `Risk:`."""
+    `ticket` (a ticket body) refuses text that can hide a line (`hides_text`),
+    then counts EVERY line that loosely looks like `Risk:` after NFKC and
+    casefold (lookalike letters, fullwidth forms, lowercase), fenced code
+    included. That one line must itself start with the ASCII `Risk:` once
+    Markdown markers are stripped."""
+    if ticket and hides_text(text or ""):
+        return None
     lines = []
     for raw in (text or "").splitlines():
         l = raw.strip()
         if ticket:
             l = re.sub(r"[*_`]", "", l).lstrip(" \t>-").strip()
-            if "Risk:" in l:
+            if RISK_LOOSE.search(unicodedata.normalize("NFKC", l).casefold()):
                 lines.append(l[5:].strip() if l.startswith("Risk:") else None)
         elif l.startswith("Risk:"):
             lines.append(l[5:].strip())
