@@ -1,6 +1,6 @@
 # Integration and production candidates
 
-## Current state: reduced-gate window
+## Current state: the permanent gate (CAD-1102; window history below)
 
 CAD-1073 / PR #738 retired the legacy integration suite. The required `test`
 check compiles and runs four `safety_floor` tests; green means that floor
@@ -24,7 +24,7 @@ historical full-gate design, not current measurements or restored coverage.
 See [development-loop simplification](DEV-CYCLE.md) for the #738 reflection,
 current local check recipe and approval handoff.
 
-## Full-gate delivery design (historical while reduced gates apply)
+## Full-gate delivery design (historical, before CAD-1073)
 
 PRs continue to target main. The merge queue keeps the full fmt, clippy,
 test, build and UI gates. Main CI reuses exact-SHA queue evidence and

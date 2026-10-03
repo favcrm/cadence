@@ -146,7 +146,6 @@ build/UI checks or changing branch protection requires baseline measurements
 and an operator decision. Do not change names in YAML before migrating the
 required-check policy safely.
 
-During the reduced window, restoring approval-lineage, inventory/shard and
-remote-CLI adversarial contracts is more important than optimizing dormant
-legacy benchmarks. Releases stay frozen until restoration is independently
-reviewed and authorized.
+CAD-1102 ended the reduced window: the current gate is permanent and releases
+are no longer frozen. New behavior checks follow AGENTS.md (CAD-1099), one
+acceptance check per enforced rule, not restoration of the retired suites.

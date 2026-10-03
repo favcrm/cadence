@@ -1,11 +1,10 @@
 # Split manifests and inventory guards
 
-## Current reduced-gate window (CAD-1073)
+## Retired inventories (CAD-1073, window ended by CAD-1102)
 
 The legacy integration inventories `tests/split-map*.toml` and their Rust
 inventory guard were retired by PR #738. Do not run `scripts/split-map-sync`
-to register new behavior tests during this window: its input manifests are
-absent. That script is historical tooling, not an active gate.
+to register new behavior tests: its input manifests are absent. That script is historical tooling, not an active gate.
 
 The live doctor/host source manifest is **`src/doctor/host/split-map.toml`**.
 Run `scripts/split-doctor-host --check` to verify its declared items and tests.

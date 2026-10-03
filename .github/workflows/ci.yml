@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       test_shards:
-        description: Legacy benchmark input (inactive during the reduced-gate window)
+        description: Legacy benchmark input (inactive since CAD-1073 retired the shard suite)
         type: choice
         options: ["4", "8"]
         default: "8"
