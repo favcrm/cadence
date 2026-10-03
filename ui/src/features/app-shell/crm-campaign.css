@@ -310,3 +310,26 @@
   border-radius: 0.5rem;
   background: var(--color-ink-875);
 }
+
+/* Draft strip: view toggle and actions stay on one row at desktop; the
+   technical-details disclosure sits inside the strip (CAD-1097). */
+.crm-strip-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+
+.crm-strip-actions button {
+  white-space: nowrap;
+}
+
+@media (min-width: 720px) {
+  .crm-strip-actions {
+    flex-wrap: nowrap;
+  }
+}
+
+.crm-strip-diag {
+  flex-basis: 100%;
+}

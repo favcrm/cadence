@@ -286,6 +286,18 @@ async function mounted() {
   await click(open);
   await settle(() => assert(host.querySelector('[data-tab="overview"][aria-selected="true"]'), "a later campaign opens on Overview"));
 
+  // ---- CAD-1097: an untouched brief is empty; Create sends and saves nothing.
+  await mount("&appview=new");
+  await settle(() => assert(dialog(), "dialog opens"));
+  equal((host.querySelector('[role="dialog"] textarea') as HTMLTextAreaElement).value, "", "the brief starts empty");
+  await fill('[role="dialog"] input', "Untouched brief");
+  const savesBefore = saveBodies.length;
+  const sendsBefore = sendBodies.length;
+  await click(byText("button", "Create and draft"));
+  await settle(() => assert(dialog() && text().includes("Describe what the email should say"), "an empty brief is refused"));
+  equal(saveBodies.length, savesBefore, "nothing is saved without a brief");
+  equal(sendBodies.length, sendsBefore, "no example text is sent");
+
   // ---- Assistant draft with a failed chat send: saved once, retry sends the brief only.
   await mount("&appview=new");
   await settle(() => assert(dialog(), "dialog opens"));

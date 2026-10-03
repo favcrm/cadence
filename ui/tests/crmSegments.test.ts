@@ -365,6 +365,9 @@ async function mountedFlow() {
   // Nobody can be emailed: warn pill and a blocking reason.
   await click(host.querySelector('[data-drawer="segment"] button[aria-label="Close segment details"]'));
   await settle(() => assert(host.querySelector('tr[data-record-id="seg-none"] .chip[data-tone="warn"]'), "list row shows the warn pill for zero eligible"));
+  await click(host.querySelector('tr[data-record-id="seg-none"] td'));
+  await settle(() => assert(host.querySelector('[data-drawer="segment"]'), "a click anywhere on the row opens the drawer"));
+  await click(host.querySelector('[data-drawer="segment"] button[aria-label="Close segment details"]'));
   await click(host.querySelector('tr[data-record-id="seg-none"] button'));
   await settle(() => assert(text().includes("5 match"), "zero-eligible segment drawer renders"));
   assert(host.querySelector('[data-drawer="segment"] .chip[data-tone="warn"]')?.textContent?.includes("0 can be emailed"), "zero-eligible pill is the warn tone");
