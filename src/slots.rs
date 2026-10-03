@@ -128,6 +128,20 @@ impl Default for SlotConfig {
 
 const GIB: u64 = 1 << 30;
 
+/// CAD-1021: the lane label of a caller that derives no pane and no
+/// managed endpoint. The daemon alone mints it (`unregistered:<uid>`,
+/// from the socket peer's kernel credentials) — it is never read from a
+/// request. A registered alias is `[A-Za-z0-9_-]` only (`check_alias`),
+/// so no agent can own this prefix and no label can name an agent. It
+/// buys a queue position and nothing else: such a lane ranks behind
+/// every registered waiter (see `Slots::rank`).
+pub const UNREGISTERED_LANE_PREFIX: &str = "unregistered:";
+
+/// Whether `lane` is a daemon-minted unregistered label.
+pub fn is_unregistered_lane(lane: &str) -> bool {
+    lane.starts_with(UNREGISTERED_LANE_PREFIX)
+}
+
 /// Slot kinds map to pools: `build`/`test` share `build_slots`,
 /// `suite` owns `suite_slots`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -573,6 +587,13 @@ impl Slots {
     /// 901-second waiter tie a two-hour one; raw stamps keep rank 0
     /// in true FIFO order.
     fn rank(&self, w: &SlotWait, now: f64) -> (u8, f64) {
+        // CAD-1021 (D5): an unregistered caller queues strictly behind
+        // every registered waiter — below starved, priority and
+        // ordinary alike — so a registered waiter never loses its place
+        // to a caller the daemon could not name.
+        if is_unregistered_lane(&w.lane) {
+            return (3, w.queued_at);
+        }
         if now - w.queued_at >= self.config.starve_secs as f64 {
             (0, w.queued_at)
         } else if matches!(w.kind, SlotKind::Test | SlotKind::Suite)
@@ -1697,6 +1718,7 @@ impl Slots {
                     .map(|h| {
                         let mut j = json!({"kind": h.kind.as_str(),
                                     "lane": h.lane, "pid": h.pid,
+                                    "unregistered": is_unregistered_lane(&h.lane),
                                     "age_secs": (now - h.acquired_at).max(0.0)});
                         if h.lane == caller.lane && caller.pids.contains(&h.pid) {
                             j["token"] = json!(h.token);
@@ -1723,7 +1745,8 @@ impl Slots {
                        "lane": w.lane, "pid": w.pid,
                        "wait_secs": (now - w.queued_at).max(0.0),
                        "wait_reason": w.wait_reason.as_str(),
-                       "starved": rank == 0, "priority": rank == 1})
+                       "starved": rank == 0, "priority": rank == 1,
+                       "unregistered": is_unregistered_lane(&w.lane)})
             }).collect::<Vec<_>>(),
             "config": {
                 "build_slots": self.config.build_slots,
@@ -3604,5 +3627,73 @@ mod tests {
         assert_eq!(status["waiting"][0]["wait_reason"], "memory");
         assert_eq!(status["config"]["check_slots"], 2);
         assert!(status["config"]["slot_mem_min_available_bytes"].is_u64());
+    }
+
+    /// CAD-1021 (D5): an unregistered lane never leaps a registered one,
+    /// even when it has waited past `starve_secs` and the registered
+    /// waiter arrived later.
+    #[test]
+    fn unregistered_waiter_ranks_behind_every_registered_waiter() {
+        let mut s = slots(1, 1, 60, &["qa-1"]);
+        acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
+        let u = format!("{UNREGISTERED_LANE_PREFIX}1000");
+        // The unregistered caller queues FIRST and keeps polling until it
+        // is long past the starve bound; registered waiters arrive later.
+        acquire(&mut s, SlotKind::Build, &u, "u1", 1.0);
+        for t in [20.0, 45.0, 70.0, 95.0] {
+            acquire(&mut s, SlotKind::Build, &u, "u1", t);
+        }
+        acquire(&mut s, SlotKind::Build, "dev-2", "w1", 96.0);
+        acquire(&mut s, SlotKind::Test, "qa-1", "w2", 97.0);
+        release_first(&mut s, "dev-1", 98.0);
+        let g = acquire(&mut s, SlotKind::Build, &u, "u1", 98.0);
+        assert_eq!(g["granted"], false, "unregistered must yield: {g}");
+        assert_eq!(g["position"], 3, "{g}");
+        // The registered waiters are served first, in their own order.
+        let g = acquire(&mut s, SlotKind::Test, "qa-1", "w2", 98.0);
+        assert_eq!(g["granted"], true, "{g}");
+        release_any(&mut s, 99.0);
+        let g = acquire(&mut s, SlotKind::Build, &u, "u1", 99.0);
+        assert_eq!(g["granted"], false, "still behind dev-2: {g}");
+        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w1", 99.0);
+        assert_eq!(g["granted"], true, "{g}");
+        release_any(&mut s, 100.0);
+        // Only with no registered waiter left does it get the slot.
+        let g = acquire(&mut s, SlotKind::Build, &u, "u1", 100.0);
+        assert_eq!(g["granted"], true, "{g}");
+    }
+
+    /// CAD-1021 part 4: `status` names each waiter's own reason and marks
+    /// an unregistered one — capacity first, then a disk floor.
+    #[test]
+    fn status_names_each_waiters_reason_and_flags_unregistered() {
+        let mut s = slots(1, 1, 900, &[]);
+        s.use_resources(Some(generous()));
+        acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
+        let u = format!("{UNREGISTERED_LANE_PREFIX}1000");
+        acquire(&mut s, SlotKind::Build, "dev-2", "w1", 1.0);
+        acquire(&mut s, SlotKind::Build, &u, "u1", 2.0);
+        let st = s.status(sc("dev-2", &[me()]), 3.0).0;
+        assert_eq!(st["pools"]["build"]["capacity"], 1);
+        assert_eq!(st["pools"]["build"]["held"][0]["lane"], "dev-1");
+        let w = st["waiting"].as_array().unwrap();
+        assert_eq!(w.len(), 2);
+        assert_eq!(
+            (w[0]["lane"].as_str(), w[0]["wait_reason"].as_str()),
+            (Some("dev-2"), Some("capacity"))
+        );
+        assert_eq!(
+            (w[1]["lane"].as_str(), w[1]["unregistered"].as_bool()),
+            (Some(u.as_str()), Some(true))
+        );
+        assert_eq!(w[0]["unregistered"], false);
+        // The disk floor drops; both waiters re-poll and report it.
+        s.use_resources(Some(below_disk()));
+        acquire(&mut s, SlotKind::Build, "dev-2", "w1", 4.0);
+        acquire(&mut s, SlotKind::Build, &u, "u1", 4.0);
+        let st = s.status(sc("dev-2", &[me()]), 5.0).0;
+        for w in st["waiting"].as_array().unwrap() {
+            assert_eq!(w["wait_reason"], "disk", "{w}");
+        }
     }
 }

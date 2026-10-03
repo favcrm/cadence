@@ -83,7 +83,7 @@ pub struct Intent {
 /// Who asked for a runner — derived from the connection by the daemon.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Requester {
-    /// `pane`, `managed` or `operator`.
+    /// `pane`, `managed`, `operator` or `unregistered` (CAD-1021).
     pub kind: String,
     /// The lane the runner's slot is accounted to.
     pub lane: String,

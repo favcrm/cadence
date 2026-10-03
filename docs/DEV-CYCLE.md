@@ -63,6 +63,25 @@ Add filtered tests for the behavior you changed; the floor is not that proof.
 Host Rust builds use four jobs and normal build-slot admission. If admission
 is unavailable, report that limitation rather than claiming local validation.
 
+### Queueing without a pane (subagents, operator shells)
+
+A caller with no registered pane or managed endpoint queues through the same
+daemon instead of running cargo unqueued:
+
+```sh
+cadence build-slot run build -- cargo build      # or: run test -- cargo test ...
+cadence build-slot launch <recipe>               # a build/test recipe with no env
+cadence build-slot status                        # capacity, holders, waiters + reason
+```
+
+The daemon labels such a caller `unregistered:<uid>` from the socket peer's
+credentials (a `--lane` or `CADENCE_ALIAS` is never read). It gets a slot
+and nothing else: its waiters rank behind every registered lane, it may ask
+only for `build`/`test` (not `suite`, `check`, or a hand-held `acquire`),
+it cannot release, reconcile or launch an env-passing recipe, and operator
+and agent actions still need their positive proof. `status` lists each
+waiter's reason: `capacity`, `memory` or `disk`.
+
 Do not push fixture fixes repeatedly just to discover compiler errors in CI.
 Do not change `RUSTC_WRAPPER` or disable tests to get a passing receipt.
 
