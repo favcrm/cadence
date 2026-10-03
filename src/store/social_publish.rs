@@ -387,6 +387,43 @@ impl Store {
         next.map(|id| read_row(&conn, &id)).transpose()
     }
 
+    /// CAD-1020: the driver's due batch — up to `limit` due queued intents,
+    /// oldest first. A read only; each row is still claimed by identity.
+    pub(crate) fn social_publish_due_batch(
+        &self,
+        now_epoch: i64,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=? ORDER BY due_epoch,intent_id LIMIT ?",
+        )?;
+        let ids = stmt
+            .query_map(params![now_epoch, limit as i64], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        ids.iter().map(|id| read_row(&conn, id)).collect()
+    }
+
+    /// CAD-1020: `processing` rows for the driver's status reconcile, as
+    /// `(intent_id, request, updated)`. `after` is a rotating cursor, so a
+    /// bounded sweep reaches every row over successive ticks.
+    pub(crate) fn social_publish_processing(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT intent_id,request,updated FROM social_publish_intents WHERE state='processing' AND (?1 IS NULL OR intent_id>?1) ORDER BY intent_id LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![after, limit.max(1) as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Re-prove approved material at dispatch for artifact-frozen intents.
     /// Reloads publication material (refuses stale binding or changed
     /// review itself) and requires artifact/asset digests to equal frozen.
