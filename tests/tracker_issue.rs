@@ -2109,10 +2109,28 @@ fn session_start_shows_tailscale_fix_failure_in_text_and_json() {
     seed_repo(&repo);
     let _sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
     let host = clean_host(tmp.path());
-    // A live pidfile makes the session inspect the persisted sharing
-    // mapping without starting or stopping a board. The pid check only
-    // probes liveness; the fake CLI fails before any board restart.
-    std::fs::write(state.join("ui.pid"), std::process::id().to_string()).unwrap();
+    // A live board pidfile makes the session inspect the persisted
+    // sharing mapping without starting or stopping a board; the fake CLI
+    // fails before any board restart. CAD-1081: only this state dir's
+    // `cadence … ui run` counts as the board, so plant a stand-in.
+    struct StandIn(std::process::Child);
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    use std::os::unix::process::CommandExt;
+    let stand_in = StandIn(
+        std::process::Command::new("python3")
+            .arg0("cadence")
+            .args(["-c", "import time; time.sleep(600)", "--state-dir"])
+            .arg(&state)
+            .args(["ui", "run"])
+            .spawn()
+            .unwrap(),
+    );
+    std::fs::write(state.join("ui.pid"), stand_in.0.id().to_string()).unwrap();
     std::fs::write(state.join("ui.json"), r#"{"port":3199,"tailscale":{"dns_name":"fake.ts.net","https_port":9450,"target":"http://127.0.0.1:3199"}}"#).unwrap();
     let fake = tmp.path().join("fake-bin");
     std::fs::create_dir(&fake).unwrap();

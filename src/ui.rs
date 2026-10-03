@@ -1010,16 +1010,82 @@ pub fn detached_pid(state_dir: &Path) -> Option<i32> {
     read_pid(state_dir)
 }
 
+/// The pidfile's pid, but only when it is this state dir's board
+/// (CAD-1081). A live pid is not enough: a `ui.pid` restored into a
+/// new container can name pid 1, another process, or a thread id, and
+/// trusting it skipped the board start and pointed `ui stop` at a
+/// stranger. Anything else is stale: the file is removed (only if it
+/// still holds what was read, so a concurrent `ui start` keeps its own).
 pub(crate) fn read_pid(state_dir: &Path) -> Option<i32> {
-    std::fs::read_to_string(pid_file(state_dir))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-        .filter(|pid| {
-            // Alive check — a stale pidfile is cleaned, not trusted.
-            unsafe { libc::kill(*pid, 0) == 0 }
-        })
+    let path = pid_file(state_dir);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let pid: i32 = text.trim().parse().ok()?;
+    if is_board_process(pid, state_dir) {
+        return Some(pid);
+    }
+    if std::fs::read_to_string(&path).is_ok_and(|now| now == text) {
+        let _ = std::fs::remove_file(&path);
+    }
+    None
+}
+
+/// Is `pid` a live thread-group leader running `cadence … ui run` for
+/// `state_dir`? Mirrors state-bridge.sh `kill_pidfile`: `Tgid` must be
+/// the pid itself (a thread id answers `kill(tid, 0)` too) and not a
+/// zombie, and the argv must be the one `start_inner` spawns.
+pub(crate) fn is_board_process(pid: i32, state_dir: &Path) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(str::trim)
+    };
+    if field("Tgid:") != Some(pid.to_string().as_str())
+        || field("State:").is_none_or(|s| s.starts_with('Z'))
+    {
+        return false;
+    }
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let argv: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    board_argv_matches(&argv, state_dir)
+}
+
+/// `argv` is `<…/cadence> [--state-dir <dir>] … ui run …`. A board for
+/// another state dir is not ours; one with no `--state-dir` (an older
+/// spawn) is accepted on the rest of its argv.
+pub(crate) fn board_argv_matches(argv: &[String], state_dir: &Path) -> bool {
+    let Some((exe, args)) = argv.split_first() else {
+        return false;
+    };
+    if Path::new(exe).file_name().and_then(|n| n.to_str()) != Some("cadence")
+        || !args.windows(2).any(|w| w[0] == "ui" && w[1] == "run")
+    {
+        return false;
+    }
+    let dir = args
+        .iter()
+        .position(|a| a == "--state-dir")
+        .and_then(|i| args.get(i + 1).cloned())
+        .or_else(|| {
+            args.iter()
+                .find_map(|a| a.strip_prefix("--state-dir=").map(str::to_string))
+        });
+    dir.is_none_or(|d| {
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        canon(Path::new(&d)) == canon(state_dir)
+    })
 }
 
 /// Tiny blocking GET — enough for health checks without an HTTP client
@@ -2334,5 +2400,31 @@ mod tests {
             }))
             .is_err()
         );
+    }
+}
+
+/// CAD-1081: the argv half of the board identity; the live halves
+/// (pid 1, another process, a thread id, the real board) run against
+/// the real binary in tests/board_tailnet.rs.
+#[cfg(test)]
+mod pidfile_tests {
+    use super::board_argv_matches;
+
+    #[test]
+    fn board_argv_names_cadence_ui_run_for_this_state_dir() {
+        let state = tempfile::TempDir::new().unwrap();
+        let s = state.path().to_str().unwrap();
+        let ok = |a: &[&str]| {
+            let argv: Vec<String> = a.iter().map(|x| x.to_string()).collect();
+            board_argv_matches(&argv, state.path())
+        };
+        assert!(ok(&["/r/cadence", "--state-dir", s, "ui", "run"]));
+        assert!(ok(&["cadence", &format!("--state-dir={s}"), "ui", "run"]));
+        assert!(ok(&["cadence", "ui", "run", "--host", "127.0.0.1"]));
+        assert!(!ok(&["/sbin/init", "splash"]));
+        assert!(!ok(&["cadence", "--state-dir", s, "ui", "start"]));
+        assert!(!ok(&["cadence", "--state-dir", "/elsewhere", "ui", "run"]));
+        assert!(!ok(&["python3", "--state-dir", s, "ui", "run"]));
+        assert!(!ok(&[]));
     }
 }

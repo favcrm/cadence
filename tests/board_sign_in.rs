@@ -252,6 +252,21 @@ fn hosted_public_only_detached_child_probe() {
     assert_eq!(status, 421, "detached agent read: {body}");
 }
 
+/// CAD-1081: a live process that `ui::read_pid` accepts as this state
+/// dir's board — argv `cadence --state-dir <state> ui run` — whose
+/// pid lands in `ui.pid`. It serves nothing; killed on drop.
+fn board_stand_in(state: &Path) -> UiProc {
+    let child = Command::new("python3")
+        .arg0("cadence")
+        .args(["-c", "import time; time.sleep(600)", "--state-dir"])
+        .arg(state)
+        .args(["ui", "run"])
+        .spawn()
+        .unwrap();
+    std::fs::write(state.join("ui.pid"), child.id().to_string()).unwrap();
+    UiProc(child)
+}
+
 #[test]
 fn hosted_public_only_cannot_be_persisted_over_a_running_open_board() {
     let pm = TempDir::new().unwrap();
@@ -276,10 +291,10 @@ fn hosted_public_only_cannot_be_persisted_over_a_running_open_board() {
     let opts_path = state.path().join("ui.json");
     let before = serde_json::to_vec_pretty(&saved).unwrap();
     std::fs::write(&opts_path, &before).unwrap();
-    // `read_pid` sees a live process, while the in-process board above
-    // supplies the real open HTTP peer. Never call `ui stop` on this fake
-    // pidfile: that would signal the test runner itself.
-    std::fs::write(state.path().join("ui.pid"), std::process::id().to_string()).unwrap();
+    // `read_pid` sees a board-shaped stand-in (CAD-1081: only this state
+    // dir's `cadence … ui run` counts), while the in-process board above
+    // supplies the real open HTTP peer.
+    let _stand_in = board_stand_in(state.path());
     let flags = ui::UiFlags {
         board_public_only: true,
         ..Default::default()
@@ -379,7 +394,7 @@ fn hosted_public_only_cannot_change_live_public_identity_without_restart() {
     let opts_path = state.path().join("ui.json");
     let before = serde_json::to_vec_pretty(&saved).unwrap();
     std::fs::write(&opts_path, &before).unwrap();
-    std::fs::write(state.path().join("ui.pid"), std::process::id().to_string()).unwrap();
+    let _stand_in = board_stand_in(state.path());
     let result = ui::run_cli(
         state.path(),
         &ui::UiAction::Start {

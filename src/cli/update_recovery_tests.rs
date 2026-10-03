@@ -214,12 +214,42 @@ fn cad628_real_host_preserves_semantic_rpc_refusal() {
     assert!(fixture.calls().is_empty());
 }
 
+struct OwnedBoard(std::process::Child);
+impl Drop for OwnedBoard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// CAD-1081: a stand-in `ui::read_pid` accepts as this state dir's board
+/// (argv `cadence --state-dir <state> ui run <tail>`). The last tail
+/// argument, if any, is a file it writes once its argv is installed.
+fn board_stand_in(state: &Path, tail: &[&std::ffi::OsStr]) -> OwnedBoard {
+    use std::os::unix::process::CommandExt;
+    let script = "import pathlib, sys, time\n\
+                  if sys.argv[-1] != 'run': pathlib.Path(sys.argv[-1]).write_text('ready')\n\
+                  time.sleep(60)";
+    OwnedBoard(
+        Command::new("python3")
+            .arg0("cadence")
+            .args(["-c", script, "--state-dir"])
+            .arg(state)
+            .args(["ui", "run"])
+            .args(tail)
+            .spawn()
+            .unwrap(),
+    )
+}
+
 #[test]
 fn cad628_real_host_recreates_a_board_that_survived_the_failed_daemon() {
     let fixture = OldCli::new();
     fixture.claim("operator:cad628");
-    // The old CLI is a recorder; it never signals this fixture process.
-    std::fs::write(fixture.state.join("ui.pid"), std::process::id().to_string()).unwrap();
+    // The old CLI is a recorder; it never signals the stand-in. CAD-1081:
+    // only this state dir's `cadence … ui run` counts as a live board.
+    let board = board_stand_in(&fixture.state, &[]);
+    std::fs::write(fixture.state.join("ui.pid"), board.0.id().to_string()).unwrap();
     let result = test_seam::scoped(Asserted::Operator, || {
         fixture.host().restart(&fixture.binary)
     });
@@ -275,33 +305,23 @@ exit 1
 
 #[test]
 fn cad628_real_host_preserves_legacy_board_arguments_without_ui_json() {
-    struct OwnedBoard(std::process::Child);
-    impl Drop for OwnedBoard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     let fixture = OldCli::new();
     fixture.claim("operator:cad628");
     let dist = fixture.dir.path().join("legacy dist");
     let ready = fixture.dir.path().join("legacy-board-ready");
-    let mut board = OwnedBoard(
-        Command::new("python3")
-            .args([
-                "-c",
-                "import pathlib, sys, time; pathlib.Path(sys.argv[-1]).write_text('ready'); time.sleep(60)",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "3118",
-                "--dist",
-            ])
-            .arg(&dist)
-            .args(["--allow-host", "legacy.example"])
-            .arg(&ready)
-            .spawn()
-            .unwrap(),
+    let mut board = board_stand_in(
+        &fixture.state,
+        &[
+            "--host".as_ref(),
+            "127.0.0.1".as_ref(),
+            "--port".as_ref(),
+            "3118".as_ref(),
+            "--dist".as_ref(),
+            dist.as_os_str(),
+            "--allow-host".as_ref(),
+            "legacy.example".as_ref(),
+            ready.as_os_str(),
+        ],
     );
     // Model an already-serving board, not a child whose exec has not yet
     // installed its argv. Empty /proc cmdline during startup is transient.
