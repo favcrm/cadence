@@ -107,44 +107,43 @@ const isNote = (html: string) => html.includes('data-kind="system-note"');
 const isBriefing = (html: string) => html.includes('data-kind="briefing"');
 
 for (const density of ["full", "compact"] as const) {
-  const d = density;
 
   // 1. Permission entries render ThreadPermission, never the divider.
   const perm = render(
     sys({ text: "Permission requested (perm-7): ls", payload: { source: "permission" } }),
     density,
   );
-  ok(perm.includes('data-permission-thread="perm-7"'), `${d}: permission renders ThreadPermission`);
-  ok(!isDivider(perm), `${d}: permission is not the divider`);
+  ok(perm.includes('data-permission-thread="perm-7"'), `${density}: permission renders ThreadPermission`);
+  ok(!isDivider(perm), `${density}: permission is not the divider`);
   // Even a long multi-line permission text takes the permission route.
   const permLong = render(
     sys({ text: `Permission requested (perm-8)\n${"x".repeat(300)}`, payload: { source: "permission" } }),
     density,
   );
-  ok(permLong.includes('data-permission-thread="perm-8"'), `${d}: long permission still ThreadPermission`);
-  ok(!isNote(permLong), `${d}: long permission is not a SystemNote`);
+  ok(permLong.includes('data-permission-thread="perm-8"'), `${density}: long permission still ThreadPermission`);
+  ok(!isNote(permLong), `${density}: long permission is not a SystemNote`);
 
   // 2. Collapsed SystemNote vs divider.
   const bySource = render(sys({ payload: { source: "bootstrap" } }), density);
-  ok(isBriefing(bySource) && bySource.includes("Session briefing"), `${d}: bootstrap source is a briefing`);
-  ok(bySource.includes('aria-expanded="false"') && !bySource.includes("data-open"), `${d}: briefing closed`);
-  ok(!isDivider(bySource), `${d}: briefing is not the divider`);
+  ok(isBriefing(bySource) && bySource.includes("Session briefing"), `${density}: bootstrap source is a briefing`);
+  ok(bySource.includes('aria-expanded="false"') && !bySource.includes("data-open"), `${density}: briefing closed`);
+  ok(!isDivider(bySource), `${density}: briefing is not the divider`);
   const byMessage = render(sys({ message: "bootstrap-master" }), density);
-  ok(isBriefing(byMessage) && byMessage.includes('aria-expanded="false"'), `${d}: bootstrap-master message is a briefing`);
+  ok(isBriefing(byMessage) && byMessage.includes('aria-expanded="false"'), `${density}: bootstrap-master message is a briefing`);
   const multi = render(sys({ text: "line one\nline two" }), density);
-  ok(isNote(multi) && multi.includes("Details"), `${d}: newline is a SystemNote`);
-  ok(multi.includes('aria-expanded="false"') && !multi.includes("data-open"), `${d}: note closed`);
-  ok(!isDivider(multi), `${d}: newline is not the divider`);
+  ok(isNote(multi) && multi.includes("Details"), `${density}: newline is a SystemNote`);
+  ok(multi.includes('aria-expanded="false"') && !multi.includes("data-open"), `${density}: note closed`);
+  ok(!isDivider(multi), `${density}: newline is not the divider`);
   const long = render(sys({ text: "a".repeat(241) }), density);
-  ok(isNote(long), `${d}: 241 chars is a SystemNote`);
+  ok(isNote(long), `${density}: 241 chars is a SystemNote`);
   const edge = render(sys({ text: "a".repeat(240) }), density);
-  ok(isDivider(edge) && !isNote(edge), `${d}: 240 chars stays a divider`);
+  ok(isDivider(edge) && !isNote(edge), `${density}: 240 chars stays a divider`);
   const short = render(sys({ text: "just a line" }), density);
-  ok(isDivider(short) && short.includes("just a line"), `${d}: short line is the divider`);
-  ok(!isNote(short) && !isBriefing(short), `${d}: short line is not collapsed`);
+  ok(isDivider(short) && short.includes("just a line"), `${density}: short line is the divider`);
+  ok(!isNote(short) && !isBriefing(short), `${density}: short line is not collapsed`);
   const from = render(sys({ text: "joined", payload: { from: "alice" } }), density);
-  ok(from.includes("alice: ") && from.includes("joined"), `${d}: payload.from prefix`);
-  ok(!short.includes(": just"), `${d}: no prefix without payload.from`);
+  ok(from.includes('text-center">alice: joined</span>'), `${density}: payload.from prefix`);
+  ok(short.includes('text-center">just a line</span>'), `${density}: no prefix without payload.from`);
 
   // 3. Ref chips.
   const withRefs = render(
@@ -160,11 +159,11 @@ for (const density of ["full", "compact"] as const) {
     },
     density,
   );
-  ok((withRefs.match(/class="refchip/g) ?? []).length === 2, `${d}: one chip per ref`);
-  ok(withRefs.includes(">issue:CAD-1<") || withRefs.includes("issue:CAD-1"), `${d}: issue chip label`);
-  ok(withRefs.includes("agent:w1"), `${d}: agent chip label`);
+  ok((withRefs.match(/class="refchip/g) ?? []).length === 2, `${density}: one chip per ref`);
+  ok(withRefs.includes(">issue:CAD-1<"), `${density}: issue chip label`);
+  ok(withRefs.includes(">agent:w1<"), `${density}: agent chip label`);
   const noRefs = render(items.operator, density);
-  ok(!noRefs.includes("refchip") && !noRefs.includes("refsrow"), `${d}: operator without refs has no chips`);
+  ok(!noRefs.includes("refchip") && !noRefs.includes("refsrow"), `${density}: operator without refs has no chips`);
   const pendingRefs = render(
     {
       type: "pending",
@@ -173,6 +172,6 @@ for (const density of ["full", "compact"] as const) {
     },
     density,
   );
-  ok((pendingRefs.match(/class="refchip/g) ?? []).length === 1 && pendingRefs.includes("issue:CAD-9"), `${d}: pending refs render`);
-  ok(!render(items.pending, density).includes("refchip"), `${d}: pending without refs has no chips`);
+  ok((pendingRefs.match(/class="refchip/g) ?? []).length === 1 && pendingRefs.includes(">issue:CAD-9<"), `${density}: pending refs render`);
+  ok(!render(items.pending, density).includes("refchip"), `${density}: pending without refs has no chips`);
 }
