@@ -63,6 +63,33 @@ pub struct NewApproval<'a> {
 /// CAD-918: the latest per `(alias, project)` is the designation in force.
 pub const DESIGNATION_EVENT: &str = "approval_designation";
 
+/// CAD-96: the event an idle auto-stop records on the agent's own stream.
+/// Only the daemon's idle timer writes it, and only for a live, enabled,
+/// idle actor; no RPC appends an event of a caller-chosen kind.
+pub const AUTO_STOP_EVENT: &str = "agent_auto_stopped";
+
+/// CAD-413: work queued for an auto-stopped agent resumes it — recorded
+/// before the resume starts, so it supersedes the auto-stop marker and
+/// the sweep never retries the same stop.
+pub const AUTO_RESUME_EVENT: &str = "agent_auto_resumed";
+
+/// CAD-413: that resume failed (a refused start, or an open that never
+/// reached `ready`). The marker holds — no retry — until an operator
+/// resume or stop supersedes it, and it raises a needs-me row.
+pub const AUTO_RESUME_FAILED_EVENT: &str = "agent_auto_resume_failed";
+
+/// The newest of these is the agent's durable stop reason: an
+/// auto-stop, a manual stop (`stop_requested`), an open (`ready`), or
+/// an auto-resume in flight or failed. Events outlive a daemon restart,
+/// so the timer's stop is told apart from an operator's across one.
+pub const AUTO_STOP_MARKER_KINDS: &[&str] = &[
+    AUTO_STOP_EVENT,
+    "stop_requested",
+    "ready",
+    AUTO_RESUME_EVENT,
+    AUTO_RESUME_FAILED_EVENT,
+];
+
 /// A delegated approval the daemon verified (CAD-918).
 pub struct NewDelegated<'a> {
     pub approval: NewApproval<'a>,

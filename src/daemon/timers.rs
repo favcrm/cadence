@@ -186,18 +186,7 @@ pub const AUTO_STOP_FLOOR_SECS: u64 = 600;
 /// The timer checks at most this often (seconds of its clock).
 const AUTO_STOP_EVERY_SECS: f64 = 60.0;
 
-/// The event an auto-stop records on the agent's own stream.
-pub const AUTO_STOP_EVENT: &str = "agent_auto_stopped";
-
-/// CAD-413: work queued for an auto-stopped agent resumes it — recorded
-/// before the resume starts, so it supersedes the auto-stop marker and
-/// the sweep never retries the same stop.
-pub const AUTO_RESUME_EVENT: &str = "agent_auto_resumed";
-
-/// CAD-413: that resume failed (a refused start, or an open that never
-/// reached `ready`). The marker holds — no retry — until an operator
-/// resume or stop supersedes it, and it raises a needs-me row.
-pub const AUTO_RESUME_FAILED_EVENT: &str = "agent_auto_resume_failed";
+pub use crate::store::{AUTO_RESUME_EVENT, AUTO_RESUME_FAILED_EVENT, AUTO_STOP_EVENT};
 
 /// Event kinds that are bookkeeping, not delivery/report/turn work:
 /// they never reset an agent's idle clock. Everything else does — an
@@ -217,17 +206,8 @@ pub(super) const AUTO_STOP_PASSIVE_KINDS: &[&str] = &[
     "pane_tree_unowned",
 ];
 
-/// The newest of these is the agent's durable stop reason: an
-/// auto-stop, a manual stop (`stop_requested`), an open (`ready`), or
-/// an auto-resume in flight or failed. Events outlive a daemon restart,
-/// so the timer's stop is told apart from an operator's across one.
-pub(super) const AUTO_STOP_MARKER_KINDS: &[&str] = &[
-    AUTO_STOP_EVENT,
-    "stop_requested",
-    "ready",
-    AUTO_RESUME_EVENT,
-    AUTO_RESUME_FAILED_EVENT,
-];
+/// The agent's durable stop reason (see the store's definition).
+pub(super) use crate::store::AUTO_STOP_MARKER_KINDS;
 
 /// What the attached-client exemption can and cannot see.
 pub const AUTO_STOP_ATTACH_NOTE: &str = "attached-terminal exemption: pty panes via tmux \
