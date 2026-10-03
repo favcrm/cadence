@@ -6,6 +6,7 @@
 //! the production board on 3010. Every process this file spawns is killed
 //! by a drop guard, a failed assertion included.
 
+use cadence_agent::reaper;
 use serde_json::Value;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -64,7 +65,7 @@ impl Host {
             .env("CADENCE_PM_DIR", self.root.path().join("pm"))
             .env_remove("CADENCE_STATE_DIR")
             .env_remove("CADENCE_ALIAS");
-        let out = cmd.output().unwrap();
+        let out = reaper::output(&mut cmd).unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         serde_json::from_str(&text).unwrap_or_else(|e| {
             panic!(
@@ -90,13 +91,13 @@ struct Board<'a>(&'a Host);
 
 impl Drop for Board<'_> {
     fn drop(&mut self) {
-        let _ = Command::new(BINARY)
-            .arg("--state-dir")
+        let mut cmd = Command::new(BINARY);
+        cmd.arg("--state-dir")
             .arg(&self.0.state)
             .args(["ui", "stop"])
             .env("HOME", self.0.root.path().join("home"))
-            .env("CADENCE_PM_DIR", self.0.root.path().join("pm"))
-            .output();
+            .env("CADENCE_PM_DIR", self.0.root.path().join("pm"));
+        let _ = reaper::output(&mut cmd);
     }
 }
 
@@ -105,13 +106,9 @@ struct Bystander(Child);
 
 impl Bystander {
     fn new() -> Self {
-        Self(
-            Command::new("sleep")
-                .arg("600")
-                .stdout(Stdio::null())
-                .spawn()
-                .unwrap(),
-        )
+        let mut cmd = Command::new("sleep");
+        cmd.arg("600").stdout(Stdio::null());
+        Self(reaper::spawn(&mut cmd).unwrap())
     }
     fn pid(&self) -> i32 {
         self.0.id() as i32
