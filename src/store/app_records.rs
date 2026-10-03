@@ -105,6 +105,11 @@ CREATE TABLE IF NOT EXISTS app_record_revisions(
  body TEXT NOT NULL, body_digest TEXT NOT NULL,
  actor TEXT NOT NULL, at REAL NOT NULL,
  PRIMARY KEY(context_id, record_id, revision));
+CREATE TABLE IF NOT EXISTS app_record_consent_provenance(
+ context_id TEXT NOT NULL, record_id TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ method TEXT NOT NULL, note TEXT,
+ PRIMARY KEY(context_id, record_id, revision));
 CREATE TABLE IF NOT EXISTS app_record_csv_imports(
  request_id TEXT PRIMARY KEY, context_id TEXT NOT NULL,
  preview_token TEXT NOT NULL, result TEXT NOT NULL,
@@ -562,6 +567,16 @@ impl RecordStore {
                  created REAL NOT NULL, PRIMARY KEY(context_id, freeze_id))",
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            // CAD-1053 consent provenance: one idempotent forward
+            // migration; older files gain an empty table, version stays 1.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS app_record_consent_provenance(
+                 context_id TEXT NOT NULL, record_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 method TEXT NOT NULL, note TEXT,
+                 PRIMARY KEY(context_id, record_id, revision))",
+            )
+            .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
             // CAD-782 versioned email content: docs, immutable
             // revisions and assistant proposals. Idempotent forward
             // migration like the audience tables above; the version
@@ -837,6 +852,30 @@ impl RecordStore {
                 r.get::<_, f64>(3)?,
             ))
         })?;
+        let mut provenance: std::collections::HashMap<i64, (String, Option<String>)> =
+            std::collections::HashMap::new();
+        let mut prov_stmt = conn.prepare(
+            "SELECT revision,method,note FROM app_record_consent_provenance WHERE context_id=? AND record_id=?",
+        )?;
+        for row in prov_stmt.query_map(params![context, id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })? {
+            let (revision, method, note) = row?;
+            provenance.insert(revision, (method, note));
+        }
+        let with_provenance = |mut entry: Value, revision: i64| {
+            if let Some((method, note)) = provenance.get(&revision) {
+                entry["method"] = json!(method);
+                if let Some(note) = note {
+                    entry["note"] = json!(note);
+                }
+            }
+            entry
+        };
         let mut history = Vec::new();
         let mut email: Option<&str> = None;
         let mut sms: Option<&str> = None;
@@ -848,13 +887,13 @@ impl RecordStore {
             let current_email = profile.consent.email.as_str();
             if email != Some(current_email) {
                 email = Some(current_email);
-                history.push(json!({"revision": revision, "channel": "email", "state": current_email, "actor": actor, "at": at}));
+                history.push(with_provenance(json!({"revision": revision, "channel": "email", "state": current_email, "actor": actor, "at": at}), revision));
             }
             let current_sms = profile.consent.sms.as_ref().map(ConsentState::as_str);
             if sms != current_sms {
                 sms = current_sms;
                 if let Some(state) = current_sms {
-                    history.push(json!({"revision": revision, "channel": "sms", "state": state, "actor": actor, "at": at}));
+                    history.push(with_provenance(json!({"revision": revision, "channel": "sms", "state": state, "actor": actor, "at": at}), revision));
                 }
             }
         }
@@ -1048,6 +1087,21 @@ impl RecordStore {
         record_id: &str,
         expected: i64,
         profile: &CustomerProfile,
+        provenance: Option<&ConsentProvenance>,
+    ) -> Result<Value> {
+        self.update_record(context, record_id, expected, profile, provenance, false)
+    }
+
+    /// `from_import`: a CSV update row that grants consent is recorded
+    /// with the implied `imported` method instead of refused.
+    fn update_record(
+        &self,
+        context: &str,
+        record_id: &str,
+        expected: i64,
+        profile: &CustomerProfile,
+        provenance: Option<&ConsentProvenance>,
+        from_import: bool,
     ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(record_id, "record ID")?;
@@ -1069,6 +1123,23 @@ impl RecordStore {
         // A move onto another live row's normalized email is refused,
         // never merged; the row itself is excluded from the check.
         Self::email_conflict_in(&tx, context, record_id, profile)?;
+        let before: CustomerProfile = serde_json::from_value(current["profile"].clone())
+            .map_err(|_| Error::rejected("record integrity refused"))?;
+        let transition = consent_transition(&before.consent, &profile.consent);
+        let implied = ConsentProvenance {
+            method: ConsentMethod::Imported,
+            note: None,
+        };
+        let provenance = match (transition, provenance) {
+            (ConsentTransition::Grant, None) if from_import => Some(&implied),
+            (ConsentTransition::Grant, None) => {
+                return Err(Error::rejected("granting consent requires a method"))
+            }
+            (ConsentTransition::None, Some(_)) => {
+                return Err(Error::rejected("consent provenance needs a consent change"))
+            }
+            (_, given) => given,
+        };
         let revision = expected
             .checked_add(1)
             .ok_or_else(|| Error::rejected("record revision exhausted"))?;
@@ -1086,10 +1157,112 @@ impl RecordStore {
             params![context, record_id, revision, body, digest, now()],
         )
         .map_err(|e| Error::internal(e.to_string()))?;
+        if let Some(provenance) = provenance {
+            tx.execute(
+                "INSERT INTO app_record_consent_provenance(context_id,record_id,revision,method,note) VALUES(?, ?, ?, ?, ?)",
+                params![context, record_id, revision, provenance.method.as_str(), provenance.note],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+        }
         let result = json!({"record": self.show_in(&tx, context, record_id)?});
         tx.commit().map_err(|e| Error::internal(e.to_string()))?;
         Ok(result)
     }
+}
+
+/// How a customer was asked and answered, recorded with the consent
+/// change (CAD-1053). Granting requires one; withdrawing does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentMethod {
+    InPerson,
+    WebForm,
+    Written,
+    Imported,
+    Other,
+}
+
+impl ConsentMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InPerson => "in_person",
+            Self::WebForm => "web_form",
+            Self::Written => "written",
+            Self::Imported => "imported",
+            Self::Other => "other",
+        }
+    }
+}
+
+pub const CONSENT_NOTE_MAX: usize = 280;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsentProvenance {
+    pub method: ConsentMethod,
+    pub note: Option<String>,
+}
+
+impl ConsentProvenance {
+    /// Parse an untrusted `{method, note?}` value. Refusals name the
+    /// shape, never the content.
+    pub fn parse(value: &Value) -> Result<Self> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| Error::rejected("consent provenance must be an object"))?;
+        if object.keys().any(|key| key != "method" && key != "note") {
+            return Err(Error::rejected("consent provenance has unsupported fields"));
+        }
+        let method: ConsentMethod = serde_json::from_value(
+            object.get("method").cloned().unwrap_or(Value::Null),
+        )
+        .map_err(|_| {
+            Error::rejected(
+                "consent method must be in_person, web_form, written, imported or other",
+            )
+        })?;
+        let note = match object.get("note") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => {
+                let text = text.trim();
+                if text.chars().count() > CONSENT_NOTE_MAX || text.chars().any(char::is_control) {
+                    return Err(Error::rejected(
+                        "consent note is at most 280 characters with no control characters",
+                    ));
+                }
+                (!text.is_empty()).then(|| text.to_string())
+            }
+            Some(_) => return Err(Error::rejected("consent note must be text")),
+        };
+        Ok(Self { method, note })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConsentTransition {
+    None,
+    Withdraw,
+    Grant,
+}
+
+fn consent_transition(before: &CustomerConsent, after: &CustomerConsent) -> ConsentTransition {
+    let channels = [
+        (before.email.as_str(), after.email.as_str()),
+        (
+            before.sms.as_ref().map_or("unknown", ConsentState::as_str),
+            after.sms.as_ref().map_or("unknown", ConsentState::as_str),
+        ),
+    ];
+    let mut result = ConsentTransition::None;
+    for (was, now) in channels {
+        if was == now {
+            continue;
+        }
+        if now == "granted" {
+            return ConsentTransition::Grant;
+        }
+        result = ConsentTransition::Withdraw;
+    }
+    result
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2283,7 +2456,7 @@ impl RecordStore {
                 }
                 Apply::Update(profile, revision) => {
                     let stored =
-                        self.app_record_update(context, &row.record_id, *revision, profile);
+                        self.update_record(context, &row.record_id, *revision, profile, None, true);
                     match stored {
                         Ok(_) => {
                             applied += 1;

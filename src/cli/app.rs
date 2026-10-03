@@ -269,6 +269,13 @@ pub(crate) enum RecordAction {
         /// JSON file holding the customer profile object.
         #[arg(long)]
         profile: PathBuf,
+        /// How consent was given (in_person, web_form, written,
+        /// imported, other); required when the change grants consent.
+        #[arg(long)]
+        consent_method: Option<String>,
+        /// Optional consent note, at most 280 characters.
+        #[arg(long, requires = "consent_method")]
+        consent_note: Option<String>,
     },
     /// Preview bounded CSV text as per-row create/update/skip/error
     /// decisions without mutating anything; prints the preview token
@@ -819,10 +826,15 @@ fn record_params(action: &RecordAction) -> Result<(&'static str, serde_json::Val
             record_id,
             expected_revision,
             profile,
-        } => (
-            "app_record_update",
-            json!({"install_id": install_id, "context_id": context_id, "record_id": record_id, "expected_revision": expected_revision, "profile": read_record_profile(profile)?}),
-        ),
+            consent_method,
+            consent_note,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "record_id": record_id, "expected_revision": expected_revision, "profile": read_record_profile(profile)?});
+            if let Some(method) = consent_method {
+                params["consent_provenance"] = json!({"method": method, "note": consent_note});
+            }
+            ("app_record_update", params)
+        }
         RecordAction::CsvPreview {
             install_id,
             context_id,

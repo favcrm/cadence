@@ -15,7 +15,9 @@
 //! follow-up CAD-753-F2).
 use super::*;
 use crate::issue::app_catalog::workspace;
-use crate::store::app_records::{CsvAction, CsvDecision, CustomerProfile, RecordStore};
+use crate::store::app_records::{
+    ConsentProvenance, CsvAction, CsvDecision, CustomerProfile, RecordStore,
+};
 
 fn record_profile(params: &Value) -> Result<CustomerProfile> {
     let body = params
@@ -23,6 +25,14 @@ fn record_profile(params: &Value) -> Result<CustomerProfile> {
         .ok_or_else(|| Error::rejected("record profile is required"))?;
     CustomerProfile::parse(body)
         .map_err(|_| Error::rejected("record profile exceeds its supported shape or bounds"))
+}
+
+fn record_provenance(params: &Value) -> Result<Option<ConsentProvenance>> {
+    params
+        .get("consent_provenance")
+        .filter(|value| !value.is_null())
+        .map(ConsentProvenance::parse)
+        .transpose()
 }
 
 fn record_revision(params: &Value) -> Result<i64> {
@@ -141,6 +151,7 @@ impl Shared {
                 "record_id",
                 "expected_revision",
                 "profile",
+                "consent_provenance",
             ],
             "app_record_csv_preview" => &["install_id", "context_id", "csv_text"],
             "app_record_csv_import" => &[
@@ -211,6 +222,7 @@ impl Shared {
                 required_str(params, "record_id")?,
                 record_revision(params)?,
                 &record_profile(params)?,
+                record_provenance(params)?.as_ref(),
             ),
             "app_record_csv_preview" => records.app_record_csv_preview(context, &csv_text(params)?),
             "app_record_csv_import" => records.app_record_csv_import(
