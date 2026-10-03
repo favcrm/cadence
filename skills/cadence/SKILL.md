@@ -312,14 +312,20 @@ request waits — `build-slot status` names the `wait_reason`
 (`capacity`/`memory`/`disk`) — and never fails the caller outright.
 
 A lane also carries a `cargo` shim on its `.env` PATH (`<git-dir>/
-cadence-hooks/bin/cargo`, installed with the hook): `cargo
-build|clippy|check` run through a `build` slot, `cargo test` a `test`
-slot and `cargo nextest` a `suite` slot — so a lane's compile work is
-always admitted without any flag to remember. `cargo fmt`, `cargo add`
-and the other light subcommands pass straight to the real cargo, and a
-`cargo` run inside a held slot (`CADENCE_BUILD_SLOT_PID` naming a live
-holder) passes through rather than re-queueing on itself. The main
-checkout has no shim; nothing here touches a global config.
+cadence-hooks/bin/cargo`, installed with the hook). It routes cargo work
+through a slot by an *allowlist*: `cargo test` takes a `test` slot and
+`cargo nextest` a `suite` slot, and **every other** subcommand —
+`build`, `clippy`, `check`, `run`, `bench`, `doc`, `rustc`,
+`llvm-cov`, `package`, `publish`, any alias or unknown — takes a `build`
+slot, so no local compile escapes the queue. Only clearly-light
+subcommands pass straight to the real cargo: `fmt`, `metadata`, `tree`,
+`locate-project`, `version`, `help`, `add`, `remove`, `search`,
+`pkgid`, `verify-project`, `read-manifest`, `generate-lockfile`,
+`owner`, `login`, `logout`, `yank`, the `-h`/`--help`/`-V`/`--version`
+flags, and a bare `cargo`. A `cargo` run inside a held slot
+(`CADENCE_BUILD_SLOT_PID` naming a live holder) passes through rather
+than re-queueing on itself. The main checkout has no shim; nothing here
+touches a global config.
 
 `build-slot run check --recipe <name>` execs the recipe's *declared*
 argv — a trailing `<cmd>` that differs is refused, so a `check` grant

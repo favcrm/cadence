@@ -2287,16 +2287,19 @@ fn cargo_ungated_and_held_slot_pass_through() {
     std::fs::create_dir_all(&stubs).unwrap();
     stub_bins(&stubs);
     let path = shim_path(&shim, &stubs);
-    // `cargo fmt` is not a heavy compile — straight to real cargo.
+    // `cargo fmt` is on the light allowlist — straight to real cargo.
     run_shim(&shim, &["fmt"], &[("PATH", path.clone())]);
+    // `cargo --version` (a flag, not a subcommand) is light too.
+    run_shim(&shim, &["--version"], &[("PATH", path.clone())]);
     let clog = std::fs::read_to_string(stubs.join("cargo.log")).unwrap_or_default();
     assert!(
         clog.contains("real-cargo:fmt"),
         "fmt not passed through: {clog}"
     );
+    assert!(clog.contains("real-cargo:--version"), "{clog}");
     assert!(
         !stubs.join("cadence.log").exists(),
-        "ungated subcommand hit the slot"
+        "an allowlisted subcommand hit the slot"
     );
     // Inside a held slot (a real live pid named), a nested cargo
     // re-uses the hold — passes through, no re-queue deadlock.
@@ -2310,6 +2313,52 @@ fn cargo_ungated_and_held_slot_pass_through() {
     assert!(
         clog2.contains("real-cargo:build"),
         "held slot's cargo did not pass through: {clog2}"
+    );
+}
+
+/// The allowlist inverts the old denylist: `cargo run`, `doc`, `bench`,
+/// `rustc`, `llvm-cov`, `publish`, … compile, so they queue on `build`;
+/// an unknown subcommand or alias the allowlist does not name queues too.
+/// Before the inversion these passed straight through and escaped the
+/// queue entirely — defeating the point of a resource budget.
+#[test]
+fn cargo_compiling_and_unknown_subcommands_queue_as_build() {
+    let (_tmp, pm, state, _repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Allow", "--project", "demo"]).0);
+    let (_, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    let wt = PathBuf::from(out["worktree"].as_str().unwrap());
+    let shim = shim_dir(&wt).join("cargo");
+    let stubs = _tmp.path().join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    stub_bins(&stubs);
+    let path = shim_path(&shim, &stubs);
+    for sub in [
+        "run", "doc", "bench", "rustc", "llvm-cov", "publish", "nonsuch",
+    ] {
+        run_shim(&shim, &[sub], &[("PATH", path.clone())]);
+    }
+    let log = std::fs::read_to_string(stubs.join("cadence.log")).unwrap_or_default();
+    for sub in [
+        "run", "doc", "bench", "rustc", "llvm-cov", "publish", "nonsuch",
+    ] {
+        assert!(
+            log.contains(&format!("build-slot run build -- cargo {sub}")),
+            "cargo {sub} did not queue as build: {log}"
+        );
+    }
+    // None of them reached the real cargo outside the queue.
+    assert!(
+        !stubs.join("cargo.log").exists(),
+        "a compiling subcommand escaped the slot"
+    );
+    // The dedicated pools still route: test→test, nextest→suite.
+    run_shim(&shim, &["test"], &[("PATH", path.clone())]);
+    run_shim(&shim, &["nextest", "run"], &[("PATH", path)]);
+    let log = std::fs::read_to_string(stubs.join("cadence.log")).unwrap_or_default();
+    assert!(log.contains("build-slot run test -- cargo test"), "{log}");
+    assert!(
+        log.contains("build-slot run suite -- cargo nextest run"),
+        "{log}"
     );
 }
 

@@ -202,11 +202,13 @@ pub fn install_pre_push_hook(wt_dir: &Path) -> Result<PathBuf> {
 
 /// CAD-1021 slice 3: the lane's `cargo` shim, at
 /// `<git-dir>/cadence-hooks/bin/cargo`. Placed on the lane's PATH (via
-/// the worktree `.env`'s `PATH=` line) it routes the gated subcommands
-/// — build|clippy|check|test|nextest — through `cadence build-slot
-/// run <kind>` so a lane's cargo work is always admitted. Anything
-/// else (`cargo add`, `cargo fmt`, `cargo --version`, …) and every
-/// subcommand that does no heavy compile is passed straight through.
+/// the worktree `.env`'s `PATH=` line) it routes cargo work through
+/// `cadence build-slot run <kind>` so a lane's compiles are always
+/// admitted. The routing is an ALLOWLIST of clearly-light subcommands —
+/// everything else, including unknown subcommands and aliases, queues on
+/// the build pool. That is the operator's goal: no local compile escapes
+/// the queue (AGENTS.md — allowlists, not denylists). `cargo test` takes
+/// the test pool and `cargo nextest` the suite pool.
 ///
 /// Lane-local: the script and its PATH entry live under the lane's own
 /// git dir / `.env` — the main checkout and CI never see it. The shim
@@ -214,11 +216,14 @@ pub fn install_pre_push_hook(wt_dir: &Path) -> Result<PathBuf> {
 /// is never bricked by a missing daemon; the receipt/pre-push gate,
 /// not the shim, is the enforcement.
 const CARGO_SHIM: &str = r##"#!/bin/sh
-# CAD-1021: route gated cargo subcommands through `cadence build-slot run`.
-# `cargo fmt`/`add`/metadata do no heavy compile — pass them straight to
-# the real cargo. Inside a slot (CADENCE_BUILD_SLOT_PID names a live
-# holder) a nested cargo passes through too, so `build-slot run` of a
-# recipe that itself calls cargo never re-queues on itself.
+# CAD-1021: route cargo work through `cadence build-slot run`.
+# Only the clearly-light, never-compiling subcommands pass straight to
+# the real cargo — an allowlist (AGENTS.md: allowlists, not denylists),
+# so `cargo run`/`bench`/`doc`/`rustc`/`llvm-cov`/`package`/`publish`,
+# every alias and every unknown subcommand all queue as `build`.
+# Inside a slot (CADENCE_BUILD_SLOT_PID names a live holder) a nested
+# cargo passes through too, so `build-slot run` of a recipe that itself
+# calls cargo never re-queues on itself.
 
 real_cargo() {
     # Resolve the real cargo: the shim dir is never on this lookup's
@@ -238,14 +243,18 @@ if [ -n "$CADENCE_BUILD_SLOT_PID" ] && kill -0 "$CADENCE_BUILD_SLOT_PID" 2>/dev/
 fi
 
 case "${1:-}" in
-    build|clippy|check)
-        slot_kind=build ;;
+    # Allowlist — subcommands that never compile. A bare `cargo` (no
+    # subcommand) prints help; version/help flags are light too.
+    ''|fmt|metadata|tree|locate-project|version|-V|--version|help|-h|--help|\
+    add|remove|search|pkgid|verify-project|read-manifest|generate-lockfile|\
+    owner|login|logout|yank)
+        exec "$(real_cargo)" "$@" ;;
     test)
         slot_kind=test ;;
     nextest)
         slot_kind=suite ;;
     *)
-        exec "$(real_cargo)" "$@" ;;
+        slot_kind=build ;;
 esac
 
 # `cadence` the lane recorded in its env; fall back to PATH.

@@ -145,6 +145,7 @@ tests = [
     "cargo_build_in_a_lane_goes_through_build_slot",
     "cargo_ungated_and_held_slot_pass_through",
     "forged_slot_pid_does_not_skip_the_shim_queue",
+    "cargo_compiling_and_unknown_subcommands_queue_as_build",
 ]
 helpers = [
     "cli_dir",
