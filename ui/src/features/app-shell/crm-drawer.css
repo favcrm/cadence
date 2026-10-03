@@ -292,3 +292,81 @@
   height: 100%;
   background: var(--color-accent);
 }
+
+/* CAD-1053 customer drawer content and list chips. Tokens only. */
+.crm-sect {
+  margin-top: 1rem;
+}
+.crm-sect:first-child {
+  margin-top: 0;
+}
+.crm-sect h4 {
+  margin: 0 0 0.4rem;
+  font-size: var(--text-label);
+  font-weight: 500;
+  color: var(--color-ink-200);
+}
+.crm-consent-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+.crm-consent-cards .chip {
+  margin: 0.25rem 0;
+  background: var(--color-ink-800);
+  color: var(--color-ink-300);
+}
+.crm-consent-ok {
+  background: color-mix(in srgb, var(--color-ok) 14%, transparent);
+  color: var(--color-ok);
+}
+.crm-timeline {
+  display: grid;
+  gap: 0.75rem;
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 0.9rem;
+  border-left: 1px solid var(--color-ink-700);
+  font-size: var(--text-secondary);
+  color: var(--color-ink-200);
+}
+.crm-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.crm-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+button.chip {
+  border: 0;
+  cursor: pointer;
+  background: var(--color-ink-800);
+  color: var(--color-ink-300);
+}
+button.chip:hover,
+button.chip:focus-visible {
+  color: var(--color-ink-100);
+}
+.crm-chip-on {
+  background: color-mix(in srgb, var(--color-accent) 16%, transparent);
+  color: var(--color-ink-100);
+}
+.crm-row-open {
+  cursor: pointer;
+}
+.crm-row-open:hover {
+  background: var(--color-ink-850);
+}
+.crm-selection {
+  margin: 0 0 0.4rem;
+}
+@media (max-width: 480px) {
+  .crm-consent-cards {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

@@ -13,18 +13,22 @@ import Field from "./shared/Field";
 import { EmptyState, ErrorNotice, Loading, Notice } from "./shared/States";
 import DrawerShell, { type DrawerTab } from "./shared/DrawerShell";
 import {
+  activityItems,
+  buildConsentChange,
   buildCustomerProfile,
-  consentEntries,
+  CONSENT_METHODS,
+  CONSENT_NOTE_MAX,
+  consentLabel,
+  type ConsentSetting,
   EMPTY_CUSTOMER_FORM,
   formFromProfile,
   friendlyError,
   isConsentChoice,
   newCustomerId,
-  revisionEntries,
   viewProfile,
   type CustomerFormFields,
 } from "./customerProfile";
-import { hostActions, type HostRecord, type HostScope } from "./hostActions";
+import { hostActions, type ConsentMethod, type HostRecord, type HostScope } from "./hostActions";
 
 /**
  * The CRM workspace inside the trusted shared App shell (CAD-781
@@ -192,6 +196,27 @@ function CustomerList({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const cursor = cursors.length > 0 ? cursors[cursors.length - 1] : undefined;
+  // Filters and selection act on the rows already read (this page);
+  // the server search stays the only whole-list narrowing.
+  const [consentFilter, setConsentFilter] = useState("");
+  const [sourceFilter, setSourceFilter] = useState("");
+  const [tagFilter, setTagFilter] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const sources = Array.from(
+    new Set(records.map((r) => viewProfile(r.profile).source).filter((v): v is string => v !== null)),
+  ).sort();
+  const shown = records.filter((r) => {
+    const v = viewProfile(r.profile);
+    return (
+      (consentFilter === "" || v.consentEmail === consentFilter) &&
+      (sourceFilter === "" || v.source === sourceFilter) &&
+      (tagFilter === "" || v.tags.includes(tagFilter))
+    );
+  });
+  // Selection never outlives the rows it named.
+  useEffect(() => {
+    setSelected(new Set());
+  }, [records]);
 
   // Debounced search: typing never navigates, so no customer content
   // reaches the URL, history or session storage.
@@ -293,18 +318,96 @@ function CustomerList({
       )}
       {scope.contextId !== "" && viewer.operator && error === null && records.length > 0 && (
         <>
+          <div className="crm-filters" role="group" aria-label="Filter customers on this page">
+            <Select
+              value={consentFilter}
+              onChange={setConsentFilter}
+              options={[
+                { value: "", label: "Email consent: any" },
+                { value: "granted", label: "Granted" },
+                { value: "unknown", label: "Unknown" },
+                { value: "denied", label: "Withdrawn" },
+              ]}
+              aria-label="Filter by email consent"
+            />
+            <Select
+              value={sourceFilter}
+              onChange={setSourceFilter}
+              options={[{ value: "", label: "Source: any" }, ...sources.map((v) => ({ value: v, label: v }))]}
+              aria-label="Filter by source"
+            />
+            {tagFilter !== "" && (
+              <button type="button" className="chip crm-chip-on" onClick={() => setTagFilter("")} aria-label={`Clear tag filter ${tagFilter}`}>
+                tag: {tagFilter} ✕
+              </button>
+            )}
+          </div>
+          {selected.size > 0 && (
+            <p className="crm-selection text-label text-ink-300" role="status">
+              {selected.size} selected{" "}
+              <button type="button" className="lnk" onClick={() => setSelected(new Set())}>
+                Clear
+              </button>
+            </p>
+          )}
+          {shown.length === 0 && (
+            <EmptyState name="customers" title="No customers on this page match the filters">
+              Clear a filter to see this page's rows again.
+            </EmptyState>
+          )}
+          {shown.length > 0 && (
           <DataTable<HostRecord>
             label="Customers table — scroll horizontally to reach every column"
             wrapClassName="crm-table-wrap"
             tableClassName="crm-table"
             rowKey={(record) => record.id}
-            rowProps={(record) => ({ "data-record-id": record.id })}
+            rowProps={(record) => ({
+              "data-record-id": record.id,
+              className: "crm-row-open",
+              onClick: (e: { target: EventTarget }) => {
+                // A click on a control inside the row keeps its own meaning.
+                if ((e.target as HTMLElement).closest("button, input, a")) return;
+                onSelect(record.id);
+              },
+            })}
             columns={[
+              {
+                key: "select",
+                header: (
+                  <input
+                    type="checkbox"
+                    aria-label="Select all customers on this page"
+                    checked={shown.length > 0 && shown.every((r) => selected.has(r.id))}
+                    onChange={(e) =>
+                      setSelected(e.target.checked ? new Set(shown.map((r) => r.id)) : new Set())
+                    }
+                  />
+                ),
+                cell: (record) => (
+                  <input
+                    type="checkbox"
+                    aria-label={`Select ${viewProfile(record.profile).displayName}`}
+                    checked={selected.has(record.id)}
+                    onChange={(e) =>
+                      setSelected((prev) => {
+                        const next = new Set(prev);
+                        if (e.target.checked) next.add(record.id);
+                        else next.delete(record.id);
+                        return next;
+                      })
+                    }
+                  />
+                ),
+              },
               {
                 key: "name",
                 header: "Name",
                 cellClassName: "text-ink-100",
-                cell: (record) => viewProfile(record.profile).displayName,
+                cell: (record) => (
+                  <button type="button" className="lnk" onClick={() => onSelect(record.id)}>
+                    {viewProfile(record.profile).displayName}
+                  </button>
+                ),
               },
               {
                 key: "email",
@@ -315,40 +418,43 @@ function CustomerList({
               {
                 key: "tags",
                 header: "Tags",
-                cellClassName: "text-ink-300",
                 cell: (record) => {
-                  const view = viewProfile(record.profile);
-                  return (
-                    <>
-                      {view.tags.length > 0 ? view.tags.join(", ") : "—"}
-                      {view.source ? (
-                        <span className="num text-micro text-ink-500"> · {view.source}</span>
-                      ) : null}
-                    </>
+                  const tags = viewProfile(record.profile).tags;
+                  return tags.length > 0 ? (
+                    <span className="crm-chips">
+                      {tags.map((tag) => (
+                        <button key={tag} type="button" className="chip" title={`Filter by tag ${tag}`} onClick={() => setTagFilter(tag)}>
+                          {tag}
+                        </button>
+                      ))}
+                    </span>
+                  ) : (
+                    "—"
                   );
                 },
               },
               {
-                key: "consent",
-                header: "Consent",
-                cell: (record) => (
-                  <span className="chip" title="Email consent">
-                    {viewProfile(record.profile).consentEmail}
-                  </span>
-                ),
+                key: "source",
+                header: "Source",
+                cellClassName: "text-ink-300",
+                cell: (record) => viewProfile(record.profile).source ?? "—",
               },
               {
-                key: "open",
-                header: <span className="sr-only">Open</span>,
-                cell: (record) => (
-                  <button type="button" className="lnk" onClick={() => onSelect(record.id)}>
-                    Open
-                  </button>
-                ),
+                key: "consent",
+                header: "Email consent",
+                cell: (record) => {
+                  const state = viewProfile(record.profile).consentEmail;
+                  return (
+                    <span className={`chip ${state === "granted" ? "crm-consent-ok" : ""}`} title="Email consent">
+                      {consentLabel(state)}
+                    </span>
+                  );
+                },
               },
             ]}
-            rows={records}
+            rows={shown}
           />
+          )}
           <div className="crm-pager">
             <Button
               size="sm"
@@ -358,6 +464,7 @@ function CustomerList({
               ← Previous
             </Button>
             <span className="num text-micro text-ink-500" aria-live="polite">
+              {shown.length === records.length ? "" : `${shown.length} of `}
               {records.length} row{records.length === 1 ? "" : "s"}
               {truncated ? " · more on the server" : ""}
             </span>
@@ -387,12 +494,15 @@ function CustomerForm({
   pending,
   formError,
   formId,
+  hideConsent,
   onSubmit,
 }: {
   initial: CustomerFormFields;
   submitLabel: string;
   /** Set when a drawer footer owns the Save button; the form then has none. */
   formId?: string;
+  /** Edit hides consent: it changes only through Record consent, with provenance. */
+  hideConsent?: boolean;
   pending: boolean;
   formError: string | null;
   onSubmit: (fields: CustomerFormFields) => void;
@@ -487,6 +597,7 @@ function CustomerForm({
           )}
         </Field>
       </div>
+      {!hideConsent && (
       <div className="crm-field-row">
         <Field label="Email consent (explicit)" id="crm-consent-email" hint="No marketing until granted" className="crm-field">
           {(c) => (
@@ -513,6 +624,7 @@ function CustomerForm({
           )}
         </Field>
       </div>
+      )}
       {(fieldError ?? formError) && (
         <ErrorNotice bare>{fieldError ?? formError}</ErrorNotice>
       )}
@@ -523,6 +635,108 @@ function CustomerForm({
           </Button>
         </div>
       )}
+    </form>
+  );
+}
+
+const CONSENT_SETTINGS: { value: string; label: string }[] = [
+  { value: "granted", label: "Granted" },
+  { value: "unknown", label: "Unknown" },
+  { value: "denied", label: "Withdrawn" },
+];
+
+function asSetting(value: string | null): ConsentSetting {
+  return value === "granted" || value === "denied" ? value : "unknown";
+}
+
+/** Record consent: Email/SMS status, how it was given, optional note. */
+function ConsentForm({
+  profile,
+  formId,
+  formError,
+  onSubmit,
+}: {
+  profile: unknown;
+  formId: string;
+  formError: string | null;
+  onSubmit: (change: ReturnType<typeof buildConsentChange>) => void;
+}) {
+  const current = viewProfile(profile);
+  const [email, setEmail] = useState<ConsentSetting>(asSetting(current.consentEmail));
+  const [sms, setSms] = useState<ConsentSetting>(asSetting(current.consentSms));
+  const [method, setMethod] = useState<ConsentMethod | "">("");
+  const [note, setNote] = useState("");
+  const [fieldError, setFieldError] = useState<string | null>(null);
+  const granting =
+    (email === "granted" && current.consentEmail !== "granted") ||
+    (sms === "granted" && current.consentSms !== "granted");
+  return (
+    <form
+      id={formId}
+      className="grid gap-3"
+      onSubmit={(e) => {
+        e.preventDefault();
+        try {
+          onSubmit(buildConsentChange(profile, { email, sms, method: granting ? method : "", note }));
+        } catch (error: unknown) {
+          setFieldError(error instanceof ApiError ? error.message : String(error));
+        }
+      }}
+    >
+      <div className="crm-field-row">
+        <Field label="Email marketing" id="crm-rc-email" className="crm-field">
+          {(c) => (
+            <Select
+              id={c.id}
+              value={email}
+              onChange={(v) => { setEmail(asSetting(v)); setFieldError(null); }}
+              options={CONSENT_SETTINGS}
+              aria-label="Email marketing consent"
+              full
+            />
+          )}
+        </Field>
+        <Field label="SMS marketing" id="crm-rc-sms" className="crm-field">
+          {(c) => (
+            <Select
+              id={c.id}
+              value={sms}
+              onChange={(v) => { setSms(asSetting(v)); setFieldError(null); }}
+              options={CONSENT_SETTINGS}
+              aria-label="SMS marketing consent"
+              full
+            />
+          )}
+        </Field>
+      </div>
+      {granting && (
+        <Field label="How was it given?" id="crm-rc-method" hint="Kept in the customer's activity for audit" className="crm-field">
+          {(c) => (
+            <Select
+              id={c.id}
+              value={method}
+              onChange={(v) => { setMethod(v as ConsentMethod | ""); setFieldError(null); }}
+              options={[{ value: "", label: "Choose…" }, ...CONSENT_METHODS]}
+              aria-label="How consent was given"
+              full
+            />
+          )}
+        </Field>
+      )}
+      <Field label="Note (optional)" id="crm-rc-note" className="crm-field">
+        {(c) => (
+          <input
+            {...c}
+            className="field"
+            value={note}
+            onChange={(e) => { setNote(e.target.value); setFieldError(null); }}
+            maxLength={CONSENT_NOTE_MAX}
+            autoComplete="off"
+            placeholder="e.g. Signed at the counter, 2 Oct"
+          />
+        )}
+      </Field>
+      {(fieldError ?? formError) && <ErrorNotice bare>{fieldError ?? formError}</ErrorNotice>}
     </form>
   );
 }
@@ -610,7 +824,7 @@ function CustomerDrawer({
   const [record, setRecord] = useState<HostRecord | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [editing, setEditing] = useState(false);
+  const [mode, setMode] = useState<"view" | "edit" | "consent">("view");
   const [pending, setPending] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const reloadToken = `${scope.installId}:${scope.contextId}:${recordId}`;
@@ -618,7 +832,7 @@ function CustomerDrawer({
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    setEditing(false);
+    setMode("view");
     hostActions
       .show(scope, recordId)
       .then((next) => {
@@ -635,8 +849,7 @@ function CustomerDrawer({
   }, [reloadToken]);
 
   const view = record ? viewProfile(record.profile) : null;
-  const revisions = record ? revisionEntries(record) : [];
-  const consentTrail = record ? consentEntries(record) : [];
+  const timeline = record ? activityItems(record) : [];
 
   const initials = view
     ? view.displayName.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]?.toUpperCase()).join("")
@@ -652,6 +865,7 @@ function CustomerDrawer({
   };
   const ready = !loading && error === null && record !== null && view !== null;
 
+  const when = (at: number) => new Date(at * 1000).toISOString().slice(0, 10);
   const tabs: DrawerTab[] =
     ready && record !== null && view !== null
       ? [
@@ -660,74 +874,73 @@ function CustomerDrawer({
             label: "Overview",
             panel: (
               <>
-                <p className="text-micro text-ink-500 mb-2">
-                  Selection is chat context only — the server re-proves scope on every send.
-                </p>
-                <Detail
-                  className="crm-detail"
-                  label="Customer fields"
-                  items={[
-                    { key: "email", term: "Email", value: <span className="num">{view.email ?? "—"}</span> },
-                    { key: "phone", term: "Phone", value: <span className="num">{view.phone ?? "—"}</span> },
-                    { key: "tags", term: "Tags", value: view.tags.length > 0 ? view.tags.join(", ") : "—" },
-                    { key: "source", term: "Source", value: view.source ?? "—" },
-                    {
-                      key: "consent-email",
-                      term: "Email consent",
-                      value: <span className="chip">{view.consentEmail}</span>,
-                    },
-                    {
-                      key: "consent-sms",
-                      term: "SMS consent",
-                      value: <span className="chip">{view.consentSms ?? "unknown"}</span>,
-                    },
-                  ]}
-                />
+                <section className="crm-sect" aria-label="Consent">
+                  <h4>Consent</h4>
+                  <div className="crm-consent-cards">
+                    <div className="card px-3 py-2" data-consent="email">
+                      <div className="text-label text-ink-300">Email marketing</div>
+                      <span className={`chip ${view.consentEmail === "granted" ? "crm-consent-ok" : ""}`}>{consentLabel(view.consentEmail)}</span>
+                      <div className="text-micro text-ink-500">
+                        {view.consentEmail === "granted" ? "Can receive campaigns" : "No marketing until granted"}
+                      </div>
+                    </div>
+                    <div className="card px-3 py-2" data-consent="sms">
+                      <div className="text-label text-ink-300">SMS marketing</div>
+                      <span className={`chip ${view.consentSms === "granted" ? "crm-consent-ok" : ""}`}>{consentLabel(view.consentSms)}</span>
+                      <div className="text-micro text-ink-500">{view.consentSms === null ? "Not recorded" : "Per customer choice"}</div>
+                    </div>
+                  </div>
+                </section>
+                <section className="crm-sect" aria-label="Profile">
+                  <h4>Profile</h4>
+                  <Detail
+                    className="crm-detail"
+                    label="Customer fields"
+                    items={[
+                      { key: "email", term: "Email", value: <span className="num">{view.email ?? "—"}</span> },
+                      { key: "phone", term: "Phone", value: <span className="num">{view.phone ?? "—"}</span> },
+                      { key: "tags", term: "Tags", value: view.tags.length > 0 ? view.tags.join(", ") : "—" },
+                      { key: "source", term: "Source", value: view.source ?? "—" },
+                    ]}
+                  />
+                </section>
+                <section className="crm-sect" aria-label="Segments">
+                  <h4>Segments</h4>
+                  <p className="text-secondary text-ink-400">Membership is shown on each segment.</p>
+                </section>
+                <section className="crm-sect" aria-label="Campaigns">
+                  <h4>Campaigns</h4>
+                  <p className="text-secondary text-ink-400">Send history is shown on each campaign.</p>
+                </section>
               </>
             ),
           },
           {
             id: "activity",
             label: "Activity",
-            panel: (
-              <>
-                {consentTrail.length > 0 && (
-                  <section aria-label="Consent history">
-                    <h4 className="text-label font-medium text-ink-200">Consent history</h4>
-                    <ol className="crm-history">
-                      {consentTrail.map((entry) => (
-                        <li key={`${entry.revision}-${entry.channel}`} className="num text-label text-ink-300">
-                          r{entry.revision} · {entry.channel}: {entry.state} · {entry.actor} ·{" "}
-                          {new Date(entry.at * 1000).toISOString().slice(0, 10)}
-                        </li>
-                      ))}
-                    </ol>
-                  </section>
-                )}
-                {revisions.length > 0 && (
-                  <section aria-label="Revision history" className="mt-3">
-                    <h4 className="text-label font-medium text-ink-200">Revision history</h4>
-                    <ol className="crm-history">
-                      {revisions.map((entry) => (
-                        <li key={entry.revision} className="num text-label text-ink-300">
-                          r{entry.revision} · {entry.actor} · {entry.digest.slice(0, 18)}… ·{" "}
-                          {new Date(entry.at * 1000).toISOString().slice(0, 10)}
-                        </li>
-                      ))}
-                    </ol>
-                  </section>
-                )}
-                {consentTrail.length === 0 && revisions.length === 0 && (
-                  <p className="text-secondary text-ink-400">No activity recorded yet.</p>
-                )}
-              </>
-            ),
+            panel:
+              timeline.length > 0 ? (
+                <ol className="crm-timeline" aria-label="Activity">
+                  {timeline.map((item) => (
+                    <li key={item.key}>
+                      <span>{item.text}</span>
+                      {item.note && <span className="text-micro text-ink-400"> — “{item.note}”</span>}
+                      <div className="num text-micro text-ink-500">{when(item.at)}</div>
+                    </li>
+                  ))}
+                </ol>
+              ) : (
+                <p className="text-secondary text-ink-400">No activity recorded yet.</p>
+              ),
           },
           {
             id: "details",
             label: "Details",
             panel: (
               <section aria-label="Record diagnostics">
+                <p className="text-micro text-ink-500 mb-2">
+                  Selection is chat context only — the server re-proves scope on every send.
+                </p>
                 <p className="num text-micro text-ink-500">
                   Record <span className="num">{recordId}</span> · revision r{record.revision} · digest{" "}
                   {record.digest.slice(0, 18)}… · scope <span className="num">{scope.contextId || "none"}</span>
@@ -737,6 +950,20 @@ function CustomerDrawer({
           },
         ]
       : [];
+
+  const save = (profile: Record<string, unknown>, provenance?: { method: ConsentMethod; note?: string }) => {
+    if (record === null) return;
+    setPending(true);
+    setFormError(null);
+    void hostActions
+      .update(scope, recordId, record.revision, profile, provenance)
+      .then((next) => {
+        setRecord(next);
+        setMode("view");
+      })
+      .catch((e: unknown) => setFormError(friendlyError(e)))
+      .finally(() => setPending(false));
+  };
 
   return (
     <DrawerShell
@@ -764,55 +991,91 @@ function CustomerDrawer({
           <ErrorNotice onRetry={reload}>{error}</ErrorNotice>
         ) : undefined
       }
+      warning={
+        ready && view !== null && view.consentEmail !== "granted" ? (
+          <>
+            <b>{view.displayName} can't receive campaigns.</b>{" "}
+            {view.consentEmail === "denied" ? "Email consent was withdrawn." : "No email consent recorded."}
+          </>
+        ) : undefined
+      }
       edit={
-        editing && canWrite && ready && record !== null
-          ? {
-              formId: "crm-customer-edit",
-              title: "Edit profile — saving is refused if the record changed since you opened it",
-              pending,
-              onCancel: () => setEditing(false),
-              body: (
-                <CustomerForm
-                  key={record.revision}
-                  formId="crm-customer-edit"
-                  initial={formFromProfile(record.profile)}
-                  submitLabel="Save changes"
-                  pending={pending}
-                  formError={formError}
-                  onSubmit={(fields) => {
-                    setPending(true);
-                    setFormError(null);
-                    let profile: Record<string, unknown>;
-                    try {
-                      profile = buildCustomerProfile(fields);
-                    } catch (e: unknown) {
-                      setPending(false);
-                      setFormError(friendlyError(e));
-                      return;
-                    }
-                    void hostActions
-                      .update(scope, recordId, record.revision, profile)
-                      .then((next) => {
-                        setRecord(next);
-                        setEditing(false);
-                      })
-                      .catch((e: unknown) => setFormError(friendlyError(e)))
-                      .finally(() => setPending(false));
-                  }}
-                />
-              ),
-            }
+        mode !== "view" && canWrite && ready && record !== null
+          ? mode === "edit"
+            ? {
+                formId: "crm-customer-edit",
+                title: "Edit profile — saving is refused if the record changed since you opened it",
+                pending,
+                onCancel: () => setMode("view"),
+                body: (
+                  <CustomerForm
+                    key={record.revision}
+                    formId="crm-customer-edit"
+                    hideConsent
+                    initial={formFromProfile(record.profile)}
+                    submitLabel="Save changes"
+                    pending={pending}
+                    formError={formError}
+                    onSubmit={(fields) => {
+                      let profile: Record<string, unknown>;
+                      try {
+                        profile = buildCustomerProfile(fields);
+                      } catch (e: unknown) {
+                        setFormError(friendlyError(e));
+                        return;
+                      }
+                      save(profile);
+                    }}
+                  />
+                ),
+              }
+            : {
+                formId: "crm-customer-consent",
+                title: "Record consent",
+                saveLabel: "Save consent",
+                pending,
+                onCancel: () => setMode("view"),
+                body: (
+                  <ConsentForm
+                    key={record.revision}
+                    formId="crm-customer-consent"
+                    profile={record.profile}
+                    formError={formError}
+                    onSubmit={(change) => save(change.profile, change.provenance ?? undefined)}
+                  />
+                ),
+              }
           : null
       }
       menu={
-        ready && view?.email
-          ? [{ key: "copy-email", label: "Copy email", onSelect: () => void navigator.clipboard?.writeText(view.email ?? "") }]
+        ready
+          ? [
+              ...(view?.email
+                ? [{ key: "copy-email", label: "Copy email", onSelect: () => void navigator.clipboard?.writeText(view.email ?? "") }]
+                : []),
+              { key: "outbox", label: "View in Outbox", onSelect: () => {}, disabled: true, title: "Per-customer Outbox view is not available yet" },
+              ...(canWrite
+                ? [{ key: "archive", label: "Archive customer", onSelect: () => {}, destructive: true, disabled: true, title: "Archiving customers is not available yet" }]
+                : []),
+            ]
           : []
+      }
+      secondary={
+        ready && canWrite ? (
+          <>
+            <Button size="sm" disabled title="Adding to a segment from here is not available yet">
+              Add to segment
+            </Button>
+            <Button size="sm" onClick={() => { setMode("edit"); setFormError(null); }}>
+              Edit
+            </Button>
+          </>
+        ) : undefined
       }
       primary={
         ready && canWrite ? (
-          <Button size="sm" variant="primary" onClick={() => { setEditing(true); setFormError(null); }}>
-            Edit profile
+          <Button size="sm" variant="primary" onClick={() => { setMode("consent"); setFormError(null); }}>
+            Record consent
           </Button>
         ) : undefined
       }
