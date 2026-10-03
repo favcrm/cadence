@@ -2786,3 +2786,51 @@ impl ProviderAdapter for PiAdapter {
         self.shared.on_disconnect();
     }
 }
+
+#[cfg(test)]
+mod cad1098_tests {
+    use super::*;
+    use crate::master::Profile::{App, Home};
+
+    fn heads(rules: &[Value]) -> Vec<String> {
+        rules
+            .iter()
+            .map(|r| r["argv"][0].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// CAD-1098 Gate 1 (acceptance): the Pi guard's rules are chosen by
+    /// the session profile, and the file `open` writes for each session
+    /// carries ONLY that profile's rules — an app session's guard, then a
+    /// Home one over it, then an app one again: nothing carries over.
+    ///
+    /// Guard: `master::allowed_tools(profile)` in `pi_guard_rules`, and the
+    /// `profile` threaded through `write_pi_guard`.
+    #[test]
+    fn cad1098_pi_guard_rules_follow_the_session_profile() {
+        let (home, app) = (pi_guard_rules(Home), pi_guard_rules(App));
+        assert!(heads(&home).iter().any(|h| h == "issue"));
+        assert!(!app.is_empty());
+        assert!(heads(&app).iter().all(|h| h == "app"), "{app:?}");
+        assert!(app.iter().all(|r| home.contains(r)));
+        let dir = tempfile::Builder::new().prefix("c98p").tempdir().unwrap();
+        let rules_in = |path: &Path| -> String {
+            let text = std::fs::read_to_string(path).unwrap();
+            text.lines()
+                .find(|l| l.contains("\"argv\""))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let path = write_pi_guard(dir.path(), false, App).unwrap();
+        let first = rules_in(&path);
+        assert!(first.contains("\"argv\":[\"app\"") && !first.contains("\"argv\":[\"issue\""));
+        write_pi_guard(dir.path(), false, Home).unwrap();
+        assert!(rules_in(&path).contains("\"argv\":[\"issue\""));
+        write_pi_guard(dir.path(), false, App).unwrap();
+        assert_eq!(
+            rules_in(&path),
+            first,
+            "the Home rules carried into the app guard"
+        );
+    }
+}

@@ -1348,4 +1348,44 @@ mod tests {
         assert_eq!(result_status(&success, false), "completed");
         assert_eq!(result_status(&json!({"subtype": "odd"}), false), "failed");
     }
+
+    /// CAD-1098 Gate 1 (acceptance): the master's `--allowedTools` are
+    /// chosen by the session profile at launch. Home is the full set; an
+    /// app session holds only scoped `cadence app ...` verbs, a strict
+    /// subset of Home's, so no setup or admin verb is reachable from it;
+    /// and the profile never alters a non-master agent's launch.
+    ///
+    /// Guard: `master::allowed_tools(profile)` as used by
+    /// `build_command_for`.
+    #[test]
+    fn cad1098_master_allowed_tools_follow_the_session_profile() {
+        use crate::master::Profile::{App, Home};
+        let env = ProviderEnv::default();
+        let master = agent("master", json!({}));
+        let tools = |profile| {
+            flag_values(
+                &build_command_for(&env, &master, "s", false, None, profile),
+                "--allowedTools",
+            )
+        };
+        let home = tools(Home);
+        assert_eq!(home, crate::master::CLAUDE_ALLOWED_TOOLS);
+        assert!(home.iter().any(|t| t.starts_with("Bash(cadence issue ")));
+        let app = tools(App);
+        assert!(
+            !app.is_empty(),
+            "an app session must still hold the scoped verbs"
+        );
+        assert!(
+            app.iter()
+                .all(|t| t.starts_with("Bash(cadence app ") && home.contains(t)),
+            "{app:?}"
+        );
+        // A worker's launch ignores the profile.
+        let worker = agent("w1", json!({}));
+        assert_eq!(
+            build_command_for(&env, &worker, "s", false, None, Home),
+            build_command_for(&env, &worker, "s", false, None, App)
+        );
+    }
 }
