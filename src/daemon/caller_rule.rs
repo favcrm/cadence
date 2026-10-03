@@ -300,14 +300,26 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("agent_gc_plan", Rule::Read),
     ("agent_resume", Rule::OnAgent(Target::Alias, SelfService)),
-    ("slot_acquire", Rule::Handler("slot_caller (CAD-113/230)")),
-    ("slot_release", Rule::Handler("slot_caller (CAD-113/230)")),
-    ("slot_status", Rule::Handler("slot_caller (CAD-113/230)")),
+    (
+        "slot_acquire",
+        Rule::Handler("slot_or_unregistered: build/test run only for the unregistered label (CAD-113/230/1021)"),
+    ),
+    (
+        "slot_release",
+        Rule::Handler("slot_caller: no release for an unregistered caller (CAD-113/230/1021)"),
+    ),
+    (
+        "slot_status",
+        Rule::Handler("slot_or_unregistered: read-only, open to the unregistered label (CAD-1021)"),
+    ),
     ("slot_reconcile", Rule::Handler("proven_operator (CAD-276)")),
-    ("slot_launch", Rule::Handler("launch_requester (CAD-230b)")),
+    (
+        "slot_launch",
+        Rule::Handler("launch_requester: pane, endpoint, operator, or the unregistered label for env-less build/test recipes (CAD-230b/1021)"),
+    ),
     (
         "slot_runner",
-        Rule::Handler("connection_caller: a derived agent or the operator (CAD-230b/422)"),
+        Rule::Handler("connection_caller: a derived agent or the operator; the unregistered label reads only its own runner (CAD-230b/422/1021)"),
     ),
     (
         "approval_record",

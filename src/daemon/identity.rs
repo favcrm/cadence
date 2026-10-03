@@ -950,6 +950,36 @@ impl SlotWho {
     }
 }
 
+/// CAD-1021: a slot caller — a registered pane or managed endpoint, or
+/// the daemon-labelled unregistered caller that derives neither. Only
+/// [`Self::Unregistered`] is new; it carries no authority, only a lane
+/// label to queue under.
+pub(super) enum SlotPeer {
+    Known(SlotWho),
+    /// `lane` is `unregistered:<uid>`, minted by the daemon; the only
+    /// pid it may bind is the socket peer itself.
+    Unregistered {
+        lane: String,
+        peer: u32,
+    },
+}
+
+impl SlotPeer {
+    pub(super) fn lane(&self) -> &str {
+        match self {
+            SlotPeer::Known(w) => w.lane(),
+            SlotPeer::Unregistered { lane, .. } => lane,
+        }
+    }
+
+    pub(super) fn chain(&self) -> &[u32] {
+        match self {
+            SlotPeer::Known(w) => w.chain(),
+            SlotPeer::Unregistered { peer, .. } => std::slice::from_ref(peer),
+        }
+    }
+}
+
 /// An enrollment's owner generation, read from the owner row: the
 /// registration instant, the adapter's endpoint generation and the
 /// recorded provider pid. A re-registration, a reopen or a closed

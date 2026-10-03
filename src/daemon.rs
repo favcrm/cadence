@@ -9214,7 +9214,7 @@ mod auto_stop_timer {
 // at `crate::daemon::<Item>`; `pub(super)` lines re-bind moved
 // helpers at module scope (CAD-534).
 #[allow(unused_imports)]
-use identity::{Caller, SlotWho, VerifiedAgent};
+use identity::{Caller, SlotPeer, SlotWho, VerifiedAgent};
 pub use serve::HotStart;
 #[allow(unused_imports)]
 use serve::{
