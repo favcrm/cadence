@@ -3,8 +3,10 @@
 ## Design note
 
 A private Linux client transports one bounded host-stdin capsule to the fixed
-`/run/cadence-supervisor/grant.sock`. There is no CLI, RPC, HTTP route, selectable
-path/command, environment secret, temporary capsule file, signer or launcher.
+`/run/cadence-supervisor/grant.sock`. There is no generic CLI, RPC, HTTP route,
+selectable path/command, environment secret, temporary capsule file, signer or
+launcher. The fixed bundle has three no-argument executable entries; all remain
+closed at independently qualified image/bootstrap factories.
 The production entry resolves unavailable admission/trust/consume factories
 **before reading stdin**. No source in this batch installs or runs the client.
 
@@ -76,9 +78,12 @@ Root UID alone and caller reports cannot produce an admission.
 
 ## Explicit unavailable owner boundary
 
-This is **not** a privileged carrier/drop/observer implementation, durable
-current-owner adapter, retirement adapter, operational trust manifest,
-installation, image attestation, deployment or native eligibility result.
+The private `installer_bundle` now contains finite **source mechanics** for a
+non-setuid carrier/drop/fdexec, bounded procfs diagnostics and waiting bootstrap.
+It reuses existing capability sealing and held-FD hash/topology helpers. This is
+**not** a privileged execution/observer qualification, durable current-owner
+adapter, retirement adapter, operational trust manifest, installation, image
+attestation, deployment or native eligibility result.
 `production_admission`, receipt trust, durable consume, self-enrollment and live
 listener factories remain unavailable. Receipt verification is format evidence,
 not custody or current authority. Test paths and synthetic enrollment literals
@@ -91,6 +96,36 @@ for the UID0 receiver. A later explicitly reviewed owner must supply real
 root/drop/procfs/enrollment/retirement/trust and compatible mutual admission;
 caller metadata, synthetic digests or root UID cannot substitute. No ptrace
 capability, key, signing principal, live listener or launch authority is added.
+
+### Unelected fixed artifact and observable-policy selections
+
+Proposed source literals are `/opt/protected/bin/cadence-grant-install`,
+`/opt/protected/bin/cadence-installer-client` and
+`/opt/protected/bin/cadence-installer-observer`, root:root0755 under held
+root:root0755 ancestors. No artifact hashes or operational owner are elected.
+New fdexec policy is Linux x86_64 little-endian ET_EXEC only, bounded128MiB,
+with no PT_INTERP/PT_DYNAMIC/scripts/file capabilities/setuid/setgid. An
+unqualified dynamic startup graph is refused, not guessed.
+
+Construction-only bootstrap may permit one bounded withheld host stdin read;
+it is separate from signed enrollment/release/current-owner authority. EOF,
+trailing/oversized frame or deadline cannot open a socket or consume. The
+receiver r3 mapping/release adapter is awaiting the concrete root integration
+checkpoint; no new receipt-receiver wire change has been made at this source
+checkpoint. Existing UID0 admission and the independent production-refusal
+acceptance remain unchanged.
+
+Observer holds the real procfs PID directory and executable, compares actual
+IDs (including filesystem IDs), groups, five caps, NoNewPrivs, single-thread
+PID/TGID, starttime and user/PID/mount namespace correspondence before/after
+measurement. Exact protected-path inode plus bounded offset-preserving digest
+must match; a same-digest copy is insufficient. Target securebits/keepcaps are
+not exposed by procfs: diagnostic fields stay unavailable/null and qualified
+observation refuses. Querying the observer's own prctl would NOT measure the
+target. Only the waiting client can inspect its own prctl for construction;
+that is not external enrollment or earlier-root provenance. No ptrace fallback.
+Closed qualified carrier-seal provenance, if later selected, must remain a
+separate owner evidence type, never an invented procfs field.
 
 ## Acceptance and delivery
 

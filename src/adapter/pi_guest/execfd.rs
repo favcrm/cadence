@@ -148,7 +148,7 @@ fn stamp(file: &std::fs::File) -> Result<StatStamp> {
 /// bounded chunks. Rejects a file larger than a sane exec ceiling up front so
 /// the digest never streams an unbounded or growing blob. A `StatStamp` is
 /// taken before and after; any drift refuses.
-fn sha256_fd(file: &std::fs::File, size: u64) -> Result<[u8; 32]> {
+pub(crate) fn sha256_fd(file: &std::fs::File, size: u64) -> Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::FileExt;
     /// Refuse to hash something implausibly large for a binary — an exec'd

@@ -469,6 +469,12 @@ pub(crate) fn proc_session(pid: u32) -> Result<u32, String> {
 /// `None` when the process is gone or its `stat` is unreadable.
 pub(crate) fn proc_starttime(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_proc_starttime(&stat)
+}
+
+/// Pure field parser shared with the bounded held-procfd installer observer.
+/// Parsing a caller string is not process custody or an enrollment proof.
+pub(crate) fn parse_proc_starttime(stat: &str) -> Option<u64> {
     stat.rsplit_once(')')?
         .1
         .split_whitespace()

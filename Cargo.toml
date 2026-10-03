@@ -20,6 +20,20 @@ path = "src/main.rs"
 name = "cadence-agent-exec"
 path = "src/bin/cadence-agent-exec/main.rs"
 
+# CAD-1113: fixed non-setuid installer bundle. Source paths are unelected;
+# admission/qualified-image factories stay unavailable, no installation here.
+[[bin]]
+name = "cadence-grant-install"
+path = "src/bin/cadence-grant-install/main.rs"
+
+[[bin]]
+name = "cadence-installer-client"
+path = "src/bin/cadence-installer-client/main.rs"
+
+[[bin]]
+name = "cadence-installer-observer"
+path = "src/bin/cadence-installer-observer/main.rs"
+
 [features]
 # Embed the built `ui/` SPA into the binary. Requires `pnpm build` inside
 # `ui/` first; without the feature `cadence ui run --dist <dir>` serves
