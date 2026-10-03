@@ -184,7 +184,7 @@ fn cad771_cancel_only_before_dispatch() {
         .social_publish_cancel(&id, "install-harbour", None)
         .is_err());
     assert!(s
-        .social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        .social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
         .unwrap()
         .is_none());
     // Unknown intent ids are refused, never created.
@@ -203,18 +203,18 @@ fn cad771_claim_due_picks_only_due_queued_and_holds_on_stale_authority() {
     s.social_publish_schedule(&late).unwrap();
     // Not yet due: nothing claimable.
     assert!(s
-        .social_publish_claim_due(1_700_000_000, |_, _| Ok(true))
+        .social_publish_claim_due(1_700_000_000, |_, _, _| Ok(true))
         .unwrap()
         .is_none());
     // Stale authority at dispatch holds for a new human decision: the row
     // stays queued, nothing is claimed.
     assert!(s
-        .social_publish_claim_due(1_800_000_000, |_, _| Ok(false))
+        .social_publish_claim_due(1_800_000_000, |_, _, _| Ok(false))
         .unwrap()
         .is_none());
     // Current authority claims the early intent only.
     let claimed = s
-        .social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        .social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
         .unwrap()
         .unwrap();
     assert_eq!(claimed["intent"]["state"], "processing");
@@ -224,7 +224,7 @@ fn cad771_claim_due_picks_only_due_queued_and_holds_on_stale_authority() {
     );
     // A second claim finds nothing due-and-queued (late is future-dated).
     assert!(s
-        .social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        .social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
         .unwrap()
         .is_none());
 }
@@ -242,7 +242,7 @@ fn cad771_concurrent_claimants_have_exactly_one_winner() {
         let (s, barrier, wins) = (Arc::clone(&s), Arc::clone(&barrier), Arc::clone(&wins));
         handles.push(std::thread::spawn(move || {
             barrier.wait();
-            if s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+            if s.social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
                 .unwrap()
                 .is_some()
             {
@@ -288,7 +288,7 @@ fn cad771_report_needs_verified_receipt_and_never_bare_success() {
                 "provider_payload": "{\"id\":\"provider-post-1\"}"})
         )
         .is_err());
-    s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+    s.social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
         .unwrap()
         .unwrap();
     // A bare success string is insufficient proof.
@@ -372,14 +372,14 @@ fn cad771_refused_and_held_are_terminal_for_dispatch() {
     ] {
         let staged = s.social_publish_schedule(&intent(request)).unwrap();
         let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
-        s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        s.social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
             .unwrap()
             .unwrap();
         let done = s.social_publish_report(&id, decision, &receipt).unwrap();
         assert_eq!(done["intent"]["state"], decision);
         // Neither can be claimed again; held never silently republishes.
         assert!(s
-            .social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+            .social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
             .unwrap()
             .is_none());
     }
@@ -400,7 +400,7 @@ fn cad771_restart_loses_nothing_and_duplicates_nothing() {
         s.social_publish_show(&id).unwrap()["intent"]["state"],
         "queued"
     );
-    s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+    s.social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
         .unwrap()
         .unwrap();
     drop(s);
@@ -411,7 +411,7 @@ fn cad771_restart_loses_nothing_and_duplicates_nothing() {
         "processing"
     );
     assert!(s
-        .social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        .social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
         .unwrap()
         .is_none());
     // Reconcile by explicit report, then the receipt is durable too.
@@ -509,7 +509,7 @@ fn cad771_posted_receipt_must_match_frozen_intent() {
         .unwrap();
     let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
     let frozen = &staged["intent"]["frozen"];
-    s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+    s.social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
         .unwrap()
         .unwrap();
     let good = json!({"permalink": "https://www.instagram.com/p/ABC/",
@@ -583,7 +583,7 @@ fn cad771_note_evidence_with_foreign_binding_fails_closed() {
         .social_publish_schedule(&intent("req-foreign-note"))
         .unwrap();
     let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
-    s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+    s.social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
         .unwrap()
         .unwrap();
     for (field, value) in [
@@ -624,7 +624,7 @@ fn cad771_report_rejects_planted_foreign_upstream() {
         let s = Store::open(&path).unwrap();
         let staged = s.social_publish_schedule(&intent("req-planted")).unwrap();
         let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
-        s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        s.social_publish_claim_due(1_800_000_000, |_, _, _| Ok(true))
             .unwrap()
             .unwrap();
         note_matching_evidence(&s, &id);
@@ -666,5 +666,72 @@ fn cad771_report_rejects_planted_foreign_upstream() {
     assert_eq!(
         s.social_publish_show(&id).unwrap()["intent"]["state"],
         "processing"
+    );
+}
+
+/// CAD-1041: the send-now claim is identity-pinned — `claim_id` takes
+/// the named row or nothing, and the same single `queued→processing`
+/// CAS that guards `claim_due` guards it: two Store handles on one
+/// file, plus a raw second connection replaying the claim UPDATE, can
+/// never produce two claims of one intent. Proven by mutation: drop
+/// the `AND state='queued'` predicate and the raw replay re-takes the
+/// row.
+#[test]
+fn cad1041_claim_id_identity_and_two_handles_one_claim() {
+    use rusqlite::params;
+    let (dir, s1) = store();
+    let path = dir.path().join("t.sqlite3");
+    let id = s1.social_publish_schedule(&intent("req-claimid")).unwrap()["intent"]["intent_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Scope pin (CAD-1027 cancel predicate): another install, a context
+    // the row does not carry, or an unknown id is a no-claim.
+    s1.social_publish_schedule(&intent("req-claimid-b"))
+        .unwrap();
+    for (want, install, context) in [
+        (id.as_str(), "install-forged", None),
+        (id.as_str(), "install-harbour", Some("ctx-other")),
+        ("sp-never-scheduled", "install-harbour", None),
+    ] {
+        assert!(
+            s1.social_publish_claim_id(want, install, context)
+                .unwrap()
+                .is_none(),
+            "claimed {want} in {install}/{context:?}"
+        );
+    }
+    assert_eq!(
+        s1.social_publish_show(&id).unwrap()["intent"]["state"],
+        "queued"
+    );
+    assert!(s1
+        .social_publish_show_scoped(&id, "install-harbour", Some("ctx-other"))
+        .is_err());
+    // The named claim in its own scope wins once.
+    let claimed = s1
+        .social_publish_claim_id(&id, "install-harbour", None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed["intent"]["state"], "processing");
+    // A second Store handle on the same file cannot re-claim it.
+    let s2 = Store::open(&path).unwrap();
+    assert!(s2
+        .social_publish_claim_id(&id, "install-harbour", None)
+        .unwrap()
+        .is_none());
+    // A raw second connection replaying the claim UPDATE shape finds
+    // zero rows — the `AND state='queued'` predicate is the guard.
+    let conn2 = rusqlite::Connection::open(&path).unwrap();
+    let re_taken = conn2
+        .execute(
+            "UPDATE social_publish_intents SET state='processing',updated=? \
+             WHERE intent_id=? AND state='queued'",
+            params![1_800_000_001_i64, id],
+        )
+        .unwrap();
+    assert_eq!(
+        re_taken, 0,
+        "the claim predicate must refuse a row already processing"
     );
 }

@@ -104,6 +104,9 @@ struct FakeDoor {
     grants: Arc<Mutex<GrantAuthority>>,
     ledger: Arc<FakePublishLedger>,
     calls: Arc<Mutex<u64>>,
+    /// CAD-1041: staging (`/preflight`) requests. Staging never reaches
+    /// the provider, so it is counted here and never in `calls`.
+    stages: Arc<Mutex<u64>>,
     /// Owner-authorized destination the fake discovery returns. The fake
     /// trusts the enrolled connection namespace (operator-side) and
     /// enforces destination-exactness against this value; unset means the
@@ -128,6 +131,7 @@ impl FakeDoor {
         let grants = Arc::new(Mutex::new(GrantAuthority::default()));
         let ledger = Arc::new(FakePublishLedger::enabled());
         let calls = Arc::new(Mutex::new(0u64));
+        let stages = Arc::new(Mutex::new(0u64));
         let expected_destination = Arc::new(Mutex::new(None));
         let omit_binding = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let corrupt_binding = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -136,6 +140,7 @@ impl FakeDoor {
         let worker_grants = Arc::clone(&grants);
         let worker_ledger = Arc::clone(&ledger);
         let worker_calls = Arc::clone(&calls);
+        let worker_stages = Arc::clone(&stages);
         let worker_expected = Arc::clone(&expected_destination);
         let worker_omit = Arc::clone(&omit_binding);
         let worker_forgeries = Arc::clone(&status_forgeries);
@@ -150,7 +155,9 @@ impl FakeDoor {
                 // not a provider send — it must NOT count toward the
                 // exactly-once send-call assertions.
                 let is_destinations_read = request.url().contains("/connectors/destinations");
-                if !is_destinations_read {
+                if request.url().ends_with("/preflight") {
+                    *worker_stages.lock().unwrap() += 1;
+                } else if !is_destinations_read {
                     *worker_calls.lock().unwrap() += 1;
                 }
                 let mut body = String::new();
@@ -173,6 +180,7 @@ impl FakeDoor {
             grants,
             ledger,
             calls,
+            stages,
             expected_destination,
             omit_binding,
             corrupt_binding,
@@ -364,6 +372,10 @@ impl FakeDoor {
     fn provider_calls(&self) -> u64 {
         *self.calls.lock().unwrap()
     }
+
+    fn stages(&self) -> u64 {
+        *self.stages.lock().unwrap()
+    }
 }
 
 /// Shared fake state bundled so the route stays under the argument
@@ -399,6 +411,61 @@ struct HttpSender {
     /// a second, sender-side injection point beside the door hook.
     status_forgeries:
         Mutex<HashMap<String, cadence_agent::platform::agenticos_external::publish::LedgerOutcome>>,
+    /// CAD-1041: scripted staging verdicts by key. An unscripted key
+    /// stages through the door's `/preflight` route, as the production
+    /// sender does.
+    preflights: Mutex<HashMap<String, Staging>>,
+    /// CAD-1041: scripted execute refusals by key — the code returns
+    /// before any wire call (e.g. `nothing_sent`).
+    execute_refusals: Mutex<HashMap<String, &'static str>>,
+    /// CAD-1041: a one-shot hook run while `key` stages — a test moves the
+    /// row between the send-now staging and its claim.
+    during_stage: Mutex<HashMap<String, StageHook>>,
+    /// CAD-1041: scripted status refusals by key (no wire call).
+    status_refusals: Mutex<HashMap<String, &'static str>>,
+    /// CAD-1041: a rendezvous every staging call for `key` waits at.
+    rendezvous: Mutex<HashMap<String, Arc<Rendezvous>>>,
+}
+
+/// Holds staging calls on one key until `want` have arrived (bounded), so
+/// racing send-nows have all passed their queued check before any claims.
+struct Rendezvous {
+    arrived: Mutex<u32>,
+    all: std::sync::Condvar,
+    want: u32,
+}
+
+impl Rendezvous {
+    fn new(want: u32) -> Arc<Self> {
+        Arc::new(Self {
+            arrived: Mutex::new(0),
+            all: std::sync::Condvar::new(),
+            want,
+        })
+    }
+
+    fn arrive(&self) {
+        let mut arrived = self.arrived.lock().unwrap();
+        *arrived += 1;
+        self.all.notify_all();
+        let _ = self
+            .all
+            .wait_timeout_while(arrived, Duration::from_secs(20), |n| *n < self.want)
+            .unwrap();
+    }
+
+    fn arrived(&self) -> u32 {
+        *self.arrived.lock().unwrap()
+    }
+}
+
+type StageHook = Box<dyn FnOnce() + Send>;
+
+/// A scripted staging verdict for one key.
+#[derive(Clone, Copy)]
+enum Staging {
+    Uncertain,
+    Refused(&'static str),
 }
 
 impl HttpSender {
@@ -407,7 +474,59 @@ impl HttpSender {
             base,
             behaviors: Mutex::new(HashMap::new()),
             status_forgeries: Mutex::new(HashMap::new()),
+            preflights: Mutex::new(HashMap::new()),
+            execute_refusals: Mutex::new(HashMap::new()),
+            during_stage: Mutex::new(HashMap::new()),
+            status_refusals: Mutex::new(HashMap::new()),
+            rendezvous: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn meet_at_stage(&self, key: &str, rendezvous: Arc<Rendezvous>) {
+        self.rendezvous
+            .lock()
+            .unwrap()
+            .insert(key.into(), rendezvous);
+    }
+
+    fn script_status_refusal(&self, key: &str, code: &'static str) {
+        self.status_refusals
+            .lock()
+            .unwrap()
+            .insert(key.into(), code);
+    }
+
+    fn on_stage(&self, key: &str, hook: StageHook) {
+        self.during_stage.lock().unwrap().insert(key.into(), hook);
+    }
+
+    /// Script the staging verdict for `key`; `None` stages at the door.
+    fn script_preflight(&self, key: &str, staging: Option<Staging>) {
+        let mut scripts = self.preflights.lock().unwrap();
+        match staging {
+            Some(staging) => scripts.insert(key.into(), staging),
+            None => scripts.remove(key),
+        };
+    }
+
+    fn script_execute_refusal(&self, key: &str, code: &'static str) {
+        self.execute_refusals
+            .lock()
+            .unwrap()
+            .insert(key.into(), code);
+    }
+
+    /// The exact binding as the fake door reads it.
+    fn wire(binding: &SendBinding) -> Value {
+        json!({"key": binding.key,
+            "connection_id": binding.connection_id,
+            "toolkit": binding.toolkit.as_str(),
+            "destination_id": binding.destination_id,
+            "caption_digest": binding.caption_digest,
+            "image_digest": binding.image_digest,
+            "cadence_run_id": binding.cadence_run_id,
+            "cadence_effect_id": binding.cadence_effect_id,
+            "grant_id": binding.grant_id})
     }
 
     fn forge_status(
@@ -512,6 +631,14 @@ impl cadence_agent::platform::agenticos_external::publish::PublishSender for Htt
         cadence_agent::platform::agenticos_external::publish::LedgerOutcome,
         cadence_agent::platform::agenticos_external::publish::Refusal,
     > {
+        if let Some(code) = self.execute_refusals.lock().unwrap().get(&binding.key) {
+            return Err(
+                cadence_agent::platform::agenticos_external::publish::Refusal::new(
+                    *code,
+                    "scripted: nothing left this client",
+                ),
+            );
+        }
         let behavior = self
             .behaviors
             .lock()
@@ -519,24 +646,48 @@ impl cadence_agent::platform::agenticos_external::publish::PublishSender for Htt
             .get(&binding.key)
             .copied()
             .unwrap_or(FakeProviderBehavior::Post);
-        let verdict = self.post(
-            "/v1/device/publish/exec",
-            &json!({"key": binding.key,
-            "connection_id": binding.connection_id,
-            "toolkit": binding.toolkit.as_str(),
-            "destination_id": binding.destination_id,
-            "caption_digest": binding.caption_digest,
-            "image_digest": binding.image_digest,
-            "cadence_run_id": binding.cadence_run_id,
-            "cadence_effect_id": binding.cadence_effect_id,
-            "grant_id": binding.grant_id,
-            "behavior": match behavior {
-                FakeProviderBehavior::Post => "post",
-                FakeProviderBehavior::Refuse => "refuse",
-                FakeProviderBehavior::LoseResponseAfterAccept => "lose",
-            }}),
-        );
+        let mut wire = Self::wire(binding);
+        wire["behavior"] = json!(match behavior {
+            FakeProviderBehavior::Post => "post",
+            FakeProviderBehavior::Refuse => "refuse",
+            FakeProviderBehavior::LoseResponseAfterAccept => "lose",
+        });
+        let verdict = self.post("/v1/device/publish/exec", &wire);
         Self::outcome_of(binding, &verdict)
+    }
+
+    /// CAD-1041: stage at the door (grant liveness + exact binding), as
+    /// the production sender does, unless the key is scripted.
+    fn preflight(
+        &self,
+        binding: &SendBinding,
+    ) -> cadence_agent::platform::agenticos_external::publish::Preflight {
+        use cadence_agent::platform::agenticos_external::publish::{Preflight, Refusal};
+        let hook = self.during_stage.lock().unwrap().remove(&binding.key);
+        if let Some(hook) = hook {
+            hook();
+        }
+        let meet = self.rendezvous.lock().unwrap().get(&binding.key).cloned();
+        if let Some(meet) = meet {
+            meet.arrive();
+        }
+        match self.preflights.lock().unwrap().get(&binding.key).copied() {
+            Some(Staging::Uncertain) => {
+                return Preflight::Uncertain(Refusal::new("refused", "scripted: staging timed out"))
+            }
+            Some(Staging::Refused(code)) => {
+                return Preflight::Refused(Refusal::new(code, "scripted staging refusal"))
+            }
+            None => {}
+        }
+        let verdict = self.post("/v1/device/publish/preflight", &Self::wire(binding));
+        if verdict["verdict"] == "ok" {
+            return Preflight::Approved;
+        }
+        Preflight::Refused(Refusal::new(
+            Refusal::code_for(verdict["code"].as_str().unwrap_or("")),
+            "fake door refused staging",
+        ))
     }
 
     fn status(
@@ -548,6 +699,14 @@ impl cadence_agent::platform::agenticos_external::publish::PublishSender for Htt
     > {
         if let Some(forged) = self.status_forgeries.lock().unwrap().get(key) {
             return Ok(forged.clone());
+        }
+        if let Some(code) = self.status_refusals.lock().unwrap().get(key) {
+            return Err(
+                cadence_agent::platform::agenticos_external::publish::Refusal::new(
+                    *code,
+                    "scripted: status unavailable",
+                ),
+            );
         }
         let verdict = self.post("/v1/device/publish/status", &json!({"key": key}));
         let empty = SendBinding {
@@ -663,10 +822,19 @@ fn resolver_only_release(door: &FakeDoor) -> Release {
 }
 
 fn e2e_release(door: &FakeDoor) -> (Release, Arc<HttpSender>) {
+    e2e_release_with(door, |_| {})
+}
+
+/// `e2e_release` with further daemon option overrides.
+fn e2e_release_with(
+    door: &FakeDoor,
+    configure: impl FnOnce(&mut cadence_agent::daemon::ServeOptions),
+) -> (Release, Arc<HttpSender>) {
     let sender = Arc::new(HttpSender::new(format!("http://{}", door.addr)));
     let registered = Arc::clone(&sender);
     let dest_base = format!("http://{}", door.addr);
     let h = Release::with_options(move |opts, _| {
+        configure(opts);
         opts.social_publish_sender = Some(registered);
         // CAD-979 v9: the schedule/import path resolves the remote AOS
         // `connectionId` under a read credential — here a real
@@ -1899,6 +2067,13 @@ struct Board {
 }
 impl Board {
     fn serve(h: &Release) -> Self {
+        Self::serve_with(h, |_, _| {})
+    }
+    /// `serve` with `ServeOpts` overrides; `f` gets the leased port.
+    fn serve_with(
+        h: &Release,
+        f: impl FnOnce(&mut cadence_agent::ui::ServeOpts, u16) + Send + 'static,
+    ) -> Self {
         let lease = common::test_port();
         let port = lease.port;
         let (state, pm) = (h.daemon.state.clone(), tempfile::tempdir().unwrap());
@@ -1907,18 +2082,16 @@ impl Board {
         let (tx, rx) = std::sync::mpsc::channel();
         let bstop = stop.clone();
         let join = thread::spawn(move || {
-            cadence_agent::ui::serve(
-                &state,
-                &pm_dir,
-                &cadence_agent::ui::ServeOpts {
-                    host: "127.0.0.1".into(),
-                    port,
-                    stop: Some(bstop),
-                    startup: Some(tx),
-                    test_seam: true,
-                    ..Default::default()
-                },
-            )
+            let mut opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(bstop),
+                startup: Some(tx),
+                test_seam: true,
+                ..Default::default()
+            };
+            f(&mut opts, port);
+            cadence_agent::ui::serve(&state, &pm_dir, &opts)
         });
         rx.recv_timeout(Duration::from_secs(10))
             .expect("board up")
@@ -2307,4 +2480,828 @@ fn cad1027_daemon_refuses_unminted_approval_shape() {
             .unwrap()["intent"]["state"],
         "queued"
     );
+}
+
+/// CAD-1041 adversarial (written before the guard): the operator's
+/// send-now claims ONE named queued intent by identity, stages it,
+/// dispatches once through the shared path, then reconciles via status
+/// — never a re-send, never another intent, and only an operator may
+/// invoke it. Each refusal keeps the provider-call count unchanged.
+///
+/// CAD-1041: send-now params in the intent's own install and context.
+fn send_now_params(id: &str, install: &str, context: &Value) -> Value {
+    json!({"intent_id": id, "install_id": install, "context_id": context["id"]})
+}
+
+/// Schedule one queued intent and return `(intent_id, request_key)`.
+#[allow(clippy::too_many_arguments)]
+fn send_now_fixture(
+    h: &Release,
+    context: &Value,
+    run: &Value,
+    bundle: &str,
+    install: &str,
+    request: &str,
+    due: i64,
+) -> (String, String) {
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(context, run, bundle, install, request, due),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(intent["state"], "queued");
+    (
+        intent["intent_id"].as_str().unwrap().to_owned(),
+        intent["request"].as_str().unwrap().to_owned(),
+    )
+}
+
+#[test]
+fn cad1041_send_now_posts_the_named_intent_once() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "sn");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-send-ok",
+        epoch_now() + 3600, // future due — the click is the trigger
+    );
+    let out = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(out["state"], "posted", "{out}");
+    // One staging request at the door, then the single exec POST.
+    assert_eq!(door.stages(), 1, "send-now stages once before the claim");
+    assert_eq!(
+        *door.calls.lock().unwrap(),
+        1,
+        "the single exec POST — exactly once"
+    );
+    // A second send-now on a posted row refuses without a provider call.
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("queued"), "{err}");
+    assert_eq!(*door.calls.lock().unwrap(), 1);
+}
+
+#[test]
+fn cad1041_agent_and_detached_child_never_send() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "sngate");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-gate",
+        epoch_now(),
+    );
+    // Agent caller: refused.
+    let err = h
+        .daemon
+        .agent_rpc(
+            "cc13-pw",
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("authority") || err.contains("operator"),
+        "{err}"
+    );
+    // Detached setsid child (unproven peer): refused.
+    let err = h
+        .daemon
+        .unproven_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("authority") || err.contains("operator"),
+        "{err}"
+    );
+    assert_eq!(*door.calls.lock().unwrap(), 0);
+    // The row is still queued — refusals never mutate.
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(shown["intent"]["state"], "queued");
+}
+
+#[test]
+fn cad1041_forged_id_never_claims_a_different_intent() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snid");
+    let (id_a, key_a) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-id-a",
+        epoch_now(),
+    );
+    let (id_b, _key_b) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-id-b",
+        epoch_now(),
+    );
+    // A forged id (valid shape, never scheduled) claims nothing.
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params("sp-forged-never-scheduled", &install, &context),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("no social publish intent with this id"),
+        "{err}"
+    );
+    // Send A by name: A posts on its own request key; B stays queued.
+    let out = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id_a, &install, &context),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(out["state"], "posted");
+    assert_eq!(out["request"].as_str().unwrap(), key_a);
+    let shown_b = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id_b}))
+        .unwrap();
+    assert_eq!(shown_b["intent"]["state"], "queued", "B must not move");
+    // One provider call, keyed to A's request — a head-of-queue claim
+    // would send B's key instead.
+    assert_eq!(*door.calls.lock().unwrap(), 1);
+    let keys = door.ledger.keys();
+    assert!(
+        !keys.is_empty() && keys.iter().all(|k| k == &key_a),
+        "keys: {keys:?} want only {key_a}"
+    );
+}
+
+/// CAD-1041 adversarial (review finding B4): send-now is scoped like the
+/// CAD-1027 cancel. Another install, another context or a dropped context
+/// refuses through the RPC and the board, stages nothing, sends nothing
+/// and leaves the row queued; only the intent's own scope sends it.
+#[test]
+fn cad1041_wrong_scope_never_stages_or_sends() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snscope-a");
+    let (other, _run_b, _bundle_b, _) = approved_run(&h, "snscope-b");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-scope",
+        epoch_now(),
+    );
+    let board = Board::serve(&h);
+    let path = format!("/api/social-publishes/{id}/send-now");
+    for scope in [
+        json!({"install_id": "install-forged", "context_id": context["id"]}),
+        json!({"install_id": install, "context_id": other["id"]}),
+        json!({"install_id": install}),
+    ] {
+        let mut params = scope.clone();
+        params["intent_id"] = json!(id);
+        let err = h
+            .daemon
+            .operator_rpc("social_publish_send_now", params)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("in this install and context"),
+            "{scope}: {err}"
+        );
+        let (code, text) = board.post(&h, &path, &scope);
+        assert!(
+            (400..500).contains(&code),
+            "HTTP sent outside scope {scope}: {code} {text}"
+        );
+    }
+    assert_eq!(door.stages(), 0, "an out-of-scope request staged");
+    assert_eq!(
+        *door.calls.lock().unwrap(),
+        0,
+        "an out-of-scope request sent"
+    );
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(shown["intent"]["state"], "queued");
+    let own = json!({"install_id": install, "context_id": context["id"]});
+    let (code, text) = board.post(&h, &path, &own);
+    assert_eq!(code, 200, "in-scope send-now refused: {text}");
+    assert!(text.contains("\"posted\""), "{text}");
+}
+
+/// CAD-1041 (should-fix): a send-now that loses its claim (the row left
+/// queued while it staged) returns the intent envelope marked not sent,
+/// never a bare `{sent:false}`, on the approved and the refused path.
+#[test]
+fn cad1041_lost_claim_returns_the_intent_envelope() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snlost");
+    for (tag, staging) in [
+        ("lost-ok", None),
+        ("lost-ref", Some(Staging::Refused("not_publishable"))),
+    ] {
+        let (id, key) = send_now_fixture(
+            &h,
+            &context,
+            &run,
+            &bundle,
+            &install,
+            &format!("cad1041-{tag}"),
+            epoch_now(),
+        );
+        sender.script_preflight(&key, staging);
+        let (db, moved) = (h.daemon.state.join("cadence.sqlite3"), id.clone());
+        sender.on_stage(
+            &key,
+            Box::new(move || {
+                rusqlite::Connection::open(db)
+                    .unwrap()
+                    .execute(
+                        "UPDATE social_publish_intents SET state='cancelled' WHERE intent_id=?",
+                        [&moved],
+                    )
+                    .unwrap();
+            }),
+        );
+        let out = h
+            .daemon
+            .operator_rpc(
+                "social_publish_send_now",
+                send_now_params(&id, &install, &context),
+            )
+            .unwrap();
+        assert_eq!(out["sent"], false, "{tag}: {out}");
+        assert_eq!(out["intent"]["intent_id"], id.as_str(), "{tag}: {out}");
+        assert_eq!(out["intent"]["state"], "cancelled", "{tag}: {out}");
+        let reason = out["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("left queued"), "{tag}: {out}");
+    }
+    assert_eq!(*door.calls.lock().unwrap(), 0, "a lost claim never sends");
+}
+
+#[test]
+fn cad1041_concurrent_double_click_one_provider_call() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "sndbl");
+    let (id, key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-dbl",
+        epoch_now(),
+    );
+    // Both clicks pass the queued check and meet in staging before
+    // either claims, so they race at the claim itself: the single CAS
+    // inside claim_id lets exactly one move queued→processing.
+    let meet = Rendezvous::new(2);
+    sender.meet_at_stage(&key, Arc::clone(&meet));
+    let clicks: Vec<_> = (0..2)
+        .map(|_| {
+            let (state, params) = (
+                h.daemon.state.clone(),
+                send_now_params(&id, &install, &context),
+            );
+            thread::spawn(move || {
+                cadence_agent::test_seam::scoped(
+                    cadence_agent::test_seam::Asserted::Operator,
+                    || cadence_agent::client::rpc(&state, "social_publish_send_now", params),
+                )
+            })
+        })
+        .collect();
+    let replies: Vec<Value> = clicks
+        .into_iter()
+        .map(|click| click.join().unwrap().expect("both clicks answer"))
+        .collect();
+    assert_eq!(
+        meet.arrived(),
+        2,
+        "the clicks never overlapped: {replies:?}"
+    );
+    let won = replies.iter().filter(|r| r["sent"] != false).count();
+    let lost = replies.iter().filter(|r| r["sent"] == false).count();
+    assert_eq!((won, lost), (1, 1), "{replies:?}");
+    assert!(
+        replies
+            .iter()
+            .all(|r| r["intent"]["intent_id"] == id.as_str()),
+        "{replies:?}"
+    );
+    assert_eq!(
+        *door.calls.lock().unwrap(),
+        1,
+        "exactly one provider call across the racing clicks"
+    );
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(shown["intent"]["state"], "posted");
+}
+
+#[test]
+fn cad1041_revoked_grant_sends_nothing() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snrev");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-rev",
+        epoch_now(),
+    );
+    // Revoke after schedule: staging refuses at the door, so the row is
+    // claimed only to be reported refused and no exec POST ever leaves.
+    door.grants.lock().unwrap().revoke(GRANT_FB);
+    let out = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(out["state"], "refused", "revoked grant: {out}");
+    let error = out["receipt"]["error"].as_str().unwrap_or("");
+    assert!(error.contains("grant_revoked"), "{out}");
+    assert_eq!(door.stages(), 1, "the refusing stage ran once");
+    assert_eq!(*door.calls.lock().unwrap(), 0, "no exec POST, no status");
+}
+
+/// CAD-1041: an uncertain stage leaves the row queued with nothing sent;
+/// once staging answers, the same click sends.
+#[test]
+fn cad1041_uncertain_staging_leaves_the_row_queued() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snunc");
+    let (id, key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-unc",
+        epoch_now(),
+    );
+    sender.script_preflight(&key, Some(Staging::Uncertain));
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("stays queued"), "{err}");
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(shown["intent"]["state"], "queued");
+    assert_eq!(*door.calls.lock().unwrap(), 0, "nothing reached the door");
+    sender.script_preflight(&key, None);
+    let out = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap();
+    assert_eq!(out["intent"]["state"], "posted", "{out}");
+    assert_eq!(*door.calls.lock().unwrap(), 1);
+}
+
+/// CAD-1041: a definitive staging refusal claims the row and reports it
+/// refused with the door's code; execute never runs.
+#[test]
+fn cad1041_refused_staging_reports_refused_without_execute() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snref");
+    let (id, key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-ref",
+        epoch_now(),
+    );
+    sender.script_preflight(&key, Some(Staging::Refused("not_publishable")));
+    let out = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(out["state"], "refused", "{out}");
+    let error = out["receipt"]["error"].as_str().unwrap_or("");
+    assert!(error.contains("not_publishable"), "{out}");
+    assert_eq!(*door.calls.lock().unwrap(), 0, "execute never ran");
+    assert_eq!(door.stages(), 0);
+}
+
+/// CAD-1041: `nothing_sent` from execute (staging stayed ambiguous inside
+/// the send) holds the row for a human; it is never burned `refused`.
+#[test]
+fn cad1041_nothing_sent_holds_the_row() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snheld");
+    let (id, key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-held",
+        epoch_now(),
+    );
+    sender.script_execute_refusal(&key, "nothing_sent");
+    let out = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(out["state"], "held", "{out}");
+    let reason = out["receipt"]["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("nothing was sent"), "{out}");
+    assert_eq!(*door.calls.lock().unwrap(), 0, "no exec POST left");
+}
+
+#[test]
+fn cad1041_overdue_intent_refuses_until_rescheduled() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snlate");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-late",
+        epoch_now() - 901, // > MAX_LATENESS
+    );
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("overdue"), "{err}");
+    assert_eq!(*door.calls.lock().unwrap(), 0);
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(shown["intent"]["state"], "queued");
+}
+
+/// CAD-1041 (should-fix): the lateness bound reads the daemon's operator
+/// clock, not the wall clock: 15 minutes and one second past due refuses
+/// (row queued, nothing sent); exactly 15 minutes past due still sends.
+#[test]
+fn cad1041_lateness_bound_reads_the_operator_clock() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let clock = Arc::new(AtomicI64::new(epoch_now()));
+    let reading = Arc::clone(&clock);
+    let (h, _s) = e2e_release_with(&door, move |opts| {
+        opts.operator_clock = Some(Arc::new(move || reading.load(Ordering::SeqCst)));
+    });
+    let (context, run, bundle, install) = approved_run(&h, "snclock");
+    // Due an hour ahead on the wall clock: only the operator clock can
+    // make it overdue.
+    let due = epoch_now() + 3600;
+    let (id, _key) = send_now_fixture(&h, &context, &run, &bundle, &install, "cad1041-clock", due);
+    clock.store(due + 15 * 60 + 1, Ordering::SeqCst);
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("more than 15 minutes overdue"), "{err}");
+    assert_eq!(*door.calls.lock().unwrap(), 0);
+    clock.store(due + 15 * 60, Ordering::SeqCst);
+    let out = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap();
+    assert_eq!(out["intent"]["state"], "posted", "{out}");
+}
+
+#[test]
+fn cad1041_send_now_board_route_reaches_the_same_gate() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snboard");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-board",
+        epoch_now() + 3600,
+    );
+    let board = Board::serve(&h);
+    // The operator's click through the HTTP peer posts the named row.
+    let (code, text) = board.post(
+        &h,
+        &format!("/api/social-publishes/{id}/send-now"),
+        &json!({"install_id": install, "context_id": context["id"]}),
+    );
+    assert_eq!(code, 200, "{code} {text}");
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["intent"]["state"], "posted", "{text}");
+    assert_eq!(*door.calls.lock().unwrap(), 1);
+    assert_eq!(door.stages(), 1);
+    // A second click on the posted row is refused, provider count flat.
+    let (code2, _text2) = board.post(
+        &h,
+        &format!("/api/social-publishes/{id}/send-now"),
+        &json!({"install_id": install, "context_id": context["id"]}),
+    );
+    assert!((400..500).contains(&code2), "{code2}");
+    assert_eq!(*door.calls.lock().unwrap(), 1);
+    assert_eq!(door.stages(), 1, "a refused replay never stages");
+    // An unsigned session cannot reach the write: sign-in is the gate.
+}
+
+/// A public-mode board whose platform issuer is a local stub, plus a
+/// signed-in `member` session on it: `(board, host, cookie)`. The test
+/// seam has no member assertion, so this is the public JWT path.
+fn member_session(h: &Release) -> (Board, String, String) {
+    use base64::Engine;
+    use ring::signature::KeyPair;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let signer = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[0x41; 32]).unwrap();
+    let jwks = json!({"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "k1",
+        "x": b64.encode(signer.public_key().as_ref())}]})
+    .to_string();
+    let stub = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let issuer = format!("http://{}", stub.server_addr().to_ip().unwrap());
+    thread::spawn(move || {
+        for request in stub.incoming_requests() {
+            let _ = request.respond(tiny_http::Response::from_string(jwks.clone()));
+        }
+    });
+    let public_issuer = issuer.clone();
+    let board = Board::serve_with(h, move |opts, port| {
+        let host = format!("acme.board.localhost:{port}");
+        opts.allow_hosts.push(host.clone());
+        opts.allow_origins.push(format!("http://{host}"));
+        opts.public = Some(cadence_agent::ui::PublicBoard {
+            host,
+            authorize_url: format!("{public_issuer}/v2/board/authorize"),
+            issuer: public_issuer,
+            company: "co_1".into(),
+        });
+    });
+    let host = format!("acme.board.localhost:{}", board.port);
+    let now = epoch_now();
+    let claims = json!({"iss": issuer, "aud": host, "sub": "usr_member",
+        "email": "member@example.com", "name": "Member", "company": "co_1",
+        "role": "member", "iat": now - 5, "exp": now + 30, "jti": "jti-cad1041-member"});
+    let head = b64.encode(json!({"alg": "EdDSA", "typ": "JWT", "kid": "k1"}).to_string());
+    let signed = format!("{head}.{}", b64.encode(claims.to_string()));
+    let assertion = format!("{signed}.{}", b64.encode(signer.sign(signed.as_bytes())));
+    let body = json!({"assertion": assertion}).to_string();
+    let open = format!(
+        "POST /__platform/session HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+         Sec-Fetch-Site: same-origin\r\nOrigin: http://{host}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let (code, head, text) = common::op::raw(board.port, &open);
+    assert_eq!(code, 200, "member session: {text}");
+    let cookie = common::op::set_cookie(&head).expect("session cookie");
+    let cookie = cookie.split(';').next().unwrap().to_owned();
+    (board, host, cookie)
+}
+
+/// CAD-1041 adversarial (review finding B2): the board peer is at least as
+/// strict as the RPC. An agent caller, an operator session replayed by an
+/// agent and a public `member` session all get 403 before the relay
+/// runs; the row stays queued and nothing stages or sends.
+#[test]
+fn cad1041_board_send_now_refuses_agent_and_member_sessions() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snhttp");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-http-gate",
+        epoch_now(),
+    );
+    let path = format!("/api/social-publishes/{id}/send-now");
+    let body = json!({"install_id": install, "context_id": context["id"]}).to_string();
+    let board = Board::serve(&h);
+    let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &h.daemon.state, board.port);
+    let as_agent = common::op::seam_headers(&h.daemon.state, "agent:cc13-pw");
+    assert!(!as_agent.is_empty(), "the test seam must be armed");
+    // An agent with no session reaches the route class and is refused.
+    let bare = common::op::request(
+        "POST",
+        &path,
+        &session.host,
+        Some(&session.origin),
+        None,
+        &body,
+    );
+    let bare = common::op::assert_as(bare, &h.daemon.state, "agent:cc13-pw");
+    let (code, _, text) = common::op::raw(board.port, &bare);
+    assert_eq!(code, 403, "agent caller: {text}");
+    assert!(text.contains("operator_only"), "agent caller: {text}");
+    // An operator session replayed by the agent is refused (and revoked).
+    let (code, _, text) = common::op::raw(
+        board.port,
+        &session.request_as("POST", &path, &body, &as_agent),
+    );
+    assert_eq!(code, 403, "replayed session: {text}");
+    assert!(
+        text.contains("session_from_agent"),
+        "replayed session: {text}"
+    );
+    let (public, host, cookie) = member_session(&h);
+    let member = format!(
+        "POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+         X-Cadence-Board: 1\r\nSec-Fetch-Site: same-origin\r\nOrigin: http://{host}\r\n\
+         Cookie: {cookie}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let (code, _, text) = common::op::raw(public.port, &member);
+    assert_eq!(code, 403, "member session: {text}");
+    assert!(text.contains("member_role"), "member session: {text}");
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(
+        shown["intent"]["state"], "queued",
+        "a refused write moved the row"
+    );
+    assert_eq!(door.stages(), 0, "a refused write staged");
+    assert_eq!(*door.calls.lock().unwrap(), 0, "a refused write sent");
+}
+
+/// CAD-1041 (should-fix): when the send lost its response and the one
+/// status read is refused, the row stays processing (never a second
+/// send) and the reply names the refusal instead of dropping it.
+#[test]
+fn cad1041_refused_status_read_is_reported_not_dropped() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snstat");
+    let (id, key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-stat",
+        epoch_now(),
+    );
+    sender.set_behavior(&key, FakeProviderBehavior::LoseResponseAfterAccept);
+    sender.script_status_refusal(&key, "reconnect_needed");
+    let out = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap();
+    assert_eq!(out["intent"]["state"], "processing", "{out}");
+    let error = out["status_error"].as_str().unwrap_or("");
+    assert!(error.contains("reconnect_needed"), "{out}");
+    assert_eq!(*door.calls.lock().unwrap(), 1, "the one exec POST only");
+}
+
+#[test]
+fn cad1041_crash_after_door_accept_reconciles_never_resends() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "sncrash");
+    let (id, key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-crash",
+        epoch_now(),
+    );
+    // The door accepts the POST but the response is lost — the
+    // in-RPC status reconcile recovers it to posted inside the same
+    // call, never a second send.
+    sender.set_behavior(&key, FakeProviderBehavior::LoseResponseAfterAccept);
+    let out = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(out["state"], "posted", "{out}");
+    // exec POST + one status GET — reconcile never re-sends.
+    assert_eq!(*door.calls.lock().unwrap(), 2);
+    assert_eq!(door.stages(), 1);
+    // A send-now on the settled row refuses; no third provider call.
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("queued"), "{err}");
+    assert_eq!(*door.calls.lock().unwrap(), 2);
 }

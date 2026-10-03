@@ -22,6 +22,7 @@ loader.prototype.require = function(this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const PublishPanel = (require("../src/features/workspace-apps/PublishPanel") as typeof import("../src/features/workspace-apps/PublishPanel")).default;
+const { dueLabel } = require("../src/features/workspace-apps/socialPublish") as typeof import("../src/features/workspace-apps/socialPublish");
 function assert(value: unknown, why: string): asserts value { if (!value) throw new Error(why); }
 const host = document.createElement("div"); document.body.append(host);
 const root = createRoot(host);
@@ -55,6 +56,8 @@ let intents: any[] = [];
 let failList = false;
 const scheduled: any[] = [];
 const cancelled: string[] = [];
+const sent: string[] = [];
+const sendScopes: [string, string | null][] = [];
 const stub = {
   list: async () => { if (failList) throw new Error("Operator session expired"); return { intents }; },
   show: async (intentId: string) => ({ intent: intents.find(value => value.intent_id === intentId) }),
@@ -74,6 +77,7 @@ const stub = {
     return { media_key: `dp1.ws.conn.${importHex.slice(0, 32)}`, image_digest: importHex };
   },
   cancel: async (intentId: string, installId: string, contextId: string | null) => { cancelScopes.push([installId, contextId]); cancelled.push(intentId); intents = intents.map(value => value.intent_id === intentId ? { ...value, state: "cancelled" } : value); return { intent: intents.find(value => value.intent_id === intentId) }; },
+  sendNow: async (intentId: string, installId: string, contextId: string | null) => { sendScopes.push([installId, contextId]); sent.push(intentId); intents = intents.map(value => value.intent_id === intentId ? { ...value, state: "posted" } : value); return { intent: intents.find(value => value.intent_id === intentId) }; },
 };
 let mounts = 0;
 async function render(props: any) {
@@ -168,6 +172,41 @@ async function main() {
   await flush(); await flush();
   assert(cancelled.includes("intent-q") && text().includes("Nothing was sent"), "Cancel closes the intent without a send");
   assert(cancelScopes.at(-1)?.[0] === "install-a" && cancelScopes.at(-1)?.[1] === "ctx-other", "Cancel uses the intent's frozen install/context, not the panel's");
+  // CAD-1041: Send now takes two explicit presses on a queued intent
+  // only; processing/posted offer nothing, one click never sends.
+  assert(!sent.includes("intent-q"), "Cancel alone never sends");
+  // The second press shows the frozen post through the CAD-1027
+  // confirmation: reviewed text, image receipt, destination and due time.
+  const due = 1_900_000_000;
+  intents = [{ ...intents[0], intent_id: "intent-s", state: "queued", artifact_id: "artifact-a", caption_digest: "artifact-digest", image_digest: reviewedHex, due_epoch: due, timezone: "Asia/Hong_Kong" }];
+  await render({ candidates: [candidate] });
+  assert(button("Send now"), "Queued intent offers Send now");
+  artifactId = "artifact-other";
+  await React.act(async () => { button("Send now")?.click(); });
+  await flush();
+  await React.act(async () => { releaseArtifact?.(); });
+  await flush(); await flush();
+  assert(text().includes("no longer matches this intent") && button("Confirm send now")?.disabled, "A caption that is not the frozen one blocks the send");
+  await React.act(async () => { button("Keep queued")?.click(); });
+  await flush();
+  artifactId = "artifact-a";
+  await React.act(async () => { button("Send now")?.click(); });
+  await flush();
+  assert(button("Confirm send now")?.disabled && text().includes("Loading the reviewed caption"), "Confirm send now waits for the frozen post");
+  await React.act(async () => { releaseArtifact?.(); });
+  await flush(); await flush();
+  const sendConfirm = host.querySelector('[aria-label="Confirm send now"]')?.textContent ?? "";
+  assert(sendConfirm.includes(reviewedText) && sendConfirm.includes("sha256:artifact-digest"), "Send now shows the reviewed caption text verbatim");
+  assert(sendConfirm.includes(reviewedHex) && sendConfirm.includes("receipt-a"), "Send now shows the image digest and its reviewed receipt");
+  assert(sendConfirm.includes("17841400008460056") && sendConfirm.includes(dueLabel(due, "Asia/Hong_Kong")) && sendConfirm.includes("Asia/Hong_Kong"), "Send now shows the destination and the due time");
+  assert(!sent.includes("intent-s"), "Arming alone sends nothing");
+  await React.act(async () => { button("Confirm send now")?.click(); });
+  await flush(); await flush();
+  assert(sent.includes("intent-s") && text().includes("posted"), "Confirmed send posts the named intent");
+  assert(sendScopes.at(-1)?.[0] === "install-a" && sendScopes.at(-1)?.[1] === "ctx-other", "Send now uses the intent's frozen install/context, not the panel's");
+  intents = [{ ...intents[0], intent_id: "intent-p", state: "processing" }];
+  await render({ candidates: [candidate] });
+  assert(!button("Send now"), "Processing intent offers no Send now");
   // Every state renders its operator copy.
   intents = [
     { ...intents[0], intent_id: "i-posted", state: "posted", permalink: "https://www.instagram.com/p/fixture000/", receipt: { ok: true } },

@@ -11,6 +11,10 @@
 use super::app_bindings_rpc::strict_fields;
 use super::*;
 
+/// CAD-1041: how far past its due time an intent may still be sent now.
+/// Over it, send-now refuses and the row stays queued — re-schedule it.
+pub(crate) const SEND_NOW_MAX_LATENESS_SECS: i64 = 15 * 60;
+
 impl Shared {
     pub(super) fn rpc_social_publish(
         self: &Arc<Self>,
@@ -59,6 +63,7 @@ impl Shared {
                 "social_publish_show" => &["intent_id"],
                 "social_publish_list" => &["install_id", "context_id"],
                 "social_publish_claim_due" => &["now_epoch", "recheck"],
+                "social_publish_send_now" => &["intent_id", "install_id", "context_id"],
                 "social_publish_reconcile" => &["intent_id"],
                 "social_publish_report" => &["intent_id", "decision", "receipt"],
                 _ => return Err(Error::rejected("unknown social publish method")),
@@ -82,6 +87,7 @@ impl Shared {
                 optional_str(params, "context_id"),
             ),
             "social_publish_claim_due" => self.claim_social_publish(params),
+            "social_publish_send_now" => self.send_now_social_publish(params),
             "social_publish_reconcile" => self.reconcile_social_publish(params),
             "social_publish_report" => self.store.social_publish_report(
                 required_str(params, "intent_id")?,
@@ -317,7 +323,14 @@ impl Shared {
         .all(|field| recheck.get(*field) == frozen.get(*field))
             && recheck.get("image_digest") == frozen.get("image_digest");
         if !matches {
-            let Some(claimed) = self.store.social_publish_claim_due(now, |_, _| Ok(true))? else {
+            // Claim the same row the peek read — the candidate id pins
+            // the claim so a queue-head move can't hold a row the
+            // operator never rechecked.
+            let want = due["intent"]["intent_id"].as_str().unwrap_or("").to_owned();
+            let Some(claimed) = self
+                .store
+                .social_publish_claim_due(now, move |_, candidate, _| Ok(candidate == want))?
+            else {
                 return Ok(json!({"claimed": false}));
             };
             let id = claimed["intent"]["intent_id"].as_str().unwrap_or("");
@@ -328,9 +341,12 @@ impl Shared {
             );
         }
         let expected = frozen.clone();
+        let want = due["intent"]["intent_id"].as_str().unwrap_or("").to_owned();
         let claimed = self
             .store
-            .social_publish_claim_due(now, move |_, frozen| Ok(frozen == &expected))?;
+            .social_publish_claim_due(now, move |_, candidate, frozen| {
+                Ok(candidate == want && frozen == &expected)
+            })?;
         let Some(claimed) = claimed else {
             return Ok(json!({"claimed": false}));
         };
@@ -348,17 +364,24 @@ impl Shared {
                 &json!({"reason": "approved material changed since freeze"}),
             );
         }
-        // Daemon-observed dispatch: when a sender is registered, the exact
-        // frozen binding executes here and its evidence is persisted before
-        // any report. Without a sender the intent stays processing until
-        // the send adapter lands — posted reports require evidence.
+        self.dispatch_claimed(&id, claimed)
+    }
+
+    /// CAD-1041: the one claim-execution path, shared by the operator
+    /// `claim_due` RPC above and `send_now`. Callers must have already
+    /// proven dispatch authority (operator recheck, or send-now's own
+    /// preflight + `material_current`); this helper runs the exact
+    /// frozen binding through the registered sender and persists the
+    /// provider's evidence before any report. Without a sender the
+    /// intent stays processing — posted reports require evidence.
+    pub(crate) fn dispatch_claimed(&self, id: &str, claimed: Value) -> Result<Value> {
         let Some(sender) = self.social_publish_sender.clone() else {
             return Ok(claimed);
         };
         let frozen = &claimed["intent"]["frozen"];
         let Some(binding) = sender_binding(frozen, &claimed["intent"]["request"]) else {
             return self.store.social_publish_report(
-                &id,
+                id,
                 "held",
                 &json!({"reason": "frozen binding does not parse for dispatch"}),
             );
@@ -372,19 +395,166 @@ impl Shared {
                 ) =>
             {
                 self.store
-                    .social_publish_note_evidence(&id, &outcome.evidence_json())
+                    .social_publish_note_evidence(id, &outcome.evidence_json())
             }
             Ok(outcome) => self.store.social_publish_report(
-                &id,
+                id,
                 "refused",
                 &json!({"error": format!("dispatch ended {}", outcome.state.as_str())}),
             ),
+            // `nothing_sent` means the POST provably never left (the
+            // re-preflight inside execute_request stayed ambiguous) —
+            // hold the row for a human decision rather than burning it
+            // `refused` on a door blip.
+            Err(refusal) if refusal.code == "nothing_sent" => self
+                .store
+                .social_publish_report(
+                    id,
+                    "held",
+                    &json!({"reason": "staging stayed ambiguous; nothing was sent — retry under a fresh key"}),
+                ),
             Err(refusal) => self.store.social_publish_report(
-                &id,
+                id,
                 "refused",
                 &json!({"error": refusal.to_string()}),
             ),
         }
+    }
+
+    /// CAD-1041: the operator's explicit "send this queued intent now".
+    /// One named row is claimed BY IDENTITY in its own install and exact
+    /// context (the CAD-1027 cancel scope — a peek/claim head move or a
+    /// forged scope can never claim a row the operator did not click),
+    /// preflight-staged before the claim so a door blip leaves it
+    /// queued, dispatched exactly once through `dispatch_claimed`, then
+    /// reconciled once via `status` (never a second provider send).
+    /// Refuses a row more than `SEND_NOW_MAX_LATENESS_SECS` overdue on the
+    /// operator clock — re-schedule it
+    /// first. There is no background loop: the operator's click is the
+    /// only trigger.
+    fn send_now_social_publish(&self, params: &Value) -> Result<Value> {
+        use crate::platform::agenticos_external::publish::Preflight;
+        let id = Self::required_segment(params, "intent_id")?.to_owned();
+        // CAD-1027 scope, as cancel: the intent's own install and exact
+        // context. An out-of-scope request refuses here, before staging,
+        // and the claim below re-checks the same predicate in its CAS.
+        let install = Self::required_segment(params, "install_id")?;
+        let context = Self::strict_optional_segment(params, "context_id")?;
+        let shown = self
+            .store
+            .social_publish_show_scoped(&id, install, context)?;
+        if shown["intent"]["state"] != "queued" {
+            return Err(Error::rejected(
+                "send-now needs a queued intent — this one already left queued",
+            ));
+        }
+        // The lateness bound reads the due_epoch COLUMN (the same value
+        // the claim SQL selects on), never the frozen doc — a forged
+        // column can't hide an over-stale row behind a healthy frozen.
+        let due = shown["intent"]["due_epoch"].as_i64().unwrap_or(i64::MAX);
+        if self.operator_now() - due > SEND_NOW_MAX_LATENESS_SECS {
+            return Err(Error::rejected(format!(
+                "intent is more than {} minutes overdue — re-schedule it before send-now",
+                SEND_NOW_MAX_LATENESS_SECS / 60
+            )));
+        }
+        let Some(sender) = self.social_publish_sender.clone() else {
+            return Err(Error::rejected("no dispatch sender registered"));
+        };
+        // Pre-claim staging on the row the operator named — the exact
+        // frozen binding, never a re-typed request. A definitive door
+        // refusal is claimed and reported terminal; ambiguity stays
+        // queued for a retry.
+        let binding = sender_binding(&shown["intent"]["frozen"], &shown["intent"]["request"])
+            .ok_or_else(|| Error::rejected("frozen binding does not parse — held for a human"))?;
+        match sender.preflight(&binding) {
+            Preflight::Approved => {}
+            Preflight::Uncertain(refusal) => {
+                return Err(Error::rejected(format!(
+                    "staging is uncertain ({refusal}); the intent stays queued — retry"
+                )));
+            }
+            Preflight::Refused(refusal) => {
+                if self
+                    .store
+                    .social_publish_claim_id(&id, install, context)?
+                    .is_some()
+                {
+                    return self.store.social_publish_report(
+                        &id,
+                        "refused",
+                        &json!({"error": refusal.to_string()}),
+                    );
+                }
+                return self.not_sent(&id, "staging refused, and the intent left queued first");
+            }
+        }
+        // Claim BY IDENTITY: only this exact row transitions. A
+        // concurrent send-now or cancel reads state='processing' and
+        // gets `claimed: false`; the single CAS inside `claim_id` is
+        // what makes a double-click one provider call, not two.
+        let Some(claimed) = self.store.social_publish_claim_id(&id, install, context)? else {
+            return self.not_sent(&id, "the intent left queued before this claim");
+        };
+        if !self.store.social_publish_material_current(&id)? {
+            return self.store.social_publish_report(
+                &id,
+                "held",
+                &json!({"reason": "approved material changed since freeze"}),
+            );
+        }
+        // Exactly one provider send. `dispatch_claimed` notes posted
+        // evidence upstream but the row still reads `processing` — the
+        // operator path reports the outcome itself; send-now does the
+        // same with the daemon-observed evidence (a posted or refused
+        // upstream, verified against frozen inside `report`). When the
+        // send left the row processing (lost response), one status
+        // reconcile refreshes evidence first — never a second send.
+        self.dispatch_claimed(&id, claimed)?;
+        let after = self.store.social_publish_show(&id)?;
+        if after["intent"]["state"] != "processing" {
+            return Ok(after);
+        }
+        let evidence = after["intent"]["upstream"].clone();
+        if evidence["state"] == "posted" || evidence["state"] == "refused" {
+            let decision = evidence["state"].as_str().unwrap_or("").to_owned();
+            let receipt = if decision == "posted" {
+                evidence.clone()
+            } else {
+                json!({"error": "dispatch refused — see upstream evidence"})
+            };
+            return self.store.social_publish_report(&id, &decision, &receipt);
+        }
+        // Still processing and no settled upstream: one status read.
+        let key = after["intent"]["request"].as_str().unwrap_or("").to_owned();
+        // A refused status read leaves the row processing (safe: no second
+        // send); the reply names the refusal so the operator sees why.
+        let outcome = match sender.status(&key) {
+            Ok(outcome) => outcome,
+            Err(refusal) => {
+                let mut after = after;
+                after["status_error"] = json!(refusal.to_string());
+                return Ok(after);
+            }
+        };
+        let settled = self
+            .store
+            .social_publish_note_evidence(&id, &outcome.evidence_json())?;
+        let evidence = settled["intent"]["upstream"].clone();
+        if evidence["state"] == "posted" {
+            return self.store.social_publish_report(&id, "posted", &evidence);
+        }
+        Ok(settled)
+    }
+
+    /// A send-now that lost its claim to another send or a cancel: the
+    /// intent's current envelope, marked not sent with the reason, so a
+    /// client always reads `intent` (never a bare `{sent:false}`).
+    fn not_sent(&self, id: &str, reason: &str) -> Result<Value> {
+        let mut envelope = self.store.social_publish_show(id)?;
+        envelope["sent"] = json!(false);
+        envelope["reason"] = json!(reason);
+        Ok(envelope)
     }
 
     /// Reconcile one processing intent against the provider door: refresh

@@ -1001,9 +1001,69 @@ fn cad798_persistent_preflight_ambiguity_is_nothing_sent_refusal() {
         refusal.detail.contains("nothing was sent"),
         "unexpected: {refusal}"
     );
+    // CAD-1041: the code the dispatcher holds on, never `refused`.
+    assert_eq!(refusal.code, "nothing_sent");
     assert_eq!(door.preflight_calls(), 2);
     assert_eq!(door.exec_calls(), 0);
     assert_eq!(door.provider_calls(), 0);
+    door.stop();
+}
+
+/// CAD-1041: the trait `preflight` the operator's send-now runs before
+/// its claim. Staged → Approved; a door refusal → Refused with the door's
+/// code; a staging outage → Uncertain. A transient material read
+/// (`store_unavailable`) → Uncertain and any other material refusal →
+/// Refused, both before any door call. No exec POST in any case.
+#[test]
+fn cad1041_trait_preflight_maps_each_staging_verdict() {
+    use cadence_agent::platform::agenticos_external::publish::Preflight;
+    let door = FakeDoor::start();
+    door.enroll_connection(CONN);
+    door.issue(GRANT, 3);
+    door.issue("dpq_cad1041_revoked_1", 3);
+    door.revoke("dpq_cad1041_revoked_1");
+    door.set_enabled(true);
+    let live = sender(&door);
+    let verdict = PublishSender::preflight(&live, &binding("cad1041-pf-ok-01", GRANT));
+    assert!(matches!(verdict, Preflight::Approved), "{verdict:?}");
+    let revoked = binding("cad1041-pf-rev-01", "dpq_cad1041_revoked_1");
+    match PublishSender::preflight(&live, &revoked) {
+        Preflight::Refused(refusal) => assert_eq!(refusal.code, "grant_revoked"),
+        other => panic!("revoked grant: {other:?}"),
+    }
+    door.set_preflight_down(true);
+    let verdict = PublishSender::preflight(&live, &binding("cad1041-pf-down-01", GRANT));
+    assert!(matches!(verdict, Preflight::Uncertain(_)), "{verdict:?}");
+    door.set_preflight_down(false);
+    let staged = door.preflight_calls();
+    for (code, uncertain) in [
+        ("store_unavailable", true),
+        ("unknown_key", false),
+        ("grant_binding_mismatch", false),
+    ] {
+        let failing: MaterialResolver = Arc::new(move |_| Err(Refusal::new(code, "material")));
+        let probe = HttpPublishSender::new(
+            &format!("http://{}", door.addr),
+            DeviceCredential::new(BEARER.into()),
+            failing,
+        )
+        .expect("loopback sender");
+        match (
+            PublishSender::preflight(&probe, &binding("cad1041-pf-mat-01", GRANT)),
+            uncertain,
+        ) {
+            (Preflight::Uncertain(refusal), true) | (Preflight::Refused(refusal), false) => {
+                assert_eq!(refusal.code, code)
+            }
+            (other, _) => panic!("material {code}: {other:?}"),
+        }
+    }
+    assert_eq!(
+        door.preflight_calls(),
+        staged,
+        "material refusals never stage"
+    );
+    assert_eq!(door.exec_calls(), 0);
     door.stop();
 }
 
