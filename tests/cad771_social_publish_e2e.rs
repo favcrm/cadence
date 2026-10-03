@@ -423,6 +423,40 @@ struct HttpSender {
     during_stage: Mutex<HashMap<String, StageHook>>,
     /// CAD-1041: scripted status refusals by key (no wire call).
     status_refusals: Mutex<HashMap<String, &'static str>>,
+    /// CAD-1041: a rendezvous every staging call for `key` waits at.
+    rendezvous: Mutex<HashMap<String, Arc<Rendezvous>>>,
+}
+
+/// Holds staging calls on one key until `want` have arrived (bounded), so
+/// racing send-nows have all passed their queued check before any claims.
+struct Rendezvous {
+    arrived: Mutex<u32>,
+    all: std::sync::Condvar,
+    want: u32,
+}
+
+impl Rendezvous {
+    fn new(want: u32) -> Arc<Self> {
+        Arc::new(Self {
+            arrived: Mutex::new(0),
+            all: std::sync::Condvar::new(),
+            want,
+        })
+    }
+
+    fn arrive(&self) {
+        let mut arrived = self.arrived.lock().unwrap();
+        *arrived += 1;
+        self.all.notify_all();
+        let _ = self
+            .all
+            .wait_timeout_while(arrived, Duration::from_secs(20), |n| *n < self.want)
+            .unwrap();
+    }
+
+    fn arrived(&self) -> u32 {
+        *self.arrived.lock().unwrap()
+    }
 }
 
 type StageHook = Box<dyn FnOnce() + Send>;
@@ -444,7 +478,15 @@ impl HttpSender {
             execute_refusals: Mutex::new(HashMap::new()),
             during_stage: Mutex::new(HashMap::new()),
             status_refusals: Mutex::new(HashMap::new()),
+            rendezvous: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn meet_at_stage(&self, key: &str, rendezvous: Arc<Rendezvous>) {
+        self.rendezvous
+            .lock()
+            .unwrap()
+            .insert(key.into(), rendezvous);
     }
 
     fn script_status_refusal(&self, key: &str, code: &'static str) {
@@ -624,6 +666,10 @@ impl cadence_agent::platform::agenticos_external::publish::PublishSender for Htt
         let hook = self.during_stage.lock().unwrap().remove(&binding.key);
         if let Some(hook) = hook {
             hook();
+        }
+        let meet = self.rendezvous.lock().unwrap().get(&binding.key).cloned();
+        if let Some(meet) = meet {
+            meet.arrive();
         }
         match self.preflights.lock().unwrap().get(&binding.key).copied() {
             Some(Staging::Uncertain) => {
@@ -2748,9 +2794,9 @@ fn cad1041_lost_claim_returns_the_intent_envelope() {
 fn cad1041_concurrent_double_click_one_provider_call() {
     let door = FakeDoor::start();
     door.grants.lock().unwrap().issue(GRANT_FB, 3);
-    let (h, _s) = e2e_release(&door);
+    let (h, sender) = e2e_release(&door);
     let (context, run, bundle, install) = approved_run(&h, "sndbl");
-    let (id, _key) = send_now_fixture(
+    let (id, key) = send_now_fixture(
         &h,
         &context,
         &run,
@@ -2759,32 +2805,43 @@ fn cad1041_concurrent_double_click_one_provider_call() {
         "cad1041-dbl",
         epoch_now(),
     );
-    // Two operator clicks race on the same intent id; the single CAS
-    // inside claim_id means only one wins the queued→processing move.
-    let state = h.daemon.state.clone();
-    let params = send_now_params(&id, &install, &context);
-    let winner = thread::spawn(move || {
-        cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
-            cadence_agent::client::rpc(&state, "social_publish_send_now", params)
+    // Both clicks pass the queued check and meet in staging before
+    // either claims, so they race at the claim itself: the single CAS
+    // inside claim_id lets exactly one move queued→processing.
+    let meet = Rendezvous::new(2);
+    sender.meet_at_stage(&key, Arc::clone(&meet));
+    let clicks: Vec<_> = (0..2)
+        .map(|_| {
+            let (state, params) = (
+                h.daemon.state.clone(),
+                send_now_params(&id, &install, &context),
+            );
+            thread::spawn(move || {
+                cadence_agent::test_seam::scoped(
+                    cadence_agent::test_seam::Asserted::Operator,
+                    || cadence_agent::client::rpc(&state, "social_publish_send_now", params),
+                )
+            })
         })
-    });
-    let second = h.daemon.operator_rpc(
-        "social_publish_send_now",
-        send_now_params(&id, &install, &context),
+        .collect();
+    let replies: Vec<Value> = clicks
+        .into_iter()
+        .map(|click| click.join().unwrap().expect("both clicks answer"))
+        .collect();
+    assert_eq!(
+        meet.arrived(),
+        2,
+        "the clicks never overlapped: {replies:?}"
     );
-    let first = winner.join().unwrap();
-    // Exactly one posts; the other either posts the same claimed row
-    // (idempotent claim) or refuses "no longer queued" — never two
-    // provider sends.
-    let posted = [&first, &second]
-        .iter()
-        .filter(|r| {
-            r.as_ref()
-                .map(|v| v["intent"]["state"] == "posted")
-                .unwrap_or(false)
-        })
-        .count();
-    assert_eq!(posted, 1, "first={first:?} second={second:?}");
+    let won = replies.iter().filter(|r| r["sent"] != false).count();
+    let lost = replies.iter().filter(|r| r["sent"] == false).count();
+    assert_eq!((won, lost), (1, 1), "{replies:?}");
+    assert!(
+        replies
+            .iter()
+            .all(|r| r["intent"]["intent_id"] == id.as_str()),
+        "{replies:?}"
+    );
     assert_eq!(
         *door.calls.lock().unwrap(),
         1,
