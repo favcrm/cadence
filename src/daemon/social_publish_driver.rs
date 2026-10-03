@@ -404,9 +404,9 @@ impl Shared {
         }
     }
 
-    /// Claim and dispatch up to `PER_TICK_CAP` due intents. The batch
-    /// peeks `PER_TICK_CAP` due rows once; rows that are backing off
-    /// are SKIPPED so one ambiguous head can't stall later dues
+    /// Attempt up to `PER_TICK_CAP` due intents, oldest first. Rows that
+    /// are backing off are skipped and do not count, so ambiguous rows
+    /// at the head never stall the due rows behind them
     /// (head-of-line blocking, spec finding 3). Preflight runs BEFORE
     /// each claim: ambiguity leaves the row queued under per-intent
     /// backoff (grown 10s→300s); definitive refusal claims and reports.
@@ -416,123 +416,77 @@ impl Shared {
         let driver = &self.social_publish_driver;
         let sender = self.social_publish_sender.clone();
         let Some(sender) = sender else { return };
-        let batch = match self
-            .store
-            .social_publish_due_batch((driver.clock)(), PER_TICK_CAP)
-        {
-            Ok(batch) => batch,
-            Err(e) => {
-                driver.fail(&e.to_string());
-                return;
-            }
-        };
-        for due in batch {
-            if self.closing.load(Ordering::SeqCst) || Instant::now() >= deadline {
-                return;
-            }
-            // Mid-tick lease check — before every claim, so a lost lease
-            // stops the next claim AND the send inside it.
-            if self
-                .lease
-                .as_ref()
-                .and_then(|l| l.fence().check())
-                .is_some()
+        // Page through every due row: backing-off rows are skipped
+        // without counting, so no number of them blocks the rows behind.
+        let mut attempts = 0;
+        let mut after: Option<(i64, String)> = None;
+        loop {
+            let at = after.as_ref().map(|(due, id)| (*due, id.as_str()));
+            let page = match self
+                .store
+                .social_publish_due_batch((driver.clock)(), PER_TICK_CAP, at)
             {
-                driver.fail("lease fenced mid-tick");
-                return;
-            }
-            let intent = &due["intent"];
-            let id = intent["intent_id"].as_str().unwrap_or("").to_owned();
-            // Per-intent backoff: a backing-off row is skipped, not
-            // returned-on — later due rows still dispatch this tick.
-            if backoff
-                .get(&id)
-                .is_some_and(|until| (driver.clock)() < *until)
-            {
-                continue;
-            }
-            let frozen = &intent["frozen"];
-            // The lateness bound reads the COLUMN's `due_epoch` (the
-            // claim SQL's own source) — a forged column can't hide
-            // behind the still-frozen `frozen.due_epoch`.
-            let due_epoch = intent["due_epoch"]
-                .as_i64()
-                .or_else(|| frozen["due_epoch"].as_i64())
-                .unwrap_or(0);
-            // Stale backlog: claim the peeked row and hold, never send.
-            // Lateness is judged on the clock now, after any slow door
-            // calls earlier in this tick, never on the tick's start.
-            let now = (driver.clock)();
-            if now - due_epoch > driver.max_lateness_secs {
-                match self.claim_and_end(&due, "held", &json!({"reason": "missed publish window"}))
-                {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(e) => {
-                        driver.fail(&e.to_string());
-                        return;
-                    }
+                Ok(page) => page,
+                Err(e) => {
+                    driver.fail(&e.to_string());
+                    return;
                 }
-                continue;
-            }
-            // Explicit-mode intents (no artifact freeze) are held for the
-            // operator path — `material_current` can't re-prove them.
-            if frozen["artifact_id"].is_null() {
-                match self.claim_and_end(
-                    &due,
-                    "held",
-                    &json!({"reason": "explicit-mode publish needs operator dispatch"}),
-                ) {
-                    Ok(true) | Ok(false) => {}
-                    Err(e) => {
-                        driver.fail(&e.to_string());
-                        return;
-                    }
-                }
-                continue;
-            }
-            // Preflight before claim — binding built from frozen alone.
-            let Some(binding) =
-                super::social_publish_rpc::sender_binding(frozen, &intent["request"])
-            else {
-                // Malformed frozen can't ever send: claim and hold.
-                match self.claim_and_end(
-                    &due,
-                    "held",
-                    &json!({"reason": "frozen binding does not parse for dispatch"}),
-                ) {
-                    Ok(true) | Ok(false) => {}
-                    Err(e) => {
-                        driver.fail(&e.to_string());
-                        return;
-                    }
-                }
-                continue;
             };
-            match sender.preflight(&binding) {
-                Preflight::Uncertain(refusal) => {
-                    // Ambiguous door: leave queued and BACK OFF this row
-                    // only — the batch continues so a stuck head never
-                    // stalls the rows behind it.
-                    driver.note_error(&id, &refusal);
-                    let delay = backoff
-                        .get(&id)
-                        .map(|until| {
-                            let prev =
-                                (*until - (driver.clock)()).max(BACKOFF_MIN_SECS as i64) as u64;
-                            (prev * 2).min(BACKOFF_MAX_SECS)
-                        })
-                        .unwrap_or(BACKOFF_MIN_SECS);
-                    backoff.insert(id, (driver.clock)() + delay as i64);
+            let Some(last) = page.last() else { return };
+            after = Some((
+                last["intent"]["due_epoch"].as_i64().unwrap_or(0),
+                last["intent"]["intent_id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_owned(),
+            ));
+            for due in page {
+                if self.closing.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                    return;
+                }
+                // Mid-tick lease check — before every claim, so a lost lease
+                // stops the next claim AND the send inside it.
+                if self
+                    .lease
+                    .as_ref()
+                    .and_then(|l| l.fence().check())
+                    .is_some()
+                {
+                    driver.fail("lease fenced mid-tick");
+                    return;
+                }
+                let intent = &due["intent"];
+                let id = intent["intent_id"].as_str().unwrap_or("").to_owned();
+                // Per-intent backoff: a backing-off row is skipped, not
+                // returned-on — later due rows still dispatch this tick.
+                if backoff
+                    .get(&id)
+                    .is_some_and(|until| (driver.clock)() < *until)
+                {
                     continue;
                 }
-                Preflight::Refused(refusal) => {
-                    // Definitive door refusal: claim and report refused —
-                    // the row ends, it does not spin.
+                // The cap counts claim attempts, not rows looked at.
+                if attempts == PER_TICK_CAP {
+                    return;
+                }
+                attempts += 1;
+                let frozen = &intent["frozen"];
+                // The lateness bound reads the COLUMN's `due_epoch` (the
+                // claim SQL's own source) — a forged column can't hide
+                // behind the still-frozen `frozen.due_epoch`.
+                let due_epoch = intent["due_epoch"]
+                    .as_i64()
+                    .or_else(|| frozen["due_epoch"].as_i64())
+                    .unwrap_or(0);
+                // Stale backlog: claim the peeked row and hold, never send.
+                // Lateness is judged on the clock now, after any slow door
+                // calls earlier in this tick, never on the tick's start.
+                let now = (driver.clock)();
+                if now - due_epoch > driver.max_lateness_secs {
                     match self.claim_and_end(
                         &due,
-                        "refused",
-                        &json!({"error": refusal.to_string()}),
+                        "held",
+                        &json!({"reason": "missed publish window"}),
                     ) {
                         Ok(true) => {}
                         Ok(false) => continue,
@@ -543,58 +497,127 @@ impl Shared {
                     }
                     continue;
                 }
-                Preflight::Approved => {}
-            }
-            // Claim THE PEEKED ROW by identity; `None` means another
-            // claimant or a cancel took it first.
-            let claimed = match self.claim_peeked(&due) {
-                Ok(Some(claimed)) => claimed,
-                Ok(None) => continue,
-                Err(e) => {
-                    driver.fail(&e.to_string());
+                // Explicit-mode intents (no artifact freeze) are held for the
+                // operator path — `material_current` can't re-prove them.
+                if frozen["artifact_id"].is_null() {
+                    match self.claim_and_end(
+                        &due,
+                        "held",
+                        &json!({"reason": "explicit-mode publish needs operator dispatch"}),
+                    ) {
+                        Ok(true) | Ok(false) => {}
+                        Err(e) => {
+                            driver.fail(&e.to_string());
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                // Preflight before claim — binding built from frozen alone.
+                let Some(binding) =
+                    super::social_publish_rpc::sender_binding(frozen, &intent["request"])
+                else {
+                    // Malformed frozen can't ever send: claim and hold.
+                    match self.claim_and_end(
+                        &due,
+                        "held",
+                        &json!({"reason": "frozen binding does not parse for dispatch"}),
+                    ) {
+                        Ok(true) | Ok(false) => {}
+                        Err(e) => {
+                            driver.fail(&e.to_string());
+                            return;
+                        }
+                    }
+                    continue;
+                };
+                match sender.preflight(&binding) {
+                    Preflight::Uncertain(refusal) => {
+                        // Ambiguous door: leave queued and BACK OFF this row
+                        // only — the batch continues so a stuck head never
+                        // stalls the rows behind it.
+                        driver.note_error(&id, &refusal);
+                        let delay = backoff
+                            .get(&id)
+                            .map(|until| {
+                                let prev =
+                                    (*until - (driver.clock)()).max(BACKOFF_MIN_SECS as i64) as u64;
+                                (prev * 2).min(BACKOFF_MAX_SECS)
+                            })
+                            .unwrap_or(BACKOFF_MIN_SECS);
+                        backoff.insert(id, (driver.clock)() + delay as i64);
+                        continue;
+                    }
+                    Preflight::Refused(refusal) => {
+                        // Definitive door refusal: claim and report refused —
+                        // the row ends, it does not spin.
+                        match self.claim_and_end(
+                            &due,
+                            "refused",
+                            &json!({"error": refusal.to_string()}),
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                driver.fail(&e.to_string());
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    Preflight::Approved => {}
+                }
+                // Claim THE PEEKED ROW by identity; `None` means another
+                // claimant or a cancel took it first.
+                let claimed = match self.claim_peeked(&due) {
+                    Ok(Some(claimed)) => claimed,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        driver.fail(&e.to_string());
+                        return;
+                    }
+                };
+                let cid = id.clone();
+                // Between claim and send — the fence can trip while the
+                // claim committed; the send must not follow it.
+                if let Some(reason) = self.lease.as_ref().and_then(|l| l.fence().check()) {
+                    driver.fail(&format!("lease fenced mid-tick: {reason}"));
                     return;
                 }
-            };
-            let cid = id.clone();
-            // Between claim and send — the fence can trip while the
-            // claim committed; the send must not follow it.
-            if let Some(reason) = self.lease.as_ref().and_then(|l| l.fence().check()) {
-                driver.fail(&format!("lease fenced mid-tick: {reason}"));
-                return;
-            }
-            // A failed read is not a material change: record it and back
-            // off, never send. The unsent row stays `processing` and
-            // reconcile ends it (send-now's `?` leaves it the same way).
-            match self.store.social_publish_material_current(&cid) {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.end_report_at(
-                        &cid,
-                        "held",
-                        &json!({"reason": "approved material changed since freeze"}),
-                    );
-                    continue;
+                // A failed read is not a material change: record it and back
+                // off, never send. The unsent row stays `processing` and
+                // reconcile ends it (send-now's `?` leaves it the same way).
+                match self.store.social_publish_material_current(&cid) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.end_report_at(
+                            &cid,
+                            "held",
+                            &json!({"reason": "approved material changed since freeze"}),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        driver.note_error(&cid, &Refusal::new("store_error", e.to_string()));
+                        backoff.insert(cid, (driver.clock)() + BACKOFF_MIN_SECS as i64);
+                        continue;
+                    }
                 }
-                Err(e) => {
-                    driver.note_error(&cid, &Refusal::new("store_error", e.to_string()));
-                    backoff.insert(cid, (driver.clock)() + BACKOFF_MIN_SECS as i64);
-                    continue;
-                }
-            }
-            match self.dispatch_claimed(&cid, claimed) {
-                Ok(_envelope) => {
-                    driver.clear_error(&cid);
-                    backoff.remove(&cid);
-                    // The dispatch path persists evidence but leaves the
-                    // row `processing` (the operator RPC reports next);
-                    // the driver finishes the job — a posted upstream
-                    // verdict is reported posted from the stored
-                    // byte-exact evidence, never the caller's words.
-                    self.end_report(&cid);
-                }
-                Err(e) => {
-                    driver.note_error(&cid, &Refusal::new("refused", e.to_string()));
-                    backoff.insert(cid, (driver.clock)() + BACKOFF_MIN_SECS as i64);
+                match self.dispatch_claimed(&cid, claimed) {
+                    Ok(_envelope) => {
+                        driver.clear_error(&cid);
+                        backoff.remove(&cid);
+                        // The dispatch path persists evidence but leaves the
+                        // row `processing` (the operator RPC reports next);
+                        // the driver finishes the job — a posted upstream
+                        // verdict is reported posted from the stored
+                        // byte-exact evidence, never the caller's words.
+                        self.end_report(&cid);
+                    }
+                    Err(e) => {
+                        driver.note_error(&cid, &Refusal::new("refused", e.to_string()));
+                        backoff.insert(cid, (driver.clock)() + BACKOFF_MIN_SECS as i64);
+                    }
                 }
             }
         }

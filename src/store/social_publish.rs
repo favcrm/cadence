@@ -387,19 +387,24 @@ impl Store {
         next.map(|id| read_row(&conn, &id)).transpose()
     }
 
-    /// CAD-1020: the driver's due batch — up to `limit` due queued intents,
-    /// oldest first. A read only; each row is still claimed by identity.
+    /// CAD-1020: one page of the driver's due rows — up to `limit` due
+    /// queued intents, oldest first, after the `(due_epoch, intent_id)`
+    /// keyset `after`. A read only; each row is still claimed by identity.
     pub(crate) fn social_publish_due_batch(
         &self,
         now_epoch: i64,
         limit: usize,
+        after: Option<(i64, &str)>,
     ) -> Result<Vec<Value>> {
+        let (after_due, after_id) = after.unwrap_or((i64::MIN, ""));
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=? ORDER BY due_epoch,intent_id LIMIT ?",
+            "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=?1 AND (due_epoch>?3 OR (due_epoch=?3 AND intent_id>?4)) ORDER BY due_epoch,intent_id LIMIT ?2",
         )?;
         let ids = stmt
-            .query_map(params![now_epoch, limit as i64], |r| r.get::<_, String>(0))?
+            .query_map(params![now_epoch, limit as i64, after_due, after_id], |r| {
+                r.get::<_, String>(0)
+            })?
             .collect::<std::result::Result<Vec<String>, _>>()?;
         ids.iter().map(|id| read_row(&conn, id)).collect()
     }

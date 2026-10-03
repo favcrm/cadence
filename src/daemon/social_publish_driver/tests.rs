@@ -549,3 +549,21 @@ fn cad1020_overdue_intent_is_held_not_sent() {
     daemon.ticks(2);
     assert!(door.sent().is_empty(), "nothing was published");
 }
+
+/// Forbidden harm: a healthy post starved because more rows than one
+/// tick's cap sit ahead of it with an uncertain door.
+#[test]
+fn cad1020_uncertain_rows_ahead_never_starve_a_healthy_post() {
+    let (dir, door, clock) = rig();
+    let daemon = Daemon::open(dir.path(), &door, &clock, |_| {});
+    let store = &daemon.shared.store;
+    let now = clock.load(Ordering::SeqCst);
+    for n in 0..8 {
+        let flaky = approved_intent(store, &format!("flaky{n}"), now - 10);
+        door.uncertain.lock().unwrap().push(key(&flaky));
+    }
+    let healthy = approved_intent(store, "healthy", now - 1);
+    let daemon = daemon.run();
+    daemon.wait_state(&healthy, "posted");
+    assert_eq!(door.sent(), vec![key(&healthy)]);
+}
