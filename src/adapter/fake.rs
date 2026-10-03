@@ -25,6 +25,10 @@
 //! Agent param `fake_open_fail_if: <path>` — `open` fails while that
 //! file exists (a provider/session error on resume, for tests).
 //!
+//! Agent param `fake_generation: true` — every `open` reports a fresh
+//! endpoint generation, as a managed Pi or Codex endpoint does, so a test
+//! sees a stop/resume cycle change it.
+//!
 //! A continuity pack ahead of the message (CAD-324) is not part of the
 //! directive: the fake reports the pack it received verbatim as a
 //! `cadence/fake_pack` event, answers `FAKE_PACK <sha256 prefix>` on the
@@ -43,6 +47,9 @@ use crate::error::{Error, Result};
 use crate::store::Agent;
 
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The `fake_generation` counter: one fresh generation per open.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Answer channel payload: `Some` is a provider response, `None` is an
 /// interrupt abort.
@@ -108,6 +115,16 @@ impl ProviderAdapter for FakeAdapter {
             .lock()
             .unwrap()
             .push(*self.profile.lock().unwrap());
+        let generation = agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("fake_generation"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            .then(|| {
+                let n = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+                format!("fake-generation-{n}")
+            });
         Ok(Identity {
             thread_id: format!("fake-thread-{}", agent.alias),
             session_id: format!("fake-session-{}", agent.alias),
@@ -115,7 +132,7 @@ impl ProviderAdapter for FakeAdapter {
             effort: None,
             pid: std::process::id(),
             endpoint: None,
-            generation: None,
+            generation,
             attach: None,
         })
     }
