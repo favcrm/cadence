@@ -224,17 +224,8 @@ impl Shared {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     let proof = self
-                        .store
-                        .app_binding_for_slot(
-                            install,
-                            context,
-                            slot,
-                            required_str(bundle, "digest")?,
-                        )?
+                        .app_binding_live(install, context, slot, bundle, files)?
                         .ok_or_else(|| Error::rejected("capability binding is absent"))?;
-                    self.app_binding_receipt_current(
-                        install, context, slot, &proof, bundle, files,
-                    )?;
                     let quote = self.app_capability_quote(&proof)?;
                     Ok(json!({"slot":slot,"binding_digest":proof.digest,
                         "quote":quote,"quote_digest":app_runs::material_digest(&json!(quote))}))

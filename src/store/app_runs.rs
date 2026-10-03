@@ -219,6 +219,39 @@ impl Store {
         Ok(())
     }
     pub fn app_capability_decide(&self, id: &str, digest: &str, approve: bool) -> Result<Value> {
+        self.app_capability_decide_audited(id, digest, approve, json!({}))
+    }
+    /// CAD-1119: installing or updating an app is the operator's consent.
+    /// The operator install/upgrade path records the approval of exactly
+    /// that installed digest, auditing who installed it, how, and the
+    /// capabilities it declares. An approval already in force for this
+    /// digest is left untouched: re-deciding the same digest would
+    /// invalidate effects staged under it.
+    pub fn app_install_consent(
+        &self,
+        id: &str,
+        digest: &str,
+        via: &str,
+        capabilities: &Value,
+    ) -> Result<Option<Value>> {
+        if self.app_capability_status(id, digest)?["state"] == "approved" {
+            return Ok(None);
+        }
+        self.app_capability_decide_audited(
+            id,
+            digest,
+            true,
+            json!({"via": via, "capabilities": capabilities}),
+        )
+        .map(Some)
+    }
+    fn app_capability_decide_audited(
+        &self,
+        id: &str,
+        digest: &str,
+        approve: bool,
+        audit: Value,
+    ) -> Result<Value> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let previous: Option<(String, String)> = tx
@@ -264,7 +297,16 @@ impl Store {
             } else {
                 "app_install_capability_revoked"
             },
-            json!({"install_id":id,"digest":digest,"epoch":epoch,"actor":"operator"}),
+            {
+                let mut event =
+                    json!({"install_id":id,"digest":digest,"epoch":epoch,"actor":"operator"});
+                if let (Some(event), Some(audit)) = (event.as_object_mut(), audit.as_object()) {
+                    for (key, value) in audit {
+                        event.entry(key.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+                event
+            },
         )?;
         tx.commit()?;
         Ok(

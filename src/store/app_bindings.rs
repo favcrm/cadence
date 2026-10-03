@@ -62,9 +62,11 @@ fn config_digest(install: &str, context: Option<&str>, slot: &str, config: &Valu
         "context_id":context,"slot":slot,"config":config}))
 }
 
-/// CAD-796: the binding fields covered by installation approval. A rebind
-/// that changes any of these withdraws the installation's prior approval;
-/// anything else (receipt formatting the daemon re-derives) never churns it.
+/// CAD-796: the binding fields a derived grant rests on. A rebind that
+/// changes any of these drops the installation's derived grants; anything
+/// else (receipt formatting the daemon re-derives) never churns them. Since
+/// CAD-1119 the rebind itself is the operator's consent for the slot, so it
+/// no longer withdraws the installation's approval.
 fn binding_material_same(old: &Value, new: &Value) -> bool {
     const FIELDS: &[&str] = &[
         "install_id",
@@ -82,6 +84,101 @@ fn binding_material_same(old: &Value, new: &Value) -> bool {
         "declaration",
     ];
     FIELDS.iter().all(|field| old[field] == new[field])
+}
+
+/// CAD-1119: how a configured binding's stored receipt differs from the
+/// receipt the daemon re-derives for the same connection now.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BindingDrift {
+    /// Byte-identical: the binding is current.
+    Same,
+    /// Only provider bookkeeping moved (a descriptor or deployment pin
+    /// revision, the registration receipt, or the provider's tool name for
+    /// the same reviewed action). The binding migrates without the operator.
+    Compatible(Vec<Value>),
+    /// Anything else changed — capability, version, action, resource kind,
+    /// effect, semantics, scopes, contracts or the connection itself. The
+    /// slot stops until the operator confirms by binding it again.
+    NeedsConfirm(Vec<Value>),
+}
+
+/// Top-level receipt fields a migration may carry forward. Allowlist: a
+/// field not named here (including any future one) needs the operator.
+const MIGRATABLE_RECEIPT: &[&str] = &[
+    "registration_digest",
+    "descriptor_revision",
+    "sink_registration",
+    "reviewed_pin",
+    "reported_pin",
+];
+/// The one mapping field that may move: the provider's own name for the
+/// same reviewed action. Every other mapping field is the slot contract.
+const MIGRATABLE_MAPPING: &[&str] = &["tool"];
+
+fn drift_keys(old: &Value, new: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = old
+        .as_object()
+        .into_iter()
+        .chain(new.as_object())
+        .flat_map(|map| map.keys().cloned())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Classify a stored binding receipt against a freshly derived one.
+pub fn binding_drift(old: &Value, new: &Value) -> BindingDrift {
+    if old == new {
+        return BindingDrift::Same;
+    }
+    // A receipt is a JSON object. Anything else cannot be classified, so it
+    // never migrates (no keys would mean "nothing widened": fail closed).
+    if !old.is_object() || !new.is_object() {
+        return BindingDrift::NeedsConfirm(vec![
+            json!({"field": "receipt", "from": old, "to": new}),
+        ]);
+    }
+    let (mut compatible, mut widened) = (Vec::new(), Vec::new());
+    let mut note = |field: String, from: &Value, to: &Value, allowed: bool| {
+        let change = json!({"field": field, "from": from, "to": to});
+        if allowed {
+            compatible.push(change);
+        } else {
+            widened.push(change);
+        }
+    };
+    for key in drift_keys(old, new) {
+        let (from, to) = (&old[&key], &new[&key]);
+        // `null` and absent index the same; presence is part of the receipt.
+        if from == to && old.get(&key).is_some() == new.get(&key).is_some() {
+            continue;
+        }
+        if key == "mapping" && from.is_object() && to.is_object() {
+            for sub in drift_keys(from, to) {
+                let both = from.get(&sub).is_some() && to.get(&sub).is_some();
+                if from[&sub] != to[&sub] || (!both && from.get(&sub) != to.get(&sub)) {
+                    // An added or removed field is never bookkeeping.
+                    let allowed = both && MIGRATABLE_MAPPING.contains(&sub.as_str());
+                    note(format!("mapping.{sub}"), &from[&sub], &to[&sub], allowed);
+                }
+            }
+        } else {
+            let both = old.get(&key).is_some() && new.get(&key).is_some();
+            note(
+                key.clone(),
+                from,
+                to,
+                both && MIGRATABLE_RECEIPT.contains(&key.as_str()),
+            );
+        }
+    }
+    if widened.is_empty() {
+        BindingDrift::Compatible(compatible)
+    } else {
+        widened.extend(compatible);
+        BindingDrift::NeedsConfirm(widened)
+    }
 }
 
 fn binding_in(conn: &Connection, install: &str, id: &str) -> Result<Value> {
@@ -161,52 +258,6 @@ pub(crate) fn binding_current_in(
 }
 
 impl Store {
-    /// CAD-796: withdraw one installation's capability approval after a
-    /// material binding change. The row moves to `revoked` with a fresh
-    /// epoch, mirroring an explicit operator revoke, so new runs refuse
-    /// with "approval is absent or stale" until the operator re-approves
-    /// the changed binding. The current digest's epoch rows move with it,
-    /// like a re-approval supersede; other digests keep their exact
-    /// historical authority.
-    /// Answers whether an approval was withdrawn (absent stays absent).
-    pub(super) fn app_binding_approval_withdraw_in(
-        tx: &Connection,
-        install: &str,
-        reason: &str,
-    ) -> Result<bool> {
-        let current: Option<(String, i64)> = tx
-            .query_row(
-                "SELECT digest, epoch FROM app_install_capabilities WHERE install_id=? AND state='approved'",
-                [install],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((digest, epoch)) = current else {
-            return Ok(false);
-        };
-        let next = epoch + 1;
-        tx.execute(
-            "UPDATE app_install_capabilities SET state='revoked', epoch=?, created=? WHERE install_id=?",
-            params![next, now(), install],
-        )?;
-        tx.execute(
-            "UPDATE app_capability_epochs SET state='revoked' WHERE install_id=? AND digest=?",
-            params![install, digest],
-        )?;
-        tx.execute(
-            "INSERT INTO app_capability_epochs(install_id,epoch,digest,state,created) VALUES(?,?,?,?,?)",
-            params![install, next, digest, "revoked", now()],
-        )?;
-        Self::event(
-            tx,
-            Self::DAEMON_STREAM,
-            "app_install_capability_revoked",
-            json!({"install_id": install, "digest": digest, "epoch": next,
-                   "actor": "operator", "reason": reason}),
-        )?;
-        Ok(true)
-    }
-
     /// CAD-796: drop every derived-grant row recorded for one
     /// installation. A scope survives only while some remaining
     /// derivation (any app, any install) still covers it, so a rebind
@@ -305,10 +356,13 @@ impl Store {
         Ok(())
     }
 
-    /// CAD-796: close every configured binding on one credential and
-    /// withdraw each affected installation's approval. Called inside the
-    /// credential revoke/rotate transaction, so the record change and
-    /// the approval withdrawal land together.
+    /// CAD-796: close the waiting effects of every configured binding on
+    /// one credential and drop the affected installations' derived grants.
+    /// Called inside the credential revoke/rotate transaction, so the record
+    /// change and the closures land together. CAD-1119: the slot itself
+    /// stops at the binding receipt (the credential row or its revision no
+    /// longer matches) until the operator binds it again; the
+    /// installation's approval is the install consent and stays.
     pub(super) fn app_binding_approvals_withdraw_for_credential_in(
         tx: &Connection,
         platform_name: &str,
@@ -339,7 +393,6 @@ impl Store {
         installs.sort();
         installs.dedup();
         for install in installs {
-            Self::app_binding_approval_withdraw_in(tx, &install, "connection_credential_changed")?;
             Self::app_install_grants_drop_in(tx, &install, "operator")?;
         }
         Ok(())
@@ -578,7 +631,6 @@ impl Store {
         }
         Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
         if material_changed {
-            Self::app_binding_approval_withdraw_in(&tx, install, "connection_binding_changed")?;
             Self::app_install_grants_drop_in(&tx, install, "operator")?;
         }
         Self::event(
@@ -590,6 +642,68 @@ impl Store {
         let next = binding_in(&tx, install, id)?;
         tx.commit()?;
         Ok(json!({"binding":next}))
+    }
+
+    /// CAD-1119: carry a binding onto its connection's re-derived receipt
+    /// without the operator. The daemon calls this only after proving the
+    /// slot contract (capability, version, action, resource kind, effect,
+    /// semantics, scopes and contracts) and the connection identity are
+    /// unchanged. The row must still be exactly `proof` (compare-and-swap
+    /// on id, revision and digest), so a concurrent rebind or revoke wins.
+    /// Waiting effects pinned to the old incarnation close: a per-post
+    /// approval never carries across a receipt change.
+    pub fn app_binding_migrate(
+        &self,
+        install: &str,
+        proof: &BindingProof,
+        config: &Value,
+    ) -> Result<BindingProof> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let row = binding_in(&tx, install, &proof.id)?;
+        if row["state"] != "configured"
+            || row["revision"] != proof.revision
+            || row["digest"] != proof.digest.as_str()
+            || row["config"] != proof.config
+        {
+            return Err(Error::rejected(
+                "publication binding revision or incarnation changed",
+            ));
+        }
+        let context = row["context_id"].as_str();
+        validate_config(install, context, config)?;
+        let BindingDrift::Compatible(changes) = binding_drift(&proof.config, config) else {
+            return Err(Error::rejected(
+                "binding change widens the slot contract; the operator must confirm it",
+            ));
+        };
+        let slot = row["slot"]
+            .as_str()
+            .ok_or_else(|| Error::internal("invalid binding slot"))?;
+        let digest = config_digest(install, context, slot, config);
+        let updated = tx.execute("UPDATE app_bindings SET config=?,digest=?,revision=revision+1,updated=? WHERE install_id=? AND id=? AND revision=? AND state='configured'",params![config.to_string(),digest,now(),install,proof.id,proof.revision])?;
+        if updated != 1 {
+            return Err(Error::rejected("binding migration lost its revision claim"));
+        }
+        Self::app_effect_invalidate_in(&tx, install, None, Some(&proof.id), None)?;
+        Self::event(
+            &tx,
+            "app_bindings",
+            "app_binding_migrated",
+            json!({"install_id":install,"binding_id":proof.id,"revision":proof.revision+1,
+                   "digest":digest,"from_digest":proof.digest,"changes":changes,
+                   "actor":"daemon"}),
+        )?;
+        let next = binding_in(&tx, install, &proof.id)?;
+        tx.commit()?;
+        Ok(BindingProof {
+            id: proof.id.clone(),
+            revision: next["revision"]
+                .as_i64()
+                .ok_or_else(|| Error::internal("invalid binding revision"))?,
+            digest,
+            config: config.clone(),
+        })
     }
 
     pub fn app_binding_revoke(&self, install: &str, id: &str, expected: i64) -> Result<Value> {
@@ -610,7 +724,6 @@ impl Store {
             return Err(Error::rejected("binding revoke lost its revision claim"));
         }
         Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
-        Self::app_binding_approval_withdraw_in(&tx, install, "connection_binding_changed")?;
         Self::app_install_grants_drop_in(&tx, install, "operator")?;
         Self::event(
             &tx,

@@ -365,6 +365,32 @@ textarea.wa-prompt-input {
   font-size: var(--text-micro);
   margin-top: 0.5rem;
 }
+/* CAD-1119: a readiness blocker — its one-line row, then a full-width
+   detail block (next action, change, confirm) that wraps at any width. */
+.wa-blocker {
+  min-width: 0;
+  border-bottom: 1px solid var(--color-ink-700);
+}
+.wa-blocker > .wa-step {
+  border-bottom: 0;
+}
+.wa-blocker-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.wa-blocker-detail {
+  display: grid;
+  gap: 0.5rem;
+  min-width: 0;
+  padding-bottom: 0.65rem;
+}
+.wa-diff {
+  margin: 0;
+  padding-left: 1.1rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: var(--text-secondary);
+}
 .wa-step {
   display: flex;
   justify-content: space-between;

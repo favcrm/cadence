@@ -1,5 +1,6 @@
 import type {
   AppBinding,
+  BindingChange,
   Connection,
   Installation,
   SlotDeclaration,
@@ -142,6 +143,16 @@ export function bindingHealth(
   return "ok";
 }
 
+/** Receipt fields that migrate without the operator (daemon allowlist). */
+const BOOKKEEPING = new Set([
+  "registration_digest",
+  "sink_registration",
+  "descriptor_revision",
+  "reviewed_pin",
+  "reported_pin",
+  "mapping.tool",
+]);
+
 export interface SlotReadiness {
   slot: string;
   requirement: string;
@@ -150,17 +161,21 @@ export interface SlotReadiness {
   health: BindingHealth;
   custody: boolean;
   registered: boolean;
-  approved: boolean;
+  /** CAD-1119: the slot contract changes awaiting the operator's confirm. */
+  confirm: BindingChange[] | null;
   ready: boolean;
   nextAction: string;
 }
 
 /**
- * The installed-App Ready-to-run checklist (CAD-796): one row per typed
- * capability slot naming its bound connection, health, custody and whether
- * installation approval is still in force, with the plain next action for
- * whatever is missing, stale, revoked, unhealthy or unapproved. Legacy
- * untyped slots never authorize an effect, so they stay out of the list.
+ * The installed-App Ready-to-run checklist (CAD-796, CAD-1119): one row
+ * per typed capability slot with the plain next action for a real
+ * blocker — an unbound or stale slot, an unhealthy or unregistered
+ * connection, or a connection whose slot contract widened and awaits the
+ * operator's confirm. Installing the app is its approval, and a provider
+ * change that keeps the contract migrates silently, so neither is a
+ * blocker. Legacy untyped slots never authorize an effect, so they stay
+ * out of the list.
  */
 export function readinessFor(
   installation: Installation,
@@ -168,7 +183,6 @@ export function readinessFor(
   connections: Connection[],
   contextId: string | null,
 ): SlotReadiness[] {
-  const approved = installation.approved === true;
   return declaredSlots(installation)
     .filter((slot) => slot.declaration !== null)
     .map((slot) => {
@@ -183,20 +197,29 @@ export function readinessFor(
       // Candidate selection already requires a registered provider adapter;
       // readiness must gate on it too, or a deregistered provider reads Ready.
       const registered = connection?.status?.adapter_registered === true;
-      const ready = approved && health === "ok" && custody && registered;
+      const drift = health === "ok" ? binding?.drift : undefined;
+      // The confirm shows only what widened; provider bookkeeping that
+      // would have migrated on its own is not the operator's decision.
+      const confirm = drift?.state === "needs_confirm"
+        ? (drift.changes ?? []).filter((change) => !BOOKKEEPING.has(change.field))
+        : null;
+      const unavailable = drift?.state === "unavailable";
+      const ready = health === "ok" && custody && registered && !confirm && !unavailable;
       const nextAction = !binding || health === "not-configured"
         ? `Choose a ${slot.slot} connection below and save it.`
         : health === "stale-bundle"
-          ? `Save the ${slot.slot} connection again for the current app version, then approve the app.`
+          ? `Save the ${slot.slot} connection again for the current app version.`
           : health === "missing-connection"
             ? `Its connection is gone — choose another ${slot.slot} connection below.`
             : !custody
               ? `Its connection is unhealthy — see Settings → Connections, then rebind.`
               : !registered
                 ? `Its connection's provider is no longer registered — see Settings → Connections, then rebind.`
-                : !approved
-                ? `Approve the app's current version before running.`
-                : `Ready to run.`;
+                : confirm
+                  ? `Its connection changed what this slot may do. Review the change and confirm it.`
+                  : unavailable
+                    ? `Its connection no longer fits this slot — see Settings → Connections, then rebind.`
+                    : `Ready to run.`;
       return {
         slot: slot.slot,
         requirement: plainRequirement(slot),
@@ -205,7 +228,7 @@ export function readinessFor(
         health,
         custody,
         registered,
-        approved,
+        confirm,
         ready,
         nextAction,
       };

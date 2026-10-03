@@ -1,7 +1,7 @@
 //! Provider-neutral publication configuration. Configuration is not authority.
 use super::*;
 use crate::issue::{app, app_catalog::workspace};
-use crate::store::app_bindings::BindingProof;
+use crate::store::app_bindings::{binding_drift, BindingDrift, BindingProof};
 use std::collections::BTreeMap;
 
 impl Shared {
@@ -49,12 +49,27 @@ impl Shared {
                 .app_binding_show(install, required_str(params, "binding_id")?),
             "app_binding_list" => {
                 let pm = self.pm_at(&self.pm_dir()?)?;
-                workspace::with_runtime_snapshot(&pm, install, |bundle, _| {
-                    self.store.app_binding_list_preferred(
-                        install,
-                        context,
-                        Some(required_str(bundle, "digest")?),
-                    )
+                workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                    let digest = required_str(bundle, "digest")?;
+                    let mut listed =
+                        self.store
+                            .app_binding_list_preferred(install, context, Some(digest))?;
+                    let _custody = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    for row in listed["bindings"].as_array_mut().into_iter().flatten() {
+                        if row["state"] == "configured" && row["config"]["bundle_digest"] == digest
+                        {
+                            row["drift"] =
+                                self.app_binding_drift_status(install, row, bundle, files);
+                        }
+                    }
+                    Ok(listed)
                 })
             }
             "app_binding_revoke" => {
@@ -231,6 +246,89 @@ impl Shared {
             "reviewed_pin":connection["status"]["reviewed_pin"],"reported_pin":connection["status"]["reported_pin"],
             "mapping":mapping,"declaration":declaration}),
         )
+    }
+
+    /// CAD-1119: the binding a new run or quote uses for one slot. A
+    /// receipt that moved only in provider bookkeeping (descriptor or pin
+    /// revision, registration receipt, the provider's tool name for the
+    /// same reviewed action) migrates here without the operator, keeping
+    /// the installation's approval. Any change to the slot contract or the
+    /// connection refuses until the operator binds the slot again. Called
+    /// under PM -> custody -> release, from operator-gated calls only.
+    pub(super) fn app_binding_live(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+        bundle: &Value,
+        files: &BTreeMap<String, String>,
+    ) -> Result<Option<BindingProof>> {
+        let Some(proof) = self.store.app_binding_for_slot(
+            install,
+            context,
+            slot,
+            required_str(bundle, "digest")?,
+        )?
+        else {
+            return Ok(None);
+        };
+        let connection = proof.config["connection_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("binding connection receipt is missing"))?;
+        let fresh = self.app_binding_config(install, context, slot, connection, bundle, files)?;
+        match binding_drift(&proof.config, &fresh) {
+            BindingDrift::Same => Ok(Some(proof)),
+            BindingDrift::Compatible(_) => self
+                .store
+                .app_binding_migrate(install, &proof, &fresh)
+                .map(Some),
+            BindingDrift::NeedsConfirm(changes) => {
+                let fields: Vec<&str> = changes
+                    .iter()
+                    .filter_map(|change| change["field"].as_str())
+                    .collect();
+                Err(Error::rejected(format!(
+                    "the {slot} connection changed beyond the bound contract ({}); \
+                     the operator must confirm it by binding the slot again",
+                    fields.join(", ")
+                )))
+            }
+        }
+    }
+
+    /// The operator's view of one configured binding's receipt against the
+    /// connection now: `current`, `migrates` (silently, on next use),
+    /// `needs_confirm` with the field diff, or `unavailable` with why.
+    fn app_binding_drift_status(
+        &self,
+        install: &str,
+        row: &Value,
+        bundle: &Value,
+        files: &BTreeMap<String, String>,
+    ) -> Value {
+        let fresh = row["config"]["connection_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("binding connection receipt is missing"))
+            .and_then(|connection| {
+                self.app_binding_config(
+                    install,
+                    row["context_id"].as_str(),
+                    row["slot"].as_str().unwrap_or_default(),
+                    connection,
+                    bundle,
+                    files,
+                )
+            });
+        match fresh.map(|fresh| binding_drift(&row["config"], &fresh)) {
+            Ok(BindingDrift::Same) => json!({"state": "current", "changes": []}),
+            Ok(BindingDrift::Compatible(changes)) => {
+                json!({"state": "migrates", "changes": changes})
+            }
+            Ok(BindingDrift::NeedsConfirm(changes)) => {
+                json!({"state": "needs_confirm", "changes": changes})
+            }
+            Err(error) => json!({"state": "unavailable", "reason": error.to_string()}),
+        }
     }
 
     pub(super) fn app_binding_receipt_current(

@@ -661,9 +661,12 @@ export default function WorkspaceApp({
             </Button>
           </div>
           {!approved && (
+            // CAD-1119: installing or updating is the approval. This shows
+            // only after the operator revoked the app's access (or a bundle
+            // that failed the install checks), and restoring is that same
+            // operator decision again.
             <div className="wa-alert">
-              Approve this app’s current text workflow bundle before starting a
-              post.{" "}
+              This app’s access is off, so new posts can’t start.{" "}
               <Button
                 size="sm"
                 onClick={() =>
@@ -677,11 +680,11 @@ export default function WorkspaceApp({
                 disabled={!canWrite}
                 loading={busy}
               >
-                Approve app
+                Restore access
               </Button>
             </div>
           )}
-          {approved && !binding && (
+          {!binding && (
             <div className="wa-alert">
               Choose and save a Local destination in Settings before creating a
               run. The destination is frozen into its plan.{" "}
@@ -821,7 +824,7 @@ export default function WorkspaceApp({
                       {kind}: {upgradeProposal.receipt.structural_diff[kind].join(", ") || "none"}
                     </p>)}
                     {!!upgradeProposal.receipt.secret_warnings?.length && <p className="wa-alert">Package validation reported secret warnings; review the source before applying.</p>}
-                    <p className="wa-muted">Applying preserves this installation, contexts, version-pinned bindings and completed work. New-version runs need a fresh app approval and new bindings.</p>
+                    <p className="wa-muted">Applying preserves this installation, contexts, version-pinned bindings and completed work. Applying it approves the new version. New-version runs need new bindings.</p>
                     <Button variant="primary" disabled={!canWrite || busy || !!upgradeProposal.receipt.secret_warnings?.length} loading={busy}
                       onClick={() => void mutate(async () => {
                         const { source, receipt } = upgradeProposal;
@@ -843,6 +846,16 @@ export default function WorkspaceApp({
                   bindings={data.bindings}
                   connections={data.connections}
                   contextId={contextId || null}
+                  canWrite={canWrite}
+                  busy={busy}
+                  onConfirm={(value) =>
+                    void mutate(async () => {
+                      await workspaceApps.updateBinding(installId, value.id, {
+                        expected_revision: value.revision,
+                        connection_id: value.config.connection_id,
+                      });
+                    })
+                  }
                 />
                 <SlotBindings
                   installId={installId}

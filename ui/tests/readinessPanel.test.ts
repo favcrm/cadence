@@ -1,5 +1,5 @@
 export {};
-/** Mounted Ready-to-run QA (CAD-796): rebind → approval required → reapproval, revoke → not ready. */
+/** Mounted Ready-to-run QA (CAD-796, CAD-1119): only real blockers, a widened contract confirms inline. */
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/app-installations/install-a" });
@@ -63,33 +63,64 @@ async function render(props: Record<string, unknown>) {
   await React.act(async () => root.render(React.createElement(ReadinessPanel, props))); await flush();
 }
 async function main() {
-  // Bound, healthy and approved: the slot reads Ready with its connection.
+  // Bound and healthy: no blockers, and no approval step or approval noise.
   await render({ installation, bindings: [binding], connections, contextId: null });
   assert(text().includes("Ready to run"), "panel heading renders");
-  assert(text().includes("local/local (builtin-local)"), "bound connection named");
-  assert(text().includes("revision 2"), "binding revision named");
-  assert(text().includes("approval in force"), "approval state named");
-  assert(text().includes("Ready") && !text().includes("Needs you"), "ready slot needs nothing");
+  assert(text().includes("Every connection slot is bound and healthy."), "ready summary");
+  assert(!text().includes("Needs you"), "ready slot needs nothing");
+  assert(!/approv/i.test(text()), "no approval text");
 
-  // Rebind withdrew approval: the same binding now requires reapproval.
+  // Install = consent: even an installation the board reads as unapproved
+  // shows no approval row here; access is the app header's concern.
   await render({ installation: { ...installation, approved: false }, bindings: [binding], connections, contextId: null });
-  assert(text().includes("Needs you"), "unapproved slot needs you");
-  assert(text().includes("Approve the app's current version before running."), "reapproval action shown");
+  assert(!text().includes("Needs you") && !/approv/i.test(text()), "approval is never a slot blocker");
 
-  // Revoke closed the binding, which withdrew approval: the slot asks for a
-  // fresh save and reapproval, never a silent gap.
-  await render({ installation: { ...installation, approved: false }, bindings: [{ ...binding, state: "revoked" }], connections, contextId: null });
+  // A same-contract provider change migrates silently: still ready.
+  const migrating = { ...binding, drift: { state: "migrates", changes: [{ field: "mapping.tool", from: "old", to: "new" }] } };
+  await render({ installation, bindings: [migrating], connections, contextId: null });
+  assert(!text().includes("Needs you"), "silent migration is not a blocker");
+
+  // A widened contract: the slot blocks, names the change, and one inline
+  // confirm re-binds the same connection at its current revision.
+  const widened = { ...binding, drift: { state: "needs_confirm", changes: [
+    { field: "mapping.scopes", from: ["read"], to: ["read", "write"] },
+    { field: "registration_digest", from: "sha256:" + "a".repeat(64), to: "sha256:" + "b".repeat(64) },
+  ] } };
+  const confirmed: unknown[] = [];
+  await render({ installation, bindings: [widened], connections, contextId: null, canWrite: true, onConfirm: (b: unknown) => confirmed.push(b) });
+  assert(text().includes("Needs you"), "widened slot needs you");
+  assert(text().includes("mapping.scopes: read → read, write"), "the change is shown");
+  assert(!text().includes("registration_digest"), "bookkeeping is not part of the confirm");
+  const button = Array.from(host.querySelectorAll("button")).find((b) => b.textContent?.includes("Confirm publication change"));
+  assert(button, "inline confirm offered");
+  // Layout at 390 (Browser QA): the confirm and the change live in the
+  // full-width detail block under the row, never inside the one-line flex
+  // `.wa-step`, and the change wraps anywhere.
+  assert(button.closest(".wa-step") === null, "confirm is not in the one-line row");
+  assert(button.closest(".wa-blocker-detail") !== null, "confirm is in the full-width detail block");
+  const diff = host.querySelector(".wa-diff");
+  assert(diff && diff.closest(".wa-step") === null, "change is not in the one-line row");
+  const css: string = require("fs").readFileSync(require("path").join(require("process").cwd(), "src/features/workspace-apps/workspace-apps.css"), "utf8");
+  const rule = (name: string) => css.slice(css.indexOf(`${name} {`), css.indexOf("}", css.indexOf(`${name} {`)));
+  assert(/overflow-wrap:\s*anywhere/.test(rule(".wa-diff")), "the change wraps anywhere");
+  assert(/display:\s*grid/.test(rule(".wa-blocker-detail")) && /min-width:\s*0/.test(rule(".wa-blocker-detail")), "detail block is full width and shrinkable");
+  await React.act(async () => { button.click(); }); await flush();
+  assert(confirmed.length === 1 && (confirmed[0] as { id: string }).id === "bind-a", "confirm names the bound connection");
+  // A read-only viewer sees the change but cannot confirm it.
+  await render({ installation, bindings: [widened], connections, contextId: null, canWrite: false, onConfirm: () => {} });
+  const disabled = Array.from(host.querySelectorAll("button")).find((b) => b.textContent?.includes("Confirm"));
+  assert(disabled && disabled.disabled, "read-only confirm disabled");
+
+  // Revoke closed the binding: the slot asks for a fresh save.
+  await render({ installation, bindings: [{ ...binding, state: "revoked" }], connections, contextId: null });
   assert(text().includes("Choose a publication connection below and save it."), "revoke action shown");
-  assert(!text().includes("approval in force"), "revoked binding carries no approval");
 
-  // Rotation vanished the connection: the row says so with its reason.
+  // Rotation vanished the connection: the row says so.
   await render({ installation, bindings: [binding], connections: [], contextId: null });
-  assert(text().includes("health missing-connection"), "missing connection health named");
   assert(text().includes("choose another publication connection below"), "rebind action shown");
 
-  // Deregistered provider: bound, healthy custody, approved — still not Ready.
+  // Deregistered provider: bound and healthy custody — still not Ready.
   await render({ installation, bindings: [binding], connections: [{ ...connections[0], status: { ...connections[0].status, adapter_registered: false } }], contextId: null });
-  assert(text().includes("provider unregistered"), "registration state named");
   assert(text().includes("no longer registered"), "registration action shown");
   assert(text().includes("Needs you"), "deregistered slot needs you");
 
