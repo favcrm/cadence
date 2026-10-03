@@ -104,6 +104,9 @@ struct FakeDoor {
     grants: Arc<Mutex<GrantAuthority>>,
     ledger: Arc<FakePublishLedger>,
     calls: Arc<Mutex<u64>>,
+    /// CAD-1041: staging (`/preflight`) requests. Staging never reaches
+    /// the provider, so it is counted here and never in `calls`.
+    stages: Arc<Mutex<u64>>,
     /// Owner-authorized destination the fake discovery returns. The fake
     /// trusts the enrolled connection namespace (operator-side) and
     /// enforces destination-exactness against this value; unset means the
@@ -128,6 +131,7 @@ impl FakeDoor {
         let grants = Arc::new(Mutex::new(GrantAuthority::default()));
         let ledger = Arc::new(FakePublishLedger::enabled());
         let calls = Arc::new(Mutex::new(0u64));
+        let stages = Arc::new(Mutex::new(0u64));
         let expected_destination = Arc::new(Mutex::new(None));
         let omit_binding = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let corrupt_binding = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -136,6 +140,7 @@ impl FakeDoor {
         let worker_grants = Arc::clone(&grants);
         let worker_ledger = Arc::clone(&ledger);
         let worker_calls = Arc::clone(&calls);
+        let worker_stages = Arc::clone(&stages);
         let worker_expected = Arc::clone(&expected_destination);
         let worker_omit = Arc::clone(&omit_binding);
         let worker_forgeries = Arc::clone(&status_forgeries);
@@ -150,7 +155,9 @@ impl FakeDoor {
                 // not a provider send — it must NOT count toward the
                 // exactly-once send-call assertions.
                 let is_destinations_read = request.url().contains("/connectors/destinations");
-                if !is_destinations_read {
+                if request.url().ends_with("/preflight") {
+                    *worker_stages.lock().unwrap() += 1;
+                } else if !is_destinations_read {
                     *worker_calls.lock().unwrap() += 1;
                 }
                 let mut body = String::new();
@@ -173,6 +180,7 @@ impl FakeDoor {
             grants,
             ledger,
             calls,
+            stages,
             expected_destination,
             omit_binding,
             corrupt_binding,
@@ -364,6 +372,10 @@ impl FakeDoor {
     fn provider_calls(&self) -> u64 {
         *self.calls.lock().unwrap()
     }
+
+    fn stages(&self) -> u64 {
+        *self.stages.lock().unwrap()
+    }
 }
 
 /// Shared fake state bundled so the route stays under the argument
@@ -399,6 +411,20 @@ struct HttpSender {
     /// a second, sender-side injection point beside the door hook.
     status_forgeries:
         Mutex<HashMap<String, cadence_agent::platform::agenticos_external::publish::LedgerOutcome>>,
+    /// CAD-1041: scripted staging verdicts by key. An unscripted key
+    /// stages through the door's `/preflight` route, as the production
+    /// sender does.
+    preflights: Mutex<HashMap<String, Staging>>,
+    /// CAD-1041: scripted execute refusals by key — the code returns
+    /// before any wire call (e.g. `nothing_sent`).
+    execute_refusals: Mutex<HashMap<String, &'static str>>,
+}
+
+/// A scripted staging verdict for one key.
+#[derive(Clone, Copy)]
+enum Staging {
+    Uncertain,
+    Refused(&'static str),
 }
 
 impl HttpSender {
@@ -407,7 +433,38 @@ impl HttpSender {
             base,
             behaviors: Mutex::new(HashMap::new()),
             status_forgeries: Mutex::new(HashMap::new()),
+            preflights: Mutex::new(HashMap::new()),
+            execute_refusals: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Script the staging verdict for `key`; `None` stages at the door.
+    fn script_preflight(&self, key: &str, staging: Option<Staging>) {
+        let mut scripts = self.preflights.lock().unwrap();
+        match staging {
+            Some(staging) => scripts.insert(key.into(), staging),
+            None => scripts.remove(key),
+        };
+    }
+
+    fn script_execute_refusal(&self, key: &str, code: &'static str) {
+        self.execute_refusals
+            .lock()
+            .unwrap()
+            .insert(key.into(), code);
+    }
+
+    /// The exact binding as the fake door reads it.
+    fn wire(binding: &SendBinding) -> Value {
+        json!({"key": binding.key,
+            "connection_id": binding.connection_id,
+            "toolkit": binding.toolkit.as_str(),
+            "destination_id": binding.destination_id,
+            "caption_digest": binding.caption_digest,
+            "image_digest": binding.image_digest,
+            "cadence_run_id": binding.cadence_run_id,
+            "cadence_effect_id": binding.cadence_effect_id,
+            "grant_id": binding.grant_id})
     }
 
     fn forge_status(
@@ -512,6 +569,14 @@ impl cadence_agent::platform::agenticos_external::publish::PublishSender for Htt
         cadence_agent::platform::agenticos_external::publish::LedgerOutcome,
         cadence_agent::platform::agenticos_external::publish::Refusal,
     > {
+        if let Some(code) = self.execute_refusals.lock().unwrap().get(&binding.key) {
+            return Err(
+                cadence_agent::platform::agenticos_external::publish::Refusal::new(
+                    *code,
+                    "scripted: nothing left this client",
+                ),
+            );
+        }
         let behavior = self
             .behaviors
             .lock()
@@ -519,24 +584,40 @@ impl cadence_agent::platform::agenticos_external::publish::PublishSender for Htt
             .get(&binding.key)
             .copied()
             .unwrap_or(FakeProviderBehavior::Post);
-        let verdict = self.post(
-            "/v1/device/publish/exec",
-            &json!({"key": binding.key,
-            "connection_id": binding.connection_id,
-            "toolkit": binding.toolkit.as_str(),
-            "destination_id": binding.destination_id,
-            "caption_digest": binding.caption_digest,
-            "image_digest": binding.image_digest,
-            "cadence_run_id": binding.cadence_run_id,
-            "cadence_effect_id": binding.cadence_effect_id,
-            "grant_id": binding.grant_id,
-            "behavior": match behavior {
-                FakeProviderBehavior::Post => "post",
-                FakeProviderBehavior::Refuse => "refuse",
-                FakeProviderBehavior::LoseResponseAfterAccept => "lose",
-            }}),
-        );
+        let mut wire = Self::wire(binding);
+        wire["behavior"] = json!(match behavior {
+            FakeProviderBehavior::Post => "post",
+            FakeProviderBehavior::Refuse => "refuse",
+            FakeProviderBehavior::LoseResponseAfterAccept => "lose",
+        });
+        let verdict = self.post("/v1/device/publish/exec", &wire);
         Self::outcome_of(binding, &verdict)
+    }
+
+    /// CAD-1041: stage at the door (grant liveness + exact binding), as
+    /// the production sender does, unless the key is scripted.
+    fn preflight(
+        &self,
+        binding: &SendBinding,
+    ) -> cadence_agent::platform::agenticos_external::publish::Preflight {
+        use cadence_agent::platform::agenticos_external::publish::{Preflight, Refusal};
+        match self.preflights.lock().unwrap().get(&binding.key).copied() {
+            Some(Staging::Uncertain) => {
+                return Preflight::Uncertain(Refusal::new("refused", "scripted: staging timed out"))
+            }
+            Some(Staging::Refused(code)) => {
+                return Preflight::Refused(Refusal::new(code, "scripted staging refusal"))
+            }
+            None => {}
+        }
+        let verdict = self.post("/v1/device/publish/preflight", &Self::wire(binding));
+        if verdict["verdict"] == "ok" {
+            return Preflight::Approved;
+        }
+        Preflight::Refused(Refusal::new(
+            Refusal::code_for(verdict["code"].as_str().unwrap_or("")),
+            "fake door refused staging",
+        ))
     }
 
     fn status(
@@ -2362,10 +2443,8 @@ fn cad1041_send_now_posts_the_named_intent_once() {
         .unwrap()["intent"]
         .clone();
     assert_eq!(out["state"], "posted", "{out}");
-    // The test HttpSender uses the default preflight (Approved — its
-    // checks run inside execute), so exactly one provider call: the
-    // single exec POST. A production HttpPublishSender would stage
-    // first; the fake proves the once-only claim CAS either way.
+    // One staging request at the door, then the single exec POST.
+    assert_eq!(door.stages(), 1, "send-now stages once before the claim");
     assert_eq!(
         *door.calls.lock().unwrap(),
         1,
@@ -2553,25 +2632,117 @@ fn cad1041_revoked_grant_sends_nothing() {
         "cad1041-rev",
         epoch_now(),
     );
-    // Revoke after schedule: preflight refuses at the door and the row
-    // is claimed only to be reported refused — zero send calls reach
-    // the provider beyond the refused stage.
+    // Revoke after schedule: staging refuses at the door, so the row is
+    // claimed only to be reported refused and no exec POST ever leaves.
     door.grants.lock().unwrap().revoke(GRANT_FB);
     let out = h
         .daemon
         .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(out["state"], "refused", "revoked grant: {out}");
+    let error = out["receipt"]["error"].as_str().unwrap_or("");
+    assert!(error.contains("grant_revoked"), "{out}");
+    assert_eq!(door.stages(), 1, "the refusing stage ran once");
+    assert_eq!(*door.calls.lock().unwrap(), 0, "no exec POST, no status");
+}
+
+/// CAD-1041: an uncertain stage leaves the row queued with nothing sent;
+/// once staging answers, the same click sends.
+#[test]
+fn cad1041_uncertain_staging_leaves_the_row_queued() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snunc");
+    let (id, key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-unc",
+        epoch_now(),
+    );
+    sender.script_preflight(&key, Some(Staging::Uncertain));
+    let err = h
+        .daemon
+        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("stays queued"), "{err}");
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
         .unwrap();
-    let state = out["intent"]["state"].as_str().unwrap_or("").to_owned();
-    assert!(
-        state == "refused" || out["sent"] == false,
-        "revoked grant: {out}"
+    assert_eq!(shown["intent"]["state"], "queued");
+    assert_eq!(*door.calls.lock().unwrap(), 0, "nothing reached the door");
+    sender.script_preflight(&key, None);
+    let out = h
+        .daemon
+        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(out["intent"]["state"], "posted", "{out}");
+    assert_eq!(*door.calls.lock().unwrap(), 1);
+}
+
+/// CAD-1041: a definitive staging refusal claims the row and reports it
+/// refused with the door's code; execute never runs.
+#[test]
+fn cad1041_refused_staging_reports_refused_without_execute() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snref");
+    let (id, key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-ref",
+        epoch_now(),
     );
-    // Stage may have run (it is the refusal), but no POST ever left.
-    assert!(
-        *door.calls.lock().unwrap() <= 1,
-        "send calls must be zero: {}",
-        *door.calls.lock().unwrap()
+    sender.script_preflight(&key, Some(Staging::Refused("not_publishable")));
+    let out = h
+        .daemon
+        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(out["state"], "refused", "{out}");
+    let error = out["receipt"]["error"].as_str().unwrap_or("");
+    assert!(error.contains("not_publishable"), "{out}");
+    assert_eq!(*door.calls.lock().unwrap(), 0, "execute never ran");
+    assert_eq!(door.stages(), 0);
+}
+
+/// CAD-1041: `nothing_sent` from execute (staging stayed ambiguous inside
+/// the send) holds the row for a human; it is never burned `refused`.
+#[test]
+fn cad1041_nothing_sent_holds_the_row() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snheld");
+    let (id, key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-held",
+        epoch_now(),
     );
+    sender.script_execute_refusal(&key, "nothing_sent");
+    let out = h
+        .daemon
+        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(out["state"], "held", "{out}");
+    let reason = out["receipt"]["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("nothing was sent"), "{out}");
+    assert_eq!(*door.calls.lock().unwrap(), 0, "no exec POST left");
 }
 
 #[test]
@@ -2629,6 +2800,7 @@ fn cad1041_send_now_board_route_reaches_the_same_gate() {
     let parsed: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(parsed["intent"]["state"], "posted", "{text}");
     assert_eq!(*door.calls.lock().unwrap(), 1);
+    assert_eq!(door.stages(), 1);
     // A second click on the posted row is refused, provider count flat.
     let (code2, _text2) = board.post(
         &h,
@@ -2637,6 +2809,7 @@ fn cad1041_send_now_board_route_reaches_the_same_gate() {
     );
     assert!((400..500).contains(&code2), "{code2}");
     assert_eq!(*door.calls.lock().unwrap(), 1);
+    assert_eq!(door.stages(), 1, "a refused replay never stages");
     // An unsigned session cannot reach the write: sign-in is the gate.
 }
 
@@ -2667,6 +2840,7 @@ fn cad1041_crash_after_door_accept_reconciles_never_resends() {
     assert_eq!(out["state"], "posted", "{out}");
     // exec POST + one status GET — reconcile never re-sends.
     assert_eq!(*door.calls.lock().unwrap(), 2);
+    assert_eq!(door.stages(), 1);
     // A send-now on the settled row refuses; no third provider call.
     let err = h
         .daemon
