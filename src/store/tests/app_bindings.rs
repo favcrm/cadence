@@ -129,12 +129,14 @@ fn cad743_new_version_can_bind_after_one_hundred_old_version_rows() {
         .all(|row| row["config"]["bundle_digest"] == old_digest));
 }
 
-/// CAD-796 adversarial-first: a material rebind or revoke must withdraw the
-/// installation's prior approval and its derived grants; an identical
-/// re-save must keep both. RED without the guard: the approval row stays
-/// `approved` across the rebind.
+/// CAD-796 adversarial-first: a material rebind or revoke must drop the
+/// installation's derived grants; an identical re-save must keep them.
+/// CAD-1119 (operator direction: install = consent, binding = consent for
+/// the slot): neither the rebind nor the revoke withdraws the
+/// installation's approval any more. The revoked binding itself stops the
+/// slot.
 #[test]
-fn cad796_rebind_and_revoke_withdraw_approval_unchanged_resave_keeps_it() {
+fn cad796_rebind_and_revoke_drop_grants_and_keep_install_consent() {
     let (_dir, s) = store();
     s.conn()
         .execute_batch(crate::store::app_bindings::SCHEMA)
@@ -240,32 +242,41 @@ fn cad796_rebind_and_revoke_withdraw_approval_unchanged_resave_keeps_it() {
     assert!(s.app_binding_update("install-a", &id, 1, &forged).is_err());
     assert!(s.app_binding_show("install-b", &id).is_err());
     assert_eq!(approval_of(), Some("approved".into()));
-    // Material rebind: new connection incarnation withdraws approval and
-    // the derived grant, and closes nothing it does not own.
+    // Material rebind: the operator's rebind is the slot's consent. It
+    // drops the derived grant and closes nothing it does not own; the
+    // installation's approval stays in force.
     let mut changed = config.clone();
     changed["connection_id"] = json!("conn-b");
     let second = s.app_binding_update("install-a", &id, 1, &changed).unwrap();
     assert_eq!(second["binding"]["revision"], 2);
-    assert_eq!(approval_of(), Some("revoked".into()));
+    assert_eq!(approval_of(), Some("approved".into()));
     let grant = s
         .platform_grant("worker-a", "fixture", "work")
         .unwrap()
         .unwrap();
     assert!(!grant.scopes.contains(&"widgets:write".to_string()));
     assert!(grant.scopes.contains(&"widgets:read".to_string()));
-    // Operator re-approves the changed binding: authority returns.
-    s.app_capability_decide("install-a", digest, true).unwrap();
-    assert_eq!(approval_of(), Some("approved".into()));
-    // Revoke withdraws again; a concurrent stale revision never lands.
+    // Revoke: a concurrent stale revision never lands; the binding is
+    // revoked and the slot has no configured binding left.
     assert!(s.app_binding_revoke("install-a", &id, 1).is_err());
     s.app_binding_revoke("install-a", &id, 2).unwrap();
-    assert_eq!(approval_of(), Some("revoked".into()));
+    assert_eq!(
+        s.app_binding_show("install-a", &id).unwrap()["binding"]["state"],
+        "revoked"
+    );
+    assert!(s
+        .app_binding_for_slot("install-a", None, "publication", digest)
+        .unwrap()
+        .is_none());
+    assert_eq!(approval_of(), Some("approved".into()));
 }
 
 /// CAD-796: revoking or rotating the credential under a configured binding
-/// withdraws every affected installation's approval in the same transaction.
+/// stops that binding in the same transaction. CAD-1119: the slot stops at
+/// the binding receipt, which no longer proves current, while the
+/// installation's approval (the install consent) stays.
 #[test]
-fn cad796_credential_revoke_and_rotate_withdraw_bound_approvals() {
+fn cad796_credential_revoke_and_rotate_stop_the_bound_slot() {
     let (_dir, s) = store();
     s.conn()
         .execute_batch(crate::store::app_bindings::SCHEMA)
@@ -294,9 +305,33 @@ fn cad796_credential_revoke_and_rotate_withdraw_bound_approvals() {
         "provider":"fixture","account":"bound","connection_kind":"enrolled",
         "connection_revision":1,"registration_digest":"reg-1","descriptor_revision":1,
         "mapping":{"effect":"send","scopes":["widgets:write"]},"declaration":{}});
-    s.app_binding_create("install-a", None, "publication", &config, "cad796-cred-req")
+    let created = s
+        .app_binding_create("install-a", None, "publication", &config, "cad796-cred-req")
         .unwrap();
-    // Rotate: revision bump stales the binding and withdraws approval.
+    let proof: crate::store::app_bindings::BindingProof =
+        serde_json::from_value(json!({"id": created["binding"]["id"],
+            "revision": created["binding"]["revision"],
+            "digest": created["binding"]["digest"],
+            "config": created["binding"]["config"]}))
+        .unwrap();
+    s.conn()
+        .execute(
+            "INSERT OR REPLACE INTO connection_metadata(singleton, workspace_id) VALUES(1, 'ws')",
+            [],
+        )
+        .unwrap();
+    let current = || {
+        crate::store::app_bindings::binding_current_in(
+            &s.conn(),
+            "install-a",
+            None,
+            "publication",
+            &proof,
+        )
+        .unwrap()
+    };
+    assert!(current(), "the fresh binding is current");
+    // Rotate: the revision bump stales the binding; approval stays.
     s.platform_enroll(
         &crate::store::CredentialRecord {
             connection_id: "conn-cred".into(),
@@ -322,10 +357,10 @@ fn cad796_credential_revoke_and_rotate_withdraw_bound_approvals() {
                 |r| r.get::<_, String>(0),
             )
             .unwrap(),
-        "revoked"
+        "approved"
     );
-    // Re-approve, then revoke the credential: approval withdraws again.
-    s.app_capability_decide("install-a", digest, true).unwrap();
+    assert!(!current(), "a rotated credential stops the bound slot");
+    // Revoke the credential: the slot stays stopped.
     s.platform_revoke(
         "fixture",
         "bound",
@@ -343,8 +378,9 @@ fn cad796_credential_revoke_and_rotate_withdraw_bound_approvals() {
                 |r| r.get::<_, String>(0),
             )
             .unwrap(),
-        "revoked"
+        "approved"
     );
+    assert!(!current(), "a revoked credential stops the bound slot");
 }
 
 /// CAD-796 adversarial: a corrupt derived-grant row must fail the rebind
