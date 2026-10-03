@@ -308,13 +308,12 @@ impl Store {
     pub fn orphan_submitting_nudges(&self, reason: &str) -> Result<Vec<(String, String)>> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
-            let stale: Vec<(String, String)> = tx
-                .query_vec(
-                    "SELECT id, alias FROM messages
+            let stale: Vec<(String, String)> = tx.query_vec(
+                "SELECT id, alias FROM messages
                      WHERE source='nudge' AND state='submitting'",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
             let mut closed = Vec::new();
             for (id, alias) in stale {
                 let result = json!({"status": "unknown", "via": format!("{reason}_unconfirmed"),

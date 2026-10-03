@@ -792,7 +792,10 @@ impl Store {
             .filter(|(_, was, now)| was != now)
             .map(|(field, _, _)| *field)
             .collect::<Vec<_>>();
-            if !drift.is_empty() || target.pid != current.pid || target.pid_start != current.pid_start {
+            if !drift.is_empty()
+                || target.pid != current.pid
+                || target.pid_start != current.pid_start
+            {
                 return Err(Error::rejected(format!(
                     "native steer refused, nothing changed: agent '{}' no longer matches \
                      the authorized target ({} changed)",
@@ -802,16 +805,15 @@ impl Store {
             }
             // The turn this nudge would steer: the report-owing row's
             // token, same rule `take_queued`'s hold uses.
-            let running_turn: Option<(String, String)> = tx
-                .query_opt(
-                    &format!(
-                        "SELECT id,turn_id FROM messages WHERE alias=? AND state='running'
+            let running_turn: Option<(String, String)> = tx.query_opt(
+                &format!(
+                    "SELECT id,turn_id FROM messages WHERE alias=? AND state='running'
                          AND source NOT IN {TURNLESS_SOURCES_SQL}
                          AND turn_id IS NOT NULL AND turn_id != '' ORDER BY seq LIMIT 1"
-                    ),
-                    [&target.alias],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
+                ),
+                [&target.alias],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
             let (duplicate, _) = self.enqueue_tx(
                 &tx,
                 &target.alias,
