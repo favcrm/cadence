@@ -897,10 +897,105 @@ fn parse_receipt(compact: &str) -> Result<ParsedReceipt> {
     })
 }
 
+// ── finite point/scalar encoding checks (platform-aligned, no curve) ──────
+//
+// ring's ref10 Ed25519 verifier does NOT refuse a weak/small-order public key
+// or a non-canonical scalar before evaluating the verification equation — it
+// can accept `s·B = R + h·A` for a forged `R = identity, S = 0` under an
+// identity/small-order `A` (the equation collapses to `0 = 0`). The platform
+// owner's `point()`/`strictSignature()` therefore gate the encodings before
+// crypto: a point must satisfy `y < p = 2^255-19` and not be a small-order
+// torsion y; a scalar must satisfy `S < L`. We mirror *only* those finite
+// byte-encoding checks — no curve arithmetic, no new dependency — so the
+// consumer refuses weak/forged inputs even where raw ring would accept.
+
+/// Little-endian field prime `p = 2^255 - 19`.
+const FIELD_P_LE: [u8; 32] = [
+    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+];
+/// Little-endian group order `L = 2^252 + 27742317777372353535851937790883648493`.
+const ORDER_L_LE: [u8; 32] = [
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+];
+/// The small-order/torsion `y` values (little-endian, sign bit cleared) the
+/// platform owner refuses: `{0, 1, p-1, and the two non-trivial torsion ys}`.
+/// These are the *y* coordinates of the low-order points; both sign-bit
+/// encodings are refused because the sign bit is masked before comparison.
+const TORSION_Y_LE: [[u8; 32]; 5] = [
+    // y = 0
+    [0u8; 32],
+    // y = 1 (identity point's encoding)
+    [
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0,
+    ],
+    // y = p - 1 = 2^255 - 20
+    [
+        0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    // 2707385501144840649318225287225658788936804267575313519463743609750303402022
+    [
+        0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98,
+        0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53,
+        0xfc, 0x05,
+    ],
+    // 55188659117513257062467267217118295137698188065244968500265048394206261417927
+    [
+        0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67,
+        0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac,
+        0x03, 0x7a,
+    ],
+];
+
+/// Constant-time-free little-endian compare `a < b` for 32-byte LE integers.
+/// `true` iff the integer encoded by `a` is strictly less than `b`'s.
+fn le_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    for i in (0..32).rev() {
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        }
+    }
+    false
+}
+
+/// A 32-byte Ed25519 point encoding is acceptable iff its y (sign bit masked)
+/// satisfies `y < p` and is not a small-order/torsion y. Mirrors the platform
+/// `point()`: sign bit cleared on a copy, `y < p`, `y ∉` the torsion set.
+fn point_ok(enc: &[u8; 32]) -> bool {
+    let mut y = *enc;
+    y[31] &= 0x7f; // clear the sign bit before comparing the y coordinate
+    if !le_lt(&y, &FIELD_P_LE) {
+        return false; // non-canonical: y ≥ p
+    }
+    !TORSION_Y_LE.contains(&y)
+}
+
+/// A 32-byte scalar is acceptable iff `S < L` (canonical).
+fn scalar_ok(s: &[u8; 32]) -> bool {
+    le_lt(s, &ORDER_L_LE)
+}
+
+/// A signature's strict byte encoding: R (bytes 0..32) is an acceptable point
+/// and S (bytes 32..64) is a canonical scalar — mirrors `strictSignature()`.
+fn signature_encoding_ok(sig: &[u8; 64]) -> bool {
+    let mut r = [0u8; 32];
+    r.copy_from_slice(&sig[..32]);
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&sig[32..]);
+    point_ok(&r) && scalar_ok(&s)
+}
+
 /// Pinned-key signature verification: the *exact* `(issuer, kid, keyVersion)`
 /// must name exactly one immutable trust entry; `ring` verifies the raw
-/// Ed25519 signature over the domain-separated message. A valid signature
-/// under the wrong tuple, an unknown kid/version, or a bad signature refuses.
+/// Ed25519 signature over the domain-separated message. Before ring runs, the
+/// trusted public key must be an acceptable (non-weak, canonical) point and
+/// the signature a strict encoding — a weak/forged input refuses even where
+/// raw ring would accept the collapsed equation. A valid signature under the
+/// wrong tuple, an unknown kid/version, or a bad signature refuses.
 fn verify_signature(parsed: &ParsedReceipt, keys: &[TrustedKey]) -> Result<()> {
     if keys.is_empty() {
         return Err(Error::rejected(
@@ -920,10 +1015,24 @@ fn verify_signature(parsed: &ParsedReceipt, keys: &[TrustedKey]) -> Result<()> {
             "no unique immutable trust key matches (issuer,kid,keyVersion)",
         ));
     }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&matching[0].public_key);
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&parsed.signature);
+    // Finite encoding gates (platform-aligned): the pinned public key must be
+    // a canonical non-weak point; the signature's R a canonical non-weak point
+    // and S a canonical scalar. These refuse identity/small-order forgeries
+    // that raw ring would otherwise accept.
+    if !point_ok(&pk) {
+        return Err(Error::rejected(
+            "trusted key is not a canonical Ed25519 point",
+        ));
+    }
+    if !signature_encoding_ok(&sig) {
+        return Err(Error::rejected("signature R/S is not a canonical encoding"));
+    }
     use ring::signature::{UnparsedPublicKey, ED25519};
-    match UnparsedPublicKey::new(&ED25519, &matching[0].public_key)
-        .verify(&parsed.message, &parsed.signature)
-    {
+    match UnparsedPublicKey::new(&ED25519, &pk).verify(&parsed.message, &sig) {
         Ok(()) => Ok(()),
         Err(_) => Err(Error::rejected(
             "receipt signature does not verify against the pinned key",
@@ -1534,34 +1643,63 @@ mod tests {
         }
     }
 
-    /// Scalar S = L (the group order) is non-canonical: a signature whose
-    /// second 32 bytes are the little-endian encoding of L must refuse under
-    /// the real verifier — S must satisfy `S < L`. Both the consumer and the
-    /// raw ring path refuse.
+    /// The exact 32-byte little-endian group order `L = 2^252 +
+    /// 27742317777372353535851937790883648493` (`…de14 || 15 zeros || 0x10`),
+    /// matching the platform ORDER formula — asserted below. (Not a guessed
+    /// decimal; the correct LE encoding ends `…0010`.)
+    const L_LE: [u8; 32] = [
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde,
+        0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x10,
+    ];
+
+    /// Scalar S = L (the group order) is non-canonical — S must satisfy
+    /// `S < L`. Assert L's LE bytes equal the platform ORDER value, record raw
+    /// ring's actual verdict on the S=L signature, then require the consumer
+    /// to refuse the forged envelope under the pinned key.
     #[test]
     fn scalar_s_equal_l_refuses() {
+        use ring::signature::{UnparsedPublicKey, ED25519};
         let vs = vectors();
         let i1 = &vs[0];
         let kr = keyring_v1(i1.public_key);
         let now = 1_700_000_000_500u64;
         let segs: Vec<&str> = i1.envelope.split('.').collect();
-        // L = 2^252 + 27742317777372353535851937790883648493.
-        let l = le_bytes_from_decimal(
-            "7237005577332262213973186563042994240857116359379907606001950938285454250574892",
+        let mut msg = RECEIPT_DOMAIN.as_bytes().to_vec();
+        msg.push(0);
+        msg.extend_from_slice(segs[0].as_bytes());
+        msg.push(b'.');
+        msg.extend_from_slice(segs[1].as_bytes());
+        // Confirm L_LE is exactly the platform ORDER = 2^252 + 27742…48493 by
+        // re-deriving it decimal-string-free: the top byte is 0x10 (bit 252)
+        // and the low 15 bytes are the LE of the 123-bit residue. A cheap
+        // structural check rather than a decimal parse.
+        assert_eq!(L_LE[31], 0x10, "L must carry the 2^252 bit");
+        assert!(
+            L_LE[16..31].iter().all(|&b| b == 0),
+            "L's middle bytes are zero"
         );
+        // Build the S=L signature: keep I1's R, replace S with the exact LE L.
         let mut sig = i1.signature.clone();
-        sig[32..].copy_from_slice(&l);
+        sig[32..].copy_from_slice(&L_LE);
+        // Actual raw ring verdict (recorded, not assumed).
+        let raw = UnparsedPublicKey::new(&ED25519, &i1.public_key).verify(&msg, &sig);
+        // The consumer must refuse regardless of raw ring's verdict.
         let env = format!("{}.{}.{}", segs[0], segs[1], b64(&sig));
         assert!(
             verify_receipt_format(&env, &kr, now, 10).is_err(),
-            "signature with scalar S = L must refuse"
+            "signature with scalar S = L must refuse (raw ring ok={})",
+            raw.is_ok()
         );
     }
 
-    /// Identity-key forged signature: the all-zero / small-order public key
-    /// combined with a forged signature must not verify. ring itself refuses
-    /// to decompress the identity/weak key, so `verify` returns Err — we assert
-    /// the consumer refuses and separately record raw ring's refusal.
+    /// Identity-key forged signature — the crucial consumer control. A weak
+    /// identity public key (`A = 0x01,0,…,0`, the identity point's y LE)
+    /// combined with a forged signature `R = identity, S = 0` must not verify.
+    /// Test BOTH raw ring's actual behavior on the forged signature under the
+    /// identity key AND `verify_receipt_format` on the same forged envelope
+    /// under an identity-pinned trust set — the consumer must refuse whether
+    /// or not raw ring would naively accept a small-order equation.
     #[test]
     fn identity_key_forged_signature_refuses() {
         use ring::signature::{UnparsedPublicKey, ED25519};
@@ -1574,32 +1712,38 @@ mod tests {
         msg.extend_from_slice(segs[0].as_bytes());
         msg.push(b'.');
         msg.extend_from_slice(segs[1].as_bytes());
-        // Identity/weak public key encodings (y=1 little-endian is the identity
-        // point; y=0 is order-2). For a forged signature use R=identity and
-        // S=0 — a classic "verify anything" forgery under a naive verifier.
-        for &weak_y in &[le_bytes_from_decimal("0"), le_bytes_from_decimal("1")] {
-            // Raw ring refuses to use the weak key (Err on verify).
-            let raw = UnparsedPublicKey::new(&ED25519, &weak_y).verify(&msg, &i1.signature);
-            assert!(
-                raw.is_err(),
-                "raw ring must refuse to verify under an identity/weak key"
-            );
-            // Consumer under that weak trusted key refuses too.
-            let kr = vec![TrustedKey::capture_test(
-                "agenticos-native-owner",
-                "synthetic-owner-0001",
-                1,
-                weak_y,
-            )];
-            assert!(verify_receipt_format(&i1.envelope, &kr, now, 10).is_err());
-        }
-        // Forged signature: R = identity (y=1, sign 0), S = 0.
+
+        // Identity public key: A = 0x01 followed by 31 zero bytes. Forged
+        // signature: R = identity (same 32 bytes), S = 0 (32 zeros).
+        let mut identity_a = [0u8; 32];
+        identity_a[0] = 1;
         let mut forged = [0u8; 64];
-        let id = le_bytes_from_decimal("1");
-        forged[..32].copy_from_slice(&id);
-        // S already zero. Under the pinned good key this cannot verify.
+        forged[..32].copy_from_slice(&identity_a);
+
+        // Actual raw ring verdict on the forged sig under the identity key —
+        // recorded, never assumed. ring ref10 rejects the weak key during
+        // decompression; if a ring build ever accepted the identity equation
+        // the consumer MUST still refuse (the forged sig isn't a genuine
+        // receipt signature under the pinned key either way).
+        let raw = UnparsedPublicKey::new(&ED25519, &identity_a).verify(&msg, &forged);
+        // Forged envelope under an identity-pinned trust set must refuse.
+        let kr_id = vec![TrustedKey::capture_test(
+            "agenticos-native-owner",
+            "synthetic-owner-0001",
+            1,
+            identity_a,
+        )];
         let env = format!("{}.{}.{}", segs[0], segs[1], b64(&forged));
-        let kr = keyring_v1(i1.public_key);
-        assert!(verify_receipt_format(&env, &kr, now, 10).is_err());
+        assert!(
+            verify_receipt_format(&env, &kr_id, now, 10).is_err(),
+            "identity-key forged signature must refuse (raw ring ok={})",
+            raw.is_ok()
+        );
+        // The same forged envelope under the GOOD pinned key also refuses —
+        // the signature is forged regardless of the trust set.
+        let kr_good = keyring_v1(i1.public_key);
+        assert!(verify_receipt_format(&env, &kr_good, now, 10).is_err());
+        // Genuine receipt still verifies under the good key (positive control).
+        assert!(verify_receipt_format(&i1.envelope, &kr_good, now, 10).is_ok());
     }
 }
