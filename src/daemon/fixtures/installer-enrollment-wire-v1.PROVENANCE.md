@@ -40,6 +40,18 @@ allowance; the scanner, workflow and vendored `src/secret/gitleaks.toml` rules
 are unchanged. The fixture, its hash, the parser and the scanner must not be
 edited to evade the check.
 
+## In-process scanner baseline (test-only)
+
+The repo's own `secret::tests::no_new_findings_in_src` guard runs cadence's
+in-process gitleaks-rule scanner over `src/` and asserts no credential-shaped
+string beyond the pinned `KNOWN_FIXTURES`. The fixture's four `envelope`
+strings trip the same `jwt` rule there, so four per-finding `(file, rule,
+fingerprint)` tuples are pinned in `src/secret/tests.rs`. The fingerprint is
+`SHA256(secret)[0..8]` hex, recomputed independently: I1 `641e6f5a108d38af`,
+I2 `a15f212362eab9f1`, I3 `1aafb7cb743005dd`, I4 `19280393965df1b4`. This is a
+*test-only baseline* for the same public vectors — a per-finding pin, not a
+path or rule allowlist; the scan and its assertion are unchanged.
+
 ## Security posture
 
 - The crypto here is **diagnostic/format evidence only** — verify-only. It
