@@ -59,11 +59,8 @@ pub(crate) fn run() -> Result<i32> {
             if *token_stdin {
                 return cadence_agent::remote_auth::login(issuer, org, &dir, true, *no_open);
             }
-            let grant = cadence_agent::remote_enrollment::login_browser(
-                issuer,
-                org,
-                &dir,
-                |url, code| {
+            let grant =
+                cadence_agent::remote_enrollment::login_browser(issuer, org, &dir, |url, code| {
                     eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
                     if !no_open {
                         let program = if cfg!(target_os = "macos") {
@@ -80,8 +77,7 @@ pub(crate) fn run() -> Result<i32> {
                         let _ = cadence_agent::reaper::spawn(&mut opener);
                     }
                     Ok(())
-                },
-            )?;
+                })?;
             // Record first: a refused registry write (changed endpoint, name
             // taken by `local`) must leave no credential behind.
             let view =

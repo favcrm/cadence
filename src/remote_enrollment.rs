@@ -1245,9 +1245,10 @@ fn login_grant(value: &Value, org: &str) -> Result<LoginGrant> {
         .as_array()
         .ok_or_else(|| reject("Invalid hosted login capabilities"))?;
     let every_cli = !caps.is_empty()
-        && caps
-            .iter()
-            .all(|c| c.as_str().is_some_and(|s| s.starts_with("cli.") && s.len() <= 32));
+        && caps.iter().all(|c| {
+            c.as_str()
+                .is_some_and(|s| s.starts_with("cli.") && s.len() <= 32)
+        });
     let slug_value = field(value, "organization_slug")?;
     let endpoint = format!("https://{slug_value}{CLOUD_SUFFIX}");
     if field(value, "version")? != VERSION
@@ -2862,8 +2863,14 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut code, body) = public_request(&listener, "/v1/hosted-cadence/device/code");
             assert_eq!(body["organization_id"], "ws_real");
-            assert!(body.get("audience").is_none(), "the caller never names a host");
-            assert_eq!(body["requested_capabilities"], json!(["cli.read", "cli.write"]));
+            assert!(
+                body.get("audience").is_none(),
+                "the caller never names a host"
+            );
+            assert_eq!(
+                body["requested_capabilities"],
+                json!(["cli.read", "cli.write"])
+            );
             respond(&mut code, &browser_code(60));
             for e in &token_errors {
                 let (mut token, _) = public_request(&listener, "/v1/hosted-cadence/device/token");
@@ -2893,7 +2900,11 @@ mod tests {
         let (out, dir, _root) = run_login(login_grant_body(), vec![]);
         let grant = out.unwrap();
         assert_eq!(
-            (grant.organization_id.as_str(), grant.slug.as_str(), grant.endpoint.as_str()),
+            (
+                grant.organization_id.as_str(),
+                grant.slug.as_str(),
+                grant.endpoint.as_str()
+            ),
             ("ws_real", "acme", LOGIN_ENDPOINT)
         );
         // Verification persists nothing; the caller records, then saves.

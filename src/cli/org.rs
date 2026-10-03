@@ -599,9 +599,7 @@ mod tests {
         let mut registry = Registry::default();
         apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
         assert!(apply_record_remote(&mut registry, "alpha", EP_B, "ws_alpha", false).is_err());
-        assert!(
-            apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).is_err()
-        );
+        assert!(apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).is_err());
         let stored = registry
             .connections
             .iter()
@@ -626,30 +624,30 @@ mod tests {
     #[test]
     fn non_https_or_credentialed_endpoint_is_refused() {
         let mut registry = Registry::default();
-        assert!(
-            apply_record_remote(&mut registry, "alpha", "http://evil.example/", "ws_a", false)
-                .is_err()
-        );
-        assert!(
-            apply_record_remote(
-                &mut registry,
-                "alpha",
-                "https://user:pass@evil.example/",
-                "ws_a",
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            apply_record_remote(
-                &mut registry,
-                "alpha",
-                "https://evil.example/?next=1",
-                "ws_a",
-                false
-            )
-            .is_err()
-        );
+        assert!(apply_record_remote(
+            &mut registry,
+            "alpha",
+            "http://evil.example/",
+            "ws_a",
+            false
+        )
+        .is_err());
+        assert!(apply_record_remote(
+            &mut registry,
+            "alpha",
+            "https://user:pass@evil.example/",
+            "ws_a",
+            false
+        )
+        .is_err());
+        assert!(apply_record_remote(
+            &mut registry,
+            "alpha",
+            "https://evil.example/?next=1",
+            "ws_a",
+            false
+        )
+        .is_err());
         assert!(registry.connections.is_empty());
         assert!(registry.selected.is_none());
     }
