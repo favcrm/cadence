@@ -1171,9 +1171,8 @@ mod http {
 /// installation GET list and a message POST naming a conversation) is
 /// refused by the board as an operator-only decision (`check:
 /// operator_only`, 403) and writes nothing, while the operator's session
-/// is served on the same routes. NOT covered here: `GET
-/// /api/threads/<alias>/conversations?install=` has no board gate (see the
-/// PR report).
+/// is served on the same routes. The removed `GET
+/// /api/threads/<alias>/conversations` must stay a 404.
 ///
 /// Guards: `WRITE_ROUTES` (ui/operator.rs) + `operator::admit` for the
 /// POSTs; `admit_operator_read` (ui/serve.rs) for the installation GET.
@@ -1242,10 +1241,28 @@ fn i1_board_http_refuses_agents_on_every_conversation_route_like_the_rpc() {
     let (status, reply) = board.call(
         "operator",
         "GET",
-        &format!("/api/threads/master/conversations?install={crm}"),
+        &format!("/api/app-installations/{crm}/conversations"),
         None,
     );
     assert_eq!(status, 200, "{reply}");
+    // The ungated `GET /api/threads/<alias>/conversations` was removed
+    // (it relayed the operator-only list with no board gate): it must stay
+    // absent for an agent and for the operator, so it cannot silently
+    // return ungated.
+    for who in [agent, "operator"] {
+        let (status, reply) = board.call(
+            who,
+            "GET",
+            &format!("/api/threads/master/conversations?install={crm}"),
+            None,
+        );
+        assert_eq!(status, 404, "{who}: {reply}");
+        assert_eq!(
+            reply["error"],
+            json!("no such thread route"),
+            "{who}: {reply}"
+        );
+    }
 }
 
 const ENV_CHILD: &str = "CAD1098_ENV_CHILD";
