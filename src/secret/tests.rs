@@ -518,6 +518,31 @@ const KNOWN_FIXTURES: &[(&str, &str, &str)] = &[
         "cadence-argv-secret",
         "2f222aa5a5cec4d8",
     ),
+    // CAD-1061: the installer-enrollment wire fixture's four `envelope`
+    // fields are the *public synthetic* platform vectors (RFC8032 §7.1 test-1
+    // key, never provisioned). Their `H.P.S` base64url compact receipts match
+    // the `jwt` rule but are published test vectors, not credentials — pinned
+    // per-finding, not a path/rule allowance.
+    (
+        "src/daemon/fixtures/installer-enrollment-wire-v1.json",
+        "jwt",
+        "641e6f5a108d38af",
+    ),
+    (
+        "src/daemon/fixtures/installer-enrollment-wire-v1.json",
+        "jwt",
+        "a15f212362eab9f1",
+    ),
+    (
+        "src/daemon/fixtures/installer-enrollment-wire-v1.json",
+        "jwt",
+        "1aafb7cb743005dd",
+    ),
+    (
+        "src/daemon/fixtures/installer-enrollment-wire-v1.json",
+        "jwt",
+        "19280393965df1b4",
+    ),
 ];
 
 /// The repo's own source has no credential-shaped string beyond the known

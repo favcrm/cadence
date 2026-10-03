@@ -39,6 +39,7 @@ mod dispatch_rpc;
 mod effect_rpc;
 mod idea_rpc;
 mod identity;
+mod installer_enrollment_wire;
 mod jobs_rpc;
 mod lane_rpc;
 mod master_rpc;
