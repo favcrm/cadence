@@ -2524,3 +2524,77 @@ fn session_command_compact_and_new_session() {
     assert_ne!(fresh, before["sessionId"].as_str().unwrap(), "{out}");
     pi.close();
 }
+
+/// CAD-1076: a master session the provider refuses (the AgenticOS
+/// gateway's 400 `invalid_request`, here its message cap) is reset
+/// only when the refused turn ran no tool — a turn whose tool already
+/// ran is never offered for a replay — and the reset is a real
+/// `new_session`, after which the same prompt completes.
+#[test]
+fn a_rejected_history_resets_only_when_no_tool_ran() {
+    let state = tempfile::tempdir().unwrap();
+    let pi = master_adapter(
+        "gateway-cap",
+        state.path(),
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    pi.open(&master_agent(state.path(), json!({"unconfined": true})))
+        .unwrap();
+    for i in 0..5 {
+        let turn = pi.run_turn(&format!("turn {i}"), "m", &|_| {}).unwrap();
+        assert_eq!(turn.status, "completed", "turn {i}: {:?}", turn.error);
+    }
+    // The tool runs, then the next model call is refused.
+    let tooled = pi.run_turn("run tool", "m", &|_| {}).unwrap();
+    assert_eq!(tooled.status, "failed", "{:?}", tooled.error);
+    assert!(tooled.error.as_deref().unwrap().contains("invalid_request"));
+    assert!(!pi.reset_rejected_session(&tooled).unwrap(), "a tool ran");
+    // Refused before any work: one reset, then the turn completes.
+    let refused = pi.run_turn("plain", "m", &|_| {}).unwrap();
+    assert_eq!(refused.status, "failed", "{:?}", refused.error);
+    assert!(pi.reset_rejected_session(&refused).unwrap());
+    assert!(!pi.reset_rejected_session(&refused).unwrap(), "single use");
+    let retried = pi.run_turn("plain", "m", &|_| {}).unwrap();
+    assert_eq!(retried.status, "completed", "{:?}", retried.error);
+    let journal = std::fs::read_to_string(state.path().join("master/cwd/pi-rpc.jsonl")).unwrap();
+    assert_eq!(journal.matches("\"new_session\"").count(), 1, "{journal}");
+    pi.close();
+}
+
+/// CAD-1076: the first-loaded turn guard never hands the provider an
+/// empty text block — an empty tool result, an empty prompt and an
+/// all-blank content array become the stable "(no output)" placeholder,
+/// on the verified runtime and on any other one.
+#[test]
+fn the_turn_guard_replaces_empty_text_with_a_placeholder() {
+    let source = include_str!("../src/adapter/pi_turn_guard.ts");
+    let messages = json!([
+        {"role": "user", "content": [{"type": "text", "text": "register social-pm"}]},
+        {"role": "assistant", "content": [{"type": "toolCall", "id": "c1", "name": "bash", "arguments": {}}]},
+        {"role": "toolResult", "toolCallId": "c1", "toolName": "bash", "content": []},
+        {"role": "toolResult", "toolCallId": "c2", "toolName": "bash", "content": [{"type": "text", "text": ""}]},
+        {"role": "user", "content": ""},
+        {"role": "user", "content": [{"type": "text", "text": " \n"}]},
+        {"role": "custom", "customType": "x", "content": "kept"},
+    ]);
+    for version in ["1.0.0", "9.9.9"] {
+        let fixture = source.replace(
+            "import { VERSION } from \"@earendil-works/pi-coding-agent\";",
+            &format!("const VERSION = {};", json!(version)),
+        );
+        let js = format!(
+            "const src = {src}; import('data:text/javascript;base64,' + Buffer.from(src).toString('base64')).then(m => {{ const h = {{}}; m.default({{on: (n, f) => {{ h[n] = f; }}, registerCommand() {{}}, sendMessage() {{}}, appendEntry() {{}}}}); console.log(JSON.stringify(h.context({{messages: {messages}}}, {{}}).messages)); }});",
+            src = json!(fixture),
+        );
+        let out: Vec<Value> = node_eval(&js);
+        let placeholder = json!([{"type": "text", "text": "(no output)"}]);
+        assert_eq!(out[0], messages[0], "{version}");
+        assert_eq!(out[1], messages[1], "{version}");
+        assert_eq!(out[2]["content"], placeholder, "{version}");
+        assert_eq!(out[2]["toolCallId"], "c1", "{version}");
+        assert_eq!(out[3]["content"], placeholder, "{version}");
+        assert_eq!(out[4]["content"], "(no output)", "{version}");
+        assert_eq!(out[5]["content"], placeholder, "{version}");
+        assert_eq!(out[6], messages[6], "{version}");
+    }
+}

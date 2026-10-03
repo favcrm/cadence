@@ -1383,6 +1383,13 @@ fn write_pi_guard(state_dir: &Path, agenticos_reads: bool) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// CAD-1076: the provider refused the request itself — a 400
+/// `invalid_request` (the AgenticOS gateway's answer to a history over
+/// its schema limits), never a rate limit or an outage.
+fn history_rejected(error: &str) -> bool {
+    error.contains("400") && error.contains("invalid_request")
+}
+
 /// One in-flight command's response slot.
 struct Pending {
     map: Mutex<HashMap<String, mpsc::Sender<Value>>>,
@@ -1424,6 +1431,9 @@ struct TurnAcc {
     /// Provider-side error seen mid-turn (`message_end` error,
     /// `auto_retry_end` final failure, `extension_error`).
     error: Option<String>,
+    /// A tool started in this run — its effects already happened, so
+    /// the turn is never offered for a replay (CAD-1076).
+    tools: bool,
 }
 
 struct Shared {
@@ -1456,6 +1466,10 @@ struct Shared {
     dead: AtomicBool,
     guard_ready: AtomicBool,
     guard_receipts: Mutex<HashMap<String, GuardReceipt>>,
+    /// CAD-1076: the last master turn the provider refused before any
+    /// work — the one turn [`ProviderAdapter::reset_rejected_session`]
+    /// may reset for.
+    rejected_turn: Mutex<Option<String>>,
 }
 
 struct GuardReceipt {
@@ -1519,6 +1533,7 @@ impl PiAdapter {
             dead: AtomicBool::new(false),
             guard_ready: AtomicBool::new(false),
             guard_receipts: Mutex::new(HashMap::new()),
+            rejected_turn: Mutex::new(None),
         });
         let routed = Arc::clone(&shared);
         let disconnected = Arc::clone(&shared);
@@ -1977,6 +1992,7 @@ impl Shared {
     }
 
     fn on_tool_start(&self, event: &Value) {
+        self.turn.lock().unwrap().tools = true;
         let name = event.get("toolName").and_then(Value::as_str).unwrap_or("?");
         let args = event.get("args").unwrap_or(&Value::Null);
         self.emit(
@@ -2567,6 +2583,11 @@ impl ProviderAdapter for PiAdapter {
         } else {
             ("completed", None)
         };
+        *self.shared.rejected_turn.lock().unwrap() = (status == "failed"
+            && !acc.tools
+            && self.shared.master.load(Ordering::SeqCst)
+            && error.as_deref().is_some_and(history_rejected))
+        .then(|| turn_id.clone());
         Ok(TurnResult {
             turn_id,
             status: status.to_string(),
@@ -2687,6 +2708,20 @@ impl ProviderAdapter for PiAdapter {
                 "the '{other}' command is not supported by pi"
             ))),
         }
+    }
+
+    /// CAD-1076: a master session whose history the provider refuses
+    /// stays refused on every later call, so the turn it refused before
+    /// any work is answered with a fresh provider session (once).
+    fn reset_rejected_session(&self, result: &TurnResult) -> Result<bool> {
+        let mut rejected = self.shared.rejected_turn.lock().unwrap();
+        if rejected.as_deref() != Some(result.turn_id.as_str()) {
+            return Ok(false);
+        }
+        *rejected = None;
+        drop(rejected);
+        self.checked("new_session", json!({}))?;
+        Ok(true)
     }
 
     fn disconnected(&self) -> bool {

@@ -1329,6 +1329,8 @@ tests = [
     "master_allow_once_is_exact_and_single_use",
     "concurrent_permission_use_succeeds_once",
     "http_permission_routes_are_operator_only",
+    "empty_approved_output_then_more_turns_all_complete",
+    "a_rejected_history_is_retried_once_then_fails",
 ]
 helpers = [
     "refused",

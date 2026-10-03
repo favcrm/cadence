@@ -1207,6 +1207,45 @@ impl Shared {
         pack.wrap(&body)
     }
 
+    /// CAD-1076: the provider refused this session's history and the
+    /// adapter started a fresh session. Record why, and answer the
+    /// retry's prompt: the same message behind a continuity pack.
+    fn after_session_reset(
+        &self,
+        agent: &store::Agent,
+        message: &Message,
+        slot: Option<&str>,
+        refused: &TurnResult,
+    ) -> String {
+        let alias = agent.alias.as_str();
+        let error = refused
+            .error
+            .as_deref()
+            .unwrap_or("provider refused the request");
+        let _ = self.store.event_public(
+            alias,
+            "provider_session_reset",
+            json!({"message": message.id, "turn": refused.turn_id, "error": error}),
+        );
+        let _ = self.store.thread_append(
+            alias,
+            store::NewEntry {
+                role: store::ROLE_SYSTEM,
+                kind: store::KIND_MESSAGE,
+                text: &format!(
+                    "The provider refused this session's history ({error}). Started a new provider session with a continuity pack and retried the turn once."
+                ),
+                payload: Some(json!({"event": "provider_session_reset", "message": message.id})),
+                message_id: None,
+            },
+        );
+        self.continuity_due
+            .lock()
+            .unwrap()
+            .insert(alias.to_string(), crate::continuity::Reason::New);
+        self.continuity_prompt_slotted(alias, &agent.endpoint_kind, message, slot)
+    }
+
     /// CAD-324: record in the thread that a due pack was not delivered
     /// (`outcome`: `skipped` — nothing to carry — or `failed`). The note
     /// is a pack note, so it settles a pending compaction.
@@ -1829,20 +1868,33 @@ impl Shared {
                         .admit_app_submission(&message)
                         .and_then(|()| adapter.check_body(&message.body))
                         .and_then(|()| {
+                            let on_started = move |turn: &str| {
+                                // CAD-250: a nudge owns no turn — it never
+                                // becomes `running`, and its paste is not the
+                                // held turn's proof of life.
+                                if !nudge {
+                                    let _ = shared.store.mark_running(&started_id, turn);
+                                    watch.bump_activity();
+                                }
+                                shared.wake();
+                            };
+                            let first = adapter.run_turn_slotted(
+                                &prompt,
+                                slot.as_deref(),
+                                &message.id,
+                                &on_started,
+                            )?;
+                            if nudge || !adapter.reset_rejected_session(&first)? {
+                                return Ok(first);
+                            }
+                            // CAD-1076: one retry on a fresh session.
+                            let prompt =
+                                self.after_session_reset(&agent, &message, slot.as_deref(), &first);
                             adapter.run_turn_slotted(
                                 &prompt,
                                 slot.as_deref(),
                                 &message.id,
-                                &move |turn| {
-                                    // CAD-250: a nudge owns no turn — it never
-                                    // becomes `running`, and its paste is not the
-                                    // held turn's proof of life.
-                                    if !nudge {
-                                        let _ = shared.store.mark_running(&started_id, turn);
-                                        watch.bump_activity();
-                                    }
-                                    shared.wake();
-                                },
+                                &on_started,
                             )
                         });
                     adapter.set_unclaimed_ok(false);

@@ -315,3 +315,150 @@ fn http_permission_routes_are_operator_only() {
     let (status, _, body) = op::raw(port, &agent_get);
     assert!(status == 401 || status == 403, "agent get {status} {body}");
 }
+
+/// CAD-1076: a pi master over a gateway-faithful fake (`gateway-cap`).
+fn gateway_master(mode: &str) -> (PlanFixture, common::MockPi) {
+    let f = PlanFixture::start();
+    test_env().set(cadence_agent::master::TEST_NO_LANDLOCK, "1");
+    let pi = f.d.mock_pi(mode);
+    f.d.operator_rpc(
+        "master_start",
+        json!({"provider": "pi", "unconfined": true}),
+    )
+    .expect("master starts");
+    (f, pi)
+}
+
+/// The master's settled message `id`, after it reached a final state.
+fn settled(d: &TestDaemon, id: &str) -> serde_json::Value {
+    d.wait_message("master", id, &["completed", "failed", "unknown"], 60)
+}
+
+/// `new_session` requests fake-pi received for the master.
+fn new_sessions(d: &TestDaemon) -> usize {
+    let journal = d.state.join("master/cwd/pi-rpc.jsonl");
+    std::fs::read_to_string(journal)
+        .unwrap_or_default()
+        .matches("\"new_session\"")
+        .count()
+}
+
+/// CAD-1076, the Demo sequence: an approved command that prints
+/// nothing, its injected "Ran approved command" notice, a turn whose
+/// tool output is empty, then turns until the provider refuses the
+/// session's history (the gateway's 400). Every turn completes: the
+/// refusal resets the provider session, the retry carries a
+/// continuity pack, and the notice names the empty output.
+#[cfg(feature = "test-seam")]
+#[test]
+fn empty_approved_output_then_more_turns_all_complete() {
+    let (f, _pi) = gateway_master("gateway-cap");
+    let d = &f.d;
+    d.wait_agent("master", "idle", 30);
+    let repo = f
+        .pm_dir
+        .parent()
+        .unwrap()
+        .join("repo")
+        .canonicalize()
+        .unwrap();
+    let empty = repo.join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let argv = vec!["ls".to_string(), empty.to_string_lossy().to_string()];
+    let cwd = repo.to_string_lossy().to_string();
+    let filed = d
+        .agent_rpc(
+            "master",
+            "master_ask_permission",
+            json!({"argv": argv, "cwd": cwd, "reason": "list"}),
+        )
+        .expect("master files");
+    d.operator_rpc(
+        "master_permission_allow_once",
+        json!({"id": filed["id"].as_str().unwrap()}),
+    )
+    .expect("operator allows once");
+    let used = d
+        .agent_rpc(
+            "master",
+            "master_permission_use",
+            json!({"argv": argv, "cwd": cwd}),
+        )
+        .expect("use");
+    assert_eq!(used["applied"], json!(true), "{used}");
+    assert_eq!(used["stdout"], json!(""), "{used}");
+    let messages = d.rpc("agent_show", json!({"alias": "master"})).unwrap()["messages"].clone();
+    let notice = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| {
+            m["body"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Ran approved command")
+        })
+        .unwrap_or_else(|| panic!("no injected notice: {messages}"))
+        .clone();
+    assert!(
+        notice["body"]
+            .as_str()
+            .unwrap()
+            .contains("exit 0, no output"),
+        "{notice}"
+    );
+    let notice = settled(d, notice["id"].as_str().unwrap());
+    assert_eq!(notice["state"], "completed", "{notice}");
+    for i in 0..8 {
+        let id = format!("m{i}");
+        let text = if i == 0 {
+            "run empty tool".to_string()
+        } else {
+            format!("turn {i}")
+        };
+        d.operator_send("master", json!({"text": text, "message": id}))
+            .unwrap();
+        let m = settled(d, &id);
+        assert_eq!(m["state"], "completed", "{id}: {m}");
+    }
+    let resets: Vec<_> = d
+        .events("master")
+        .into_iter()
+        .filter(|e| e["kind"] == "provider_session_reset")
+        .collect();
+    assert!(!resets.is_empty(), "the cap was crossed without a reset");
+    assert_eq!(resets.len(), new_sessions(d), "{resets:?}");
+    let packs = d
+        .events("master")
+        .into_iter()
+        .filter(|e| {
+            e["kind"] == cadence_agent::continuity::PACK_EVENT && e["payload"]["reason"] == "new"
+        })
+        .count();
+    assert!(packs >= resets.len(), "every reset carries a pack: {packs}");
+}
+
+/// CAD-1076: a history no new session repairs is retried exactly
+/// once per message, then the message fails with the provider's
+/// error — never a silent loop.
+#[cfg(feature = "test-seam")]
+#[test]
+fn a_rejected_history_is_retried_once_then_fails() {
+    let (f, _pi) = gateway_master("gateway-always");
+    let d = &f.d;
+    d.wait_agent("master", "idle", 30);
+    let before = new_sessions(d);
+    d.operator_send("master", json!({"text": "hello", "message": "h1"}))
+        .unwrap();
+    let m = settled(d, "h1");
+    assert_eq!(m["state"], "failed", "{m}");
+    assert!(m.to_string().contains("invalid_request"), "{m}");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(new_sessions(d), before + 1, "one reset for h1");
+    let resets = d
+        .events("master")
+        .into_iter()
+        .filter(|e| e["kind"] == "provider_session_reset" && e["payload"]["message"] == "h1")
+        .count();
+    assert_eq!(resets, 1);
+}

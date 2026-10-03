@@ -607,6 +607,14 @@ pub trait ProviderAdapter: Send + Sync {
             "the '{command}' command is not supported by this provider"
         )))
     }
+    /// CAD-1076: `result` failed because the provider refused the
+    /// session's history before doing any work. When the endpoint can
+    /// start a fresh provider session it does so and answers `true`:
+    /// the daemon then retries that turn once with a continuity pack.
+    /// Single use per turn; the default never resets.
+    fn reset_rejected_session(&self, _result: &TurnResult) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// CAD-1009: the opener and closer of the scoped-turn block the daemon
