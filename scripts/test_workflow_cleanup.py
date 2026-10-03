@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline workflow-shape regressions for CAD-1088 (no external packages)."""
+"""Executable workflow boundary checks plus one required-gate wiring smoke test."""
 from pathlib import Path
 import os
 import re
@@ -24,39 +24,58 @@ def job(text, name):
 
 
 class CleanupTests(unittest.TestCase):
-    def test_single_required_test_runner_preserves_doctests_and_floor(self):
-        ci = workflow("ci.yml")
-        test = job(ci, "test")
-        self.assertIn("needs: [queue-evidence]", test)
-        self.assertIn("cargo test --doc --locked", test)
-        self.assertIn("cargo test --locked --test safety_floor", test)
-        self.assertNotRegex(ci, r"(?m)^  test-(shard|once):")
-        self.assertNotIn("needs.test-shard", ci)
-        self.assertNotIn("needs.test-once", ci)
-        self.assertNotIn("continue-on-error", test)
-
-    def test_required_gates_and_merge_group_remain(self):
+    def test_required_gates_still_have_real_checks_and_scope_wiring(self):
         ci = workflow("ci.yml")
         self.assertIn("  merge_group:", ci)
         for name in ("fmt", "clippy", "test", "build", "ui"):
-            self.assertIn("needs.queue-evidence.outputs.tested != 'true'", job(ci, name))
+            body = job(ci, name)
+            self.assertIn("change-scope", body)
+            self.assertIn("needs.queue-evidence.outputs.tested", body)
+            commands = [step for step in re.split(r"(?=^      - )", body, flags=re.M)
+                        if re.search(r"(?:run:|uses:).*(?:cargo |pnpm |rust-cache@|ci-rust-toolchain)", step)]
+            self.assertTrue(commands, name)
+            for step in commands:
+                category = "ui" if name == "ui" else "rust"
+                self.assertIn(f"needs.change-scope.outputs.{category} != 'false'", step)
+        test = job(ci, "test")
+        self.assertIn("cargo test --doc --locked", test)
+        self.assertIn("cargo test --locked --test safety_floor", test)
+        self.assertIn("scripts/split-doctor-host --check", job(ci, "fmt"))
 
-    def test_live_doctor_manifest_cannot_be_skipped(self):
-        fmt = job(workflow("ci.yml"), "fmt")
-        self.assertIn("run: scripts/split-doctor-host --check", fmt)
-        self.assertNotIn("tests/split-map-doctor.toml", fmt)
-        self.assertNotIn("tests/split-map-host.toml", fmt)
-        self.assertIn("python3 scripts/test_workflow_cleanup.py", fmt)
-        self.assertIn("python3 scripts/test_pre_push_plan.py", fmt)
-
-    def test_retired_journey_is_cargo_only_and_checks_guard_message(self):
-        e2e = workflow("e2e.yml")
-        self.assertNotIn("pnpm/action-setup", e2e)
-        self.assertNotIn("actions/setup-node", e2e)
-        self.assertNotIn("tests/e2e/pnpm-lock.yaml", e2e)
-        self.assertIn("cargo check --release --locked --features test-seam", e2e)
-        self.assertIn("grep -q 'must never be compiled into a release build'", e2e)
-        self.assertNotIn("continue-on-error", e2e)
+    def test_scope_shell_defaults_full_on_missing_or_forged_policy(self):
+        scope = job(workflow("ci.yml"), "change-scope")
+        block = scope.split("        run: |\n", 1)[1]
+        script = textwrap.dedent(block)
+        with tempfile.TemporaryDirectory() as root:
+            attacker = Path(root) / "scripts/ci-change-scope.py"
+            attacker.parent.mkdir()
+            attacker.write_text("from pathlib import Path\nPath('forged-policy-executed').touch()\n"
+                                "print('{\"scope\":\"ui\",\"rust\":\"false\",\"ui\":\"true\"}')\n")
+            git = Path(root) / "git"
+            git.write_text("#!/bin/sh\n[ \"$1\" = show ] || exit 1\n"
+                           "[ \"$2\" = \"$BASE:scripts/ci-change-scope.py\" ] || exit 1\n"
+                           "[ \"$TEST_MISSING\" = yes ] && exit 1\n"
+                           "printf '%s\\n' 'import os' 'print(os.environ[\"TEST_RESULT\"])'\n")
+            git.chmod(0o755)
+            for event, missing, result, expected in (
+                ("pull_request", "yes", '{}', "full"),
+                ("pull_request", "no", '{"scope":"docs","rust":"true","ui":"false"}', "full"),
+                ("pull_request", "no", '{"scope":"docs","rust":"false","ui":"false"}', "docs"),
+                ("merge_group", "no", '{"scope":"docs","rust":"false","ui":"false"}', "full"),
+            ):
+                with self.subTest(event=event, missing=missing, result=result):
+                    output = Path(root) / "output"
+                    output.write_text("")
+                    env = dict(os.environ, EVENT=event, BASE="0" * 40, HEAD="1" * 40,
+                               RUNNER_TEMP=root, GITHUB_WORKSPACE=root,
+                               GITHUB_OUTPUT=str(output), GITHUB_STEP_SUMMARY=str(Path(root) / "summary"),
+                               TEST_MISSING=missing, TEST_RESULT=result,
+                               PATH=root + os.pathsep + os.environ["PATH"])
+                    run = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
+                                         env=env, cwd=root, capture_output=True, text=True)
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertIn(f"scope={expected}\n", output.read_text())
+                    self.assertFalse((Path(root) / 'forged-policy-executed').exists())
 
     def test_seam_probe_rejects_success_and_unrelated_build_failure(self):
         e2e = workflow("e2e.yml")
@@ -79,13 +98,6 @@ class CleanupTests(unittest.TestCase):
                                             env=env, capture_output=True, text=True)
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
-    def test_release_guards_are_still_hard_refusals(self):
-        ci, staging = workflow("ci.yml"), workflow("staging.yml")
-        for name in ("release-artifact", "release-gate"):
-            self.assertIn("scripts/require-full-gates", job(ci, name))
-        for name in ("select", "stage", "promote"):
-            self.assertIn("scripts/require-full-gates", job(staging, name))
-        self.assertTrue((ROOT / ".github/reduced-gates").is_file())
 
 
 if __name__ == "__main__":

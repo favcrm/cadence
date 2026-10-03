@@ -5,7 +5,14 @@
 CAD-1073 / PR #738 retired the legacy integration suite. The required `test`
 check compiles and runs four `safety_floor` tests; green means that floor
 passed, **not** full behavior coverage. `fmt`, `clippy`, `build` and `ui`
-remain required on PRs and merge groups. The committed `.github/reduced-gates`
+remain required on PRs and merge groups. CAD-1088 selects PR feedback from a
+classifier loaded from the base commit: isolated docs use no compilation;
+isolated UI code runs UI validation but not unrelated default Rust gates.
+Required contexts explicitly report not-applicable commands rather than
+claiming to build. Governance, workflow, scripts, dependency manifests, mixed
+or unknown changes run all gates. Merge groups always run the full current
+validation (including the reduced floor); fast PR feedback is not evidence
+for skipping integration validation. The committed `.github/reduced-gates`
 marker and `scripts/require-full-gates` refuse release artifacts, candidate
 staging and promotion from a reduced-gate source SHA. Do not remove them as a
 CI-speed optimization.
@@ -205,7 +212,7 @@ one failed test. Compilation/setup failure, zero tests, a skipped test,
 an error or a different failed test makes the experiment fail. Ordinary
 CI must still prove the original implementation passes the test.
 
-## PR test selection and review coverage
+## PR test selection and review coverage (historical pre-transition policy)
 
 The required `test` job reads its selection policy from the PR base.
 A missing base policy or any uncertainty runs the full suite. Documentation

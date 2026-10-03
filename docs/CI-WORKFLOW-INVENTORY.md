@@ -27,6 +27,14 @@ indefinitely. `cadence-nextest` itself is still live in the review recipe.
 
 ## Bounded simplification implemented here
 
+- Add trusted-base PR feedback selection. Isolated docs: no Rust or UI
+  compilation, including no cross-builds. Isolated UI source: UI validation
+  and embedded build; unrelated default Rust clippy/floor/build commands are
+  not applicable. All shared/config/workflow/script/mixed/unknown changes:
+  full validation. Classifier missing or failing: full validation. Required
+  contexts remain and say when commands were not run; merge-group, main,
+  tags and dispatch always keep real full gates. This PR adds the policy
+  for later PRs: its base lacks the classifier, so bootstrap is full.
 - Fold the echo-only shard runner and separate doctest runner into required
   `test`. Run doctests and the four-test floor as separate blocking steps
   with one checkout/toolchain/cache. Saves two runner startups and removes

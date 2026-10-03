@@ -29,6 +29,25 @@ failure, not fix it. One correctly bound scope approval, two independent
 exact-head verdicts, one correctly bound merge approval and a queue enqueue
 should be the normal path—not repeated requests for the same decision.
 
+## Change-dependent PR feedback
+
+A classifier read from the **base revision** selects cheap PR feedback:
+
+| Change | PR compilation | Final merge queue |
+| --- | --- | --- |
+| Isolated documentation guides | None; document/contracts checks still run | All current real gates |
+| Isolated UI source/assets | Frontend checks + embedded-UI build; no unrelated default Rust gates | All current real gates |
+| Rust logic | All feature/build/test gates; embedded feature can depend on Rust | All current real gates |
+| Workflow, scripts, dependencies, governance, mixed/unknown changes | All gates | All current real gates |
+
+Deletions, renames, symlinks, bad SHAs, absent classifier or failed lookup
+fall back to full validation. PR code cannot supply its own selection policy.
+Required contexts explicitly report not-applicable commands, never 'built' or
+'passed tests' when they did not execute. Merge groups do not take the fast
+path: this keeps final integration coverage even when docs are read indirectly
+by source/tests. Fast-path timings measure PR feedback, not total landing
+latency. #758 bootstraps the policy with a full run because its base lacks it.
+
 ## One local entry point
 
 ```sh
