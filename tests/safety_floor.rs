@@ -30,7 +30,6 @@ fn safety_floor_cli_refuses_unknown_verb() {
     // still enforces its command surface during the clean-slate window.
     let mut cmd = Command::new("target/debug/cadence");
     cmd.args(["nonexistent-verb"]);
-    if let Ok(out) = reaper::output(&mut cmd) {
-        assert!(!out.status.success(), "unknown verb must refuse");
-    }
+    let out = reaper::output(&mut cmd).expect("cadence binary must exist to test refusal");
+    assert!(!out.status.success(), "unknown verb must refuse");
 }

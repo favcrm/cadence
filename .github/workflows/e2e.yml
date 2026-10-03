@@ -57,7 +57,13 @@ jobs:
         run: |
           echo 'tests/e2e_mvp.rs retired under CAD-1073.'
           echo 'The MVP journey returns with the new behavior suite.'
-          cargo build --release --locked --features test-seam 2>&1 | grep -q 'test-seam'
+          echo 'Release-boundary residual floor: release build + test-seam must fail.'
+          # Assert the seam refuses to compile in release mode: the build
+          # must FAIL, not merely mention test-seam in its output.
+          if cargo build --release --locked --features test-seam; then
+            echo 'RELEASE+TEST-SEAM BUILD UNEXPECTEDLY SUCCEEDED'
+            exit 1
+          fi
       - if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
