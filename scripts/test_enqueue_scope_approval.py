@@ -303,19 +303,62 @@ class ScopeApproval(unittest.TestCase):
                 reasons, report = self.c.evaluate()
                 self.assertEqual(reasons, [], report)
 
-    def test_ticket_risk_line_in_a_fence_is_ignored_and_two_lines_mean_no_scope(self):
-        self.c.paths, self.c.ticket_body = ["src/rollout.rs"], "```\nRisk: human (6, 7)\n```\nRisk: human (7)\n"
-        self.c.store = [scope_rec(body=self.c.ticket_body)]
-        self.set_risk("Risk: human (7) — x")
-        self.refused("does not declare (declared [7])")  # the fenced (6) is not declared
+    def test_ticket_risk_line_hidden_from_the_rendered_page_gives_no_scope(self):
         self.c.paths = ["docs/AUDIT.md"]
-        reasons, report = self.c.evaluate()
-        self.assertEqual(reasons, [], report)
-        for body in ("Risk: human (7)\nRisk: human (1, 4)\n", "Risk: human (7)\n```\nx\n```\nRisk: human (7)\n"):
+        for body in ("```\nRisk: human (6, 7)\n~~~\nRisk: human (7)\n",  # ``` closed by ~~~
+                     "<!--\nRisk: human (6)\n-->\n**Risk:** human (7)\n",
+                     "```\nRisk: human (6, 7)\n```\nRisk: human (7)\n",
+                     "Risk: human (7)\nRisk: human (1, 4)\n",
+                     "Risk: human (7)\n```\nx\n```\nRisk: human (7)\n"):
             with self.subTest(body=body):
                 self.c.ticket_body = body
                 self.c.store = [scope_rec(body=body)]
                 self.refused("declares no parseable")
+
+    def test_disguised_visible_risk_line_over_a_hidden_one_gives_no_scope(self):
+        # Escapes built at runtime so the file itself holds no lookalikes.
+        disguises = {
+            "fullwidth colon": "Risk" + chr(0xFF1A) + " human (7)",
+            "fullwidth R": chr(0xFF32) + "isk: human (7)",
+            "cyrillic i": "R" + chr(0x456) + "sk: human (7)",
+            "zero-width space": "Ri" + chr(0x200B) + "sk: human (7)",
+            "soft hyphen": "Ris" + chr(0xAD) + "k: human (7)",
+            "lowercase": "risk: human (7)",
+            "entity colon": "Risk&#58; human (7)",
+            "entity R": "&#82;isk: human (7)",
+            "named entity": "Risk&colon; human (7)",
+        }
+        self.c.paths = ["src/rollout.rs"]
+        self.set_risk("Risk: human (7) - x")
+        for name, vis in disguises.items():
+            for hidden in ("<!--\nRisk: human (4, 6, 7)\n-->\n", "<div hidden>\nRisk: human (4, 6, 7)\n</div>\n",
+                           '<p style="display:none">Risk: human (4, 6, 7)</p>\n'):
+                with self.subTest(name=name, hidden=hidden):
+                    self.c.ticket_body = hidden + vis + "\n"
+                    self.c.store = [scope_rec(body=self.c.ticket_body)]
+                    self.refused()
+
+    def test_loose_risk_pattern_counts_lookalike_lines_without_hiding_markup(self):
+        self.c.paths = ["src/rollout.rs"]
+        self.set_risk("Risk: human (7) - x")
+        for name, vis in (("fullwidth colon", "Risk" + chr(0xFF1A) + " human (4, 6, 7)"),
+                          ("cyrillic i", "R" + chr(0x456) + "sk: human (4, 6, 7)"),
+                          ("lowercase", "risk: human (4, 6, 7)")):
+            with self.subTest(name=name):
+                self.c.ticket_body = "Risk: human (7)\n" + vis + "\n"  # two counted lines
+                self.c.store = [scope_rec(body=self.c.ticket_body)]
+                self.refused("declares no parseable")
+                self.c.ticket_body = vis + "\n"  # one counted line, not the ASCII label
+                self.c.store = [scope_rec(body=self.c.ticket_body)]
+                self.refused("declares no parseable")
+
+    def test_single_bold_or_quoted_risk_line_is_accepted(self):
+        for body in ("## Goal\n**Risk:** human (4, 7)\n", "> _Risk: human (4, 7)_\n", "- `Risk: human (4, 7)`\n"):
+            with self.subTest(body=body):
+                self.c.ticket_body = body
+                self.c.store = [scope_rec(body=body)]
+                reasons, report = self.c.evaluate()
+                self.assertEqual(reasons, [], report)
 
     def test_verdict_with_two_risk_lines_needs_a_per_head_approval(self):
         for extra in ("Risk: human (1)\n", "Risk: auto\n", "Risk: human (4, 7)\n"):
