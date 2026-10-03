@@ -396,7 +396,7 @@ mod tests {
         for p in [
             "src/cli/status.rs",
             "src/issue/write.rs",
-            "tests/board_issue.rs",
+            "src/issue/blocked.rs",
             "docs/guides/wiki-knowledge.md",
         ] {
             assert_eq!(rp.classify(p), PathClass::Delegable, "{p}");

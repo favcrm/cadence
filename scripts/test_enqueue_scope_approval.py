@@ -273,11 +273,26 @@ class ScopeApproval(unittest.TestCase):
                 self.refused()
 
     def test_human_path_in_no_risk_list_needs_a_per_head_approval(self):
-        for path in ("config/production-baseline.json", "tests/safety_floor.rs", "apps/x/package-lock.json"):
+        # CAD-1100 mapped the formerly-unmapped human paths (config/**,
+        # tests/**, lockfiles and build inputs anywhere, nested .github/.
+        # cargo). docs/TEAM.md is retired (no longer a trigger-7 path) but
+        # stays in HUMAN_EXACT, so it is the remaining unmapped human path.
+        for path in ("docs/TEAM.md",):
             with self.subTest(path=path):
                 self.assertTrue(enq.is_human_path(path, ()))
                 self.c.paths = ["scripts/enqueue-reviewed", path]
                 self.refused("in no risk trigger list")
+
+    def test_formerly_unmapped_human_paths_are_now_in_scope(self):
+        # The three paths the CAD-1100 ticket named now map to triggers
+        # the ticket declares (4 and 7), so the scope approval covers them.
+        for path, why in (("config/production-baseline.json", "config/**"),
+                          ("tests/safety_floor.rs", "tests/**"),
+                          ("apps/x/package-lock.json", "**/package-lock.json")):
+            with self.subTest(path=path):
+                self.c.paths = ["scripts/enqueue-reviewed", path]
+                reasons, report = self.c.evaluate()
+                self.assertEqual(reasons, [], (path, why, report))
 
     def test_trigger_1_or_3_anywhere_on_a_risk_line_is_refused(self):
         for risk in ("human (4, 7) and trigger 1 (identity)", "human (4, 7) (triggers 4 and 3)",
