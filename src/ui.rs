@@ -1061,9 +1061,10 @@ fn gone_or_unknown(e: &std::io::Error) -> BoardPid {
 
 /// Is `pid` (under `proc_root`, `/proc` outside tests) a live
 /// thread-group leader running `cadence … ui run` for `state_dir`?
-/// Mirrors state-bridge.sh `kill_pidfile`: `Tgid` must be the pid
-/// itself (a thread id answers `kill(tid, 0)` too) and not a zombie,
-/// and the argv must be the one `start_inner` spawns.
+/// Stricter than state-bridge.sh `kill_pidfile`, which only looks for
+/// `cadence` in the cmdline: `Tgid` must be the pid itself (a thread id
+/// answers `kill(tid, 0)` too), not a zombie, and the argv must be the
+/// one `start_inner` spawns, for this state dir.
 pub(crate) fn board_identity(proc_root: &Path, pid: i32, state_dir: &Path) -> BoardPid {
     if pid <= 0 {
         return BoardPid::NotBoard;
