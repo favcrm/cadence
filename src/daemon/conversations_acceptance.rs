@@ -54,6 +54,12 @@ fn install(shared: &Arc<Shared>, app: &str) -> String {
 }
 
 fn gx() -> Gx {
+    gx_with(true)
+}
+
+/// `social_context: false` leaves Social Content installed but with no
+/// context at all (an app before its first brand).
+fn gx_with(social_context: bool) -> Gx {
     let dir = tempfile::Builder::new().prefix("c98a").tempdir().unwrap();
     let pm = dir.path().join("pm");
     crate::issue::Pm::init(&pm).unwrap();
@@ -110,7 +116,12 @@ fn gx() -> Gx {
             .unwrap()
             .to_string()
     };
-    let (crm_a, crm_b, social_ctx) = (ctx(&crm, "Acme"), ctx(&crm, "Beta"), ctx(&social, "Social"));
+    let social_ctx = if social_context {
+        ctx(&social, "Social")
+    } else {
+        String::new()
+    };
+    let (crm_a, crm_b) = (ctx(&crm, "Acme"), ctx(&crm, "Beta"));
     let gx = Gx {
         dir,
         shared,
@@ -1147,7 +1158,7 @@ mod http {
         };
         let rest = Gx2 {
             crm,
-            _social: social,
+            social,
             crm_a,
             _crm_b: crm_b,
             _social_ctx: social_ctx,
@@ -1158,7 +1169,7 @@ mod http {
 
     pub(super) struct Gx2 {
         pub crm: String,
-        pub _social: String,
+        pub social: String,
         pub crm_a: String,
         pub _crm_b: String,
         pub _social_ctx: String,
@@ -1178,7 +1189,7 @@ mod http {
 /// POSTs; `admit_operator_read` (ui/serve.rs) for the installation GET.
 #[test]
 fn i1_board_http_refuses_agents_on_every_conversation_route_like_the_rpc() {
-    let (board, state, rest) = http::start(gx());
+    let (board, state, rest) = http::start(gx_with(false));
     let db = || rusqlite::Connection::open(crate::rollout::db_file(&state)).unwrap();
     let count = |sql: &str| -> i64 { db().query_row(sql, [], |r| r.get(0)).unwrap() };
     let (threads, messages) = (
@@ -1245,6 +1256,14 @@ fn i1_board_http_refuses_agents_on_every_conversation_route_like_the_rpc() {
         None,
     );
     assert_eq!(status, 200, "{reply}");
+    // A create with NO context_id is still the operator's alone: an agent
+    // is refused at the board, the operator is served for a known install.
+    let bare = format!("/api/app-installations/{}/conversations", rest.social);
+    let (status, reply) = board.call(agent, "POST", &bare, Some(json!({"general": true})));
+    assert_eq!(status, 403, "{reply}");
+    assert_eq!(reply["check"], json!("operator_only"), "{reply}");
+    let (status, reply) = board.call("operator", "POST", &bare, Some(json!({"general": true})));
+    assert_eq!(status, 200, "{reply}");
     // The ungated `GET /api/threads/<alias>/conversations` was removed
     // (it relayed the operator-only list with no board gate): it must stay
     // absent for an agent and for the operator, so it cannot silently
@@ -1263,6 +1282,176 @@ fn i1_board_http_refuses_agents_on_every_conversation_route_like_the_rpc() {
             "{who}: {reply}"
         );
     }
+}
+
+impl Gx {
+    /// The operator's message bound to an installation only (no context).
+    fn send_install_only(&self, id: &str, app: Value, conversation: Option<&str>) -> Result<Value> {
+        let mut params =
+            json!({"alias": "master", "text": format!("hi {id}"), "message": id, "app": app});
+        if let Some(c) = conversation {
+            params["conversation"] = json!(c);
+        }
+        self.operator("thread_send", params)
+    }
+}
+
+/// An installation-only binding `app:{install_id}` (no context) is proven
+/// by the catalog or a context row, never by the client: an unknown or
+/// forged install id is refused for `thread_send`, `conversation_create`
+/// and `conversation_list`, and nothing is created. Positive control: a
+/// KNOWN install with no context at all (Social Content before a brand)
+/// lands in its own General.
+///
+/// Guards: `Shared::known_install` (conversations_rpc.rs, the catalog
+/// fallback) and the install-only proof in `rpc_thread_send`
+/// (messages_rpc.rs).
+#[test]
+fn install_only_binding_needs_a_known_install_and_creates_nothing_otherwise() {
+    let gx = gx_with(false);
+    assert!(gx.social_ctx.is_empty(), "fixture: Social has no context");
+    let (threads, messages) = (gx.threads(), gx.messages());
+    for forged in ["no-such-install", "install-1", &"a".repeat(64)] {
+        let err = err_text(gx.send_install_only("m-f", json!({"install_id": forged}), None));
+        assert!(err.contains("Unknown app installation"), "{forged}: {err}");
+        let err = err_text(gx.operator(
+            "conversation_create",
+            json!({"alias": "master", "install_id": forged, "general": true}),
+        ));
+        assert!(err.contains("Unknown app installation"), "{forged}: {err}");
+        let err = err_text(gx.operator(
+            "conversation_list",
+            json!({"alias": "master", "install_id": forged}),
+        ));
+        assert!(err.contains("Unknown app installation"), "{forged}: {err}");
+    }
+    assert_eq!((gx.threads(), gx.messages()), (threads, messages));
+    // Control: the known no-context install lands in ITS General.
+    let receipt = gx
+        .send_install_only("m-ok", json!({"install_id": gx.social}), None)
+        .unwrap();
+    assert_eq!(receipt["thread"]["general"], json!(true), "{receipt}");
+    assert_eq!(receipt["thread"]["install_id"], json!(gx.social));
+    assert_eq!(gx.messages(), messages + 1);
+    let general = gx.general_of_install_only(&gx.social);
+    assert_eq!(receipt["thread"]["id"], json!(general));
+}
+
+impl Gx {
+    fn general_of_install_only(&self, install: &str) -> String {
+        let made = self
+            .operator(
+                "conversation_create",
+                json!({"alias": "master", "install_id": install, "general": true}),
+            )
+            .unwrap();
+        assert_eq!(made["created"], json!(false), "General already existed");
+        made["conversation"]["id"].as_str().unwrap().to_string()
+    }
+}
+
+/// An installation-only message gets NO delivery hint and NO turn-token
+/// slot (the hint needs a proven context), so its prompt is the bare body
+/// and its turn token cannot redeem a scoped CRM verb: I3/I4 still hold.
+///
+/// Guard: `Store::message_app` (store/threads.rs) requires a stamped
+/// context; `delivery_hint`/`turn_slot` build on it.
+#[test]
+fn install_only_message_gets_no_hint_no_slot_and_cannot_redeem() {
+    let gx = gx();
+    let agent = gx.shared.store.agent("master").unwrap();
+    gx.send_install_only(
+        "m-ctx",
+        json!({"install_id": gx.crm, "context_id": gx.crm_a}),
+        None,
+    )
+    .unwrap();
+    assert!(
+        gx.shared.turn_slot(&agent, &gx.message("m-ctx")).is_some(),
+        "control"
+    );
+    gx.finish("m-ctx", 2.0);
+    gx.send_install_only("m-bare", json!({"install_id": gx.crm}), None)
+        .unwrap();
+    let bare = gx.message("m-bare");
+    assert!(gx.shared.delivery_hint(&bare).is_none());
+    assert!(gx.shared.turn_slot(&agent, &bare).is_none());
+    let body = gx
+        .shared
+        .delivery_body("master", "managed", &bare, Some("<<slot>>"));
+    assert_eq!(
+        body, bare.body,
+        "nothing is added to an install-only message"
+    );
+    // Its (genuinely current) token cannot redeem any scoped verb, even
+    // naming the CRM installation and a real context.
+    let token = gx.run("m-bare");
+    let err = err_text(gx.verb(
+        "app_segment_assistant_list",
+        json!({"install_id": gx.crm, "context_id": gx.crm_a}),
+        "m-bare",
+        &token,
+    ));
+    assert!(err.contains("carries no verified App scope"), "{err}");
+}
+
+/// A campaign conversation selector or campaign subject needs a PROVEN
+/// context: an installation-only binding naming a campaign conversation,
+/// and a `conversation_create` with a campaign subject but no context, are
+/// refused and write nothing.
+///
+/// Guards: the context check in `verify_conversation_selector` and the
+/// store's enqueue check (two layers), and the `needs the context` arm of
+/// `rpc_conversation_create`.
+#[test]
+fn campaign_conversation_without_a_proven_context_is_refused() {
+    let gx = gx();
+    let campaign = gx.conversation(&gx.crm, &gx.crm_a, json!({"subject": "campaign:cmp-a"}));
+    let (threads, messages) = (gx.threads(), gx.messages());
+    let err = err_text(gx.send_install_only("m-c", json!({"install_id": gx.crm}), Some(&campaign)));
+    assert!(err.contains("only the context it was created in"), "{err}");
+    let err = err_text(gx.operator(
+        "conversation_create",
+        json!({"alias": "master", "install_id": gx.crm, "subject": "campaign:cmp-a"}),
+    ));
+    assert!(err.contains("needs the context it belongs to"), "{err}");
+    assert_eq!((gx.threads(), gx.messages()), (threads, messages));
+    // Control: with its own proven context the same selector works.
+    let ok = gx
+        .send_install_only(
+            "m-ok",
+            json!({"install_id": gx.crm, "context_id": gx.crm_a}),
+            Some(&campaign),
+        )
+        .unwrap();
+    assert_eq!(ok["thread"]["id"], json!(campaign));
+}
+
+/// A forged extra key in an installation-only binding is refused like it
+/// is in a full one: the client names the installation and nothing else.
+///
+/// Guard: the key allowlist in `thread_app` (daemon.rs).
+#[test]
+fn install_only_binding_refuses_forged_extra_keys() {
+    let gx = gx();
+    let messages = gx.messages();
+    for key in [
+        "verified",
+        "conversation",
+        "subject",
+        "scope",
+        "context_revision",
+        "context_digest",
+    ] {
+        let mut app = json!({"install_id": gx.crm});
+        app[key] = json!("x");
+        let err = err_text(gx.send_install_only("m-k", app, None));
+        assert!(
+            err.contains(&format!("field '{key}' is not accepted")),
+            "{key}: {err}"
+        );
+    }
+    assert_eq!(gx.messages(), messages);
 }
 
 const ENV_CHILD: &str = "CAD1098_ENV_CHILD";
