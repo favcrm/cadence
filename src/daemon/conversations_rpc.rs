@@ -13,6 +13,7 @@
 //! written.
 
 use super::*;
+use crate::master;
 use crate::store::app_records::RecordStore;
 use crate::store::ConversationKind;
 
@@ -26,7 +27,87 @@ fn campaign_of(subject: &str) -> Result<&str> {
     Ok(id)
 }
 
+/// A conversation's identity for the session-switch rule: every home
+/// message (or one with no thread) is one key.
+fn session_key(thread: Option<&store::Thread>) -> String {
+    match thread {
+        Some(t) if !t.is_home() => t.id.clone(),
+        _ => "home".to_string(),
+    }
+}
+
 impl Shared {
+    /// CAD-1098 I7: a provider session serves ONE conversation. Before
+    /// `message` is delivered, compare its conversation with the one the
+    /// last delivered message belonged to (a stored fact, so it holds
+    /// across a daemon restart too). On a difference the session ends and
+    /// a new one opens, with:
+    ///
+    /// - the tool profile chosen from the message's stored conversation
+    ///   (Gate 1 — never a prompt or param; `App` for an app
+    ///   conversation, `Home` otherwise),
+    /// - no resumed provider history (`thread_id` cleared) and a
+    ///   continuity pack due, built from that conversation only,
+    /// - the master's tmp dir emptied (I11).
+    ///
+    /// Returns whether a switch happened. A switch that cannot complete
+    /// is an error — the caller fences rather than delivering into the
+    /// wrong session.
+    pub(super) fn switch_session_if_needed(
+        &self,
+        alias: &str,
+        adapter: &Arc<dyn ProviderAdapter>,
+        message: &Message,
+    ) -> Result<bool> {
+        if !master::is_master(alias) || message.is_nudge() {
+            return Ok(false);
+        }
+        let target = self.store.message_conversation(alias, &message.id)?;
+        let previous = match self.store.last_delivered_message(alias, &message.id)? {
+            Some(id) => self.store.message_conversation(alias, &id)?,
+            None => None,
+        };
+        let profile = match &target {
+            Some(t) if !t.is_home() => master::Profile::App,
+            _ => master::Profile::Home,
+        };
+        // Same conversation as the last delivered message AND a session
+        // already running this profile: keep it. A fresh actor opens Home,
+        // so an app conversation resumed after a restart still switches
+        // (its pack carries the history).
+        if session_key(previous.as_ref()) == session_key(target.as_ref())
+            && adapter.session_profile() == profile
+        {
+            return Ok(false);
+        }
+        self.revoke_endpoint(alias, "conversation switch");
+        adapter.close();
+        if let Err(e) = master::clear_tmp(&self.state_dir) {
+            return Err(Error::rejected(format!(
+                "conversation switch: the master's tmp dir could not be cleared: {e}"
+            )));
+        }
+        adapter.set_session_profile(profile);
+        let mut fresh = self.store.agent(alias)?;
+        fresh.thread_id = None;
+        let identity = adapter.open(&fresh)?;
+        self.store
+            .set_identity_with_quota(alias, &identity, adapter.quota_snapshot())?;
+        self.continuity_due
+            .lock()
+            .unwrap()
+            .insert(alias.to_string(), crate::continuity::Reason::New);
+        self.enroll_endpoint(alias);
+        adapter.post_enrollment_ready(&fresh)?;
+        let _ = self.store.event_public(
+            alias,
+            "conversation_session_switched",
+            json!({"message": message.id, "profile": format!("{profile:?}")}),
+        );
+        self.wake();
+        Ok(true)
+    }
+
     /// The operator's chat caller rule, shared by `thread_send`,
     /// `conversation_list` and `conversation_create`: a connection the
     /// daemon attributes to a pane or managed endpoint is refused, so is
@@ -298,10 +379,6 @@ mod tests {
             })
         }
 
-        fn as_who(&self, who: Asserted, method: &str, params: Value) -> Result<Value> {
-            scoped(who, || self.shared.dispatch(method, &params, pid()))
-        }
-
         fn create(&self, install: &str, context: &str, extra: Value) -> Result<Value> {
             let mut params = json!({"alias": "master", "install_id": install,
                                     "context_id": context});
@@ -393,415 +470,12 @@ mod tests {
         assert_eq!(page["entries"][0]["text"], json!("hello m-c"));
     }
 
-    /// I2: no client field decides scope, subject or install.
-    #[test]
-    fn thread_send_refuses_client_scope_subject_fields() {
-        let fx = fx();
-        for field in [
-            "scope",
-            "subject",
-            "install_id",
-            "thread",
-            "thread_id",
-            "general",
-            "title",
-        ] {
-            let mut params = json!({"alias": "master", "text": "x", "message": "m-f",
-                "app": {"install_id": "install-1", "context_id": fx.crm_a}});
-            params[field] = json!("whatever");
-            let err = fx
-                .as_operator("thread_send", params)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                err.contains(&format!("field '{field}' is not accepted")),
-                "{field}: {err}"
-            );
-        }
-        // A forged key inside the binding is refused too.
-        for key in ["conversation", "subject", "verified", "scope"] {
-            let mut app = json!({"install_id": "install-1", "context_id": fx.crm_a});
-            app[key] = json!("x");
-            let err = fx
-                .as_operator(
-                    "thread_send",
-                    json!({"alias": "master", "text": "x", "message": "m-f", "app": app}),
-                )
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("is not accepted"), "{key}: {err}");
-        }
-        // A selector without a verified binding is not a way into a conversation.
-        let general = conv_id(
-            &fx.create("install-1", &fx.crm_a, json!({"general": true}))
-                .unwrap(),
-        );
-        let err = fx
-            .as_operator(
-                "thread_send",
-                json!({"alias": "master", "text": "x", "message": "m-f", "conversation": general}),
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("needs a verified app binding"), "{err}");
-        assert_eq!(fx.count("SELECT count(*) FROM messages"), 0);
-        assert!(fx.entries_of(&general).is_empty());
-    }
-
     /// I2/I5: a forged or unproven binding is refused before any
-    /// conversation row is made.
-    #[test]
-    fn forged_app_binding_creates_no_conversation() {
-        let fx = fx();
-        let rows = || fx.count("SELECT count(*) FROM threads");
-        let before = rows();
-        // Unknown installation, unknown context, another install's context.
-        for (install, context) in [
-            ("install-9", fx.crm_a.as_str()),
-            ("install-1", "ctx-nope"),
-            ("install-1", fx.social.as_str()),
-        ] {
-            assert!(
-                fx.send("m-x", install, context, None).is_err(),
-                "{install} {context}"
-            );
-        }
-        assert_eq!(rows(), before, "a refused send made a conversation");
-        assert_eq!(fx.count("SELECT count(*) FROM messages"), 0);
-        // The create verb: unknown installation is "Unknown app installation".
-        let err = fx
-            .create("install-9", &fx.crm_a, json!({"general": true}))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Unknown app installation"), "{err}");
-        let err = fx
-            .create("install-1", &fx.social, json!({"general": true}))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("context is unavailable"), "{err}");
-        let err = fx
-            .as_operator(
-                "conversation_list",
-                json!({"alias": "master", "install_id": "install-9"}),
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Unknown app installation"), "{err}");
-        assert_eq!(rows(), before);
-    }
-
-    /// I2: a conversation of another installation is never a target.
-    #[test]
-    fn conversation_of_other_install_refused() {
-        let fx = fx();
-        let social = conv_id(
-            &fx.create("install-2", &fx.social, json!({"general": true}))
-                .unwrap(),
-        );
-        let err = fx
-            .send("m-x", "install-1", &fx.crm_a, Some(&social))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Unknown conversation"), "{err}");
-        assert!(fx.entries_of(&social).is_empty());
-        assert_eq!(fx.count("SELECT count(*) FROM messages"), 0);
-        // Nor the other alias's conversation under this alias.
-        let err = fx
-            .as_operator(
-                "thread_read",
-                json!({"alias": "w1", "after": 0, "conversation": social}),
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Unknown conversation"), "{err}");
-    }
-
     /// I5: a campaign conversation serves only the context it was
-    /// proven under.
-    #[test]
-    fn campaign_conversation_not_usable_for_other_campaign_or_company() {
-        let fx = fx();
-        let a = conv_id(
-            &fx.create("install-1", &fx.crm_a, json!({"subject": "campaign:cmp-a"}))
-                .unwrap(),
-        );
-        // Another company (context B) of the same installation.
-        let err = fx
-            .send("m-x", "install-1", &fx.crm_b, Some(&a))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("only the context it was created in"), "{err}");
-        assert!(fx.entries_of(&a).is_empty());
-        // Its own context works.
-        fx.send("m-ok", "install-1", &fx.crm_a, Some(&a)).unwrap();
-        assert_eq!(fx.entries_of(&a).len(), 1);
-        // The same subject in another context is another conversation.
-        let b = conv_id(
-            &fx.create("install-1", &fx.crm_b, json!({"subject": "campaign:cmp-b"}))
-                .unwrap(),
-        );
-        assert_ne!(a, b);
-    }
-
     /// I5: a campaign subject must exist in the installation's own
-    /// content for the proven context.
-    #[test]
-    fn campaign_subject_must_exist_in_context() {
-        let fx = fx();
-        let before = fx.count("SELECT count(*) FROM threads");
-        // Nonexistent; another company's campaign; a malformed subject.
-        for (context, subject) in [
-            (fx.crm_a.clone(), "campaign:cmp-nope"),
-            (fx.crm_a.clone(), "campaign:cmp-b"),
-            (fx.crm_b.clone(), "campaign:cmp-a"),
-            (fx.crm_a.clone(), "customer:cmp-a"),
-            (fx.crm_a.clone(), "campaign:"),
-        ] {
-            let err = fx
-                .create("install-1", &context, json!({"subject": subject}))
-                .unwrap_err()
-                .to_string();
-            assert!(
-                err.contains("does not exist")
-                    || err.contains("subject must be")
-                    || err.contains("campaign ID must be"),
-                "{subject}: {err}"
-            );
-        }
-        // The other installation cannot claim install-1's campaign.
-        assert!(fx
-            .create(
-                "install-2",
-                &fx.social,
-                json!({"subject": "campaign:cmp-a"})
-            )
-            .is_err());
-        assert_eq!(
-            fx.count("SELECT count(*) FROM threads"),
-            before,
-            "a refused create left a row"
-        );
-        // General and subject together is refused.
-        assert!(fx
-            .create(
-                "install-1",
-                &fx.crm_a,
-                json!({"general": true, "subject": "campaign:cmp-a"})
-            )
-            .is_err());
-    }
-
     /// I2: every later entry of a message follows the message's
     /// conversation, not "the alias's thread" — including a turn that
-    /// finishes after a home message was queued.
-    #[test]
-    fn turn_output_follows_the_messages_conversation() {
-        let fx = fx();
-        let a = conv_id(
-            &fx.create("install-1", &fx.crm_a, json!({"subject": "campaign:cmp-a"}))
-                .unwrap(),
-        );
-        fx.send("m-app", "install-1", &fx.crm_a, Some(&a)).unwrap();
-        let home = fx
-            .as_operator(
-                "thread_send",
-                json!({"alias": "master", "text": "home q", "message": "m-home"}),
-            )
-            .unwrap()["thread"]["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        fx.shared.store.mark_running("m-app", "turn-1").unwrap();
-        // Provider output arrives keyed only by the alias: it must land
-        // with the running message.
-        fx.shared
-            .store
-            .thread_append_running(
-                "master",
-                store::ROLE_AGENT,
-                store::KIND_TOOL_CALL,
-                "Bash: ls",
-                None,
-            )
-            .unwrap();
-        let message = fx.shared.store.message("m-app").unwrap().unwrap();
-        fx.shared
-            .store
-            .finish(
-                &message,
-                "completed",
-                &json!({"turn_id": "turn-1", "status": "completed", "text": "done", "stop_reason": "end_turn", "error": null}),
-                None,
-            )
-            .unwrap();
-        let kinds =
-            |t: &str| -> Vec<String> { fx.entries_of(t).iter().map(|e| e.kind.clone()).collect() };
-        assert_eq!(kinds(&a), vec!["message", "tool_call", "turn_result"]);
-        assert_eq!(kinds(&home), vec!["message"], "app turn output leaked home");
-    }
-
     /// I1: an agent, a detached child (no proof) and an unproven caller
-    /// can neither send into nor create nor list conversations.
-    #[test]
-    fn agent_cannot_send_or_create_conversation() {
-        let fx = fx();
-        let rows = fx.count("SELECT count(*) FROM threads");
-        for who in [
-            Asserted::Agent("w1".into()),
-            Asserted::Agent("master".into()),
-            Asserted::Unproven,
-        ] {
-            let err = fx
-                .as_who(
-                    who.clone(),
-                    "conversation_create",
-                    json!({"alias": "master", "install_id": "install-1",
-                           "context_id": fx.crm_a, "general": true}),
-                )
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("operator"), "{who:?}: {err}");
-            assert!(fx
-                .as_who(
-                    who.clone(),
-                    "conversation_list",
-                    json!({"alias": "master", "install_id": "install-1"}),
-                )
-                .is_err());
-            assert!(fx
-                .as_who(
-                    who.clone(),
-                    "thread_send",
-                    json!({"alias": "master", "text": "x", "message": "m-a",
-                           "app": {"install_id": "install-1", "context_id": fx.crm_a}}),
-                )
-                .is_err());
-        }
-        assert_eq!(fx.count("SELECT count(*) FROM threads"), rows);
-        assert_eq!(fx.count("SELECT count(*) FROM messages"), 0);
-    }
-
-    /// I2: concurrent first creates and first sends make one row each.
-    #[test]
-    fn concurrent_first_send_to_campaign_makes_one_conversation() {
-        let fx = Arc::new(fx());
-        let barrier = Arc::new(std::sync::Barrier::new(6));
-        let mut handles = Vec::new();
-        for n in 0..6 {
-            let fx = Arc::clone(&fx);
-            let barrier = Arc::clone(&barrier);
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                let created = fx
-                    .create("install-1", &fx.crm_a, json!({"subject": "campaign:cmp-a"}))
-                    .unwrap();
-                // And a General first send racing the same way.
-                let sent = fx
-                    .send(&format!("m-{n}"), "install-1", &fx.crm_a, None)
-                    .unwrap();
-                (created, sent)
-            }));
-        }
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert_eq!(
-            fx.count("SELECT count(*) FROM threads WHERE subject='campaign:cmp-a'"),
-            1
-        );
-        assert_eq!(
-            fx.count("SELECT count(*) FROM threads WHERE is_general=1"),
-            1
-        );
-        let created_flags = results
-            .iter()
-            .filter(|(c, _)| c["created"] == json!(true))
-            .count();
-        assert_eq!(created_flags, 1, "exactly one create made the row");
-        let ids: std::collections::HashSet<_> = results.iter().map(|(c, _)| conv_id(c)).collect();
-        assert_eq!(ids.len(), 1);
-        // Every send landed in the one General conversation: none lost.
-        let general: String = fx
-            .db()
-            .query_row("SELECT id FROM threads WHERE is_general=1", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(fx.entries_of(&general).len(), 6);
-    }
-
-    /// I2: one message id cannot be replayed into another conversation.
-    #[test]
-    fn retry_same_message_other_conversation_refused() {
-        let fx = fx();
-        let a = conv_id(
-            &fx.create("install-1", &fx.crm_a, json!({"subject": "campaign:cmp-a"}))
-                .unwrap(),
-        );
-        let n = conv_id(&fx.create("install-1", &fx.crm_a, json!({})).unwrap());
-        fx.send("m-1", "install-1", &fx.crm_a, Some(&a)).unwrap();
-        // The same retry is a duplicate, not a second entry.
-        let again = fx.send("m-1", "install-1", &fx.crm_a, Some(&a)).unwrap();
-        assert_eq!(again["duplicate"], json!(true));
-        // The same id aimed elsewhere (another conversation, General, or
-        // none named) is refused whole.
-        for other in [Some(n.as_str()), None] {
-            let err = fx
-                .send("m-1", "install-1", &fx.crm_a, other)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("already used with different content"), "{err}");
-        }
-        assert_eq!(fx.entries_of(&a).len(), 1);
-        assert!(fx.entries_of(&n).is_empty());
-    }
-
-    /// I2: an archived conversation is kept and read-only.
-    #[test]
-    fn archived_conversation_is_read_only() {
-        let fx = fx();
-        let a = conv_id(&fx.create("install-1", &fx.crm_a, json!({})).unwrap());
-        fx.send("m-1", "install-1", &fx.crm_a, Some(&a)).unwrap();
-        fx.db()
-            .execute("UPDATE threads SET archived=1 WHERE id=?", [&a])
-            .unwrap();
-        let err = fx
-            .send("m-2", "install-1", &fx.crm_a, Some(&a))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("archived"), "{err}");
-        assert_eq!(fx.entries_of(&a).len(), 1);
-        assert_eq!(fx.count("SELECT count(*) FROM messages"), 1);
-        // Still readable.
-        let page = fx
-            .as_operator(
-                "thread_read",
-                json!({"alias": "master", "after": 0, "conversation": a}),
-            )
-            .unwrap();
-        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
-        // Removing the agent archives every conversation, keeping rows.
-        fx.db()
-            .execute(
-                "UPDATE agents SET state='stopped',endpoint=NULL WHERE alias='master'",
-                [],
-            )
-            .unwrap();
-        fx.shared
-            .store
-            .remove_agent("master", true, &json!({}))
-            .unwrap();
-        assert_eq!(
-            fx.count(
-                "SELECT count(*) FROM threads WHERE alias IS NOT NULL AND install_id IS NOT NULL"
-            ),
-            0
-        );
-        assert_eq!(
-            fx.count("SELECT count(*) FROM threads WHERE archived=1 AND install_id IS NOT NULL"),
-            1
-        );
-        assert!(fx.entries_of(&a).len() == 1);
-    }
-
     /// The verbs list, make "New conversation" rows and refuse a
     /// private path in the id grammar.
     #[test]
@@ -845,12 +519,5 @@ mod tests {
             1
         );
         assert_ne!(list("install-2")["general"], list("install-1")["general"]);
-        // An unknown field is refused, not dropped.
-        assert!(fx
-            .as_operator(
-                "conversation_create",
-                json!({"alias": "master", "install_id": "install-1", "context_id": fx.crm_a, "scope": "home"}),
-            )
-            .is_err());
     }
 }

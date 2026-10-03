@@ -1335,9 +1335,9 @@ export default function (pi) {
 /// One allowlisted invocation in the generated guard: the argv after
 /// `cadence`, and whether trailing arguments are allowed
 /// (`Bash(cadence <verb…> *)` forms) or the match is exact.
-fn pi_guard_rules() -> Vec<Value> {
+fn pi_guard_rules(profile: crate::master::Profile) -> Vec<Value> {
     let mut rules = Vec::new();
-    for tool in crate::master::CLAUDE_ALLOWED_TOOLS {
+    for tool in crate::master::allowed_tools(profile) {
         let Some(inner) = tool.strip_prefix("Bash(").and_then(|t| t.strip_suffix(')')) else {
             continue;
         };
@@ -1357,11 +1357,15 @@ fn pi_guard_rules() -> Vec<Value> {
 
 /// Write the guard extension; a missing or stale file never weakens
 /// the posture because `open` regenerates it per launch.
-fn write_pi_guard(state_dir: &Path, agenticos_reads: bool) -> Result<PathBuf> {
+fn write_pi_guard(
+    state_dir: &Path,
+    agenticos_reads: bool,
+    profile: crate::master::Profile,
+) -> Result<PathBuf> {
     // JSON strings are valid JS literals — the substitution needs no
     // escaping of its own.
     let source = PI_GUARD_HEAD
-        .replace("__RULES__", &json!(pi_guard_rules()).to_string())
+        .replace("__RULES__", &json!(pi_guard_rules(profile)).to_string())
         .replace(
             "__AGENTICOS_READ_TOOLS__",
             &json!(if agenticos_reads {
@@ -1502,6 +1506,8 @@ pub struct PiAdapter {
     /// `Some` selects the protected launch seam (`pi_guest`), which fails
     /// closed until the external prerequisites are satisfied (CAD-1012).
     agent_uid: Option<u32>,
+    /// CAD-1098: the tool profile the next `open` launches with.
+    profile: Mutex<crate::master::Profile>,
 }
 
 /// Identity evidence must include an actual namespace and model id;
@@ -1568,6 +1574,7 @@ impl PiAdapter {
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| PathBuf::from(".")),
             agent_uid,
+            profile: Mutex::new(crate::master::Profile::Home),
         }
     }
 
@@ -2114,6 +2121,14 @@ fn command_error(command: &str, resp: &Value) -> Error {
 }
 
 impl ProviderAdapter for PiAdapter {
+    fn set_session_profile(&self, profile: crate::master::Profile) {
+        *self.profile.lock().unwrap() = profile;
+    }
+
+    fn session_profile(&self) -> crate::master::Profile {
+        *self.profile.lock().unwrap()
+    }
+
     fn note_activity(&self) {
         *self.shared.last_activity.lock().unwrap() = Instant::now();
     }
@@ -2174,7 +2189,11 @@ impl ProviderAdapter for PiAdapter {
         self.shared.master.store(master, Ordering::SeqCst);
         if master {
             let agenticos_reads = agenticos_read_extension(&self.env)?.is_some();
-            write_pi_guard(&self.state_dir, agenticos_reads)?;
+            write_pi_guard(
+                &self.state_dir,
+                agenticos_reads,
+                *self.profile.lock().unwrap(),
+            )?;
         }
         self.shared.guard_ready.store(false, Ordering::SeqCst);
         let guard_path = write_pi_turn_guard(&self.state_dir, &agent.alias)?.canonicalize()?;
@@ -2208,6 +2227,12 @@ impl ProviderAdapter for PiAdapter {
                 pm.as_deref(),
                 master_confined(&self.env, agent),
             ));
+            if *self.profile.lock().unwrap() == crate::master::Profile::App {
+                env.push((
+                    crate::master::CONVERSATION_ENV.to_string(),
+                    "app".to_string(),
+                ));
+            }
         }
         // CAD-570: every pi agent gets its own XDG_CACHE_HOME inside
         // its private dir, created 0700 — pi-devin's model catalog

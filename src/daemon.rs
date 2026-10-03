@@ -854,8 +854,18 @@ impl Shared {
         // survives a daemon restart; the event itself is recorded below
         // like every `cadence/<kind>`.
         if method == "cadence/session_compacted" {
-            if let Err(e) = self.store.thread_append(
+            // The compacting session serves the running message's
+            // conversation (CAD-1098 I7): the note and its pending pack
+            // belong to that thread.
+            let thread = self
+                .store
+                .running_message(alias)
+                .ok()
+                .flatten()
+                .and_then(|m| self.store.message_conversation(alias, &m.id).ok().flatten());
+            if let Err(e) = self.note_in(
                 alias,
+                thread.as_ref(),
                 store::NewEntry {
                     role: store::ROLE_SYSTEM,
                     kind: store::KIND_MESSAGE,
@@ -1015,7 +1025,7 @@ impl Shared {
             // for the provider turn. The stored text is untouched —
             // the thread keeps the operator's exact words.
             let mut body = message.body.clone();
-            if let Ok(Some(hint)) = self.store.message_app(&message.id) {
+            if let Some(hint) = self.delivery_hint(message) {
                 if let Some(envelope) = app_hint_envelope(&hint) {
                     // CAD-1009: the turn-token slot follows the hint on
                     // its own line; the adapter fills it with the token
@@ -1070,10 +1080,7 @@ impl Shared {
         // the pull (`message read`) carries the full envelope as
         // metadata. A hint that cannot be re-proved is simply absent.
         let app = self
-            .store
-            .message_app(&message.id)
-            .ok()
-            .flatten()
+            .delivery_hint(message)
             .and_then(|hint| app_hint_notice(&hint))
             .unwrap_or_default();
         format!(
@@ -1095,6 +1102,22 @@ impl Shared {
     /// caller of the scoped verbs) runs managed Pi or Claude; pty,
     /// Codex and cloud endpoints get the hint only. The slot is fresh
     /// per call and never stored — the message body cannot contain it.
+    /// CAD-1098 I4: the App hint a delivery may carry. The send-time
+    /// stamp must still re-prove (`message_app`) AND the message's own
+    /// conversation must belong to the stamped installation; on any
+    /// mismatch the hint — and with it the turn-token slot — is dropped
+    /// and the message still delivers unscoped.
+    fn delivery_hint(&self, message: &Message) -> Option<Value> {
+        let hint = self.store.message_app(&message.id).ok().flatten()?;
+        let conversation = self
+            .store
+            .message_conversation(&message.alias, &message.id)
+            .ok()
+            .flatten()?;
+        (conversation.install_id.as_deref() == hint.get("install_id").and_then(Value::as_str))
+            .then_some(hint)
+    }
+
     fn turn_slot(&self, agent: &Agent, message: &Message) -> Option<String> {
         if agent.endpoint_kind == "pty"
             || registry::spec_opt(&agent.provider, &agent.endpoint_kind)
@@ -1114,7 +1137,7 @@ impl Shared {
         {
             return None;
         }
-        let hint = self.store.message_app(&message.id).ok().flatten()?;
+        let hint = self.delivery_hint(message)?;
         app_hint_envelope(&hint)?;
         Some(format!("<<cadence-turn-slot:{}>>", Uuid::new_v4().simple()))
     }
@@ -1149,15 +1172,23 @@ impl Shared {
         // A new or lost session is decided at open (in memory: the next
         // open decides again); a compaction is a thread note, pending
         // until a pack note follows it.
+        // CAD-1098 I7: the pack, its notes and the compaction marker all
+        // belong to the MESSAGE's conversation (home when it has none).
+        let thread = self
+            .store
+            .message_conversation(alias, &message.id)
+            .ok()
+            .flatten()
+            .or_else(|| self.store.thread(alias).ok().flatten());
         let due = self
             .continuity_due
             .lock()
             .unwrap()
             .remove(alias)
             .or_else(|| {
-                self.store
-                    .compaction_pending(alias)
-                    .unwrap_or(false)
+                thread
+                    .as_ref()
+                    .is_some_and(|t| self.store.compaction_pending_of(&t.id).unwrap_or(false))
                     .then_some(crate::continuity::Reason::Compacted)
             });
         let Some(reason) = due else {
@@ -1167,15 +1198,28 @@ impl Shared {
             return body;
         }
         let pm_dir = self.pm_dir().ok().filter(|d| d.is_dir());
-        let built =
-            crate::continuity::assemble(&self.store, pm_dir.as_deref(), alias, reason, &message.id);
+        let built = crate::continuity::assemble(
+            &self.store,
+            pm_dir.as_deref(),
+            alias,
+            reason,
+            &message.id,
+            thread.as_ref(),
+        );
         let pack = match built {
             Ok(Some(pack)) => pack,
             Ok(None) => {
                 // Nothing to carry. A pending compaction is settled so
                 // later turns do not rebuild it.
                 if reason == crate::continuity::Reason::Compacted {
-                    self.continuity_settle(alias, reason, &message.id, "skipped", None);
+                    self.continuity_settle(
+                        alias,
+                        thread.as_ref(),
+                        reason,
+                        &message.id,
+                        "skipped",
+                        None,
+                    );
                 }
                 return body;
             }
@@ -1190,13 +1234,21 @@ impl Shared {
                     json!({"reason": reason.as_str(), "message": message.id,
                            "error": error}),
                 );
-                self.continuity_settle(alias, reason, &message.id, "failed", Some(&error));
+                self.continuity_settle(
+                    alias,
+                    thread.as_ref(),
+                    reason,
+                    &message.id,
+                    "failed",
+                    Some(&error),
+                );
                 return body;
             }
         };
         let payload = pack.payload(&message.id);
-        if let Err(e) = self.store.thread_append(
+        if let Err(e) = self.note_in(
             alias,
+            thread.as_ref(),
             store::NewEntry {
                 role: store::ROLE_SYSTEM,
                 kind: store::KIND_MESSAGE,
@@ -1242,8 +1294,14 @@ impl Shared {
         ) {
             eprintln!("provider_session_reset event for '{alias}' failed: {e}");
         }
-        if let Err(e) = self.store.thread_append(
+        let thread = self
+            .store
+            .message_conversation(alias, &message.id)
+            .ok()
+            .flatten();
+        if let Err(e) = self.note_in(
             alias,
+            thread.as_ref(),
             store::NewEntry {
                 role: store::ROLE_SYSTEM,
                 kind: store::KIND_MESSAGE,
@@ -1266,9 +1324,24 @@ impl Shared {
     /// CAD-324: record in the thread that a due pack was not delivered
     /// (`outcome`: `skipped` — nothing to carry — or `failed`). The note
     /// is a pack note, so it settles a pending compaction.
+    /// A daemon note (pack, settle, session reset) in the conversation it
+    /// is about — home when `thread` is `None` or home (CAD-1098).
+    fn note_in(
+        &self,
+        alias: &str,
+        thread: Option<&store::Thread>,
+        entry: store::NewEntry,
+    ) -> Result<Option<i64>> {
+        match thread {
+            Some(t) if !t.is_home() => self.store.thread_append_to(&t.id, entry),
+            _ => self.store.thread_append(alias, entry),
+        }
+    }
+
     fn continuity_settle(
         &self,
         alias: &str,
+        thread: Option<&store::Thread>,
         reason: crate::continuity::Reason,
         message: &str,
         outcome: &str,
@@ -1281,8 +1354,9 @@ impl Shared {
                 reason.as_str()
             ),
         };
-        if let Err(e) = self.store.thread_append(
+        if let Err(e) = self.note_in(
             alias,
+            thread,
             store::NewEntry {
                 role: store::ROLE_SYSTEM,
                 kind: store::KIND_MESSAGE,
@@ -1856,6 +1930,12 @@ impl Shared {
                     // CAD-1009: a scoped App turn's token slot (None for
                     // a nudge, a plain message or an endpoint that
                     // cannot redeem).
+                    // CAD-1098 I7: a session serves one conversation — switch
+                    // (new provider session, profile and pack) before the
+                    // prompt is built, so the pack is this conversation's.
+                    if !nudge {
+                        self.switch_session_if_needed(alias, &adapter, &message)?;
+                    }
                     let slot = if nudge {
                         None
                     } else {

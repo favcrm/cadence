@@ -143,6 +143,7 @@ pub(super) fn run(
         }
         Some(ReportAction::File { task, kind, file }) => {
             use cadence_agent::issue::task_report;
+            cadence_agent::master::refuse_in_app_conversation("report file")?;
             let cap = task_report::BODY_MAX as u64;
             let text = read_master_command_file(&state_dir, file.as_deref(), cap)?;
             let mut out = task_report::file(&pm, &text, Some(&task), Some(kind), "")?;

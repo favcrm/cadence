@@ -156,12 +156,31 @@ fn claude_command(env: &ProviderEnv) -> Vec<String> {
 /// `mcp_config` is the generated broker config path when
 /// `params.broker_approvals` is set — it lands beside the permission
 /// flags so every resume replays the broker wiring too.
+#[cfg(test)]
 fn build_command(
     env: &ProviderEnv,
     agent: &Agent,
     session_id: &str,
     resume: bool,
     mcp_config: Option<&Path>,
+) -> Vec<String> {
+    build_command_for(
+        env,
+        agent,
+        session_id,
+        resume,
+        mcp_config,
+        crate::master::Profile::Home,
+    )
+}
+
+fn build_command_for(
+    env: &ProviderEnv,
+    agent: &Agent,
+    session_id: &str,
+    resume: bool,
+    mcp_config: Option<&Path>,
+    profile: crate::master::Profile,
 ) -> Vec<String> {
     let params = agent.params.clone().unwrap_or(Value::Null);
     let mut cmd = claude_command(env);
@@ -202,7 +221,7 @@ fn build_command(
             "--permission-mode".to_string(),
             "dontAsk".to_string(),
         ]);
-        for tool in crate::master::CLAUDE_ALLOWED_TOOLS {
+        for tool in crate::master::allowed_tools(profile) {
             cmd.extend(["--allowedTools".to_string(), tool.to_string()]);
         }
         for tool in crate::master::CLAUDE_DISALLOWED_TOOLS {
@@ -255,6 +274,7 @@ fn mcp_permission_command(env: &ProviderEnv) -> Vec<String> {
 /// line wrapped in `cadence confine` with its policy (CAD-439) — Claude
 /// Code auto-allows read-only Bash commands whatever the allowlist
 /// says, so the OS decides what the master's process tree can read.
+#[cfg(test)]
 fn launch_command(
     env: &ProviderEnv,
     state_dir: &Path,
@@ -263,7 +283,27 @@ fn launch_command(
     resume: bool,
     mcp_config: Option<&Path>,
 ) -> (Vec<String>, Option<crate::confine::Policy>) {
-    let command = build_command(env, agent, session_id, resume, mcp_config);
+    launch_command_for(
+        env,
+        state_dir,
+        agent,
+        session_id,
+        resume,
+        mcp_config,
+        crate::master::Profile::Home,
+    )
+}
+
+fn launch_command_for(
+    env: &ProviderEnv,
+    state_dir: &Path,
+    agent: &Agent,
+    session_id: &str,
+    resume: bool,
+    mcp_config: Option<&Path>,
+    profile: crate::master::Profile,
+) -> (Vec<String>, Option<crate::confine::Policy>) {
+    let command = build_command_for(env, agent, session_id, resume, mcp_config, profile);
     if !master_confined(env, agent) {
         return (command, None);
     }
@@ -373,6 +413,8 @@ pub struct ClaudeAdapter {
     state_dir: PathBuf,
     /// This daemon's launch overrides — read at every `open`.
     env: ProviderEnv,
+    /// CAD-1098: the tool profile the next `open` launches with.
+    profile: Mutex<crate::master::Profile>,
 }
 
 struct Shared {
@@ -438,6 +480,7 @@ impl ClaudeAdapter {
             shared,
             log_path: log_path.to_path_buf(),
             env: env.clone(),
+            profile: Mutex::new(crate::master::Profile::Home),
             state_dir: log_path
                 .parent()
                 .and_then(|p| p.parent())
@@ -749,6 +792,14 @@ impl ProviderAdapter for ClaudeAdapter {
         *self.shared.last_activity.lock().unwrap() = Instant::now();
     }
 
+    fn set_session_profile(&self, profile: crate::master::Profile) {
+        *self.profile.lock().unwrap() = profile;
+    }
+
+    fn session_profile(&self) -> crate::master::Profile {
+        *self.profile.lock().unwrap()
+    }
+
     /// The transcript clock — every parsed provider notification bumps
     /// it in `Shared::dispatch`, so the daemon's stall watch reads the
     /// same liveness signal the turn's own idle check uses.
@@ -778,13 +829,15 @@ impl ProviderAdapter for ClaudeAdapter {
         } else {
             None
         };
-        let (command, confinement) = launch_command(
+        let profile = *self.profile.lock().unwrap();
+        let (command, confinement) = launch_command_for(
             &self.env,
             &self.state_dir,
             agent,
             &session_id,
             resume,
             mcp_config.as_deref(),
+            profile,
         );
         if let Some(policy) = &confinement {
             self.log_confinement(policy)?;
@@ -818,6 +871,12 @@ impl ProviderAdapter for ClaudeAdapter {
                 pm.as_deref(),
                 master_confined(&self.env, agent),
             ));
+            if profile == crate::master::Profile::App {
+                env.push((
+                    crate::master::CONVERSATION_ENV.to_string(),
+                    "app".to_string(),
+                ));
+            }
         }
         let params = agent.params.clone().unwrap_or(Value::Null);
         let idle_secs = params

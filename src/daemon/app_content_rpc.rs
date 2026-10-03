@@ -547,14 +547,16 @@ impl Shared {
                 "app content payload has unsupported fields",
             ));
         }
+        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant proposal")?;
         let ScopedChat {
             caller,
             install,
             context,
             message_id,
             ..
-        } = self.scoped_chat_assistant(params, peer_pid, "assistant proposal")?;
+        } = scoped.clone();
         let campaign = required_str(params, "campaign_id")?;
+        scoped.require_campaign(campaign)?;
         let proposal = required_str(params, "proposal_id")?;
         let draft = content_draft(params)?;
         let request_id = content_request_id(params)?;
@@ -812,10 +814,17 @@ impl Shared {
             // The agent's inert pending draft must be discoverable in
             // the campaign's proposal list BEFORE the operator applies
             // it — list by campaign (optionally) and show one proposal.
-            "app_content_assistant_proposals" => records.app_content_proposal_list(
-                &scoped.context,
-                params.get("campaign_id").and_then(Value::as_str),
-            ),
+            "app_content_assistant_proposals" => {
+                let named = params.get("campaign_id").and_then(Value::as_str);
+                if let Some(named) = named {
+                    scoped.require_campaign(named)?;
+                }
+                let own = scoped
+                    .subject
+                    .as_deref()
+                    .and_then(|s| s.strip_prefix(crate::store::SUBJECT_CAMPAIGN));
+                records.app_content_proposal_list(&scoped.context, named.or(own))
+            }
             "app_content_assistant_proposal_show" => records
                 .app_content_proposal_show(&scoped.context, required_str(params, "proposal_id")?),
             _ => Err(Error::rejected("unknown app assistant read method")),
@@ -856,6 +865,7 @@ impl Shared {
             ));
         }
         let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant email draft")?;
+        scoped.require_campaign(required_str(params, "campaign_id")?)?;
         let draft = content_draft(params)?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
         let result = records.app_content_assistant_draft(
@@ -887,11 +897,32 @@ impl Shared {
 /// runs under (CAD-1014). The caller is the connection-derived agent;
 /// install+context come from the re-proved `message_app` stamp on the
 /// operator's own scoped chat message — never agent text.
+#[derive(Clone)]
 pub(super) struct ScopedChat {
+    /// CAD-1098 I5: `campaign:<id>` when the turn's conversation is a
+    /// campaign's; the verbs naming a campaign must match it.
+    pub(super) subject: Option<String>,
     pub(super) caller: String,
     pub(super) install: String,
     pub(super) context: String,
     pub(super) message_id: String,
+}
+
+impl ScopedChat {
+    /// CAD-1098 I5: in a campaign conversation a verb naming a campaign
+    /// serves only that campaign.
+    pub(super) fn require_campaign(&self, campaign: &str) -> Result<()> {
+        match &self.subject {
+            Some(subject)
+                if subject != &format!("{}{campaign}", crate::store::SUBJECT_CAMPAIGN) =>
+            {
+                Err(Error::rejected(
+                    "this conversation is about another campaign",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Shared {
@@ -1027,6 +1058,26 @@ impl Shared {
                 "{desc} scope does not match its verified chat turn"
             )));
         }
+        // CAD-1098 I3: the token is also bound to the message's own
+        // conversation — its installation must be the requested one. A
+        // message in home (or in another app's conversation) never
+        // redeems here, whatever its stamp says.
+        let conversation = self
+            .store
+            .message_conversation(&caller, message_id)?
+            .filter(|c| c.install_id.as_deref() == Some(install))
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "{desc} turn is not in a conversation of this installation"
+                ))
+            })?;
+        // I5: a campaign conversation serves only the context it was
+        // proven under.
+        if conversation.subject.is_some() && conversation.context_id.as_deref() != Some(context) {
+            return Err(Error::rejected(format!(
+                "{desc} scope does not match this campaign conversation"
+            )));
+        }
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, install, |_, _| {
             let _release = self
@@ -1037,6 +1088,7 @@ impl Shared {
             Ok(())
         })?;
         Ok(ScopedChat {
+            subject: conversation.subject,
             caller,
             install: install.to_string(),
             context: context.to_string(),

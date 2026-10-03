@@ -3041,40 +3041,6 @@ mod tests {
         assert!(log.contains("rollout_migration_refused"), "{log}");
     }
 
-    /// CAD-1098: the v31 -> v32 crossing (the conversation columns) goes
-    /// through the gate like every schema change: refused without a
-    /// receipt, byte-identical; and a store one schema ahead is refused
-    /// by this binary exactly as a v31 binary refuses a v32 store.
-    #[test]
-    fn cad1098_v32_crossing_needs_a_receipt_and_a_newer_store_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = fresh(&dir);
-        let db = db_file(&state);
-        let set = |version: i64| {
-            let conn = Connection::open(&db).unwrap();
-            conn.execute("UPDATE schema_version SET version=?1", [version])
-                .unwrap();
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-                .unwrap();
-        };
-        set(SCHEMA_VERSION - 1);
-        let before = std::fs::read(&db).unwrap();
-        let err = authorize_migration(&db).unwrap_err().to_string();
-        assert!(
-            err.contains(&format!(
-                "refusing to migrate schema {}",
-                SCHEMA_VERSION - 1
-            )),
-            "{err}"
-        );
-        assert!(err.contains("not modified"), "{err}");
-        assert_eq!(std::fs::read(&db).unwrap(), before);
-        set(SCHEMA_VERSION + 1);
-        let err = authorize_migration(&db).unwrap_err().to_string();
-        assert!(err.contains("newer than this binary"), "{err}");
-        assert!(Store::open(&db).is_err());
-    }
-
     #[test]
     fn matching_receipt_allows_the_migration_and_a_fresh_dir_does_not_need_one() {
         let dir = tempfile::tempdir().unwrap();

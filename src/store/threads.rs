@@ -564,6 +564,25 @@ impl Store {
         Self::thread_by_id_in(&conn, id)
     }
 
+    /// The message `alias` delivered to its provider session most
+    /// recently before `current` (nudges aside) — the session the next
+    /// turn would otherwise reuse. `None` when it has delivered none.
+    pub fn last_delivered_message(&self, alias: &str, current: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT id FROM messages WHERE alias=?1 AND id != ?2
+                     AND source != 'nudge' AND started IS NOT NULL
+                     AND state IN {DELIVERED_STATES}
+                     ORDER BY started DESC, seq DESC LIMIT 1"
+                ),
+                params![alias, current],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// The thread a message's entries live in: where its enqueue note
     /// landed, `None` when the message left none (daemon traffic to an
     /// unthreaded alias). Every later entry for the message — assistant
@@ -835,6 +854,13 @@ impl Store {
                 payload,
             });
         Ok(())
+    }
+
+    /// The id of the alias's in-flight turn (`submitting` or `running`),
+    /// as [`Self::thread_append_running`] links provider output to it.
+    pub fn active_message_id(&self, alias: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        Self::running_message_in(&conn, alias)
     }
 
     /// The alias's in-flight turn. `submitting` counts: a provider can

@@ -352,6 +352,14 @@ impl Shared {
                  needs rows; `cadence send` and `agent_send` carry none",
             ));
         }
+        // CAD-1098: app conversations are the master's. Another agent has
+        // no per-conversation session, so an app binding to it is refused.
+        if app.is_some() && !crate::master::is_master(&alias) {
+            return Err(Error::rejected(
+                "an app binding is only for the master's chat — other agents \
+                 have no per-app conversations",
+            ));
+        }
         if app.is_some() && sender != store::Sender::OperatorChat {
             return Err(Error::rejected(
                 "app is a thread_send field — only the operator's chat carries \
