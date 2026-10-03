@@ -295,7 +295,7 @@ jobs:
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         with:
           shared-key: gate-release
-          save-if: true
+          save-if: false
       # CAD-1103: the linker flag follows rust-cache, which hashes RUST* env.
       - name: Enable fast linker (mold/lld; falls back to the default linker)
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
