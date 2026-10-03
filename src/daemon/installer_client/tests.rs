@@ -350,3 +350,18 @@ fn kernel_peer_and_enrolled_process_refuse_caller_observations() {
     assert!(grant::production_consume_factory().is_err());
     assert!(grant::GrantListener::listen_production().is_err());
 }
+
+// Independently authored by CAD-1113 ticket coordinator, not implementer.
+// Include unchanged inside installer_client's cfg(test) tests module.
+// This is the real production authority factory, not a test substitute.
+#[test]
+fn cad1113_independent_production_authority_remains_unavailable() {
+    assert!(
+        super::production_admission().is_err(),
+        "production carrier authority must refuse without independently supplied enrollment/drop/retirement"
+    );
+    assert!(
+        super::from_host_stdin().is_err(),
+        "real production entry must refuse before accepting caller capsule authority"
+    );
+}
