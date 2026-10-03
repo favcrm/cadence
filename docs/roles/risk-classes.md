@@ -29,7 +29,7 @@ Each path must satisfy ALL four criteria:
 3. It cannot touch production, the installed binary, the tracker, secrets or credentials, or install software on a host.
 4. Any effect is behind a human-class control downstream: diagnostics do not authorize delivery, and changes to gates, releases or production still require operator approval.
 
-A PR is auto-eligible under this allowlist only when every `scripts/**` path it touches is allowlisted, the changes preserve all four criteria, and no other human trigger applies (for example, `.github/**` stays human under trigger 4). New paths and new gate or delivery wiring are not implicitly allowlisted: a PR that gives an allowlisted script a gate, release or promotion caller must remove its allowlist entry in the same PR. Changing this allowlist is itself trigger 7 (`human`). The two-independent-review requirement is unchanged.
+A PR is auto-eligible under this allowlist only when every `scripts/**` path it touches is allowlisted, the changes preserve all four criteria, and no other human trigger applies (for example, `.github/**` stays human under trigger 4). New paths and new gate or delivery wiring are not implicitly allowlisted: a PR that gives an allowlisted script a gate, release or promotion caller must remove its allowlist entry in the same PR. Changing this allowlist is itself trigger 7 (`human`). The review count follows AGENTS.md "Review" (CAD-1104): one independent review plus the operator's approval for `human` diffs, and two reviews only for triggers 1 and 3.
 
 ## Class `delegated` — a designated agent approves (CAD-918, operator decision 2026-10-01)
 

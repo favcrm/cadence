@@ -49,12 +49,24 @@ ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
 
 # Human-class path triggers: docs/roles/risk-classes.md (4, 7) and the
 # AGENTS.md list. A verdict note's `Risk: human` also makes a diff human.
-HUMAN_PREFIXES = (".github/", "scripts/", "docs/roles/")
+# CAD-1104: with one reviewer by default, the operator's approval is the second
+# check, so this list must catch every trigger 4/6/7 path mechanically rather
+# than rely on a single reviewer's `Risk:` line.
+HUMAN_PREFIXES = (".github/", "scripts/", "docs/roles/", ".config/", ".cargo/",
+                  "src/audit/", "src/delegation/", "tests/common/")
 HUMAN_LINES = 1500  # risk-classes trigger 5
 HUMAN_BASENAMES = {"Cargo.toml", "Cargo.lock", "package.json", "pnpm-lock.yaml"}
 HUMAN_EXACT = {
     "Cargo.toml", "Cargo.lock", "ui/package.json", "cadence-review.toml",
     "src/review.rs", "docs/TEAM.md", "docs/CHARTER.md", "AGENTS.md",
+    # trigger 4 build inputs
+    "build.rs", "rust-toolchain.toml", "clippy.toml",
+    # trigger 6: installs and rollouts (CAD-1104)
+    "src/rollout.rs", "src/update.rs", "src/upgrade.rs", "src/cli/rollout.rs",
+    "src/cli/daemon.rs", "src/cli/update.rs", "src/cli/upgrade.rs",
+    # trigger 7: approval and delivery rules (CAD-1104)
+    "src/audit.rs", "src/delegation.rs", "src/issue/delivery_policy.rs",
+    "docs/AUDIT.md", "tests/safety_floor.rs",
 }
 
 REGULAR_MODES = ("100644", "100755")

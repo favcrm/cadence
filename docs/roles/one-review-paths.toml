@@ -22,16 +22,17 @@
 # this list; CAD-1099 below supersedes it with a wider list. `tests/common/**`
 # (harness and isolation code) stays two-review via the exclude list.
 #
-# CAD-1099 (operator decision 2026-10-03, "spec > dev > review > pr > deploy is
-# taking too long"): ONE independent review is the default for normal code
-# and docs. Two reviews also cover trigger 2-schema, whole sensitive source
-# trees (src/daemon, src/bin, src/platform, src/adapter, src/store,
-# src/agent_uid) and nested build/lock files, because risk-paths.toml is a
-# delegation allowlist, not a complete map. UI (`ui/**`, `src/ui/**`) is trigger 1 and keeps two. Two reviews remain for every path in docs/roles/risk-paths.toml
-# triggers 1 (trust boundary/identity), 3 (secrets), 4 (supply chain/CI),
-# 6 (release/rollout) and 7 (rules/gates/their proofs), plus the remote-CLI
-# auth modules below. Includes are explicit directories, so a new top-level
-# path keeps two reviews until it is listed here. Exclude wins.
+# CAD-1099 / CAD-1104 (operator decisions 2026-10-03, "simplify and make the
+# dev cycle more smooth and fast"): ONE independent review is the default for
+# code, docs, CI/workflows, scripts, rules, dependencies and rollout. Many of
+# those are `human` class, where the operator's approval is the second check
+# (scripts/enqueue-reviewed requires it independently of this list). Two
+# reviews remain ONLY for trust boundary/identity and secrets (risk triggers 1
+# and 3): the risk-paths trigger 1/3 lists, the auth modules, the
+# identity-heavy source trees and UI (the board runs with the operator's
+# session). risk-paths.toml is a delegation allowlist, not a complete map, so
+# the identity-heavy trees are excluded by directory. Includes are explicit, so
+# an unknown new top-level path keeps two reviews until listed. Exclude wins.
 
 one_review_include = [
   "src/**",
@@ -44,11 +45,27 @@ one_review_include = [
   "workflows/**",
   "contracts/**",
   "design/**",
+  "config/**",
+  "tools/**",
+  ".github/**",
+  ".config/**",
+  ".cargo/**",
+  "scripts/**",
+  "AGENTS.md",
   "README.md",
   "CONTEXT.md",
   "CONTRIBUTING.md",
+  "Cargo.toml",
+  "Cargo.lock",
+  "build.rs",
+  "rust-toolchain.toml",
+  "clippy.toml",
+  "cadence-review.toml",
+  ".gitignore",
+  ".gitattributes",
 ]
-# Two reviews for these, even though an include glob matches them.
+# Two reviews (Standards + Spec/security) for these, even though an include
+# glob matches them. Trust boundary/identity and secrets ONLY.
 one_review_exclude = [
   # risk-paths.toml trigger 1: trust boundary and identity
   "src/peer.rs",
@@ -66,93 +83,27 @@ one_review_exclude = [
   "src/master_perm.rs",
   "src/agent_uid.rs",
   "src/cli/agent_uid.rs",
-  # CAD-1099 review fix: risk-paths.toml is a delegation ALLOWLIST and was never
-  # a complete map of identity/credential code, so whole sensitive trees keep
-  # two reviews here (fail-safe, by directory).
+  # identity-heavy trees (risk-paths is not a complete map; by directory)
   "src/daemon/**",
   "src/bin/**",
   "src/platform/**",
   "src/adapter/**",
   "src/store/**",
   "src/agent_uid/**",
-  "src/cli/platform.rs",
   "src/pi_policy.rs",
   "src/confine.rs",
+  # the production master's prompt and confinement policy
   "agents/**",
-  # nested build and supply-chain inputs anywhere under an include dir
-  "**/Cargo.toml",
-  "**/Cargo.lock",
-  "**/build.rs",
-  "**/.cargo/**",
-  "**/package-lock.json",
-  "**/.npmrc",
-  "**/.github/**",
-  "**/yarn.lock",
-  "**/bun.lockb",
-  "**/rust-toolchain.toml",
-  # remote-CLI and board auth modules (CAD-1019, CAD-526/777): identity
+  # remote-CLI and board auth modules (CAD-1019, CAD-526/777)
   "src/cli_actor.rs",
   "src/board_identity.rs",
   "src/remote_auth.rs",
   "src/remote_enrollment.rs",
   "src/remote_cli.rs",
   "src/device_login.rs",
-  # trigger 2 (schema and store version)
-  "src/store/schema.rs",
-  "src/remote_result_outbox.rs",
-  # trigger 3: secrets, credentials, redaction
+  "src/cli/platform.rs",
+  # risk-paths.toml trigger 3: secrets, credentials, redaction
   "src/secret/**",
   "src/cli/secret.rs",
   "src/cli/connection.rs",
-  # trigger 4: supply chain and CI (outside the include dirs except these)
-  "**/package.json",
-  "**/pnpm-lock.yaml",
-  # trigger 6: outward or fleet actions, installs and rollouts
-  "src/rollout.rs",
-  "src/update.rs",
-  "src/upgrade.rs",
-  "src/cli/rollout.rs",
-  "src/cli/daemon.rs",
-  "src/cli/update.rs",
-  "src/cli/upgrade.rs",
-  # trigger 7: the rules, the gates, their inputs and their proofs
-  "docs/roles/**",
-  "docs/TEAM.md",
-  "docs/CHARTER.md",
-  "docs/AUDIT.md",
-  "docs/design/**",
-  "docs/cadence/**",
-  "docs/START-HERE.md",
-  "docs/ARCHITECTURE.md",
-  "docs/BOARD.md",
-  "src/review.rs",
-  "src/review/**",
-  "src/audit.rs",
-  "src/audit/**",
-  "src/delegation.rs",
-  "src/delegation/**",
-  "src/daemon/approvals_rpc.rs",
-  "src/store/events.rs",
-  "src/overview.rs",
-  "src/delivery.rs",
-  "src/issue/delivery_policy.rs",
-  "src/issue/model.rs",
-  "src/issue/board.rs",
-  "src/issue/parse.rs",
-  "src/cli/audit.rs",
-  "src/cli/mod.rs",
-  "tests/scripts/**",
-  "tests/common/**",
-  "tests/split-map*.toml",
-  "tests/split_map_inventory.rs",
-  "tests/shard-weights.json",
-  "tests/ci_test_plan.rs",
-  "tests/test_seam.rs",
-  "tests/safety_floor.rs",
-  "tests/audit_review.rs",
-  "tests/delegated_approval.rs",
-  "tests/fixtures/**",
-  "tests/operator_lineage.rs",
-  "tests/master_permission.rs",
-  "tests/build_identity.rs",
 ]

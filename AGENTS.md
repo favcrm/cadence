@@ -40,18 +40,25 @@ may still ask for a design to be agreed on the ticket before code.
 ### Review: what a merge needs (interim, CAD-815)
 Until the delivery loop enforces a per-project policy (CAD-814), every
 PR needs each of the following as a PASS on the exact head you enqueue:
-- **One independent review by default (CAD-1099).** A PR needs ONE
+- **One independent review by default (CAD-1099, CAD-1104).** A PR needs ONE
   independent review covering standards and spec, filed as
   `# Verdict: <ID> Review (standards+spec) — pass|revise`, when every
   changed path qualifies under `docs/roles/one-review-paths.toml`. That list
-  covers normal code and docs, and EXCLUDES UI (`ui/**`, `src/ui/**`: the board runs with the operator's session), trust-boundary/identity,
-  security, rules/gates/CI, supply-chain and release/rollout paths
-  (risk-classes triggers 1, 2-schema, 3, 4, 6, 7, plus the sensitive source trees listed in that file). A PR touching any excluded path
-  needs **Standards** and **Spec/security** reviews by two different
-  independent reviewers. No reviewer may be the author. Prefer a reviewer
-  whose model vendor differs from the author's. Reviewers flag only gaps that
-  affect correctness, security or the ticket's requirements; style
-  preferences and requests for extra tests are optional notes, not REVISE.
+  covers code, docs, CI/workflows, scripts, rules, dependencies and rollout.
+  It EXCLUDES only trust-boundary/identity and secrets (risk-classes
+  triggers 1 and 3: the auth/identity modules, the identity-heavy source
+  trees listed in that file, and UI, since the board runs with the
+  operator's session). A PR touching an excluded path needs **Standards**
+  and **Spec/security** reviews by two different independent reviewers.
+  For a `human`-class PR (see below) the operator's approval is the second
+  check, so one reviewer plus the operator is enough outside triggers 1
+  and 3. No reviewer may be the author. Prefer a reviewer whose model
+  vendor differs from the author's.
+- **Notes never block (CAD-1104).** REVISE only for a correctness,
+  security or ticket-requirement gap. Everything else (wording, docs,
+  comments, style, extra tests) is a note: the reviewer PASSes with notes,
+  and the author fixes them in a follow-up PR, not in the reviewed PR,
+  because a new head voids every verdict.
   The path list is a floor, not a complete map: a single reviewer who sees
   auth, identity, credential, signature, secret, confinement or gate logic
   in a one-review PR returns REVISE asking for a second (Spec/security)
