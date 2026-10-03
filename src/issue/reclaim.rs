@@ -25,10 +25,15 @@
 //!   `.cadence/target/shared`, the main checkout and every other lane's
 //!   target are all refused, never removed.
 //! - I-C: a reclaim racing a build that is just starting never deletes
-//!   files out from under it — the fd/cwd scans are the race window
-//!   (cargo holds its target dir open the moment it starts), and the
-//!   whole check runs under the tracker lock so two reclaim passes can
-//!   never interleave a delete with a stale verdict.
+//!   files out from under it. The guard is a /proc fd + cwd scan plus a
+//!   live-agent/`cwd_holder_aliases` check (a build holds its `target/`
+//!   open and takes the lane as cwd the moment it starts), re-run
+//!   immediately before `remove_dir_all` — so a process that appeared
+//!   between the first idleness check and the delete is caught. The
+//!   mtime-idle window (no write for `idle_secs`) means a candidate is
+//!   already quiet, and the symlink re-check right before the rm refuses
+//!   a path swapped to a link. There is no cross-process lock; the
+//!   re-scan is the mechanism that closes the check→delete gap.
 //!
 //! The shared `.cadence/target/shared` cache is never a candidate — it
 //! belongs to the repo, not the lane, and holds every lane's deps.
@@ -172,12 +177,14 @@ fn reclaim_target(lane: &Path, cargo_target: Option<&str>, root: &Path) -> Resul
     }
 }
 
-/// The reason a lane's `target/` is NOT reclaimable, or `None` when the
-/// lane is idle and safe to reclaim. `state_dir` may name a stopped
-/// daemon — a down daemon just means no live panes/messages.
-fn blocked_reason(view: &finish::DaemonView, lane: &Path, idle: Duration) -> Option<String> {
-    // A process standing in the lane, or holding an fd inside it, is a
-    // live build or a live shell — never reclaim under it.
+/// The /proc + live-agent scan — every block a just-started build can
+/// produce: a process cwd'd in the lane, an open fd inside it, or a
+/// registered agent whose cwd is bound to it. This is the fast,
+/// time-sensitive half of [`blocked_reason`], re-run immediately before
+/// the delete so a process that appeared between the first check and
+/// the `rm` is caught (I-C). It does NOT re-walk mtimes — a build that
+/// has started holds a cwd or an fd, which is what this scan finds.
+fn live_process_reason(view: &finish::DaemonView, lane: &Path) -> Option<String> {
     if let Some(pid) = finish::pids_cwd_under(lane).first() {
         return Some(format!(
             "process {pid} ({}) cwd inside",
@@ -194,6 +201,18 @@ fn blocked_reason(view: &finish::DaemonView, lane: &Path, idle: Duration) -> Opt
     // pane bound to it, is work in flight even with no on-disk write yet.
     if view.up && !finish::cwd_holder_aliases(view, Some(lane)).is_empty() {
         return Some("a registered agent's cwd is on the lane".to_string());
+    }
+    None
+}
+
+/// The reason a lane's `target/` is NOT reclaimable, or `None` when the
+/// lane is idle and safe to reclaim. A down daemon just means no live
+/// agents; the /proc scans still run.
+fn blocked_reason(view: &finish::DaemonView, lane: &Path, idle: Duration) -> Option<String> {
+    // A process standing in the lane, or holding an fd inside it, is a
+    // live build or a live shell — never reclaim under it.
+    if let Some(r) = live_process_reason(view, lane) {
+        return Some(r);
     }
     if newest_write_under(lane, idle).is_some() {
         return Some(format!(
@@ -287,6 +306,23 @@ fn reclaim_lane(
         // being down is covered by the /proc scans still running).
         return Ok(None);
     }
+    // Test seam: let a test inject a just-started build into the real
+    // check→delete gap, proving the re-scan below catches it.
+    #[cfg(test)]
+    tests::before_rescan(&lane);
+    // I-C: a build could have started in the gap between the idleness
+    // check above and this point. Re-run the fast live-process scan on
+    // the lane — a just-started build takes the lane as cwd / holds its
+    // target/ open — not the slow mtime walk, immediately before the
+    // delete, and bail if anything appeared.
+    if let Some(appeared) = live_process_reason(view, lane) {
+        tracing::info!(
+            event = "reclaim_rescan_skip",
+            lane = %lane.display(),
+            reason = %appeared
+        );
+        return Ok(None);
+    }
     // Re-verify the path is still a real dir under the lane immediately
     // before the delete — a TOCTOU symlink swap between the check and
     // the rm must never follow the link. `remove_dir_all` itself does
@@ -318,4 +354,208 @@ fn reclaim_lane(
         actor,
     );
     Ok(Some(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Destructive-guard checks only: this module deletes directories.
+    use super::*;
+    use std::process::Command;
+
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "reclaim-{tag}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// A real repo plus a `git worktree add` lane under `.cadence/wt/`.
+    fn repo_with_lane(tmp: &Tmp) -> (PathBuf, PathBuf) {
+        let repo = tmp.0.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(git(&repo, &["init", "-q"]));
+        std::fs::write(repo.join("f"), b"x").unwrap();
+        assert!(git(&repo, &["add", "f"]));
+        assert!(git(&repo, &["commit", "-qm", "c"]));
+        let lane = repo.join(".cadence").join("wt").join("d-1");
+        assert!(git(
+            &repo,
+            &["worktree", "add", "-q", lane.to_str().unwrap(), "-b", "x-lane"]
+        ));
+        (repo, lane)
+    }
+
+    fn lane_target(lane: &Path) -> PathBuf {
+        let t = lane.join("target");
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(t.join("blob"), vec![b'x'; 4096]).unwrap();
+        t
+    }
+
+    fn down_view() -> finish::DaemonView {
+        finish::daemon_view(&std::env::temp_dir().join("reclaim-no-daemon"))
+    }
+
+    fn age(dir: &Path, secs: u64) {
+        let epoch = (SystemTime::now() - Duration::from_secs(secs))
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let _ = Command::new("find")
+            .arg(dir)
+            .args(["-exec", "touch", "-h", "-d"])
+            .arg(format!("@{epoch}"))
+            .arg("{}")
+            .arg("+")
+            .status();
+    }
+
+    fn pm_stub(tmp: &Tmp) -> Pm {
+        let pm_dir = tmp.0.join("pm");
+        std::fs::create_dir_all(&pm_dir).unwrap();
+        std::fs::write(pm_dir.join("pm.yaml"), "schema: 1\n").unwrap();
+        Pm::at(&pm_dir).unwrap()
+    }
+
+    fn issue_stub(lane: &Path) -> board::Issue {
+        let mut i = board::Issue {
+            project: "demo".to_string(),
+            dir: lane.to_path_buf(),
+            front: crate::issue::model::Front::new("D-1", "T", "2026-01-01T00:00:00Z"),
+            body: String::new(),
+            comments: Vec::new(),
+            artifacts: Vec::new(),
+        };
+        i.front.refs = vec![crate::issue::model::Ref {
+            kind: "worktree".to_string(),
+            url: None,
+            path: Some(lane.display().to_string()),
+            label: None,
+            closed: None,
+            worktree: None,
+            cargo_target: None,
+            agent: None,
+        }];
+        i
+    }
+
+    thread_local! {
+        static PLANT: std::cell::RefCell<Option<std::process::Child>> =
+            const { std::cell::RefCell::new(None) };
+        static PLANT_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Test seam called by `reclaim_lane` between the idleness check and
+    /// the re-scan: when armed, a `sleep` cwd'd in the lane appears, the
+    /// "build just started" condition.
+    pub(crate) fn before_rescan(dir: &Path) {
+        if !PLANT_ARMED.with(|a| a.get()) {
+            return;
+        }
+        let child = Command::new("sleep")
+            .arg("60")
+            .current_dir(dir)
+            .spawn()
+            .expect("plant a build");
+        let want = dir.canonicalize().unwrap();
+        let link = format!("/proc/{}/cwd", child.id());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline
+            && std::fs::read_link(&link).map(|c| c != want).unwrap_or(true)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        PLANT.with(|p| *p.borrow_mut() = Some(child));
+    }
+
+    /// (a) `.cadence/target/shared`, and anything under it, is refused.
+    #[test]
+    fn shared_dep_cache_is_refused() {
+        let tmp = Tmp::new("shared");
+        let (repo, lane) = repo_with_lane(&tmp);
+        let shared = crate::worktree::shared_target_dir(&repo);
+        std::fs::create_dir_all(shared.join("debug")).unwrap();
+        std::fs::write(shared.join("dep"), b"x").unwrap();
+        for cand in [shared.clone(), shared.join("debug")] {
+            assert!(
+                reclaim_target(&lane, Some(cand.to_str().unwrap()), &repo).is_err(),
+                "{} must be refused",
+                cand.display()
+            );
+        }
+        assert!(shared.join("dep").is_file(), "the shared cache survived");
+    }
+
+    /// (b) a live agent whose cwd is the lane blocks, with no /proc trace
+    /// and no in-window write.
+    #[test]
+    fn live_agent_on_the_lane_is_refused() {
+        let tmp = Tmp::new("agent");
+        let (_repo, lane) = repo_with_lane(&tmp);
+        let _t = lane_target(&lane);
+        age(&lane, 7 * 3600);
+        let idle = Duration::from_secs(6 * 3600);
+        assert!(
+            blocked_reason(&down_view(), &lane, idle).is_none(),
+            "control: a down daemon leaves the aged lane free"
+        );
+        let view = finish::DaemonView::with_agents(
+            true,
+            vec![json!({"alias": "w1", "cwd": lane.display().to_string()})],
+        );
+        assert!(blocked_reason(&view, &lane, idle).is_some());
+    }
+
+    /// (c) a build that appears between the check and the delete is
+    /// caught by the just-before-delete re-scan.
+    #[test]
+    fn a_build_started_in_the_gap_is_caught_by_the_rescan() {
+        let tmp = Tmp::new("race");
+        let (_repo, lane) = repo_with_lane(&tmp);
+        let target = lane_target(&lane);
+        age(&lane, 7 * 3600);
+        let pm = pm_stub(&tmp);
+        PLANT_ARMED.with(|a| a.set(true));
+        let bytes = reclaim_lane(
+            &down_view(),
+            &pm,
+            &issue_stub(&lane),
+            &lane,
+            Duration::from_secs(6 * 3600),
+            "test",
+        );
+        PLANT_ARMED.with(|a| a.set(false));
+        if let Some(mut c) = PLANT.with(|p| p.borrow_mut().take()) {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        assert_eq!(bytes.unwrap(), None, "the re-scan must skip a racing lane");
+        assert!(target.is_dir(), "the racing lane's target survived");
+    }
 }

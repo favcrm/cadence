@@ -647,6 +647,23 @@ pub(crate) struct DaemonView {
     agents: Vec<Value>,
 }
 
+impl DaemonView {
+    /// A test view: `up` plus the agent rows `agent_list` would have
+    /// returned (each `{"alias", "cwd"}`), so a reclaim/finish guard's
+    /// live-agent arm can be driven without a running daemon.
+    #[cfg(test)]
+    pub(crate) fn with_agents(up: bool, agents: Vec<Value>) -> Self {
+        Self {
+            up,
+            agents,
+            tasks: std::collections::HashMap::new(),
+            task_errors: std::collections::HashMap::new(),
+            enum_unreachable: None,
+            enum_inconclusive: None,
+        }
+    }
+}
+
 pub(crate) fn daemon_view(state_dir: &Path) -> DaemonView {
     let mut v = DaemonView {
         up: client::socket_path(state_dir).exists(),
