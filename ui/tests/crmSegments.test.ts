@@ -350,15 +350,9 @@ async function mountedFlow() {
   await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "View all"));
   await settle(() => assert(host.querySelector('[aria-label="All members"]'), "View all opens the Members tab"));
 
-  // Footer menu: Duplicate works; Export and Delete are disabled with a reason.
-  await click(host.querySelector('[aria-label="More actions"]'));
-  const item = (label: string) => Array.from(host.querySelectorAll('[role="menuitem"]')).find((el) => el.textContent === label) as HTMLElement;
-  assert(item("Export members").getAttribute("aria-disabled") === "true" && item("Export members").title !== "", "export is disabled with a tooltip");
-  assert(item("Delete segment").getAttribute("aria-disabled") === "true" && item("Delete segment").className.includes("danger"), "delete is disabled and red");
-  const postsBeforeDelete = posts;
-  await click(item("Delete segment"));
-  assert(posts === postsBeforeDelete, "a disabled item sends nothing");
-  await click(item("Duplicate"));
+  // CAD-1072: Export members and Delete segment have no backend (CAD-1069), so they are not shown.
+  assert(!text().includes("Export members") && !text().includes("Delete segment"), "unbuilt actions are absent");
+  await click(Array.from(host.querySelectorAll(".crm-drawer-foot button")).find((el) => el.textContent === "Duplicate"));
   await settle(() => assert(Object.values(segments).some((x: any) => x.name === "Newsletter (copy)"), "duplicate saves a copy"));
   await settle(() => assert(host.querySelector('[data-drawer="segment"] h3')?.textContent === "Newsletter (copy)", "duplicate opens the copy"));
 

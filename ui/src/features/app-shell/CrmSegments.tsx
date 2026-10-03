@@ -905,20 +905,18 @@ function SegmentDrawer({
       tabs={tabs}
       tab={tab}
       onTab={setTab}
-      menu={
-        ready
-          ? [
-              { key: "duplicate", label: "Duplicate", onSelect: duplicate, disabled: !canWrite, title: canWrite ? undefined : "Operators only" },
-              { key: "export", label: "Export members", onSelect: () => {}, disabled: true, title: "Not available yet: the host has no segment export" },
-              { key: "delete", label: "Delete segment", onSelect: () => {}, disabled: true, destructive: true, title: "Not available yet: the host has no segment delete" },
-            ]
-          : undefined
-      }
       secondary={
-        ready && canWrite ? (
-          <Button size="sm" onClick={() => setEditing(true)}>
-            Edit rules
-          </Button>
+        ready ? (
+          <>
+            <Button size="sm" onClick={duplicate} disabled={!canWrite} title={canWrite ? undefined : "Operators only"}>
+              Duplicate
+            </Button>
+            {canWrite ? (
+              <Button size="sm" onClick={() => setEditing(true)}>
+                Edit rules
+              </Button>
+            ) : null}
+          </>
         ) : undefined
       }
       state={
