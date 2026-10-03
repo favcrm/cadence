@@ -34,7 +34,6 @@ import re
 import subprocess
 import sys
 import time
-import tomllib
 
 
 def git_lines(root, *args):
@@ -108,17 +107,6 @@ def focused_tests(root, changed):
         if changed is None or path in changed:
             out.append((f"focused {path}", argv))
     return out
-
-
-def required_features(root):
-    """{test target: required-features} from Cargo.toml [[test]] tables."""
-    try:
-        with open(os.path.join(root, "Cargo.toml"), "rb") as f:
-            doc = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError):
-        return {}
-    return {t["name"]: set(t.get("required-features", []))
-            for t in doc.get("test", []) if "name" in t}
 
 
 def plan(root, changed, with_tests):
