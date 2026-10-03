@@ -128,9 +128,24 @@ impl Shared {
         }
     }
 
-    fn known_install(&self, install: &str) -> Result<()> {
+    /// The installation exists: it has a context in the store, or the
+    /// catalog (the installed apps) names it — an app with no context yet
+    /// (Social Content before a brand) is still an installation.
+    pub(super) fn known_install(&self, install: &str) -> Result<()> {
         crate::proto::identifier(install, "installation ID")?;
-        if !self.store.app_install_known(install)? {
+        if self.store.app_install_known(install)? {
+            return Ok(());
+        }
+        let in_catalog = self
+            .pm_dir()
+            .and_then(|dir| self.pm_at(&dir))
+            .and_then(|pm| {
+                crate::issue::app_catalog::workspace::with_runtime_snapshot(&pm, install, |_, _| {
+                    Ok(())
+                })
+            })
+            .is_ok();
+        if !in_catalog {
             return Err(Error::rejected("Unknown app installation"));
         }
         Ok(())
@@ -165,7 +180,7 @@ impl Shared {
         conversation: &str,
     ) -> Result<()> {
         let install = app["install_id"].as_str().unwrap_or_default();
-        let context = app["context_id"].as_str().unwrap_or_default();
+        let context = app["context_id"].as_str();
         let thread = self
             .store
             .thread_by_id(conversation)?
@@ -177,11 +192,11 @@ impl Shared {
             ));
         }
         if let Some(subject) = &thread.subject {
-            if thread.context_id.as_deref() != Some(context) {
+            let Some(context) = context.filter(|c| thread.context_id.as_deref() == Some(*c)) else {
                 return Err(Error::rejected(
                     "this campaign conversation serves only the context it was created in",
                 ));
-            }
+            };
             self.verify_campaign_subject(install, context, subject)?;
         }
         Ok(())
@@ -236,9 +251,11 @@ impl Shared {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let install = required_str(params, "install_id")?;
         self.known_install(install)?;
-        let context = required_str(params, "context_id")?;
-        // The context must be active in this installation.
-        self.store.app_context_proof(install, context)?;
+        // A context is proven when given; a campaign subject needs one.
+        let context = optional_text(params, "context_id")?;
+        if let Some(context) = context {
+            self.store.app_context_proof(install, context)?;
+        }
         let general = match params.get("general") {
             None | Some(Value::Null) => false,
             Some(Value::Bool(b)) => *b,
@@ -253,6 +270,9 @@ impl Shared {
             }
             (true, None) => ConversationKind::General,
             (false, Some(subject)) => {
+                let context = context.ok_or_else(|| {
+                    Error::rejected("a campaign conversation needs the context it belongs to")
+                })?;
                 self.verify_campaign_subject(install, context, subject)?;
                 ConversationKind::Subject(subject)
             }

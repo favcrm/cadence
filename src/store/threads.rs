@@ -452,7 +452,7 @@ fn message_entry<'a>(
 
 struct Binding<'a> {
     install: &'a str,
-    context: &'a str,
+    context: Option<&'a str>,
     conversation: Option<&'a str>,
 }
 
@@ -646,13 +646,13 @@ impl Store {
         &self,
         alias: &str,
         install: &str,
-        context: &str,
+        context: Option<&str>,
         kind: ConversationKind,
     ) -> Result<(Thread, bool)> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         self.agent_in(&tx, alias)?;
-        let out = Self::conversation_make_in(&tx, alias, install, Some(context), kind)?;
+        let out = Self::conversation_make_in(&tx, alias, install, context, kind)?;
         tx.commit()?;
         Ok(out)
     }
@@ -744,19 +744,13 @@ impl Store {
         tx: &Connection,
         alias: &str,
         install: &str,
-        context: &str,
+        context: Option<&str>,
         selector: Option<&str>,
     ) -> Result<Thread> {
         let thread = match selector {
             None => {
-                Self::conversation_make_in(
-                    tx,
-                    alias,
-                    install,
-                    Some(context),
-                    ConversationKind::General,
-                )?
-                .0
+                Self::conversation_make_in(tx, alias, install, context, ConversationKind::General)?
+                    .0
             }
             Some(id) => Self::thread_by_id_in(tx, id)?
                 .filter(|t| t.alias == alias && t.install_id.as_deref() == Some(install))
@@ -767,7 +761,9 @@ impl Store {
                 "this conversation is archived and read-only",
             ));
         }
-        if thread.subject.is_some() && thread.context_id.as_deref() != Some(context) {
+        if thread.subject.is_some()
+            && (context.is_none() || thread.context_id.as_deref() != context)
+        {
             return Err(Error::rejected(
                 "this campaign conversation serves only the context it was created in",
             ));
@@ -1008,7 +1004,9 @@ impl Store {
         }
         Some(Binding {
             install: obj.get("install_id")?.as_str()?,
-            context: obj.get("context_id")?.as_str()?,
+            // Absent for an installation-only binding: the context is a
+            // per-turn hint, never part of a conversation's key.
+            context: obj.get("context_id").and_then(Value::as_str),
             conversation: obj.get("conversation").and_then(Value::as_str),
         })
     }

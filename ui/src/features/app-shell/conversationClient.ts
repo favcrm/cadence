@@ -76,18 +76,20 @@ export function parseSlash(text: string): "new" | null {
 
 // --- lists ---------------------------------------------------------------
 
-// One daemon serves every install: once a 404 says it has no conversation
-// routes, other installs skip straight to the home thread (no stream churn).
-let daemonLegacy = false;
+// A daemon (or board) that predates conversations answers 501 or a bare
+// 404 (no route); an unknown installation answers 404 naming it. Only the
+// former is "legacy", and only for that install's list — never a tab-wide flag.
+function predatesConversations(e: unknown): boolean {
+  if (!(e instanceof ApiError)) return false;
+  if (e.status === 501) return true;
+  return e.status === 404 && !/Unknown app installation/i.test(e.message ?? "");
+}
 
 const listFamily = cache.family<string, ConversationList>("conversations", async (id) => {
   try {
     return { legacy: false, conversations: parseConversationList(await api.conversationList(id)) };
   } catch (e) {
-    if (e instanceof ApiError && e.status === 404) {
-      daemonLegacy = true;
-      return { legacy: true, conversations: [] };
-    }
+    if (predatesConversations(e)) return { legacy: true, conversations: [] };
     throw e;
   }
 });
@@ -132,7 +134,7 @@ export async function openCampaignConversation(
   try {
     return (await createConversation(installId, contextId, campaignSubject(campaignId))).id;
   } catch (e) {
-    if (e instanceof ApiError && e.status === 404) return null;
+    if (predatesConversations(e)) return null;
     throw e;
   }
 }
@@ -257,9 +259,6 @@ export function useActiveConversation(installId: string): ActiveConversation {
   const draft = useDraftSubject(installId);
   const retry = useCallback(() => void res.refresh(), [res]);
   const data = list.data;
-  if (data === null && daemonLegacy) {
-    return { state: "legacy", error: null, conversations: [], selected: null, draftSubject: null, store: resources.masterThread, retry };
-  }
   if (data === null) {
     const failed = list.status === "failed";
     return { state: failed ? "failed" : "loading", error: failed ? (list.error ?? "request failed") : null, conversations: [], selected: null, draftSubject: null, store: null, retry };
@@ -283,6 +282,13 @@ export function useActiveConversation(installId: string): ActiveConversation {
 // --- queued notice -------------------------------------------------------
 
 export const QUEUED_NOTICE = "Assistant is finishing another task — your message is queued";
+
+/** An operator message in this conversation has no turn result yet — the
+ *  panel keeps polling the master's state so a reload still shows the queue. */
+export function hasUnansweredOperator(entries: ThreadEntry[]): boolean {
+  const answered = new Set(entries.filter((e) => e.kind === "turn_result").map((e) => e.message));
+  return entries.some((e) => e.role === "operator" && e.kind === "message" && !answered.has(e.message));
+}
 
 /** True when this conversation is waiting on a reply while the master's
  *  running message belongs to a different conversation. */

@@ -375,7 +375,7 @@ export const api = {
     text: string,
     message: string,
     refs?: ThreadRef[],
-    app?: { install_id: string; context_id: string },
+    app?: { install_id: string; context_id?: string },
     conversation?: string,
   ) =>
     post<Record<string, unknown>>(
@@ -400,7 +400,11 @@ export const api = {
   conversationCreate: (installId: string, contextId: string, subject?: string) =>
     post<Record<string, unknown>>(
       `/api/app-installations/${encodeURIComponent(installId)}/conversations`,
-      subject ? { context_id: contextId, subject } : { context_id: contextId },
+      {
+        // The context is optional: General and New need none.
+        ...(contextId !== "" ? { context_id: contextId } : {}),
+        ...(subject ? { subject } : {}),
+      },
     ),
   /**
    * `POST /api/needs/<verb>` — the rail's snooze/dismiss (CAD-574);

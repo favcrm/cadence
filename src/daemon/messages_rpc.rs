@@ -316,7 +316,14 @@ impl Shared {
         // re-prove here so `agent_send`/`send` can never carry one.
         let app = match params.get("app") {
             None | Some(Value::Null) => None,
-            Some(v) => Some(thread_app(v, &self.store)?),
+            Some(v) => {
+                let normalized = thread_app(v, &self.store)?;
+                // An installation-only binding is proven by the catalog.
+                if normalized.get("context_id").is_none() {
+                    self.known_install(normalized["install_id"].as_str().unwrap_or_default())?;
+                }
+                Some(normalized)
+            }
         };
         // CAD-1098: `conversation` only selects among the conversations
         // of the verified App binding's installation. It is checked

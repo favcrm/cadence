@@ -3799,7 +3799,15 @@ fn thread_app(value: &Value, store: &Store) -> Result<Value> {
             "app takes install_id and context_id only; field '{key}' is not accepted"
         )));
     }
-    for key in ["install_id", "context_id"] {
+    // `context_id` may be absent: an installation-only binding for an
+    // app whose chat has no context selected. The install is proven by
+    // the caller; no hint or turn token is ever made for it.
+    let keys: &[&str] = if obj.contains_key("context_id") {
+        &["install_id", "context_id"]
+    } else {
+        &["install_id"]
+    };
+    for key in keys.iter().copied() {
         let id = obj.get(key).and_then(Value::as_str).unwrap_or_default();
         if id.is_empty()
             || id.len() > 128
@@ -3813,7 +3821,9 @@ fn thread_app(value: &Value, store: &Store) -> Result<Value> {
         }
     }
     let install = obj["install_id"].as_str().unwrap();
-    let context = obj["context_id"].as_str().unwrap();
+    let Some(context) = obj.get("context_id").and_then(Value::as_str) else {
+        return Ok(json!({"install_id": install, "verified": true}));
+    };
     // Server proof: the installation exists and the context is
     // active in it — an unknown install, an unknown context, or an
     // archived one refuses here, before anything is queued.

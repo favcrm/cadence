@@ -558,7 +558,9 @@ assert(text().includes("Second"), "new installation renders");
 // A single-context install keeps the switch hidden — no link clutter.
 assert(!host.querySelector("[data-scope-link]"), "single-context installs render no switch links");
 equal(panes(), 1, "install switch keeps one chat pane");
-equal(eventSources, 1, "install switch opens no second stream");
+// Legacy detection is per installation (CAD-1098): the new install reads its own
+// conversation list before it resumes the home thread, so the stream reconnects once.
+equal(eventSources, 2, "install switch reconnects the stream once, never more");
 assert(text().includes("Scoped follow-up"), "install switch keeps the live thread");
 
 // chatBinding: empty wants plain chat, inactive blocks early with the

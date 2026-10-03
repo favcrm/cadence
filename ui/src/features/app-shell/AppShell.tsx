@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { streamInto } from "../../lib/sse";
-import { useResource } from "../../lib/useResource";
+import { useQuery, useResource } from "../../lib/useResource";
 import { navigate, useHref } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
@@ -31,6 +31,7 @@ import {
   conversationStreamUrl,
   createConversation,
   idleThread,
+  hasUnansweredOperator,
   isQueuedBehindOther,
   parseSlash,
   selectConversation,
@@ -777,12 +778,15 @@ function ChatPane({
   const store = active.store ?? idleThread;
   const convId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const thread = useResource(store);
-  const masterState = useResource(resources.masterState);
+  const masterState = useQuery(resources.masterState);
   const [draft, setDraft] = useState("");
   const [sendError, setSendError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const loaded = thread.data !== null;
   const draftSubject = active.draftSubject;
+  // With no context selected the send still carries the installation, so
+  // it lands in the app's conversation (the context is only a per-turn hint).
+  const sendApp = binding.scope ?? (active.state === "ready" ? { install_id: installId } : undefined);
   const usable =
     active.state === "legacy" || (active.state === "ready" && (convId !== null || draftSubject !== null));
 
@@ -812,6 +816,13 @@ function ChatPane({
   const queued = isQueuedBehindOther(masterState.data?.turn, thread.data?.entries ?? [], thread.data?.pending ?? []);
   // The notice needs a live turn read while a reply is awaited.
   const awaiting = queued || (thread.data?.pending ?? []).some((p) => p.state === "sent");
+  // After a reload or navigation the selected conversation may still be
+  // waiting on another conversation's turn: read the master's state once
+  // (the poll below then keeps the notice live while it is queued).
+  const unanswered = hasUnansweredOperator(thread.data?.entries ?? []);
+  useEffect(() => {
+    if (unanswered) void resources.masterState.refresh();
+  }, [unanswered, convId]);
   useEffect(() => {
     if (!awaiting) return;
     const t = setInterval(() => void resources.masterState.refresh(), 6_000);
@@ -858,7 +869,7 @@ function ChatPane({
       ({ id, store: dest }) => {
         dest.write((s) => addPending(s, message, body, Date.now()));
         return api
-          .threadSend(MASTER, body, message, undefined, binding.scope ?? undefined, id ?? undefined)
+          .threadSend(MASTER, body, message, undefined, sendApp, id ?? undefined)
           .then(() => {
             dest.write((s) => settlePending(s, message, { ok: true }));
             void resources.masterState.refresh();
@@ -994,7 +1005,7 @@ function ChatPane({
               const message = newMessageId();
               const body = JSON.stringify(intent);
               try {
-                await api.threadSend(MASTER, body, message, undefined, binding.scope ?? undefined, convId ?? undefined);
+                await api.threadSend(MASTER, body, message, undefined, sendApp, convId ?? undefined);
                 void store.refresh();
                 void resources.masterState.refresh();
                 return null;

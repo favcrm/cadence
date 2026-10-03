@@ -76,7 +76,7 @@ struct ThreadMessageReq {
 #[serde(deny_unknown_fields)]
 struct ConversationReq {
     install_id: Option<String>,
-    context_id: String,
+    context_id: Option<String>,
     subject: Option<String>,
     general: Option<bool>,
 }
@@ -95,7 +95,8 @@ struct ThreadRef {
 #[serde(deny_unknown_fields)]
 struct ThreadApp {
     install_id: String,
-    context_id: String,
+    /// Absent for an installation-only binding (no context selected).
+    context_id: Option<String>,
 }
 
 /// Alias grammar checked before it reaches the daemon — the same one
@@ -124,7 +125,7 @@ fn rpc_err(e: &Error) -> HttpResp {
     if text.starts_with("Daemon is not reachable") {
         return err_response(503, &text);
     }
-    if text.contains("Unknown method 'thread_") {
+    if text.contains("Unknown method 'thread_") || text.contains("Unknown method 'conversation_") {
         return err_response(501, "this daemon does not support threads");
     }
     if text.contains("Unknown managed agent")
@@ -331,7 +332,10 @@ pub(super) fn post_message(
             .collect::<Vec<_>>());
     }
     if let Some(app) = req.app {
-        params["app"] = json!({"install_id": app.install_id, "context_id": app.context_id});
+        params["app"] = match app.context_id {
+            Some(context) => json!({"install_id": app.install_id, "context_id": context}),
+            None => json!({"install_id": app.install_id}),
+        };
     }
     if let Some(conversation) = req.conversation {
         params["conversation"] = Value::String(conversation);
@@ -397,8 +401,10 @@ pub(super) fn post_conversation(
     let mut params = json!({
         "alias": alias,
         "install_id": install,
-        "context_id": req.context_id,
     });
+    if let Some(context) = req.context_id {
+        params["context_id"] = Value::String(context);
+    }
     if let Some(subject) = req.subject {
         params["subject"] = Value::String(subject);
     }
