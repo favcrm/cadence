@@ -29,6 +29,12 @@ pub(super) enum Route<'a> {
     SendNow(&'a str),
     /// CAD-979: `POST /api/social-media-imports` → `social_publish_media_import`.
     MediaImport,
+    /// CAD-1123 HP4: `POST /api/social-publish-starts` → `social_publish_start`.
+    /// The body names a run and a mode only; the daemon derives the rest.
+    Start,
+    /// CAD-1123 HP4: `POST /api/social-publishes/<id>/reschedule` →
+    /// `social_publish_reschedule` (compare-and-swap on the queued intent).
+    Reschedule(&'a str),
 }
 fn segment(id: &str) -> bool {
     !id.is_empty()
@@ -43,6 +49,9 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     if path == "/api/social-media-imports" {
         return Some(Route::MediaImport);
     }
+    if path == "/api/social-publish-starts" {
+        return Some(Route::Start);
+    }
     if path == "/api/social-publishes" {
         return Some(Route::List);
     }
@@ -56,6 +65,7 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         return match verb {
             "cancel" => Some(Route::Cancel(id)),
             "send-now" => Some(Route::SendNow(id)),
+            "reschedule" => Some(Route::Reschedule(id)),
             _ => None,
         };
     }
@@ -133,6 +143,34 @@ struct MediaImport {
     toolkit: String,
     destination_id: String,
 }
+/// CAD-1123 HP4: publish start. Unknown fields are refused, so a forged
+/// destination, grant, scope or approval in the body is a 400 here and a
+/// strict-field refusal at the daemon.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Start {
+    request_id: String,
+    run_id: String,
+    mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    due_epoch: Option<i64>,
+}
+/// CAD-1123 HP4: reschedule names the intent's own scope, the time the
+/// operator saw and the new time.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Reschedule {
+    install_id: String,
+    #[serde(
+        default,
+        deserialize_with = "present_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    context_id: Option<String>,
+    expected_due_epoch: i64,
+    due_epoch: i64,
+}
+
 /// CAD-1027: cancel (and CAD-1041 send-now) names the intent's own
 /// install and exact context; the daemon refuses any other scope.
 #[derive(Deserialize, Serialize)]
@@ -295,6 +333,33 @@ pub(super) fn handle(
             params["intent_id"] = json!(id);
             ("social_publish_send_now", params)
         }
+        Route::Start => {
+            let bytes = match read_body(request, BODY_CAP) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            let value: Start = match parse_json(&bytes) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            (
+                "social_publish_start",
+                serde_json::to_value(value).expect("typed start serializes"),
+            )
+        }
+        Route::Reschedule(id) => {
+            let bytes = match read_body(request, BODY_CAP) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            let value: Reschedule = match parse_json(&bytes) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let mut params = serde_json::to_value(value).expect("typed reschedule serializes");
+            params["intent_id"] = json!(id);
+            ("social_publish_reschedule", params)
+        }
         Route::MediaImport => {
             let bytes = match read_body(request, BODY_CAP) {
                 Ok(bytes) => bytes,
@@ -341,7 +406,19 @@ mod tests {
             route("/api/social-publishes/intent-a/send-now"),
             Some(Route::SendNow("intent-a"))
         ));
+        // CAD-1123 HP4: start and reschedule route exactly, and are writes.
+        assert!(matches!(
+            route("/api/social-publish-starts"),
+            Some(Route::Start)
+        ));
+        assert!(matches!(
+            route("/api/social-publishes/intent-a/reschedule"),
+            Some(Route::Reschedule("intent-a"))
+        ));
+        assert!(!Route::Start.is_read() && !Route::Reschedule("a").is_read());
         for path in [
+            "/api/social-publish-starts/extra",
+            "/api/social-publishes/intent-a/reschedule/extra",
             "/api/social-publishes/claim-due",
             "/api/social-publishes/reconcile",
             "/api/social-publishes/report",

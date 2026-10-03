@@ -589,3 +589,91 @@ fn cad1041_claim_id_identity_and_two_handles_one_claim() {
         .unwrap()
         .is_none());
 }
+
+fn apv(n: u8) -> String {
+    format!("apv-{n:032x}")
+}
+
+/// CAD-1123 HP4: reschedule is one compare-and-swap on the queued row. The
+/// row keeps a schedule throughout, refuses a stale time, a wrong scope, a
+/// reused approval and a claimed row, and changes nothing when refused.
+#[test]
+fn cad1123_reschedule_is_one_atomic_swap_on_a_queued_intent() {
+    let (_dir, s) = store();
+    let first = s.social_publish_schedule(&intent("req-rs")).unwrap();
+    let id = first["intent"]["intent_id"].as_str().unwrap().to_owned();
+    let (install, due) = ("install-harbour", 1_750_000_000);
+    let moved = s
+        .social_publish_reschedule(&id, install, None, due, due + 600, &apv(1))
+        .unwrap();
+    assert_eq!(moved["intent"]["state"], "queued");
+    assert_eq!(moved["intent"]["due_epoch"], due + 600);
+    assert_eq!(moved["intent"]["frozen"]["due_epoch"], due + 600);
+    assert_eq!(moved["intent"]["frozen"]["approval_id"], apv(1));
+    // The frozen digest follows the frozen document.
+    assert_ne!(
+        moved["intent"]["frozen_digest"],
+        first["intent"]["frozen_digest"]
+    );
+    // A second swap that read the OLD time loses the race and refuses.
+    assert!(s
+        .social_publish_reschedule(&id, install, None, due, due + 900, &apv(2))
+        .is_err());
+    // Wrong install, wrong context, a replayed approval: all refuse.
+    assert!(s
+        .social_publish_reschedule(&id, "other", None, due + 600, due + 900, &apv(3))
+        .is_err());
+    assert!(s
+        .social_publish_reschedule(&id, install, Some("ctx"), due + 600, due + 900, &apv(4))
+        .is_err());
+    assert!(s
+        .social_publish_reschedule(&id, install, None, due + 600, due + 900, &apv(1))
+        .is_err());
+    assert!(s
+        .social_publish_reschedule(&id, install, None, due + 600, due + 900, "apv-short")
+        .is_err());
+    assert_eq!(
+        s.social_publish_show(&id).unwrap()["intent"]["due_epoch"],
+        due + 600
+    );
+    // A claimed row can no longer move; neither can a cancelled one.
+    s.social_publish_claim_id(&id, install, None)
+        .unwrap()
+        .unwrap();
+    assert!(s
+        .social_publish_reschedule(&id, install, None, due + 600, due + 900, &apv(5))
+        .is_err());
+    let other = s.social_publish_schedule(&intent("req-rs2")).unwrap();
+    let other_id = other["intent"]["intent_id"].as_str().unwrap();
+    s.social_publish_cancel(other_id, install, None).unwrap();
+    assert!(s
+        .social_publish_reschedule(other_id, install, None, due, due + 900, &apv(6))
+        .is_err());
+}
+
+/// CAD-1123 HP4: the permalink is read only from a posted receipt and only
+/// when it is a plain https link on a known social host.
+#[test]
+fn cad1123_permalink_only_from_a_posted_receipt_on_a_known_host() {
+    use crate::store::social_publish::posted_permalink;
+    let ok = json!({"permalink":"https://www.instagram.com/p/ABC123/"});
+    assert_eq!(
+        posted_permalink("posted", Some(&ok)),
+        json!("https://www.instagram.com/p/ABC123/")
+    );
+    assert!(posted_permalink("queued", Some(&ok)).is_null());
+    assert!(posted_permalink("posted", None).is_null());
+    for bad in [
+        "http://www.instagram.com/p/a/",
+        "https://evil.example/p/a/",
+        "https://www.instagram.com.evil.example/p/a/",
+        "javascript:alert(1)",
+        "https://www.instagram.com/p/a b/",
+    ] {
+        let receipt = json!({ "permalink": bad });
+        assert!(
+            posted_permalink("posted", Some(&receipt)).is_null(),
+            "{bad}"
+        );
+    }
+}

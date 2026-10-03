@@ -44,6 +44,8 @@ CREATE INDEX IF NOT EXISTS social_publish_install
 /// Event kinds on the platform stream for intent lifecycle.
 pub const SOCIAL_PUBLISH_SCHEDULED_EVENT: &str = "social_publish_scheduled";
 pub const SOCIAL_PUBLISH_CANCELLED_EVENT: &str = "social_publish_cancelled";
+/// CAD-1123 HP4: a queued intent's due time moved under a new approval.
+pub const SOCIAL_PUBLISH_RESCHEDULED_EVENT: &str = "social_publish_rescheduled";
 pub const SOCIAL_PUBLISH_CLAIMED_EVENT: &str = "social_publish_claimed";
 pub const SOCIAL_PUBLISH_REPORTED_EVENT: &str = "social_publish_reported";
 
@@ -173,7 +175,38 @@ fn envelope(
     upstream: Option<&Value>,
 ) -> Value {
     json!({"intent":{"schema":1,"intent_id":intent_id,"request":request,"state":state,
-        "frozen":frozen,"frozen_digest":digest,"receipt":receipt,"upstream":upstream}})
+        "frozen":frozen,"frozen_digest":digest,"receipt":receipt,"upstream":upstream,
+        "permalink":posted_permalink(state,receipt)}})
+}
+
+/// CAD-1123 HP4: the public link to the post, only once the intent is
+/// `posted` and only from the provider's own evidence on the receipt.
+/// It must be a plain https URL on a known social host, so the screen can
+/// show "View on Instagram" without trusting free text.
+pub fn posted_permalink(state: &str, receipt: Option<&Value>) -> Value {
+    if state != "posted" {
+        return Value::Null;
+    }
+    let Some(link) = receipt.and_then(|r| r["permalink"].as_str()) else {
+        return Value::Null;
+    };
+    let host = link
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("");
+    let known = matches!(
+        host,
+        "www.instagram.com" | "instagram.com" | "www.facebook.com" | "facebook.com"
+    );
+    let plain = link.len() <= 300
+        && link
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=%".contains(&b));
+    if known && plain {
+        json!(link)
+    } else {
+        Value::Null
+    }
 }
 
 fn parse_json_cell(cell: Option<String>, what: &str) -> Result<Option<Value>> {
@@ -345,6 +378,127 @@ impl Store {
             let result = read_row(&tx, intent_id)?;
             Ok(result)
         })
+    }
+
+    /// CAD-1123 HP4: move one queued intent's due time under a NEW approval,
+    /// atomically. One UPDATE compare-and-swaps on everything the operator
+    /// saw: `state='queued'`, the intent's own install and exact context,
+    /// and the due time the screen showed (`expected_due_epoch`). The row is
+    /// never cancelled and re-frozen, so there is no window with no
+    /// schedule: it either keeps its old time or has the new one. A claim
+    /// (driver or send-now), a cancel, a second reschedule that read the same
+    /// old time, or a wrong scope changes zero rows and refuses. The new
+    /// approval id is the minted `apv-` shape and, like every approval,
+    /// authorizes exactly one change (a replay refuses).
+    pub fn social_publish_reschedule(
+        &self,
+        intent_id: &str,
+        install_id: &str,
+        context_id: Option<&str>,
+        expected_due_epoch: i64,
+        due_epoch: i64,
+        approval_id: &str,
+    ) -> Result<Value> {
+        if !valid_approval_id(approval_id) {
+            return Err(Error::rejected(
+                "bad_approval: approval id must be apv- followed by 32 lowercase hex",
+            ));
+        }
+        if due_epoch <= 0 {
+            return Err(Error::rejected("social publish due time is invalid"));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let replayed: Option<String> = tx
+                .query_row_raw(
+                    "SELECT intent_id FROM social_publish_intents WHERE approval_id=?",
+                    [approval_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if replayed.is_some() {
+                return Err(Error::rejected(
+                    "approval_replay: this approval already authorized another social publish intent",
+                ));
+            }
+            let current: Option<(String, i64)> = tx
+                .query_row_raw(
+                    "SELECT frozen,due_epoch FROM social_publish_intents WHERE intent_id=? AND state='queued' AND install_id=? AND context_id IS ?",
+                    params![intent_id, install_id, context_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let refuse = || {
+                Error::rejected(
+                    "only a queued social publish intent in this install and context, still at the time you saw, can be rescheduled",
+                )
+            };
+            let Some((frozen_text, due)) = current else {
+                return Err(refuse());
+            };
+            if due != expected_due_epoch {
+                return Err(refuse());
+            }
+            let mut frozen: Value = serde_json::from_str(&frozen_text)?;
+            frozen["due_epoch"] = json!(due_epoch);
+            frozen["approval_id"] = json!(approval_id);
+            let digest = app_runs::material_digest(&frozen);
+            let changed = tx.execute(
+                "UPDATE social_publish_intents SET due_epoch=?,approval_id=?,frozen=?,frozen_digest=?,updated=? WHERE intent_id=? AND state='queued' AND install_id=? AND context_id IS ? AND due_epoch=?",
+                params![due_epoch, approval_id, frozen.to_string(), digest, now(), intent_id, install_id, context_id, expected_due_epoch],
+            )?;
+            if changed != 1 {
+                return Err(refuse());
+            }
+            Self::event(
+                &tx,
+                platform::PLATFORM_STREAM,
+                SOCIAL_PUBLISH_RESCHEDULED_EVENT,
+                json!({"intent_id":intent_id,"due_epoch":due_epoch,"approval_id":approval_id}),
+            )?;
+            read_row(&tx, intent_id)
+        })
+    }
+
+    /// CAD-1123 HP4: the intent a host-minted request id already froze in
+    /// this install, if any — so a retried or double-tapped publish start
+    /// resumes the same intent instead of minting a second one.
+    pub(crate) fn social_publish_find_request(
+        &self,
+        install_id: &str,
+        request_id: &str,
+    ) -> Result<Option<Value>> {
+        let request = format!(
+            "social-publish-{}",
+            uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!("{install_id}:{request_id}").as_bytes()
+            )
+            .simple()
+        );
+        let conn = self.conn();
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT intent_id FROM social_publish_intents WHERE request=?",
+                [&request],
+                |r| r.get(0),
+            )
+            .optional()?;
+        id.map(|id| read_row(&conn, &id)).transpose()
+    }
+
+    /// CAD-1123 HP4: the artifact a run's independent reviewer approved —
+    /// the one the publish material re-proves. Ordered like the material's
+    /// own review lookup, so both name the same artifact.
+    pub(crate) fn app_run_approved_artifact(&self, run_id: &str) -> Result<String> {
+        self.conn()
+            .query_row(
+                "SELECT artifact_id FROM app_run_reviews WHERE run_id=? AND decision='approve' ORDER BY step_id LIMIT 1",
+                [run_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::rejected("run has no independently approved artifact"))
     }
 
     pub fn social_publish_show(&self, intent_id: &str) -> Result<Value> {

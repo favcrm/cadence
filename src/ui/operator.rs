@@ -187,6 +187,17 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/social-publishes/*/send-now",
         RouteClass::OperatorOnly,
     ),
+    // CAD-1123 HP4: publish from the binding and the atomic reschedule.
+    route(
+        "POST",
+        "/api/social-publish-starts",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/social-publishes/*/reschedule",
+        RouteClass::OperatorOnly,
+    ),
     route(
         "POST",
         "/api/app-installations/*/approve",
@@ -2069,6 +2080,16 @@ mod tests {
             route_class("POST", "/api/social-publishes/spub-1/send-now"),
             RouteClass::OperatorOnly
         );
+        for path in [
+            "/api/social-publish-starts",
+            "/api/social-publishes/spub-1/reschedule",
+        ] {
+            assert_eq!(
+                route_class("POST", path),
+                RouteClass::OperatorOnly,
+                "{path}"
+            );
+        }
         assert_eq!(
             route_class("POST", "/api/issues/CAD-1/comments"),
             RouteClass::AgentAllowed
