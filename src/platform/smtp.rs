@@ -704,7 +704,7 @@ pub struct SmtpMessage {
     pub text: String,
     pub unsubscribe_url: String,
     /// CAD-786: the durable per-recipient key a campaign delivery
-    /// stamps as `Message-ID: <key@cadence.invalid>`; `None` mints an
+    /// stamps as `Message-ID: <key@sender-domain>`; `None` mints an
     /// ephemeral id on the envelope host (test sends).
     pub idempotency_key: Option<String>,
 }
@@ -810,6 +810,44 @@ fn header_address(name: &str, address: &str) -> Result<String> {
     Ok(format!("\"{name}\" <{address}>"))
 }
 
+/// RFC 5322 `date-time` in UTC, e.g. `Fri, 03 Oct 2026 04:40:00 +0000`.
+pub(crate) fn rfc5322_date(epoch: i64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // `iso` is `YYYY-MM-DDTHH:MM:SSZ`; reuse it rather than a second
+    // civil-date algorithm.
+    let iso = crate::issue::time::iso(epoch);
+    let month: usize = iso[5..7].parse().unwrap_or(1);
+    let weekday = DAYS[epoch.div_euclid(86_400).rem_euclid(7) as usize];
+    format!(
+        "{weekday}, {} {} {} {} +0000",
+        &iso[8..10],
+        MONTHS[month - 1],
+        &iso[..4],
+        &iso[11..19]
+    )
+}
+
+/// The domain a `Message-ID` is minted under: the verified sender's
+/// own domain. The sender passed `validate_sender`, so the domain is
+/// a bounded ASCII host; anything unexpected falls back to the
+/// envelope-independent reserved `cadence.invalid`.
+fn sender_domain(sender: &str) -> String {
+    match sender.rsplit_once('@') {
+        Some((_, d))
+            if !d.is_empty()
+                && d.len() <= 253
+                && d.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') =>
+        {
+            d.to_ascii_lowercase()
+        }
+        _ => "cadence.invalid".to_string(),
+    }
+}
+
 /// Deterministic multipart/alternative assembly from the frozen
 /// render bytes. The boundary is derived from the content digest so
 /// the same revision always assembles the same body.
@@ -823,7 +861,7 @@ pub fn assemble_message(
         "cadence-{}",
         &crate::platform::connections::registration_digest(content_digest)[7..39]
     );
-    let date = crate::issue::time::now_epoch();
+    let date = rfc5322_date(crate::issue::time::now_epoch());
     let message_id = match &message.idempotency_key {
         Some(key) => {
             // The durable key is a sha256 digest; its `sha256:` tag
@@ -836,7 +874,7 @@ pub fn assemble_message(
             {
                 return Err(Error::rejected("SMTP idempotency key exceeds its bounds"));
             }
-            format!("<{key}@cadence.invalid>")
+            format!("<{key}@{}>", sender_domain(&envelope.sender))
         }
         None => format!("<{}@{}>", uuid::Uuid::new_v4().simple(), envelope.host),
     };
@@ -1555,6 +1593,57 @@ fn auth_mechanisms(ehlo: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn date_header_is_rfc5322_utc() {
+        let at = |iso: &str| rfc5322_date(crate::issue::time::parse_iso(iso).unwrap());
+        assert_eq!(
+            at("2026-10-03T04:40:00Z"),
+            "Sat, 03 Oct 2026 04:40:00 +0000"
+        );
+        assert_eq!(
+            at("1970-01-01T00:00:00Z"),
+            "Thu, 01 Jan 1970 00:00:00 +0000"
+        );
+        assert_eq!(
+            at("2024-02-29T23:59:59Z"),
+            "Thu, 29 Feb 2024 23:59:59 +0000"
+        );
+    }
+
+    #[test]
+    fn message_id_uses_the_sender_domain_and_dates_are_not_epoch() {
+        let envelope = SmtpEnvelope {
+            host: "smtp.relay.test".into(),
+            port: 587,
+            tls_mode: "starttls".into(),
+            username: "u".into(),
+            secret: b"never-in-the-message".to_vec(),
+            sender: "News@Example.COM".into(),
+            sender_name: String::new(),
+        };
+        let message = SmtpMessage {
+            to: "a@b.test".into(),
+            subject: "s".into(),
+            html: "<p>h</p>".into(),
+            text: "t".into(),
+            unsubscribe_url: String::new(),
+            idempotency_key: Some(format!("sha256:{}", "ab12".repeat(16))),
+        };
+        let out = assemble_message(&envelope, &message, "sha256:d").unwrap();
+        let id = out.lines().find(|l| l.starts_with("Message-ID:")).unwrap();
+        assert_eq!(
+            id,
+            format!("Message-ID: <{}@example.com>", "ab12".repeat(16))
+        );
+        assert!(!out.contains("cadence.invalid"));
+        assert!(!out.contains("never-in-the-message"));
+        let date = out.lines().find(|l| l.starts_with("Date: ")).unwrap();
+        assert!(date.ends_with(" +0000") && date.contains(", "), "{date}");
+        let mut forged = message;
+        forged.idempotency_key = Some("k\r\nBcc: x@evil.test".into());
+        assert!(assemble_message(&envelope, &forged, "sha256:d").is_err());
+    }
 
     #[test]
     fn enrollment_grammar_accepts_only_the_two_encrypted_submissions() {

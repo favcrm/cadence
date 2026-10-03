@@ -275,3 +275,13 @@ console.log("router checks passed");
 // A plain Projects entry is overview; existing board bookmarks remain Issues.
 equal(readLocation("/projects", "").route, { screen: "projects", slug: null, section: "overview" }, "portfolio landing");
 equal(readLocation("/projects/cadence", "?view=list").route, { screen: "projects", slug: "cadence", section: "issues" }, "legacy issue bookmark");
+
+// CAD-1068: CRM app params stay on the app route and never follow to /settings.
+{
+  const crm = "?crm=campaigns&record=r1&ctx=c1&appview=new&segment=s1&keep=1";
+  const app = readLocation("/app-installations/install-a", crm);
+  equal(locationHref(app, crm), "/app-installations/install-a?crm=campaigns&record=r1&ctx=c1&appview=new&segment=s1&keep=1", "app route keeps its own params");
+  const settings = goTo(app, { screen: "settings", section: "memory" });
+  equal(locationHref(settings, crm), "/settings/memory?keep=1", "settings drops CRM params, keeps unrelated ones");
+  equal(locationHref(goTo(app, { screen: "home" }), crm), "/?keep=1", "home drops CRM params");
+}
