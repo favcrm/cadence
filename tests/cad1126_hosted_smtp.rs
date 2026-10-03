@@ -464,6 +464,69 @@ fn hosted_smtp_goes_only_through_smtp_internal_and_the_secret_never_leaves_the_d
     assert!(message.contains(&format!("To: <{RECIPIENT}>")));
     assert!(!message.contains(&password));
 
+    // With a live binding, the same callers still cannot send or read it.
+    let after_bind = relay.count();
+    for who in [Asserted::Agent("writer".into()), Asserted::Unproven] {
+        for (method, params) in [
+            (
+                "crm_smtp_test_send",
+                json!({"install_id": install, "context_id": context, "campaign_id": "launch-1", "to_email": RECIPIENT}),
+            ),
+            (
+                "crm_smtp_show",
+                json!({"install_id": install, "context_id": context}),
+            ),
+        ] {
+            assert!(
+                fx.rpc(who.clone(), method, params).is_err(),
+                "{method} must refuse {} after the bind",
+                who.as_str()
+            );
+        }
+    }
+    assert_eq!(
+        relay.count(),
+        after_bind,
+        "a refused caller sent through the bound sender"
+    );
+
+    // Replace (rotate) must not strand the workspace: the binding reads
+    // as stale with its link revision, a rebind succeeds in place, and a
+    // test send is accepted through the relay again.
+    fx.op(
+        "connection_rotate",
+        json!({"connection_id": id, "secret": password}),
+    );
+    let stale = fx.op(
+        "crm_smtp_show",
+        json!({"install_id": install, "context_id": context}),
+    );
+    assert_eq!(stale["binding"]["state"], "stale", "{stale}");
+    let link_revision = stale["binding"]["link_revision"].as_i64().unwrap();
+    assert!(
+        fx.rpc(
+            Asserted::Operator,
+            "crm_smtp_test_send",
+            json!({"install_id": install, "context_id": context, "campaign_id": "launch-1", "to_email": RECIPIENT}),
+        )
+        .is_err(),
+        "a stale binding must not send"
+    );
+    fx.op(
+        "crm_smtp_rebind",
+        json!({"install_id": install, "context_id": context, "connection_id": id, "expected_revision": link_revision}),
+    );
+    let sends = relay.seen().iter().filter(|s| s.path == "/v1/send").count();
+    let replaced = fx.op(
+        "crm_smtp_test_send",
+        json!({"install_id": install, "context_id": context, "campaign_id": "launch-1", "to_email": RECIPIENT}),
+    );
+    assert_eq!(replaced["receipt"]["accepted"], true, "{replaced}");
+    assert_eq!(
+        relay.seen().iter().filter(|s| s.path == "/v1/send").count(),
+        sends + 1
+    );
+
     // An approved campaign send takes the same path, with its
     // List-Unsubscribe header, to the subscriber.
     let prepared = fx.op(

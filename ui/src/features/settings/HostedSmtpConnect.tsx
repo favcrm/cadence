@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
 import {
   PRESETS,
@@ -32,7 +33,7 @@ export default function HostedSmtpConnect({
 }: {
   /** The address already connected, if any: the form then replaces it. */
   connected: string | null;
-  onConnect: (details: ConnectDetails) => Promise<void>;
+  onConnect: (details: ConnectDetails, acceptRisk: boolean) => Promise<void>;
   onCancel?: () => void;
 }) {
   const [preset, setPreset] = useState<Preset>(PRESETS[0]);
@@ -42,6 +43,8 @@ export default function HostedSmtpConnect({
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [consent, setConsent] = useState(false);
+  // Set only when the daemon refused with custody_unprotected.
+  const [riskNeeded, setRiskNeeded] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -58,8 +61,8 @@ export default function HostedSmtpConnect({
       setError("Fill in your email address, the app password and the mail server.");
       return;
     }
-    if (!consent) {
-      setError("Tick the box to confirm where the password is kept.");
+    if (riskNeeded && !consent) {
+      setError("Tick the box to store the password anyway, or cancel.");
       return;
     }
     setPending(true);
@@ -72,12 +75,20 @@ export default function HostedSmtpConnect({
       password,
       sender: address.trim(),
       sender_name: name.trim(),
-    })
-      .catch((e: unknown) => setError(connectErrorText(e)))
-      .finally(() => {
+    }, riskNeeded && consent)
+      .then(() => setPassword(""))
+      .catch((e: unknown) => {
+        // Nothing was stored on this refusal; keep the typed password
+        // so the operator can tick and resend without retyping it.
+        if (e instanceof ApiError && e.code === "custody_unprotected") {
+          setRiskNeeded(true);
+          setError(connectErrorText(e));
+          return;
+        }
         setPassword("");
-        setPending(false);
-      });
+        setError(connectErrorText(e));
+      })
+      .finally(() => setPending(false));
   };
 
   return (
@@ -193,19 +204,21 @@ export default function HostedSmtpConnect({
           {host} · port {portFor(tls)} · {tls === "implicit" ? "SSL/TLS" : "STARTTLS"}
         </p>
       )}
-      <label className="flex items-start gap-2 text-label text-ink-300">
-        <input
-          type="checkbox"
-          checked={consent}
-          onChange={(e) => setConsent(e.target.checked)}
-          disabled={pending}
-          className="mt-0.5"
-        />
-        <span>
-          Keep this password in this workspace's private storage. It is used only to send your
-          emails, and is never shown again.
-        </span>
-      </label>
+      {riskNeeded && (
+        <label className="flex items-start gap-2 text-label text-ink-300" data-consent>
+          <input
+            type="checkbox"
+            checked={consent}
+            onChange={(e) => setConsent(e.target.checked)}
+            disabled={pending}
+            className="mt-0.5"
+          />
+          <span>
+            This workspace can't keep the password apart from agents running under the same
+            system account, so they could read it. I accept storing it here.
+          </span>
+        </label>
+      )}
       {error && (
         <p className="text-label text-fail break-words" role="alert">
           {error}

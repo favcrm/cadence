@@ -107,7 +107,11 @@ impl SmtpInternal {
                 "smtp_failed",
                 "The mail server could not be verified.",
             )),
-            Reply::Failed { code, message, .. } => Err(Error::invalid(error_code(&code), message)),
+            Reply::Failed {
+                code,
+                step,
+                message,
+            } => Err(Error::invalid(error_code(&code, &step), message)),
             Reply::Unknown(message) => Err(Error::invalid("smtp_unknown", message)),
         }
     }
@@ -222,7 +226,7 @@ fn transport_failure(error: &ureq::Error) -> Reply {
 
 /// The stable wire code the board maps to its own safe wording. Anything
 /// the relay sends outside the contract's list collapses to one code.
-fn error_code(code: &str) -> &'static str {
+fn error_code(code: &str, step: &str) -> &'static str {
     match code {
         "auth" => "smtp_auth",
         "tls" => "smtp_tls",
@@ -231,7 +235,10 @@ fn error_code(code: &str) -> &'static str {
         "private_host" => "smtp_private_host",
         "port_not_allowed" => "smtp_port",
         "timeout" => "smtp_timeout",
-        "rejected" => "smtp_rate",
+        // Only the per-company cap at validate is a rate limit; the same
+        // code at ehlo/mail/rcpt is the mail server refusing.
+        "rejected" if step == "validate" => "smtp_rate",
+        "rejected" => "smtp_refused",
         "not_provisioned" => "smtp_not_provisioned",
         "invalid" => "smtp_invalid",
         "unreachable" => "smtp_unreachable",
@@ -252,7 +259,12 @@ pub fn plain_message(code: &str, step: &str) -> &'static str {
         ("timeout", _) => "The mail server took too long to answer. Try again.",
         ("recipient", _) => "The mail server refused this recipient address.",
         ("data", _) => "The mail server refused the message.",
-        ("rejected", _) => "Too many emails were sent in a short time. Wait a little and try again.",
+        ("rejected", "validate") => {
+            "Too many emails were sent in a short time. Wait a little and try again."
+        }
+        ("rejected", _) => {
+            "Your mail server refused the message: check the From address is allowed on this account."
+        }
         ("not_provisioned", _) => "Email sending isn't set up for this workspace yet.",
         ("invalid", _) => "The email settings are not valid. Check each field.",
         (_, "auth") => "Couldn't sign in: check the app password (and the username).",
@@ -274,7 +286,8 @@ pub fn wire_message(wire_code: &str) -> Option<&'static str> {
         "smtp_private_host" => "private_host",
         "smtp_port" => "port_not_allowed",
         "smtp_timeout" => "timeout",
-        "smtp_rate" => "rejected",
+        "smtp_rate" => return Some(plain_message("rejected", "validate")),
+        "smtp_refused" => return Some(plain_message("rejected", "mail")),
         "smtp_not_provisioned" => "not_provisioned",
         "smtp_invalid" => "invalid",
         "smtp_unreachable" => "unreachable",
@@ -340,7 +353,10 @@ fn classify_failure(code: &str, step: &str, message: String) -> SmtpOutcome {
         (_, "data") => SmtpOutcome::Uncertain { message },
         ("recipient", _) => SmtpOutcome::Rejected { code: 550, message },
         ("data", _) => SmtpOutcome::Rejected { code: 554, message },
-        ("rejected", _) => SmtpOutcome::Deferred { code: 429, message },
+        // The per-company cap is the only retry-later `rejected`.
+        ("rejected", "validate") => SmtpOutcome::Deferred { code: 429, message },
+        // At ehlo/mail/rcpt the mail server refused: not a rate limit.
+        ("rejected", _) => SmtpOutcome::Rejected { code: 550, message },
         (
             "invalid" | "port_not_allowed" | "private_host" | "dns" | "connect" | "tls" | "auth"
             | "timeout" | "not_provisioned" | "unreachable",
@@ -383,6 +399,29 @@ mod tests {
                 "code {code} at step data must be Uncertain"
             );
         }
+    }
+
+    #[test]
+    fn rejected_is_a_rate_limit_only_at_validate() {
+        assert!(matches!(
+            classify_failure("rejected", "validate", String::new()),
+            SmtpOutcome::Deferred { .. }
+        ));
+        for step in ["ehlo", "mail", "rcpt", ""] {
+            assert!(
+                matches!(
+                    classify_failure("rejected", step, String::new()),
+                    SmtpOutcome::Rejected { code: 550, .. }
+                ),
+                "rejected at {step} is a server refusal"
+            );
+        }
+        assert_eq!(error_code("rejected", "validate"), "smtp_rate");
+        assert_eq!(error_code("rejected", "mail"), "smtp_refused");
+        assert!(wire_message("smtp_refused")
+            .unwrap()
+            .contains("refused the message"));
+        assert!(wire_message("smtp_rate").unwrap().contains("Too many"));
     }
 
     #[test]

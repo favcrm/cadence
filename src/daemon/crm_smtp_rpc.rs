@@ -359,8 +359,33 @@ impl Shared {
                         "SMTP sender binding is revoked; bind it again instead",
                     ));
                 }
-                let (transport, projection) =
-                    self.crm_smtp_authority(&link.connection_id, link.auth_revision)?;
+                // CAD-1126: after a rotate (hosted Replace) the link is
+                // pinned to the old credential revision. Report it as
+                // `stale`, with its link revision and the sender the new
+                // custody projects, so the board can rebind in place
+                // instead of dead-ending. Sending stays refused: the
+                // authority check above still gates every send.
+                let (transport_kind, projection, state) =
+                    match self.crm_smtp_authority(&link.connection_id, link.auth_revision) {
+                        Ok((transport, projection)) => {
+                            (transport.kind(), projection, link.state.clone())
+                        }
+                        Err(refusal) => {
+                            let stale = self
+                                .store
+                                .connection_credential(&link.connection_id)?
+                                .filter(|record| {
+                                    record.exchange == crate::platform::smtp::ENROLLMENT_SHAPE
+                                        && i64::try_from(record.credential_revision)
+                                            .is_ok_and(|rev| rev != link.auth_revision)
+                                })
+                                .and_then(|record| self.smtp_projection_typed(&record).ok());
+                            match stale {
+                                Some(projection) => ("smtp", projection, "stale".to_string()),
+                                None => return Err(refusal),
+                            }
+                        }
+                    };
                 let row = self
                     .connection_list_locked()?
                     .into_iter()
@@ -373,11 +398,11 @@ impl Shared {
                         "connection_id": link.connection_id,
                         "auth_revision": link.auth_revision,
                         "link_revision": link.link_revision,
-                        "state": link.state,
+                        "state": state,
                         "digest": link.digest,
                         "sender": {"name": projection.sender_name, "address": projection.sender},
                         "transport": {"host": projection.host, "port": projection.port, "tls_mode": projection.tls_mode, "username": projection.username},
-                        "transport_kind": transport.kind(),
+                        "transport_kind": transport_kind,
                         "connection": row,
                     },
                 }))

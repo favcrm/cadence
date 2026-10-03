@@ -177,7 +177,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
   // CAD-1126: connect (or replace) the tenant's own SMTP and bind it as
   // the CRM sender in one step. A refusal from the verify step throws to
   // the form, which shows plain words; a bind failure shows here.
-  const connectEmail = async (d: ConnectDetails) => {
+  const connectEmail = async (d: ConnectDetails, acceptRisk: boolean) => {
     const fields = {
       host: d.host,
       port: d.port,
@@ -186,7 +186,9 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
       secret: d.password,
       sender: d.sender,
       ...(d.sender_name ? { sender_name: d.sender_name } : {}),
-      accept_same_uid_risk: true,
+      // Only after the daemon refused with custody_unprotected and the
+      // operator ticked the honest consent (CAD-1013 pattern).
+      ...(acceptRisk ? { accept_same_uid_risk: true } : {}),
     };
     const out = emailRow
       ? await api.connectionRotate(emailRow.id, fields)
@@ -295,7 +297,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
           <Link href="/settings/connections">Settings → Connections</Link>.
         </p>
       )}
-      {canWrite && usable.length > 0 && !(hostedSmtp && usable.length === 1 && emailRow) && (
+      {canWrite && usable.length > 0 && !(hostedSmtp && usable.length === 1 && emailRow && live !== null) && (
         <div className="crm-field-row">
           <div className="crm-field">
             <label className="text-label text-ink-300" htmlFor="email-sender">

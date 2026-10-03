@@ -63,10 +63,12 @@ const WORDS: Record<string, string> = {
   smtp_not_provisioned: "Email sending isn't set up for this workspace yet.",
   smtp_invalid: "Some details aren't valid. Check each field.",
   smtp_unreachable: "The mail relay isn't reachable right now. Try again in a moment.",
+  smtp_refused:
+    "Your mail server refused the message: check the From address is allowed on this account.",
   smtp_failed: "The mail server refused the connection. Check the details and try again.",
   smtp_unknown: "The mail server refused the connection. Check the details and try again.",
   custody_unprotected:
-    "This workspace couldn't store the password safely without your consent. Tick the box and try again.",
+    "This workspace can't keep the password apart from agents on the same system account. Tick the box below to store it anyway, then connect again.",
 };
 
 /** Plain words for a refusal; never the raw message, which can echo input. */
