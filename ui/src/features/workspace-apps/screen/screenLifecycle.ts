@@ -1,4 +1,4 @@
-import { parseChild, parseInit, shapeFor, type ScreenPush } from "./screenProtocol";
+import { parseChild, parseInit, PUBLISH_INTENTS_V1, shapeFor, type ChildToHost, type ScreenPush } from "./screenProtocol";
 
 export type MountReceipt = { mount: string; bridge_nonce: string; generation: number; tag: string };
 export function parseMount(value: unknown, tag: string): MountReceipt | null {
@@ -12,18 +12,25 @@ export function parseMount(value: unknown, tag: string): MountReceipt | null {
   return v as MountReceipt;
 }
 
-/** Each instance owns one frame generation. Teardown precedes replacement. */
-export class ScreenChannel {
-  private port: MessagePort | null = null;
-  private ready = false;
-  /** Set once, by the child's `ready`: whether it opted into publish-intents.v1. */
-  private intents = false;
-  private closed = false;
+/**
+ * The closed receive side every mounted frame shares (CAD-1006): source,
+ * opaque-origin, single-init, tag/nonce/generation and the closed child
+ * vocabulary are checked here and nowhere else. A subclass decides only
+ * what a child's `ready` opts into and what is pushed after it. Teardown
+ * precedes replacement.
+ */
+export abstract class FrameChannel {
+  protected port: MessagePort | null = null;
+  protected ready = false;
+  protected closed = false;
   private initialized = false;
   private loads = 0;
-  constructor(private source: Window, private receipt: MountReceipt,
-    private projection: ScreenPush, private removeFrame: () => void,
-    private failed: () => void, private onReady: () => void) {}
+  constructor(protected source: Window, protected receipt: MountReceipt,
+    protected removeFrame: () => void, protected failed: () => void, private onReady: () => void) {}
+  /** The child's one `ready`: record its opt-in, or refuse it (return false closes). */
+  protected abstract accept(ready: Extract<ChildToHost, { op: "ready" }>): boolean;
+  /** Send the negotiated shape (called once after `ready`). */
+  protected abstract send(): void;
   receive(event: Pick<MessageEvent, "origin" | "source" | "data" | "ports">): void {
     if (this.closed || event.source !== this.source) return;
     if (event.origin !== "null") {
@@ -41,9 +48,8 @@ export class ScreenChannel {
       const child = parseChild(event.data);
       if (!child || child.op === "state" && !this.ready) { this.close(true); return; }
       if (child.op === "ready") {
-        if (this.ready) { this.close(true); return; }
+        if (this.ready || !this.accept(child)) { this.close(true); return; }
         this.ready = true;
-        this.intents = child.accepts !== undefined;
         this.send();
         if (!this.closed) this.onReady();
       }
@@ -51,6 +57,29 @@ export class ScreenChannel {
     };
     this.port.onmessageerror = () => this.close(true);
     this.port.start();
+  }
+  load(): void { if (++this.loads > 1) this.close(true); }
+  close(report = false): void {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.port) { this.port.onmessage = null; this.port.onmessageerror = null; this.port.close(); }
+    this.port = null;
+    this.removeFrame();
+    if (report) this.failed();
+  }
+}
+
+/** Each instance owns one frame generation. Teardown precedes replacement. */
+export class ScreenChannel extends FrameChannel {
+  /** Set once, by the child's `ready`: whether it opted into publish-intents.v1. */
+  private intents = false;
+  constructor(source: Window, receipt: MountReceipt, private projection: ScreenPush,
+    removeFrame: () => void, failed: () => void, onReady: () => void) {
+    super(source, receipt, removeFrame, failed, onReady);
+  }
+  protected accept(ready: Extract<ChildToHost, { op: "ready" }>): boolean {
+    this.intents = ready.accepts?.[0] === PUBLISH_INTENTS_V1;
+    return true;
   }
   update(projection: ScreenPush): void {
     if (this.closed) return;
@@ -62,18 +91,9 @@ export class ScreenChannel {
     if (this.ready) this.send();
   }
   /** Send the negotiated shape, or close when it cannot be sent within bounds. */
-  private send(): void {
+  protected send(): void {
     const push = shapeFor(this.projection, this.intents);
     if (!push) { this.close(true); return; }
     this.port?.postMessage(push);
-  }
-  load(): void { if (++this.loads > 1) this.close(true); }
-  close(report = false): void {
-    if (this.closed) return;
-    this.closed = true;
-    if (this.port) { this.port.onmessage = null; this.port.onmessageerror = null; this.port.close(); }
-    this.port = null;
-    this.removeFrame();
-    if (report) this.failed();
   }
 }

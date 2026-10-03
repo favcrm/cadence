@@ -60,11 +60,22 @@ export function parseConversationList(raw: Record<string, unknown>): Conversatio
   return rows.map(parseConversation).filter((c): c is Conversation => c !== null);
 }
 
-/** Picker label: General, a campaign, or a fresh conversation. */
-export function conversationLabel(c: Conversation, index: number): string {
+/** Picker label: General, a server title, the label the app's descriptor
+ *  gives its subject kind (`campaign:<id>` is kind `campaign`), `Other` for a
+ *  subject kind the descriptor does not declare, or a fresh conversation.
+ *  The daemon's verified subject rules stay the authority; the descriptor
+ *  only labels what the server returned. */
+export function conversationLabel(
+  c: Conversation,
+  index: number,
+  subjects: readonly { kind: string; label: string }[] = [],
+): string {
   if (c.isGeneral) return "General";
   if (c.title) return c.title;
-  if (c.subject?.startsWith("campaign:")) return "Campaign";
+  if (c.subject !== null) {
+    const kind = c.subject.split(":")[0];
+    return subjects.find((s) => s.kind === kind)?.label ?? "Other";
+  }
   return `Conversation ${index}`;
 }
 

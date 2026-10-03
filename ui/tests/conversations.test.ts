@@ -1,5 +1,6 @@
 /** CAD-1098 S3: per-app assistant conversations in the shell chat. */
 declare function require(name: string): any;
+declare const process: { cwd(): string };
 export {};
 function assert(value: unknown, why: string): asserts value {
   if (!value) throw new Error(why);
@@ -57,6 +58,11 @@ const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { sta
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
   const method = init?.method ?? "GET";
+  // The CRM package's own descriptor, served pinned to the install's digest.
+  if (url.pathname === "/api/app-installations/install-crm/chat-descriptor") {
+    return json({ descriptor: JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "workspace-apps", "crm", "app-chat.json"), "utf8")), digest: "d", app: "crm" });
+  }
+  if (url.pathname.endsWith("/chat-descriptor")) return json({ error: "no chat descriptor" }, 404);
   const m = url.pathname.match(/^\/api\/app-installations\/([^/]+)(\/contexts|\/conversations)?$/);
   if (m && m[2] === "/conversations") {
     if (method === "POST") {
