@@ -13,6 +13,7 @@ pub mod agent_uid;
 pub mod audit;
 pub mod backup;
 pub mod board_identity;
+pub mod cli_actor;
 pub mod client;
 pub mod confine;
 pub mod continuity;
