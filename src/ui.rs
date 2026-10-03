@@ -1079,10 +1079,15 @@ pub(crate) fn board_identity(proc_root: &Path, pid: i32, state_dir: &Path) -> Bo
             .find_map(|l| l.strip_prefix(name))
             .map(str::trim)
     };
-    let (Some(tgid), Some(state)) = (field("Tgid:"), field("State:")) else {
+    let real_uid = field("Uid:").and_then(|u| u.split_whitespace().next());
+    let (Some(tgid), Some(state), Some(uid)) = (field("Tgid:"), field("State:"), real_uid) else {
         return BoardPid::Unknown;
     };
-    if tgid != pid.to_string() || state.starts_with('Z') {
+    // The board runs as whoever started it — the owner of this state
+    // dir. Never the exe path: an update's recovery stops the board the
+    // previous release binary still runs.
+    let me = unsafe { libc::getuid() }.to_string();
+    if tgid != pid.to_string() || state.starts_with('Z') || uid != me {
         return BoardPid::NotBoard;
     }
     let raw = match proc_read(&dir, "cmdline") {
@@ -2468,6 +2473,12 @@ mod pidfile_tests {
     use super::{board_argv_state_dir, board_identity, pid_file, read_pid_in, same_dir, BoardPid};
     use std::path::Path;
 
+    /// A live leader's `status`, owned by this test's uid.
+    fn status(tgid: i32) -> String {
+        let uid = unsafe { libc::getuid() };
+        format!("State:\tS (sleeping)\nTgid:\t{tgid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+    }
+
     /// A fake `/proc/<pid>` with the given `status` and argv.
     fn fake_proc(root: &Path, pid: i32, status: &str, argv: &[&str]) {
         let dir = root.join(pid.to_string());
@@ -2485,10 +2496,10 @@ mod pidfile_tests {
         let (root, st) = (root.path(), state.path());
         let s = st.to_str().unwrap();
         let board = ["cadence", "--state-dir", s, "ui", "run"];
-        fake_proc(root, 40, "State:\tS\nTgid:\t40\n", &board);
+        fake_proc(root, 40, &status(40), &board);
         assert_eq!(board_identity(root, 40, st), BoardPid::Board);
         assert_eq!(board_identity(root, 41, st), BoardPid::NotBoard, "no entry");
-        fake_proc(root, 42, "State:\tS\nTgid:\t40\n", &board);
+        fake_proc(root, 42, &status(40), &board);
         assert_eq!(board_identity(root, 42, st), BoardPid::NotBoard, "a thread");
         fake_proc(root, 43, "State:\tS\n", &board);
         assert_eq!(
@@ -2517,12 +2528,12 @@ mod pidfile_tests {
         let (root, st) = (root.path(), base.path().join("st"));
         std::fs::create_dir(&st).unwrap();
         let board = ["cadence", "--state-dir", "st", "ui", "run"];
-        fake_proc(root, 50, "State:\tS\nTgid:\t50\n", &board);
+        fake_proc(root, 50, &status(50), &board);
         // No cwd entry: the process is gone.
         assert_eq!(board_identity(root, 50, &st), BoardPid::NotBoard);
         std::os::unix::fs::symlink(base.path(), root.join("50/cwd")).unwrap();
         assert_eq!(board_identity(root, 50, &st), BoardPid::Board);
-        fake_proc(root, 51, "State:\tS\nTgid:\t51\n", &board);
+        fake_proc(root, 51, &status(51), &board);
         std::os::unix::fs::symlink(root, root.join("51/cwd")).unwrap();
         assert_eq!(
             board_identity(root, 51, &st),
@@ -2530,7 +2541,7 @@ mod pidfile_tests {
             "other cwd"
         );
         // An unreadable cwd link (not a link: EINVAL) is unproven.
-        fake_proc(root, 52, "State:\tS\nTgid:\t52\n", &board);
+        fake_proc(root, 52, &status(52), &board);
         std::fs::write(root.join("52/cwd"), "").unwrap();
         assert_eq!(board_identity(root, 52, &st), BoardPid::Unknown);
     }
