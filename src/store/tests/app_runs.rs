@@ -422,12 +422,14 @@ fn cad631_operator_reconcile_cannot_create_material() {
     .unwrap();
     let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
     let writer = start_local_step(&s, &dispatched, 0, "writer");
-    s.conn()
-        .execute(
+    s.fixture_write(|c| {
+        c.execute(
             "UPDATE messages SET state='unknown' WHERE id=?",
             [&writer.id],
         )
-        .unwrap();
+        .map_err(Into::into)
+    })
+    .unwrap();
     s.reconcile(
         &writer.id,
         "completed",
@@ -484,12 +486,14 @@ fn cad631_snapshot_identity_replacement_and_wrong_bundle_cannot_claim() {
     assert!(s
         .take_queued_app_proven("writer", Some((message, "sha256:modified")))
         .is_err());
-    s.conn()
-        .execute(
+    s.fixture_write(|c| {
+        c.execute(
             "UPDATE agents SET created=created+1 WHERE alias='writer'",
             [],
         )
-        .unwrap();
+        .map_err(Into::into)
+    })
+    .unwrap();
     assert!(s
         .take_queued_app_proven("writer", Some((message, "sha256:bundle")))
         .is_err());
@@ -651,9 +655,11 @@ fn cad631_authority_loss_invalidates_once_and_keeps_material_receipts() {
 #[test]
 fn cad631_pm_in_owner_group_is_not_an_execution_worker() {
     let (_dir, s, run) = runtime_fixture();
-    s.conn()
-        .execute("UPDATE agents SET role='pm' WHERE alias='writer'", [])
-        .unwrap();
+    s.fixture_write(|c| {
+        c.execute("UPDATE agents SET role='pm' WHERE alias='writer'", [])
+            .map_err(Into::into)
+    })
+    .unwrap();
     let workflow: crate::store::app_runs::LocalWorkflow =
         serde_json::from_value(run["snapshot"]["workflow"].clone()).unwrap();
     let inputs = std::collections::BTreeMap::new();
@@ -708,12 +714,14 @@ fn cad631_public_app_message_projection_hides_provider_material() {
     .unwrap();
     let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
     let message = start_local_step(&s, &dispatched, 0, "writer");
-    s.conn()
-        .execute(
+    s.fixture_write(|c| {
+        c.execute(
             "UPDATE messages SET error='private-provider-material-sentinel' WHERE id=?",
             [&message.id],
         )
-        .unwrap();
+        .map_err(Into::into)
+    })
+    .unwrap();
     let projection = s.message(&message.id).unwrap().unwrap().to_json();
     assert!(!projection
         .to_string()
@@ -730,12 +738,14 @@ fn cad631_pty_team_is_explicitly_unsupported_and_transcript_history_is_private()
         s.app_material_endpoint("writer").unwrap(),
         "terminal state must not expose retained transcript"
     );
-    s.conn()
-        .execute(
+    s.fixture_write(|c| {
+        c.execute(
             "UPDATE agents SET endpoint_kind='pty' WHERE alias='writer'",
             [],
         )
-        .unwrap();
+        .map_err(Into::into)
+    })
+    .unwrap();
     let workflow: crate::store::app_runs::LocalWorkflow =
         serde_json::from_value(run["snapshot"]["workflow"].clone()).unwrap();
     let inputs = std::collections::BTreeMap::new();
@@ -871,12 +881,14 @@ fn cad631_operator_audit_survives_revoke_while_worker_fetch_and_corruption_refus
             "sha256:bundle"
         )
         .is_err());
-    s.conn()
-        .execute(
+    s.fixture_write(|c| {
+        c.execute(
             "UPDATE app_run_artifacts SET content=? WHERE id=?",
             params![b"corrupted material".as_slice(), artifact],
         )
-        .unwrap();
+        .map_err(Into::into)
+    })
+    .unwrap();
     assert!(s.app_artifact_for_operator(artifact).is_err());
 }
 
@@ -1088,12 +1100,14 @@ fn cad778_frozen_run_with_float_identity_approves() {
         ("writer", 1790648372.680178f64),
         ("reviewer", 1790647563.6348941f64),
     ] {
-        s.conn()
-            .execute(
+        s.fixture_write(|c| {
+            c.execute(
                 "UPDATE agents SET created=?1, updated=?1 WHERE alias=?2",
                 rusqlite::params![created, alias],
             )
-            .unwrap();
+            .map_err(Into::into)
+        })
+        .unwrap();
     }
     let text="---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
     let inputs = std::collections::BTreeMap::new();
@@ -1130,12 +1144,14 @@ fn cad778_tampered_snapshot_still_refused() {
     let id = run["id"].as_str().unwrap();
     let mut snapshot: Value = run["snapshot"].clone();
     snapshot["inputs"] = json!({"injected": "forged"});
-    s.conn()
-        .execute(
+    s.fixture_write(|c| {
+        c.execute(
             "UPDATE app_runs SET snapshot=?1 WHERE id=?2",
             rusqlite::params![snapshot.to_string(), id],
         )
-        .unwrap();
+        .map_err(Into::into)
+    })
+    .unwrap();
     assert!(s
         .app_run_decide(
             id,

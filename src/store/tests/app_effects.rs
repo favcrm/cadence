@@ -112,11 +112,13 @@ fn child_fixture(s: &Store) -> (crate::store::EffectRow, Value) {
         .unwrap()
         .any(|column| column.unwrap() == "authorization_kind");
     if !present {
-        s.conn().execute_batch("ALTER TABLE platform_effects ADD COLUMN authorization_kind TEXT NOT NULL DEFAULT 'agent_grant';").unwrap();
+        s.fixture_write(|c| c.execute_batch("ALTER TABLE platform_effects ADD COLUMN authorization_kind TEXT NOT NULL DEFAULT 'agent_grant';").map_err(Into::into)).unwrap();
     }
-    s.conn()
-        .execute_batch(crate::store::app_effects::SCHEMA)
-        .unwrap();
+    s.fixture_write(|c| {
+        c.execute_batch(crate::store::app_effects::SCHEMA)
+            .map_err(Into::into)
+    })
+    .unwrap();
     let body = "server-owned body\n";
     let artifact_digest = crate::store::app_runs::artifact_digest(body.as_bytes());
     let mut provenance = json!({"install_id":"install-a","context_id":null,"run_id":"run-a",
@@ -215,12 +217,14 @@ fn cad692_app_child_claim_is_exact_cas_and_readonly_permit_requires_integrity() 
     assert_eq!(permit.platform, "local");
     assert_eq!(permit.account, "local");
     assert_eq!(permit.tool, "publish_app_text");
-    s.conn()
-        .execute(
+    s.fixture_write(|c| {
+        c.execute(
             "UPDATE platform_effects SET input='{}' WHERE effect_id=?",
             [&row.effect_id],
         )
-        .unwrap();
+        .map_err(Into::into)
+    })
+    .unwrap();
     assert!(crate::store::app_effects::read_execution_permit(&db, &row.effect_id).is_err());
 }
 
@@ -229,21 +233,25 @@ fn cad692_legacy_or_missing_child_cannot_supply_app_execution_permit() {
     let (dir, s) = store();
     let (row, authority) = child_fixture(&s);
     s.app_effect_stage(&row, &authority).unwrap();
-    s.conn().execute("UPDATE platform_effects SET state='executing',authorization_kind='agent_grant' WHERE effect_id=?",[&row.effect_id]).unwrap();
+    s.fixture_write(|c| c.execute("UPDATE platform_effects SET state='executing',authorization_kind='agent_grant' WHERE effect_id=?",[&row.effect_id]).map_err(Into::into)).unwrap();
     let db = dir.path().join("t.sqlite3");
     assert!(crate::store::app_effects::read_execution_permit(&db, &row.effect_id).is_err());
-    s.conn()
-        .execute(
+    s.fixture_write(|c| {
+        c.execute(
             "UPDATE platform_effects SET authorization_kind='app_artifact' WHERE effect_id=?",
             [&row.effect_id],
         )
-        .unwrap();
-    s.conn()
-        .execute(
+        .map_err(Into::into)
+    })
+    .unwrap();
+    s.fixture_write(|c| {
+        c.execute(
             "DELETE FROM app_effect_authorizations WHERE effect_id=?",
             [&row.effect_id],
         )
-        .unwrap();
+        .map_err(Into::into)
+    })
+    .unwrap();
     assert!(crate::store::app_effects::read_execution_permit(&db, &row.effect_id).is_err());
 }
 

@@ -55,12 +55,14 @@ fn cad690_context_receipt_is_rechecked_in_create_and_execution_transactions() {
         .unwrap();
     // Corrupt only the revision fixture, deliberately bypassing proactive
     // invalidation, so this assertion isolates the current-receipt gate.
-    s.conn()
-        .execute(
+    s.fixture_write(|c| {
+        c.execute(
             "UPDATE app_contexts SET revision=revision+1 WHERE id=?",
             [id],
         )
-        .unwrap();
+        .map_err(Into::into)
+    })
+    .unwrap();
     assert!(
         s.app_run_create_with_context(request("stale-create"), Some(&proof))
             .is_err(),
@@ -97,8 +99,8 @@ fn cad690_context_migration_is_atomic_and_preserves_legacy_snapshots_and_authori
     )
     .unwrap();
     let before = s.app_run_show(run["id"].as_str().unwrap()).unwrap();
-    s.conn().execute_batch("INSERT INTO platform_grants(agent,platform,account,scopes,granted_at,by) VALUES('writer','legacy','account','[\"read\"]',1,'operator'); INSERT INTO platform_effects(effect_id,request,agent,platform,account,tool,input,input_summary,preview,scopes,state,staged_at,updated_at) VALUES('legacy-effect','legacy-request','writer','legacy','account','publish','{}','legacy summary','legacy preview','[\"publish\"]','pending',1,1);").unwrap();
-    s.conn().execute_batch("INSERT INTO platform_credentials(platform,account,scopes,fingerprint,custody,exchange,enrolled_at,by,connection_id,credential_revision) VALUES('legacy','account','[\"read\"]','fingerprint','file','token',1,'operator','conn-legacy',3);").unwrap();
+    s.fixture_write(|c| Ok(c.execute_batch("INSERT INTO platform_grants(agent,platform,account,scopes,granted_at,by) VALUES('writer','legacy','account','[\"read\"]',1,'operator'); INSERT INTO platform_effects(effect_id,request,agent,platform,account,tool,input,input_summary,preview,scopes,state,staged_at,updated_at) VALUES('legacy-effect','legacy-request','writer','legacy','account','publish','{}','legacy summary','legacy preview','[\"publish\"]','pending',1,1);")?)).unwrap();
+    s.fixture_write(|c| Ok(c.execute_batch("INSERT INTO platform_credentials(platform,account,scopes,fingerprint,custody,exchange,enrolled_at,by,connection_id,credential_revision) VALUES('legacy','account','[\"read\"]','fingerprint','file','token',1,'operator','conn-legacy',3);")?)).unwrap();
     let workspace: String = s
         .conn()
         .query_row(

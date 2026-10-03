@@ -995,3 +995,46 @@ fn cad782_nonempty_proposal_list_releases_the_record_lock() {
     let count = listed.expect("nonempty proposal list refused");
     assert_eq!(count, 1, "nonempty proposal list dropped its row");
 }
+
+#[test]
+fn cad1011_integrated_html_text_name_survive_save_reopen_and_stale_cas() {
+    let dir = TempDir::new().unwrap();
+    let store = content_file(&dir, "install-a");
+    let initial = Draft::parse_html("Launch", "", "<p>Welcome</p>")
+        .unwrap()
+        .with_text(Some("Welcome in plain text"))
+        .unwrap()
+        .with_name(Some("Spring launch"))
+        .unwrap();
+    let created = store
+        .app_content_save("ctx-1", "launch-1", None, &initial)
+        .unwrap();
+    assert_eq!(created["content"]["html"], initial.html.as_deref().unwrap());
+    assert_eq!(created["content"]["text_override"], "Welcome in plain text");
+    assert_eq!(created["content"]["name"], "Spring launch");
+    let next = Draft::parse_html("Launch v2", "", "<p>Updated welcome</p>")
+        .unwrap()
+        .with_text(Some("Updated plain text"))
+        .unwrap();
+    let updated = store
+        .app_content_save("ctx-1", "launch-1", Some(1), &next)
+        .unwrap();
+    assert_eq!(updated["content"]["revision"], 2);
+    assert_eq!(updated["content"]["html"], next.html.as_deref().unwrap());
+    assert_eq!(updated["content"]["text_override"], "Updated plain text");
+    assert_eq!(updated["content"]["name"], "Spring launch");
+    drop(store);
+    let reopened = content_file(&dir, "install-a");
+    assert_eq!(
+        reopened.app_content_show("ctx-1", "launch-1").unwrap(),
+        updated
+    );
+    assert!(reopened
+        .app_content_save("ctx-1", "launch-1", Some(1), &initial)
+        .is_err());
+    assert_eq!(
+        reopened.app_content_show("ctx-1", "launch-1").unwrap(),
+        updated,
+        "stale CAS must preserve the reopened content"
+    );
+}

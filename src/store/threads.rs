@@ -33,6 +33,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
+use super::StoreConn;
 use super::{now, take_bytes, Store};
 use crate::error::{Error, Result};
 
@@ -459,17 +460,17 @@ struct Binding<'a> {
 impl Store {
     /// The alias's thread, created on first use. The agent must exist.
     pub fn ensure_thread(&self, alias: &str) -> Result<Thread> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        self.agent_in(&tx, alias)?;
-        let thread = Self::ensure_thread_in(&tx, alias)?;
-        tx.commit()?;
-        Ok(thread)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            self.agent_in(&tx, alias)?;
+            let thread = Self::ensure_thread_in(&tx, alias)?;
+            Ok(thread)
+        })
     }
 
     /// [`Self::ensure_thread`] inside the caller's transaction; the
     /// caller has already proved the agent exists.
-    fn ensure_thread_in(tx: &Connection, alias: &str) -> Result<Thread> {
+    fn ensure_thread_in(tx: &impl super::StoreConn, alias: &str) -> Result<Thread> {
         if let Some(thread) = Self::thread_in(tx, alias)? {
             return Ok(thread);
         }
@@ -499,7 +500,7 @@ impl Store {
     /// id; the alias moves to `archived_alias` and a `system` entry marks
     /// the removal. A later registration under the alias gets a new
     /// thread.
-    pub(super) fn thread_detach_in(tx: &Connection, alias: &str) -> Result<()> {
+    pub(super) fn thread_detach_in(tx: &impl super::StoreConn, alias: &str) -> Result<()> {
         let Some(thread) = Self::thread_in(tx, alias)? else {
             return Self::conversations_detach_in(tx, alias);
         };
@@ -527,7 +528,7 @@ impl Store {
     /// The agent's app conversations go with it: archived (read-only,
     /// kept), their alias moved to `archived_alias` so a reused alias
     /// starts fresh, like the home thread.
-    fn conversations_detach_in(tx: &Connection, alias: &str) -> Result<()> {
+    fn conversations_detach_in(tx: &impl super::StoreConn, alias: &str) -> Result<()> {
         tx.execute(
             "UPDATE threads SET alias=NULL, archived_alias=?1, archived=1
              WHERE alias=?1 AND install_id IS NOT NULL",
@@ -538,11 +539,10 @@ impl Store {
 
     /// The alias's thread, if one was ever started.
     pub fn thread(&self, alias: &str) -> Result<Option<Thread>> {
-        let conn = self.conn();
-        Self::thread_in(&conn, alias)
+        self.read_tx(|conn| Self::thread_in(&conn, alias))
     }
 
-    fn thread_in(conn: &Connection, alias: &str) -> Result<Option<Thread>> {
+    fn thread_in(conn: &impl super::StoreConn, alias: &str) -> Result<Option<Thread>> {
         Ok(conn
             .query_row(
                 "SELECT * FROM threads WHERE alias=? AND install_id IS NULL",
@@ -552,7 +552,7 @@ impl Store {
             .optional()?)
     }
 
-    fn thread_by_id_in(conn: &Connection, id: &str) -> Result<Option<Thread>> {
+    fn thread_by_id_in(conn: &impl super::StoreConn, id: &str) -> Result<Option<Thread>> {
         Ok(conn
             .query_row("SELECT * FROM threads WHERE id=?", [id], row_thread)
             .optional()?)
@@ -589,7 +589,11 @@ impl Store {
     /// text, tools, turn result — follows it (CAD-1098 I2). `alias`
     /// bounds the lookup so a message id of another agent never steers
     /// an entry out of its own threads.
-    fn message_thread_in(conn: &Connection, alias: &str, id: &str) -> Result<Option<Thread>> {
+    fn message_thread_in(
+        conn: &impl super::StoreConn,
+        alias: &str,
+        id: &str,
+    ) -> Result<Option<Thread>> {
         Ok(conn
             .query_row(
                 "SELECT t.* FROM thread_entries e JOIN threads t ON t.id=e.thread_id
@@ -627,13 +631,12 @@ impl Store {
     /// by creation. Reads only; creates nothing.
     pub fn conversation_list(&self, alias: &str, install: &str) -> Result<Vec<Thread>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
+        let rows = conn.query_vec(
             "SELECT * FROM threads WHERE alias=? AND install_id=?
              ORDER BY is_general DESC, created, id LIMIT ?",
+            params![alias, install, CONVERSATION_LIMIT + 1],
+            row_thread,
         )?;
-        let rows = stmt
-            .query_map(params![alias, install, CONVERSATION_LIMIT + 1], row_thread)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -649,29 +652,26 @@ impl Store {
         context: Option<&str>,
         kind: ConversationKind,
     ) -> Result<(Thread, bool)> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        self.agent_in(&tx, alias)?;
-        let out = Self::conversation_make_in(&tx, alias, install, context, kind)?;
-        tx.commit()?;
-        Ok(out)
+        self.write_tx(|tx| {
+            self.agent_in(tx, alias)?;
+            Self::conversation_make_in(tx, alias, install, context, kind)
+        })
     }
 
     /// The app's General conversation, made if absent (idempotent; the
     /// installation is already proven by the caller). The board's list
     /// always shows it, so it exists before the first message.
     pub fn conversation_ensure_general(&self, alias: &str, install: &str) -> Result<Thread> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        self.agent_in(&tx, alias)?;
-        let (thread, _) =
-            Self::conversation_make_in(&tx, alias, install, None, ConversationKind::General)?;
-        tx.commit()?;
-        Ok(thread)
+        self.write_tx(|tx| {
+            self.agent_in(tx, alias)?;
+            let (thread, _) =
+                Self::conversation_make_in(tx, alias, install, None, ConversationKind::General)?;
+            Ok(thread)
+        })
     }
 
     fn conversation_make_in(
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         alias: &str,
         install: &str,
         context: Option<&str>,
@@ -741,7 +741,7 @@ impl Store {
     /// under. No selector means the app's General conversation (made on
     /// first use). Nothing here trusts a client field for scope.
     pub(super) fn conversation_resolve_in(
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         alias: &str,
         install: &str,
         context: Option<&str>,
@@ -774,11 +774,11 @@ impl Store {
     /// Append to the alias's thread. `Ok(None)` when it has none —
     /// agents without a chat are untouched.
     pub fn thread_append(&self, alias: &str, entry: NewEntry) -> Result<Option<i64>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let seq = Self::thread_append_in(&tx, alias, entry)?;
-        tx.commit()?;
-        Ok(seq)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let seq = Self::thread_append_in(&tx, alias, entry)?;
+            Ok(seq)
+        })
     }
 
     /// [`Self::thread_append`] for managed provider output: the entry
@@ -791,25 +791,24 @@ impl Store {
         text: &str,
         payload: Option<Value>,
     ) -> Result<Option<i64>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        // The entry follows the running MESSAGE's conversation, never
-        // "the alias's thread" (CAD-1098 I2): `thread_append_in` resolves
-        // it from the message id; with no running message it is home.
-        let running = Self::running_message_in(&tx, alias)?;
-        let seq = Self::thread_append_in(
-            &tx,
-            alias,
-            NewEntry {
-                role,
-                kind,
-                text,
-                payload,
-                message_id: running.as_deref(),
-            },
-        )?;
-        tx.commit()?;
-        Ok(seq)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            // Follow the running message's conversation (CAD-1098 I2).
+            // With no running message, thread_append_in resolves home.
+            let running = Self::running_message_in(&tx, alias)?;
+            let seq = Self::thread_append_in(
+                &tx,
+                alias,
+                NewEntry {
+                    role,
+                    kind,
+                    text,
+                    payload,
+                    message_id: running.as_deref(),
+                },
+            )?;
+            Ok(seq)
+        })
     }
 
     /// Agent text that the turn result may repeat — Codex `final_answer`
@@ -823,33 +822,33 @@ impl Store {
     /// appended now. A daemon restart drops what is held — the provider
     /// transcript still has it.
     pub fn thread_hold_running(&self, alias: &str, text: &str, payload: Value) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let Some(running) = Self::running_message_in(&tx, alias)? else {
-            Self::thread_append_in(
-                &tx,
-                alias,
-                NewEntry {
-                    role: ROLE_AGENT,
-                    kind: KIND_ASSISTANT_TEXT,
-                    text,
-                    payload: Some(payload),
-                    message_id: None,
-                },
-            )?;
-            tx.commit()?;
-            return Ok(());
-        };
-        self.thread_held
-            .lock()
-            .unwrap()
-            .entry(running)
-            .or_default()
-            .push(HeldText {
-                text: text.to_string(),
-                payload,
-            });
-        Ok(())
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let Some(running) = Self::running_message_in(&tx, alias)? else {
+                Self::thread_append_in(
+                    &tx,
+                    alias,
+                    NewEntry {
+                        role: ROLE_AGENT,
+                        kind: KIND_ASSISTANT_TEXT,
+                        text,
+                        payload: Some(payload),
+                        message_id: None,
+                    },
+                )?;
+                return Ok(());
+            };
+            self.thread_held
+                .lock()
+                .unwrap()
+                .entry(running)
+                .or_default()
+                .push(HeldText {
+                    text: text.to_string(),
+                    payload,
+                });
+            Ok(())
+        })
     }
 
     /// The id of the alias's in-flight turn (`submitting` or `running`),
@@ -862,7 +861,7 @@ impl Store {
     /// The alias's in-flight turn. `submitting` counts: a provider can
     /// persist items before `on_started` marks the message `running`
     /// (Codex emits them right behind the `turn/start` reply).
-    fn running_message_in(tx: &Connection, alias: &str) -> Result<Option<String>> {
+    fn running_message_in(tx: &impl super::StoreConn, alias: &str) -> Result<Option<String>> {
         Ok(tx
             .query_row(
                 "SELECT id FROM messages WHERE alias=?
@@ -877,7 +876,7 @@ impl Store {
     /// Transactional append — used inside enqueue and finish so an entry
     /// lands with the state change it records, or not at all.
     pub(super) fn thread_append_in(
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         alias: &str,
         entry: NewEntry,
     ) -> Result<Option<i64>> {
@@ -911,17 +910,19 @@ impl Store {
     /// Append to one specific thread (a conversation's pack or session
     /// notes — entries tied to no message that must not land in home).
     pub fn thread_append_to(&self, thread_id: &str, entry: NewEntry) -> Result<Option<i64>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let Some(thread) = Self::thread_by_id_in(&tx, thread_id)? else {
-            return Ok(None);
-        };
-        let seq = Self::thread_write_in(&tx, &thread, entry)?;
-        tx.commit()?;
-        Ok(Some(seq))
+        self.write_tx(|tx| {
+            let Some(thread) = Self::thread_by_id_in(tx, thread_id)? else {
+                return Ok(None);
+            };
+            Self::thread_write_in(tx, &thread, entry).map(Some)
+        })
     }
 
-    fn thread_write_in(tx: &Connection, thread: &Thread, entry: NewEntry) -> Result<i64> {
+    fn thread_write_in(
+        tx: &impl super::StoreConn,
+        thread: &Thread,
+        entry: NewEntry,
+    ) -> Result<i64> {
         if !ROLES.contains(&entry.role) {
             return Err(Error::internal(format!(
                 "unknown thread role '{}'",
@@ -961,7 +962,7 @@ impl Store {
     /// The operator/system entry for a freshly queued message.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn thread_note_enqueued(
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         alias: &str,
         sender: &Sender,
         source: &str,
@@ -1014,7 +1015,7 @@ impl Store {
     /// The verified App binding the enqueue note for `id` recorded
     /// (CAD-802), `None` when its payload carries none — the stored
     /// side of the retry's content comparison.
-    pub(super) fn entry_app_in(tx: &Connection, id: &str) -> Result<Option<Value>> {
+    pub(super) fn entry_app_in(tx: &impl super::StoreConn, id: &str) -> Result<Option<Value>> {
         Self::entry_payload_field_in(tx, id, "app")
     }
 
@@ -1078,14 +1079,18 @@ impl Store {
     /// The refs the enqueue note for `id` recorded (CAD-574), `None`
     /// when its payload carries none — the stored side of the retry's
     /// content comparison.
-    pub(super) fn entry_refs_in(tx: &Connection, id: &str) -> Result<Option<Value>> {
+    pub(super) fn entry_refs_in(tx: &impl super::StoreConn, id: &str) -> Result<Option<Value>> {
         Self::entry_payload_field_in(tx, id, "refs")
     }
 
     /// One named field of the enqueue note's payload for `id`, `None`
     /// when the payload carries none — the stored side of the retry's
     /// content comparison.
-    fn entry_payload_field_in(tx: &Connection, id: &str, field: &str) -> Result<Option<Value>> {
+    fn entry_payload_field_in(
+        tx: &impl super::StoreConn,
+        id: &str,
+        field: &str,
+    ) -> Result<Option<Value>> {
         let first: Option<Option<String>> = tx
             .query_row(
                 "SELECT payload FROM thread_entries WHERE message_id=? \
@@ -1107,7 +1112,7 @@ impl Store {
     /// carry lands first, as `assistant_text`.
     pub(super) fn thread_note_finished(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         message: &super::Message,
         status: &str,
         result: &Value,
@@ -1208,19 +1213,18 @@ impl Store {
     }
 
     fn entries_after_in(
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         thread_id: &str,
         after: i64,
         limit: i64,
     ) -> Result<Vec<ThreadEntry>> {
         let limit = limit.clamp(1, PAGE_MAX);
-        let mut stmt = conn.prepare(
+        let rows = conn.query_vec(
             "SELECT * FROM thread_entries WHERE thread_id=? AND seq>?
              ORDER BY seq LIMIT ?",
+            params![thread_id, after, limit],
+            row_entry,
         )?;
-        let rows = stmt
-            .query_map(params![thread_id, after, limit], row_entry)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1253,22 +1257,18 @@ impl Store {
     }
 
     fn entries_before_in(
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         thread_id: &str,
         before: Option<i64>,
         limit: i64,
     ) -> Result<(Vec<ThreadEntry>, bool)> {
         let limit = limit.clamp(1, PAGE_MAX);
-        let mut stmt = conn.prepare(
+        let mut rows = conn.query_vec(
             "SELECT * FROM thread_entries WHERE thread_id=? AND seq<?
              ORDER BY seq DESC LIMIT ?",
+            params![thread_id, before.unwrap_or(i64::MAX), limit + 1],
+            row_entry,
         )?;
-        let mut rows = stmt
-            .query_map(
-                params![thread_id, before.unwrap_or(i64::MAX), limit + 1],
-                row_entry,
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
         let more = rows.len() as i64 > limit;
         rows.truncate(limit as usize);
         rows.reverse();
@@ -1311,7 +1311,7 @@ impl Store {
     }
 
     fn continuity_in(
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         thread_id: &str,
         current: &str,
         limit: i64,
@@ -1327,12 +1327,13 @@ impl Store {
             |r| r.get(0),
         )?;
         let limit = limit.clamp(1, PAGE_MAX);
-        let mut stmt = conn.prepare(&format!(
-            "SELECT e.* FROM thread_entries e WHERE {filter} ORDER BY e.seq DESC LIMIT ?3"
-        ))?;
-        let mut rows = stmt
-            .query_map(params![thread_id, current, limit], row_entry)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows = conn.query_vec(
+            &format!(
+                "SELECT e.* FROM thread_entries e WHERE {filter} ORDER BY e.seq DESC LIMIT ?3"
+            ),
+            params![thread_id, current, limit],
+            row_entry,
+        )?;
         rows.reverse();
         let older = total - rows.len() as i64;
         Ok((rows, older.max(0)))
@@ -1356,7 +1357,7 @@ impl Store {
         Self::compaction_pending_in(&conn, thread_id)
     }
 
-    fn compaction_pending_in(conn: &Connection, thread_id: &str) -> Result<bool> {
+    fn compaction_pending_in(conn: &impl super::StoreConn, thread_id: &str) -> Result<bool> {
         let last = |event: &str| -> Result<i64> {
             Ok(conn.query_row(
                 "SELECT COALESCE(MAX(seq), 0) FROM thread_entries

@@ -82,17 +82,28 @@ pub mod social_publish;
 pub use plans::{current_verdict, Job, Task, Verdict, JOB_STATES};
 mod quota;
 mod schema;
+mod seal;
 pub(crate) use schema::open_read_only;
 pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
+pub use seal::OpenMode;
+// `WriteTxn` is `pub` so the `ShutdownEntriesHook` test seam (a `pub`
+// `ServeOptions` field) can name it — it is an opaque facade to external
+// callers: every method is `pub(crate)` except the read/DML verbs
+// `execute`/`execute_batch`/`query_row`/`query_map` a hook legitimately
+// needs, and there is no `commit`/`rollback`/`Connection` escape.
+pub use seal::WriteTxn;
+pub(crate) use seal::{preflight_writer_guard, require_legacy_writer_tx, StoreConn};
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod writer_census;
 
 /// How long a connection waits on another process's lock before
 /// SQLITE_BUSY (CAD-256). The daemon's writer and every out-of-process
 /// reader (`audit`, `issue retro`, `doctor host`) share one WAL store.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn now() -> f64 {
+pub(crate) fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -102,7 +113,7 @@ fn now() -> f64 {
 pub struct Store {
     conn: Mutex<Connection>,
     /// CAD-538: the hosted-lease write fence — installed by the daemon
-    /// when it runs under `hosted.lease`. `write_conn` refuses once it
+    /// when it runs under `hosted.lease`. `write_tx` refuses once it
     /// trips; reads stay up so a fenced daemon can still be diagnosed.
     write_fence: std::sync::OnceLock<Arc<crate::lease::Fence>>,
     /// Adoption candidates that survived `recover()`'s store-level
@@ -117,21 +128,47 @@ pub struct Store {
     /// until it finishes ([`Store::thread_hold_running`], CAD-320).
     thread_held: Mutex<std::collections::HashMap<String, Vec<threads::HeldText>>>,
     /// Test seam (CAD-694): invoked inside every `shutdown_entries`
-    /// transaction with that attempt's live tx — a test can mutate rows
-    /// or return a synthetic sqlite error to prove rollback and retry.
-    /// Production leaves it unset.
-    pub(crate) shutdown_entries_hook: Option<ShutdownEntriesHook>,
+    /// transaction with that attempt's live [`WriteTxn`] — a test can
+    /// mutate rows or return a synthetic sqlite error to prove rollback
+    /// and retry. The hook is NOT producer authority: it receives only
+    /// the restricted `WriteTxn` facade (no `commit`/`rollback`/`Connection`
+    /// escape). Production leaves it unset; a protected-mode store
+    /// refuses registration (see [`Self::set_shutdown_entries_hook`]).
+    /// Never set directly — registration goes through the setter so the
+    /// protected-mode refusal applies.
+    shutdown_entries_hook: Option<ShutdownEntriesHook>,
+    /// CAD-1011: true only when the store was opened under
+    /// `OpenMode::Protected`. A protected open is unreachable today
+    /// (`preflight` refuses it), so this is always false — recorded so a
+    /// future protected path fails closed: `set_shutdown_entries_hook`
+    /// and `shutdown_entries`' hook execution refuse when set.
+    protected_open: bool,
     /// Test seam (CAD-694): the `shutdown_entries` retry backoff
     /// multiplier in milliseconds — production 50; tests set 0 so the
     /// retry bound is proven without wall-clock sleeps.
     pub(crate) shutdown_backoff_ms: u64,
+    /// CAD-1011: the producer-closure guard state shared with this
+    /// connection's SQLite authorizer — arm level + tx-control phase,
+    /// driven under `conn`'s mutex so a prepared write can never step
+    /// outside the armed window.
+    seal_state: std::sync::Arc<seal::GuardState>,
+    /// CAD-1011: this store's bound identity — the canonicalized database
+    /// path recorded at open. `OwnerMaintenancePermit::database_id` must
+    /// equal it, so a permit issued for one store can never authorize
+    /// owner maintenance on another. `pub(super)` — the owner-op bodies
+    /// in `seal.rs` read it; it is a local identity only, never
+    /// authenticated restore/incarnation provenance.
+    pub(super) db_identity: String,
 }
 
 /// The `shutdown_entries` test seam (CAD-694): called with each
 /// attempt's live transaction; the hook may write through it or return
 /// a synthetic sqlite error, so rollback, retry bound and
 /// retryable-classification are provable without wedging the store.
-pub type ShutdownEntriesHook = Arc<dyn Fn(&Connection) -> rusqlite::Result<()> + Send + Sync>;
+// The test-seam hook type. `WriteTxn` is `pub` but opaque — every
+// method on it is `pub(crate)`, so the public facade exposes nothing
+// usable (no prepare/execute/Connection escape) to an outside caller.
+pub type ShutdownEntriesHook = Arc<dyn Fn(&WriteTxn<'_>) -> rusqlite::Result<()> + Send + Sync>;
 
 /// Terminal task states — verdicts/acceptance/cancellation are closed
 /// to these. `verified` sits between review and done (accept pending).
@@ -163,58 +200,118 @@ impl Store {
     /// The only way to take the connection lock (CAD-256). A panic while
     /// another caller held the guard poisons the mutex; `lock().unwrap()`
     /// would then panic on every later call and take the daemon down
-    /// with it. The connection itself is still sound — an unwinding
-    /// `Transaction` rolls back on drop — so recover the guard, clear
-    /// the poison, roll back anything a raw `BEGIN` left open, and
-    /// record one `store_poisoned` event on the daemon stream.
+    /// with it. Recover the guard, verify rollback, and attempt one
+    /// `store_poisoned` event on the daemon stream. Clear poison only
+    /// after forensic cleanup is verified; an unverified connection
+    /// remains poisoned and unavailable rather than leaking a writer.
+    ///
+    /// The returned guard is DISARMED — the authorizer denies every
+    /// write/DML/DDL/tx-boundary it attempts, so test/fixture read
+    /// probes (`s.conn().query_row`) are safe: this is a read surface,
+    /// never a producer path. Private to `store` — test children under
+    /// `store::tests` still reach it as a private ancestor member.
     fn conn(&self) -> MutexGuard<'_, Connection> {
         match self.conn.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
                 let guard = poisoned.into_inner();
-                self.conn.clear_poison();
-                let rolled_back = !guard.is_autocommit();
-                if rolled_back {
-                    let _ = guard.execute_batch("ROLLBACK");
-                }
+                // CAD-1011: VERIFY the rollback, don't assume it. A panic
+                // can leave the conn inside a tx *or* in autocommit —
+                // `!is_autocommit()` alone is not proof a rollback ran.
+                // `verified_rollback` runs ROLLBACK inside the owner's
+                // TxControl window (the disarmed authorizer would refuse
+                // it) and reports `RolledBack` ONLY once the conn is
+                // actually back in autocommit; a denied/failed ROLLBACK
+                // is `Unverified`, never silently labelled rolled back.
+                let recovery = Self::verified_rollback(&self.seal_state, &guard);
+                let state_label = match recovery {
+                    seal::PoisonRecovery::CleanAutocommit => "clean_autocommit",
+                    seal::PoisonRecovery::RolledBack => "rolled_back",
+                    seal::PoisonRecovery::Unverified => "unverified",
+                };
                 eprintln!(
                     "store: connection lock was poisoned by a panic; recovered \
-                     (rolled_back={rolled_back})"
+                     (state={state_label})"
                 );
-                // CAD-538: a fenced daemon writes nothing — not even the
-                // forensic row for the poison it just recovered.
+                // CAD-538 + CAD-1011: a fenced daemon writes nothing —
+                // not even the forensic row — and a poison whose rollback
+                // is UNVERIFIED records no forensic write at all: the
+                // connection may still be inside a transaction, so a
+                // write now would be attributed to the wrong tx or fail
+                // mislabeled. Only a known-clean conn (already autocommit,
+                // or a verified rollback) gets the forensic row.
+                let clean = !matches!(recovery, seal::PoisonRecovery::Unverified);
+                assert!(
+                    clean,
+                    "store: poison recovery is unverified; connection remains unavailable"
+                );
                 let fenced = self.write_fence.get().is_some_and(|f| f.check().is_some());
                 if !fenced {
-                    if let Err(e) = Self::event(
-                        &guard,
-                        Self::DAEMON_STREAM,
-                        "store_poisoned",
-                        json!({"rolled_back": rolled_back}),
-                    ) {
-                        eprintln!("store: could not record store_poisoned: {e}");
-                    }
+                    // CAD-1011: the forensic recovery event is an
+                    // owner-maintenance write inside ONE held BEGIN
+                    // IMMEDIATE — the closure-latch re-check and the row
+                    // are one critical section, and only an explicit safe
+                    // unsealed outcome (LatchAbsent/LatchOpen) may write.
+                    // A sealed, malformed or unreadable latch records
+                    // nothing — never a false `rolled_back` on a closed
+                    // or unknown store.
+                    let rolled_back = matches!(recovery, seal::PoisonRecovery::RolledBack);
+                    assert!(
+                        Self::forensic_poison_event(
+                            &self.seal_state,
+                            &guard,
+                            rolled_back,
+                            state_label
+                        ),
+                        "store: forensic cleanup is unverified; connection remains unavailable"
+                    );
                 }
+                assert!(
+                    guard.is_autocommit(),
+                    "store: recovery retained an open transaction"
+                );
+                self.conn.clear_poison();
                 guard
             }
         }
     }
 
-    /// CAD-538: the write path's connection — [`Self::conn`] plus the
-    /// hosted-lease fence, checked while holding the lock so the check
-    /// and the write that follows it are serialized against the trip.
+    /// CAD-1011: the ONLY producer write lane. `f` runs inside
+    /// `BEGIN IMMEDIATE` on the held conn mutex after the durable
+    /// closure latch and the hosted-lease fence are both re-checked
+    /// *inside* the lock — closure-check, lease-check and every DML are
+    /// one SQLite writer critical section. A fenced or sealed store
+    /// refuses before `f` runs; a callback error/panic rolls back.
+    ///
     /// `check` covers both halves of lease loss: the detected trip and
     /// the held lease's expiry — a shutdown tail outliving the TTL
     /// cannot commit into a lease a successor already took. The
     /// heartbeat's [`Self::fence_writes`] drains the in-flight writer
     /// before it returns, so no write starts post-trip.
-    fn write_conn(&self) -> Result<MutexGuard<'_, Connection>> {
-        let guard = self.conn();
-        if let Some(reason) = self.write_fence.get().and_then(|f| f.check()) {
-            return Err(Error::rejected(format!(
-                "store write refused — the daemon's hosted lease is lost: {reason}"
-            )));
-        }
-        Ok(guard)
+    pub(crate) fn write_tx<R>(
+        &self,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
+    ) -> Result<R>
+    where
+        R: 'static,
+    {
+        // The fence is re-checked inside the held conn mutex by
+        // `with_sealed_tx_fenced` — a writer fenced while waiting on the
+        // lock is refused before arming or opening the tx.
+        self.with_sealed_tx_fenced(|| self.write_fence.get().and_then(|f| f.check()), f)
+    }
+
+    /// Raw-error variant of [`Self::write_tx`] — the callback returns
+    /// `rusqlite::Result` so callers classify BUSY/constraint at the
+    /// source (e.g. `shutdown_entries`' typed-retry path).
+    pub(crate) fn write_tx_raw<T>(
+        &self,
+        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T>
+    where
+        T: 'static,
+    {
+        self.with_sealed_tx_fenced_raw(|| self.write_fence.get().and_then(|f| f.check()), f)
     }
 
     /// Install the hosted-lease fence — the daemon calls this right
@@ -223,8 +320,32 @@ impl Store {
         let _ = self.write_fence.set(fence);
     }
 
+    /// Register the CAD-694 `shutdown_entries` test hook. An arbitrary
+    /// hook is not producer authority — it runs inside the sealed write
+    /// tx on the restricted `WriteTxn` facade only. Refuses on a
+    /// protected-mode store: a protected db's maintenance authority is
+    /// external, and a daemon-side hook must never stand in for it.
+    ///
+    /// A `Protected` open is unreachable today (`preflight` returns
+    /// `Unknown`), so `protected_open` is always false — the refusal is
+    /// written so the hook path fails closed the day a protected open
+    /// becomes reachable, not because one exists now.
+    pub(crate) fn set_shutdown_entries_hook(
+        &mut self,
+        hook: Option<ShutdownEntriesHook>,
+    ) -> Result<()> {
+        if self.protected_open && hook.is_some() {
+            return Err(Error::rejected(
+                "shutdown_entries hook cannot be registered on a \
+                 protected-mode store",
+            ));
+        }
+        self.shutdown_entries_hook = hook;
+        Ok(())
+    }
+
     /// Trip the fence, then wait out the writer in flight — after this
-    /// returns, every [`Self::write_conn`] observes the trip before its
+    /// returns, every [`Self::write_tx`] observes the trip before its
     /// write begins.
     pub fn fence_writes(&self, reason: impl Into<String>) {
         if let Some(fence) = self.write_fence.get() {
@@ -243,13 +364,6 @@ impl Store {
     /// a foreign reader keeps the file alive, which is `Ok(false)`,
     /// not a failure — the WAL is durable either way, just not merged.
     pub fn checkpoint(&self) -> Result<bool> {
-        let conn = self.conn();
-        let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
-        match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-        }) {
-            Ok((0, log)) => Ok(log >= 0),
-            _ => Ok(false),
-        }
+        self.owner_checkpoint()
     }
 }

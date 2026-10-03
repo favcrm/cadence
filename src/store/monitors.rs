@@ -3,7 +3,7 @@
 use crate::adapter::registry;
 use crate::error::{Error, Result};
 use crate::proto::identifier;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -13,6 +13,7 @@ use super::kickoff::kickoff_body;
 use super::messages::Priority;
 use super::plans::Task;
 use super::quota::automatic_quota_error;
+use super::StoreConn;
 use super::{is_terminal, now, Sender, Store};
 
 /// A daemon-owned supervision registration. `state` is the monitor
@@ -157,7 +158,7 @@ impl MonitorAlert {
 }
 
 impl Store {
-    fn monitor_in(&self, conn: &Connection, id: &str) -> Result<Monitor> {
+    fn monitor_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<Monitor> {
         conn.query_row("SELECT * FROM monitors WHERE id=?", [id], row_monitor)
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
@@ -167,7 +168,7 @@ impl Store {
             })
     }
 
-    fn monitor_alert_in(&self, conn: &Connection, seq: i64) -> Result<MonitorAlert> {
+    fn monitor_alert_in(&self, conn: &impl super::StoreConn, seq: i64) -> Result<MonitorAlert> {
         conn.query_row(
             "SELECT * FROM monitor_alerts WHERE seq=?",
             [seq],
@@ -181,14 +182,16 @@ impl Store {
         })
     }
 
-    fn monitor_coverage_in(&self, conn: &Connection, id: &str) -> Result<Vec<String>> {
-        let mut stmt =
-            conn.prepare("SELECT task_id FROM monitor_tasks WHERE monitor_id=? ORDER BY task_id")?;
-        let rows = stmt.query_map([id], |row| row.get::<_, String>(0))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    fn monitor_coverage_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<Vec<String>> {
+        conn.query_vec(
+            "SELECT task_id FROM monitor_tasks WHERE monitor_id=? ORDER BY task_id",
+            [id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(Into::into)
     }
 
-    fn monitor_counts_in(&self, conn: &Connection, id: &str) -> Result<(i64, i64)> {
+    fn monitor_counts_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<(i64, i64)> {
         let open: i64 = conn.query_row(
             "SELECT COUNT(*) FROM monitor_alerts WHERE monitor_id=? AND state='open'",
             [id],
@@ -203,18 +206,22 @@ impl Store {
     }
 
     pub fn monitor_view(&self, id: &str) -> Result<(Monitor, Vec<String>, i64, i64)> {
-        let conn = self.conn();
-        let monitor = self.monitor_in(&conn, id)?;
-        let coverage = self.monitor_coverage_in(&conn, id)?;
-        let (open, total) = self.monitor_counts_in(&conn, id)?;
-        Ok((monitor, coverage, open, total))
+        self.read_tx(|conn| {
+            let monitor = self.monitor_in(&conn, id)?;
+            let coverage = self.monitor_coverage_in(&conn, id)?;
+            let (open, total) = self.monitor_counts_in(&conn, id)?;
+            Ok((monitor, coverage, open, total))
+        })
     }
 
     pub fn monitors(&self) -> Result<Vec<Monitor>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT * FROM monitors ORDER BY id")?;
-        let rows = stmt.query_map([], row_monitor)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        self.read_tx(|conn| {
+            let stmt_sql = "SELECT * FROM monitors ORDER BY id";
+            let rows = conn
+                .query_vec(stmt_sql, [], row_monitor)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
     }
 
     /// Register a monitor with a fixed task set. The project key must match
@@ -260,103 +267,103 @@ impl Store {
                 "Monitor coverage must not contain duplicate task ids",
             ));
         }
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        for task_id in &unique {
-            Self::refuse_app_task(&tx, task_id)?;
-            let task = self.task_in(&tx, task_id)?;
-            let job = self.job_in(&tx, &task.job_id)?;
-            if job.repo.as_deref() != Some(project) {
-                return Err(Error::rejected(format!(
-                    "Task '{task_id}' is not bound to monitor project '{project}'"
-                )));
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            for task_id in &unique {
+                Self::refuse_app_task(&tx, task_id)?;
+                let task = self.task_in(&tx, task_id)?;
+                let job = self.job_in(&tx, &task.job_id)?;
+                if job.repo.as_deref() != Some(project) {
+                    return Err(Error::rejected(format!(
+                        "Task '{task_id}' is not bound to monitor project '{project}'"
+                    )));
+                }
             }
-        }
-        if let Ok(existing) = self.monitor_in(&tx, id) {
-            let existing_coverage = self.monitor_coverage_in(&tx, id)?;
-            let same = existing.project == project
-                && existing.owner == owner
-                && existing.interval_secs == interval_secs as i64
-                && existing.dispatch_enabled == dispatch_enabled
-                && existing.auto_dispatch_enabled == auto_dispatch_enabled
-                && existing_coverage == unique;
-            if !same {
-                return Err(Error::rejected(format!(
-                    "Monitor '{id}' already exists with different scope or settings"
-                )));
+            if let Ok(existing) = self.monitor_in(&tx, id) {
+                let existing_coverage = self.monitor_coverage_in(&tx, id)?;
+                let same = existing.project == project
+                    && existing.owner == owner
+                    && existing.interval_secs == interval_secs as i64
+                    && existing.dispatch_enabled == dispatch_enabled
+                    && existing.auto_dispatch_enabled == auto_dispatch_enabled
+                    && existing_coverage == unique;
+                if !same {
+                    return Err(Error::rejected(format!(
+                        "Monitor '{id}' already exists with different scope or settings"
+                    )));
+                }
+                return Ok((existing, true));
             }
-            tx.commit()?;
-            return Ok((existing, true));
-        }
-        let t = now();
-        let cursor: i64 =
-            tx.query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| r.get(0))?;
-        tx.execute(
-            "INSERT INTO monitors(
-                id,project,owner,interval_secs,state,next_check_at,event_cursor,
-                delivery_configured,delivery_state,dispatch_enabled,
-                auto_dispatch_enabled,created,updated)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![
-                id,
-                project,
-                owner,
-                interval_secs as i64,
-                "degraded",
-                t,
-                cursor,
-                0i64,
-                "unconfigured",
-                dispatch_enabled as i64,
-                auto_dispatch_enabled as i64,
-                t,
-                t
-            ],
-        )?;
-        for task_id in &unique {
+            let t = now();
+            let cursor: i64 =
+                tx.query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| r.get(0))?;
             tx.execute(
-                "INSERT INTO monitor_tasks(monitor_id,task_id) VALUES(?,?)",
-                params![id, task_id],
+                "INSERT INTO monitors(
+                            id,project,owner,interval_secs,state,next_check_at,event_cursor,
+                            delivery_configured,delivery_state,dispatch_enabled,
+                            auto_dispatch_enabled,created,updated)
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                params![
+                    id,
+                    project,
+                    owner,
+                    interval_secs as i64,
+                    "degraded",
+                    t,
+                    cursor,
+                    0i64,
+                    "unconfigured",
+                    dispatch_enabled as i64,
+                    auto_dispatch_enabled as i64,
+                    t,
+                    t
+                ],
             )?;
-        }
-        Self::event(
-            &tx,
-            Self::DAEMON_STREAM,
-            "monitor_registered",
-            json!({"monitor": id, "project": project,
-                   "owner": owner, "coverage": unique,
-                   "dispatch_enabled": dispatch_enabled,
-                   "auto_dispatch_enabled": auto_dispatch_enabled}),
-        )?;
-        tx.commit()?;
-        let monitor = self.monitor_in(&conn, id)?;
-        Ok((monitor, false))
+            for task_id in &unique {
+                tx.execute(
+                    "INSERT INTO monitor_tasks(monitor_id,task_id) VALUES(?,?)",
+                    params![id, task_id],
+                )?;
+            }
+            Self::event(
+                &tx,
+                Self::DAEMON_STREAM,
+                "monitor_registered",
+                json!({"monitor": id, "project": project,
+                               "owner": owner, "coverage": unique,
+                               "dispatch_enabled": dispatch_enabled,
+                               "auto_dispatch_enabled": auto_dispatch_enabled}),
+            )?;
+            let monitor = self.monitor_in(&conn, id)?;
+            Ok((monitor, false))
+        })
     }
 
     pub fn monitor(&self, id: &str) -> Result<Monitor> {
-        let conn = self.conn();
-        self.monitor_in(&conn, id)
+        self.read_tx(|conn| self.monitor_in(&conn, id))
     }
 
     pub fn monitor_is_covered(&self, id: &str, task_id: &str) -> Result<bool> {
-        let conn = self.conn();
-        self.monitor_in(&conn, id)?;
-        Ok(conn
-            .query_row(
-                "SELECT 1 FROM monitor_tasks WHERE monitor_id=? AND task_id=?",
-                params![id, task_id],
-                |_| Ok(()),
-            )
-            .is_ok())
+        self.read_tx(|conn| {
+            self.monitor_in(&conn, id)?;
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM monitor_tasks WHERE monitor_id=? AND task_id=?",
+                    params![id, task_id],
+                    |_| Ok(()),
+                )
+                .is_ok())
+        })
     }
 
     /// The fixed coverage set for a monitor.  Callers use this list for
     /// reconciliation; membership is always the stored task set and is
     /// never inferred from a project or job name.
     pub fn monitor_tasks(&self, id: &str) -> Result<Vec<String>> {
-        let conn = self.conn();
-        self.monitor_in(&conn, id)?;
-        self.monitor_coverage_in(&conn, id)
+        self.read_tx(|conn| {
+            self.monitor_in(&conn, id)?;
+            self.monitor_coverage_in(&conn, id)
+        })
     }
 
     /// Return an existing live kickoff without minting a new revision. This
@@ -366,34 +373,32 @@ impl Store {
         &self,
         task_id: &str,
     ) -> Result<Option<(Task, String, bool, bool)>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        Self::refuse_app_task(&tx, task_id)?;
-        let task = self.task_in(&tx, task_id)?;
-        if !matches!(task.state.as_str(), "dispatched" | "running") {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let job = self.job_in(&tx, &task.job_id)?;
-        if job.state != "open" {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let assignee = task.assignee.as_deref().ok_or_else(|| {
-            Error::rejected(format!(
-                "Task '{task_id}' has no assignee — cannot reuse its kickoff"
-            ))
-        })?;
-        let worker = self.agent_in(&tx, assignee)?;
-        self.check_group_member(&job, &worker)?;
-        let live_id = task
-            .dispatch_message
-            .as_deref()
-            .and_then(|message| self.message_in(&tx, message).ok().flatten())
-            .filter(|message| !is_terminal(&message.state))
-            .map(|message| message.id);
-        tx.commit()?;
-        Ok(live_id.map(|message| (task, message, true, false)))
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            Self::refuse_app_task(&tx, task_id)?;
+            let task = self.task_in(&tx, task_id)?;
+            if !matches!(task.state.as_str(), "dispatched" | "running") {
+                return Ok(None);
+            }
+            let job = self.job_in(&tx, &task.job_id)?;
+            if job.state != "open" {
+                return Ok(None);
+            }
+            let assignee = task.assignee.as_deref().ok_or_else(|| {
+                Error::rejected(format!(
+                    "Task '{task_id}' has no assignee — cannot reuse its kickoff"
+                ))
+            })?;
+            let worker = self.agent_in(&tx, assignee)?;
+            self.check_group_member(&job, &worker)?;
+            let live_id = task
+                .dispatch_message
+                .as_deref()
+                .and_then(|message| self.message_in(&tx, message).ok().flatten())
+                .filter(|message| !is_terminal(&message.state))
+                .map(|message| message.id);
+            Ok(live_id.map(|message| (task, message, true, false)))
+        })
     }
 
     /// Dispatch a covered task from the automatic monitor path. Every
@@ -413,223 +418,223 @@ impl Store {
         pending_aliases: &HashSet<String>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        Self::refuse_app_task(&tx, task_id)?;
-        let monitor = self.monitor_in(&tx, monitor_id)?;
-        if monitor.state != "active" {
-            return Err(Error::rejected(format!(
-                "Monitor '{monitor_id}' is {} — dispatch requires an active check",
-                monitor.state
-            )));
-        }
-        if !monitor.dispatch_enabled {
-            return Err(Error::rejected(format!(
-                "Monitor '{monitor_id}' has dispatch disabled — enable it explicitly at registration"
-            )));
-        }
-        if !monitor.auto_dispatch_enabled {
-            return Err(Error::rejected(format!(
-                "Monitor '{monitor_id}' has automatic dispatch disabled — opt in explicitly at registration"
-            )));
-        }
-        if !self
-            .monitor_coverage_in(&tx, monitor_id)?
-            .iter()
-            .any(|covered| covered == task_id)
-        {
-            return Err(Error::rejected(format!(
-                "Task '{task_id}' is outside monitor '{monitor_id}' coverage"
-            )));
-        }
+        self.write_tx(|conn| {
 
-        let task = self.task_in(&tx, task_id)?;
-        let job = self.job_in(&tx, &task.job_id)?;
-        if job.state != "open" || job.repo.as_deref() != Some(monitor.project.as_str()) {
-            return Err(Error::rejected(format!(
-                "Task '{task_id}' is not in monitor project '{}' with an open job",
-                monitor.project
-            )));
-        }
-        let assignee = task
-            .assignee
-            .as_deref()
-            .ok_or_else(|| Error::rejected(format!("Task '{task_id}' has no explicit assignee")))?;
-        let worker = self.agent_in(&tx, assignee)?;
-        self.check_group_member(&job, &worker)?;
+                    let tx = &mut *conn;
+                    Self::refuse_app_task(&tx, task_id)?;
+                    let monitor = self.monitor_in(&tx, monitor_id)?;
+                    if monitor.state != "active" {
+                        return Err(Error::rejected(format!(
+                            "Monitor '{monitor_id}' is {} — dispatch requires an active check",
+                            monitor.state
+                        )));
+                    }
+                    if !monitor.dispatch_enabled {
+                        return Err(Error::rejected(format!(
+                            "Monitor '{monitor_id}' has dispatch disabled — enable it explicitly at registration"
+                        )));
+                    }
+                    if !monitor.auto_dispatch_enabled {
+                        return Err(Error::rejected(format!(
+                            "Monitor '{monitor_id}' has automatic dispatch disabled — opt in explicitly at registration"
+                        )));
+                    }
+                    if !self
+                        .monitor_coverage_in(&tx, monitor_id)?
+                        .iter()
+                        .any(|covered| covered == task_id)
+                    {
+                        return Err(Error::rejected(format!(
+                            "Task '{task_id}' is outside monitor '{monitor_id}' coverage"
+                        )));
+                    }
 
-        // A retry of a still-live kickoff is idempotent and must remain
-        // possible even if the worker is now busy or has a pending prompt.
-        if matches!(task.state.as_str(), "dispatched" | "running") {
-            let live_id = task
-                .dispatch_message
-                .as_deref()
-                .and_then(|message| self.message_in(&tx, message).ok().flatten())
-                .filter(|message| !is_terminal(&message.state))
-                .map(|message| message.id);
-            if let Some(live_id) = live_id {
-                self.resolve_monitor_dispatch_blocked_tx(&tx, monitor_id, task_id, now(), by)?;
-                tx.commit()?;
-                return Ok((task, live_id, true, false));
-            }
-            return Err(Error::rejected(format!(
-                "Task '{task_id}' has no live kickoff — only draft or revising tasks are eligible"
-            )));
-        }
-        if !matches!(task.state.as_str(), "draft" | "revising") {
-            return Err(Error::rejected(format!(
-                "Task '{task_id}' is '{}' — only draft or revising tasks are eligible",
-                task.state
-            )));
-        }
-        if task
-            .acceptance
-            .as_deref()
-            .is_none_or(|s| s.trim().is_empty())
-        {
-            return Err(Error::rejected(format!(
-                "Task '{task_id}' has no acceptance criteria — dispatch is refused"
-            )));
-        }
-        if !registry::has_actor(&worker.provider, &worker.endpoint_kind) {
-            return Err(Error::rejected(format!(
-                "Assignee '{assignee}' is a mailbox, not a dispatchable worker"
-            )));
-        }
-        if let Some(reason) = automatic_quota_error(&worker) {
-            return Err(Error::rejected(reason));
-        }
-        // The fake provider is an in-process fixture and deliberately has no
-        // transport endpoint. Real actors publish one when open.
-        let live_endpoint = worker.endpoint.is_some()
-            || (worker.provider == "fake" && worker.endpoint_kind == "fake");
-        if !worker.enabled || !live_endpoint || worker.state != "idle" {
-            return Err(Error::rejected(format!(
-                "Assignee '{assignee}' is not demonstrably idle and live (state {}, endpoint {})",
-                worker.state, live_endpoint
-            )));
-        }
-        if registry::ready_gate(&worker.provider, &worker.endpoint_kind)
-            && worker
-                .params
-                .as_ref()
-                .and_then(|params| params.get("auto_ready"))
-                .and_then(Value::as_str)
-                != Some("verified")
-        {
-            return Err(Error::rejected(format!(
-                "Assignee '{assignee}' requires an explicit readiness claim; automatic dispatch is refused"
-            )));
-        }
-        if pending_aliases.contains(assignee) {
-            return Err(Error::rejected(format!(
-                "Assignee '{assignee}' is waiting on an approval request"
-            )));
-        }
-        let queued: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'",
-            [assignee],
-            |row| row.get(0),
-        )?;
-        if queued > 0 {
-            return Err(Error::rejected(format!(
-                "Assignee '{assignee}' has queued work; dispatch is refused"
-            )));
-        }
-        let unfinished: Option<String> = tx
-            .query_row(
-                "SELECT id FROM tasks
-                 WHERE assignee=? AND id<>?
-                   AND state NOT IN ('verified','done','cancelled','failed')
-                 ORDER BY updated LIMIT 1",
-                params![assignee, task_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if unfinished.is_some() {
-            return Err(Error::rejected(format!(
-                "Assignee '{assignee}' already has unfinished task work"
-            )));
-        }
+                    let task = self.task_in(&tx, task_id)?;
+                    let job = self.job_in(&tx, &task.job_id)?;
+                    if job.state != "open" || job.repo.as_deref() != Some(monitor.project.as_str()) {
+                        return Err(Error::rejected(format!(
+                            "Task '{task_id}' is not in monitor project '{}' with an open job",
+                            monitor.project
+                        )));
+                    }
+                    let assignee = task
+                        .assignee
+                        .as_deref()
+                        .ok_or_else(|| Error::rejected(format!("Task '{task_id}' has no explicit assignee")))?;
+                    let worker = self.agent_in(&tx, assignee)?;
+                    self.check_group_member(&job, &worker)?;
 
-        let revision = task.revision + 1;
-        let attempt: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM messages WHERE task_id=? AND source='job_dispatch'",
-            [task_id],
-            |row| row.get(0),
-        )?;
-        let kickoff = Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            format!("cadence-dispatch:{task_id}:r{revision}:a{attempt}").as_bytes(),
-        )
-        .simple()
-        .to_string();
-        let body = kickoff_body(&job, &task, revision, &kickoff, &worker)?;
-        let reply_to = (assignee != job.pm_alias).then_some(job.pm_alias.as_str());
-        let (duplicate, _state) = self.enqueue_tx(
-            &tx,
-            assignee,
-            &body,
-            reply_to,
-            &kickoff,
-            "job_dispatch",
-            Some(task_id),
-            job.issue_id.as_deref(),
-            task.worktree.as_deref(),
-            &Sender::Unattributed,
-            Priority::Normal,
-            None,
-            None,
-        )?;
-        if duplicate {
-            tx.commit()?;
-            return Ok((task, kickoff, true, false));
-        }
-        let at = now();
-        tx.execute(
-            "UPDATE tasks SET state='dispatched',revision=?,assignee=?,
-             dispatch_message=?,head_sha=NULL,error=NULL,updated=?
-             WHERE id=?",
-            params![revision, assignee, kickoff, at, task_id],
-        )?;
-        Self::event_scoped(
-            &tx,
-            &job.pm_alias,
-            "task_dispatched",
-            json!({"task": task_id, "job": job.id, "assignee": assignee,
-                   "revision": revision, "message": kickoff, "by": by,
-                   "automatic": true}),
-            Some(&job.id),
-            Some(task_id),
-        )?;
-        self.resolve_monitor_dispatch_blocked_tx(&tx, monitor_id, task_id, at, by)?;
-        let dispatched = self.task_in(&tx, task_id)?;
-        tx.commit()?;
-        let behind_dead = worker.endpoint.is_none()
-            && registry::has_actor(&worker.provider, &worker.endpoint_kind);
-        Ok((dispatched, kickoff, false, behind_dead))
+                    // A retry of a still-live kickoff is idempotent and must remain
+                    // possible even if the worker is now busy or has a pending prompt.
+                    if matches!(task.state.as_str(), "dispatched" | "running") {
+                        let live_id = task
+                            .dispatch_message
+                            .as_deref()
+                            .and_then(|message| self.message_in(&tx, message).ok().flatten())
+                            .filter(|message| !is_terminal(&message.state))
+                            .map(|message| message.id);
+                        if let Some(live_id) = live_id {
+                            self.resolve_monitor_dispatch_blocked_tx(&tx, monitor_id, task_id, now(), by)?;
+                            return Ok((task, live_id, true, false));
+                        }
+                        return Err(Error::rejected(format!(
+                            "Task '{task_id}' has no live kickoff — only draft or revising tasks are eligible"
+                        )));
+                    }
+                    if !matches!(task.state.as_str(), "draft" | "revising") {
+                        return Err(Error::rejected(format!(
+                            "Task '{task_id}' is '{}' — only draft or revising tasks are eligible",
+                            task.state
+                        )));
+                    }
+                    if task
+                        .acceptance
+                        .as_deref()
+                        .is_none_or(|s| s.trim().is_empty())
+                    {
+                        return Err(Error::rejected(format!(
+                            "Task '{task_id}' has no acceptance criteria — dispatch is refused"
+                        )));
+                    }
+                    if !registry::has_actor(&worker.provider, &worker.endpoint_kind) {
+                        return Err(Error::rejected(format!(
+                            "Assignee '{assignee}' is a mailbox, not a dispatchable worker"
+                        )));
+                    }
+                    if let Some(reason) = automatic_quota_error(&worker) {
+                        return Err(Error::rejected(reason));
+                    }
+                    // The fake provider is an in-process fixture and deliberately has no
+                    // transport endpoint. Real actors publish one when open.
+                    let live_endpoint = worker.endpoint.is_some()
+                        || (worker.provider == "fake" && worker.endpoint_kind == "fake");
+                    if !worker.enabled || !live_endpoint || worker.state != "idle" {
+                        return Err(Error::rejected(format!(
+                            "Assignee '{assignee}' is not demonstrably idle and live (state {}, endpoint {})",
+                            worker.state, live_endpoint
+                        )));
+                    }
+                    if registry::ready_gate(&worker.provider, &worker.endpoint_kind)
+                        && worker
+                            .params
+                            .as_ref()
+                            .and_then(|params| params.get("auto_ready"))
+                            .and_then(Value::as_str)
+                            != Some("verified")
+                    {
+                        return Err(Error::rejected(format!(
+                            "Assignee '{assignee}' requires an explicit readiness claim; automatic dispatch is refused"
+                        )));
+                    }
+                    if pending_aliases.contains(assignee) {
+                        return Err(Error::rejected(format!(
+                            "Assignee '{assignee}' is waiting on an approval request"
+                        )));
+                    }
+                    let queued: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'",
+                        [assignee],
+                        |row| row.get(0),
+                    )?;
+                    if queued > 0 {
+                        return Err(Error::rejected(format!(
+                            "Assignee '{assignee}' has queued work; dispatch is refused"
+                        )));
+                    }
+                    let unfinished: Option<String> = tx
+                        .query_opt(
+                            "SELECT id FROM tasks
+                             WHERE assignee=? AND id<>?
+                               AND state NOT IN ('verified','done','cancelled','failed')
+                             ORDER BY updated LIMIT 1",
+                            params![assignee, task_id],
+                            |row| row.get(0),
+                        )?;
+                    if unfinished.is_some() {
+                        return Err(Error::rejected(format!(
+                            "Assignee '{assignee}' already has unfinished task work"
+                        )));
+                    }
+
+                    let revision = task.revision + 1;
+                    let attempt: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM messages WHERE task_id=? AND source='job_dispatch'",
+                        [task_id],
+                        |row| row.get(0),
+                    )?;
+                    let kickoff = Uuid::new_v5(
+                        &Uuid::NAMESPACE_URL,
+                        format!("cadence-dispatch:{task_id}:r{revision}:a{attempt}").as_bytes(),
+                    )
+                    .simple()
+                    .to_string();
+                    let body = kickoff_body(&job, &task, revision, &kickoff, &worker)?;
+                    let reply_to = (assignee != job.pm_alias).then_some(job.pm_alias.as_str());
+                    let (duplicate, _state) = self.enqueue_tx(
+                        &tx,
+                        assignee,
+                        &body,
+                        reply_to,
+                        &kickoff,
+                        "job_dispatch",
+                        Some(task_id),
+                        job.issue_id.as_deref(),
+                        task.worktree.as_deref(),
+                        &Sender::Unattributed,
+                        Priority::Normal,
+                        None,
+                        None,
+                    )?;
+                    if duplicate {
+                        return Ok((task, kickoff, true, false));
+                    }
+                    let at = now();
+                    tx.execute(
+                        "UPDATE tasks SET state='dispatched',revision=?,assignee=?,
+                         dispatch_message=?,head_sha=NULL,error=NULL,updated=?
+                         WHERE id=?",
+                        params![revision, assignee, kickoff, at, task_id],
+                    )?;
+                    Self::event_scoped(
+                        &tx,
+                        &job.pm_alias,
+                        "task_dispatched",
+                        json!({"task": task_id, "job": job.id, "assignee": assignee,
+                               "revision": revision, "message": kickoff, "by": by,
+                               "automatic": true}),
+                        Some(&job.id),
+                        Some(task_id),
+                    )?;
+                    self.resolve_monitor_dispatch_blocked_tx(&tx, monitor_id, task_id, at, by)?;
+                    let dispatched = self.task_in(&tx, task_id)?;
+                    let behind_dead = worker.endpoint.is_none()
+                        && registry::has_actor(&worker.provider, &worker.endpoint_kind);
+                    Ok((dispatched, kickoff, false, behind_dead))
+        })
     }
 
     pub fn monitor_heartbeat(&self, id: &str) -> Result<Monitor> {
-        let conn = self.write_conn()?;
-        let t = now();
-        conn.execute(
-            "UPDATE monitors SET heartbeat_at=?,updated=? WHERE id=? AND state<>'off'",
-            params![t, t, id],
-        )?;
-        self.monitor_in(&conn, id)
+        self.write_tx(|conn| {
+            let t = now();
+            conn.execute(
+                "UPDATE monitors SET heartbeat_at=?,updated=? WHERE id=? AND state<>'off'",
+                params![t, t, id],
+            )?;
+            self.monitor_in(&conn, id)
+        })
     }
 
     pub fn due_monitors(&self, at: f64) -> Result<Vec<Monitor>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT * FROM monitors
-             WHERE state IN ('active','degraded') AND next_check_at IS NOT NULL
-               AND next_check_at<=?
-             ORDER BY next_check_at,id",
-        )?;
-        let rows = stmt.query_map([at], row_monitor)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        self.read_tx(|conn| {
+            let stmt_sql = "SELECT * FROM monitors
+                         WHERE state IN ('active','degraded') AND next_check_at IS NOT NULL
+                           AND next_check_at<=?
+                         ORDER BY next_check_at,id";
+            let rows = conn
+                .query_vec(stmt_sql, [at], row_monitor)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
     }
 
     pub(super) fn monitor_alert_kind(kind: &str) -> bool {
@@ -653,87 +658,85 @@ impl Store {
     /// one SQLite transaction: a crash can repeat a read, never a durable
     /// alert, because `(monitor_id,fingerprint)` is unique.
     pub fn check_monitor(&self, id: &str, at: f64) -> Result<MonitorCheck> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let monitor = self.monitor_in(&tx, id)?;
-        if monitor.state == "off" {
-            tx.commit()?;
-            return Ok(MonitorCheck {
-                monitor_id: id.to_string(),
-                cursor: monitor.event_cursor,
-                ..MonitorCheck::default()
-            });
-        }
-        let coverage: HashSet<String> = self.monitor_coverage_in(&tx, id)?.into_iter().collect();
-        let events = {
-            let mut stmt = tx.prepare(
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let monitor = self.monitor_in(&tx, id)?;
+            if monitor.state == "off" {
+                return Ok(MonitorCheck {
+                    monitor_id: id.to_string(),
+                    cursor: monitor.event_cursor,
+                    ..MonitorCheck::default()
+                });
+            }
+            let coverage: HashSet<String> =
+                self.monitor_coverage_in(&tx, id)?.into_iter().collect();
+            let events = tx.query_vec(
                 "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
-                 WHERE seq>? ORDER BY seq LIMIT 500",
+                         WHERE seq>? ORDER BY seq LIMIT 500",
+                [monitor.event_cursor],
+                row_event,
             )?;
-            let rows = stmt.query_map([monitor.event_cursor], row_event)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let mut cursor = monitor.event_cursor;
-        let mut alerts_created = 0;
-        for event in &events {
-            cursor = cursor.max(event.seq);
-            let Some(task_id) = event.task_id.as_deref() else {
-                continue;
-            };
-            if !coverage.contains(task_id) || !Self::monitor_alert_kind(&event.kind) {
-                continue;
-            }
-            let fingerprint = format!("event:{}", event.seq);
-            let payload = json!({
-                "event_seq": event.seq,
-                "alias": event.alias,
-                "kind": event.kind,
-                "payload": event.payload,
-                "job_id": event.job_id,
-                "task_id": task_id,
-                "at": event.at,
-            });
-            tx.execute(
-                "INSERT OR IGNORE INTO monitor_alerts(
-                    monitor_id,task_id,event_seq,fingerprint,kind,payload,
-                    state,attempts,created,updated)
-                 VALUES(?,?,?,?,?,?, 'open',0,?,?)",
-                params![
-                    id,
-                    task_id,
-                    event.seq,
-                    fingerprint,
-                    event.kind,
-                    payload.to_string(),
-                    at,
-                    at
-                ],
-            )?;
-            if tx.changes() == 1 {
-                alerts_created += 1;
-                Self::event(
-                    &tx,
-                    Self::DAEMON_STREAM,
-                    "monitor_alert",
-                    json!({"monitor": id, "task": task_id,
-                           "event_seq": event.seq, "kind": event.kind,
-                           "fingerprint": format!("event:{}", event.seq)}),
+            let mut cursor = monitor.event_cursor;
+            let mut alerts_created = 0;
+            for event in &events {
+                cursor = cursor.max(event.seq);
+                let Some(task_id) = event.task_id.as_deref() else {
+                    continue;
+                };
+                if !coverage.contains(task_id) || !Self::monitor_alert_kind(&event.kind) {
+                    continue;
+                }
+                let fingerprint = format!("event:{}", event.seq);
+                let payload = json!({
+                    "event_seq": event.seq,
+                    "alias": event.alias,
+                    "kind": event.kind,
+                    "payload": event.payload,
+                    "job_id": event.job_id,
+                    "task_id": task_id,
+                    "at": event.at,
+                });
+                tx.execute(
+                    "INSERT OR IGNORE INTO monitor_alerts(
+                                monitor_id,task_id,event_seq,fingerprint,kind,payload,
+                                state,attempts,created,updated)
+                             VALUES(?,?,?,?,?,?, 'open',0,?,?)",
+                    params![
+                        id,
+                        task_id,
+                        event.seq,
+                        fingerprint,
+                        event.kind,
+                        payload.to_string(),
+                        at,
+                        at
+                    ],
                 )?;
+                if tx.changes() == 1 {
+                    alerts_created += 1;
+                    Self::event(
+                        &tx,
+                        Self::DAEMON_STREAM,
+                        "monitor_alert",
+                        json!({"monitor": id, "task": task_id,
+                                       "event_seq": event.seq, "kind": event.kind,
+                                       "fingerprint": format!("event:{}", event.seq)}),
+                    )?;
+                }
             }
-        }
-        let next = at + monitor.interval_secs as f64;
-        tx.execute(
-            "UPDATE monitors SET state='active',heartbeat_at=?,last_check_at=?,
-                last_success_at=?,next_check_at=?,event_cursor=?,error=NULL,updated=?
-             WHERE id=? AND state<>'off'",
-            params![at, at, at, next, cursor, at, id],
-        )?;
-        tx.commit()?;
-        Ok(MonitorCheck {
-            monitor_id: id.to_string(),
-            scanned: events.len() as i64,
-            alerts_created,
-            cursor,
+            let next = at + monitor.interval_secs as f64;
+            tx.execute(
+                "UPDATE monitors SET state='active',heartbeat_at=?,last_check_at=?,
+                            last_success_at=?,next_check_at=?,event_cursor=?,error=NULL,updated=?
+                         WHERE id=? AND state<>'off'",
+                params![at, at, at, next, cursor, at, id],
+            )?;
+            Ok(MonitorCheck {
+                monitor_id: id.to_string(),
+                scanned: events.len() as i64,
+                alerts_created,
+                cursor,
+            })
         })
     }
 
@@ -741,26 +744,26 @@ impl Store {
     /// first occurrence of a reason emits one daemon event; repeated ticks
     /// update status and retry time without an event storm.
     pub fn fail_monitor_check(&self, id: &str, at: f64, error: &str) -> Result<Monitor> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let monitor = self.monitor_in(&tx, id)?;
-        let changed = monitor.state != "degraded" || monitor.error.as_deref() != Some(error);
-        let next = at + monitor.interval_secs as f64;
-        tx.execute(
-            "UPDATE monitors SET state='degraded',heartbeat_at=?,last_check_at=?,
-                next_check_at=?,error=?,updated=? WHERE id=? AND state<>'off'",
-            params![at, at, next, error, at, id],
-        )?;
-        if changed {
-            Self::event(
-                &tx,
-                Self::DAEMON_STREAM,
-                "monitor_degraded",
-                json!({"monitor": id, "error": error}),
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let monitor = self.monitor_in(&tx, id)?;
+            let changed = monitor.state != "degraded" || monitor.error.as_deref() != Some(error);
+            let next = at + monitor.interval_secs as f64;
+            tx.execute(
+                "UPDATE monitors SET state='degraded',heartbeat_at=?,last_check_at=?,
+                            next_check_at=?,error=?,updated=? WHERE id=? AND state<>'off'",
+                params![at, at, next, error, at, id],
             )?;
-        }
-        tx.commit()?;
-        self.monitor_in(&conn, id)
+            if changed {
+                Self::event(
+                    &tx,
+                    Self::DAEMON_STREAM,
+                    "monitor_degraded",
+                    json!({"monitor": id, "error": error}),
+                )?;
+            }
+            self.monitor_in(&conn, id)
+        })
     }
 
     /// Record a guarded automatic-dispatch refusal without treating the
@@ -775,99 +778,99 @@ impl Store {
         at: f64,
         reason: &str,
     ) -> Result<MonitorAlert> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let monitor = self.monitor_in(&tx, id)?;
-        let owner = monitor.owner.clone();
-        if !self
-            .monitor_coverage_in(&tx, id)?
-            .iter()
-            .any(|covered| covered == task_id)
-        {
-            return Err(Error::rejected(format!(
-                "Task '{task_id}' is outside monitor '{id}' coverage"
-            )));
-        }
-        let fingerprint = format!("dispatch-blocked:{task_id}");
-        let previous: Option<(i64, i64, String, Option<String>)> = tx
-            .query_row(
-                "SELECT seq,event_seq,state,last_error FROM monitor_alerts
-                 WHERE monitor_id=? AND fingerprint=?",
-                params![id, fingerprint],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-        let action =
-            "Inspect the guard reason, resolve the explicit task/worker prerequisite, then retry";
-        let seq = if let Some((seq, event_seq, state, previous_reason)) = previous {
-            let next_state = match state.as_str() {
-                // A later refusal is a new episode after a successful
-                // dispatch; make the durable alert visible again.
-                "resolved" => "open",
-                "acknowledged" if previous_reason.as_deref() != Some(reason) => "open",
-                state => state,
-            };
-            let payload = json!({
-                "monitor": id,
-                "task_id": task_id,
-                "event_seq": event_seq,
-                "reason": reason,
-                "next_action": action,
-                "owner": owner.clone(),
-                "authority": "operator",
-                "automatic": true,
-                "observed_at": at,
-            });
-            tx.execute(
-                "UPDATE monitor_alerts SET payload=?,state=?,attempts=attempts+1,
-                    last_error=?,updated=? WHERE seq=?",
-                params![payload.to_string(), next_state, reason, at, seq],
-            )?;
-            seq
-        } else {
-            Self::event_scoped(
-                &tx,
-                Self::DAEMON_STREAM,
-                "monitor_dispatch_blocked",
-                json!({"monitor": id, "task": task_id,
-                       "reason": reason, "next_action": action,
-                       "owner": owner.clone(), "automatic": true}),
-                None,
-                Some(task_id),
-            )?;
-            let event_seq = tx.last_insert_rowid();
-            let payload = json!({
-                "monitor": id,
-                "task_id": task_id,
-                "event_seq": event_seq,
-                "reason": reason,
-                "next_action": action,
-                "owner": owner,
-                "authority": "operator",
-                "automatic": true,
-                "observed_at": at,
-            });
-            tx.execute(
-                "INSERT INTO monitor_alerts(
-                    monitor_id,task_id,event_seq,fingerprint,kind,payload,
-                    state,attempts,last_error,created,updated)
-                 VALUES(?,?,?,?,?,?,'open',1,?,?,?)",
-                params![
-                    id,
-                    task_id,
-                    event_seq,
-                    fingerprint,
-                    "dispatch_blocked",
-                    payload.to_string(),
-                    reason,
-                    at,
-                    at
-                ],
-            )?;
-            tx.last_insert_rowid()
-        };
-        tx.commit()?;
-        self.monitor_alert_in(&conn, seq)
+        self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    let monitor = self.monitor_in(&tx, id)?;
+                    let owner = monitor.owner.clone();
+                    if !self
+                        .monitor_coverage_in(&tx, id)?
+                        .iter()
+                        .any(|covered| covered == task_id)
+                    {
+                        return Err(Error::rejected(format!(
+                            "Task '{task_id}' is outside monitor '{id}' coverage"
+                        )));
+                    }
+                    let fingerprint = format!("dispatch-blocked:{task_id}");
+                    let previous: Option<(i64, i64, String, Option<String>)> = tx
+                        .query_opt(
+                            "SELECT seq,event_seq,state,last_error FROM monitor_alerts
+                             WHERE monitor_id=? AND fingerprint=?",
+                            params![id, fingerprint],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        )?;
+                    let action =
+                        "Inspect the guard reason, resolve the explicit task/worker prerequisite, then retry";
+                    let seq = if let Some((seq, event_seq, state, previous_reason)) = previous {
+                        let next_state = match state.as_str() {
+                            // A later refusal is a new episode after a successful
+                            // dispatch; make the durable alert visible again.
+                            "resolved" => "open",
+                            "acknowledged" if previous_reason.as_deref() != Some(reason) => "open",
+                            state => state,
+                        };
+                        let payload = json!({
+                            "monitor": id,
+                            "task_id": task_id,
+                            "event_seq": event_seq,
+                            "reason": reason,
+                            "next_action": action,
+                            "owner": owner.clone(),
+                            "authority": "operator",
+                            "automatic": true,
+                            "observed_at": at,
+                        });
+                        tx.execute(
+                            "UPDATE monitor_alerts SET payload=?,state=?,attempts=attempts+1,
+                                last_error=?,updated=? WHERE seq=?",
+                            params![payload.to_string(), next_state, reason, at, seq],
+                        )?;
+                        seq
+                    } else {
+                        Self::event_scoped(
+                            &tx,
+                            Self::DAEMON_STREAM,
+                            "monitor_dispatch_blocked",
+                            json!({"monitor": id, "task": task_id,
+                                   "reason": reason, "next_action": action,
+                                   "owner": owner.clone(), "automatic": true}),
+                            None,
+                            Some(task_id),
+                        )?;
+                        let event_seq = tx.last_insert_rowid();
+                        let payload = json!({
+                            "monitor": id,
+                            "task_id": task_id,
+                            "event_seq": event_seq,
+                            "reason": reason,
+                            "next_action": action,
+                            "owner": owner,
+                            "authority": "operator",
+                            "automatic": true,
+                            "observed_at": at,
+                        });
+                        tx.execute(
+                            "INSERT INTO monitor_alerts(
+                                monitor_id,task_id,event_seq,fingerprint,kind,payload,
+                                state,attempts,last_error,created,updated)
+                             VALUES(?,?,?,?,?,?,'open',1,?,?,?)",
+                            params![
+                                id,
+                                task_id,
+                                event_seq,
+                                fingerprint,
+                                "dispatch_blocked",
+                                payload.to_string(),
+                                reason,
+                                at,
+                                at
+                            ],
+                        )?;
+                        tx.last_insert_rowid()
+                    };
+                    self.monitor_alert_in(&conn, seq)
+        })
     }
 
     /// Close a dispatch-blocked alert once the same covered task has a
@@ -876,7 +879,7 @@ impl Store {
     /// operator dispatch repair the same stale alert as well.
     fn resolve_monitor_dispatch_blocked_tx(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         id: &str,
         task_id: &str,
         at: f64,
@@ -944,32 +947,32 @@ impl Store {
         at: f64,
         by: &str,
     ) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        self.monitor_in(&tx, id)?;
-        self.resolve_monitor_dispatch_blocked_tx(&tx, id, task_id, at, by)?;
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            self.monitor_in(&tx, id)?;
+            self.resolve_monitor_dispatch_blocked_tx(&tx, id, task_id, at, by)?;
+            Ok(())
+        })
     }
 
     pub fn stop_monitor(&self, id: &str) -> Result<Monitor> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        self.monitor_in(&tx, id)?;
-        let t = now();
-        tx.execute(
-            "UPDATE monitors SET state='off',next_check_at=NULL,error=NULL,updated=?
-             WHERE id=?",
-            params![t, id],
-        )?;
-        Self::event(
-            &tx,
-            Self::DAEMON_STREAM,
-            "monitor_off",
-            json!({"monitor": id}),
-        )?;
-        tx.commit()?;
-        self.monitor_in(&conn, id)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            self.monitor_in(&tx, id)?;
+            let t = now();
+            tx.execute(
+                "UPDATE monitors SET state='off',next_check_at=NULL,error=NULL,updated=?
+                         WHERE id=?",
+                params![t, id],
+            )?;
+            Self::event(
+                &tx,
+                Self::DAEMON_STREAM,
+                "monitor_off",
+                json!({"monitor": id}),
+            )?;
+            self.monitor_in(&conn, id)
+        })
     }
 
     pub fn monitor_alerts(
@@ -979,44 +982,51 @@ impl Store {
         open_only: bool,
         limit: i64,
     ) -> Result<Vec<MonitorAlert>> {
-        let conn = self.conn();
-        self.monitor_in(&conn, id)?;
-        let sql = if open_only {
-            "SELECT * FROM monitor_alerts WHERE monitor_id=? AND seq>? AND state='open'
-             ORDER BY seq LIMIT ?"
-        } else {
-            "SELECT * FROM monitor_alerts WHERE monitor_id=? AND seq>?
-             ORDER BY seq LIMIT ?"
-        };
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(params![id, after, limit.clamp(1, 500)], row_monitor_alert)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        self.read_tx(|conn| {
+            self.monitor_in(&conn, id)?;
+            let sql = if open_only {
+                "SELECT * FROM monitor_alerts WHERE monitor_id=? AND seq>? AND state='open'
+                         ORDER BY seq LIMIT ?"
+            } else {
+                "SELECT * FROM monitor_alerts WHERE monitor_id=? AND seq>?
+                         ORDER BY seq LIMIT ?"
+            };
+            let stmt_sql = sql;
+            let rows = conn
+                .query_vec(
+                    stmt_sql,
+                    params![id, after, limit.clamp(1, 500)],
+                    row_monitor_alert,
+                )
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
     }
 
     pub fn ack_monitor_alert(&self, id: &str, seq: i64, by: &str) -> Result<MonitorAlert> {
         identifier(by, "Alert acknowledger")?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let alert = self.monitor_alert_in(&tx, seq)?;
-        if alert.monitor_id != id {
-            return Err(Error::rejected(format!(
-                "Alert '{seq}' does not belong to monitor '{id}'"
-            )));
-        }
-        if alert.state == "open" {
-            tx.execute(
-                "UPDATE monitor_alerts SET state='acknowledged',updated=? WHERE seq=?",
-                params![now(), seq],
-            )?;
-            Self::event(
-                &tx,
-                Self::DAEMON_STREAM,
-                "monitor_alert_ack",
-                json!({"monitor": id, "alert": seq, "by": by}),
-            )?;
-        }
-        tx.commit()?;
-        self.monitor_alert_in(&conn, seq)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let alert = self.monitor_alert_in(&tx, seq)?;
+            if alert.monitor_id != id {
+                return Err(Error::rejected(format!(
+                    "Alert '{seq}' does not belong to monitor '{id}'"
+                )));
+            }
+            if alert.state == "open" {
+                tx.execute(
+                    "UPDATE monitor_alerts SET state='acknowledged',updated=? WHERE seq=?",
+                    params![now(), seq],
+                )?;
+                Self::event(
+                    &tx,
+                    Self::DAEMON_STREAM,
+                    "monitor_alert_ack",
+                    json!({"monitor": id, "alert": seq, "by": by}),
+                )?;
+            }
+            self.monitor_alert_in(&conn, seq)
+        })
     }
 
     // ---- Jobs, tasks, verdicts (the work axis) ----

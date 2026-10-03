@@ -1176,19 +1176,27 @@ fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
 /// Null the token-bearing columns, then rebuild the file so freed pages
 /// (deleted rows, old values) are not carried along.
 fn scrub(db: &Path) -> Result<Scrub> {
+    // CAD-1011: a durable-sealed or latch-carrying source must not be
+    // copy-transformed into a production-usable db — refuse at the source.
+    crate::store::preflight_writer_guard(db)?;
     let conn = Connection::open(db)?;
     // Turn tokens live on in event payloads and prose long after the
     // messages row, and a token spells out its generation. Redact every
     // token-shaped value everywhere before the columns are nulled.
     let shape = token_shape();
-    let redaction = redact_turn_tokens(&conn, &shape)?;
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+    crate::store::require_legacy_writer_tx(&tx)?;
+    let redaction = redact_turn_tokens(&tx, &shape)?;
     let mut scrubbed = Vec::new();
     for (table, column) in SCRUB_COLUMNS {
-        if has_column(&conn, table, column)? {
-            conn.execute(&format!("UPDATE {table} SET {column}=NULL"), [])?;
+        if has_column(&tx, table, column)? {
+            tx.execute(&format!("UPDATE {table} SET {column}=NULL"), [])?;
             scrubbed.push(format!("{table}.{column}"));
         }
     }
+    tx.commit()?;
+    // The only caller supplies its own private export-partial copy, never
+    // the live store. VACUUM cannot run inside the write transaction.
     conn.execute_batch("VACUUM")?;
     conn.close().map_err(|(_, e)| e)?;
     refuse_remaining_tokens(db, &shape, redaction.matcher.as_ref())?;
@@ -1280,7 +1288,7 @@ fn logged_generation_shape() -> regex::Regex {
 /// an old endpoint's `ready` event outlives every token naming it) — are
 /// redacted where they stand alone too. Each occurrence in any text cell
 /// is replaced with [`REDACTED`].
-fn redact_turn_tokens(conn: &Connection, shape: &regex::Regex) -> Result<Redaction> {
+fn redact_turn_tokens(conn: &rusqlite::Transaction<'_>, shape: &regex::Regex) -> Result<Redaction> {
     let generation_shape = regex::Regex::new(&format!(
         "^(?:{})$",
         crate::adapter::registry::TURN_TOKEN_GENERATION
@@ -1328,9 +1336,8 @@ fn redact_turn_tokens(conn: &Connection, shape: &regex::Regex) -> Result<Redacti
         }
         Ok(())
     })?;
-    let tx = conn.unchecked_transaction()?;
     for (table, column, rowid, text) in &updates {
-        tx.execute(
+        conn.execute(
             &format!(
                 "UPDATE {} SET {}=?1 WHERE rowid=?2",
                 quote_ident(table),
@@ -1339,7 +1346,6 @@ fn redact_turn_tokens(conn: &Connection, shape: &regex::Regex) -> Result<Redacti
             params![text, rowid],
         )?;
     }
-    tx.commit()?;
     Ok(Redaction {
         values: values.len(),
         cells: updates.len() as u64,
@@ -1893,8 +1899,11 @@ fn apply_remap(db: &Path, mappings: &[Mapping]) -> Result<Vec<usize>> {
     if mappings.iter().all(|m| m.from == m.to) {
         return Ok(rows);
     }
+    // CAD-1011: refuse to remap a durable-sealed/latch-carrying source.
+    crate::store::preflight_writer_guard(db)?;
     let conn = Connection::open(db)?;
-    let tx = conn.unchecked_transaction()?;
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+    crate::store::require_legacy_writer_tx(&tx)?;
     for (table, column) in PATH_COLUMNS {
         if !has_column(&tx, table, column)? {
             continue;

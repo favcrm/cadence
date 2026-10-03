@@ -1,13 +1,14 @@
 //! Turn delivery: finish/route, fencing, reconcile, job-event notices.
 
 use crate::error::{Error, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::kickoff::{check_commit_sha, cloud_hold_exit, last_sha_line};
 use super::messages::{Message, FENCING_UNKNOWN_SQL};
 use super::plans::{Job, Task};
+use super::StoreConn;
 use super::{now, Store};
 
 pub(super) const UNKNOWN_EVENT_REASON_CHARS: usize = 512;
@@ -60,40 +61,40 @@ impl Store {
     /// One alert after held-recovery gives up. The agent stays unfenced
     /// and the held message is not replayed. A second call is a no-op.
     pub fn escalate_cloud_hold(&self, message: &Message, reason: &str) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let already: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='cloud_recover_escalated' \
-             AND json_extract(payload,'$.message')=?2",
-            params![&message.alias, &message.id],
-            |row| row.get(0),
-        )?;
-        if already == 0 {
-            Self::event(
-                &tx,
-                &message.alias,
-                "cloud_recover_escalated",
-                json!({
-                    "reason": reason,
-                    "fenced": false,
-                    "message": message.id,
-                }),
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let already: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='cloud_recover_escalated' \
+                         AND json_extract(payload,'$.message')=?2",
+                params![&message.alias, &message.id],
+                |row| row.get(0),
             )?;
-            self.route_notice(
-                &tx,
-                message,
-                "cloud_recover_escalated",
-                &json!({
-                    "status": "unknown",
-                    "text": "",
-                    "held": true,
-                    "escalated": true,
-                    "error": reason,
-                }),
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+            if already == 0 {
+                Self::event(
+                    &tx,
+                    &message.alias,
+                    "cloud_recover_escalated",
+                    json!({
+                        "reason": reason,
+                        "fenced": false,
+                        "message": message.id,
+                    }),
+                )?;
+                self.route_notice(
+                    &tx,
+                    message,
+                    "cloud_recover_escalated",
+                    &json!({
+                        "status": "unknown",
+                        "text": "",
+                        "held": true,
+                        "escalated": true,
+                        "error": reason,
+                    }),
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// CAD-152: reserve an `agent recover-submit` Enter for running
@@ -110,95 +111,95 @@ impl Store {
         id: &str,
         detail: Value,
     ) -> Result<Option<i64>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        if let Some(message) = self.message_in(&tx, id)? {
-            if message.source == "app_run_dispatch" {
-                return Err(Error::rejected("app turns do not support manual Enter recovery; preserve uncertainty and create a newly approved run"));
-            }
-        }
-        let prior: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='submit_recovered' \
-             AND json_extract(payload,'$.message')=?2",
-            params![alias, id],
-            |row| row.get(0),
-        )?;
-        if prior > 0 {
-            return Ok(None);
-        }
-        let result: Option<String> = tx
-            .query_row(
-                "SELECT result FROM messages WHERE id=?1 AND alias=?2 AND state='running'",
-                params![id, alias],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| Error::rejected(format!("message {id} is no longer running")))?;
-        let mut result = result
-            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
-            .filter(Value::is_object)
-            .unwrap_or_else(|| json!({}));
-        result["recovered"] = json!({"at": now()});
-        tx.execute(
-            "UPDATE messages SET result=?1 WHERE id=?2 AND state='running'",
-            params![result.to_string(), id],
-        )?;
-        Self::event(&tx, alias, "submit_recovered", detail)?;
-        let seq = tx.last_insert_rowid();
-        tx.commit()?;
-        Ok(Some(seq))
+        self.write_tx(|conn| {
+
+                    let tx = &mut *conn;
+                    if let Some(message) = self.message_in(&tx, id)? {
+                        if message.source == "app_run_dispatch" {
+                            return Err(Error::rejected("app turns do not support manual Enter recovery; preserve uncertainty and create a newly approved run"));
+                        }
+                    }
+                    let prior: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='submit_recovered' \
+                         AND json_extract(payload,'$.message')=?2",
+                        params![alias, id],
+                        |row| row.get(0),
+                    )?;
+                    if prior > 0 {
+                        return Ok(None);
+                    }
+                    let result: Option<String> = tx
+                        .query_opt(
+                            "SELECT result FROM messages WHERE id=?1 AND alias=?2 AND state='running'",
+                            params![id, alias],
+                            |row| row.get(0),
+                        )?
+                        .ok_or_else(|| Error::rejected(format!("message {id} is no longer running")))?;
+                    let mut result = result
+                        .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+                        .filter(Value::is_object)
+                        .unwrap_or_else(|| json!({}));
+                    result["recovered"] = json!({"at": now()});
+                    tx.execute(
+                        "UPDATE messages SET result=?1 WHERE id=?2 AND state='running'",
+                        params![result.to_string(), id],
+                    )?;
+                    Self::event(&tx, alias, "submit_recovered", detail)?;
+                    let seq = tx.last_insert_rowid();
+                    Ok(Some(seq))
+        })
     }
 
     /// CAD-152: merge the outcome (`after`, `result`, …) into the
     /// `submit_recovered` record reserved at `seq`.
     pub fn finish_submit_recovery(&self, seq: i64, outcome: &Value) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let raw: String = tx.query_row(
-            "SELECT payload FROM events WHERE seq=?1 AND kind='submit_recovered'",
-            [seq],
-            |row| row.get(0),
-        )?;
-        let mut payload: Value = serde_json::from_str(&raw)?;
-        if let (Some(p), Some(o)) = (payload.as_object_mut(), outcome.as_object()) {
-            for (k, v) in o {
-                p.insert(k.clone(), v.clone());
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let raw: String = tx.query_row(
+                "SELECT payload FROM events WHERE seq=?1 AND kind='submit_recovered'",
+                [seq],
+                |row| row.get(0),
+            )?;
+            let mut payload: Value = serde_json::from_str(&raw)?;
+            if let (Some(p), Some(o)) = (payload.as_object_mut(), outcome.as_object()) {
+                for (k, v) in o {
+                    p.insert(k.clone(), v.clone());
+                }
             }
-        }
-        tx.execute(
-            "UPDATE events SET payload=?1 WHERE seq=?2",
-            params![payload.to_string(), seq],
-        )?;
-        tx.commit()?;
-        Ok(())
+            tx.execute(
+                "UPDATE events SET payload=?1 WHERE seq=?2",
+                params![payload.to_string(), seq],
+            )?;
+            Ok(())
+        })
     }
 
     /// CAD-152: the `submit_recovered` record of an earlier `agent
     /// recover-submit` for message `id` on `alias`, if one exists — the
     /// durable marker that makes a second recovery refuse.
     pub fn submit_recovered(&self, alias: &str, id: &str) -> Result<Option<Value>> {
-        let conn = self.conn();
-        let raw: Option<String> = conn
-            .query_row(
+        self.read_tx(|conn| {
+            let raw: Option<String> = conn.query_opt(
                 "SELECT payload FROM events WHERE alias=?1 AND kind='submit_recovered' \
-                 AND json_extract(payload,'$.message')=?2 ORDER BY seq LIMIT 1",
+                             AND json_extract(payload,'$.message')=?2 ORDER BY seq LIMIT 1",
                 params![alias, id],
                 |row| row.get(0),
-            )
-            .optional()?;
-        Ok(raw.map(|r| serde_json::from_str(&r).unwrap_or(Value::Null)))
+            )?;
+            Ok(raw.map(|r| serde_json::from_str(&r).unwrap_or(Value::Null)))
+        })
     }
 
     /// Endpoint died while submitted PTY messages were in flight — each
     /// may have reached the provider, so they are `unknown`, never retried.
     pub fn orphan_running(&self, alias: &str, error: &str) -> Result<()> {
-        let conn = self.write_conn()?;
-        conn.execute(
-            "UPDATE messages SET state='unknown',error=?,completed=?
-             WHERE alias=? AND state='running'",
-            params![error, now(), alias],
-        )?;
-        Ok(())
+        self.write_tx(|conn| {
+            conn.execute(
+                "UPDATE messages SET state='unknown',error=?,completed=?
+                         WHERE alias=? AND state='running'",
+                params![error, now(), alias],
+            )?;
+            Ok(())
+        })
     }
 
     /// Persist the result and route it to `reply_to` in the SAME
@@ -211,11 +212,11 @@ impl Store {
         result: &Value,
         error: Option<&str>,
     ) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        self.finish_in(&tx, message, status, result, error)?;
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            self.finish_in(&tx, message, status, result, error)?;
+            Ok(())
+        })
     }
 
     /// CAD-250: a nudge never outlives the pane it was aimed at. Cancel the
@@ -225,7 +226,7 @@ impl Store {
     /// `older_than` limits to rows created before that epoch (the TTL).
     /// Returns the `(id, alias)` pairs it closed.
     pub(super) fn cancel_nudges_in(
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         alias: Option<&str>,
         reason: &str,
         older_than: Option<f64>,
@@ -237,21 +238,21 @@ impl Store {
         } else {
             "('queued','submitting')"
         };
-        let mut stmt = tx.prepare(&format!(
-            "SELECT id, alias, state FROM messages
-             WHERE source='nudge' AND state IN {states}
-               AND (?1 IS NULL OR alias=?1) AND (?2 IS NULL OR created < ?2)"
-        ))?;
-        let stale = stmt
-            .query_map(params![alias, older_than], |r| {
+        let stale: Vec<(String, String, String)> = tx.query_vec(
+            &format!(
+                "SELECT id, alias, state FROM messages
+                 WHERE source='nudge' AND state IN {states}
+                   AND (?1 IS NULL OR alias=?1) AND (?2 IS NULL OR created < ?2)"
+            ),
+            params![alias, older_than],
+            |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                 ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
+            },
+        )?;
         let mut closed = Vec::new();
         for (id, alias, state) in stale {
             let (to, why) = if state == "queued" {
@@ -281,21 +282,21 @@ impl Store {
     /// CAD-250 N2: the alias's actor stopped (stop, fence, shutdown, any
     /// exit) — its queued nudges are cancelled, never pasted later.
     pub fn cancel_nudges_for(&self, alias: &str, reason: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let closed = Self::cancel_nudges_in(&tx, Some(alias), reason, None)?;
-        tx.commit()?;
-        Ok(closed)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let closed = Self::cancel_nudges_in(&tx, Some(alias), reason, None)?;
+            Ok(closed)
+        })
     }
 
     /// CAD-250 N3: a nudge still queued `ttl` seconds after it was created
     /// (a pane that stayed busy) is stale steering — cancelled at `now`.
     pub fn expire_queued_nudges(&self, now: f64, ttl: f64) -> Result<Vec<(String, String)>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let closed = Self::cancel_nudges_in(&tx, None, "ttl", Some(now - ttl))?;
-        tx.commit()?;
-        Ok(closed)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let closed = Self::cancel_nudges_in(&tx, None, "ttl", Some(now - ttl))?;
+            Ok(closed)
+        })
     }
 
     /// CAD-1015: daemon boot sweep. A `submitting` nudge means the daemon
@@ -305,37 +306,36 @@ impl Store {
     /// never left non-terminal. Unlike `cancel_nudges_for` this is not
     /// alias-scoped: a crashed daemon's orphan could name any agent.
     pub fn orphan_submitting_nudges(&self, reason: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let stale: Vec<(String, String)> = tx
-            .prepare(
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let stale: Vec<(String, String)> = tx.query_vec(
                 "SELECT id, alias FROM messages
-                 WHERE source='nudge' AND state='submitting'",
-            )?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut closed = Vec::new();
-        for (id, alias) in stale {
-            let result = json!({"status": "unknown", "via": format!("{reason}_unconfirmed"),
-                                "reason": format!("{reason} — a nudge is never replayed")});
-            let n = tx.execute(
-                "UPDATE messages SET state='unknown',result=?,completed=?
-                 WHERE id=? AND state='submitting' AND source='nudge'",
-                params![result.to_string(), now(), id],
+                     WHERE source='nudge' AND state='submitting'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            if n == 1 {
-                Self::event(
-                    &tx,
-                    &alias,
-                    "nudge_cancelled",
-                    json!({"message": id, "was": "submitting", "state": "unknown",
-                           "reason": reason}),
+            let mut closed = Vec::new();
+            for (id, alias) in stale {
+                let result = json!({"status": "unknown", "via": format!("{reason}_unconfirmed"),
+                                    "reason": format!("{reason} — a nudge is never replayed")});
+                let n = tx.execute(
+                    "UPDATE messages SET state='unknown',result=?,completed=?
+                     WHERE id=? AND state='submitting' AND source='nudge'",
+                    params![result.to_string(), now(), id],
                 )?;
-                closed.push((id, alias));
+                if n == 1 {
+                    Self::event(
+                        &tx,
+                        &alias,
+                        "nudge_cancelled",
+                        json!({"message": id, "was": "submitting", "state": "unknown",
+                               "reason": reason}),
+                    )?;
+                    closed.push((id, alias));
+                }
             }
-        }
-        tx.commit()?;
-        Ok(closed)
+            Ok(closed)
+        })
     }
 
     /// CAD-250: finish a turn from its worker's `message result` — only
@@ -351,15 +351,15 @@ impl Store {
         result: &Value,
         error: Option<&str>,
     ) -> Result<std::result::Result<Message, Option<Message>>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let current = self.message_in(&tx, message_id)?;
-        let Some(current) = current.filter(|m| m.state == "running") else {
-            return Ok(Err(self.message_in(&tx, message_id)?));
-        };
-        self.finish_in(&tx, &current, status, result, error)?;
-        tx.commit()?;
-        Ok(Ok(current))
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let current = self.message_in(&tx, message_id)?;
+            let Some(current) = current.filter(|m| m.state == "running") else {
+                return Ok(Err(self.message_in(&tx, message_id)?));
+            };
+            self.finish_in(&tx, &current, status, result, error)?;
+            Ok(Ok(current))
+        })
     }
 
     /// CAD-250: move a delivered, unreported pty turn to `unknown` —
@@ -377,28 +377,28 @@ impl Store {
         bound: Option<(u64, f64)>,
         reason: &str,
     ) -> Result<bool> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let Some(current) = self.message_in(&tx, message_id)? else {
-            return Ok(false);
-        };
-        let due = match bound {
-            Some((secs, now)) => current.report_overdue(secs, now),
-            None => current.holds_turn(),
-        };
-        if !due {
-            return Ok(false);
-        }
-        let stored = json!({"status": "unknown", "text": "", "error": reason,
-                            "via": "report_timeout", "turn_id": current.turn_id});
-        self.finish_in(&tx, &current, "unknown", &stored, Some(reason))?;
-        tx.commit()?;
-        Ok(true)
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let Some(current) = self.message_in(&tx, message_id)? else {
+                return Ok(false);
+            };
+            let due = match bound {
+                Some((secs, now)) => current.report_overdue(secs, now),
+                None => current.holds_turn(),
+            };
+            if !due {
+                return Ok(false);
+            }
+            let stored = json!({"status": "unknown", "text": "", "error": reason,
+                                        "via": "report_timeout", "turn_id": current.turn_id});
+            self.finish_in(&tx, &current, "unknown", &stored, Some(reason))?;
+            Ok(true)
+        })
     }
 
     pub(super) fn finish_in(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         message: &Message,
         status: &str,
         result: &Value,
@@ -492,7 +492,7 @@ impl Store {
     /// deterministic id and no `reply_to`, so they cannot create loops.
     pub(super) fn route_result(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         message: &Message,
         result: &Value,
     ) -> Result<bool> {
@@ -594,7 +594,7 @@ impl Store {
     /// may route.
     pub(super) fn route_notice(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         message: &Message,
         kind: &str,
         result: &Value,
@@ -746,7 +746,7 @@ impl Store {
     /// isn't a pty endpoint, where the full body delivers fine).
     fn bound_routed_result(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         target: &str,
         result: &mut Value,
         worker: &str,
@@ -785,13 +785,14 @@ impl Store {
     /// True when the alias has an `unknown` in-flight attempt that must be
     /// reconciled before it may run again.
     pub fn has_unknown(&self, alias: &str) -> Result<bool> {
-        let conn = self.conn();
-        let count: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL}"),
-            [alias],
-            |r| r.get(0),
-        )?;
-        Ok(count > 0)
+        self.read_tx(|conn| {
+            let count: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL}"),
+                [alias],
+                |r| r.get(0),
+            )?;
+            Ok(count > 0)
+        })
     }
 
     /// The unknown `error` a fence restamp should show. One column, one
@@ -802,42 +803,45 @@ impl Store {
     /// literals `recover` and `orphan_running` write; message rows are
     /// not rewritten here.
     pub fn preferred_unknown_error(&self, alias: &str) -> Result<Option<String>> {
-        let conn = self.conn();
-        match conn.query_row(
-            &format!(
-                "SELECT error FROM messages
-             WHERE alias=? AND {FENCING_UNKNOWN_SQL} AND error IS NOT NULL
-             ORDER BY
-               CASE error
-                 WHEN 'Uncertain provider outcome requires review' THEN 3
-                 WHEN 'agent fenced at restart; turn never verified' THEN 2
-                 WHEN 'Runtime restarted during provider turn' THEN 1
-                 ELSE 0
-               END,
-               seq DESC
-             LIMIT 1"
-            ),
-            [alias],
-            |row| row.get(0),
-        ) {
-            Ok(error) => Ok(error),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        self.read_tx(|conn| {
+            match conn.query_row(
+                &format!(
+                    "SELECT error FROM messages
+                         WHERE alias=? AND {FENCING_UNKNOWN_SQL} AND error IS NOT NULL
+                         ORDER BY
+                           CASE error
+                             WHEN 'Uncertain provider outcome requires review' THEN 3
+                             WHEN 'agent fenced at restart; turn never verified' THEN 2
+                             WHEN 'Runtime restarted during provider turn' THEN 1
+                             ELSE 0
+                           END,
+                           seq DESC
+                         LIMIT 1"
+                ),
+                [alias],
+                |row| row.get(0),
+            ) {
+                Ok(error) => Ok(error),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
     }
 
     /// Ids of the alias's fencing `unknown` messages, oldest first — what
     /// `agent unfence` reconciles in one call. An unconfirmed nudge is
     /// `unknown` too but fences nothing, so it is not listed (CAD-250).
     pub fn unknown_messages(&self, alias: &str) -> Result<Vec<String>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL} ORDER BY seq"
-        ))?;
-        let ids = stmt
-            .query_map([alias], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        Ok(ids)
+        self.read_tx(|conn| {
+            let stmt_sql = &format!(
+                "SELECT id FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL} ORDER BY seq"
+            );
+            let ids = conn
+                .query_vec(stmt_sql, [alias], |r| r.get(0))
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            Ok(ids)
+        })
     }
 
     /// Operator reconcile — the only exit from `unknown` that keeps the
@@ -872,81 +876,80 @@ impl Store {
             )));
         }
         let sha = sha.map(check_commit_sha).transpose()?;
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let message = self
-            .message_in(&tx, message_id)?
-            .ok_or_else(|| Error::rejected(format!("No such message '{message_id}'")))?;
-        if message.state != "unknown" {
-            return Err(Error::rejected(format!(
-                "Message '{message_id}' is '{}', not unknown — only an unknown \
-                 message can be reconciled",
-                message.state
-            )));
-        }
-        let result = json!({
-            "status": status,
-            "via": "operator_reconcile",
-            "note": note,
-            "sha": sha,
-        });
-        // The state guard in the UPDATE is the atomic fence against a
-        // concurrent transition between the check and the write.
-        let n = tx.execute(
-            "UPDATE messages SET state=?,result=?,completed=? WHERE id=? AND state='unknown'",
-            params![status, result.to_string(), now(), message_id],
-        )?;
-        if n == 0 {
-            return Err(Error::rejected(format!(
-                "Message '{message_id}' left unknown state before the reconcile committed"
-            )));
-        }
-        Self::event(
-            &tx,
-            &message.alias,
-            "reconciled",
-            json!({"message": message_id, "status": status,
-                   "note": note, "by": by}),
-        )?;
-        if matches!(status, "completed" | "failed") {
-            self.route_result(&tx, &message, &result)?;
-        } else {
-            self.route_notice(&tx, &message, "interrupted", &result)?;
-        }
-        // An operator reconcile to `completed` behaves like a normal
-        // completion for the task — same SHA rules: an explicit `sha`
-        // field on the result, else a `SHA:` line in the note, else NULL.
-        if !self.app_run_finished_in(
-            &tx,
-            &message,
-            status,
-            &result,
-            &super::app_runs::AppCompletionProof::OperatorReconcile,
-        )? && status == "completed"
-        {
-            self.task_on_completed(&tx, &message, &result)?;
-        }
-        // The fence lifts when the last unknown reconciles — attention
-        // drops to stopped and disabled, the same condition as an
-        // operator stop: a restart must not relaunch a worker the
-        // operator never resumed. `agent resume` is the next move.
-        let remaining: i64 = tx.query_row(
-            &format!("SELECT COUNT(*) FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL}"),
-            [&message.alias],
-            |r| r.get(0),
-        )?;
-        // A nudge's unknown never fenced, so reconciling it lifts nothing.
-        if remaining == 0 && !message.is_nudge() {
-            tx.execute(
-                "UPDATE agents SET state='stopped',enabled=0,updated=? \
-                 WHERE alias=? AND state='attention'",
-                params![now(), message.alias],
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let message = self
+                .message_in(&tx, message_id)?
+                .ok_or_else(|| Error::rejected(format!("No such message '{message_id}'")))?;
+            if message.state != "unknown" {
+                return Err(Error::rejected(format!(
+                    "Message '{message_id}' is '{}', not unknown — only an unknown \
+                             message can be reconciled",
+                    message.state
+                )));
+            }
+            let result = json!({
+                "status": status,
+                "via": "operator_reconcile",
+                "note": note,
+                "sha": sha,
+            });
+            // The state guard in the UPDATE is the atomic fence against a
+            // concurrent transition between the check and the write.
+            let n = tx.execute(
+                "UPDATE messages SET state=?,result=?,completed=? WHERE id=? AND state='unknown'",
+                params![status, result.to_string(), now(), message_id],
             )?;
-        }
-        tx.commit()?;
-        drop(conn);
-        self.message(message_id)?
-            .ok_or_else(|| Error::internal("reconciled message vanished"))
+            if n == 0 {
+                return Err(Error::rejected(format!(
+                    "Message '{message_id}' left unknown state before the reconcile committed"
+                )));
+            }
+            Self::event(
+                &tx,
+                &message.alias,
+                "reconciled",
+                json!({"message": message_id, "status": status,
+                               "note": note, "by": by}),
+            )?;
+            if matches!(status, "completed" | "failed") {
+                self.route_result(&tx, &message, &result)?;
+            } else {
+                self.route_notice(&tx, &message, "interrupted", &result)?;
+            }
+            // An operator reconcile to `completed` behaves like a normal
+            // completion for the task — same SHA rules: an explicit `sha`
+            // field on the result, else a `SHA:` line in the note, else NULL.
+            if !self.app_run_finished_in(
+                &tx,
+                &message,
+                status,
+                &result,
+                &super::app_runs::AppCompletionProof::OperatorReconcile,
+            )? && status == "completed"
+            {
+                self.task_on_completed(&tx, &message, &result)?;
+            }
+            // The fence lifts when the last unknown reconciles — attention
+            // drops to stopped and disabled, the same condition as an
+            // operator stop: a restart must not relaunch a worker the
+            // operator never resumed. `agent resume` is the next move.
+            let remaining: i64 = tx.query_row(
+                &format!("SELECT COUNT(*) FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL}"),
+                [&message.alias],
+                |r| r.get(0),
+            )?;
+            // A nudge's unknown never fenced, so reconciling it lifts nothing.
+            if remaining == 0 && !message.is_nudge() {
+                tx.execute(
+                    "UPDATE agents SET state='stopped',enabled=0,updated=? \
+                             WHERE alias=? AND state='attention'",
+                    params![now(), message.alias],
+                )?;
+            }
+            self.message_in(&*tx, message_id)?
+                .ok_or_else(|| Error::internal("reconciled message vanished"))
+        })
     }
 
     /// Operator/agent cancel of a still-`queued` message — the row keeps
@@ -956,51 +959,50 @@ impl Store {
     /// `worker_notice` so a waiter is never left hanging. A task-bound
     /// delivery is refused — `task cancel` owns that lifecycle.
     pub fn cancel(&self, message_id: &str, by: &str, reason: Option<&str>) -> Result<Message> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let message = self
-            .message_in(&tx, message_id)?
-            .ok_or_else(|| Error::rejected(format!("No such message '{message_id}'")))?;
-        if let Some(task) = &message.task_id {
-            return Err(Error::rejected(format!(
-                "Message '{message_id}' is bound to task '{task}' — \
-                 `cadence task cancel {task}` owns its lifecycle"
-            )));
-        }
-        if message.state != "queued" {
-            return Err(Error::rejected(format!(
-                "Message '{message_id}' is '{}' — only a queued message can be \
-                 cancelled (a running turn is interrupted at the provider)",
-                message.state
-            )));
-        }
-        let result = json!({
-            "status": "cancelled", "via": "message_cancel",
-            "by": by, "reason": reason,
-        });
-        // The state guard in the UPDATE is the atomic fence against a
-        // concurrent claim between the check and the write.
-        let n = tx.execute(
-            "UPDATE messages SET state='cancelled',result=?,completed=?
-             WHERE id=? AND state='queued'",
-            params![result.to_string(), now(), message_id],
-        )?;
-        if n == 0 {
-            return Err(Error::rejected(format!(
-                "Message '{message_id}' left queued state before the cancel committed"
-            )));
-        }
-        Self::event(
-            &tx,
-            &message.alias,
-            "cancelled",
-            json!({"message": message_id, "by": by, "reason": reason}),
-        )?;
-        self.route_notice(&tx, &message, "cancelled", &result)?;
-        tx.commit()?;
-        drop(conn);
-        self.message(message_id)?
-            .ok_or_else(|| Error::internal("cancelled message vanished"))
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let message = self
+                .message_in(&tx, message_id)?
+                .ok_or_else(|| Error::rejected(format!("No such message '{message_id}'")))?;
+            if let Some(task) = &message.task_id {
+                return Err(Error::rejected(format!(
+                    "Message '{message_id}' is bound to task '{task}' — \
+                             `cadence task cancel {task}` owns its lifecycle"
+                )));
+            }
+            if message.state != "queued" {
+                return Err(Error::rejected(format!(
+                    "Message '{message_id}' is '{}' — only a queued message can be \
+                             cancelled (a running turn is interrupted at the provider)",
+                    message.state
+                )));
+            }
+            let result = json!({
+                "status": "cancelled", "via": "message_cancel",
+                "by": by, "reason": reason,
+            });
+            // The state guard in the UPDATE is the atomic fence against a
+            // concurrent claim between the check and the write.
+            let n = tx.execute(
+                "UPDATE messages SET state='cancelled',result=?,completed=?
+                         WHERE id=? AND state='queued'",
+                params![result.to_string(), now(), message_id],
+            )?;
+            if n == 0 {
+                return Err(Error::rejected(format!(
+                    "Message '{message_id}' left queued state before the cancel committed"
+                )));
+            }
+            Self::event(
+                &tx,
+                &message.alias,
+                "cancelled",
+                json!({"message": message_id, "by": by, "reason": reason}),
+            )?;
+            self.route_notice(&tx, &message, "cancelled", &result)?;
+            self.message_in(&*tx, message_id)?
+                .ok_or_else(|| Error::internal("cancelled message vanished"))
+        })
     }
 
     /// Routed job notification to the PM — `source='job_event'` so it
@@ -1016,7 +1018,7 @@ impl Store {
     /// once while a retried write is a no-op.
     pub(super) fn route_job_event(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         job: &Job,
         task: &Task,
         new_state: &str,
@@ -1086,13 +1088,13 @@ impl Store {
         dedupe: &str,
         note: &str,
     ) -> Result<()> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let task = self.task_in(&tx, task_id)?;
-        let job = self.job_in(&tx, &task.job_id)?;
-        self.route_job_event(&tx, &job, &task, new_state, dedupe, note)?;
-        tx.commit()?;
-        Ok(())
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let task = self.task_in(&tx, task_id)?;
+            let job = self.job_in(&tx, &task.job_id)?;
+            self.route_job_event(&tx, &job, &task, new_state, dedupe, note)?;
+            Ok(())
+        })
     }
 
     /// Task edge for `mark_running`: a task-attached kickoff observed
@@ -1103,7 +1105,7 @@ impl Store {
     /// or already-advanced task is untouched.
     pub(super) fn task_on_running(
         &self,
-        tx: &Connection,
+        tx: &impl super::StoreConn,
         message_id: &str,
         alias: &str,
     ) -> Result<()> {
@@ -1148,7 +1150,12 @@ impl Store {
     /// reaches `review` with NULL; `job task sha` repairs it. Any
     /// non-completion terminal leaves the task where it is — `job show`
     /// reports the drift and `job dispatch` starts the next revision.
-    fn task_on_completed(&self, tx: &Connection, message: &Message, result: &Value) -> Result<()> {
+    fn task_on_completed(
+        &self,
+        tx: &impl super::StoreConn,
+        message: &Message,
+        result: &Value,
+    ) -> Result<()> {
         // Only a dispatch kickoff carries the work axis: `--task`
         // follow-ups and `job_event` notifications attach `task_id`
         // for indexing but completing them must not move the task.

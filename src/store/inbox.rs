@@ -2,17 +2,18 @@
 
 use crate::adapter::registry;
 use crate::error::{Error, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::params;
 use serde_json::{json, Value};
 
 use super::agents::Agent;
 use super::messages::{row_message, Message};
+use super::StoreConn;
 use super::{now, Store};
 
 impl Store {
     /// The alias must be a passive inbox — every `cadence inbox` verb
     /// (drain, peek, ack) shares this refusal for process endpoints.
-    fn inbox_agent_in(&self, conn: &Connection, alias: &str) -> Result<Agent> {
+    fn inbox_agent_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<Agent> {
         let agent = self.agent_in(conn, alias)?;
         if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             return Err(Error::rejected(format!(
@@ -29,29 +30,27 @@ impl Store {
     /// transaction. The receipt is local mailbox history; `route_result`
     /// deliberately does not turn it into a synthetic worker notification.
     pub fn inbox_drain(&self, alias: &str, after: i64) -> Result<Vec<Message>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        self.inbox_agent_in(&tx, alias)?;
-        let mut stmt = tx.prepare(
-            "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
-             ORDER BY seq",
-        )?;
-        let pending = stmt
-            .query_map(params![alias, after], row_message)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-        for m in &pending {
-            let result = json!({"status": "completed", "via": "inbox_read"});
-            tx.execute(
-                "UPDATE messages SET state='completed',result=?,completed=?
-                 WHERE id=? AND state='queued'",
-                params![result.to_string(), now(), m.id],
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            self.inbox_agent_in(&tx, alias)?;
+            let pending = tx.query_vec(
+                "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
+                         ORDER BY seq",
+                params![alias, after],
+                row_message,
             )?;
-            Self::event(&tx, alias, "inbox_read", json!({"message": m.id}))?;
-            self.route_result(&tx, m, &result)?;
-        }
-        tx.commit()?;
-        Ok(pending)
+            for m in &pending {
+                let result = json!({"status": "completed", "via": "inbox_read"});
+                tx.execute(
+                    "UPDATE messages SET state='completed',result=?,completed=?
+                             WHERE id=? AND state='queued'",
+                    params![result.to_string(), now(), m.id],
+                )?;
+                Self::event(&tx, alias, "inbox_read", json!({"message": m.id}))?;
+                self.route_result(&tx, m, &result)?;
+            }
+            Ok(pending)
+        })
     }
 
     /// Peek at an inbox agent's queue (CAD-480): every `queued` message
@@ -63,36 +62,36 @@ impl Store {
     /// queued and countable but stop blocking the follower's head of
     /// line.
     pub fn inbox_peek(&self, alias: &str, after: i64, reader: &str) -> Result<Vec<Message>> {
-        let conn = self.conn();
-        self.inbox_agent_in(&conn, alias)?;
-        let mut stmt = conn.prepare(
-            "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
-             ORDER BY seq",
-        )?;
-        let pending = stmt
-            .query_map(params![alias, after], row_message)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-        let parked = self.inbox_parked_in(&conn, alias, reader)?;
-        Ok(pending
-            .into_iter()
-            .filter(|m| !parked.contains(&m.id))
-            .collect())
+        self.read_tx(|conn| {
+            self.inbox_agent_in(&conn, alias)?;
+            let stmt_sql = "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq>?
+                         ORDER BY seq";
+            let pending = conn
+                .query_vec(stmt_sql, params![alias, after], row_message)
+                .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let parked = self.inbox_parked_in(&conn, alias, reader)?;
+            Ok(pending
+                .into_iter()
+                .filter(|m| !parked.contains(&m.id))
+                .collect())
+        })
     }
 
     /// The message ids `reader` parked on this inbox (`inbox_park`
     /// events), as a set the peek filters out.
     fn inbox_parked_in(
         &self,
-        conn: &Connection,
+        conn: &impl super::StoreConn,
         alias: &str,
         reader: &str,
     ) -> Result<std::collections::HashSet<String>> {
-        let mut stmt =
-            conn.prepare("SELECT payload FROM events WHERE alias=? AND kind='inbox_park'")?;
-        let rows = stmt
-            .query_map([alias], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = conn.query_vec(
+            "SELECT payload FROM events WHERE alias=? AND kind='inbox_park'",
+            [alias],
+            |row| row.get::<_, String>(0),
+        )?;
         Ok(rows
             .iter()
             .filter_map(|p| serde_json::from_str::<Value>(p).ok())
@@ -117,63 +116,61 @@ impl Store {
     /// Returns the seqs this call completed and the remaining unread
     /// count.
     pub fn inbox_ack(&self, alias: &str, through: i64, reader: &str, by: &str) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        self.inbox_agent_in(&tx, alias)?;
-        let tail: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE alias=?",
-            [alias],
-            |r| r.get(0),
-        )?;
-        let through = through.min(tail);
-        let mut stmt = tx.prepare(
-            "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq<=?
-             ORDER BY seq",
-        )?;
-        let pending = stmt
-            .query_map(params![alias, through], row_message)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-        // Messages this reader parked stay queued under its own
-        // watermark too — the ack asserts consumption, and a parked
-        // message is precisely what the reader could not consume. The
-        // cursor still moves past their seqs; they stay queued and
-        // unread for the operator and other readers.
-        let parked = self.inbox_parked_in(&tx, alias, reader)?;
-        let pending: Vec<Message> = pending
-            .into_iter()
-            .filter(|m| !parked.contains(&m.id))
-            .collect();
-        let mut acked = Vec::with_capacity(pending.len());
-        for m in &pending {
-            let result =
-                json!({"status": "completed", "via": "inbox_ack", "by": by, "reader": reader});
-            tx.execute(
-                "UPDATE messages SET state='completed',result=?,completed=?
-                 WHERE id=? AND state='queued'",
-                params![result.to_string(), now(), m.id],
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            self.inbox_agent_in(&tx, alias)?;
+            let tail: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE alias=?",
+                [alias],
+                |r| r.get(0),
             )?;
-            acked.push(m.seq);
-            self.route_result(&tx, m, &result)?;
-        }
-        // The watermark event is the durable per-reader cursor — a
-        // restart reads `inbox_readers` to resume after the last ack.
-        // It is recorded even when nothing was queued, so a reader's
-        // claim past the current tail is still durable.
-        Self::event(
-            &tx,
-            alias,
-            "inbox_ack",
-            json!({"reader": reader, "through": through, "seqs": acked, "by": by}),
-        )?;
-        let unread: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'",
-            [alias],
-            |r| r.get(0),
-        )?;
-        tx.commit()?;
-        Ok(json!({"acked": acked, "through": through, "reader": reader,
-                  "unread": unread}))
+            let through = through.min(tail);
+            let pending = tx.query_vec(
+                "SELECT * FROM messages WHERE alias=? AND state='queued' AND seq<=?
+                         ORDER BY seq",
+                params![alias, through],
+                row_message,
+            )?;
+            // Messages this reader parked stay queued under its own
+            // watermark too — the ack asserts consumption, and a parked
+            // message is precisely what the reader could not consume. The
+            // cursor still moves past their seqs; they stay queued and
+            // unread for the operator and other readers.
+            let parked = self.inbox_parked_in(&tx, alias, reader)?;
+            let pending: Vec<Message> = pending
+                .into_iter()
+                .filter(|m| !parked.contains(&m.id))
+                .collect();
+            let mut acked = Vec::with_capacity(pending.len());
+            for m in &pending {
+                let result =
+                    json!({"status": "completed", "via": "inbox_ack", "by": by, "reader": reader});
+                tx.execute(
+                    "UPDATE messages SET state='completed',result=?,completed=?
+                             WHERE id=? AND state='queued'",
+                    params![result.to_string(), now(), m.id],
+                )?;
+                acked.push(m.seq);
+                self.route_result(&tx, m, &result)?;
+            }
+            // The watermark event is the durable per-reader cursor — a
+            // restart reads `inbox_readers` to resume after the last ack.
+            // It is recorded even when nothing was queued, so a reader's
+            // claim past the current tail is still durable.
+            Self::event(
+                &tx,
+                alias,
+                "inbox_ack",
+                json!({"reader": reader, "through": through, "seqs": acked, "by": by}),
+            )?;
+            let unread: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'",
+                [alias],
+                |r| r.get(0),
+            )?;
+            Ok(json!({"acked": acked, "through": through, "reader": reader,
+                              "unread": unread}))
+        })
     }
 
     /// Park one still-queued message for `reader` (CAD-480): the
@@ -190,43 +187,41 @@ impl Store {
         by: &str,
         reason: &str,
     ) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        self.inbox_agent_in(&tx, alias)?;
-        let state: Option<String> = tx
-            .query_row(
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            self.inbox_agent_in(&tx, alias)?;
+            let state: Option<String> = tx.query_opt(
                 "SELECT state FROM messages WHERE alias=? AND id=?",
                 params![alias, message],
                 |r| r.get(0),
-            )
-            .optional()?;
-        match state.as_deref() {
-            Some("queued") => {}
-            Some(s) => {
-                return Err(Error::rejected(format!(
-                    "cannot park '{message}' on '{alias}': it is {s}, not queued"
-                )))
+            )?;
+            match state.as_deref() {
+                Some("queued") => {}
+                Some(s) => {
+                    return Err(Error::rejected(format!(
+                        "cannot park '{message}' on '{alias}': it is {s}, not queued"
+                    )))
+                }
+                None => {
+                    return Err(Error::rejected(format!(
+                        "cannot park '{message}': no such message on '{alias}'"
+                    )))
+                }
             }
-            None => {
-                return Err(Error::rejected(format!(
-                    "cannot park '{message}': no such message on '{alias}'"
-                )))
-            }
-        }
-        Self::event(
-            &tx,
-            alias,
-            "inbox_park",
-            json!({"reader": reader, "message": message, "by": by,
-                   "reason": reason}),
-        )?;
-        let unread: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'",
-            [alias],
-            |r| r.get(0),
-        )?;
-        tx.commit()?;
-        Ok(json!({"parked": message, "reader": reader, "unread": unread}))
+            Self::event(
+                &tx,
+                alias,
+                "inbox_park",
+                json!({"reader": reader, "message": message, "by": by,
+                               "reason": reason}),
+            )?;
+            let unread: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'",
+                [alias],
+                |r| r.get(0),
+            )?;
+            Ok(json!({"parked": message, "reader": reader, "unread": unread}))
+        })
     }
 
     /// Reset one reader's cursor (CAD-480): the `inbox_ack_reset` event
@@ -235,17 +230,17 @@ impl Store {
     /// the cursor moves — completed messages stay completed, so nothing
     /// is lost; queued ones come back.
     pub fn inbox_ack_reset(&self, alias: &str, reader: &str, by: &str) -> Result<Value> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        self.inbox_agent_in(&tx, alias)?;
-        Self::event(
-            &tx,
-            alias,
-            "inbox_ack_reset",
-            json!({"reader": reader, "by": by}),
-        )?;
-        tx.commit()?;
-        Ok(json!({"reset": reader}))
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            self.inbox_agent_in(&tx, alias)?;
+            Self::event(
+                &tx,
+                alias,
+                "inbox_ack_reset",
+                json!({"reader": reader, "by": by}),
+            )?;
+            Ok(json!({"reset": reader}))
+        })
     }
 
     /// Per-reader consume watermarks for an inbox (CAD-480), derived
@@ -261,20 +256,19 @@ impl Store {
     }
 
     /// [`Self::inbox_readers`] on a caller-held connection.
-    fn inbox_readers_in(&self, conn: &Connection, alias: &str) -> Result<Value> {
-        let mut stmt = conn.prepare(
+    fn inbox_readers_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<Value> {
+        let rows = conn.query_vec(
             "SELECT kind, payload, at FROM events WHERE alias=?
              AND kind IN ('inbox_ack','inbox_ack_reset') ORDER BY seq",
-        )?;
-        let rows = stmt
-            .query_map([alias], |row| {
+            [alias],
+            |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, f64>(2)?,
                 ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            },
+        )?;
         let mut readers = serde_json::Map::new();
         for (kind, payload, at) in rows {
             let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);

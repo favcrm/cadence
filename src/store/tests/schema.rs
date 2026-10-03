@@ -388,16 +388,24 @@
         std::thread::scope(|scope| {
             let crashed = scope
                 .spawn(|| {
-                    let conn = s.conn();
-                    // A raw BEGIN the panic leaves open: recovery must
-                    // roll it back, not commit the next caller into it.
-                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-                    panic!("store closure panicked while holding the lock");
+                    // A panic inside a fixture-armed owner write leaves
+                    // the callback's BEGIN IMMEDIATE tx open mid-unwind;
+                    // `sealed_tx` rolls it back under TxControl and the
+                    // dropped guard still poisons the mutex for recovery.
+                    let _ = s.fixture_write(|wtx| -> Result<()> {
+                        wtx.execute("INSERT INTO events(alias,kind,payload,at) VALUES('panic-probe','probe','{}',0)", [])?;
+                        panic!("store closure panicked while holding the lock");
+                    });
                 })
                 .join();
             assert!(crashed.is_err());
         });
         assert!(s.conn.is_poisoned());
+
+        let held = s.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(held.is_autocommit(), "fixture rollback must precede poison recovery");
+        assert_eq!(held.query_row("SELECT count(*) FROM events WHERE alias='panic-probe'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        drop(held);
 
         let events = s.events(Store::DAEMON_STREAM, 0, 100).unwrap();
         assert!(!s.conn.is_poisoned());
@@ -406,7 +414,7 @@
             .filter(|e| e.kind == "store_poisoned")
             .collect();
         assert_eq!(poisoned.len(), 1, "{events:?}");
-        assert_eq!(poisoned[0].payload["rolled_back"], true);
+        assert_eq!(poisoned[0].payload["rolled_back"], false);
         // Later calls take the plain path and record nothing more.
         s.event_public("daemon", "probe", json!({})).unwrap();
         let events = s.events(Store::DAEMON_STREAM, 0, 100).unwrap();

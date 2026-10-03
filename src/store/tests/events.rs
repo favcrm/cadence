@@ -175,19 +175,20 @@
     /// naming it — `at` backdated so the rollup's age cut applies.
     fn delivery(s: &Store, alias: &str, id: &str, state: &str, events: &[(&str, f64)]) {
         s.enqueue(alias, "work", None, id, "user").unwrap();
-        let conn = s.conn();
-        conn.execute(
-            "UPDATE messages SET state=?1 WHERE id=?2",
-            params![state, id],
-        )
+        s.fixture_write(|conn| {
+            (*conn).execute(
+                "UPDATE messages SET state=?1 WHERE id=?2",
+                params![state, id],
+            )?;
+            for (kind, age) in events {
+                (*conn).execute(
+                    "INSERT INTO events(alias,kind,payload,at) VALUES(?1,?2,?3,?4)",
+                    params![alias, kind, json!({"message": id}).to_string(), now() - age],
+                )?;
+            }
+            Ok(())
+        })
         .unwrap();
-        for (kind, age) in events {
-            conn.execute(
-                "INSERT INTO events(alias,kind,payload,at) VALUES(?1,?2,?3,?4)",
-                params![alias, kind, json!({"message": id}).to_string(), now() - age],
-            )
-            .unwrap();
-        }
     }
 
     /// Every event row, oldest first: `(seq, alias, kind, payload, at)`.
@@ -300,8 +301,7 @@
         reg(&s, "a1", &dir.path().join("w"));
         delivery(&s, "a1", "m-done", "completed", &[]);
         let old = now() - 30.0 * DAY;
-        {
-            let conn = s.conn();
+        s.fixture_write(|conn| {
             for kind in [
                 "turn_started",
                 "turn_finished",
@@ -316,20 +316,20 @@
                 "agent_gc_removed",
                 "a_kind_added_later",
             ] {
-                conn.execute(
+                (*conn).execute(
                     "INSERT INTO events(alias,kind,payload,at) VALUES('a1',?1,?2,?3)",
                     params![kind, json!({"message": "m-done"}).to_string(), old],
-                )
-                .unwrap();
+                )?;
             }
             // A delivery row a job view reads stays in that view.
-            conn.execute(
+            (*conn).execute(
                 "INSERT INTO events(alias,kind,payload,job_id,task_id,at)
                  VALUES('a1','submitted',?1,'job-1','job-1-impl',?2)",
                 params![json!({"message": "m-done"}).to_string(), old],
-            )
-            .unwrap();
-        }
+            )?;
+            Ok(())
+        })
+        .unwrap();
         for (id, state) in [
             ("m-queued", "queued"),
             ("m-submitting", "submitting"),
