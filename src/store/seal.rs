@@ -1662,6 +1662,93 @@ mod tests {
         (db.clone(), Store::open(&db).unwrap())
     }
 
+    fn forensic_refusal_releases_writer(case: &str) {
+        let dir = TempDir::new().unwrap();
+        let (db, store) = open_legacy(&dir);
+        let sibling = Connection::open(&db).unwrap();
+        sibling.busy_timeout(std::time::Duration::ZERO).unwrap();
+        sibling.execute_batch(SEAL_SCHEMA).unwrap();
+        let closed = if case == "sealed" { 1 } else { 2 };
+        sibling
+            .execute(
+                "INSERT INTO closure_state(id,closed) VALUES(1,?1)",
+                [closed],
+            )
+            .unwrap();
+        if case == "read_error" {
+            let conn = store.conn.lock().unwrap();
+            let state = store.seal_state.clone();
+            // Inject a real SQLite authorization error for the latch preflight.
+            // Keep the production transaction-control denial: an implicit
+            // rollback outside ControlPhase must still fail in the red case.
+            conn.authorizer(Some(
+                move |ctx: rusqlite::hooks::AuthContext<'_>| match ctx.action {
+                    AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => {
+                        if state.phase.load(Ordering::SeqCst) == GuardState::TX_CONTROL {
+                            Authorization::Allow
+                        } else {
+                            Authorization::Deny
+                        }
+                    }
+                    AuthAction::Read { table_name, .. }
+                        if table_name == "sqlite_master" || table_name == "sqlite_schema" =>
+                    {
+                        Authorization::Deny
+                    }
+                    _ => Authorization::Allow,
+                },
+            ));
+            assert!(preflight_read(&conn).is_err());
+        }
+        std::thread::scope(|scope| {
+            assert!(scope
+                .spawn(|| {
+                    let _held = store.conn.lock().unwrap();
+                    panic!("poison a clean connection before unsafe forensic refusal");
+                })
+                .join()
+                .is_err());
+        });
+        assert!(store.conn.is_poisoned());
+        let recovered = store.conn();
+        assert!(
+            recovered.is_autocommit(),
+            "{case}: forensic refusal stranded a transaction"
+        );
+        install_authorizer(&recovered, store.seal_state.clone());
+        let forensic_rows: i64 = recovered
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='store_poisoned'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            forensic_rows, 0,
+            "{case}: unsafe latch received a forensic write"
+        );
+        assert!(recovered.execute_batch("BEGIN IMMEDIATE").is_err());
+        drop(recovered);
+        assert!(!store.conn.is_poisoned());
+        // A second actual connection must acquire the writer immediately.
+        sibling.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn forensic_sealed_refusal_releases_writer() {
+        forensic_refusal_releases_writer("sealed");
+    }
+
+    #[test]
+    fn forensic_malformed_refusal_releases_writer() {
+        forensic_refusal_releases_writer("malformed");
+    }
+
+    #[test]
+    fn forensic_read_error_refusal_releases_writer() {
+        forensic_refusal_releases_writer("read_error");
+    }
+
     /// A synthetic owner-maintenance permit bound to `db` — the only way
     /// tests authorize `propose_close`/`witness_commit`. Far-future
     /// deadline so expiry is not under test here.
