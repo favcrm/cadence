@@ -755,3 +755,144 @@ fn cad782_http_verb_path_matrix() {
     );
     assert_eq!(before["content"], created["content"]);
 }
+
+// ---- CAD-1056: the HTML/text save over the board ----
+
+const HTTP_HTML: &str = "<h1 onclick=\"x()\">Hi {{first_name|friend}}</h1><script>alert(1)</script><a href=\"javascript:alert(1)\">bad</a><img src=\"https://t.example/p.gif\" width=\"1\" height=\"1\"><p>Body</p>";
+
+#[test]
+fn cad1056_http_html_save_matches_rpc_and_is_as_strict() {
+    let b = Board::new();
+    let base = b.base();
+    let saved = b.value(
+        "POST",
+        &format!("{base}/campaigns"),
+        json!({"campaign_id": "launch-h", "subject": "Own", "html": HTTP_HTML, "text": "Plain {{first_name|friend}}"}),
+    );
+    let doc = &saved["content"];
+    assert_eq!(doc["mode"], "html");
+    let stored = doc["html"].as_str().unwrap();
+    for bad in ["<script", "onclick", "javascript:", "t.example"] {
+        assert!(!stored.contains(bad), "{bad} stored: {stored}");
+    }
+    // Same bytes as the daemon RPC, and the render keeps the host footer.
+    assert_eq!(b.rpc_show("launch-h")["content"], *doc);
+    let rendered = b.value(
+        "POST",
+        &format!("{base}/campaigns/launch-h/render"),
+        json!({"sample_first_name": "Amina"}),
+    );
+    assert!(rendered["render"]["html"]
+        .as_str()
+        .unwrap()
+        .contains("Unsubscribe</a>"));
+    assert_eq!(rendered["render"]["send_ready"], false);
+    assert!(rendered["render"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Plain Amina"));
+
+    // Stale CAS, both-or-neither body and footer spoof refuse over HTTP
+    // exactly as on the RPC, and nothing mutates.
+    let refusals = [
+        json!({"campaign_id": "launch-h", "subject": "x", "html": "<p>x</p>"}),
+        json!({"campaign_id": "launch-h", "subject": "x", "html": "<p>x</p>", "expected_revision": 9}),
+        json!({"campaign_id": "launch-h", "subject": "x", "expected_revision": 1}),
+        json!({"campaign_id": "launch-h", "subject": "x", "html": "<p>x</p>", "blocks": blocks(), "expected_revision": 1}),
+        json!({"campaign_id": "launch-h", "subject": "x", "html": "<a href=\"https://e.example/unsubscribe\">u</a>", "expected_revision": 1}),
+        json!({"campaign_id": "launch-h", "subject": "x", "html": "<script>1</script>", "expected_revision": 1}),
+    ];
+    for body in refusals {
+        let (code, text) = b.operator("POST", &format!("{base}/campaigns"), &body.to_string());
+        assert!((400..500).contains(&code), "{body} admitted: {code} {text}");
+    }
+    // Forged identity/derived fields refuse at the transport schema.
+    for forged in [
+        json!({"actor": "operator"}),
+        json!({"by": "operator"}),
+        json!({"sanitized_html": "<p>x</p>"}),
+        json!({"content_digest": "abc"}),
+        json!({"install_id": "other"}),
+    ] {
+        let mut body = json!({"campaign_id": "launch-h", "subject": "x", "html": "<p>x</p>", "expected_revision": 1});
+        for (k, v) in forged.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        assert_eq!(
+            b.operator("POST", &format!("{base}/campaigns"), &body.to_string())
+                .0,
+            400,
+            "forged {forged}"
+        );
+    }
+    assert_eq!(b.rpc_show("launch-h")["content"], *doc);
+
+    // A good second save bumps the revision and resets approval.
+    b.daemon
+        .operator_rpc("app_content_approve", json!({"install_id": b.install, "context_id": b.context_id, "campaign_id": "launch-h", "expected_revision": 1}))
+        .unwrap();
+    let again = b.value(
+        "POST",
+        &format!("{base}/campaigns"),
+        json!({"campaign_id": "launch-h", "subject": "Own", "html": "<p>Second</p>", "expected_revision": 1}),
+    );
+    assert_eq!(again["content"]["revision"], 2);
+    assert_eq!(again["content"]["approval"]["valid"], false);
+}
+
+#[test]
+fn cad1056_http_html_save_agent_and_detached_get_403() {
+    let b = Board::new();
+    let base = b.base();
+    let created = b.value(
+        "POST",
+        &format!("{base}/campaigns"),
+        json!({"campaign_id": "launch-1", "subject": "Spring launch", "blocks": blocks()}),
+    );
+    let mut lane = LaneShell::spawn(b.root.path());
+    plant_member_pane(
+        &b.daemon,
+        "content-html-http-worker",
+        "claude",
+        None,
+        lane.pid(),
+    );
+    let bodies = [
+        json!({"campaign_id": "launch-1", "subject": "Evil", "html": HTTP_HTML, "expected_revision": 1}),
+        json!({"campaign_id": "launch-evil", "subject": "Evil", "html": HTTP_HTML, "text": "evil"}),
+    ];
+    let mut failures = Vec::new();
+    for prefix in ["", "setsid "] {
+        for body in &bodies {
+            let stolen =
+                common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &b.daemon.state, b.port);
+            let wire =
+                stolen.request_as("POST", &format!("{base}/campaigns"), &body.to_string(), "");
+            let file = lane
+                .dir
+                .path()
+                .join(format!("html-request-{}.txt", lane.seq));
+            std::fs::write(&file, wire).unwrap();
+            let (rc, response) = lane.run(&format!("{prefix}python3 -c 'import socket,sys;s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {} {}", b.port, file.display()));
+            assert_eq!(rc, 0);
+            let status = response.split_whitespace().nth(1).unwrap_or("missing");
+            if status != "403" {
+                failures.push(format!("{prefix:?} {body}: {status}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "HTML save peer guard failed: {failures:?}"
+    );
+    // Sessionless write refuses too.
+    let host = common::op::board_host(b.port);
+    let raw = json!({"campaign_id": "launch-1", "subject": "x", "html": "<p>x</p>", "expected_revision": 1}).to_string();
+    let bare = format!("POST {base}/campaigns HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{raw}", raw.len());
+    assert_eq!(
+        common::op::raw(b.port, &bare).0,
+        403,
+        "sessionless HTML save admitted"
+    );
+    assert_eq!(b.rpc_show("launch-1")["content"], created["content"]);
+}

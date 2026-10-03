@@ -151,6 +151,7 @@ CREATE TABLE IF NOT EXISTS app_content_docs(
  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
  approval_revision INTEGER, approval_digest TEXT,
  actor TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+ html TEXT, text_override TEXT,
  PRIMARY KEY(context_id, campaign_id));
 CREATE TABLE IF NOT EXISTS app_content_revisions(
  context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
@@ -158,7 +159,7 @@ CREATE TABLE IF NOT EXISTS app_content_revisions(
  subject TEXT NOT NULL, preheader TEXT NOT NULL,
  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
  actor TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('operator','proposal')),
- proposal_id TEXT, at REAL NOT NULL,
+ proposal_id TEXT, at REAL NOT NULL, html TEXT, text_override TEXT,
  PRIMARY KEY(context_id, campaign_id, revision));
 CREATE TABLE IF NOT EXISTS app_content_proposals(
  context_id TEXT NOT NULL, proposal_id TEXT NOT NULL,
@@ -574,6 +575,7 @@ impl RecordStore {
                  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
                  approval_revision INTEGER, approval_digest TEXT,
                  actor TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+                 html TEXT, text_override TEXT,
                  PRIMARY KEY(context_id, campaign_id));
                  CREATE TABLE IF NOT EXISTS app_content_revisions(
                  context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
@@ -581,7 +583,7 @@ impl RecordStore {
                  subject TEXT NOT NULL, preheader TEXT NOT NULL,
                  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
                  actor TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('operator','proposal')),
-                 proposal_id TEXT, at REAL NOT NULL,
+                 proposal_id TEXT, at REAL NOT NULL, html TEXT, text_override TEXT,
                  PRIMARY KEY(context_id, campaign_id, revision));
                  CREATE TABLE IF NOT EXISTS app_content_proposals(
                  context_id TEXT NOT NULL, proposal_id TEXT NOT NULL,
@@ -663,6 +665,27 @@ impl RecordStore {
                         "ALTER TABLE app_content_proposals ADD COLUMN {column} TEXT"
                     ))
                     .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+                }
+            }
+            // CAD-1056: operator HTML body and plain-text override
+            // ride the doc and its immutable revisions. Older files
+            // gain nullable columns; blocks-mode rows keep NULLs.
+            for table in ["app_content_docs", "app_content_revisions"] {
+                for column in ["html", "text_override"] {
+                    let probe = format!("SELECT {column} FROM {table} LIMIT 0");
+                    let missing = match conn.prepare(&probe) {
+                        Ok(_) => false,
+                        Err(error) if is_contention(&error) => {
+                            return Err(Error::internal("record file is busy"));
+                        }
+                        Err(_) => true,
+                    };
+                    if missing {
+                        conn.execute_batch(&format!(
+                            "ALTER TABLE {table} ADD COLUMN {column} TEXT"
+                        ))
+                        .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+                    }
                 }
             }
             conn.execute_batch(

@@ -60,6 +60,35 @@ fn content_draft(params: &Value) -> Result<Draft> {
         .map_err(|_| Error::rejected("email content exceeds its supported shape or bounds"))
 }
 
+/// CAD-1056: the operator save body is exactly one of `blocks`
+/// (structured) or `html` (pasted, host-sanitised), plus an optional
+/// plain-text override. Proposals keep the blocks-only `content_draft`.
+fn content_save_draft(params: &Value) -> Result<Draft> {
+    let subject = required_str(params, "subject")?;
+    let preheader = match params.get("preheader") {
+        None => "",
+        Some(Value::String(text)) => text.as_str(),
+        Some(_) => return Err(Error::rejected("email preheader must be a string")),
+    };
+    let text = match params.get("text") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.as_str()),
+        Some(_) => return Err(Error::rejected("email plain text must be a string")),
+    };
+    let draft = match (params.get("blocks"), params.get("html")) {
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(Error::rejected(
+                "email content needs exactly one of blocks or html",
+            ));
+        }
+        (Some(_), None) => content_draft(params)?,
+        (None, Some(Value::String(html))) => Draft::parse_html(subject, preheader, html)
+            .map_err(|_| Error::rejected("email HTML exceeds its supported shape or bounds"))?,
+        (None, Some(_)) => return Err(Error::rejected("email HTML must be a string")),
+    };
+    draft.with_text(text)
+}
+
 fn content_expected(params: &Value) -> Result<Option<i64>> {
     match params.get("expected_revision") {
         None => Ok(None),
@@ -162,6 +191,8 @@ impl Shared {
                 "subject",
                 "preheader",
                 "blocks",
+                "html",
+                "text",
                 "expected_revision",
             ],
             "app_content_show" => &["install_id", "context_id", "campaign_id"],
@@ -267,7 +298,7 @@ impl Shared {
                 context,
                 required_str(params, "campaign_id")?,
                 content_expected(params)?,
-                &content_draft(params)?,
+                &content_save_draft(params)?,
             ),
             "app_content_show" => {
                 records.app_content_show(context, required_str(params, "campaign_id")?)

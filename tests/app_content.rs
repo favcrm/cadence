@@ -872,3 +872,358 @@ fn cad782_binding_reads_are_classified_reads_not_writes() {
         );
     }
 }
+
+// ---- CAD-1056: operator HTML / plain-text content write path ----
+
+const HOSTILE_HTML: &str = concat!(
+    "<h1 onclick=\"steal()\">Big news {{first_name|friend}}</h1>",
+    "<script>alert(1)</script>",
+    "<p style=\"color:#336699;position:fixed\">Read <a href=\"javascript:alert(1)\">bad</a> ",
+    "<a href=\"https://example.com/post\" onmouseover=\"x()\">good</a></p>",
+    "<img src=\"https://track.example/p.gif\" width=\"1\" height=\"1\">",
+    "<img src=\"https://example.com/hero.png\" width=\"600\" alt=\"hero\">",
+    "<iframe src=\"https://evil.example\"></iframe>",
+    "<form action=\"https://evil.example\"><input name=a><button>go</button></form>",
+    "<!--[if mso]><script>x()</script><![endif]-->",
+    "<meta http-equiv=\"refresh\" content=\"0;url=https://evil.example\">",
+);
+
+fn html_save(
+    w: &Content,
+    install: &str,
+    context: &str,
+    campaign: &str,
+    rev: Option<u64>,
+    html: &str,
+) -> cadence_agent::Result<Value> {
+    let mut params = json!({"install_id": install, "context_id": context, "campaign_id": campaign, "subject": "Own words", "preheader": "News", "html": html});
+    if let Some(expected) = rev {
+        params["expected_revision"] = json!(expected);
+    }
+    w.daemon.operator_rpc("app_content_save", params)
+}
+
+fn assert_clean_render(html: &str) {
+    for bad in [
+        "<script",
+        "alert(1)",
+        "onclick",
+        "onmouseover",
+        "javascript:",
+        "<iframe",
+        "<form",
+        "<input",
+        "<button",
+        "http-equiv",
+        "track.example",
+        "<!--",
+        "position:fixed",
+    ] {
+        assert!(
+            !html.contains(bad),
+            "{bad} survived into the render: {html}"
+        );
+    }
+}
+
+#[test]
+fn cad1056_html_save_sanitises_stores_and_renders_with_host_footer() {
+    let w = Content::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-content-h1");
+    let context_id = context["id"].as_str().unwrap();
+
+    let saved = html_save(&w, install, context_id, "launch-h", None, HOSTILE_HTML).unwrap();
+    let doc = &saved["content"];
+    assert_eq!(doc["revision"], 1);
+    assert_eq!(doc["mode"], "html");
+    let stored = doc["html"].as_str().unwrap();
+    assert_clean_render(stored);
+    assert!(stored.contains("https://example.com/post") && stored.contains("hero.png"));
+    assert!(stored.contains("color:#336699"));
+    assert!(doc["content_digest"].as_str().unwrap().len() >= 32);
+    assert_eq!(doc["approval"]["valid"], false);
+
+    let render = w
+        .daemon
+        .operator_rpc(
+            "app_content_render",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-h", "sample_first_name": "Amina"}),
+        )
+        .unwrap()["render"]
+        .clone();
+    let html = render["html"].as_str().unwrap();
+    assert_clean_render(html);
+    assert!(html.contains("Big news Amina"));
+    // The host footer is always appended after the operator body and
+    // cannot be moved, removed or spoofed.
+    let footer = html
+        .find("Unsubscribe</a>")
+        .expect("host unsubscribe footer");
+    assert!(footer > html.find("Big news").unwrap());
+    assert_eq!(html.matches("Unsubscribe</a>").count(), 1);
+    assert_eq!(render["preview_only"], true);
+    assert_eq!(render["send_ready"], false);
+    let text = render["text"].as_str().unwrap();
+    assert!(text.contains("Big news Amina") && text.contains("Unsubscribe: "));
+    assert!(!text.contains("alert(1)") && !text.contains("<h1") && !text.contains("<p"));
+
+    // Optional plain-text override replaces only the generated body
+    // text; the host footer is still appended and the digest moves.
+    let mut params = json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-h", "subject": "Own words", "html": HOSTILE_HTML, "text": "Plain words for {{first_name|friend}}", "expected_revision": 1});
+    let overridden = w
+        .daemon
+        .operator_rpc("app_content_save", params.clone())
+        .unwrap();
+    assert_eq!(
+        overridden["content"]["text_override"],
+        "Plain words for {{first_name|friend}}"
+    );
+    assert_ne!(
+        overridden["content"]["content_digest"],
+        doc["content_digest"]
+    );
+    let render = w
+        .daemon
+        .operator_rpc(
+            "app_content_render",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-h", "sample_first_name": "Amina"}),
+        )
+        .unwrap()["render"]
+        .clone();
+    let text = render["text"].as_str().unwrap();
+    assert!(text.contains("Plain words for Amina") && !text.contains("Big news"));
+    assert!(text.contains("Unsubscribe: "));
+    // Blocks plus a text override is the same verb.
+    params = json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-h", "subject": "Blocks", "blocks": blocks(), "text": "Just text", "expected_revision": 2});
+    let blocks_text = w.daemon.operator_rpc("app_content_save", params).unwrap();
+    assert_eq!(blocks_text["content"]["mode"], "blocks");
+    assert_eq!(blocks_text["content"]["text_override"], "Just text");
+}
+
+#[test]
+fn cad1056_html_save_refuses_bad_shapes_without_mutation() {
+    let w = Content::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-content-h2");
+    let context_id = context["id"].as_str().unwrap();
+    let created = w.save(install, context_id, "launch-1", None);
+    let footer = "You received this because you subscribed via Cadence CRM.";
+    let big = format!("<p>{}</p>", "x".repeat(110_000));
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "both blocks and html",
+            json!({"blocks": blocks(), "html": "<p>x</p>"}),
+        ),
+        ("neither", json!({})),
+        ("html not a string", json!({"html": ["<p>x</p>"]})),
+        ("script only", json!({"html": "<script>alert(1)</script>"})),
+        ("oversize", json!({"html": big})),
+        (
+            "footer sentence",
+            json!({"html": format!("<p>{footer}</p>")}),
+        ),
+        (
+            "own unsubscribe link",
+            json!({"html": "<a href=\"https://e.example/unsubscribe\">Unsubscribe</a>"}),
+        ),
+        ("bad token", json!({"html": "<p>{{last_name|x}}</p>"})),
+        (
+            "text with footer",
+            json!({"html": "<p>ok</p>", "text": footer}),
+        ),
+        (
+            "text with control",
+            json!({"html": "<p>ok</p>", "text": "a\u{7}b"}),
+        ),
+        (
+            "text oversize",
+            json!({"html": "<p>ok</p>", "text": "x".repeat(40_000)}),
+        ),
+        ("text not string", json!({"html": "<p>ok</p>", "text": 5})),
+    ];
+    for (label, extra) in cases {
+        let mut params = json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "subject": "Hi", "expected_revision": 1});
+        for (k, v) in extra.as_object().unwrap() {
+            params[k] = v.clone();
+        }
+        assert!(
+            w.daemon.operator_rpc("app_content_save", params).is_err(),
+            "{label} was admitted"
+        );
+    }
+    assert_eq!(
+        w.show(install, context_id, "launch-1")["content"],
+        created["content"]
+    );
+}
+
+#[test]
+fn cad1056_html_save_cas_approval_reset_and_concurrency() {
+    let w = Content::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-content-h3");
+    let context_id = context["id"].as_str().unwrap();
+    w.save(install, context_id, "launch-1", None);
+    w.daemon
+        .operator_rpc(
+            "app_content_approve",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "expected_revision": 1}),
+        )
+        .unwrap();
+    assert_eq!(
+        w.show(install, context_id, "launch-1")["content"]["approval"]["valid"],
+        true
+    );
+
+    // Blind and stale HTML overwrites refuse and change nothing.
+    for rev in [None, Some(7)] {
+        assert!(html_save(&w, install, context_id, "launch-1", rev, "<p>x</p>").is_err());
+    }
+    assert_eq!(
+        w.show(install, context_id, "launch-1")["content"]["revision"],
+        1
+    );
+    assert_eq!(
+        w.show(install, context_id, "launch-1")["content"]["approval"]["valid"],
+        true
+    );
+
+    // A successful HTML save always invalidates the approval.
+    let saved = html_save(
+        &w,
+        install,
+        context_id,
+        "launch-1",
+        Some(1),
+        "<p>New words</p>",
+    )
+    .unwrap();
+    assert_eq!(saved["content"]["revision"], 2);
+    assert_eq!(saved["content"]["approval"]["valid"], false);
+    assert!(saved["content"]["approval"]["revision"].is_null());
+    // Send preparation refuses on the unapproved revision.
+    assert!(w
+        .daemon
+        .operator_rpc(
+            "app_content_send_prepare",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "binding_id": "preview"}),
+        )
+        .is_err());
+    // The superseded revision stays renderable and immutable.
+    let old = w
+        .daemon
+        .operator_rpc(
+            "app_content_render",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "revision": 1}),
+        )
+        .unwrap();
+    assert!(old["render"]["html"]
+        .as_str()
+        .unwrap()
+        .contains("A calm first line."));
+
+    // Concurrent HTML saves at one observed revision: exactly one wins.
+    let results = std::thread::scope(|scope| {
+        (0..6)
+            .map(|n| {
+                let w = &w;
+                scope.spawn(move || {
+                    html_save(
+                        w,
+                        install,
+                        context_id,
+                        "launch-1",
+                        Some(2),
+                        &format!("<p>Racer {n}</p>"),
+                    )
+                    .is_ok()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        results.iter().filter(|ok| **ok).count(),
+        1,
+        "concurrent HTML CAS admitted {results:?}"
+    );
+    assert_eq!(
+        w.show(install, context_id, "launch-1")["content"]["revision"],
+        3
+    );
+}
+
+#[test]
+fn cad1056_agent_detached_and_forged_callers_cannot_save_html() {
+    let w = Content::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-content-h4");
+    let context_id = context["id"].as_str().unwrap();
+    w.save(install, context_id, "launch-1", None);
+    let before = w.show(install, context_id, "launch-1");
+
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "content-html-worker", "claude", None, lane.pid());
+    let evil = json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "subject": "Evil", "html": "<p>evil</p>", "text": "evil", "expected_revision": 1});
+    let frame = lane.rpc(&w.daemon.state, "app_content_save", evil.clone());
+    assert_eq!(frame["ok"], false, "agent saved HTML");
+    assert!(frame.to_string().contains("operator"), "{frame}");
+    // New campaign too.
+    let mut fresh = evil.clone();
+    fresh["campaign_id"] = json!("launch-evil");
+    fresh.as_object_mut().unwrap().remove("expected_revision");
+    assert_eq!(
+        lane.rpc(&w.daemon.state, "app_content_save", fresh)["ok"],
+        false
+    );
+
+    // A detached child of the agent is unproven and refused.
+    let request = lane.dir.path().join("detached-html.json");
+    std::fs::write(
+        &request,
+        cadence_agent::proto::request("app_content_save", evil).to_string(),
+    )
+    .unwrap();
+    let (rc, output) = lane.run(&format!("setsid python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");print(s.makefile().readline())' {} {}", cadence_agent::client::socket_path(&w.daemon.state).display(), request.display()));
+    assert_eq!(rc, 0);
+    let frame: Value = serde_json::from_str(output.trim()).unwrap();
+    assert_eq!(frame["ok"], false);
+    assert!(frame.to_string().contains("operator"));
+
+    // Forged identity, receipt and routing fields refuse even on the
+    // operator connection: the grammar is exact.
+    for forged in [
+        json!({"actor": "operator"}),
+        json!({"by": "operator"}),
+        json!({"assistant_receipt": "r"}),
+        json!({"turn_id": "t", "nonce": "n"}),
+        json!({"workspace": "w"}),
+        json!({"origin": "operator"}),
+        json!({"sanitized": true}),
+        json!({"content_digest": "abc"}),
+    ] {
+        let mut params = json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "subject": "Hi", "html": "<p>ok</p>", "expected_revision": 1});
+        for (k, v) in forged.as_object().unwrap() {
+            params[k] = v.clone();
+        }
+        assert!(
+            w.daemon.operator_rpc("app_content_save", params).is_err(),
+            "forged {forged} admitted"
+        );
+    }
+    assert_eq!(w.show(install, context_id, "launch-1"), before);
+    assert!(w
+        .daemon
+        .operator_rpc(
+            "app_content_show",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-evil"})
+        )
+        .is_err());
+}
