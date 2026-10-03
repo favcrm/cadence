@@ -38,8 +38,11 @@ const block = history.publish_intents!;
 check(block.status === "ok" && block.withheld === 0 && block.rows.map(r => r.intent_id).join() === "i1,i2,i3",
   "same-run cancelled history and multiple destinations stay separate rows");
 check(block.rows[0].state === "cancelled" && block.rows[2].destination_id === "dest-b", "intent state and destination are verbatim");
-check(Object.keys(block.rows[0]).sort().join() === "channel,context_id,destination_id,due_epoch,effect_id,install_id,intent_id,run_id,state,timezone",
+check(Object.keys(shapeFor(history, true)!.publish_intents!.rows[0]).sort().join() === "channel,context_id,destination_id,due_epoch,effect_id,install_id,intent_id,run_id,state,timezone",
   "intent rows are closed");
+// CAD-1123: the host-side projection rows add only the two screen.v2 keys, when present.
+check(block.rows.every(row => Object.keys(row).every(key => ["channel", "context_id", "destination_id", "due_epoch", "effect_id",
+  "install_id", "intent_id", "permalink", "refusal", "run_id", "state", "timezone"].includes(key))), "projection intent rows are closed");
 check(!JSON.stringify(history).includes("PRIVATE"), "grant, approval, key, receipt and upstream never pushed");
 check(history.runs.every(r => r.context_id === "brand") && history.outbox[0].run_id === "run" && history.outbox[0].context_id === "brand",
   "runs and effects carry full linkage identity");

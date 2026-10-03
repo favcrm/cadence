@@ -44,6 +44,8 @@ pub struct ScreenPackage {
     pub assets: BTreeMap<String, String>,
     /// The declared `app` tag the package was reviewed as.
     pub app: String,
+    /// The declared remote image sets (host-listed names only).
+    pub remote_images: Vec<String>,
 }
 
 /// `true` when `tag` is a legal screen tag (the bundle's tag grammar).
@@ -146,6 +148,7 @@ pub fn extract(files: &BTreeMap<String, String>, tag: &str) -> Result<ScreenPack
         manifest,
         assets,
         app: checked.app().to_string(),
+        remote_images: checked.remote_images().to_vec(),
     })
 }
 
@@ -237,5 +240,33 @@ mod tests {
         files.insert("screens/c/screens.json".to_string(), decl);
         let tags = tags_in(&files).unwrap();
         assert_eq!(tags, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn cad1123_remote_images_declare_only_host_listed_sets() {
+        let js = "x";
+        let with = |sets: serde_json::Value| {
+            let mut decl: serde_json::Value =
+                serde_json::from_str(&decl(&[("client.js", js)])).unwrap();
+            decl["remote_images"] = sets;
+            bundle_with("a", &decl.to_string(), &[("client.js", js)])
+        };
+        let pkg = extract(&with(json!(["instagram-cdn"])), "a").unwrap();
+        assert_eq!(pkg.remote_images, vec!["instagram-cdn".to_string()]);
+        assert!(extract(&with(json!([])), "a")
+            .unwrap()
+            .remote_images
+            .is_empty());
+        let plain = bundle_with("a", &decl(&[("client.js", js)]), &[("client.js", js)]);
+        assert!(extract(&plain, "a").unwrap().remote_images.is_empty());
+        for bad in [
+            json!(["https://*.cdninstagram.com"]),
+            json!(["evil"]),
+            json!(["instagram-cdn", "instagram-cdn"]),
+            json!("instagram-cdn"),
+            json!([1]),
+        ] {
+            assert!(extract(&with(bad.clone()), "a").is_err(), "admitted {bad}");
+        }
     }
 }

@@ -1180,3 +1180,38 @@ fn cad778_benign_floats_round_trip_exactly() {
         assert_eq!(material_digest(&reparsed), digest);
     }
 }
+
+#[test]
+fn cad1123_run_approval_is_recorded_durably_with_time_and_derived_actor() {
+    let (_dir, s, run) = runtime_fixture();
+    let id = run["id"].as_str().unwrap();
+    assert!(
+        run.get("approval").is_none(),
+        "an unapproved run has no approval record"
+    );
+    assert!(run["created"].as_i64().unwrap() > 0 && run["updated"].as_i64().unwrap() > 0);
+    // A refused approval leaves no record.
+    assert!(s
+        .app_run_decide(id, Some("forged"), false, Some("sha256:bundle"))
+        .is_err());
+    assert!(s.app_run_show(id).unwrap().get("approval").is_none());
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
+    // The pruned daemon stream does not hold it.
+    s.prune_stream(Store::DAEMON_STREAM, 0).unwrap();
+    let shown = s.app_run_show(id).unwrap();
+    assert_eq!(shown["approval"]["by"], "operator");
+    let at = shown["approval"]["at"].as_i64().unwrap();
+    assert!(at >= run["created"].as_i64().unwrap() && at > 0);
+    // Another run's approval never leaks onto this run.
+    assert!(s.app_run_list(Some("install-1")).unwrap()["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["id"] == id || r.get("approval").is_none()));
+}

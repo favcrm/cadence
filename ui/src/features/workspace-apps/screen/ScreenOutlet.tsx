@@ -1,14 +1,16 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { sessionHeaders } from "../../../lib/sessionKey";
-import { parseMount, ScreenChannel } from "./screenLifecycle";
+import { parseMount, ScreenChannel, type AssetLoader } from "./screenLifecycle";
 import type { ScreenPush } from "./screenProtocol";
 
 /** App code lives in its independently installed bundle, never in the board. */
-export default function ScreenOutlet({ projection, fallback }: { projection: ScreenPush; fallback: ReactNode }) {
+export default function ScreenOutlet({ projection, fallback, loadAsset }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader }) {
   const container = useRef<HTMLDivElement>(null);
   const channel = useRef<ScreenChannel | null>(null);
   const latest = useRef(projection);
   latest.current = projection;
+  const loader = useRef(loadAsset);
+  loader.current = loadAsset;
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
   const scope = JSON.stringify([projection.install_id, projection.digest, projection.tag, projection.context_id]);
   useLayoutEffect(() => {
@@ -42,7 +44,8 @@ export default function ScreenOutlet({ projection, fallback }: { projection: Scr
         container.current.replaceChildren(frame);
         if (!frame.contentWindow) throw new Error("Screen frame unavailable");
         owned = new ScreenChannel(frame.contentWindow, receipt, latest.current,
-          () => frame.remove(), fail, () => { if (!retired) { clearTimeout(timer); setState("ready"); } });
+          () => frame.remove(), fail, () => { if (!retired) { clearTimeout(timer); setState("ready"); } },
+          ref => loader.current ? loader.current(ref) : Promise.resolve(null));
         channel.current = owned;
         frame.addEventListener("load", () => owned?.load());
         timer = setTimeout(() => { owned?.close(true); }, 10000);

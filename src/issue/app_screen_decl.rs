@@ -70,6 +70,25 @@ const CONTRACT: &str = "app-screens/v1";
 /// asset.
 const ENTRY: &str = "client.js";
 
+/// CAD-1123 (operator decision Q1): the closed set of named remote image
+/// origins a screen may opt into with `remote_images`. A declaration
+/// names a set, never a host, so a package cannot widen the frame's
+/// egress beyond what the host lists here. The browser loads these
+/// directly into the frame; the daemon never fetches them.
+const REMOTE_IMAGE_SETS: &[(&str, &[&str])] = &[(
+    "instagram-cdn",
+    &["https://*.cdninstagram.com", "https://*.fbcdn.net"],
+)];
+
+/// The CSP `img-src` sources one declared remote image set admits, or
+/// `None` for a name the host does not list.
+pub fn remote_image_sources(name: &str) -> Option<&'static [&'static str]> {
+    REMOTE_IMAGE_SETS
+        .iter()
+        .find(|(set, _)| *set == name)
+        .map(|(_, hosts)| *hosts)
+}
+
 /// A declaration that passed every check [`validate_map`] makes.
 ///
 /// Carries small validated metadata only — never asset bodies and
@@ -85,9 +104,15 @@ pub struct IntegrityCheckedScreen {
     source_digest: String,
     sdk_digest: String,
     toolchain_digest: String,
+    remote_images: Vec<String>,
 }
 
 impl IntegrityCheckedScreen {
+    /// The declared remote image sets — each a name in the host's closed
+    /// list, distinct; empty unless the screen opted in.
+    pub fn remote_images(&self) -> &[String] {
+        &self.remote_images
+    }
     /// The declared app tag (`model::valid_tag` grammar).
     pub fn app(&self) -> &str {
         &self.app
@@ -130,6 +155,10 @@ struct RawDecl {
     /// Optional; `null`, a non-array or any member refuses.
     #[serde(default)]
     may: Vec<Value>,
+    /// Optional named remote image sets (CAD-1123); each must be a host
+    /// listed set, without repeats.
+    #[serde(default)]
+    remote_images: Vec<String>,
 }
 
 /// One declared asset member — closed, all four fields required.
@@ -227,6 +256,7 @@ pub fn validate_map(
         source_digest: decl.provenance.source_digest,
         sdk_digest: decl.provenance.sdk_digest,
         toolchain_digest: decl.provenance.toolchain_digest,
+        remote_images: decl.remote_images,
     })
 }
 
@@ -332,6 +362,19 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
         return Err(Error::rejected(
             "`may` declares no methods — only an empty array (or its absence) is accepted",
         ));
+    }
+    let mut sets = HashSet::new();
+    for name in &decl.remote_images {
+        if remote_image_sources(name).is_none() {
+            return Err(Error::rejected(format!(
+                "remote_images {name:?} — not a host-listed image set"
+            )));
+        }
+        if !sets.insert(name.as_str()) {
+            return Err(Error::rejected(format!(
+                "remote_images {name:?} is declared twice"
+            )));
+        }
     }
     if decl.assets.is_empty() {
         return Err(Error::rejected(format!(
