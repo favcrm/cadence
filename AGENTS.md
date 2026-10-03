@@ -172,6 +172,71 @@ Bot reviews (Devin Review, CodeRabbit and similar) are advisory:
   to the new head, only after that head passes review.
 - Use `--admin` only in a declared emergency, never as routine.
 
+### Behavior-first verification and delivery outcomes (CAD-1071)
+
+Verify the promised behavior, not the shape of the implementation or the
+number of tests. A green suite is regression evidence, not product acceptance.
+These are working instructions, not a claim of new automated enforcement.
+
+- Before implementation, derive acceptance from the issue and reviewed design
+  contract: given state/input, expected observable result, relevant refusal or
+  recovery result, and forbidden side effects. Resolve consequential ambiguity;
+  do not derive expected results solely from the code the agent just wrote.
+- Map each promised outcome to an executable check or observed demonstration
+  in the appropriate isolated environment. Existing checks may suffice; do not
+  add a case just because a function changed. For bug fixes, run a reproduction
+  that fails on the defective behavior and passes after the fix. Setup/build
+  failures and empty selections are not evidence that the behavior was caught.
+- Iterate with focused behavior checks and sandbox probes, inspect actual
+  execution feedback, then repair. Prefer cheap state/property checks for logic;
+  use real process, RPC/HTTP, persistence and browser boundaries when their
+  wiring is the contract. Fakes cannot establish real-provider compatibility.
+  Do not turn every assertion into a slow end-to-end journey.
+- Select checks by the changed contract AND its consumers, not only changed
+  test filenames: a new CLI verb can affect help snapshots; a shared model can
+  break another target's compilation. Mandatory pre-push, admission/isolation,
+  independent review, Browser QA and required CI/merge-queue gates still apply.
+  A focused pass, temporary probe or LLM judgment does not replace those gates.
+- At handoff, record who ran each check, actual revision and any uncommitted
+  tree changes, command, selected scope and test count (where applicable), exit
+  status/result, and evidence artifact or log. Label earlier-head, stacked-head
+  and simulated-environment results explicitly; do not call them exact-final-
+  head or live-system proof. State skipped checks and limitations. If execution
+  is blocked, report it and use an authorized runner; never narrate an unrun pass.
+- Acceptance links each promised outcome to that evidence, including material
+  failure paths. Keep implemented, reviewed, merged, installed and operationally
+  verified distinct; do not touch production to obtain acceptance evidence.
+
+#### Replace accumulated tests by contract, not by age
+
+Retain executable protection for distinct behavioral contracts and known
+regressions. Consolidate redundant setups/cases and replace implementation-
+coupled assertions with behavior checks; do not bulk-delete the suite because
+it is old or large. A family-scoped replacement PR must:
+
+1. Map each removed test/assertion to its protected behavior and retained or
+   replacement check, including relevant refusal, boundary and regression cases.
+   A genuinely obsolete contract requires an explicit reviewed spec change;
+   age, passing coverage percentages and fewer tests do not establish equivalence.
+2. Demonstrate that the replacement catches the relevant wrong behavior. Use
+   the historical reproduction, a deliberate guard mutation or another concrete
+   counterexample; the failure must come from the behavioral assertion, not
+   broken setup. Independent reviewers verify the mapping and execution evidence
+   before removal. Temporary exploration probes alone are not retained coverage.
+3. Preserve security/identity, agent and detached-child refusals, concurrency
+   and exactly-once behavior, RPC/HTTP parity, persistence/migration/recovery,
+   timing bounds, test isolation and fail-closed defaults. Gate inputs, inventory
+   contracts, default-feature refusal proofs and release test-seam exclusion are
+   protected too; a logic fake cannot replace a required boundary proof.
+4. Update affected inventory/split maps and required gate wiring without silently
+   reducing the protected contracts. Classify the replacement PR from its own
+   diff under the existing risk/review rules; this policy grants no approval or
+   exception to them. Never skip, ignore or weaken checks merely to get green.
+5. Measure cost on comparable runs: distinguish compile/setup, test execution,
+   admission/runner waits and workflow wall time. Diagnose fixture failures rather
+   than masking them with retries. Optimize feedback time without losing the
+   behavior being proved; do not claim a speedup from test count alone.
+
 ### Checks: trust exit codes, not filtered text
 - A shell hook routes commands through `rtk`, which can print "clean" or
   nothing at all when a check really failed. It has hidden a
