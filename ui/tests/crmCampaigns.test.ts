@@ -621,6 +621,12 @@ async function mountedFlow() {
   }
   const byText = (tag: string, label: string) =>
     Array.from(host.querySelectorAll(tag)).find((el) => (el.textContent ?? "").trim() === label) ?? null;
+  // CAD-1055: the saved campaign detail is tabbed; only the active
+  // panel is mounted, so a step first opens the tab that owns it.
+  const openTab = async (name: "overview" | "email" | "audience" | "activity") => {
+    if (host.querySelector(`[data-tab="${name}"][aria-selected="true"]`)) return;
+    await click(host.querySelector(`[data-tab="${name}"]`));
+  };
   async function fillInput(selector: string, value: string) {
     const element = host.querySelector(selector) as HTMLInputElement;
     assert(element, `field exists: ${selector}`);
@@ -718,6 +724,8 @@ async function mountedFlow() {
   // the Freeze ID default derives from the saved id (not a stale one).
   await settle(() => assert(location.search.includes(`record=${unsavedCampaignId}`), "the first save moves the URL to record=<campaign_id>"));
   assert(!location.search.includes("appview=new"), "the saved campaign leaves the New view");
+  await settle(() => assert(host.querySelector('[data-tab="audience"]'), "the saved campaign renders its tabs"));
+  await openTab("audience");
   await settle(() => assert(host.querySelector('input[value$="-freeze-1"]'), "the detail renders its freeze default"));
   assert(!text().includes("New campaign"), "a saved campaign no longer says New campaign");
   equal((host.querySelector("#cmp-detail-freeze") as HTMLInputElement).value, `${unsavedCampaignId}-freeze-1`, "the Freeze ID default derives from the saved campaign id");
@@ -725,6 +733,7 @@ async function mountedFlow() {
     ?? Object.values(contents).at(-1);
   assert(openDoc().revision === 1, "revision 1 exists after the assistant apply");
 
+  await openTab("email");
   // Host-rendered preview (CAD-1008): the saved revision renders
   // automatically — Visual default, HTML/Text tabs — beside the content
   // summary card. A manual Refresh re-renders the same saved version.
@@ -755,8 +764,10 @@ async function mountedFlow() {
 
   // Approval is content-only; a proposal Apply invalidates it and a
   // stale-source proposal refuses with Apply disabled.
+  await openTab("overview");
   await click(byText("button", "Approve r2 (content-only)"));
   await settle(() => assert(text().includes("Approved r2"), "approval lands content-only"));
+  await openTab("email");
   // A second assistant draft lands at r2 (scoped chat turn), then save
   // r3 via a text correction so the proposal drifts stale.
   landAssistantDraft(openDoc().campaign_id as string, { subject: "Assistant draft subject v2 draft" });
@@ -863,9 +874,10 @@ async function mountedFlow() {
     assert((frame.getAttribute("srcdoc") ?? "").includes("Assistant draft subject"), "the real draft body renders in the Visual iframe");
   }, 30000);
   // HTML + Text tabs render the same pending draft.
-  await click(Array.from(bodyPreview!.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === "HTML"));
+  // The shared toolbar (Visual/HTML/Text) now drives the draft stage.
+  await click(byText("button", "HTML"));
   await settle(() => assert((bodyPreview!.querySelector('pre[data-preview="html"]')?.textContent ?? "").includes("Assistant draft subject"), "HTML tab renders the pending draft"));
-  await click(Array.from(bodyPreview!.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === "Text"));
+  await click(byText("button", "Text"));
   await settle(() => assert((bodyPreview!.querySelector('pre[data-preview="text"]')?.textContent ?? "").includes("Assistant copy"), "Text tab renders the pending draft body"));
 
   // Apply the verified draft: expected_revision = current draft, the
@@ -888,6 +900,7 @@ async function mountedFlow() {
   // Test-send is a real one-recipient SMTP send — the fixture's
   // sender binding is live, so the button is armed and the receipt
   // records SMTP acceptance only.
+  await openTab("overview");
   await fillInput("#cmp-test-email", "qa@example.com");
   await click(byText("button", "Send test"));
   await settle(() =>
@@ -908,31 +921,38 @@ async function mountedFlow() {
   await openPage("customers");
   await React.act(async () => { navigate(`${location.pathname}?ctx=ctx-a&crm=campaigns&record=${savedCampaignId}`); });
   await flush();
+  await settle(() => assert(host.querySelector('[data-tab="overview"][aria-selected="true"]'), "a fresh detail opens on Overview"));
+  await openTab("audience");
   await settle(() => assert(host.querySelector('section[aria-label="Frozen audience"]'), "detail names its freeze panel"));
+  await openTab("email");
   await settle(() => {
     const frame = host.querySelector('iframe[data-preview="visual"]') as HTMLIFrameElement;
     assert(frame && (frame.getAttribute("srcdoc") ?? "").includes("HTML form"), "the saved campaign auto-renders its preview on open");
   });
   {
-    const labels = [
-      'div[aria-label="Email content"]',
-      'section[aria-label="Email preview"]',
-      'section[aria-label="Content approval"]',
-      'section[aria-label="Frozen audience"]',
-      'section[aria-label="SMTP sender"]',
-      'section[aria-label="Test send"]',
-      'section[aria-label="Assistant proposals"]',
-      'section[aria-label="Final send"]',
-    ];
-    const seen: number[] = [];
-    for (const sel of labels) {
-      const el = host.querySelector(sel);
-      assert(el, `panel renders: ${sel}`);
-      const pos = Array.from(host.querySelectorAll("form, section")).indexOf(el as Element);
-      seen.push(pos);
+    // CAD-1055: the giant single-scroll task order is gone — each tab
+    // mounts only its own panels, and no Content tab exists.
+    const tabs = Array.from(host.querySelectorAll('[role="tab"]')).map((el) => el.getAttribute("data-tab"));
+    equal(tabs, ["overview", "email", "audience", "activity"], "four tabs, no Content tab");
+    const panelsOf = async (name: "overview" | "email" | "audience" | "activity") => {
+      await openTab(name);
+      return Array.from(host.querySelectorAll('[data-panel] section[aria-label], [data-panel] div[aria-label]'))
+        .map((el) => el.getAttribute("aria-label"));
+    };
+    const overview = await panelsOf("overview");
+    for (const label of ["Ready to send", "Campaign summary", "Content approval", "SMTP sender", "Test send", "Final send"]) {
+      assert(overview.includes(label), `Overview carries: ${label}`);
     }
-    const ordered = seen.every((pos, i) => i === 0 || pos > seen[i - 1]);
-    assert(ordered, `panels render in the saved-campaign task order: ${seen.join(",")}`);
+    assert(!overview.includes("Frozen audience") && !overview.includes("Email preview"), "Overview mounts no other tab's panels");
+    const email = await panelsOf("email");
+    assert(email.includes("Email preview") && email.includes("Assistant proposals"), "Email carries the preview and the proposal strip");
+    assert(!email.includes("Final send") && !email.includes("Frozen audience"), "Email mounts no send or audience panels");
+    const audience = await panelsOf("audience");
+    assert(audience.includes("Frozen audience"), "Audience carries the audience panel");
+    assert(!host.querySelector('[data-panel] [aria-label="Email preview"]'), "Audience mounts no preview");
+    const activity = await panelsOf("activity");
+    assert(activity.includes("Campaign sends"), "Activity carries the sends history");
+    await openTab("audience");
   }
   await click(byText("button", "Recheck freeze"));
   await settle(() => assert(text().includes("Valid"), "freeze validity rechecks live"));
@@ -966,6 +986,7 @@ async function mountedFlow() {
   }) as typeof fetch;
   // Refresh once: the held response answers with the current revision
   // while we save the next one.
+  await openTab("email");
   await click(byText("button", "Refresh preview"));
   await settle(() => assert(heldRender !== null, "the refresh render is in flight"));
   const heldRevision = renderDoc().revision;

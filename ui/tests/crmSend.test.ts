@@ -448,6 +448,12 @@ async function mountedFlow() {
     await React.act(async () => { element!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
     await flush();
   }
+  // CAD-1055: the saved detail is tabbed and mounts only the active
+  // panel — open the tab that owns the control a step needs.
+  const openTab = async (name: string) => {
+    if (host.querySelector(`[data-tab="${name}"][aria-selected="true"]`)) return;
+    await click(host.querySelector(`[data-tab="${name}"]`));
+  };
   const byText = (tag: string, label: string) =>
     Array.from(host.querySelectorAll(tag)).find((el) => (el.textContent ?? "").trim() === label) ?? null;
   async function fillInput(selector: string, value: string) {
@@ -503,8 +509,10 @@ async function mountedFlow() {
   assert(text().includes("not proof of inbox delivery"), "the test receipt labels acceptance only");
 
   // Recheck the freeze — validity lands, prepare unlocks.
+  await openTab("audience");
   await click(byText("button", "Recheck freeze"));
   await settle(() => assert(text().includes("Valid"), "freeze validity reports"));
+  await openTab("overview");
   await settle(() => {
     const btn = prepareButton();
     if (btn?.disabled) {
