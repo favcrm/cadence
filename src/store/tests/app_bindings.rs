@@ -320,12 +320,13 @@ fn cad796_credential_revoke_and_rotate_stop_the_bound_slot() {
             "digest": created["binding"]["digest"],
             "config": created["binding"]["config"]}))
         .unwrap();
-    s.conn()
-        .execute(
+    s.fixture_write(|c| {
+        c.execute(
             "INSERT OR REPLACE INTO connection_metadata(singleton, workspace_id) VALUES(1, 'ws')",
             [],
         )
-        .unwrap();
+    })
+    .unwrap();
     let current = || {
         crate::store::app_bindings::binding_current_in(
             &s.conn(),
@@ -589,8 +590,7 @@ fn cad1119_binding_drift_allows_only_bookkeeping_to_migrate() {
 #[test]
 fn cad1119_store_migrate_refuses_a_widened_receipt_with_a_valid_proof() {
     let (_dir, s) = store();
-    s.conn()
-        .execute_batch(crate::store::app_bindings::SCHEMA)
+    s.fixture_write(|c| c.execute_batch(crate::store::app_bindings::SCHEMA))
         .unwrap();
     let config = cad1119_receipt();
     let created = s

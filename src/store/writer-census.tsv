@@ -116,7 +116,7 @@ store/tests/agents.rs	test-fixtures	open	5
 store/tests/app_audiences.rs	test-fixtures	execute	3
 store/tests/app_audiences.rs	test-fixtures	open	3
 store/tests/app_bindings.rs	test-fixtures	execute	7
-store/tests/app_bindings.rs	test-fixtures	guarded_write	5
+store/tests/app_bindings.rs	test-fixtures	guarded_write	7
 store/tests/app_content.rs	test-fixtures	execute	2
 store/tests/app_content.rs	test-fixtures	open	2
 store/tests/app_contexts.rs	test-fixtures	execute	7
