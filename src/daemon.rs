@@ -452,6 +452,12 @@ pub struct Shared {
     /// CAD-786: pause between campaign submissions; default 1 s,
     /// tests shorten it.
     crm_send_interval: Duration,
+    /// CAD-1063: how long a send waits before re-presenting deliveries
+    /// that the platform ledger holds for owner approval.
+    crm_send_pending_poll: Duration,
+    /// CAD-1063: the hosted platform email door; `Some` only on a
+    /// hosted daemon, where it replaces SMTP egress.
+    hosted_email: Option<crate::platform::hosted_email::HostedEmail>,
     /// CAD-786: the base the unsubscribe links mint — the board's
     /// public origin; `None` refuses `crm_send_prepare`.
     unsubscribe_origin: Option<String>,
@@ -697,6 +703,12 @@ impl Shared {
             } else {
                 opts.crm_send_interval_ms
             }),
+            crm_send_pending_poll: Duration::from_millis(if opts.crm_send_pending_poll_ms == 0 {
+                30_000
+            } else {
+                opts.crm_send_pending_poll_ms
+            }),
+            hosted_email: opts.hosted_email.clone(),
             unsubscribe_origin: opts.unsubscribe_origin.clone(),
             #[cfg(feature = "test-seam")]
             crm_send_row_gate: opts.crm_send_row_gate.clone(),
@@ -4583,6 +4595,15 @@ pub struct ServeOptions {
     /// milliseconds; `0` is the production default (1 s). Tests pin
     /// a small value so waits stay short.
     pub crm_send_interval_ms: u64,
+    /// CAD-1063: pause before re-presenting deliveries waiting on the
+    /// platform's owner approval, in milliseconds; `0` is the
+    /// production default (30 s).
+    pub crm_send_pending_poll_ms: u64,
+    /// CAD-1063: the hosted CRM email transport. Set by
+    /// `platform::agenticos::attach` on a daemon holding a hosted
+    /// lease (and by fixtures); `None` keeps the SMTP path. Never
+    /// sourced from RPC or PM.
+    pub hosted_email: Option<crate::platform::hosted_email::HostedEmail>,
     /// CAD-786: the public origin unsubscribe links mint
     /// (`{origin}/unsubscribe/<token>`). `https://` anywhere or
     /// loopback `http://` for rigs; `None` refuses
