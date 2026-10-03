@@ -41,6 +41,8 @@ mod crm_smtp_rpc;
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;
+#[cfg(all(test, feature = "test-seam"))]
+mod hosted_smtp_acceptance;
 mod idea_rpc;
 mod identity;
 mod installer_enrollment_wire;
