@@ -118,9 +118,20 @@ impl Shared {
                  an enrolled endpoint — caller identity ambiguous",
                 chain[p]
             ))),
-            (pane, Some(r)) if pane.is_none_or(|p| r < p) => Ok(Some(SlotWho::Strict(
-                slots.strict_caller(peer_pid, chain[r])?,
-            ))),
+            (pane, Some(r)) if pane.is_none_or(|p| r < p) => {
+                let caller = slots.strict_caller(peer_pid, chain[r])?;
+                // CAD-1021: a runner an UNREGISTERED caller launched is
+                // enrolled under the daemon's `unregistered:<uid>` label.
+                // That label is a queue position, never an agent: its
+                // process tree derives NO identity here — the single
+                // choke point every `slot_identity` consumer (the caller
+                // rule, requests, operator verbs) reads — so it stays as
+                // unproven as the caller that launched it.
+                if crate::slots::is_unregistered_lane(&caller.lane) {
+                    return Ok(None);
+                }
+                Ok(Some(SlotWho::Strict(caller)))
+            }
             (Some(p), _) => {
                 let lane = adapter::pty::nearest_pane(&chain[p..], &panes)
                     .cloned()
@@ -436,7 +447,12 @@ impl Shared {
     /// enrolled managed endpoint (phase a), or — deriving neither — the
     /// proven operator ([`crate::peer::operator_proof`]). A runner's own
     /// process tree, a revoked or expired endpoint, a failed strict
-    /// verification and anything unproven are refused, naming the rule.
+    /// verification are refused, naming the rule. CAD-1021: anything else
+    /// that derives no identity and is not provably the operator queues as
+    /// the daemon-labelled `unregistered:<uid>` (build/test recipes with no
+    /// env only — [`Self::unregistered_launch_allowed`]); that label is not
+    /// an agent, and the runner tree it enrolls derives no identity either
+    /// ([`Self::slot_identity`]).
     fn launch_requester(&self, peer_pid: u32) -> Result<crate::runner::Requester> {
         let requester = |kind: &str, lane: String| crate::runner::Requester {
             kind: kind.to_string(),
@@ -802,23 +818,36 @@ impl Shared {
             caller_rule::Who::Operator | caller_rule::Who::Agent(_) => None,
             caller_rule::Who::Unproven(why) => Some(why),
         };
-        let id = required_str(params, "runner_id")?;
-        let receipt = crate::runner::read_receipt(&self.state_dir, id)?;
-        if let Some(why) = unproven {
-            let own = match self.slot_or_unregistered(peer_pid)? {
-                SlotPeer::Unregistered { lane, .. } => {
-                    receipt.requester.kind == "unregistered" && receipt.requester.lane == lane
+        // Authorize BEFORE reading: an unproven caller learns nothing
+        // about whether a runner id exists beyond its own label's.
+        let own_label = match unproven {
+            None => None,
+            Some(why) => match self.slot_or_unregistered(peer_pid)? {
+                SlotPeer::Unregistered { lane, .. } => Some(lane),
+                SlotPeer::Known(_) => {
+                    return Err(Error::rejected(format!(
+                        "slot runner is an operator or registered-agent read — this \
+                         connection derives no agent identity and is not provably \
+                         the operator: {why} (caller rule, CAD-422)"
+                    )))
                 }
-                SlotPeer::Known(_) => false,
-            };
-            if !own {
-                return Err(Error::rejected(format!(
-                    "slot runner is an operator or registered-agent read — this \
-                     connection derives no agent identity and is not provably \
-                     the operator: {why} (caller rule, CAD-422); an unregistered \
-                     caller reads only its own runner"
-                )));
-            }
+            },
+        };
+        let id = required_str(params, "runner_id")?;
+        let Some(lane) = own_label else {
+            let receipt = crate::runner::read_receipt(&self.state_dir, id)?;
+            return serde_json::to_value(&receipt).map_err(|e| Error::internal(e.to_string()));
+        };
+        // One answer for "absent", "unreadable" and "someone else's".
+        let refuse = || {
+            Error::rejected(
+                "slot runner: an unregistered caller reads only its own runner \
+                 (or none — the same answer for an absent id)",
+            )
+        };
+        let receipt = crate::runner::read_receipt(&self.state_dir, id).map_err(|_| refuse())?;
+        if !(receipt.requester.kind == "unregistered" && receipt.requester.lane == lane) {
+            return Err(refuse());
         }
         serde_json::to_value(&receipt).map_err(|e| Error::internal(e.to_string()))
     }

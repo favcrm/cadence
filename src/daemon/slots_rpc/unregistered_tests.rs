@@ -324,3 +324,48 @@ fn peer_label_is_minted_from_the_connection_never_a_field() {
         SlotPeer::Known(_) => panic!("a forged env must not derive a pane"),
     }
 }
+
+/// The blocker on PR #779: a runner launched by an unregistered caller is
+/// enrolled under `unregistered:<uid>`; its process tree must derive NO
+/// identity — never `Who::Agent(label)` — so no attributed gate admits it.
+#[test]
+fn an_unregistered_runner_tree_is_no_agent_to_any_gate() {
+    let (_root, shared) = daemon();
+    let peer = Peer::forged();
+    let clk = crate::slots::SlotClock::at((shared.slot_clock)(), epoch_secs());
+    shared
+        .slots
+        .lock()
+        .unwrap()
+        .enroll_runner(&label(), &rid(7), "digest", peer.0, clk)
+        .unwrap();
+    assert!(shared.slot_identity(peer.0).unwrap().is_none());
+    assert!(matches!(
+        shared.connection_caller(peer.0).unwrap(),
+        caller_rule::Who::Unproven(_)
+    ));
+    for method in ["test_submit", "monitor_register", "agent_ready"] {
+        shared
+            .caller_gate(method, &json!({}), peer.0)
+            .expect_err(method);
+    }
+    // It still gets what the label gets: a queue position.
+    let r = shared.rpc_slot_acquire(&run_params("build", "t1", peer.0), peer.0);
+    assert!(r.is_ok(), "{r:?}");
+}
+
+#[test]
+fn a_registered_style_runner_tree_is_still_that_agent() {
+    // The guard is the unregistered label only: a pane-lane runner tree
+    // keeps acting as its launcher (existing CAD-230b design).
+    let (_root, shared) = daemon();
+    let peer = Peer::forged();
+    let clk = crate::slots::SlotClock::at((shared.slot_clock)(), epoch_secs());
+    shared
+        .slots
+        .lock()
+        .unwrap()
+        .enroll_runner("dev-1", &rid(8), "digest", peer.0, clk)
+        .unwrap();
+    assert!(shared.slot_identity(peer.0).unwrap().is_some());
+}

@@ -404,7 +404,12 @@ During implementation and handoff:
   full suites**. If required build-slot admission is refused or unavailable,
   report the blocker and use an authorized runner (`cadence build-slot
   launch <recipe>` runs a project-declared recipe under a daemon-owned slot)
-  or CI. A direct local command,
+  or CI. A caller with no registered pane or endpoint (a subagent, an
+  operator shell) may queue as the daemon-labelled `unregistered:<uid>`
+  (`cadence build-slot run build|test -- <cmd>`, or `launch` of an env-less
+  build/test recipe): a queue position behind registered lanes and no
+  authority. `cadence build-slot status` shows each waiter's reason
+  (capacity, memory or disk). A direct local command,
   an advisory alias or an unused slot is not admission. Never label such a run
   as an admitted gate. Reuse eligible evidence and avoid duplicate full suites.
 - Self-check before handoff; independent QA still reviews the exact change

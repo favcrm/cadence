@@ -1,10 +1,13 @@
 # Admitted focused test recipe for external reviewers (CAD-794)
 
 External reviewers (for example Codex sessions) have no pane and no
-managed endpoint, so they hold no build-slot identity of their own:
-`cadence build-slot status` rejects them as underivable callers and
-`cadence build-slot run` cannot bind them. Their supported path is
-CAD-230's daemon-launched runner — `cadence build-slot launch <recipe>
+managed endpoint, so they hold no registered build-slot identity. Since
+CAD-1021 they may still queue as the daemon-labelled `unregistered:<uid>`
+(no authority, ranked behind registered lanes): `build-slot status` and
+`build-slot run build|test` work, and `launch` of a build/test recipe that
+declares **no `env`** runs. A recipe that passes env (such as the one below)
+and every other action still need the operator. Their supported path for
+this recipe is CAD-230's daemon-launched runner — `cadence build-slot launch <recipe>
 --project cadence --worktree <lane>` — which runs a **fixed**
 `build.recipes` entry from the `cadence` project's `project.yaml`.
 Nothing about the command comes from the request: unknown recipes,
@@ -114,8 +117,10 @@ path under the state dir. The log holds the full `cargo test` output.
   — '<field>' is refused`.
 - Foreign checkout: `'<path>' is not a checkout of a repo registered to
   project 'cadence'`.
-- Underivable, unenrolled caller: `build-slot launch needs a pane
-  agent, an enrolled managed endpoint or the proven operator`.
+- Unregistered caller, recipe with `env` or kind suite/check: `a caller
+  with no registered pane or managed endpoint may launch only a recipe that
+  declares no env` (or `only build or test recipes`). Unreadable ancestry
+  still refuses as underivable.
 - Source moved while queued: the gate never opens; the receipt names
   the old and new `HEAD` and the reviewer launches again.
 
