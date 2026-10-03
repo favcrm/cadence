@@ -30,6 +30,25 @@ export function checkCampaignId(id: string): void {
   }
 }
 
+/** CAD-1058: the human campaign name mirrors the host bound — one
+ *  trimmed plain line, up to 80 characters, no markup or braces. */
+export const CAMPAIGN_NAME_MAX = 80;
+export function checkCampaignName(name: string): void {
+  if (
+    name.length < 1 ||
+    name.length > CAMPAIGN_NAME_MAX ||
+    name.trim() !== name ||
+    /[<>`{}\u0000-\u001f\u007f]/.test(name)
+  ) {
+    throw new ApiError("Give the campaign a short plain name (up to 80 characters).", 400);
+  }
+}
+
+/** The name an operator sees: the human name, else the subject. */
+export function campaignTitle(doc: { name: string | null; subject: string }): string {
+  return doc.name ?? doc.subject;
+}
+
 function checkTokens(text: string): void {
   let rest = text;
   for (;;) {
@@ -152,6 +171,8 @@ export function withToken(text: string, fallback: string): string {
 
 export interface ContentDoc {
   campaignId: string;
+  /** CAD-1058: optional human name; null for campaigns without one. */
+  name: string | null;
   revision: number;
   subject: string;
   preheader: string;
@@ -184,6 +205,7 @@ export function parseContentDoc(value: unknown): ContentDoc {
   }
   return {
     campaignId: row.campaign_id,
+    name: typeof row.name === "string" && row.name !== "" ? row.name : null,
     revision: row.revision,
     subject: row.subject,
     preheader: row.preheader,

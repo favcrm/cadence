@@ -12,6 +12,7 @@ import {
   type AudienceScope,
 } from "./audienceClient";
 import {
+  campaignTitle,
   friendlyCampaignError,
   parseContentDoc,
   parseContentList,
@@ -47,7 +48,6 @@ import {
 } from "./sendClient";
 import { PreviewPanel, parsePreview, type AudiencePreview } from "./CrmSegments";
 import { friendlyAudienceError, newAudienceId } from "./segmentGrammar";
-import Field from "./shared/Field";
 import { ErrorNotice } from "./shared/States";
 import "./crm-campaign.css";
 import CampaignTabs from "./campaign/CampaignTabs";
@@ -56,6 +56,8 @@ import { useEmailDraft } from "./campaign/useEmailDraft";
 import OverviewPane from "./campaign/OverviewPane";
 import EligibilityFunnel from "./campaign/EligibilityFunnel";
 import ActivityPane from "./campaign/ActivityPane";
+import NewCampaignDialog from "./campaign/NewCampaignDialog";
+import { clearLanding, peekLanding } from "./campaign/landing";
 import { audienceSummary } from "./campaign/audienceSummary";
 import {
   APPROVAL_ANCHOR,
@@ -127,26 +129,29 @@ export default function CrmCampaigns({
           campaignId={recordId}
           onBack={() => onSelect(null)}
         />
-      ) : view === "list" ? (
-        <CampaignList
-          scope={scope}
-          viewer={viewer}
-          onSelect={onSelect}
-          onNew={() => onView("new")}
-        />
       ) : (
-        <CampaignNew
-          scope={scope}
-          viewer={viewer}
-          onCreated={(id) => {
-            if (onRecordCreated) onRecordCreated(id);
-            else {
-              onView("list");
-              onSelect(id);
-            }
-          }}
-          onCancel={() => onView("list")}
-        />
+        <>
+          <CampaignList
+            scope={scope}
+            viewer={viewer}
+            onSelect={onSelect}
+            onNew={() => onView("new")}
+          />
+          {view === "new" && viewer.operator && !viewer.readOnly && scope.contextId !== "" && (
+            <NewCampaignDialog
+              scope={scope}
+              initialSegmentId={new URLSearchParams(window.location.search).get("segment")}
+              onCreated={(id) => {
+                if (onRecordCreated) onRecordCreated(id);
+                else {
+                  onView("list");
+                  onSelect(id);
+                }
+              }}
+              onCancel={() => onView("list")}
+            />
+          )}
+        </>
       )}
     </div>
   );
@@ -296,7 +301,7 @@ function CampaignList({
           <table className="crm-table">
             <thead>
               <tr>
-                <th scope="col">Subject</th>
+                <th scope="col">Campaign</th>
                 <th scope="col">Content</th>
                 <th scope="col">Latest send</th>
                 <th scope="col">
@@ -308,8 +313,10 @@ function CampaignList({
               {campaigns.map((campaign) => (
                 <tr key={campaign.campaignId}>
                   <td className="text-ink-100">
-                    {campaign.subject}
-                    <span className="num text-micro text-ink-500"> · {campaign.campaignId}</span>
+                    <span title={campaign.campaignId}>{campaignTitle(campaign)}</span>
+                    {campaign.name !== null && campaign.name !== campaign.subject && (
+                      <span className="text-micro text-ink-500"> · {campaign.subject}</span>
+                    )}
                   </td>
                   <td>
                     <span
@@ -3066,214 +3073,8 @@ function SenderPanel({ render }: { render: ContentRender }) {
 }
 
 /* ------------------------------------------------------------------ */
-/* New + detail pages.                                                 */
+/* Detail page (New is the dialog in campaign/NewCampaignDialog).      */
 /* ------------------------------------------------------------------ */
-
-function CampaignNew({
-  scope,
-  viewer,
-  onCreated,
-  onCancel,
-}: {
-  scope: AudienceScope;
-  viewer: Viewer;
-  onCreated: (campaignId: string) => void;
-  onCancel: () => void;
-}) {
-  const headRef = useRef<HTMLHeadingElement | null>(null);
-  const [campaignId, setCampaignId] = useState(() => newAudienceId("cmp"));
-  // CAD-1054: "Use in campaign" from the segment drawer preselects its segment.
-  const [pick, setPick] = useState<AudiencePick>(() => {
-    const seg = new URLSearchParams(window.location.search).get("segment");
-    return { base: seg ? { mode: "segment", segmentId: seg } : { mode: "all" }, exclusionListId: null };
-  });
-  const [, setAudiencePreview] = useState<AudiencePreview | null>(null);
-  const [doc, setDoc] = useState<ContentDoc | null>(null);
-  const [freezeId, setFreezeId] = useState("");
-  const [ceiling, setCeiling] = useState("500");
-  const [freezePending, setFreezePending] = useState(false);
-  const [freezeError, setFreezeError] = useState<string | null>(null);
-  const [freezeDone, setFreezeDone] = useState<string | null>(null);
-  useEffect(() => {
-    headRef.current?.focus();
-  }, []);
-  // The Freeze ID default follows the campaign ID until the operator
-  // types their own, so it never keeps a stale generated id.
-  const freezeTouched = useRef(false);
-  useEffect(() => {
-    if (!freezeTouched.current) setFreezeId(`${campaignId}-freeze-1`);
-  }, [campaignId]);
-  // The first save makes the campaign a saved record: the page moves to
-  // its detail (`record=<id>`) instead of staying a "New campaign".
-  const savedId = doc?.campaignId ?? null;
-  const onCreatedRef = useRef(onCreated);
-  onCreatedRef.current = onCreated;
-  useEffect(() => {
-    if (savedId !== null) onCreatedRef.current(savedId);
-  }, [savedId]);
-  return (
-    <section aria-label="New campaign" className="grid gap-3">
-      <div>
-        <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1} data-outlet-heading>
-          New campaign
-        </h3>
-        <p className="text-label text-ink-400 mt-1">
-          <button type="button" className="lnk" onClick={onCancel}>
-            ← Campaigns
-          </button>{" "}
-          — audience previews need no save; the email preview, test send and proposals unlock
-          after the first save.
-        </p>
-      </div>
-      {!viewer.operator ? (
-        <p className="card px-4 py-3 text-label text-ink-400">
-          Sign in as the operator to create campaigns.
-        </p>
-      ) : viewer.readOnly ? (
-        <p className="card px-4 py-3 text-label text-ink-400" data-state="read-only">
-          Read-only view. A verified operator creates campaigns.
-        </p>
-      ) : scope.contextId === "" ? (
-        <p className="card px-4 py-3 text-label text-ink-400">
-          Administrator CRM setup is required before creating a campaign.
-        </p>
-      ) : (
-        <>
-          <Field
-            label="Campaign ID"
-            id="cmp-id"
-            hint="Letters, digits, - _"
-            disabled={doc !== null}
-            className="crm-field"
-          >
-            {(c) => (
-              <input
-                {...c}
-                className="field"
-                value={campaignId}
-                onChange={(e) => setCampaignId(e.target.value)}
-                maxLength={128}
-                autoComplete="off"
-              />
-            )}
-          </Field>
-          <AudienceSection
-            scope={scope}
-            viewer={viewer}
-            pick={pick}
-            onPick={setPick}
-            onPreview={setAudiencePreview}
-            freezeSlot={
-              <section aria-label="Freeze audience" className="grid gap-2">
-                <h4 className="text-label font-medium text-ink-200">
-                  Freeze this audience (optional, named by the operator)
-                </h4>
-                <div className="crm-field-row">
-                  <div className="crm-field">
-                    <label className="text-label text-ink-300" htmlFor="cmp-freeze-id">
-                      Freeze ID
-                    </label>
-                    <input
-                      id="cmp-freeze-id"
-                      className="field"
-                      value={freezeId}
-                      onChange={(e) => {
-                        freezeTouched.current = true;
-                        setFreezeId(e.target.value);
-                      }}
-                      maxLength={128}
-                      autoComplete="off"
-                      disabled={freezePending}
-                    />
-                  </div>
-                  <div className="crm-field">
-                    <label className="text-label text-ink-300" htmlFor="cmp-ceiling">
-                      Recipient ceiling (1–500)
-                    </label>
-                    <input
-                      id="cmp-ceiling"
-                      className="field num"
-                      inputMode="numeric"
-                      value={ceiling}
-                      onChange={(e) => setCeiling(e.target.value)}
-                      maxLength={4}
-                      autoComplete="off"
-                      disabled={freezePending}
-                    />
-                  </div>
-                </div>
-                {freezeError && (
-                  <p className="text-label text-fail" role="alert">
-                    {freezeError}
-                  </p>
-                )}
-                {freezeDone && (
-                  <p className="text-label text-ok" role="status">
-                    {freezeDone}
-                  </p>
-                )}
-                <div>
-                  <Button
-                    size="sm"
-                    loading={freezePending}
-                    disabled={freezePending}
-                    onClick={() => {
-                      setFreezeError(null);
-                      setFreezeDone(null);
-                      const max = Number(ceiling);
-                      if (freezeId.trim() === "" || !Number.isInteger(max) || max < 1 || max > 500) {
-                        setFreezeError("a freeze needs an ID and a ceiling of 1 to 500");
-                        return;
-                      }
-                      if (pick.base.mode === "custom" && pick.base.customerIds.length === 0) {
-                        setFreezeError("a custom base needs at least one customer ID");
-                        return;
-                      }
-                      setFreezePending(true);
-                      void audienceClient
-                        .prepare(scope, {
-                          freezeId: freezeId.trim(),
-                          base: pick.base,
-                          exclusionListId: pick.exclusionListId ?? undefined,
-                          maxRecipients: max,
-                        })
-                        .then((value) => {
-                          const freeze = (value as { freeze?: Record<string, unknown> } | null)?.freeze;
-                          const count = (freeze?.final_count as number | undefined) ?? -1;
-                          setFreezeDone(
-                            `Frozen ${freezeId.trim()} with ${count} recipients — recheck validity on the campaign detail.`,
-                          );
-                        })
-                        .catch((err: unknown) => setFreezeError(friendlyAudienceError(err)))
-                        .finally(() => setFreezePending(false));
-                    }}
-                  >
-                    Freeze audience
-                  </Button>
-                </div>
-              </section>
-            }
-          />
-          <CampaignWorkspace
-            scope={scope}
-            viewer={viewer}
-            campaignId={campaignId}
-            doc={doc}
-            onDoc={setDoc}
-          />
-          {doc !== null && (
-            <p className="card px-4 py-3 text-label text-ink-300">
-              Saved revision r{doc.revision}.{" "}
-              <button type="button" className="lnk" onClick={() => onCreated(doc.campaignId)}>
-                Open campaign detail →
-              </button>
-            </p>
-          )}
-        </>
-      )}
-    </section>
-  );
-}
 
 function CampaignDetail({
   scope,
@@ -3295,9 +3096,18 @@ function CampaignDetail({
   // state, not an error. True when a pending proposal names this
   // campaign and the saved content reads back absent.
   const [pendingOnly, setPendingOnly] = useState(false);
-  const [pick, setPick] = useState<AudiencePick>({ base: { mode: "all" }, exclusionListId: null });
+  // CAD-1058: a campaign just created from the dialog lands on its Email
+  // tab, with the segment the operator picked there (if any). Peeked on
+  // mount and cleared in an effect, so the hand-off is one-shot.
+  const [pick, setPick] = useState<AudiencePick>(() => {
+    const segmentId = peekLanding(campaignId)?.segmentId ?? null;
+    return {
+      base: segmentId !== null ? { mode: "segment", segmentId } : { mode: "all" },
+      exclusionListId: null,
+    };
+  });
   const [audiencePreview, setAudiencePreview] = useState<AudiencePreview | null>(null);
-  const [tab, setTab] = useState<CampaignTab>("overview");
+  const [tab, setTab] = useState<CampaignTab>(() => peekLanding(campaignId)?.tab ?? "overview");
   const [freezeId, setFreezeId] = useState(`${campaignId}-freeze-1`);
   const [freeze, setFreeze] = useState<{
     finalCount: number;
@@ -3311,6 +3121,8 @@ function CampaignDetail({
 
   useEffect(() => {
     headRef.current?.focus();
+    clearLanding(campaignId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const reloadToken = `${scope.installId}:${scope.contextId}:${campaignId}`;
@@ -3382,7 +3194,7 @@ function CampaignDetail({
     <section aria-label="Campaign details" className="grid gap-3">
       <div>
         <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1} data-outlet-heading>
-          {loading ? "Campaign details" : (doc?.subject ?? "Campaign details")}{" "}
+          {loading ? "Campaign details" : (doc !== null ? campaignTitle(doc) : "Campaign details")}{" "}
           {doc !== null && (
             <span className="chip align-middle" data-campaign-status>
               {doc.approval.valid && doc.approval.revision === doc.revision ? "Approved" : "Draft"}
@@ -3392,9 +3204,14 @@ function CampaignDetail({
         <p className="text-label text-ink-400 mt-1">
           <button type="button" className="lnk" onClick={onBack}>
             ← Campaigns
-          </button>{" "}
-          <span className="num">· {campaignId}</span>
+          </button>
         </p>
+        <details className="crm-diag">
+          <summary className="text-micro text-ink-500">Details</summary>
+          <p className="num text-micro text-ink-500 mt-1" title="Campaign ID">
+            Campaign ID {campaignId}
+          </p>
+        </details>
       </div>
       {loading && (
         <p className="text-secondary text-ink-400" role="status">

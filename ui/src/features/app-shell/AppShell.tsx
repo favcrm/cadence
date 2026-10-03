@@ -137,6 +137,9 @@ export default function AppShell({
       if (patch.appview !== undefined) {
         if (patch.appview === null || patch.appview === "list") q.delete("appview");
         else q.set("appview", patch.appview);
+        // CAD-1058: `segment` is the New campaign dialog's preselect; it
+        // never outlives the dialog (cancel, create or any other view).
+        if (patch.appview !== "new") q.delete("segment");
       }
       if (patch.record !== undefined) {
         if (patch.record === null) q.delete("record");

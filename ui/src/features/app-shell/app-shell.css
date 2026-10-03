@@ -1027,3 +1027,69 @@ p.sfield-hint {
   border-radius: 0.25rem;
   padding: 0.1rem 0.4rem;
 }
+
+/* CAD-1058 New campaign dialog: a short modal on the shared confirm
+   scrim. Board tokens only; no motion. */
+.crm-newc {
+  position: relative;
+  width: min(37.5rem, 100%);
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+  padding: 1rem 1.1rem;
+}
+.crm-newc-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.crm-newc-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.4rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--color-ink-700);
+}
+.crm-newc-foot > span {
+  margin-right: auto;
+}
+.crm-starts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+@media (max-width: 36rem) {
+  .crm-starts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.crm-start {
+  display: grid;
+  gap: 0.15rem;
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-850);
+}
+.crm-start:hover:not(:disabled) {
+  border-color: var(--color-ink-600);
+}
+.crm-start[aria-checked="true"] {
+  border-color: var(--color-accent);
+}
+.crm-start:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.crm-start-title {
+  font-size: var(--text-secondary);
+  font-weight: 500;
+  color: var(--color-ink-100);
+}
+.crm-start-hint {
+  font-size: var(--text-label);
+  color: var(--color-ink-500);
+}

@@ -313,6 +313,7 @@ async function mountedFlow() {
   };
   const proposals: Record<string, any> = {};
   const applyBodies: any[] = [];
+  const saveBodies: any[] = [];
   const sendBodies: any[] = [];
   let propSeq = 0;
   // CAD-1016: no manual mint — a scoped chat turn lands the assistant's
@@ -372,6 +373,7 @@ async function mountedFlow() {
     // Content saves ride the collection path with CAS.
     if (method === "POST" && url.pathname.endsWith("/content/campaigns")) {
       const body = JSON.parse(String(init!.body));
+      saveBodies.push(body);
       const current = contents[body.campaign_id]?.revision as number | undefined;
       if (current !== undefined && body.expected_revision === undefined) {
         return refused("email content already exists; name the observed revision");
@@ -382,7 +384,9 @@ async function mountedFlow() {
       const revision = current === undefined ? 1 : current + 1;
       contents[body.campaign_id] = {
         campaign_id: body.campaign_id, install_id: "install-crm", context_id: "ctx-a", revision,
-        subject: body.subject, preheader: body.preheader, blocks: body.blocks,
+        name: body.name ?? contents[body.campaign_id]?.name ?? null,
+        subject: body.subject, preheader: body.preheader, blocks: body.blocks ?? [],
+        ...(body.html === undefined ? {} : { html: body.html, mode: "html" }),
         content_digest: `content-digest-${revision}`,
         approval: { revision: null, digest: null, valid: false, scope: "content-only" },
       };
@@ -676,62 +680,72 @@ async function mountedFlow() {
   // Switching sections clears the record view: no drawer follows.
   assert(!host.querySelector("[data-drawer]"), "no drawer follows a section switch");
 
-  // New campaign: audience preview counts render live without a save.
+  // CAD-1058 New campaign: a short dialog, not a long page. Name first,
+  // three ways to start, optional audience; Assistant draft creates the
+  // campaign then sends the brief to the scoped chat; it lands on the
+  // saved campaign's Email tab with the human name as its title.
   await click(byText("button", "New campaign"));
-  await settle(() => assert(host.querySelector('[data-state="no-draft"]'), "new campaign page opens in the no-draft preview-first state"));
-  await React.act(async () => { await sleep(700); });
-  await settle(() => assert(text().includes("Final recipients"), "audience preview counts render pre-save"));
-  // Suppression add refreshes the suppression counts.
+  await settle(() => assert(host.querySelector('[role="dialog"][aria-labelledby="crm-newc-title"]'), "New campaign opens as a dialog"));
+  assert(!host.querySelector("#cmp-id"), "the Campaign ID field is gone from the main path");
+  assert(!text().includes("Freeze this audience"), "no freeze controls up front");
+  assert(!host.querySelector('[data-state="no-draft"]'), "no long New page renders");
+  assert(text().includes("Create and draft"), "primary text follows the default Assistant choice");
+  await click(host.querySelector('[data-start="html"]'));
+  assert(text().includes("Create from HTML"), "primary text follows the Paste HTML choice");
+  await click(host.querySelector('[data-start="blank"]'));
+  assert(text().includes("Create blank campaign"), "primary text follows the Blank choice");
+  await click(host.querySelector('[data-start="ai"]'));
+  // A name is required and human: a bad or empty one refuses before any save.
+  await click(byText("button", "Create and draft"));
+  assert(text().includes("Give the campaign a short plain name"), "an empty name is refused client-side");
+  equal(saveBodies.length, 0, "no save left the browser for an empty name");
+  await fillInput('[role="dialog"] input', "Spring launch");
+  await click(byText("button", "Create and draft"));
+  assert(text().includes("Describe what the email should say"), "the assistant start needs a brief");
+  equal(saveBodies.length, 0, "no save without a brief either");
+  const briefArea = host.querySelector('[role="dialog"] textarea') as HTMLTextAreaElement;
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(briefArea, "Welcome new customers warmly.");
+    briefArea.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await click(byText("button", "Create and draft"));
+  await settle(() => assert(saveBodies.length === 1, "the campaign was saved once"));
+  equal(saveBodies[0].name, "Spring launch", "the save carried the human name");
+  assert(/^cmp-[0-9a-f]{12}$/.test(saveBodies[0].campaign_id), "the id is generated, not typed");
+  assert(saveBodies[0].expected_revision === undefined, "a new campaign saves without an expected revision");
+  const unsavedCampaignId = saveBodies[0].campaign_id as string;
+  await settle(() => assert(sendBodies.length === 1, "the brief went to the scoped chat"));
+  equal(sendBodies.at(-1)!.app, { install_id: "install-crm", context_id: "ctx-a" }, "the brief carried the scope");
+  assert(String(sendBodies.at(-1)!.text).includes("Welcome new customers warmly.") && String(sendBodies.at(-1)!.text).includes(unsavedCampaignId), "the brief and the campaign id travel together");
+  await settle(() => assert(location.search.includes(`record=${unsavedCampaignId}`), "the first save moves the URL to record=<campaign_id>"));
+  assert(!location.search.includes("appview=new"), "the saved campaign leaves the New view");
+  assert(!host.querySelector('[role="dialog"]'), "the dialog closes on landing");
+  await settle(() => assert(host.querySelector('[data-tab="email"][aria-selected="true"]'), "it lands on the Email tab"));
+  assert((host.querySelector("[data-outlet-heading]")?.textContent ?? "").includes("Spring launch"), "the header shows the human name, not the subject or id");
+  const idDetails = host.querySelector("details.crm-diag");
+  assert(idDetails && idDetails.textContent!.includes(unsavedCampaignId) && !idDetails.hasAttribute("open"), "the id sits behind Details");
+  assert(!(host.querySelector("[data-outlet-heading]")?.textContent ?? "").includes(unsavedCampaignId), "the id is not in the title");
+  landAssistantDraft(unsavedCampaignId);
+  await click(byText("button", "Refresh drafts"));
+  await settle(() => assert(host.querySelector('[data-proposal^="prop-asst-"]'), "the pending draft lands"), 30000);
+  const firstLi = host.querySelector('[data-proposal^="prop-asst-"]');
+  assert(firstLi, "the verified proposal row exists");
+  // The brief's draft is inert until the operator decides; Discard keeps
+  // the saved r1 so the revision walk below stays unchanged.
+  await click(Array.from(firstLi!.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === "Discard"));
+  await settle(() => assert(!host.querySelector('[data-proposal^="prop-asst-"]'), "the discarded draft leaves"));
+  await openTab("audience");
+  await settle(() => assert(host.querySelector('input[value$="-freeze-1"]'), "the detail renders its freeze default"));
+  equal((host.querySelector("#cmp-detail-freeze") as HTMLInputElement).value, `${unsavedCampaignId}-freeze-1`, "the Freeze ID default derives from the saved campaign id");
+  // Audience tab keeps the suppression and freeze workflows the old page had.
+  await settle(() => assert(host.querySelector("#aud-suppress-email"), "suppressions live on the Audience tab"));
   await fillInput("#aud-suppress-email", "gone@example.com");
   await fillInput("#aud-suppress-reason", "opted out by phone");
   await click(byText("button", "Add suppression"));
   await settle(() => assert(text().includes("gone@example.com"), "added suppression lists"));
-  // Freeze the picked audience under an operator-named ID.
-  await click(byText("button", "Freeze audience"));
-  await settle(() => assert(text().includes("Frozen") && text().includes("5 recipients"), "freeze receipt reports"));
-
-  // Content save unlocks preview, test-send and proposals in place.
-  // CAD-1013 preview-first: there is no manual composer — the campaign
-  // starts with "No email draft yet" and is created by the assistant
-  // proposal path, never a bare Content form.
-  assert(host.querySelector('[data-state="no-draft"]'), "unsaved campaign shows the no-draft state, not a composer");
-  assert(!host.querySelector('form[aria-label="Email content"]'), "no manual block editor renders");
-  assert(!byText("button", "Submit editor as proposal (operator-submitted)"), "the operator proposal shortcut is gone");
-  assert(!host.querySelector("#cmp-subject"), "no manual subject input until a draft exists");
-
-  // Initial creation is not stranded: send the assistant a scoped chat
-  // message, the agent's turn lands an inert pending draft (source r0),
-  // Apply creates revision 1 through the verified assistant path — no
-  // manual mint.
-  assert(!byText("button", "Ask assistant to draft"), "no manual assistant-draft mint control renders");
-  assert(text().includes("Ask the assistant in the left chat"), "the agent-first hint renders pre-save");
-  const proposalsText = host.querySelector('section[aria-label="Assistant proposals"]')?.textContent ?? "";
-  equal(proposalsText.split("Ask the assistant in the left chat").length - 1, 1, "the Proposals card says it once, not twice");
-  await fillArea("#app-shell-chat-box", "Draft the launch email for this campaign");
-  await click(byText("button", "Send"));
-  assert(sendBodies.length === 1, "the scoped chat message was sent");
-  equal(sendBodies.at(-1)!.app, { install_id: "install-crm", context_id: "ctx-a" }, "the send carried the scope");
-  const unsavedCampaignId = (host.querySelector("#cmp-id") as HTMLInputElement | null)?.value
-    ?? Object.keys(contents).at(-1) as string;
-  landAssistantDraft(unsavedCampaignId);
-  await click(byText("button", "Refresh drafts"));
-  await settle(() => assert(host.querySelector('[data-proposal^="prop-asst-"]'), "the pending draft lands pre-save"), 30000);
-  const firstLi = host.querySelector('[data-proposal^="prop-asst-"]');
-  assert(firstLi, "the verified proposal row exists");
-  await click(Array.from(firstLi!.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Apply")));
-  // CAD-1009: the first save makes the campaign a saved record — the
-  // URL moves to record=<id>, the page stops saying "New campaign", and
-  // the Freeze ID default derives from the saved id (not a stale one).
-  await settle(() => assert(location.search.includes(`record=${unsavedCampaignId}`), "the first save moves the URL to record=<campaign_id>"));
-  assert(!location.search.includes("appview=new"), "the saved campaign leaves the New view");
-  await settle(() => assert(host.querySelector('[data-tab="audience"]'), "the saved campaign renders its tabs"));
-  await openTab("audience");
-  await settle(() => assert(host.querySelector('input[value$="-freeze-1"]'), "the detail renders its freeze default"));
-  assert(!text().includes("New campaign"), "a saved campaign no longer says New campaign");
-  equal((host.querySelector("#cmp-detail-freeze") as HTMLInputElement).value, `${unsavedCampaignId}-freeze-1`, "the Freeze ID default derives from the saved campaign id");
   const openDoc = () => contents[(host.querySelector("#cmp-id") as HTMLInputElement | null)?.value ?? ""]
     ?? Object.values(contents).at(-1);
-  assert(openDoc().revision === 1, "revision 1 exists after the assistant apply");
+  assert(openDoc().revision === 1, "revision 1 is the dialog's save; the discarded draft changed nothing");
 
   await openTab("email");
   // Host-rendered preview (CAD-1008): the saved revision renders

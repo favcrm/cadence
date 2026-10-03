@@ -372,8 +372,8 @@ async function mountedFlow() {
   assert((host.querySelector('[data-testid="rule-sentence"]')?.textContent ?? "").includes("and"), "rules join with and");
   await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Use in campaign"));
   assert(location.search.includes("crm=campaigns") && location.search.includes("appview=new") && location.search.includes("segment=seg-none"), "Use in campaign opens new campaign with the segment: " + location.search);
-  await settle(() => assert(host.querySelector('[aria-label="Audience"]'), "campaign form opens"));
-  await settle(() => assert((host.querySelector("#aud-segment") as any)?.textContent?.includes("No consent") || (host.querySelector('[aria-label="Saved segment"]') as any), "campaign audience preselects the segment"));
+  await settle(() => assert(host.querySelector('[role="dialog"] [aria-label="Audience"]'), "the New campaign dialog opens"));
+  await settle(() => assert((host.querySelector('[role="dialog"]')?.textContent ?? "").includes("No consent"), "the dialog's audience preselects the segment"));
   // Back to the segment list and re-open the Newsletter drawer for the stale-write check.
   await React.act(async () => { history.pushState(null, "", "/app-installations/install-crm?ctx=ctx-a&crm=segments"); window.dispatchEvent(new Event("popstate")); });
   await settle(() => assert(host.querySelector('tr[data-record-id]'), "segments list again"));
