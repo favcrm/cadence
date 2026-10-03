@@ -617,6 +617,22 @@ impl Shared {
             }
             _ => Err(Error::rejected("unknown catalog operation")),
         }?;
+        // CAD-1119: install = consent. This RPC is operator-only (the
+        // connection-bound proof above), so only the operator's install or
+        // update of a version records its approval, with the digest and
+        // the capabilities it declares on the audit stream.
+        if let Some(via) = match method {
+            "app_workspace_install" => Some("install"),
+            "app_workspace_upgrade" => Some("upgrade"),
+            _ => None,
+        } {
+            if let (Some(id), Some(digest)) = (
+                result["install_id"].as_str().map(str::to_owned),
+                result["digest"].as_str().map(str::to_owned),
+            ) {
+                result["consent"] = self.record_install_consent(&pm, &id, &digest, via);
+            }
+        }
         let project_approval = |row: &mut Value| -> Result<()> {
             if let (Some(id), Some(digest)) = (row["install_id"].as_str(), row["digest"].as_str()) {
                 let status = self.store.app_capability_status(id, digest)?;

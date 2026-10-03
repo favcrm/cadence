@@ -131,12 +131,14 @@ fn cad743_new_version_can_bind_after_one_hundred_old_version_rows() {
         .all(|row| row["config"]["bundle_digest"] == old_digest));
 }
 
-/// CAD-796 adversarial-first: a material rebind or revoke must withdraw the
-/// installation's prior approval and its derived grants; an identical
-/// re-save must keep both. RED without the guard: the approval row stays
-/// `approved` across the rebind.
+/// CAD-796 adversarial-first: a material rebind or revoke must drop the
+/// installation's derived grants; an identical re-save must keep them.
+/// CAD-1119 (operator direction: install = consent, binding = consent for
+/// the slot): neither the rebind nor the revoke withdraws the
+/// installation's approval any more. The revoked binding itself stops the
+/// slot.
 #[test]
-fn cad796_rebind_and_revoke_withdraw_approval_unchanged_resave_keeps_it() {
+fn cad796_rebind_and_revoke_drop_grants_and_keep_install_consent() {
     let (_dir, s) = store();
     s.fixture_write(|c| {
         c.execute_batch(crate::store::app_bindings::SCHEMA)
@@ -244,32 +246,41 @@ fn cad796_rebind_and_revoke_withdraw_approval_unchanged_resave_keeps_it() {
     assert!(s.app_binding_update("install-a", &id, 1, &forged).is_err());
     assert!(s.app_binding_show("install-b", &id).is_err());
     assert_eq!(approval_of(), Some("approved".into()));
-    // Material rebind: new connection incarnation withdraws approval and
-    // the derived grant, and closes nothing it does not own.
+    // Material rebind: the operator's rebind is the slot's consent. It
+    // drops the derived grant and closes nothing it does not own; the
+    // installation's approval stays in force.
     let mut changed = config.clone();
     changed["connection_id"] = json!("conn-b");
     let second = s.app_binding_update("install-a", &id, 1, &changed).unwrap();
     assert_eq!(second["binding"]["revision"], 2);
-    assert_eq!(approval_of(), Some("revoked".into()));
+    assert_eq!(approval_of(), Some("approved".into()));
     let grant = s
         .platform_grant("worker-a", "fixture", "work")
         .unwrap()
         .unwrap();
     assert!(!grant.scopes.contains(&"widgets:write".to_string()));
     assert!(grant.scopes.contains(&"widgets:read".to_string()));
-    // Operator re-approves the changed binding: authority returns.
-    s.app_capability_decide("install-a", digest, true).unwrap();
-    assert_eq!(approval_of(), Some("approved".into()));
-    // Revoke withdraws again; a concurrent stale revision never lands.
+    // Revoke: a concurrent stale revision never lands; the binding is
+    // revoked and the slot has no configured binding left.
     assert!(s.app_binding_revoke("install-a", &id, 1).is_err());
     s.app_binding_revoke("install-a", &id, 2).unwrap();
-    assert_eq!(approval_of(), Some("revoked".into()));
+    assert_eq!(
+        s.app_binding_show("install-a", &id).unwrap()["binding"]["state"],
+        "revoked"
+    );
+    assert!(s
+        .app_binding_for_slot("install-a", None, "publication", digest)
+        .unwrap()
+        .is_none());
+    assert_eq!(approval_of(), Some("approved".into()));
 }
 
 /// CAD-796: revoking or rotating the credential under a configured binding
-/// withdraws every affected installation's approval in the same transaction.
+/// stops that binding in the same transaction. CAD-1119: the slot stops at
+/// the binding receipt, which no longer proves current, while the
+/// installation's approval (the install consent) stays.
 #[test]
-fn cad796_credential_revoke_and_rotate_withdraw_bound_approvals() {
+fn cad796_credential_revoke_and_rotate_stop_the_bound_slot() {
     let (_dir, s) = store();
     s.fixture_write(|c| {
         c.execute_batch(crate::store::app_bindings::SCHEMA)
@@ -300,9 +311,33 @@ fn cad796_credential_revoke_and_rotate_withdraw_bound_approvals() {
         "provider":"fixture","account":"bound","connection_kind":"enrolled",
         "connection_revision":1,"registration_digest":"reg-1","descriptor_revision":1,
         "mapping":{"effect":"send","scopes":["widgets:write"]},"declaration":{}});
-    s.app_binding_create("install-a", None, "publication", &config, "cad796-cred-req")
+    let created = s
+        .app_binding_create("install-a", None, "publication", &config, "cad796-cred-req")
         .unwrap();
-    // Rotate: revision bump stales the binding and withdraws approval.
+    let proof: crate::store::app_bindings::BindingProof =
+        serde_json::from_value(json!({"id": created["binding"]["id"],
+            "revision": created["binding"]["revision"],
+            "digest": created["binding"]["digest"],
+            "config": created["binding"]["config"]}))
+        .unwrap();
+    s.conn()
+        .execute(
+            "INSERT OR REPLACE INTO connection_metadata(singleton, workspace_id) VALUES(1, 'ws')",
+            [],
+        )
+        .unwrap();
+    let current = || {
+        crate::store::app_bindings::binding_current_in(
+            &s.conn(),
+            "install-a",
+            None,
+            "publication",
+            &proof,
+        )
+        .unwrap()
+    };
+    assert!(current(), "the fresh binding is current");
+    // Rotate: the revision bump stales the binding; approval stays.
     s.platform_enroll(
         &crate::store::CredentialRecord {
             connection_id: "conn-cred".into(),
@@ -328,10 +363,10 @@ fn cad796_credential_revoke_and_rotate_withdraw_bound_approvals() {
                 |r| r.get::<_, String>(0),
             )
             .unwrap(),
-        "revoked"
+        "approved"
     );
-    // Re-approve, then revoke the credential: approval withdraws again.
-    s.app_capability_decide("install-a", digest, true).unwrap();
+    assert!(!current(), "a rotated credential stops the bound slot");
+    // Revoke the credential: the slot stays stopped.
     s.platform_revoke(
         "fixture",
         "bound",
@@ -349,8 +384,9 @@ fn cad796_credential_revoke_and_rotate_withdraw_bound_approvals() {
                 |r| r.get::<_, String>(0),
             )
             .unwrap(),
-        "revoked"
+        "approved"
     );
+    assert!(!current(), "a revoked credential stops the bound slot");
 }
 
 /// CAD-796 adversarial: a corrupt derived-grant row must fail the rebind
@@ -419,4 +455,171 @@ fn cad796_corrupt_grant_row_rolls_back_rebind() {
             .unwrap(),
         "approved"
     );
+}
+
+/// A full binding receipt as `app_binding_config` derives it.
+fn cad1119_receipt() -> Value {
+    json!({"schema":1,"install_id":"install-a","context":null,
+        "bundle_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "workspace_id":"ws","connection_id":"conn-a","provider":"fixture","account":"work",
+        "connection_kind":"enrolled","connection_revision":1,
+        "registration_digest":"sha256:reg-1","sink_registration":"sink-1",
+        "descriptor_revision":"fixture-connections/2","reviewed_pin":"tools@2","reported_pin":"tools@2",
+        "mapping":{"capability":"probe.read","version":1,"action":"list_items",
+            "resource_kind":"connection_account","tool":"old_tool","scopes":["provider.read"],
+            "effect":"read","semantics":"metadata_read","input_contract":"in@1","output_contract":"out@1"},
+        "declaration":{"schema":1,"capability":"probe.read","version":1,"action":"list_items",
+            "resource_kind":"connection_account","effect":"read"}})
+}
+
+/// CAD-1119 adversarial: the migration allowlist is the only thing between a
+/// changed connection and a silent migration, so every field outside it —
+/// top-level and `mapping.*`, an unknown, added or removed field, and a
+/// receipt or mapping that is not an object — needs the operator. Only the
+/// allowlisted bookkeeping fields migrate.
+#[test]
+fn cad1119_binding_drift_allows_only_bookkeeping_to_migrate() {
+    use crate::store::app_bindings::{binding_drift, BindingDrift};
+    let base = cad1119_receipt();
+    let changed = |path: &[&str], value: Value| {
+        let mut next = base.clone();
+        let mut at = &mut next;
+        for key in &path[..path.len() - 1] {
+            at = &mut at[*key];
+        }
+        at[path[path.len() - 1]] = value;
+        next
+    };
+    let removed = |path: &[&str]| {
+        let mut next = base.clone();
+        let mut at = &mut next;
+        for key in &path[..path.len() - 1] {
+            at = &mut at[*key];
+        }
+        at.as_object_mut().unwrap().remove(path[path.len() - 1]);
+        next
+    };
+    let mut widened: Vec<(String, Value)> = Vec::new();
+    for key in [
+        "schema",
+        "install_id",
+        "context",
+        "bundle_digest",
+        "workspace_id",
+        "connection_id",
+        "provider",
+        "account",
+        "connection_kind",
+        "connection_revision",
+        "declaration",
+    ] {
+        widened.push((key.into(), changed(&[key], json!("changed"))));
+        widened.push((format!("{key} removed"), removed(&[key])));
+    }
+    for key in [
+        "capability",
+        "version",
+        "action",
+        "resource_kind",
+        "scopes",
+        "effect",
+        "semantics",
+        "input_contract",
+        "output_contract",
+    ] {
+        widened.push((
+            format!("mapping.{key}"),
+            changed(&["mapping", key], json!("changed")),
+        ));
+        widened.push((format!("mapping.{key} removed"), removed(&["mapping", key])));
+    }
+    widened.push((
+        "unknown top-level".into(),
+        changed(&["future_field"], json!(1)),
+    ));
+    widened.push((
+        "unknown mapping".into(),
+        changed(&["mapping", "future_field"], json!(1)),
+    ));
+    widened.push(("mapping.tool removed".into(), removed(&["mapping", "tool"])));
+    widened.push((
+        "registration removed".into(),
+        removed(&["registration_digest"]),
+    ));
+    widened.push((
+        "mapping not an object".into(),
+        changed(&["mapping"], json!("x")),
+    ));
+    widened.push(("receipt not an object".into(), json!([1])));
+    for (case, next) in &widened {
+        assert!(
+            matches!(binding_drift(&base, next), BindingDrift::NeedsConfirm(_)),
+            "{case} must need the operator"
+        );
+    }
+    assert!(matches!(
+        binding_drift(&json!([1]), &json!([2])),
+        BindingDrift::NeedsConfirm(_)
+    ));
+    assert_eq!(binding_drift(&base, &base), BindingDrift::Same);
+    for key in [
+        "registration_digest",
+        "sink_registration",
+        "descriptor_revision",
+        "reviewed_pin",
+        "reported_pin",
+    ] {
+        assert!(
+            matches!(
+                binding_drift(&base, &changed(&[key], json!("moved"))),
+                BindingDrift::Compatible(_)
+            ),
+            "{key} is bookkeeping"
+        );
+    }
+    assert!(matches!(
+        binding_drift(&base, &changed(&["mapping", "tool"], json!("new_tool"))),
+        BindingDrift::Compatible(_)
+    ));
+}
+
+/// CAD-1119 adversarial: the store re-checks the classification. A widened
+/// receipt never migrates, even with an exact compare-and-swap proof; a
+/// bookkeeping change does.
+#[test]
+fn cad1119_store_migrate_refuses_a_widened_receipt_with_a_valid_proof() {
+    let (_dir, s) = store();
+    s.conn()
+        .execute_batch(crate::store::app_bindings::SCHEMA)
+        .unwrap();
+    let config = cad1119_receipt();
+    let created = s
+        .app_binding_create("install-a", None, "source", &config, "cad1119-migrate")
+        .unwrap()["binding"]
+        .clone();
+    let proof: crate::store::app_bindings::BindingProof = serde_json::from_value(json!({
+        "id": created["id"], "revision": created["revision"],
+        "digest": created["digest"], "config": created["config"]}))
+    .unwrap();
+    for (field, value) in [
+        ("connection_revision", json!(2)),
+        ("account", json!("other")),
+    ] {
+        let mut widened = config.clone();
+        widened[field] = value;
+        let refused = s.app_binding_migrate("install-a", &proof, &widened);
+        assert!(refused.is_err(), "{field} migrated");
+    }
+    let mut effect = config.clone();
+    effect["mapping"]["effect"] = json!("draft");
+    assert!(s.app_binding_migrate("install-a", &proof, &effect).is_err());
+    assert_eq!(
+        s.app_binding_show("install-a", &proof.id).unwrap()["binding"]["revision"],
+        1,
+        "nothing migrated"
+    );
+    let mut moved = config.clone();
+    moved["descriptor_revision"] = json!("fixture-connections/3");
+    let next = s.app_binding_migrate("install-a", &proof, &moved).unwrap();
+    assert_eq!(next.revision, 2);
 }

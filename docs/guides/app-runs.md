@@ -70,12 +70,17 @@ The catalog installation command returns a stable installation ID:
 ```sh
 cadence app catalog install /trusted/cadence/apps/local-content
 cadence app catalog show <installation-id>
-cadence app catalog approve <installation-id> --digest <installed-digest>
 ```
 
-Approval requires the exact digest returned by the current installation.
-It permits the bounded local artifact capability; it creates neither a
-run nor a dispatch and does not grant account-wide permissions.
+Installing is the approval (CAD-1119): the operator's install, or update,
+records the approval of exactly the installed digest, audited with the
+digest and the capabilities it declares. It permits the bounded local
+artifact capability; it creates neither a run nor a dispatch and does not
+grant account-wide permissions. Each run still waits for its own
+frozen-price approval, and each publication for its own approval.
+`cadence app catalog revoke <installation-id> --digest <installed-digest>` turns the installation's access off;
+`cadence app catalog approve <installation-id> --digest <installed-digest>`
+turns it back on.
 
 Supply an explicit JSON object of string inputs in a local file:
 

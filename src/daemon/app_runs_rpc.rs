@@ -63,7 +63,76 @@ fn freeze_content_inputs(
     (effective, origins)
 }
 
+/// The installed bundle checks an installation approval rests on: a
+/// typed manifest with no legacy untyped connection slots and at least one
+/// supported local workflow. Shared by the explicit operator approval and
+/// the consent an operator install or update records (CAD-1119).
+pub(super) fn local_execution_contract(
+    files: &BTreeMap<String, String>,
+) -> Result<crate::issue::app::Manifest> {
+    let manifest = crate::issue::app::parse_manifest(
+        files
+            .get("app.md")
+            .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
+    )?;
+    if !manifest.connections.is_empty() {
+        return Err(Error::rejected(
+            "local text execution does not support connection capabilities",
+        ));
+    }
+    let mut count = 0;
+    for (name, text) in files {
+        if name.starts_with("workflows/") {
+            LocalWorkflow::validate_template(text)?;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return Err(Error::rejected(
+            "installed app has no supported local workflow",
+        ));
+    }
+    Ok(manifest)
+}
+
 impl Shared {
+    /// CAD-1119: an operator install or update is the consent for exactly
+    /// the installed digest. Called only from the operator-gated catalog
+    /// RPC after the bundle is committed; never from an agent path. The
+    /// runtime snapshot re-proves the digest, so a concurrent update
+    /// cannot receive consent meant for another version. A bundle that
+    /// fails the approval checks is installed but not approved, and the
+    /// result says why.
+    pub(super) fn record_install_consent(
+        &self,
+        pm: &crate::issue::Pm,
+        install: &str,
+        digest: &str,
+        via: &str,
+    ) -> Value {
+        let outcome = workspace::with_runtime_snapshot(pm, install, |row, files| {
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if row["digest"].as_str() != Some(digest) {
+                return Err(Error::rejected(
+                    "installation changed before its consent was recorded",
+                ));
+            }
+            let manifest = local_execution_contract(files)?;
+            let capabilities = serde_json::to_value(&manifest.capabilities)
+                .map_err(|e| Error::internal(e.to_string()))?;
+            self.store
+                .app_install_consent(install, digest, via, &capabilities)
+        });
+        match outcome {
+            Ok(_) => json!({"recorded": true, "via": via, "digest": digest}),
+            Err(error) => json!({"recorded": false, "via": via, "digest": digest,
+                "reason": error.to_string()}),
+        }
+    }
+
     pub(super) fn rpc_app_local(
         self: &Arc<Self>,
         method: &str,
@@ -144,28 +213,7 @@ impl Shared {
                             return Err(Error::rejected("installation digest is stale"));
                         }
                         if method == "app_local_install_approve" {
-                            let manifest = crate::issue::app::parse_manifest(
-                                files.get("app.md").ok_or_else(|| {
-                                    Error::rejected("installation manifest unavailable")
-                                })?,
-                            )?;
-                            if !manifest.connections.is_empty() {
-                                return Err(Error::rejected(
-                                    "local text execution does not support connection capabilities",
-                                ));
-                            }
-                            let mut count = 0;
-                            for (name, text) in files {
-                                if name.starts_with("workflows/") {
-                                    LocalWorkflow::validate_template(text)?;
-                                    count += 1;
-                                }
-                            }
-                            if count == 0 {
-                                return Err(Error::rejected(
-                                    "installed app has no supported local workflow",
-                                ));
-                            }
+                            local_execution_contract(files)?;
                         }
                         self.store.app_capability_decide(
                             required_str(params, "install_id")?,
@@ -305,23 +353,13 @@ impl Shared {
                                     "workflow publication slot is not declared by this app",
                                 ));
                             }
-                            let binding = self.store.app_binding_for_slot(
+                            self.app_binding_live(
                                 id,
                                 context.as_ref().map(|(_, proof)| proof.id.as_str()),
                                 slot,
-                                required_str(row, "digest")?,
-                            )?;
-                            if let Some(proof) = &binding {
-                                self.app_binding_receipt_current(
-                                    id,
-                                    context.as_ref().map(|(_, proof)| proof.id.as_str()),
-                                    slot,
-                                    proof,
-                                    row,
-                                    files,
-                                )?;
-                            }
-                            Ok(binding)
+                                row,
+                                files,
+                            )
                         })
                         .transpose()?
                         .flatten();
@@ -341,22 +379,14 @@ impl Shared {
                             ));
                         }
                         let proof = self
-                            .store
-                            .app_binding_for_slot(
+                            .app_binding_live(
                                 id,
                                 context.as_ref().map(|(_, proof)| proof.id.as_str()),
                                 slot,
-                                required_str(row, "digest")?,
+                                row,
+                                files,
                             )?
                             .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
-                        self.app_binding_receipt_current(
-                            id,
-                            context.as_ref().map(|(_, proof)| proof.id.as_str()),
-                            slot,
-                            &proof,
-                            row,
-                            files,
-                        )?;
                         capabilities.insert(slot.clone(), proof);
                         quotes.insert(
                             slot.clone(),

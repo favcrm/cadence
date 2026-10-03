@@ -203,22 +203,31 @@ equal(bindingForSlot([staleRow, freshRow], null, "publication", "sha256:current"
 equal(bindingForSlot([freshRow, staleRow], null, "publication", "sha256:current")?.id, "bind-new", "current pin either order");
 equal(bindingForSlot([staleRow], null, "publication", "sha256:current")?.id, "bind-old", "stale still visible");
 
-// Ready-to-run (CAD-796): each typed slot names its connection, health,
-// custody and approval with the next action; legacy slots stay out.
+// Ready-to-run (CAD-796, CAD-1119): each typed slot names its connection,
+// health and custody with the next action for a real blocker; legacy
+// slots stay out. Installing is the approval, so it is never a blocker.
 const readyRows = readinessFor(installation(), [binding()], all, null);
 equal(readyRows.map((r) => r.slot), ["publication", "source"], "typed slots only");
-equal(readyRows[0].ready, true, "bound healthy approved slot is ready");
+equal(readyRows[0].ready, true, "bound healthy slot is ready");
 equal(readyRows[0].nextAction, "Ready to run.", "ready needs nothing");
 equal(readyRows[0].connection?.id, "builtin-local", "names the bound connection");
 equal(readyRows[0].custody, true, "custody reported");
 equal(readyRows[1].ready, false, "unbound slot is not ready");
 equal(readyRows[1].nextAction, "Choose a source connection below and save it.", "missing slot action");
-const gatedRows = readinessFor({ ...installation(), approved: false }, [binding()], all, null);
-equal(gatedRows[0].ready, false, "rebind-era approval gates the run");
-equal(gatedRows[0].nextAction, "Approve the app's current version before running.", "reapproval action");
+// A provider change that keeps the contract migrates silently: still Ready.
+const migrating = binding({ drift: { state: "migrates", changes: [{ field: "mapping.tool", from: "a", to: "b" }] } });
+equal(readinessFor(installation(), [migrating], all, null)[0].ready, true, "same-contract change is not a blocker");
+// A widened contract blocks the slot and carries the change to confirm.
+const widened = binding({ drift: { state: "needs_confirm", changes: [{ field: "mapping.scopes", from: [], to: ["x"] }] } });
+const confirmRows = readinessFor(installation(), [widened], all, null);
+equal(confirmRows[0].ready, false, "widened contract blocks");
+equal(confirmRows[0].confirm?.[0]?.field, "mapping.scopes", "change carried to the confirm");
+equal(confirmRows[0].nextAction, "Its connection changed what this slot may do. Review the change and confirm it.", "confirm action");
+const unfit = binding({ drift: { state: "unavailable", reason: "provider action effect differs from app contract" } });
+equal(readinessFor(installation(), [unfit], all, null)[0].ready, false, "unfit connection blocks");
 const movedRows = readinessFor({ ...installation(), digest: "sha256:other" }, [binding()], all, null);
 equal(movedRows[0].health, "stale-bundle", "bundle move detected");
-equal(movedRows[0].nextAction, "Save the publication connection again for the current app version, then approve the app.", "stale rebind action");
+equal(movedRows[0].nextAction, "Save the publication connection again for the current app version.", "stale rebind action");
 const goneRows = readinessFor(installation(), [binding({ config: { ...binding().config, connection_id: "conn-gone" } })], all, null);
 equal(goneRows[0].ready, false, "vanished connection is not ready");
 equal(goneRows[0].nextAction, "Its connection is gone — choose another publication connection below.", "gone connection action");

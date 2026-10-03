@@ -220,56 +220,97 @@ impl Store {
         Ok(())
     }
     pub fn app_capability_decide(&self, id: &str, digest: &str, approve: bool) -> Result<Value> {
+        self.app_capability_decide_audited(id, digest, approve, json!({}))
+    }
+    /// CAD-1119: installing or updating an app is the operator's consent.
+    /// The operator install/upgrade path records the approval of exactly
+    /// that installed digest, auditing who installed it, how, and the
+    /// capabilities it declares. An approval already in force for this
+    /// digest is left untouched: re-deciding the same digest would
+    /// invalidate effects staged under it.
+    pub fn app_install_consent(
+        &self,
+        id: &str,
+        digest: &str,
+        via: &str,
+        capabilities: &Value,
+    ) -> Result<Option<Value>> {
+        if self.app_capability_status(id, digest)?["state"] == "approved" {
+            return Ok(None);
+        }
+        self.app_capability_decide_audited(
+            id,
+            digest,
+            true,
+            json!({"via": via, "capabilities": capabilities}),
+        )
+        .map(Some)
+    }
+    fn app_capability_decide_audited(
+        &self,
+        id: &str,
+        digest: &str,
+        approve: bool,
+        audit: Value,
+    ) -> Result<Value> {
         self.write_tx(|conn| {
-
-                    let tx = &mut *conn;
-                    let previous: Option<(String, String)> = tx
-                        .query_opt(
-                            "SELECT digest,state FROM app_install_capabilities WHERE install_id=?",
-                            [id],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
-                        )?;
-                    tx.execute("INSERT INTO app_install_capabilities VALUES(?,1,?,?,?) ON CONFLICT(install_id) DO UPDATE SET epoch=epoch+1,digest=excluded.digest,state=excluded.state,created=excluded.created",params![id,digest,if approve{"approved"}else{"revoked"},now()])?;
-                    let epoch: i64 = tx.query_row(
-                        "SELECT epoch FROM app_install_capabilities WHERE install_id=?",
-                        [id],
-                        |r| r.get(0),
-                    )?;
-                    if approve {
-                        // Reapproving the same bundle supersedes its older epochs. A new
-                        // bundle leaves completed old-version work authorized by its
-                        // exact historical epoch and retained bundle bytes.
-                        tx.execute(
-                            "UPDATE app_capability_epochs SET state='revoked' WHERE install_id=? AND digest=?",
-                            params![id, digest],
-                        )?;
-                        if previous.as_ref().is_some_and(|(old, _)| old == digest) {
-                            Self::app_effect_invalidate_in(&tx, id, None, None, Some(digest))?;
-                        }
-                    } else {
-                        // An explicit installation revoke removes authority from every
-                        // version, including completed historical work.
-                        tx.execute(
-                            "UPDATE app_capability_epochs SET state='revoked' WHERE install_id=?",
-                            [id],
-                        )?;
-                        Self::app_effect_invalidate_in(&tx, id, None, None, None)?;
+            let tx = &mut *conn;
+        let previous: Option<(String, String)> = tx
+            .query_opt(
+                "SELECT digest,state FROM app_install_capabilities WHERE install_id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+        tx.execute("INSERT INTO app_install_capabilities VALUES(?,1,?,?,?) ON CONFLICT(install_id) DO UPDATE SET epoch=epoch+1,digest=excluded.digest,state=excluded.state,created=excluded.created",params![id,digest,if approve{"approved"}else{"revoked"},now()])?;
+        let epoch: i64 = tx.query_row(
+            "SELECT epoch FROM app_install_capabilities WHERE install_id=?",
+            [id],
+            |r| r.get(0),
+        )?;
+        if approve {
+            // Reapproving the same bundle supersedes its older epochs. A new
+            // bundle leaves completed old-version work authorized by its
+            // exact historical epoch and retained bundle bytes.
+            tx.execute(
+                "UPDATE app_capability_epochs SET state='revoked' WHERE install_id=? AND digest=?",
+                params![id, digest],
+            )?;
+            if previous.as_ref().is_some_and(|(old, _)| old == digest) {
+                Self::app_effect_invalidate_in(&tx, id, None, None, Some(digest))?;
+            }
+        } else {
+            // An explicit installation revoke removes authority from every
+            // version, including completed historical work.
+            tx.execute(
+                "UPDATE app_capability_epochs SET state='revoked' WHERE install_id=?",
+                [id],
+            )?;
+            Self::app_effect_invalidate_in(&tx, id, None, None, None)?;
+        }
+        tx.execute("INSERT INTO app_capability_epochs(install_id,epoch,digest,state,created) VALUES(?,?,?,?,?)",
+            params![id,epoch,digest,if approve{"approved"}else{"revoked"},now()])?;
+        Self::event(
+            &tx,
+            Self::DAEMON_STREAM,
+            if approve {
+                "app_install_capability_approved"
+            } else {
+                "app_install_capability_revoked"
+            },
+            {
+                let mut event =
+                    json!({"install_id":id,"digest":digest,"epoch":epoch,"actor":"operator"});
+                if let (Some(event), Some(audit)) = (event.as_object_mut(), audit.as_object()) {
+                    for (key, value) in audit {
+                        event.entry(key.clone()).or_insert_with(|| value.clone());
                     }
-                    tx.execute("INSERT INTO app_capability_epochs(install_id,epoch,digest,state,created) VALUES(?,?,?,?,?)",
-                        params![id,epoch,digest,if approve{"approved"}else{"revoked"},now()])?;
-                    Self::event(
-                        &tx,
-                        Self::DAEMON_STREAM,
-                        if approve {
-                            "app_install_capability_approved"
-                        } else {
-                            "app_install_capability_revoked"
-                        },
-                        json!({"install_id":id,"digest":digest,"epoch":epoch,"actor":"operator"}),
-                    )?;
-                    Ok(
-                        json!({"install_id":id,"epoch":epoch,"digest":digest,"approved":approve,"capabilities":["local.text.produce","local.text.review"],"outward_release":false}),
-                    )
+                }
+                event
+            },
+        )?;
+        Ok(
+            json!({"install_id":id,"epoch":epoch,"digest":digest,"approved":approve,"capabilities":["local.text.produce","local.text.review"],"outward_release":false}),
+        )
         })
     }
 }
