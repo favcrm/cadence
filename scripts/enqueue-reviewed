@@ -79,6 +79,9 @@ HUMAN_EXACT = {
 # CAD-1106: a scope approval never covers trust boundary/identity (1) or
 # secrets (3); those need a per-head approval.
 NEVER_SCOPE_TRIGGERS = {1, 3}
+# Tracker statuses (src/issue/model.rs STATUSES) a scope approval may cover:
+# work has started and the ticket is not closed. backlog, done, dropped: no.
+SCOPE_STATUSES = ("ready", "doing", "review")
 SCOPE_RECORDED_VIA = "operator-connection"  # the proof check_approval relies on
 # Rust's char::is_whitespace set: the daemon's scope_digest is sha256 of
 # body.trim(), and Python's str.strip() trims a different set.
@@ -416,9 +419,18 @@ def glob_list(toml_text, key_path):
     return node if isinstance(node, list) and all(isinstance(g, str) for g in node) else None
 
 
-def risk_line(text):
-    """The first `Risk:` line (stripped, without the label), or None."""
-    return next((l.strip()[5:].strip() for l in (text or "").splitlines() if l.strip().startswith("Risk:")), None)
+def risk_line(text, skip_fences=False):
+    """The one `Risk:` line (stripped, without the label), or None when there
+    is none or MORE THAN ONE (fail closed: which one counts is unknowable).
+    `skip_fences` ignores lines inside fenced code blocks (a ticket body)."""
+    lines, fenced = [], False
+    for raw in (text or "").splitlines():
+        l = raw.strip()
+        if skip_fences and l.startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced and l.startswith("Risk:"):
+            lines.append(l[5:].strip())
+    return lines[0] if len(lines) == 1 else None
 
 
 def risk_triggers(line):
@@ -491,10 +503,10 @@ def scope_reasons(issue, title, branch, ticket, paths, risk_text, one_text, verd
             why.append(f"trigger 1/3 or two-review path needs a per-head approval: {', '.join(hit[:5])}")
     if not paths:
         why.append("no changed paths")
-    if ticket.get("status") in (None, "done", "cancelled") or not isinstance(ticket.get("status"), str):
-        why.append(f"ticket {issue} status is {ticket.get('status')!r}; a scope approval does not cover a done, cancelled or unknown-status ticket")
+    if ticket.get("status") not in SCOPE_STATUSES:
+        why.append(f"ticket {issue} status is {ticket.get('status')!r}; a scope approval covers only a ticket in {'/'.join(SCOPE_STATUSES)}")
     # The ticket declares its Risk triggers; the approval covers only those.
-    declared = risk_triggers(risk_line(body)) if isinstance(body, str) else None
+    declared = risk_triggers(risk_line(body, True)) if isinstance(body, str) else None
     pt, unmapped = path_triggers(paths, risk_text)
     if not declared:
         why.append(f"ticket {issue} declares no parseable `Risk: human (<numbers>)` line, so its scope is unknown")

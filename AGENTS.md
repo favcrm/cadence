@@ -122,7 +122,9 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   `[trigger6]`/`[trigger7]`) and of every verdict must be declared, and a
   human-class path in no trigger list needs the per-head approval. A diff
   touching a risk-paths trigger 1/3 path or a two-review path always needs
-  the per-head approval, and so does a done or cancelled ticket. Editing the ticket body voids the scope
+  the per-head approval, and so does a ticket not in ready, doing or review (backlog, done, dropped). A
+  ticket body or verdict with more than one `Risk:` line (fenced code in the
+  body is skipped) gives no scope approval. Editing the ticket body voids the scope
   approval (the digest changes); `cadence audit revoke <id>` withdraws it.
 - **Delegated approval** (CAD-918) when the reviewers class the PR
   `delegated` (`docs/roles/risk-classes.md`): the agent designated for
