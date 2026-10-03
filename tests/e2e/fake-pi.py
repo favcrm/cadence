@@ -43,6 +43,9 @@ Modes (argv[1]):
   any work, until `new_session` resets the history. A prompt with
   "run empty tool" runs a tool whose result has no content (the Demo
   "(no output)" shape). `gateway-always` refuses every model call.
+  In any mode, a prompt containing `fake-fail <key>` ends with the
+  provider error FAIL_SHAPES[key] (a 429, a 5xx, a credential error, the
+  exact gateway 400) — the shapes a session reset must tell apart.
 
 When CADENCE_ALIAS is `master` the fake also records what the launch
 actually delivered — `pi-argv.json` (sys.argv tail, i.e. every flag the
@@ -255,6 +258,12 @@ GATEWAY_CAP = {"gateway-cap": 12, "gateway-always": 0}.get(MODE)
 GATEWAY_400 = ('400 {"message":"Unsupported or malformed text request.",'
                '"type":"invalid_request_error","code":"invalid_request"}')
 history = 1  # the system prompt
+FAIL_SHAPES = {
+    "429": '429 {"error":{"message":"Rate limited","type":"rate_limit_error","code":"rate_limited"}}',
+    "502": '502 {"error":{"message":"The model provider could not complete the call.","type":"server_error","code":"upstream_unavailable"}}',
+    "auth": "No API key found for agenticos. Use /login to sign in.",
+    "gateway400": GATEWAY_400,
+}
 live_turn = False
 pending_dialog = None
 
@@ -335,6 +344,11 @@ def run_prompt(message):
         # the daemon actually delivered (envelope lines included).
         reply = "fake-pi prompt: " + message
     slow = MODE == "slow"  # CAD-551: a visible turn for the working row
+    for key, error in FAIL_SHAPES.items():
+        if "fake-fail " + key in message:
+            live_turn = False
+            finish_turn("error", "", error)
+            return
     if gateway_refused():
         return
     if "run empty tool" in message:

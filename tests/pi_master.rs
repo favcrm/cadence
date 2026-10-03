@@ -2598,3 +2598,54 @@ fn the_turn_guard_replaces_empty_text_with_a_placeholder() {
         assert_eq!(out[6], messages[6], "{version}");
     }
 }
+
+/// CAD-1076: only the gateway's 400 `invalid_request` resets a master
+/// session — a rate limit, an outage and a credential error are
+/// ordinary failures, and `new_session` is never sent for them.
+#[test]
+fn only_a_rejected_history_resets_the_master() {
+    let state = tempfile::tempdir().unwrap();
+    let pi = master_adapter(
+        "normal",
+        state.path(),
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    pi.open(&master_agent(state.path(), json!({"unconfined": true})))
+        .unwrap();
+    for key in ["429", "502", "auth"] {
+        let turn = pi
+            .run_turn(&format!("fake-fail {key}"), "m", &|_| {})
+            .unwrap();
+        assert_eq!(turn.status, "failed", "{key}: {:?}", turn.error);
+        assert!(!pi.reset_rejected_session(&turn).unwrap(), "{key} reset");
+    }
+    let journal = state.path().join("master/cwd/pi-rpc.jsonl");
+    let rpcs = std::fs::read_to_string(&journal).unwrap();
+    assert!(!rpcs.contains("\"new_session\""), "{rpcs}");
+    // Positive control: the gateway's exact 400 does reset.
+    let refused = pi.run_turn("fake-fail gateway400", "m", &|_| {}).unwrap();
+    assert!(pi.reset_rejected_session(&refused).unwrap());
+    pi.close();
+}
+
+/// CAD-1076: the reset is master-only. A Pi worker keeps a persistent
+/// session file, so the gateway's exact 400 on a worker turn is an
+/// ordinary failure — no `new_session`, no replay.
+#[test]
+fn a_worker_refused_with_the_gateway_400_is_not_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    pi.open(&agent("dev-1", json!({}))).unwrap();
+    let refused = pi.run_turn("fake-fail gateway400", "m", &|_| {}).unwrap();
+    assert_eq!(refused.status, "failed", "{:?}", refused.error);
+    assert!(refused
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("invalid_request"));
+    assert!(
+        !pi.reset_rejected_session(&refused).unwrap(),
+        "worker reset"
+    );
+    pi.close();
+}
