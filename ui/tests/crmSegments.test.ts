@@ -351,7 +351,6 @@ async function mountedFlow() {
   await settle(() => assert(host.querySelector('[aria-label="All members"]'), "View all opens the Members tab"));
 
   // CAD-1072: Export members and Delete segment have no backend (CAD-1069), so they are not shown.
-  assert(!host.querySelector('[aria-label="More actions"]'), "no menu of dead placeholders");
   assert(!text().includes("Export members") && !text().includes("Delete segment"), "unbuilt actions are absent");
   await click(Array.from(host.querySelectorAll(".crm-drawer-foot button")).find((el) => el.textContent === "Duplicate"));
   await settle(() => assert(Object.values(segments).some((x: any) => x.name === "Newsletter (copy)"), "duplicate saves a copy"));

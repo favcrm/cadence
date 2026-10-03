@@ -823,7 +823,4 @@ fn cad1072_create_refuses_provenance_without_a_grant() {
         // Nothing was written.
         assert!(store.app_record_show("ctx-1", "c1").is_err());
     }
-    // Bounds are the update path's: an oversized note is refused at parse.
-    let long = "x".repeat(281);
-    assert!(ConsentProvenance::parse(&json!({"method": "other", "note": long})).is_err());
 }

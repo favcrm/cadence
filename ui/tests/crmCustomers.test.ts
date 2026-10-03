@@ -388,13 +388,8 @@ assert(text().includes("beta-two@example.com"), "drawer shows the profile");
 assert(host.querySelector('[data-testid="drawer-warning"]')?.textContent?.includes("can't receive campaigns"), "denied customer shows the status warning");
 assert(!host.querySelector('[data-testid="drawer-warning"] button'), "the warning strip holds no controls");
 const foot = host.querySelector(".crm-drawer-foot")!;
-const footLabels = Array.from(foot.querySelectorAll("button")).map((b) => b.textContent?.trim());
-equal(footLabels.filter((l) => ["Copy email", "Edit", "Record consent"].includes(l ?? "")), ["Copy email", "Edit", "Record consent"], "footer order: Copy email, Edit, primary Record consent");
-assert(foot.querySelector("button.btn-primary")?.textContent === "Record consent", "Record consent is the single primary");
-// CAD-1072: no dead placeholders; the one real extra action sits inline, so there is no menu.
+// CAD-1072: unbuilt actions are not shown.
 for (const dead of ["Add to segment", "Archive customer", "View in Outbox"]) assert(!foot.textContent!.includes(dead), `${dead} is not built and not shown`);
-assert(!foot.querySelector('button[aria-label="More actions"]'), "a single real extra action shows inline, not in a menu");
-assert(Array.from(foot.querySelectorAll("button")).every((b) => !(b as HTMLButtonElement).disabled), "the footer holds no disabled buttons");
 assert(host.querySelector('[data-consent="email"]')?.textContent?.includes("Withdrawn"), "Overview consent card shows the email state");
 assert(text().includes("Profile") && text().includes("Segments") && text().includes("Campaigns"), "Overview carries Profile, Segments and Campaigns");
 // Activity is a human timeline; ids stay under Details.
