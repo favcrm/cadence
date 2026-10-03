@@ -19,13 +19,13 @@ and workspace. These are operator commands, not a production rollout.
 ```sh
 cadence app catalog install workspace-apps/crm
 cadence app catalog show <install-id>
-cadence app catalog approve <install-id> --digest <installed-digest>
 ```
 
 `install` validates and copies the local bundle and returns a stable
 installation ID plus the bundle `digest` and `catalog_generation`.
-`approve` requires the exact returned digest; it permits the bundle's
-bounded local text capability only. It creates no run, dispatch, binding,
+Installing is the approval (CAD-1119): it records the approval of exactly
+that digest, which permits the bundle's bounded local text capability
+only. It creates no run, dispatch, binding,
 customer record, SMTP connection or send authority.
 
 ## Optional context
@@ -150,7 +150,7 @@ cadence app catalog upgrade <install-id> --source <dir> \
 ```
 
 The upgrade preserves installation, context and record identities and
-leaves the new digest unapproved until `app catalog approve` runs on it.
+records the operator's approval of the new digest, as an install does.
 It performs **no schema or arbitrary data migration** — it only swaps the
 bundle bytes under the same identity, with CAS refusal on a stale expected
 digest.

@@ -34,10 +34,23 @@ export interface Connection {
   descriptor: { action_mappings: ActionMapping[] } | null;
   status: { manifest_status: string; custody_available: boolean; adapter_registered: boolean };
 }
+/** One field a bound connection's re-derived receipt changed (CAD-1119). */
+export interface BindingChange { field: string; from: unknown; to: unknown }
+/**
+ * The daemon's view of a configured binding against its connection now:
+ * `current`; `migrates` silently on next use (provider bookkeeping only);
+ * `needs_confirm` when the slot contract changed; `unavailable` with why.
+ */
+export interface BindingDrift {
+  state: "current" | "migrates" | "needs_confirm" | "unavailable";
+  changes?: BindingChange[];
+  reason?: string;
+}
 export interface AppBinding {
   id: string; install_id: string; context_id: string | null; slot: string;
   revision: number; state: string; digest: string;
   config: { bundle_digest: string; connection_id: string; provider: string; account: string; mapping: ActionMapping };
+  drift?: BindingDrift;
 }
 export interface UpgradeProposal {
   install_id: string; name: string; version: string; digest: string;

@@ -97,7 +97,7 @@ function WorkspaceCatalog() {
         <AppIcon label={row.title || row.name} />
         <div className="min-w-0 flex-1">
           <Link href={`/app-installations/${encodeURIComponent(row.install_id)}`} className="text-cardtitle font-medium text-ink-100 hover:text-accent">{row.title || row.name}</Link>
-          <span className="chip ml-2">{row.approved === true ? "Approved for drafting" : "Needs approval"}</span>
+          {row.approved !== true && <span className="chip ml-2">Access off</span>}
           <p className="text-label text-ink-400 mt-0.5 break-words">{row.summary}</p>
         </div>
         <Button href={`/app-installations/${encodeURIComponent(row.install_id)}`} className="app-card-action">Open app</Button>

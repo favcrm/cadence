@@ -61,7 +61,7 @@ Create refuses workers outside the owner group, non-distinct
 writer/reviewer, and unenrolled providers (PTY and remote endpoints
 are unsupported for runs). The agent never creates runs — it executes
 its assigned produce/review steps from the kickoff it is sent.
-`app catalog approve` approves local capabilities; it does not derive
+Installing (or updating) the app approves its local capabilities; it does not derive
 team grants. (`app set-team` and `app approve` with grant derivation
 are the legacy project-app verbs — different syntax, different path.)
 Writer and reviewer must differ; the same alias never holds both roles
