@@ -896,3 +896,85 @@ fn cad1056_http_html_save_agent_and_detached_get_403() {
     );
     assert_eq!(b.rpc_show("launch-1")["content"], created["content"]);
 }
+
+#[test]
+fn cad1058_http_name_matches_rpc_and_is_as_strict() {
+    let b = Board::new();
+    let base = b.base();
+    let saved = b.value(
+        "POST",
+        &format!("{base}/campaigns"),
+        json!({"campaign_id": "launch-n", "name": "Spring launch", "subject": "Hi", "blocks": blocks()}),
+    );
+    assert_eq!(saved["content"]["name"], "Spring launch");
+    assert_eq!(b.rpc_show("launch-n")["content"], saved["content"]);
+    let listed = b.value("GET", &format!("{base}/campaigns/list"), json!({}));
+    assert_eq!(listed["contents"][0]["name"], "Spring launch");
+    // Bad names refuse like the RPC; a forged field still 400s.
+    for name in [
+        json!(""),
+        json!("<b>x</b>"),
+        json!("n".repeat(81)),
+        json!("a\nb"),
+        json!(5),
+    ] {
+        let body = json!({"campaign_id": "launch-n", "name": name, "subject": "Hi", "blocks": blocks(), "expected_revision": 1});
+        let (code, text) = b.operator("POST", &format!("{base}/campaigns"), &body.to_string());
+        assert!((400..500).contains(&code), "{body} admitted: {code} {text}");
+    }
+    let forged = json!({"campaign_id": "launch-n", "name": "x", "subject": "Hi", "blocks": blocks(), "expected_revision": 1, "actor": "operator"});
+    assert_eq!(
+        b.operator("POST", &format!("{base}/campaigns"), &forged.to_string())
+            .0,
+        400
+    );
+    assert_eq!(b.rpc_show("launch-n")["content"], saved["content"]);
+}
+
+#[test]
+fn cad1058_http_name_agent_and_detached_get_403() {
+    let b = Board::new();
+    let base = b.base();
+    let created = b.value(
+        "POST",
+        &format!("{base}/campaigns"),
+        json!({"campaign_id": "launch-1", "name": "Operator name", "subject": "Hi", "blocks": blocks()}),
+    );
+    let mut lane = LaneShell::spawn(b.root.path());
+    plant_member_pane(
+        &b.daemon,
+        "content-name-http-worker",
+        "claude",
+        None,
+        lane.pid(),
+    );
+    let bodies = [
+        json!({"campaign_id": "launch-1", "name": "Agent", "subject": "Evil", "blocks": blocks(), "expected_revision": 1}),
+        json!({"campaign_id": "launch-evil", "name": "Agent", "subject": "Evil", "blocks": blocks()}),
+    ];
+    let mut failures = Vec::new();
+    for prefix in ["", "setsid "] {
+        for body in &bodies {
+            let stolen =
+                common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &b.daemon.state, b.port);
+            let wire =
+                stolen.request_as("POST", &format!("{base}/campaigns"), &body.to_string(), "");
+            let file = lane
+                .dir
+                .path()
+                .join(format!("name-request-{}.txt", lane.seq));
+            std::fs::write(&file, wire).unwrap();
+            let (rc, response) = lane.run(&format!("{prefix}python3 -c 'import socket,sys;s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {} {}", b.port, file.display()));
+            assert_eq!(rc, 0);
+            let status = response.split_whitespace().nth(1).unwrap_or("missing");
+            if status != "403" {
+                failures.push(format!("{prefix:?} {body}: {status}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "name save peer guard failed: {failures:?}"
+    );
+    assert_eq!(b.rpc_show("launch-1")["content"], created["content"]);
+}

@@ -905,6 +905,40 @@ fn cad782_origin_column_migrates_older_files() {
 }
 
 #[test]
+fn cad1058_name_column_migrates_older_files_idempotently() {
+    use super::super::app_records::record_db_path;
+    let dir = TempDir::new().unwrap();
+    let store = content_file(&dir, "install-a");
+    save_basic(&store);
+    drop(store);
+    // A file from before the name column: reopen adds it, keeps the
+    // saved content, and reopening again is a no-op.
+    let path = record_db_path(dir.path(), "install-a").unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch("ALTER TABLE app_content_docs DROP COLUMN name")
+        .unwrap();
+    drop(conn);
+    for _ in 0..2 {
+        let store = content_file(&dir, "install-a");
+        let shown = store.app_content_show("ctx-1", "launch-1").unwrap();
+        assert_eq!(shown["content"]["revision"], 1);
+        assert!(shown["content"]["name"].is_null());
+        drop(store);
+    }
+    let store = content_file(&dir, "install-a");
+    let named = draft("Named", blocks_basic())
+        .with_name(Some("Spring launch"))
+        .unwrap();
+    store
+        .app_content_save("ctx-1", "launch-1", Some(1), &named)
+        .unwrap();
+    assert_eq!(
+        store.app_content_show("ctx-1", "launch-1").unwrap()["content"]["name"],
+        "Spring launch"
+    );
+}
+
+#[test]
 fn cad782_block_parse_is_exact() {
     // Unknown fields, unknown types and wrong shapes refuse.
     for body in [

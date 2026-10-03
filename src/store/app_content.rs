@@ -51,6 +51,9 @@ use serde_json::Value;
 /// Subject is required, preheader optional; both are plain text.
 pub const SUBJECT_BYTES: usize = 150;
 pub const PREHEADER_BYTES: usize = 200;
+/// CAD-1058: bound on the optional human campaign name.
+pub const NAME_CHARS: usize = 80;
+pub const NAME_BYTES: usize = 240;
 /// Bounded visual blocks per draft/proposal.
 pub const BLOCKS_MAX: usize = 12;
 pub const HEADING_BYTES: usize = 120;
@@ -372,6 +375,9 @@ pub struct Draft {
     pub html: Option<String>,
     /// CAD-1056: operator plain-text override; generated when absent.
     pub text: Option<String>,
+    /// CAD-1058: optional human campaign name (operator save only).
+    /// Plain text; never part of the digest or a revision.
+    pub name: Option<String>,
 }
 
 impl Draft {
@@ -404,6 +410,7 @@ impl Draft {
             blocks: parsed,
             html: None,
             text: None,
+            name: None,
         })
     }
 
@@ -422,6 +429,7 @@ impl Draft {
             blocks: Vec::new(),
             html: Some(clean),
             text: None,
+            name: None,
         })
     }
 
@@ -445,6 +453,25 @@ impl Draft {
         }
         validate_tokens(text, 0)?;
         self.text = Some(text.to_string());
+        Ok(self)
+    }
+
+    /// CAD-1058: attach an optional human campaign name. Bounded plain
+    /// text: trimmed, one line, no markup and no merge tokens.
+    pub fn with_name(mut self, name: Option<&str>) -> Result<Self> {
+        let Some(name) = name else {
+            return Ok(self);
+        };
+        if name.trim() != name
+            || name.chars().count() > NAME_CHARS
+            || name.contains(['{', '}'])
+            || reject_text(name, NAME_BYTES, false).is_err()
+        {
+            return Err(Error::rejected(
+                "campaign name exceeds its supported shape or bounds",
+            ));
+        }
+        self.name = Some(name.to_string());
         Ok(self)
     }
 
@@ -779,6 +806,7 @@ pub struct AssistantClaim<'a> {
 }
 
 struct ContentRow {
+    name: Option<String>,
     revision: i64,
     subject: String,
     preheader: String,
@@ -916,7 +944,7 @@ impl RecordStore {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(campaign, "campaign ID")?;
         conn.query_row(
-            "SELECT revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,html,text_override FROM app_content_docs WHERE context_id=? AND campaign_id=?",
+            "SELECT revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,html,text_override,name FROM app_content_docs WHERE context_id=? AND campaign_id=?",
             params![context, campaign],
             |r| {
                 let blocks: String = r.get(3)?;
@@ -931,6 +959,7 @@ impl RecordStore {
                     approval_digest: r.get(6)?,
                     html: r.get(7)?,
                     text: r.get(8)?,
+                    name: r.get(9)?,
                 })
             },
         )
@@ -943,6 +972,7 @@ impl RecordStore {
             && row.approval_digest.as_deref() == Some(row.digest.as_str());
         json!({
             "campaign_id": campaign,
+            "name": row.name,
             "install_id": self.install(),
             "context_id": context,
             "revision": row.revision,
@@ -1016,15 +1046,15 @@ impl RecordStore {
         let digest = content_digest(self.install(), context, campaign, revision, draft);
         if current.is_none() {
             tx.execute(
-                "INSERT INTO app_content_docs(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,actor,created,updated,html,text_override) VALUES(?,?,?,?,?,?,?,NULL,NULL,'operator',?,?,?,?)",
-                params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now(), now(), draft.html, draft.text],
+                "INSERT INTO app_content_docs(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,actor,created,updated,html,text_override,name) VALUES(?,?,?,?,?,?,?,NULL,NULL,'operator',?,?,?,?,?)",
+                params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now(), now(), draft.html, draft.text, draft.name],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
         } else {
             let changed = tx
                 .execute(
-                    "UPDATE app_content_docs SET revision=?,subject=?,preheader=?,blocks=?,content_digest=?,approval_revision=NULL,approval_digest=NULL,actor='operator',updated=?,html=?,text_override=? WHERE context_id=? AND campaign_id=? AND revision=?",
-                    params![revision, draft.subject, draft.preheader, blocks_text, digest, now(), draft.html, draft.text, context, campaign, current],
+                    "UPDATE app_content_docs SET revision=?,subject=?,preheader=?,blocks=?,content_digest=?,approval_revision=NULL,approval_digest=NULL,actor='operator',updated=?,html=?,text_override=?,name=COALESCE(?,name) WHERE context_id=? AND campaign_id=? AND revision=?",
+                    params![revision, draft.subject, draft.preheader, blocks_text, digest, now(), draft.html, draft.text, draft.name, context, campaign, current],
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
             if changed != 1 {
@@ -1130,6 +1160,7 @@ impl RecordStore {
                     blocks: parsed,
                     html,
                     text,
+                    name: None,
                 };
                 return Ok((wanted, draft, digest));
             }
@@ -1154,6 +1185,7 @@ impl RecordStore {
                 blocks: parsed,
                 html: row.html,
                 text: row.text,
+                name: None,
             },
             row.digest,
         ))
@@ -2181,6 +2213,7 @@ impl RecordStore {
             blocks,
             html: None,
             text: None,
+            name: None,
         };
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
