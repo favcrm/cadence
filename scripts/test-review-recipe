@@ -72,8 +72,8 @@ class RecipeTargets(unittest.TestCase):
 
     def test_recipe_preserves_every_original_board_split(self):
         # CAD-1073: the board split manifest was retired with the suite.
-        # The recipe keeps a reduced baseline during the window; when the
-        # manifest exists again the guard re-arms.
+        # The recipe keeps a reduced baseline (CAD-1102 ended the transition
+        # window); when the manifest exists again the guard re-arms.
         manifest = ROOT / "tests/split-map-board.toml"
         if not manifest.exists():
             self.skipTest("tests/split-map-board.toml retired under CAD-1073")
@@ -84,7 +84,7 @@ class RecipeTargets(unittest.TestCase):
 
     def test_recipe_runs_feature_disabled_refusal_contract(self):
         # CAD-1073: the test_seam gate's target was retired; the safety
-        # floor is the executable refusal check during the window.
+        # floor is the executable refusal check.
         recipe = tomllib.loads((ROOT / "cadence-review.toml").read_text())
         self.assertTrue(any("--test safety_floor " in gate + " " for gate in recipe["gates"]))
 

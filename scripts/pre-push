@@ -24,7 +24,7 @@ Steps run in order and stop at the first failure:
 
 Every step is judged by its exit code alone and gets one summary line. Host
 limits from AGENTS.md apply: CARGO_BUILD_JOBS defaults to 4 and tests run with
---test-threads 2. The reduced-window floor is not full behavior coverage. "Changed" is
+--test-threads 2. The safety floor is not full behavior coverage. "Changed" is
 the union of commits since the base, working-tree edits and untracked files;
 if git cannot tell, everything counts as changed.
 """

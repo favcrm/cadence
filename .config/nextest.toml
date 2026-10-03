@@ -1,4 +1,4 @@
-# CAD-1073: reduced profile for the clean-slate transition window.
+# CAD-1073: reduced profile from the clean-slate transition (ended by CAD-1102).
 # Overrides and test-groups for deleted binaries are removed; they would
 # fail nextest config validation ("no binary IDs matched").
 [profile.cadence]
