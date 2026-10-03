@@ -425,3 +425,19 @@ To bump the pin, in one PR:
    every new lint or format change in the same PR.
 3. Run `scripts/pre-push`. The PR touches `rust-toolchain.toml`, so expect
    it to be reviewed like any other CI change.
+
+## PR-gate `ci` profile and fast linker (CAD-1103)
+
+The `build` and `ui` jobs compile with `cargo build --profile ci` (inherits
+`release`; opt-level 1, 256 codegen units, no debuginfo, no incremental, no
+LTO) and link with mold, or lld, installed by `scripts/ci-fast-linker enable`
+(it falls back to the default linker when neither works). These jobs prove the
+tree compiles, links, carries no test seam and passes the migration rehearsal;
+none of that depends on optimisation. `release-artifact`, `release-build`,
+staging and promotion keep the full `--release` profile, `require-full-gates`
+and the `cargo check --release --features test-seam` refusal probe. The
+`cache-warm` release leg warms the same `ci` profile with the same linker flag
+(the flag is part of cargo's fingerprint). Not merged: `build` and `ui` stay two
+compiles (default features vs `--features ui`, different path scopes), and the
+two clippy passes stay (default vs `test-seam` lint different cfg code).
+Tree-hash artifact reuse is a follow-up.
