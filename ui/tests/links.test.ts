@@ -72,6 +72,8 @@ for (const href of [
   "http://[::ffff:8.8.8.8]/",
   " https://example.com/",
   "\\\\example.com/x",
+  // Kills the decode-only mutation (decode guard reverted to startsWith("//")).
+  "\\%5B2001:db8::1%5D/x",
   "/\\example.com/x",
   "/rel",
   "./a",

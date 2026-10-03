@@ -1,3 +1,4 @@
+import SafeLink from "../../ui/SafeLink";
 import { useWriteBlock } from "../auth/WriteGate";
 import { useState } from "react";
 import { api, ApiError } from "../../lib/api";
@@ -53,7 +54,7 @@ function copy(text: string): Promise<void> {
  * routes; Copy command keeps the row's fallback command one tap away —
  * demoted off the row because Ask master is the action now.
  */
-function NeedMenu({
+export function NeedMenu({
   need,
   block,
   busy,
@@ -82,15 +83,9 @@ function NeedMenu({
       />
       <div className="needmenu" role="menu" aria-label={`actions for ${need.title}`}>
         {need.link && (
-          <a
-            className={`${item} block`}
-            href={need.link}
-            target="_blank"
-            rel="noreferrer"
-            role="menuitem"
-          >
+          <SafeLink className={`${item} block`} href={need.link} role="menuitem">
             Open
-          </a>
+          </SafeLink>
         )}
         {!need.link && need.issue && (
           <button className={item} role="menuitem" onClick={() => onOpenIssue(need.issue!)}>

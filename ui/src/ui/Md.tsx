@@ -1,6 +1,6 @@
 import Markdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { isLoopbackHref } from "./links";
+import SafeLink from "./SafeLink";
 
 // Bare issue ids become `issue:` links as a remark pass over `text` nodes
 // only, so code blocks, inline code, existing links and autolinked URLs
@@ -94,23 +94,10 @@ export default function Md({
               // A malformed id is shown as text: no button, no anchor.
               <>{children}</>
             )
-          ) : isLoopbackHref(href) ? (
-            // A link to this machine is shown, never followed (CAD-313).
-            <span
-              className="text-warn"
-              title="A link to this machine — not clickable on the board, so the board's session cookie is never sent to another local server. Copy it if you trust it."
-            >
-              {children} <code className="num break-all">[{href}]</code>
-            </span>
           ) : (
-            <a
-              className="lnk"
-              href={href}
-              target="_blank"
-              rel="noreferrer"
-            >
+            <SafeLink className="lnk" href={href}>
               {children}
-            </a>
+            </SafeLink>
           );
         },
       }}

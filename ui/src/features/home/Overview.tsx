@@ -1,3 +1,4 @@
+import SafeLink from "../../ui/SafeLink";
 import { useWriteBlock } from "../auth/WriteGate";
 import { exclusionLabel, issueCounts, statusBreakdown } from "../../lib/counts";
 import type { ResourceState } from "../../lib/cache";
@@ -67,7 +68,7 @@ function isGlobalProject(value: string | null | undefined): boolean {
 
 /** Sections come from the server-resolved `audience` (CAD-253); with
  *  `decision`, "Needs your decision" always shows, empty or not. */
-function NeedRows({ rows, decision }: { rows: Overview["needs_me"]; decision: boolean }) {
+export function NeedRows({ rows, decision }: { rows: Overview["needs_me"]; decision: boolean }) {
   const grouped = needSections(rows, decision);
   return (
     <div className="space-y-3">
@@ -104,9 +105,9 @@ function NeedRows({ rows, decision }: { rows: Overview["needs_me"]; decision: bo
                 </span>
                 <span className="min-w-0 flex-1 basis-[12rem] text-label text-ink-200">
                   {n.link ? (
-                    <a href={n.link} target="_blank" rel="noreferrer" className="hover:text-accent">
+                    <SafeLink href={n.link} className="hover:text-accent">
                       {n.title}
-                    </a>
+                    </SafeLink>
                   ) : (
                     n.title
                   )}
