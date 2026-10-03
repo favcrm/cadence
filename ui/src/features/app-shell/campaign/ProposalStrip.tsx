@@ -77,6 +77,7 @@ export default function ProposalStrip({
           ) : null}
         </span>
         <span className="flex-1" />
+        <span className="crm-strip-actions">
         <span className="crm-seg" role="group" aria-label="Preview version">
           <button
             type="button"
@@ -145,6 +146,15 @@ export default function ProposalStrip({
             </Button>
           </>
         )}
+        </span>
+        <details className="crm-diag crm-strip-diag">
+          <summary className="text-micro text-ink-500">Technical details</summary>
+          <p className="num text-micro text-ink-500 mt-1">
+            {proposal.proposalId} · actor {proposal.actor} · origin {proposal.origin} · source r
+            {proposal.sourceRevision}
+            {receipt !== null ? ` · receipt campaign ${receipt.campaignId}` : ""}
+          </p>
+        </details>
       </div>
       {replacesHtml && canWrite && (
         <p className="text-label text-warn" data-state="replaces-html">
@@ -157,14 +167,6 @@ export default function ProposalStrip({
           now r{expectedRevision}. Re-review its text before asking the assistant to draft again.
         </p>
       )}
-      <details className="crm-diag">
-        <summary className="text-micro text-ink-500">Technical details</summary>
-        <p className="num text-micro text-ink-500 mt-1">
-          {proposal.proposalId} · actor {proposal.actor} · origin {proposal.origin} · source r
-          {proposal.sourceRevision}
-          {receipt !== null ? ` · receipt campaign ${receipt.campaignId}` : ""}
-        </p>
-      </details>
     </div>
   );
 }

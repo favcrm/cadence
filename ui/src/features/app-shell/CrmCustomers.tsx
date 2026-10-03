@@ -413,7 +413,7 @@ function CustomerList({
               {
                 key: "email",
                 header: "Email",
-                cellClassName: "num text-ink-300",
+                cellClassName: "num text-ink-300 crm-nowrap",
                 cell: (record) => viewProfile(record.profile).email ?? "—",
               },
               {

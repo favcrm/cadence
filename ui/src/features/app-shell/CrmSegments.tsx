@@ -360,7 +360,16 @@ function SegmentList({
             </thead>
             <tbody>
               {segments.map((segment) => (
-                <tr key={segment.id} data-record-id={segment.id}>
+                <tr
+                  key={segment.id}
+                  data-record-id={segment.id}
+                  className="crm-row-open"
+                  onClick={(e) => {
+                    // A click on a control inside the row keeps its own meaning.
+                    if ((e.target as HTMLElement).closest("button, input, a")) return;
+                    onSelect(segment.id);
+                  }}
+                >
                   <td className="text-ink-100">
                     {segment.name}
                     <span className="num text-micro text-ink-500"> · {segment.id}</span>
