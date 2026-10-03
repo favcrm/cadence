@@ -98,7 +98,7 @@ impl FloorHost {
     fn run(&self, args: &[&str]) -> Output {
         let mut cmd = self.command();
         cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-        OwnChild(Some(cmd.spawn().unwrap())).wait(Duration::from_secs(25))
+        OwnChild(Some(reaper::spawn(&mut cmd).unwrap())).wait(Duration::from_secs(25))
     }
 }
 
@@ -112,12 +112,7 @@ impl Drop for FloorHost {
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .unwrap();
+    let out = reaper::output(Command::new("git").arg("-C").arg(repo).args(args)).unwrap();
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -222,15 +217,16 @@ fn safety_floor_suite_lock_serializes_review() {
     .env("CADENCE_SUITE_LOCK", &lock)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
-    let mut child = OwnChild(Some(cmd.spawn().unwrap()));
+    let mut child = OwnChild(Some(reaper::spawn(&mut cmd).unwrap()));
     let deadline = Instant::now() + Duration::from_secs(15);
     while !ready.exists() && child.pending() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(
-        ready.exists(),
-        "review never reached its gate before suite lock"
-    );
+    if !ready.exists() {
+        drop(held);
+        let out = child.wait(Duration::from_secs(5));
+        panic!("review never reached its gate before suite lock: {out:?}");
+    }
     std::thread::sleep(Duration::from_millis(300));
     assert!(child.pending(), "review finished despite held suite lock");
     assert!(
