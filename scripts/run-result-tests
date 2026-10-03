@@ -1,0 +1,28 @@
+#!/bin/bash
+# CAD-1090: run every cargo test target (scripts/result-test-args) the same
+# way in CI and in `scripts/pre-push --tests`.
+#  - --features test-seam: some targets are cfg(feature = "test-seam") and
+#    would otherwise run 0 tests and pass.
+#  - fails when any selected target reports `running 0 tests`.
+#  - --no-fail-fast: every target reports, not just the first red one.
+#  - HOME/XDG/TMPDIR are private; toolchain homes pass through.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+targets=$("$root/scripts/result-test-args")
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+scratch=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/result-tests.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/xdg-config" \
+       XDG_DATA_HOME="$scratch/xdg-data" XDG_STATE_HOME="$scratch/xdg-state" \
+       XDG_CACHE_HOME="$scratch/xdg-cache" TMPDIR="$scratch/tmp"
+mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+export CADENCE_SUITE_LOCK="${CADENCE_SUITE_LOCK:-$scratch/cadence-suite.lock}"
+echo "integration targets:" $(echo "$targets" | grep -v '^--test$')
+log="$scratch/out.log"
+# shellcheck disable=SC2086
+cargo test --locked --features test-seam --no-fail-fast $targets -- --test-threads 2 2>&1 | tee "$log"
+if grep -q '^running 0 tests' "$log"; then
+  echo "::error::a selected test target ran 0 tests (cfg-gated off?)" >&2
+  exit 1
+fi

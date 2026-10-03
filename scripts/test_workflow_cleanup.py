@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Executable workflow boundary checks plus one required-gate wiring smoke test."""
 from pathlib import Path
+import json
 import os
 import re
 import subprocess
@@ -39,7 +40,24 @@ class CleanupTests(unittest.TestCase):
                 self.assertIn(f"needs.change-scope.outputs.{category} != 'false'", step)
         test = job(ci, "test")
         self.assertIn("cargo test --doc --locked", test)
-        self.assertIn("cargo test --locked --test safety_floor", test)
+        # CAD-1090: every tests/*.rs target, via the shared selection script.
+        self.assertIn("scripts/run-result-tests", test)
+        runner = (ROOT / "scripts/run-result-tests").read_text()
+        self.assertIn("scripts/result-test-args", runner)
+        for needle in ("--features test-seam", "--no-fail-fast", "--test-threads 2",
+                       "running 0 tests", "HOME=", "XDG_CONFIG_HOME="):
+            self.assertIn(needle, runner)
+        selected = subprocess.run([str(ROOT / "scripts/result-test-args")],
+                                  capture_output=True, text=True, check=True).stdout.split()
+        self.assertIn("safety_floor", selected)
+        meta = json.loads(subprocess.run(
+            ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
+            cwd=ROOT, capture_output=True, text=True, check=True).stdout)
+        cargo_tests = sorted({t["name"] for p in meta["packages"]
+                              for t in p["targets"] if "test" in t["kind"]})
+        self.assertTrue(cargo_tests)
+        self.assertEqual(cargo_tests, sorted(selected[1::2]))
+        self.assertEqual(set(selected[0::2]), {"--test"})
         self.assertIn("scripts/split-doctor-host --check", job(ci, "fmt"))
 
     def test_scope_shell_defaults_full_on_missing_or_forged_policy(self):

@@ -1,0 +1,20 @@
+#!/bin/sh
+# CAD-1090: the one selection rule for CI and `scripts/pre-push --tests`.
+# Prints `--test` / `<name>` pairs, one per line, for every target of kind
+# `test` that cargo itself reports (tests/*.rs and tests/<dir>/main.rs, plus
+# any [[test]] entry), so a new result-test is picked up with no workflow
+# edit. Fails closed when cargo reports none: an empty selection would pass
+# without running anything.
+set -eu
+cd "$(dirname "$0")/.."
+cargo metadata --no-deps --format-version 1 --locked | python3 -c '
+import json, sys
+meta = json.load(sys.stdin)
+names = sorted({t["name"] for p in meta["packages"] for t in p["targets"]
+                if "test" in t["kind"]})
+if not names:
+    sys.exit("result-test-args: cargo reports no test targets")
+for n in names:
+    print("--test")
+    print(n)
+'
