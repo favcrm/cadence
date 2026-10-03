@@ -1,4 +1,5 @@
 import {
+  buildConsentChange,
   buildCustomerProfile,
   consentEntries,
   friendlyError,
@@ -82,6 +83,25 @@ for (const [fields, why] of [
 equal(parseTags("vip; newsletter  referral"), ["vip", "newsletter", "referral"], "tag separators split");
 await rejected(() => Promise.resolve().then(() => parseTags("a,".repeat(17))), (e) => e instanceof ApiError, "17 tags refused");
 assert(/^[A-Za-z0-9_-]{1,128}$/.test(newCustomerId()), "fresh record ids match the peer grammar");
+
+// CAD-1053 consent change: granting needs a method, withdrawing never does.
+{
+  const was = { schema: 1, display_name: "Ada", tags: [], consent: { email: "unknown" } };
+  await rejected(() => Promise.resolve().then(() => buildConsentChange(was, { email: "granted", sms: "unknown", method: "", note: "" })), (e) => e instanceof ApiError, "grant without method refused client-side");
+  await rejected(() => Promise.resolve().then(() => buildConsentChange(was, { email: "unknown", sms: "unknown", method: "", note: "" })), (e) => e instanceof ApiError, "no-op change refused");
+  await rejected(() => Promise.resolve().then(() => buildConsentChange(was, { email: "granted", sms: "unknown", method: "written", note: "x".repeat(281) })), (e) => e instanceof ApiError, "long note refused");
+  const granted = buildConsentChange(was, { email: "granted", sms: "unknown", method: "written", note: "  by email  " });
+  equal(granted.provenance, { method: "written", note: "by email" }, "provenance trims the note");
+  equal((granted.profile as any).consent, { email: "granted", sms: "unknown" }, "consent replaced");
+  const withdrawn = buildConsentChange({ ...was, consent: { email: "granted" } }, { email: "denied", sms: "unknown", method: "", note: "" });
+  equal(withdrawn.provenance, null, "withdrawal needs no provenance");
+}
+// The client refuses a forged provenance key.
+await rejected(
+  () => Promise.resolve().then(() => hostActions.guards.assertCleanBody({ expected_revision: 1, profile: {}, consent_provenance: {}, actor: "operator" }, ["expected_revision", "profile", "consent_provenance"])),
+  (e) => e instanceof ApiError,
+  "forged actor next to provenance refused",
+);
 
 // Defensive reads never throw and never render raw shapes.
 equal(viewProfile(null).displayName, "—", "null profile falls back");
@@ -194,6 +214,13 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
         return new Response(JSON.stringify({ error: "record revision is stale" }), { status: 409 });
       }
       current.revision += 1;
+      for (const channel of ["email", "sms"] as const) {
+        const was = current.profile.consent?.[channel] ?? "unknown";
+        const now = body.profile.consent?.[channel] ?? "unknown";
+        if (was !== now) {
+          current.consent_history.push({ revision: current.revision, channel, state: now, actor: "operator", at: 1759286400, ...(body.consent_provenance ?? {}) });
+        }
+      }
       current.profile = body.profile;
       current.digest = "sha256:upd";
       current.history.push({ revision: current.revision, digest: "sha256:upd", actor: "operator", at: 1759286400 });
@@ -295,7 +322,26 @@ await settle(() => assert(text().includes("Search Alpha One"), "list paints real
 assert(host.querySelector("[data-outlet-heading]")?.textContent?.trim() === "Customers", "customers list retains its section heading");
 assert(!host.querySelector(".crm-crumb"), "the CRM outlet does not duplicate the shell breadcrumb");
 assert(!host.querySelector('nav[aria-label="CRM sections"]'), "the outlet leaves navigation to the host sidebar");
-assert(text().includes("granted"), "consent state renders in the list");
+assert(text().includes("Granted"), "consent state renders in the list as a pill");
+// CAD-1053 list: tag chips, a separate Source column, consent pills, filters, selection.
+const listHeaders = Array.from(host.querySelectorAll('section[aria-label="Customers list"] th')).map((th) => th.textContent?.trim());
+assert(listHeaders.includes("Source") && listHeaders.includes("Email consent") && listHeaders.includes("Tags"), "list has Tags, Source and Email consent columns");
+assert(host.querySelector('tr[data-record-id="customer-s2"] td:nth-child(5)')?.textContent === "import", "source has its own column");
+assert(host.querySelector('tr[data-record-id="customer-s1"] button.chip[title="Filter by tag alpha"]'), "tags render as chips");
+assert(host.querySelector('tr[data-record-id="customer-s2"] .chip[title="Email consent"]')?.textContent === "Withdrawn", "denied reads as Withdrawn");
+// Tag chip filters the page; clearing restores it.
+await click(host.querySelector('tr[data-record-id="customer-s1"] button.chip'));
+assert(text().includes("tag: alpha") && !text().includes("Search Beta Two"), "tag chip filters the loaded rows");
+await click(host.querySelector('button[aria-label="Clear tag filter alpha"]'));
+assert(text().includes("Search Beta Two"), "clearing the tag filter restores rows");
+// Bulk select: row and select-all checkboxes drive a selection count; it never opens a drawer.
+await click(host.querySelector('input[aria-label="Select Search Alpha One"]'));
+assert(text().includes("1 selected") && !host.querySelector('[data-drawer="customer"]'), "row checkbox selects without opening");
+await click(host.querySelector('input[aria-label="Select all customers on this page"]'));
+const pageRows = host.querySelectorAll("tr[data-record-id]").length;
+assert(pageRows >= 2 && text().includes(`${pageRows} selected`), "select all counts the page");
+await click(Array.from(host.querySelectorAll("button.lnk")).find((el) => el.textContent === "Clear"));
+assert(!text().includes("selected"), "clear empties the selection");
 // The customers table no longer leads with the diagnostic revision
 // column — record bookkeeping lives under the drawer's collapsed
 // Record diagnostics instead (CAD-1008).
@@ -332,18 +378,78 @@ await settle(() => assert(text().includes("Search Alpha One"), "customers link r
 assert(!location.search.includes("crm="), "customers is the default route");
 
 // Drawer: profile, consent trail, keyboard close with focus restoration.
-const openBeta = Array.from(host.querySelectorAll("button.lnk")).find((el) => el.textContent === "Open" && el.closest("tr")?.textContent?.includes("Beta"));
-(openBeta as HTMLElement).focus(); // real browsers focus the pressed button
+// Whole-row click opens the drawer (the click lands on the row itself, not a control).
+const openBeta = host.querySelector('tr[data-record-id="customer-s2"] td:nth-child(3)') as HTMLElement;
+(openBeta.closest("tr")!.querySelector("button.lnk") as HTMLElement).focus(); // real browsers focus the pressed control
 await click(openBeta);
-await settle(() => assert(host.querySelector('[data-drawer="customer"]'), "drawer opens"));
+await settle(() => assert(host.querySelector('[data-drawer="customer"]'), "row click opens the drawer"));
 assert(text().includes("beta-two@example.com"), "drawer shows the profile");
-assert(text().includes("chat context only"), "drawer names the selection contract");
-// CAD-1052: history lives under Activity, diagnostics under Details.
+// CAD-1053 status strip, footer and Overview cards.
+assert(host.querySelector('[data-testid="drawer-warning"]')?.textContent?.includes("can't receive campaigns"), "denied customer shows the status warning");
+assert(!host.querySelector('[data-testid="drawer-warning"] button'), "the warning strip holds no controls");
+const foot = host.querySelector(".crm-drawer-foot")!;
+const footLabels = Array.from(foot.querySelectorAll("button")).map((b) => b.textContent?.trim());
+equal(footLabels.filter((l) => ["Add to segment", "Edit", "Record consent"].includes(l ?? "")), ["Add to segment", "Edit", "Record consent"], "footer order: Add to segment, Edit, primary Record consent");
+assert(foot.querySelector("button.btn-primary")?.textContent === "Record consent", "Record consent is the single primary");
+assert((Array.from(foot.querySelectorAll("button")).find((b) => b.textContent === "Add to segment") as HTMLButtonElement).disabled, "Add to segment is disabled until it has a backend");
+await click(foot.querySelector('button[aria-label="More actions"]'));
+const menuItems = Array.from(host.querySelectorAll('[role="menuitem"]')) as HTMLButtonElement[];
+equal(menuItems.map((m) => m.textContent), ["Copy email", "View in Outbox", "Archive customer"], "menu order");
+assert(menuItems[2].classList.contains("danger") && menuItems[2].getAttribute("aria-disabled") === "true" && menuItems[2].title.length > 0, "Archive is red, disabled and explains why");
+await click(foot.querySelector('button[aria-label="More actions"]'));
+assert(host.querySelector('[data-consent="email"]')?.textContent?.includes("Withdrawn"), "Overview consent card shows the email state");
+assert(text().includes("Profile") && text().includes("Segments") && text().includes("Campaigns"), "Overview carries Profile, Segments and Campaigns");
+// Activity is a human timeline; ids stay under Details.
 await click(Array.from(host.querySelectorAll('[role="tab"]')).find((el) => el.textContent === "Activity"));
-assert(text().includes("Consent history"), "Activity tab shows the consent trail");
-assert(text().includes("Revision history"), "Activity tab shows revision history");
+assert(text().includes("Email consent withdrawn by the operator") && text().includes("Created · Email consent granted by the operator"), "Activity reads as plain sentences");
+assert(!text().includes("sha256:") && !text().includes("customer-s2"), "Activity shows no ids or digests");
 await click(Array.from(host.querySelectorAll('[role="tab"]')).find((el) => el.textContent === "Details"));
+assert(text().includes("chat context only"), "Details names the selection contract");
 assert(text().includes("customer-s2") && text().includes("revision r"), "Details tab holds the record diagnostics");
+
+// Record consent: Email/SMS status, "How was it given?", optional note.
+async function pick(id: string, label: string) {
+  await React.act(async () => { (host.querySelector(`#${id}`) as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await flush();
+  const option = Array.from(document.querySelector(`#${id}-listbox`)!.querySelectorAll('[role="option"]')).find((el) => (el.textContent ?? "").trim() === label);
+  assert(option, `option ${label} exists`);
+  await click(option);
+}
+posts.length = 0;
+await click(Array.from(host.querySelectorAll(".crm-drawer-foot button")).find((el) => el.textContent === "Record consent"));
+await settle(() => assert(host.querySelector("#crm-customer-consent"), "Record consent opens the form in place"));
+assert(host.querySelector("#crm-rc-email") && host.querySelector("#crm-rc-sms") && host.querySelector("#crm-rc-note"), "form has Email, SMS and Note");
+assert(!host.querySelector("#crm-rc-method"), "no method question until a grant is chosen");
+await pick("crm-rc-email", "Granted");
+assert(host.querySelector("#crm-rc-method"), "choosing Granted asks how it was given");
+await click(host.querySelector('[data-drawer="customer"] button[type="submit"]'));
+await flush();
+assert(posts.length === 0 && text().includes("Say how consent was given"), "a grant without a method never reaches the wire");
+await pick("crm-rc-method", "In person (counter / event)");
+await fill("#crm-rc-note", "Signed at the counter");
+await click(host.querySelector('[data-drawer="customer"] button[type="submit"]'));
+await settle(() => assert(posts.length === 1, "the grant posts once"));
+equal(Object.keys(posts[0].body).sort(), ["consent_provenance", "expected_revision", "profile"], "update body carries only the allowlisted keys");
+equal(posts[0].body.consent_provenance, { method: "in_person", note: "Signed at the counter" }, "provenance carries method and note");
+equal(posts[0].body.profile.consent, { email: "granted", sms: "unknown" }, "only consent changed");
+assert(posts[0].body.profile.display_name === "Search Beta Two" && posts[0].body.profile.source === "import", "other profile fields are preserved");
+await settle(() => assert(!host.querySelector('[data-testid="drawer-warning"]'), "the warning clears once email consent is granted"));
+await click(Array.from(host.querySelectorAll('[role="tab"]')).find((el) => el.textContent === "Activity"));
+assert(text().includes("Email consent granted (in person)") && text().includes("Signed at the counter"), "Activity shows the method and note");
+// Withdrawing needs no method and sends no provenance.
+posts.length = 0;
+await click(Array.from(host.querySelectorAll(".crm-drawer-foot button")).find((el) => el.textContent === "Record consent"));
+await settle(() => assert(host.querySelector("#crm-customer-consent"), "form reopens"));
+await pick("crm-rc-email", "Withdrawn");
+assert(!host.querySelector("#crm-rc-method"), "withdrawing asks no method");
+await click(host.querySelector('[data-drawer="customer"] button[type="submit"]'));
+await settle(() => assert(posts.length === 1, "the withdrawal posts"));
+equal(Object.keys(posts[0].body).sort(), ["expected_revision", "profile"], "withdrawal carries no provenance");
+// Edit hides consent: it can no longer change it behind the provenance rule.
+await click(Array.from(host.querySelectorAll(".crm-drawer-foot button")).find((el) => el.textContent === "Edit"));
+await settle(() => assert(host.querySelector("#crm-customer-edit"), "edit opens"));
+assert(!host.querySelector("#crm-consent-email") && !text().includes("Email consent (explicit)"), "edit has no consent selects");
+await click(Array.from(host.querySelectorAll(".crm-drawer-foot button")).find((el) => el.textContent === "Cancel"));
 assert(location.search.includes("record=customer-s2"), "direct record route deep-links");
 assert(!location.search.includes("beta-two"), "no customer content in the URL");
 await React.act(async () => {
@@ -406,7 +512,7 @@ equal(posts[0].body.profile.consent, { email: "unknown", sms: "unknown" }, "cons
 await settle(() => assert(host.querySelector('[data-drawer="customer"]'), "created record opens its drawer"));
 
 // Edit with a stale revision surfaces the server refusal and keeps the drawer.
-await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Edit profile"));
+await click(Array.from(host.querySelectorAll(".crm-drawer-foot button")).find((el) => el.textContent === "Edit"));
 await settle(() => assert(host.querySelector("#crm-display-name"), "edit form opens"));
 (recordStore[posts[0].body.record_id] as any).revision = 99;
 await fill("#crm-display-name", "New Person Edited");
@@ -716,6 +822,7 @@ await flush(); await flush();
 assert(text().includes("Read-only"), "read-only state is explicit");
 assert(!host.querySelector("#crm-display-name"), "read-only renders no edit form");
 assert(!Array.from(host.querySelectorAll("button")).some((el) => el.textContent === "Import CSV"), "read-only renders no import control");
+assert(!Array.from(host.querySelectorAll("button")).some((el) => el.textContent === "Record consent"), "read-only renders no Record consent");
 
 await React.act(async () => { root.unmount(); });
 console.log("crm customer checks passed");

@@ -45,6 +45,13 @@ export interface HostRecord {
   consentHistory?: unknown;
 }
 
+/** How consent was given (CAD-1053). Granting requires one; the note is optional (≤280). */
+export type ConsentMethod = "in_person" | "web_form" | "written" | "imported" | "other";
+export interface ConsentProvenance {
+  method: ConsentMethod;
+  note?: string;
+}
+
 /** URL-bound scope: the only identity this client will use. */
 export interface HostScope {
   installId: string;
@@ -53,7 +60,7 @@ export interface HostScope {
 
 /** Body keys the HTTP peer accepts. Everything else is forged. */
 const CREATE_KEYS = ["record_id", "profile"] as const;
-const UPDATE_KEYS = ["expected_revision", "profile"] as const;
+const UPDATE_KEYS = ["expected_revision", "profile", "consent_provenance"] as const;
 
 /** Authority-claiming fields that must never travel from the browser. */
 const ALWAYS_FORBIDDEN = [
@@ -207,12 +214,20 @@ export const hostActions = {
     assertCleanBody(body, CREATE_KEYS);
     return asRecord(await request<unknown>(listPath(scope), body));
   },
-  /** `POST …/records/:id/update` — body is exactly `{expected_revision, profile}`. */
-  async update(scope: HostScope, recordId: string, expectedRevision: number, profile: unknown): Promise<HostRecord> {
+  /** `POST …/records/:id/update` — body is `{expected_revision, profile}` plus
+   *  `consent_provenance` only on a consent change. */
+  async update(
+    scope: HostScope,
+    recordId: string,
+    expectedRevision: number,
+    profile: unknown,
+    consentProvenance?: ConsentProvenance,
+  ): Promise<HostRecord> {
     if (!Number.isInteger(expectedRevision) || expectedRevision <= 0) {
       throw new ApiError("expected record revision must be a positive integer", 400);
     }
     const body: Record<string, unknown> = { expected_revision: expectedRevision, profile };
+    if (consentProvenance !== undefined) body.consent_provenance = consentProvenance;
     assertCleanBody(body, UPDATE_KEYS);
     return asRecord(await request<unknown>(updatePath(scope, recordId), body));
   },

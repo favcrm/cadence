@@ -1,6 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { hostErrorText } from "./shared/hostErrors";
-import type { HostRecord } from "./hostActions";
+import type { ConsentMethod, ConsentProvenance, HostRecord } from "./hostActions";
 
 /**
  * Allowlisted customer profile shaping for the CRM Customers screens
@@ -223,6 +223,97 @@ export interface ConsentEntry {
   state: string;
   actor: string;
   at: number;
+  method?: string;
+  note?: string;
+}
+
+export const CONSENT_METHODS: { value: ConsentMethod; label: string }[] = [
+  { value: "in_person", label: "In person (counter / event)" },
+  { value: "web_form", label: "Website sign-up form" },
+  { value: "written", label: "Written / email reply" },
+  { value: "imported", label: "Imported list (source noted)" },
+  { value: "other", label: "Other" },
+];
+export const CONSENT_NOTE_MAX = 280;
+
+export type ConsentSetting = "granted" | "unknown" | "denied";
+
+/** Operator wording: the stored `denied` state reads as withdrawn. */
+export function consentLabel(state: string | null): string {
+  if (state === "granted") return "Granted";
+  if (state === "denied") return "Withdrawn";
+  return "Unknown";
+}
+
+/**
+ * Build the update for the Record consent form: the loaded profile with
+ * only its consent replaced, plus the provenance. Granting a channel
+ * that is not already granted needs a method; withdrawing never does.
+ * Throws a field-named ApiError, never an echo of the note.
+ */
+export function buildConsentChange(
+  profile: unknown,
+  next: { email: ConsentSetting; sms: ConsentSetting; method: ConsentMethod | ""; note: string },
+): { profile: Record<string, unknown>; provenance: ConsentProvenance | null } {
+  const view = viewProfile(profile);
+  const was = { email: view.consentEmail, sms: view.consentSms ?? "unknown" };
+  const changed = next.email !== was.email || next.sms !== was.sms;
+  if (!changed) throw new ApiError("Change at least one consent setting", 400);
+  const granting =
+    (next.email === "granted" && was.email !== "granted") ||
+    (next.sms === "granted" && was.sms !== "granted");
+  const note = next.note.trim();
+  if (note.length > CONSENT_NOTE_MAX || hasControl(note)) {
+    throw new ApiError("Note is at most 280 characters", 400);
+  }
+  if (granting && next.method === "") {
+    throw new ApiError("Say how consent was given", 400);
+  }
+  const base = formFromProfile(profile);
+  const built = buildCustomerProfile({ ...base, consentEmail: next.email, consentSms: next.sms });
+  const provenance: ConsentProvenance | null =
+    next.method === "" ? null : { method: next.method, ...(note !== "" ? { note } : {}) };
+  return { profile: built, provenance };
+}
+
+export interface ActivityItem {
+  key: string;
+  text: string;
+  note?: string;
+  at: number;
+  agent: boolean;
+}
+
+const METHOD_TEXT: Record<string, string> = {
+  in_person: "in person",
+  web_form: "on the website form",
+  written: "in writing",
+  imported: "from an imported list",
+  other: "another way",
+};
+
+/** Plain-language timeline, newest first. Ids and digests stay in Details. */
+export function activityItems(record: HostRecord): ActivityItem[] {
+  const consent = consentEntries(record);
+  return revisionEntries(record)
+    .map((rev) => {
+      const here = consent.filter((c) => c.revision === rev.revision);
+      const channelName = (c: ConsentEntry) => (c.channel === "sms" ? "SMS" : "Email");
+      const parts = here.map((c) => {
+        const how = c.method ? ` ${METHOD_TEXT[c.method] ?? ""}`.trimEnd() : "";
+        return c.state === "granted"
+          ? `${channelName(c)} consent granted${how === "" ? "" : ` (${how.trim()})`}`
+          : c.state === "denied"
+            ? `${channelName(c)} consent withdrawn`
+            : `${channelName(c)} consent recorded as ${c.state}`;
+      });
+      const who = rev.actor === "operator" ? "the operator" : rev.actor;
+      const lead = rev.revision === 1 ? "Created" : parts.length === 0 ? "Profile edited" : "";
+      const text = [lead, ...parts].filter(Boolean).join(" · ") + ` by ${who}`;
+      const note = here.find((c) => c.note)?.note;
+      return { key: `r${rev.revision}`, text, ...(note ? { note } : {}), at: rev.at, agent: rev.actor !== "operator" };
+    })
+    .reverse();
 }
 
 /** Per-channel consent/suppression transitions; malformed entries are dropped. */
@@ -247,6 +338,8 @@ export function consentEntries(record: HostRecord): ConsentEntry[] {
       state: row.state,
       actor: row.actor,
       at: row.at,
+      ...(typeof row.method === "string" ? { method: row.method } : {}),
+      ...(typeof row.note === "string" ? { note: row.note } : {}),
     });
   }
   return entries.sort((a, b) => a.revision - b.revision);

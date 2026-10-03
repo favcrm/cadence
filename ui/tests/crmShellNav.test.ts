@@ -152,7 +152,7 @@ async function openPage(section: "customers" | "segments" | "campaigns") {
 }
 // One chat node across section moves; a drawer never follows.
 const openSeed = Array.from(host.querySelectorAll("button.lnk")).find(
-  (el) => el.textContent === "Open" && el.closest("tr")?.textContent?.includes("Seed Alpha"),
+  (el) => el.textContent === "Seed Alpha" && el.closest("tr"),
 );
 await click(openSeed);
 await settle(() => assert(host.querySelector('[data-drawer="customer"]'), "drawer opens before the move"));
