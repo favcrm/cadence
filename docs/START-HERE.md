@@ -54,11 +54,10 @@ relay foundations, monitor observations, UI alerts, provider profile display,
 build/test slots and structured review evidence exist in source. This list does
 not certify every adapter, configuration or deployment.
 
-The [bounded acceptance harness](../tests/cad225_acceptance.sh) intentionally
-separates supported cases from missing complete-loop capabilities. Read its
-current labels and the associated ticket evidence for the revision you are
-assessing. Do not infer full autonomy from a green subset or change the harness
-labels to claim completion.
+The bounded acceptance harness was removed in the CAD-1073 clean-slate
+retirement. Its former labels and ticket evidence are preserved in git history;
+do not infer full autonomy from a green subset or change labels to claim
+completion.
 
 Live assignments, queue ages and quota belong in runtime state. Plans,
 acceptance, reviews and release evidence belong in the tracker/artifacts.

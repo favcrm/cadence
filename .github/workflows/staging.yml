@@ -88,12 +88,11 @@ jobs:
           python3 scripts/delivery-candidate.py prepare --repo "$REPO" --run-id "$baseline" --dest "$RUNNER_TEMP/baseline"
           python3 scripts/staging-rehearsal.py --baseline "$RUNNER_TEMP/baseline/cadence" \
             --candidate "$GITHUB_WORKSPACE/target/release/cadence" --sha "$SOURCE_SHA" --out "$RUNNER_TEMP/rehearsal"
-      - name: Full MVP journey using the PR's embedded-UI release binary
-        env:
-          CARGO_BUILD_JOBS: 4
-          E2E_OUT: ${{ runner.temp }}/staging-e2e
-          CADENCE_E2E_PORT: 3186
-        run: scripts/e2e/mvp.sh --no-build
+      # CAD-1073: tests/e2e_mvp.rs was retired with the suite; the
+      # rehearsal proof above (baseline → candidate migration/backup
+      # recovery against the real binaries) is the residual release gate.
+      - name: MVP journey retired — clean-slate transition
+        run: echo 'tests/e2e_mvp.rs retired under CAD-1073; rehearsal above is the residual release proof.'
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -133,6 +132,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - name: Refuse automatic selection under reduced gates
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: scripts/require-full-gates "$GITHUB_WORKSPACE" "$SOURCE_SHA"
       - name: Select the newest eligible attested candidate
         id: select
         env:
@@ -180,6 +183,10 @@ jobs:
         with:
           path: control
           persist-credentials: false
+      - name: Refuse manual or automatic staging under reduced gates
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: control/scripts/require-full-gates "$GITHUB_WORKSPACE/control" "$SOURCE_SHA"
       - name: Verify candidate identity, digest and build attestation
         id: candidate
         env:
@@ -197,6 +204,10 @@ jobs:
           ref: ${{ steps.candidate.outputs.source_sha }}
           path: candidate-source
           persist-credentials: false
+      - name: Refuse a reduced-gate candidate, even under a later full-gate control SHA
+        env:
+          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+        run: control/scripts/require-full-gates "$GITHUB_WORKSPACE/candidate-source" "$SOURCE_SHA"
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           package_json_file: candidate-source/ui/package.json
@@ -206,15 +217,12 @@ jobs:
           cache: pnpm
           cache-dependency-path: candidate-source/tests/e2e/pnpm-lock.yaml
       - run: control/scripts/ci-rust-toolchain --export --profile minimal
-      - name: MVP journey against the exact downloadable binary
+      # CAD-1073: tests/e2e_mvp.rs was retired with the suite. The stage
+      # job's residual release gate is the migration/backup rehearsal below
+      # plus the digest recheck; the MVP journey returns with the new suite.
+      - name: MVP journey retired — clean-slate transition
         id: mvp
-        env:
-          CARGO_BUILD_JOBS: 4
-          E2E_OUT: ${{ runner.temp }}/staging-e2e
-          CADENCE_E2E_ROOT: ${{ github.workspace }}/candidate-source
-          CADENCE_E2E_BINARY: ${{ runner.temp }}/candidate/cadence
-          CADENCE_E2E_PORT: 3186
-        run: sh control/scripts/e2e/mvp.sh --no-build
+        run: echo 'tests/e2e_mvp.rs retired under CAD-1073; MVP journey skipped on the staging path.'
       - name: Verify the previous release and rehearse migration and backup recovery
         id: rehearsal
         env:
@@ -290,6 +298,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - name: Refuse promotion under reduced gates after approval wait
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: scripts/require-full-gates "$GITHUB_WORKSPACE" "$SOURCE_SHA"
       - name: Re-verify the artifact after the approval wait
         env:
           GH_TOKEN: ${{ github.token }}

@@ -34,7 +34,6 @@ import re
 import subprocess
 import sys
 import time
-import tomllib
 
 
 def git_lines(root, *args):
@@ -110,23 +109,16 @@ def focused_tests(root, changed):
     return out
 
 
-def required_features(root):
-    """{test target: required-features} from Cargo.toml [[test]] tables."""
-    try:
-        with open(os.path.join(root, "Cargo.toml"), "rb") as f:
-            doc = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError):
-        return {}
-    return {t["name"]: set(t.get("required-features", []))
-            for t in doc.get("test", []) if "name" in t}
-
-
 def plan(root, changed, with_tests):
     """[(name, argv or None, skip reason)] in run order."""
     rs = rust_changed(changed)
     steps = [
         ("fmt", ["cargo", "fmt", "--all", "--", "--check"], None),
-        ("split-map", ["python3", "scripts/split-map-sync", "--check"], None),
+        # CAD-1073: split-map's manifest was retired with tests/ — a
+        # missing tests/split-map.toml means there is nothing to check.
+        ("split-map", ["python3", "scripts/split-map-sync", "--check"],
+         None if os.path.exists(os.path.join(root, "tests/split-map.toml"))
+         else "tests/split-map.toml retired"),
     ]
     why = None if rs else "no Rust changes"
     steps.append(("clippy", ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"], why))
@@ -140,7 +132,9 @@ def plan(root, changed, with_tests):
     if not need:
         steps.append(("contracts", None, "scripts/, .github/, tests/scripts/ unchanged"))
     elif not cs:
-        steps.append(("contracts", ["false"], None))  # ci.yml unreadable: fail closed
+        # CAD-1073: the contract suite is retired — no tests/scripts/*.py
+        # files exist to run, so there is nothing to fail closed on.
+        steps.append(("contracts", None, "contract suite retired under CAD-1073"))
     else:
         steps += [(f"contract {os.path.basename(c)}", ["python3", c], None) for c in cs]
     wrapper = {"scripts/cadence-nextest", "scripts/test-cadence-nextest",
@@ -151,34 +145,23 @@ def plan(root, changed, with_tests):
     # CAD-1021: cheap focused unit tests gated on the file they guard.
     for name, argv in focused_tests(root, changed):
         steps.append((name, argv, None))
+    # CAD-1073 clean-slate: only the safety floor is wired to --tests.
     if not with_tests:
-        steps.append(("tests", None, "pass --tests to run changed binaries"))
+        steps.append(("tests", None, "pass --tests to run the safety floor"))
     elif changed is None:
         steps.append(("tests", None, "unknown changes: cannot pick binaries"))
+    elif "tests/safety_floor.rs" in changed:
+        steps.append(("tests safety_floor", ["cargo", "test", "--locked",
+                                             "--test", "safety_floor"], None))
     else:
-        bins = sorted({p[len("tests/"):-3] for p in changed
-                       if re.fullmatch(r"tests/[A-Za-z0-9_]+\.rs", p)})
-        needs = required_features(root)
-        for b in bins:
-            if not os.path.exists(os.path.join(root, "tests", b + ".rs")):
-                steps.append((f"tests {b}", None, "file deleted or renamed"))
-            elif needs.get(b, set()) - {"test-seam"}:
-                steps.append((f"tests {b}", None, "needs features CI builds separately: "
-                              + ",".join(sorted(needs[b] - {"test-seam"}))))
-            else:
-                # Same build shape as scripts/ci-rust-tests.py.
-                steps.append((f"tests {b}", ["scripts/cadence-nextest", "--test", b,
-                                             "--locked", "--features", "test-seam",
-                                             "--test-threads", "2"], None))
-        if not bins:
-            steps.append(("tests", None, "no tests/*.rs changed"))
+        steps.append(("tests", None, "no tests/*.rs changed"))
     return steps
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--tests", action="store_true",
-                    help="also run filtered tests for changed tests/*.rs binaries")
+                    help=argparse.SUPPRESS)
     ap.add_argument("--list", action="store_true", help="print the plan and exit")
     ap.add_argument("--base", help="diff base ref (default origin/main, else main)")
     ap.add_argument("--root", default=os.path.dirname(os.path.dirname(

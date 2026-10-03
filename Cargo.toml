@@ -84,10 +84,8 @@ webpki-roots = { version = "1" }
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 ammonia = "4"
 
-[[test]]
-name = "e2e_mvp"
-path = "tests/e2e_mvp.rs"
-required-features = ["e2e"]
+# CAD-1073: the legacy e2e target was retired with the suite; the
+# safety-floor binary in tests/ is autodiscovered and needs no entry.
 
 [dev-dependencies]
 jsonschema = { version = "=0.56.0", default-features = false }
