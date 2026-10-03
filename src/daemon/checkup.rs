@@ -47,6 +47,10 @@ pub(super) const CHECKUP_EVENT: &str = "checkup";
 
 /// Default pass interval: `ServeOptions.checkup` is `None`.
 pub(super) const DEFAULT_CHECKUP_SECS: u64 = 60;
+/// CAD-1021: the merged-lane sweep + idle `target/` reclaim runs at most
+/// this often inside the checkup — the pass does real `git` + /proc work
+/// per lane, so a 60s checkup never re-walks every lane each tick.
+pub(super) const RECLAIM_EVERY: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Outcome {
@@ -443,6 +447,33 @@ impl Shared {
         Ok(())
     }
 
+    /// CAD-1021 slice 4: run the merged sweep + idle `target/` reclaim at
+    /// most once per [`RECLAIM_EVERY`]. The pass is best-effort — every
+    /// guard lives in `issue::reclaim::run`, and a failure is warned, never
+    /// raised (a reclaim that can't run leaves the lanes as they are).
+    pub(super) fn maybe_reclaim(self: &Arc<Self>, pm: &issue::Pm) {
+        {
+            let mut last = self.reclaim_at.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|t| t.elapsed() < RECLAIM_EVERY) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        match issue::reclaim::run(pm, &self.state_dir, "daemon") {
+            Ok(out) => {
+                let reclaimed = out["reclaimed"].as_array().map(Vec::len).unwrap_or(0);
+                if reclaimed > 0 {
+                    tracing::info!(
+                        event = "reclaim",
+                        swept = out["swept"].as_u64().unwrap_or(0),
+                        reclaimed
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(event = "reclaim_failed", error = e.to_string()),
+        }
+    }
+
     /// The scan over one tracker dir — split from [`Self::pm_dir`]
     /// resolution so a test can point it at its own pm. Returns the
     /// done map alongside the escalation pass: every `done` report by
@@ -483,6 +514,12 @@ impl Shared {
             {
                 tracing::warn!(event = "backlog_groom_failed", error = e.to_string());
             }
+            // CAD-1021 slice 4: the merged sweep + idle `target/` reclaim,
+            // throttled to RECLAIM_EVERY — the sweep already carries every
+            // finish guard, and reclaim re-checks idleness before a delete.
+            // Best-effort like the sweeps above: a failure never starves
+            // the report scan.
+            self.maybe_reclaim(&pm);
         }
         for project in issue::project::list(pm_dir)? {
             let Ok(entries) = std::fs::read_dir(pm_dir.join(&project.key)) else {

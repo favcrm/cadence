@@ -26,7 +26,8 @@
 //! half of the same reality check. The daemon tick (watch.rs) calls
 //! [`run_daemon`], which skips the finish sweep: probing worktree
 //! liveness goes through `client::rpc`, which the daemon must not
-//! issue to itself.
+//! issue to itself unbounded (the CAD-1021 reclaim pass is the bounded
+//! exception: `finish::with_probe_timeout` caps each probe).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -513,7 +514,8 @@ pub fn run(
 
 /// The daemon tick — same sweep without the finish pass: worktree
 /// liveness probes go through `client::rpc`, which the daemon must
-/// not call on itself (CAD-754). `limit` caps issues per tick; the
+/// not call on itself unbounded (CAD-754; the CAD-1021 reclaim pass
+/// bounds its probes). `limit` caps issues per tick; the
 /// next tick takes the rest.
 pub fn run_daemon(pm: &Pm, actor: &str, limit: usize) -> Result<Value> {
     run_inner(pm, None, false, actor, None, limit, &gh_list, &gh_view)
