@@ -1,3 +1,6 @@
+// Two slashes or backslashes in any mix: one definition for both uses below.
+const isNetworkPath = (href: string): boolean => /^[\\/]{2}/.test(href);
+
 /**
  * Links in agent-written markdown that point at THIS machine (CAD-313,
  * review round 2 of PR #249). A worker could post
@@ -7,24 +10,27 @@
  * key is required too), but a loopback link in the board is never
  * clickable — defence in depth. Pure, so tests/links.test.ts runs it in
  * plain node.
+ *
+ * Browsers treat `\` like `/` in http(s) URLs, so `\\host/x` and `/\host/x`
+ * are network paths too (CAD-1078): any mix of two slashes or backslashes.
  */
 export function isLoopbackHref(rawHref: string): boolean {
   const href = rawHref.trim();
   // react-markdown hands the href percent-encoded (`http://%5B::1%5D/`),
   // which URL rejects; decode only the bracket escapes of an absolute href.
-  const absolute = /^([a-z][a-z0-9+.-]*:|\/\/)/i.test(href);
+  const absolute = /^[a-z][a-z0-9+.-]*:/i.test(href) || isNetworkPath(href);
   const candidate = absolute ? href.replace(/%5b/gi, "[").replace(/%5d/gi, "]") : href;
   let url: URL;
   try {
     // The fixed non-loopback base exists only so a network-path `//host/x`
     // href is judged by its host. A scheme'd href is always parsed absolute:
     // on an https board a browser treats `http:/host` as absolute.
-    url = new URL(candidate, candidate.startsWith("//") ? "http://base.invalid" : undefined);
+    url = new URL(candidate, isNetworkPath(candidate) ? "http://base.invalid" : undefined);
   } catch {
     // An http(s) or network-path href that will not parse even against the
     // base fails CLOSED (CAD-1075). Only a genuinely relative href is this
     // board's own origin.
-    return /^(https?:|\/\/)/i.test(href);
+    return /^https?:/i.test(href) || isNetworkPath(href);
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return false;
   const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
