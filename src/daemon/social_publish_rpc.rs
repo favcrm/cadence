@@ -79,13 +79,27 @@ impl Shared {
                 Self::required_segment(params, "install_id")?,
                 Self::strict_optional_segment(params, "context_id")?,
             ),
-            "social_publish_show" => self
-                .store
-                .social_publish_show(required_str(params, "intent_id")?),
-            "social_publish_list" => self.store.social_publish_list(
-                optional_str(params, "install_id"),
-                optional_str(params, "context_id"),
-            ),
+            // CAD-1020: show and list carry the driver's status, and each
+            // intent its transient `driver.last_error`.
+            "social_publish_show" => {
+                let mut shown = self
+                    .store
+                    .social_publish_show(required_str(params, "intent_id")?)?;
+                self.attach_driver_error(&mut shown["intent"]);
+                shown["driver"] = self.social_publish_driver.status_json();
+                Ok(shown)
+            }
+            "social_publish_list" => {
+                let mut list = self.store.social_publish_list(
+                    optional_str(params, "install_id"),
+                    optional_str(params, "context_id"),
+                )?;
+                for intent in list["intents"].as_array_mut().into_iter().flatten() {
+                    self.attach_driver_error(intent);
+                }
+                list["driver"] = self.social_publish_driver.status_json();
+                Ok(list)
+            }
             "social_publish_claim_due" => self.claim_social_publish(params),
             "social_publish_send_now" => self.send_now_social_publish(params),
             "social_publish_reconcile" => self.reconcile_social_publish(params),
@@ -511,19 +525,9 @@ impl Shared {
         // send left the row processing (lost response), one status
         // reconcile refreshes evidence first — never a second send.
         self.dispatch_claimed(&id, claimed)?;
-        let after = self.store.social_publish_show(&id)?;
+        let after = self.settle_dispatched(&id)?;
         if after["intent"]["state"] != "processing" {
             return Ok(after);
-        }
-        let evidence = after["intent"]["upstream"].clone();
-        if evidence["state"] == "posted" || evidence["state"] == "refused" {
-            let decision = evidence["state"].as_str().unwrap_or("").to_owned();
-            let receipt = if decision == "posted" {
-                evidence.clone()
-            } else {
-                json!({"error": "dispatch refused — see upstream evidence"})
-            };
-            return self.store.social_publish_report(&id, &decision, &receipt);
         }
         // Still processing and no settled upstream: one status read.
         let key = after["intent"]["request"].as_str().unwrap_or("").to_owned();
@@ -545,6 +549,34 @@ impl Shared {
             return self.store.social_publish_report(&id, "posted", &evidence);
         }
         Ok(settled)
+    }
+
+    /// CAD-1041/CAD-1020: close a dispatched row from the evidence the
+    /// daemon itself observed — send-now and the driver share it. A
+    /// settled upstream is reported (the strict gate in `report` checks it
+    /// against frozen); otherwise the row is returned still `processing`.
+    pub(crate) fn settle_dispatched(&self, id: &str) -> Result<Value> {
+        let after = self.store.social_publish_show(id)?;
+        if after["intent"]["state"] != "processing" {
+            return Ok(after);
+        }
+        let evidence = after["intent"]["upstream"].clone();
+        match evidence["state"].as_str() {
+            Some("posted") => self.store.social_publish_report(id, "posted", &evidence),
+            Some("refused") => self.store.social_publish_report(
+                id,
+                "refused",
+                &json!({"error": "dispatch refused — see upstream evidence"}),
+            ),
+            _ => Ok(after),
+        }
+    }
+
+    /// CAD-1020: one intent's transient driver error (terminal reasons
+    /// live on the receipt).
+    fn attach_driver_error(&self, intent: &mut Value) {
+        let id = intent["intent_id"].as_str().unwrap_or("").to_owned();
+        intent["driver"] = json!({"last_error": self.social_publish_driver.last_error_for(&id)});
     }
 
     /// A send-now that lost its claim to another send or a cancel: the
@@ -584,7 +616,7 @@ impl Shared {
 
 /// The exact frozen binding as the dispatch sender speaks it. `None`
 /// when frozen fails its own contract shapes — held, never dispatched.
-fn sender_binding(
+pub(crate) fn sender_binding(
     frozen: &Value,
     request: &Value,
 ) -> Option<crate::platform::agenticos_external::publish::SendBinding> {
