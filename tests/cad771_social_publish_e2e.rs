@@ -1980,6 +1980,13 @@ struct Board {
 }
 impl Board {
     fn serve(h: &Release) -> Self {
+        Self::serve_with(h, |_, _| {})
+    }
+    /// `serve` with `ServeOpts` overrides; `f` gets the leased port.
+    fn serve_with(
+        h: &Release,
+        f: impl FnOnce(&mut cadence_agent::ui::ServeOpts, u16) + Send + 'static,
+    ) -> Self {
         let lease = common::test_port();
         let port = lease.port;
         let (state, pm) = (h.daemon.state.clone(), tempfile::tempdir().unwrap());
@@ -1988,18 +1995,16 @@ impl Board {
         let (tx, rx) = std::sync::mpsc::channel();
         let bstop = stop.clone();
         let join = thread::spawn(move || {
-            cadence_agent::ui::serve(
-                &state,
-                &pm_dir,
-                &cadence_agent::ui::ServeOpts {
-                    host: "127.0.0.1".into(),
-                    port,
-                    stop: Some(bstop),
-                    startup: Some(tx),
-                    test_seam: true,
-                    ..Default::default()
-                },
-            )
+            let mut opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(bstop),
+                startup: Some(tx),
+                test_seam: true,
+                ..Default::default()
+            };
+            f(&mut opts, port);
+            cadence_agent::ui::serve(&state, &pm_dir, &opts)
         });
         rx.recv_timeout(Duration::from_secs(10))
             .expect("board up")
@@ -2911,6 +2916,127 @@ fn cad1041_send_now_board_route_reaches_the_same_gate() {
     assert_eq!(*door.calls.lock().unwrap(), 1);
     assert_eq!(door.stages(), 1, "a refused replay never stages");
     // An unsigned session cannot reach the write: sign-in is the gate.
+}
+
+/// A public-mode board whose platform issuer is a local stub, plus a
+/// signed-in `member` session on it: `(board, host, cookie)`. The test
+/// seam has no member assertion, so this is the public JWT path.
+fn member_session(h: &Release) -> (Board, String, String) {
+    use base64::Engine;
+    use ring::signature::KeyPair;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let signer = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[0x41; 32]).unwrap();
+    let jwks = json!({"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "k1",
+        "x": b64.encode(signer.public_key().as_ref())}]})
+    .to_string();
+    let stub = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let issuer = format!("http://{}", stub.server_addr().to_ip().unwrap());
+    thread::spawn(move || {
+        for request in stub.incoming_requests() {
+            let _ = request.respond(tiny_http::Response::from_string(jwks.clone()));
+        }
+    });
+    let public_issuer = issuer.clone();
+    let board = Board::serve_with(h, move |opts, port| {
+        let host = format!("acme.board.localhost:{port}");
+        opts.allow_hosts.push(host.clone());
+        opts.allow_origins.push(format!("http://{host}"));
+        opts.public = Some(cadence_agent::ui::PublicBoard {
+            host,
+            authorize_url: format!("{public_issuer}/v2/board/authorize"),
+            issuer: public_issuer,
+            company: "co_1".into(),
+        });
+    });
+    let host = format!("acme.board.localhost:{}", board.port);
+    let now = epoch_now();
+    let claims = json!({"iss": issuer, "aud": host, "sub": "usr_member",
+        "email": "member@example.com", "name": "Member", "company": "co_1",
+        "role": "member", "iat": now - 5, "exp": now + 30, "jti": "jti-cad1041-member"});
+    let head = b64.encode(json!({"alg": "EdDSA", "typ": "JWT", "kid": "k1"}).to_string());
+    let signed = format!("{head}.{}", b64.encode(claims.to_string()));
+    let assertion = format!("{signed}.{}", b64.encode(signer.sign(signed.as_bytes())));
+    let body = json!({"assertion": assertion}).to_string();
+    let open = format!(
+        "POST /__platform/session HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+         Sec-Fetch-Site: same-origin\r\nOrigin: http://{host}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let (code, head, text) = common::op::raw(board.port, &open);
+    assert_eq!(code, 200, "member session: {text}");
+    let cookie = common::op::set_cookie(&head).expect("session cookie");
+    let cookie = cookie.split(';').next().unwrap().to_owned();
+    (board, host, cookie)
+}
+
+/// CAD-1041 adversarial (review finding B2): the board peer is at least as
+/// strict as the RPC. An agent caller, an operator session replayed by an
+/// agent and a public `member` session all get 403 before the relay
+/// runs; the row stays queued and nothing stages or sends.
+#[test]
+fn cad1041_board_send_now_refuses_agent_and_member_sessions() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snhttp");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-http-gate",
+        epoch_now(),
+    );
+    let path = format!("/api/social-publishes/{id}/send-now");
+    let body = json!({"install_id": install, "context_id": context["id"]}).to_string();
+    let board = Board::serve(&h);
+    let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &h.daemon.state, board.port);
+    let as_agent = common::op::seam_headers(&h.daemon.state, "agent:cc13-pw");
+    assert!(!as_agent.is_empty(), "the test seam must be armed");
+    // An agent with no session reaches the route class and is refused.
+    let bare = common::op::request(
+        "POST",
+        &path,
+        &session.host,
+        Some(&session.origin),
+        None,
+        &body,
+    );
+    let bare = common::op::assert_as(bare, &h.daemon.state, "agent:cc13-pw");
+    let (code, _, text) = common::op::raw(board.port, &bare);
+    assert_eq!(code, 403, "agent caller: {text}");
+    assert!(text.contains("operator_only"), "agent caller: {text}");
+    // An operator session replayed by the agent is refused (and revoked).
+    let (code, _, text) = common::op::raw(
+        board.port,
+        &session.request_as("POST", &path, &body, &as_agent),
+    );
+    assert_eq!(code, 403, "replayed session: {text}");
+    assert!(
+        text.contains("session_from_agent"),
+        "replayed session: {text}"
+    );
+    let (public, host, cookie) = member_session(&h);
+    let member = format!(
+        "POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+         X-Cadence-Board: 1\r\nSec-Fetch-Site: same-origin\r\nOrigin: http://{host}\r\n\
+         Cookie: {cookie}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let (code, _, text) = common::op::raw(public.port, &member);
+    assert_eq!(code, 403, "member session: {text}");
+    assert!(text.contains("member_role"), "member session: {text}");
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(
+        shown["intent"]["state"], "queued",
+        "a refused write moved the row"
+    );
+    assert_eq!(door.stages(), 0, "a refused write staged");
+    assert_eq!(*door.calls.lock().unwrap(), 0, "a refused write sent");
 }
 
 #[test]
