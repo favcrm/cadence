@@ -198,10 +198,10 @@ impl Store {
     /// The only way to take the connection lock (CAD-256). A panic while
     /// another caller held the guard poisons the mutex; `lock().unwrap()`
     /// would then panic on every later call and take the daemon down
-    /// with it. The connection itself is still sound — an unwinding
-    /// `Transaction` rolls back on drop — so recover the guard, clear
-    /// the poison, roll back anything a raw `BEGIN` left open, and
-    /// record one `store_poisoned` event on the daemon stream.
+    /// with it. Recover the guard, verify rollback, and attempt one
+    /// `store_poisoned` event on the daemon stream. Clear poison only
+    /// after forensic cleanup is verified; an unverified connection
+    /// remains poisoned and unavailable rather than leaking a writer.
     ///
     /// The returned guard is DISARMED — the authorizer denies every
     /// write/DML/DDL/tx-boundary it attempts, so test/fixture read
@@ -213,15 +213,6 @@ impl Store {
             Ok(guard) => guard,
             Err(poisoned) => {
                 let guard = poisoned.into_inner();
-                self.conn.clear_poison();
-                // CAD-1011: VERIFY the rollback, don't assume it. A panic
-                // can leave the conn inside a tx *or* in autocommit —
-                // `!is_autocommit()` alone is not proof a rollback ran.
-                // `verified_rollback` runs ROLLBACK inside the owner's
-                // TxControl window (the disarmed authorizer would refuse
-                // it) and returns true ONLY once the conn is actually
-                // back in autocommit; a denied/failed ROLLBACK reports
-                // false and is never silently labelled `rolled_back`.
                 // CAD-1011: VERIFY the rollback, don't assume it. A panic
                 // can leave the conn inside a tx *or* in autocommit —
                 // `!is_autocommit()` alone is not proof a rollback ran.
@@ -248,8 +239,12 @@ impl Store {
                 // mislabeled. Only a known-clean conn (already autocommit,
                 // or a verified rollback) gets the forensic row.
                 let clean = !matches!(recovery, seal::PoisonRecovery::Unverified);
+                assert!(
+                    clean,
+                    "store: poison recovery is unverified; connection remains unavailable"
+                );
                 let fenced = self.write_fence.get().is_some_and(|f| f.check().is_some());
-                if !fenced && clean {
+                if !fenced {
                     // CAD-1011: the forensic recovery event is an
                     // owner-maintenance write inside ONE held BEGIN
                     // IMMEDIATE — the closure-latch re-check and the row
@@ -259,8 +254,21 @@ impl Store {
                     // nothing — never a false `rolled_back` on a closed
                     // or unknown store.
                     let rolled_back = matches!(recovery, seal::PoisonRecovery::RolledBack);
-                    Self::forensic_poison_event(&self.seal_state, &guard, rolled_back, state_label);
+                    assert!(
+                        Self::forensic_poison_event(
+                            &self.seal_state,
+                            &guard,
+                            rolled_back,
+                            state_label
+                        ),
+                        "store: forensic cleanup is unverified; connection remains unavailable"
+                    );
                 }
+                assert!(
+                    guard.is_autocommit(),
+                    "store: recovery retained an open transaction"
+                );
+                self.conn.clear_poison();
                 guard
             }
         }

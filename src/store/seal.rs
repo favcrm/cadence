@@ -1237,7 +1237,7 @@ impl Store {
         conn: &Connection,
         rolled_back: bool,
         state_label: &'static str,
-    ) {
+    ) -> bool {
         let _armed = ArmGuard::enter(state, GuardState::OWNER);
         let tx = {
             let _ctrl = ControlPhase::enter(state);
@@ -1245,7 +1245,10 @@ impl Store {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("store: forensic tx begin failed: {e}");
-                    return;
+                    return !matches!(
+                        Self::verified_rollback(state, conn),
+                        PoisonRecovery::Unverified
+                    );
                 }
             }
         };
@@ -1255,28 +1258,40 @@ impl Store {
             Ok(Preflight::LatchAbsent) | Ok(Preflight::LatchOpen)
         );
         if !safe {
-            let _ = tx;
-            return;
-        }
-        let out = Store::event(
-            &tx,
-            Store::DAEMON_STREAM,
-            "store_poisoned",
-            serde_json::json!({"rolled_back": rolled_back, "state": state_label}),
-        );
-        match out {
-            Ok(()) => {
-                let _ctrl = ControlPhase::enter(state);
-                if let Err(e) = tx.commit() {
-                    eprintln!("store: forensic commit failed: {e}");
+            // Transaction::drop ignores a denied rollback in Callback.
+            // Refusal must explicitly relinquish the writer under the
+            // owner's transaction-control window, just like other errors.
+            if let Err(e) = Self::rollback_tx(state, conn, tx) {
+                eprintln!("store: forensic refusal rollback failed: {e}");
+            }
+        } else {
+            let out = Store::event(
+                &tx,
+                Store::DAEMON_STREAM,
+                "store_poisoned",
+                serde_json::json!({"rolled_back": rolled_back, "state": state_label}),
+            );
+            match out {
+                Ok(()) => {
+                    let _ctrl = ControlPhase::enter(state);
+                    if let Err(e) = tx.commit() {
+                        eprintln!("store: forensic commit failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("store: could not record store_poisoned: {e}");
+                    if let Err(e) = Self::rollback_tx(state, conn, tx) {
+                        eprintln!("store: forensic event rollback failed: {e}");
+                    }
                 }
             }
-            Err(e) => {
-                eprintln!("store: could not record store_poisoned: {e}");
-                let _ctrl = ControlPhase::enter(state);
-                let _ = tx.rollback();
-            }
         }
+        // Commit/rollback errors can leave a transaction outstanding.
+        // Reuse is permitted only after the actual connection is clean.
+        !matches!(
+            Self::verified_rollback(state, conn),
+            PoisonRecovery::Unverified
+        )
     }
 
     /// `propose_close` — flip the durable latch (owner lane), authorized
@@ -1747,6 +1762,77 @@ mod tests {
     #[test]
     fn forensic_read_error_refusal_releases_writer() {
         forensic_refusal_releases_writer("read_error");
+    }
+
+    #[test]
+    fn forensic_unverified_cleanup_keeps_connection_poisoned() {
+        let dir = TempDir::new().unwrap();
+        let (db, store) = open_legacy(&dir);
+        let sibling = Connection::open(&db).unwrap();
+        sibling.busy_timeout(std::time::Duration::ZERO).unwrap();
+        sibling.execute_batch(SEAL_SCHEMA).unwrap();
+        sibling
+            .execute("INSERT INTO closure_state(id,closed) VALUES(1,1)", [])
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            let state = store.seal_state.clone();
+            // Simulate a real denied ROLLBACK, including authorized cleanup.
+            conn.authorizer(Some(
+                move |ctx: rusqlite::hooks::AuthContext<'_>| match ctx.action {
+                    AuthAction::Transaction {
+                        operation: rusqlite::hooks::TransactionOperation::Rollback,
+                    } => Authorization::Deny,
+                    AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => {
+                        if state.phase.load(Ordering::SeqCst) == GuardState::TX_CONTROL {
+                            Authorization::Allow
+                        } else {
+                            Authorization::Deny
+                        }
+                    }
+                    _ => Authorization::Allow,
+                },
+            ));
+        }
+        std::thread::scope(|scope| {
+            assert!(scope
+                .spawn(|| {
+                    let _held = store.conn.lock().unwrap();
+                    panic!("poison before failed cleanup");
+                })
+                .join()
+                .is_err());
+        });
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(store.conn());
+        }));
+        assert!(
+            refused.is_err(),
+            "unverified forensic cleanup returned an ordinary guard"
+        );
+        assert!(
+            store.conn.is_poisoned(),
+            "unverified cleanup cleared quarantine"
+        );
+        let held = store.conn.lock().unwrap_err().into_inner();
+        assert!(!held.is_autocommit());
+        assert_eq!(
+            held.query_row(
+                "SELECT count(*) FROM events WHERE kind='store_poisoned'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        install_authorizer(&held, store.seal_state.clone());
+        drop(held);
+        // Once cleanup is possible, the next recovery verifies it before reuse.
+        let recovered = store.conn();
+        assert!(recovered.is_autocommit());
+        drop(recovered);
+        assert!(!store.conn.is_poisoned());
+        sibling.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
     }
 
     /// A synthetic owner-maintenance permit bound to `db` — the only way
