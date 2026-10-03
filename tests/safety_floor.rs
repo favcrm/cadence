@@ -98,7 +98,7 @@ impl FloorHost {
     fn run(&self, args: &[&str]) -> Output {
         let mut cmd = self.command();
         cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-        OwnChild(cmd.spawn().unwrap()).wait(Duration::from_secs(25))
+        OwnChild(Some(cmd.spawn().unwrap())).wait(Duration::from_secs(25))
     }
 }
 
