@@ -29,7 +29,9 @@ export function isLoopbackHref(rawHref: string): boolean {
   const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
   if (host === "localhost" || host.endsWith(".localhost")) return true;
   if (host === "::1" || host === "::" || host === "0:0:0:0:0:0:0:1") return true;
-  if (/^::ffff:(127\.|0\.0\.0\.0|7f)/.test(host)) return true;
+  // URL always emits IPv4-mapped hosts in hex: 127.x.y.z is ::ffff:7fXX:YYYY
+  // and 0.0.0.0 is ::ffff:0:0 (the dotted forms never reach this test).
+  if (/^::ffff:(7f[0-9a-f]{2}:[0-9a-f]{1,4}|0:0)$/.test(host)) return true;
   // The URL parser normalises 2130706433, 0x7f.1 and friends to dotted form.
   if (/^127\.\d+\.\d+\.\d+$/.test(host) || host === "0.0.0.0") return true;
   return false;

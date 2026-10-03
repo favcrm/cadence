@@ -27,6 +27,10 @@ for (const href of [
   "http://%5Bzz%5D/",
   "//%5B::1%5D/x",
   "//[::1]/x",
+  "http://%5B::ffff:0:0%5D/",
+  "http://[::ffff:0.0.0.0]/",
+  "http://[::ffff:0:0]:3138/",
+  "http://[::ffff:127.255.1.2]/",
   " http://%5B::1%5D/",
   "\thttp://[::1]/",
 ]) {
@@ -47,6 +51,7 @@ for (const href of [
   "http://%5B2001:db8::1%5D/",
   "http://%5b2001:db8::1%5d/",
   "//example.com/x",
+  "http://[::ffff:8.8.8.8]/",
   " https://example.com/",
 ]) {
   equal(isLoopbackHref(href), false, href);
