@@ -137,8 +137,9 @@ digest, no fresh full review for unchanged code, and no duplicate Node setup
 for cargo-only retired journeys. Measure failure-before-review rate and
 number of operator/reviewer handoffs as well as CI elapsed/runner minutes.
 
-The default policy still requires two independent reviewers and operator
-approval for human risk. Automating evidence collection, reviewer state,
+Review count follows AGENTS.md "Review" (CAD-1099): one independent review by
+default, two for the excluded paths in `docs/roles/one-review-paths.toml`, and
+operator approval for human risk. Automating evidence collection, reviewer state,
 head-drift notifications or an operator decision UI is a separate reviewed
 implementation—not a license to self-approve. Likewise, consolidating required
 build/UI checks or changing branch protection requires baseline measurements

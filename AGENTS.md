@@ -44,14 +44,21 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   independent review covering standards and spec, filed as
   `# Verdict: <ID> Review (standards+spec) — pass|revise`, when every
   changed path qualifies under `docs/roles/one-review-paths.toml`. That list
-  covers normal code, UI and docs, and EXCLUDES trust-boundary/identity,
+  covers normal code and docs, and EXCLUDES UI (`ui/**`, `src/ui/**`: the board runs with the operator's session), trust-boundary/identity,
   security, rules/gates/CI, supply-chain and release/rollout paths
-  (risk-classes triggers 1, 3, 4, 6, 7). A PR touching any excluded path
+  (risk-classes triggers 1, 2-schema, 3, 4, 6, 7, plus the sensitive source trees listed in that file). A PR touching any excluded path
   needs **Standards** and **Spec/security** reviews by two different
   independent reviewers. No reviewer may be the author. Prefer a reviewer
   whose model vendor differs from the author's. Reviewers flag only gaps that
   affect correctness, security or the ticket's requirements; style
   preferences and requests for extra tests are optional notes, not REVISE.
+  The path list is a floor, not a complete map: a single reviewer who sees
+  auth, identity, credential, signature, secret, confinement or gate logic
+  in a one-review PR returns REVISE asking for a second (Spec/security)
+  reviewer, and states the trigger in `Risk:`. When unsure, two. A single
+  reviewer of a PR that changes or deletes a check states that no gate check
+  and no isolation or fail-closed default was weakened, naming what was
+  checked.
   - **Reviewer-count scaling (CAD-814):** for a two-review PR, the default is two distinct
     reviewers. When the project runs a solo-operator lane — the author is
     the only registered reviewer-capable identity on the project — a
@@ -237,7 +244,7 @@ normal gates return. An agent or PR may not grant that exception to itself.
   clippy, UI typecheck and active script contracts for what you changed).
   Use `scripts/pre-push --tests` before requesting review of Rust changes:
   during CAD-1073 it always runs the safety floor, even when its source is
-  unchanged. It does not replace behavior tests for the changed contract.
+  unchanged. It is the regression floor, not proof of the ticket's outcome (see "Behavior-first verification").
   Integration split manifests are retired; do not run `split-map-sync`
   until a reviewed inventory restoration establishes its inputs.
 - sccache is the host-wide rustc wrapper (set in `~/.cargo/config.toml`).
@@ -339,12 +346,13 @@ mapping, process owner, permitted operations and rollback artifact.
   by name. Never run `rm <scratchpad>/*`.
 
 ### Gates and security work
-- A new rule the daemon or an HTTP route enforces (auth, operator-only,
-  exactly-once, a gate) or a change that deletes data ships with ONE
-  acceptance check proving the bad case is refused (for example an agent
-  caller, a forged field or a replay). Write it from the ticket, not from the
-  implementation. The reviewer confirms it exercises the real guard and that
-  the implementer did not weaken it. No other ceremony.
+- A rule the daemon or an HTTP route enforces (auth, operator-only,
+  exactly-once, a gate), whether new or changed, or a change that deletes
+  data, ships with ONE acceptance check proving the bad case is refused (for
+  example an agent caller, a forged field or a replay). It is written from
+  the ticket by someone other than the implementer (the reviewer or the
+  ticket author), and the implementer may not edit or weaken it. The
+  reviewer confirms it exercises the real guard. No other ceremony.
 - A board or HTTP path must be at least as strict as the daemon RPC it
   relays, so run the same operator proof on the HTTP peer.
 - Restrict actors with allowlists, not denylists.

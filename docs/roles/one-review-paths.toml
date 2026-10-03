@@ -23,8 +23,8 @@
 # (harness and isolation code) stays two-review via the exclude list.
 #
 # CAD-1099 (operator decision 2026-10-03, "spec > dev > review > pr > deploy is
-# taking too long"): ONE independent review is the default for normal code,
-# UI and docs. Two reviews remain for every path in docs/roles/risk-paths.toml
+# taking too long"): ONE independent review is the default for normal code
+# and docs. UI (`ui/**`, `src/ui/**`) is trigger 1 and keeps two. Two reviews remain for every path in docs/roles/risk-paths.toml
 # triggers 1 (trust boundary/identity), 3 (secrets), 4 (supply chain/CI),
 # 6 (release/rollout) and 7 (rules/gates/their proofs), plus the remote-CLI
 # auth modules below. Includes are explicit directories, so a new top-level
@@ -32,7 +32,6 @@
 
 one_review_include = [
   "src/**",
-  "ui/**",
   "docs/**",
   "tests/**",
   "skills/**",
@@ -65,6 +64,24 @@ one_review_exclude = [
   "src/master_perm.rs",
   "src/agent_uid.rs",
   "src/cli/agent_uid.rs",
+  # CAD-1099 review fix: risk-paths.toml is a delegation ALLOWLIST and was never
+  # a complete map of identity/credential code, so whole sensitive trees keep
+  # two reviews here (fail-safe, by directory).
+  "src/daemon/**",
+  "src/bin/**",
+  "src/platform/**",
+  "src/adapter/**",
+  "src/store/**",
+  "src/pi_policy.rs",
+  "src/confine.rs",
+  "agents/**",
+  # nested build and supply-chain inputs anywhere under an include dir
+  "**/Cargo.toml",
+  "**/Cargo.lock",
+  "**/build.rs",
+  "**/.cargo/**",
+  "**/package-lock.json",
+  "**/.npmrc",
   # remote-CLI and board auth modules (CAD-1019, CAD-526/777): identity
   "src/cli_actor.rs",
   "src/board_identity.rs",

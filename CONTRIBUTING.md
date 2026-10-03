@@ -150,9 +150,10 @@ Choose tests by the changed contract:
   built SPA. Avoid `--all-features`: `e2e` is an opt-in journey tier with its own
   release/Node/browser prerequisites.
 
-Retain real timing budgets and operator-lineage proofs. Enforced gates require
-adversarial agent, detached-child, concurrent and forged-field tests first,
-including the HTTP peer when applicable. Do not weaken assertions, skip tests
+Retain real timing budgets and operator-lineage proofs. A new or changed
+enforced rule ships with one independent acceptance check proving the bad
+case is refused, including on the HTTP peer when applicable (AGENTS.md
+"Gates and security work"). Do not weaken assertions, skip tests
 or add retries to obtain a green result. Rerun a loaded-host timeout alone before
 concluding it is a product failure.
 
