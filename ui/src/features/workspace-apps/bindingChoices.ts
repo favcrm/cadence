@@ -143,6 +143,16 @@ export function bindingHealth(
   return "ok";
 }
 
+/** Receipt fields that migrate without the operator (daemon allowlist). */
+const BOOKKEEPING = new Set([
+  "registration_digest",
+  "sink_registration",
+  "descriptor_revision",
+  "reviewed_pin",
+  "reported_pin",
+  "mapping.tool",
+]);
+
 export interface SlotReadiness {
   slot: string;
   requirement: string;
@@ -188,7 +198,11 @@ export function readinessFor(
       // readiness must gate on it too, or a deregistered provider reads Ready.
       const registered = connection?.status?.adapter_registered === true;
       const drift = health === "ok" ? binding?.drift : undefined;
-      const confirm = drift?.state === "needs_confirm" ? (drift.changes ?? []) : null;
+      // The confirm shows only what widened; provider bookkeeping that
+      // would have migrated on its own is not the operator's decision.
+      const confirm = drift?.state === "needs_confirm"
+        ? (drift.changes ?? []).filter((change) => !BOOKKEEPING.has(change.field))
+        : null;
       const unavailable = drift?.state === "unavailable";
       const ready = health === "ok" && custody && registered && !confirm && !unavailable;
       const nextAction = !binding || health === "not-configured"

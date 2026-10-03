@@ -82,13 +82,28 @@ async function main() {
 
   // A widened contract: the slot blocks, names the change, and one inline
   // confirm re-binds the same connection at its current revision.
-  const widened = { ...binding, drift: { state: "needs_confirm", changes: [{ field: "mapping.scopes", from: ["read"], to: ["read", "write"] }] } };
+  const widened = { ...binding, drift: { state: "needs_confirm", changes: [
+    { field: "mapping.scopes", from: ["read"], to: ["read", "write"] },
+    { field: "registration_digest", from: "sha256:" + "a".repeat(64), to: "sha256:" + "b".repeat(64) },
+  ] } };
   const confirmed: unknown[] = [];
   await render({ installation, bindings: [widened], connections, contextId: null, canWrite: true, onConfirm: (b: unknown) => confirmed.push(b) });
   assert(text().includes("Needs you"), "widened slot needs you");
   assert(text().includes("mapping.scopes: read → read, write"), "the change is shown");
+  assert(!text().includes("registration_digest"), "bookkeeping is not part of the confirm");
   const button = Array.from(host.querySelectorAll("button")).find((b) => b.textContent?.includes("Confirm publication change"));
   assert(button, "inline confirm offered");
+  // Layout at 390 (Browser QA): the confirm and the change live in the
+  // full-width detail block under the row, never inside the one-line flex
+  // `.wa-step`, and the change wraps anywhere.
+  assert(button.closest(".wa-step") === null, "confirm is not in the one-line row");
+  assert(button.closest(".wa-blocker-detail") !== null, "confirm is in the full-width detail block");
+  const diff = host.querySelector(".wa-diff");
+  assert(diff && diff.closest(".wa-step") === null, "change is not in the one-line row");
+  const css: string = require("fs").readFileSync(require("path").join(require("process").cwd(), "src/features/workspace-apps/workspace-apps.css"), "utf8");
+  const rule = (name: string) => css.slice(css.indexOf(`${name} {`), css.indexOf("}", css.indexOf(`${name} {`)));
+  assert(/overflow-wrap:\s*anywhere/.test(rule(".wa-diff")), "the change wraps anywhere");
+  assert(/display:\s*grid/.test(rule(".wa-blocker-detail")) && /min-width:\s*0/.test(rule(".wa-blocker-detail")), "detail block is full width and shrinkable");
   await React.act(async () => { button.click(); }); await flush();
   assert(confirmed.length === 1 && (confirmed[0] as { id: string }).id === "bind-a", "confirm names the bound connection");
   // A read-only viewer sees the change but cannot confirm it.

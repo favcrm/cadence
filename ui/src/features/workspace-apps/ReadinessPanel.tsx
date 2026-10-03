@@ -47,33 +47,42 @@ export function ReadinessPanel({
           : "Every connection slot is bound and healthy."}
       </p>
       {blockers.map((row) => (
-        <div key={row.slot} className="wa-step" aria-label={`${row.slot} readiness`}>
-          <span>
-            {titleFor(row.slot)} · {row.requirement}
-          </span>
-          <span className="wa-status" data-tone="warn">
-            Needs you
-          </span>
-          <p className="wa-muted">{row.nextAction}</p>
-          {row.confirm && row.binding && (
-            <>
-              <ul className="wa-muted" aria-label={`${row.slot} connection change`}>
-                {row.confirm.map((change) => (
-                  <li key={change.field}>{describe(change)}</li>
-                ))}
-              </ul>
-              {onConfirm && (
-                <Button
-                  size="sm"
-                  disabled={!canWrite || busy}
-                  loading={busy}
-                  onClick={() => row.binding && onConfirm(row.binding)}
-                >
-                  Confirm {row.slot} change
-                </Button>
-              )}
-            </>
-          )}
+        // The row keeps the one-line title and status; the next action, the
+        // change and the confirm sit in a full-width block under it, so the
+        // confirm never leaves the panel at any width.
+        <div key={row.slot} className="wa-blocker" aria-label={`${row.slot} readiness`}>
+          <div className="wa-step">
+            <span className="wa-blocker-title">
+              {titleFor(row.slot)} · {row.requirement}
+            </span>
+            <span className="wa-status" data-tone="warn">
+              Needs you
+            </span>
+          </div>
+          <div className="wa-blocker-detail">
+            <p className="wa-muted">{row.nextAction}</p>
+            {row.confirm && row.binding && (
+              <>
+                <ul className="wa-diff" aria-label={`${row.slot} connection change`}>
+                  {row.confirm.map((change) => (
+                    <li key={change.field}>{describe(change)}</li>
+                  ))}
+                </ul>
+                {onConfirm && (
+                  <div className="wa-row">
+                    <Button
+                      size="sm"
+                      disabled={!canWrite || busy}
+                      loading={busy}
+                      onClick={() => row.binding && onConfirm(row.binding)}
+                    >
+                      Confirm {row.slot} change
+                    </Button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
         </div>
       ))}
     </section>
