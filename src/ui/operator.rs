@@ -257,6 +257,18 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
+    // CAD-1098: making a conversation is the operator's chat, like the
+    // message POST — the daemon proves the connection again.
+    route(
+        "POST",
+        "/api/threads/*/conversations",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/conversations",
+        RouteClass::OperatorOnly,
+    ),
     // CAD-551: the composer's slash commands and Stop — the daemon's
     // `master_command` is operator-only, so the relay is too.
     route("POST", "/api/master/command", RouteClass::OperatorOnly),
@@ -495,29 +507,28 @@ pub(super) fn admit_operator_read(
     opts: &ServeOpts,
 ) -> Result<(), HttpResp> {
     let caller = board_caller(request, state_dir, opts, false)?;
+    let what = format!(
+        "GET {}",
+        request.url().split('?').next().unwrap_or_default()
+    );
     match &caller {
         Caller::Agent(alias) => Err(guard_fail(
             "operator_only",
             &format!(
-                "GET /api/master/permissions is the operator's decision — this request comes \
+                "{what} is the operator's decision — this request comes \
                  from agent '{alias}'; decide from the operator's browser"
             ),
         )),
         Caller::Named(named) if !named.operator => Err(guard_fail(
             "member_role",
             &format!(
-                "GET /api/master/permissions needs the board owner's role — this session is \
+                "{what} needs the board owner's role — this session is \
                  {}'s, mapped `member`",
                 named.actor
             ),
         )),
         Caller::Named(_) => Ok(()),
-        Caller::Operator(_) => super::home::prove_operator_peer(
-            request,
-            state_dir,
-            opts,
-            "GET /api/master/permissions",
-        ),
+        Caller::Operator(_) => super::home::prove_operator_peer(request, state_dir, opts, &what),
     }
 }
 
@@ -2082,6 +2093,24 @@ mod tests {
             route_class("POST", "/api/session/device/poll"),
             RouteClass::Session
         );
+        // CAD-1098: making a conversation is the operator's chat, on
+        // either path; the board is never less strict than the RPC.
+        for path in [
+            "/api/threads/master/conversations",
+            "/api/app-installations/install-1/conversations",
+        ] {
+            assert_eq!(
+                route_class("POST", path),
+                RouteClass::OperatorOnly,
+                "{path}"
+            );
+            assert!(
+                WRITE_ROUTES.iter().any(|r| r.method == "POST"
+                    && r.class == RouteClass::OperatorOnly
+                    && matches(r.pattern, path)),
+                "{path} must be listed, not left to the fail-closed default"
+            );
+        }
         // Unlisted writes are operator-only.
         assert_eq!(route_class("POST", "/api/launch"), RouteClass::OperatorOnly);
         assert_eq!(

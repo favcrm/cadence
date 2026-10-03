@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { streamInto } from "../../lib/sse";
-import { useQuery } from "../../lib/useResource";
+import { useQuery, useResource } from "../../lib/useResource";
 import { navigate, useHref } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
@@ -24,6 +24,20 @@ import { ChatRow, chatContext, type ChatPage } from "./chatRender";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
+import {
+  QUEUED_NOTICE,
+  conversationLabel,
+  conversationThread,
+  conversationStreamUrl,
+  createConversation,
+  idleThread,
+  hasUnansweredOperator,
+  isQueuedBehindOther,
+  parseSlash,
+  selectConversation,
+  useActiveConversation,
+  useChatCollapsed,
+} from "./conversationClient";
 import "./app-shell.css";
 
 /**
@@ -96,7 +110,8 @@ export default function AppShell({
     rawSection === "segments" || rawSection === "campaigns" ? rawSection : "customers";
   const [chatOpen, setChatOpen] = useState(false);
   // CAD-1051: desktop rail. Narrow widths keep the drawer above.
-  const [chatCollapsed, setChatCollapsed] = useState(false);
+  // CAD-1098: collapse state is per app installation.
+  const [chatCollapsed, setChatCollapsed] = useChatCollapsed(installId);
   // CAD-861: the app-views/v1 contract preview is a dev-only overlay
   // keyed by `contract-preview` in the URL — it never mounts in a
   // production bundle and never replaces the trusted outlet by default.
@@ -460,6 +475,7 @@ export default function AppShell({
             </button>
           </div>
           <ChatPane
+            installId={installId}
             viewer={viewer}
             contextLabel={isSocial ? null : contextLabel(contexts, contextId)}
             binding={binding}
@@ -725,16 +741,17 @@ export function latestScopedChatMessage(
 }
 
 /**
- * The actual master conversation in compact form: the same
- * `resources.masterThread` store Home reads and writes, streamed live
- * from `/api/threads/master/stream`. Whatever the operator says here
- * lands in the same thread Home shows — one conversation, two panes.
+ * The install's assistant conversation in compact form (CAD-1098): one
+ * thread store per conversation, streamed live from
+ * `/api/threads/master/stream?conversation=<id>`. The picker lists General,
+ * campaign conversations and + New; the home thread is not shown here.
  * Sends carry the shell's current installation/context; the daemon
  * proves both against its store and stamps the verified binding on
  * the entry — the chip below renders only that read-back stamp, never
  * what was sent.
  */
 function ChatPane({
+  installId,
   viewer,
   contextLabel,
   binding,
@@ -744,6 +761,7 @@ function ChatPane({
   collapsed,
   onCollapsed,
 }: {
+  installId: string;
   viewer: Viewer;
   contextLabel: string | null;
   binding: ChatBinding;
@@ -753,55 +771,116 @@ function ChatPane({
   collapsed: boolean;
   onCollapsed: (next: boolean) => void;
 }) {
-  const thread = useQuery(resources.masterThread);
+  // CAD-1098: one conversation per (installation, optional subject); the
+  // thread shown is that conversation's own store, never the home thread
+  // (unless the daemon predates conversations: `legacy`).
+  const active = useActiveConversation(installId);
+  const store = active.store ?? idleThread;
+  const convId = active.state === "ready" ? (active.selected?.id ?? null) : null;
+  const thread = useResource(store);
+  const masterState = useQuery(resources.masterState);
   const [draft, setDraft] = useState("");
   const [sendError, setSendError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
   const loaded = thread.data !== null;
+  const draftSubject = active.draftSubject;
+  // With no context selected the send still carries the installation, so
+  // it lands in the app's conversation (the context is only a per-turn hint).
+  const sendApp = binding.scope ?? (active.state === "ready" ? { install_id: installId } : undefined);
+  const usable =
+    active.state === "legacy" || (active.state === "ready" && (convId !== null || draftSubject !== null));
 
   useEffect(() => {
-    if (!loaded) void resources.masterThread.refresh();
-  }, [loaded]);
+    if (usable && !loaded) void store.refresh();
+  }, [usable, loaded, store]);
   useEffect(() => {
-    if (!loaded || thread.data?.missing === true) return;
-    const sub = streamInto(resources.masterThread, reduceFrame, {
-      url: `/api/threads/${MASTER}/stream`,
+    if (!usable || !loaded || thread.data?.missing === true || draftSubject !== null) return;
+    const sub = streamInto(store, reduceFrame, {
+      url: convId === null ? `/api/threads/${MASTER}/stream` : conversationStreamUrl(convId),
       events: ["entry"],
-      lastEventId: String(lastSeq(resources.masterThread.get().data) ?? 0),
+      lastEventId: String(lastSeq(store.get().data) ?? 0),
       onError: () => undefined,
     });
     return () => sub.close();
-  }, [loaded, thread.data?.missing]);
+  }, [store, usable, convId, loaded, thread.data?.missing, draftSubject]);
 
   const items = threadItems(thread.data);
   const tail = items.slice(-8);
-  const canSend = viewer.operator && !viewer.readOnly;
-  // Waiting dot: the thread grew while the rail was collapsed.
+  const canSend = viewer.operator && !viewer.readOnly && usable;
+  const canCreate = viewer.operator && !viewer.readOnly && active.state === "ready";
+  // Waiting dot: the selected conversation grew while the rail was collapsed.
   const seen = useRef(items.length);
   if (!collapsed) seen.current = items.length;
   const waiting = collapsed && items.length > seen.current;
   const ctx = page === null ? null : chatContext(page, recordOpen);
+  const queued = isQueuedBehindOther(masterState.data?.turn, thread.data?.entries ?? [], thread.data?.pending ?? []);
+  // The notice needs a live turn read while a reply is awaited.
+  const awaiting = queued || (thread.data?.pending ?? []).some((p) => p.state === "sent");
+  // After a reload or navigation the selected conversation may still be
+  // waiting on another conversation's turn: read the master's state once
+  // (the poll below then keeps the notice live while it is queued).
+  const unanswered = hasUnansweredOperator(thread.data?.entries ?? []);
+  useEffect(() => {
+    if (unanswered) void resources.masterState.refresh();
+  }, [unanswered, convId]);
+  useEffect(() => {
+    if (!awaiting) return;
+    const t = setInterval(() => void resources.masterState.refresh(), 6_000);
+    return () => clearInterval(t);
+  }, [awaiting]);
+
+  // "+ New", `/new` and `/clear` are one call: a fresh conversation.
+  const startNew = () => {
+    if (!canCreate || creating) return;
+    setCreating(true);
+    setSendError(null);
+    createConversation(installId, binding.scope?.context_id ?? "")
+      .catch((e: unknown) => setSendError(e instanceof ApiError ? e.message : String(e)))
+      .finally(() => setCreating(false));
+  };
 
   const send = () => {
     const body = draft.trim();
     if (!body || !canSend) return;
+    if (parseSlash(body) === "new") {
+      // A command, never a message: nothing is sent to the assistant.
+      setDraft("");
+      startNew();
+      return;
+    }
     if (binding.error !== null) {
       setSendError(binding.error);
       return;
     }
     const message = newMessageId();
     setSendError(null);
-    resources.masterThread.write((s) => addPending(s, message, body, Date.now()));
-    api
-      .threadSend(MASTER, body, message, undefined, binding.scope ?? undefined)
-      .then(() => {
-        resources.masterThread.write((s) => settlePending(s, message, { ok: true }));
-        void resources.masterState.refresh();
-      })
-      .catch((e: ApiError) => {
-        setSendError(e.message ?? String(e));
-        resources.masterThread.write((s) => settlePending(s, message, { ok: false, error: e.message ?? String(e) }));
-      });
+    // Create-on-first-send: an unsaved campaign conversation is made
+    // (idempotently) right before its first message, then the message
+    // goes to the returned id.
+    const target: Promise<{ id: string | null; store: typeof store }> =
+      draftSubject !== null
+        ? createConversation(installId, binding.scope?.context_id ?? "", draftSubject).then((c) => ({
+            id: c.id,
+            store: conversationThread(c.id),
+          }))
+        : Promise.resolve({ id: convId, store });
     setDraft("");
+    void target.then(
+      ({ id, store: dest }) => {
+        dest.write((s) => addPending(s, message, body, Date.now()));
+        return api
+          .threadSend(MASTER, body, message, undefined, sendApp, id ?? undefined)
+          .then(() => {
+            dest.write((s) => settlePending(s, message, { ok: true }));
+            void resources.masterState.refresh();
+          })
+          .catch((e: ApiError) => {
+            setSendError(e.message ?? String(e));
+            dest.write((s) => settlePending(s, message, { ok: false, error: e.message ?? String(e) }));
+          });
+      },
+      (e: unknown) => setSendError(e instanceof ApiError ? e.message : String(e)),
+    );
   };
 
   return (
@@ -831,22 +910,73 @@ function ChatPane({
           ⇤
         </button>
       </div>
-      {thread.status === "failed" && (
+      {active.state !== "legacy" && (
+        <div className="app-chat-conv" data-chat-conversations>
+          <select
+            className="app-chat-conv-select text-secondary"
+            aria-label="Conversation"
+            value={convId ?? ""}
+            disabled={active.state !== "ready" || (active.conversations.length === 0 && draftSubject === null)}
+            onChange={(e) => e.target.value !== "" && selectConversation(installId, e.target.value)}
+          >
+            {active.conversations.length === 0 && draftSubject === null && <option value="">General</option>}
+            {draftSubject !== null && <option value="">New campaign conversation (unsaved)</option>}
+            {active.conversations.map((c, i) => (
+              <option key={c.id} value={c.id}>
+                {conversationLabel(c, i)}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            data-chat-new
+            disabled={!canCreate || creating}
+            onClick={startNew}
+          >
+            + New
+          </button>
+        </div>
+      )}
+      {active.state === "failed" && (
         <p className="text-label text-fail" role="alert">
-          The thread could not be read — {thread.error}{" "}
-          <button type="button" className="lnk" onClick={() => void resources.masterThread.refresh()}>
+          The conversations could not be read — {active.error}{" "}
+          <button type="button" className="lnk" onClick={active.retry}>
             Retry
           </button>
         </p>
       )}
-      {!loaded && thread.status !== "failed" && (
+      {active.state === "ready" && convId === null && (
+        <p className="text-label text-ink-500" data-empty="conversations">
+          No conversation yet. Start one with + New.
+        </p>
+      )}
+      <p className="text-micro text-ink-500">
+        <Link href="/" className="lnk" data-chat-home-link>
+          Earlier history is in Home
+        </Link>
+      </p>
+      {queued && (
+        <p className="text-label text-ink-300" role="status" data-chat-queued>
+          {QUEUED_NOTICE}
+        </p>
+      )}
+      {thread.status === "failed" && (
+        <p className="text-label text-fail" role="alert">
+          The thread could not be read — {thread.error}{" "}
+          <button type="button" className="lnk" onClick={() => void store.refresh()}>
+            Retry
+          </button>
+        </p>
+      )}
+      {usable && !loaded && thread.status !== "failed" && (
         <p className="text-label text-ink-500" role="status">
           Reading the thread…
         </p>
       )}
-      {loaded && tail.length === 0 && (
+      {usable && loaded && tail.length === 0 && (
         <p className="text-label text-ink-500" data-empty="chat">
-          No conversation yet. Ask the master from Home, or send the first message here.
+          Nothing here yet. Send the first message.
         </p>
       )}
       <ol className="app-chat-list" aria-label="Recent master messages">
@@ -875,8 +1005,8 @@ function ChatPane({
               const message = newMessageId();
               const body = JSON.stringify(intent);
               try {
-                await api.threadSend(MASTER, body, message, undefined, binding.scope ?? undefined);
-                void resources.masterThread.refresh();
+                await api.threadSend(MASTER, body, message, undefined, sendApp, convId ?? undefined);
+                void store.refresh();
                 void resources.masterState.refresh();
                 return null;
               } catch (e: unknown) {

@@ -341,6 +341,7 @@ const shellBase = {
 };
 globalThis.fetch = (async (input: unknown) => {
   const url = String(input);
+  if (url.endsWith("/conversations")) return new Response("{}", { status: 404 });
   const receipt = url.endsWith("/contexts") ? { contexts: [] }
     : url.startsWith("/api/threads/master") ? { entries: [], more_before: false }
     : url === "/api/app-installations/install-a" ? { ...shellBase, install_id: "install-a" }
@@ -379,7 +380,7 @@ assert(!location.search.includes("contract-preview"), "App menu installation swi
 assert(!host.querySelector("[data-contract-preview]"), "new installation never stays behind an old fixture");
 assert(text().includes("Social operational outlet"), "new installation opens its real outlet");
 equal(host.querySelectorAll("[data-chat-pane]").length, 1, "installation switch preserves one chat pane");
-equal(streams, 1, "installation switch preserves the chat stream");
+equal(streams, 2, "installation switch reconnects the chat stream once (per-install legacy detection)");
 await React.act(async () => { shellRoot.unmount(); });
 console.log("app view contract checks passed");
 }

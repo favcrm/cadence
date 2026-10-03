@@ -192,9 +192,47 @@ fn clip(text: &str, max: usize) -> String {
     )
 }
 
+/// Which gate a master connection's running turn falls under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum MasterScope {
+    Home,
+    /// An app conversation, by thread id.
+    App(String),
+    /// No resolvable running message: treated as App (fail closed).
+    Unresolved,
+}
+
 /// Is `method` open to a master connection.
 pub(crate) fn master_may_call(method: &str) -> bool {
     MASTER_ALLOWED.contains(&method)
+}
+
+/// CAD-1098 Gate 2: the daemon methods a master turn whose running
+/// message is in an APP conversation (or whose running message cannot be
+/// resolved — fail closed) may call: the nine scoped assistant verbs,
+/// `message_report` (own running message only — it finishes the turn) and
+/// `thread_read` (only the running message's own conversation). Nothing
+/// else: no `health` (fleet metadata), no permission verbs (so
+/// `run_approved` never starts from an app turn, standing rules
+/// included), no `agent_*`, `job_*`, `wiki_*`, plan, project, dispatch,
+/// escalate, interrupt or answer verbs. An allowlist, so a method added
+/// later is closed to app turns until it is listed here.
+pub const MASTER_APP_ALLOWED: &[&str] = &[
+    "app_record_csv_assistant_import",
+    "app_record_csv_assistant_preview",
+    "app_segment_assistant_save",
+    "app_segment_assistant_list",
+    "app_segment_assistant_show",
+    "app_segment_assistant_preview",
+    "app_content_assistant_draft",
+    "app_content_assistant_proposals",
+    "app_content_assistant_proposal_show",
+    "message_report",
+    "thread_read",
+];
+
+pub(crate) fn master_app_may_call(method: &str) -> bool {
+    MASTER_APP_ALLOWED.contains(&method)
 }
 
 // In-process test daemons may have no tracing subscriber. Preserve the reason
@@ -292,6 +330,36 @@ impl Shared {
         if !self.caller_is_master(peer_pid) {
             return Ok(());
         }
+        // CAD-1098 Gate 2: the scope comes from the running message's
+        // stored conversation, never a param. Home keeps `MASTER_ALLOWED`;
+        // an app conversation — or no resolvable running message — is
+        // narrowed to `MASTER_APP_ALLOWED`.
+        let scope = self.master_turn_scope();
+        if scope != MasterScope::Home {
+            if !master_app_may_call(method) {
+                return Err(Error::invalid(
+                    "master_refused",
+                    format!(
+                        "an app conversation's turn may call only the scoped app verbs, \
+                         `message report` and `thread read` of its own conversation — not \
+                         {method}; setup and admin work is the home thread's"
+                    ),
+                ));
+            }
+            if method == "thread_read" {
+                let own = match &scope {
+                    MasterScope::App(conversation) => conversation,
+                    _ => "",
+                };
+                if optional_str(params, "conversation") != Some(own) || own.is_empty() {
+                    return Err(Error::invalid(
+                        "master_refused",
+                        "an app turn reads only its own conversation (name it with \
+                         `conversation`)",
+                    ));
+                }
+            }
+        }
         if !master_may_call(method) {
             return Err(Error::invalid(
                 "master_refused",
@@ -314,6 +382,22 @@ impl Shared {
             }
         }
         Ok(())
+    }
+
+    /// The conversation the master's running turn belongs to, from the
+    /// store. A running (or submitting) message in an app conversation is
+    /// `App(<thread id>)`; one in home is `Home`; none, or one whose
+    /// conversation cannot be read, is `Unresolved` (fail closed).
+    pub(super) fn master_turn_scope(&self) -> MasterScope {
+        let running = match self.store.active_message_id(ALIAS) {
+            Ok(Some(id)) => id,
+            _ => return MasterScope::Unresolved,
+        };
+        match self.store.message_conversation(ALIAS, &running) {
+            Ok(Some(t)) if !t.is_home() => MasterScope::App(t.id),
+            Ok(_) => MasterScope::Home,
+            Err(_) => MasterScope::Unresolved,
+        }
     }
 
     /// `master_dispatch` — the master's only way to hand work to an
@@ -1712,6 +1796,8 @@ mod tests {
             "agent_ask",
             "agent_stop",
             "thread_send",
+            "conversation_list",
+            "conversation_create",
             "plan_approve",
             "plan_reject",
             "slot_acquire",

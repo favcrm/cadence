@@ -292,8 +292,27 @@ pub fn endpoint_takes_packs(endpoint_kind: &str) -> bool {
 /// message the pack travels with. A tracker that cannot be read leaves
 /// the plan state out with its reason; the thread is required.
 pub fn gather(store: &Store, pm_dir: Option<&Path>, alias: &str, current: &str) -> Result<Sources> {
-    let (entries, older_entries) = store.continuity_entries(alias, current, SOURCE_ENTRIES)?;
-    let (plans, plan_error) = match pm_dir {
+    let home = store.thread(alias)?;
+    gather_for(store, pm_dir, alias, current, home.as_ref())
+}
+
+/// [`gather`] for one conversation's thread (CAD-1098 I7): the entries
+/// come from that thread only, and an app conversation's pack carries
+/// no plan state — only USER.md besides its own history. `None` is an
+/// alias with no thread.
+pub fn gather_for(
+    store: &Store,
+    pm_dir: Option<&Path>,
+    alias: &str,
+    current: &str,
+    thread: Option<&crate::store::Thread>,
+) -> Result<Sources> {
+    let (entries, older_entries) = match thread {
+        Some(thread) => store.continuity_entries_of(&thread.id, current, SOURCE_ENTRIES)?,
+        None => (Vec::new(), 0),
+    };
+    let plan_scope = thread.is_none_or(|t| t.is_home());
+    let (plans, plan_error) = match pm_dir.filter(|_| plan_scope) {
         Some(dir) => match plan_state(dir, alias, crate::master::is_master(alias)) {
             Ok(plans) => (plans, None),
             Err(e) => (Vec::new(), Some(e.to_string())),
@@ -318,11 +337,12 @@ pub fn assemble(
     alias: &str,
     reason: Reason,
     current: &str,
+    thread: Option<&crate::store::Thread>,
 ) -> Result<Option<Pack>> {
-    if store.thread(alias)?.is_none() {
+    if thread.is_none() {
         return Ok(None);
     }
-    build(reason, &gather(store, pm_dir, alias, current)?)
+    build(reason, &gather_for(store, pm_dir, alias, current, thread)?)
 }
 
 /// The operator's preferences: `<pm>/company/USER.md`, trimmed, at

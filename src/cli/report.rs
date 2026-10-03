@@ -143,6 +143,7 @@ pub(super) fn run(
         }
         Some(ReportAction::File { task, kind, file }) => {
             use cadence_agent::issue::task_report;
+            cadence_agent::master::refuse_in_app_conversation("report file")?;
             let cap = task_report::BODY_MAX as u64;
             let text = read_master_command_file(&state_dir, file.as_deref(), cap)?;
             let mut out = task_report::file(&pm, &text, Some(&task), Some(kind), "")?;
@@ -187,4 +188,98 @@ pub(super) fn run(
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod cad1098_tests {
+    use super::*;
+
+    const CHILD: &str = "CAD1098_BELT_CHILD";
+
+    fn refused(error: &Error) -> bool {
+        error
+            .to_string()
+            .contains("not available in an app conversation")
+    }
+
+    /// Runs inside the child process the test below spawns, with the
+    /// environment the daemon gives an app conversation's master session.
+    /// A normal run of the suite does nothing here.
+    #[test]
+    fn cad1098_belt_child() {
+        let Ok(mode) = std::env::var(CHILD) else {
+            return;
+        };
+        let dir = PathBuf::from(std::env::var("CAD1098_STATE").unwrap());
+        let file = ReportAction::File {
+            task: "CAD-1".into(),
+            kind: cadence_agent::issue::task_report::Kind::Done,
+            file: None,
+        };
+        let new = cadence_agent::issue::cli::IssueAction::New {
+            title: "t".into(),
+            project: None,
+            priority: None,
+            parent: None,
+            epic: None,
+            tags: vec![],
+            blocked_by: vec![],
+            owner: None,
+            component: None,
+            id: None,
+            file: None,
+            status: None,
+        };
+        let report = run(dir.clone(), None, None, None, None, None, None, Some(file));
+        let issue = super::super::issue::run(dir, new);
+        let (report, issue) = (report.unwrap_err(), issue.unwrap_err());
+        match mode.as_str() {
+            "app" => assert!(refused(&report) && refused(&issue), "{report} / {issue}"),
+            // Control: the same verbs, same master, no app marker — they get
+            // past the belt (and stop on their own, different, checks).
+            _ => assert!(!refused(&report) && !refused(&issue), "{report} / {issue}"),
+        }
+    }
+
+    fn spawn(mode: &str, conversation: Option<&str>) -> std::process::Output {
+        let root = tempfile::Builder::new().prefix("c98b").tempdir().unwrap();
+        let pm = root.path().join("pm");
+        cadence_agent::issue::Pm::init(&pm).unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "cli::report::cad1098_tests::cad1098_belt_child"])
+            .args(["--nocapture", "--test-threads", "1"])
+            .env_remove("CADENCE_CONVERSATION")
+            .env("CADENCE_ALIAS", "master")
+            .env("CADENCE_PM_DIR", &pm)
+            .env("CAD1098_STATE", root.path())
+            .env("HOME", root.path())
+            .env(CHILD, mode);
+        if let Some(c) = conversation {
+            cmd.env("CADENCE_CONVERSATION", c);
+        }
+        cmd.output().unwrap()
+    }
+
+    /// CAD-1098 I6 (defence in depth ONLY): the master with
+    /// `CADENCE_CONVERSATION=app` is refused by `issue new` and
+    /// `report file` before they touch the tracker; without it (or with
+    /// any other value) the belt does not fire. The daemon-side half —
+    /// that the daemon never reads the variable — is
+    /// `daemon::conversations_acceptance::the_daemon_never_reads_the_conversation_env`.
+    ///
+    /// Guard: `master::refuse_in_app_conversation` in `issue new` and
+    /// `report file`.
+    #[test]
+    fn cad1098_cli_belt_refuses_issue_new_and_report_file_in_an_app_conversation() {
+        for (mode, conversation) in [("app", Some("app")), ("home", None), ("home", Some("home"))] {
+            let out = spawn(mode, conversation);
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{mode}/{conversation:?}: {text}");
+            assert!(text.contains("1 passed"), "child did not run: {text}");
+        }
+    }
 }

@@ -10,7 +10,19 @@
 //! - `GET  /api/threads/<alias>/stream[?after=<seq>]` — server-sent
 //!   events, one `entry` frame per entry with `id: <seq>`; a reconnect
 //!   resumes from `Last-Event-ID` (preferred) or `after`.
-//! - `POST /api/threads/<alias>/messages` `{"text", "message"?, "app"?}` —
+//! - `GET  /api/app-installations/<id>/conversations` — the master's
+//!   conversations for that installation (CAD-1098; operator-gated in
+//!   serve.rs): `{alias, install_id, general, conversations: [...]}`;
+//!   an unknown installation is 404. There is no `/api/threads/...`
+//!   GET for it.
+//! - `POST /api/threads/<alias>/conversations` `{"install_id",
+//!   "context_id", "subject"?, "general"?}` — make or find a
+//!   conversation (operator-only, like the messages POST); answers
+//!   `{conversation, created}`.
+//! - `?conversation=<id>` on the thread read and stream selects that
+//!   conversation's entries (an unknown id is 404; home when absent).
+//! - `POST /api/threads/<alias>/messages` `{"text", "message"?, "app"?,
+//!   "conversation"?}` —
 //!   the operator's message, queued to the agent like `cadence send`.
 //!   `app` (`{install_id, context_id}`, CAD-802) is never authority:
 //!   the daemon proves both against its store and stamps the verified
@@ -55,6 +67,18 @@ struct ThreadMessageReq {
     /// master"). The daemon's `thread_refs` is the strict side — this
     /// field only carries `{kind,id}` pairs through the relay.
     refs: Option<Vec<ThreadRef>>,
+    /// CAD-1098: a selector among the conversations of `app`'s
+    /// installation — never authority; the daemon checks it.
+    conversation: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationReq {
+    install_id: Option<String>,
+    context_id: Option<String>,
+    subject: Option<String>,
+    general: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -71,7 +95,8 @@ struct ThreadRef {
 #[serde(deny_unknown_fields)]
 struct ThreadApp {
     install_id: String,
-    context_id: String,
+    /// Absent for an installation-only binding (no context selected).
+    context_id: Option<String>,
 }
 
 /// Alias grammar checked before it reaches the daemon — the same one
@@ -100,10 +125,13 @@ fn rpc_err(e: &Error) -> HttpResp {
     if text.starts_with("Daemon is not reachable") {
         return err_response(503, &text);
     }
-    if text.contains("Unknown method 'thread_") {
+    if text.contains("Unknown method 'thread_") || text.contains("Unknown method 'conversation_") {
         return err_response(501, "this daemon does not support threads");
     }
-    if text.contains("Unknown managed agent") {
+    if text.contains("Unknown managed agent")
+        || text.contains("Unknown conversation")
+        || text.contains("Unknown app installation")
+    {
         return err_response(404, &text);
     }
     match e {
@@ -159,7 +187,7 @@ pub(super) fn read(
             _ => return err_response(400, "before must be a positive seq"),
         },
     };
-    let params = if tail || before.is_some() {
+    let mut params = if tail || before.is_some() {
         if query("after").is_some() {
             return err_response(400, "after cannot be combined with tail or before");
         }
@@ -172,6 +200,9 @@ pub(super) fn read(
     } else {
         json!({"alias": alias, "after": after, "limit": limit})
     };
+    if let Some(conversation) = query("conversation") {
+        params["conversation"] = Value::String(conversation);
+    }
     match client::rpc(state_dir, "thread_read", params) {
         Ok(page) => json_response(page),
         Err(e) => rpc_err(&e),
@@ -201,12 +232,20 @@ pub(super) fn stream(
             return;
         }
     };
+    // CAD-1098: the stream follows one conversation when named.
+    let conversation = query("conversation");
+    let with_conversation = |mut p: Value| {
+        if let Some(id) = &conversation {
+            p["conversation"] = Value::String(id.clone());
+        }
+        p
+    };
     // Fail before the stream opens when the alias or daemon is wrong —
     // a 404/501/503 beats an event stream that only ever errors.
     if let Err(e) = client::rpc(
         state_dir,
         "thread_read",
-        json!({"alias": alias, "after": cursor, "limit": 1}),
+        with_conversation(json!({"alias": alias, "after": cursor, "limit": 1})),
     ) {
         let _ = request.respond(rpc_err(&e));
         return;
@@ -226,7 +265,9 @@ pub(super) fn stream(
         match client::rpc(
             state_dir,
             "thread_read",
-            json!({"alias": alias, "after": cursor, "limit": 100, "wait": STREAM_WAIT}),
+            with_conversation(
+                json!({"alias": alias, "after": cursor, "limit": 100, "wait": STREAM_WAIT}),
+            ),
         ) {
             Ok(page) => {
                 let entries = page["entries"].as_array().cloned().unwrap_or_default();
@@ -291,10 +332,87 @@ pub(super) fn post_message(
             .collect::<Vec<_>>());
     }
     if let Some(app) = req.app {
-        params["app"] = json!({"install_id": app.install_id, "context_id": app.context_id});
+        params["app"] = match app.context_id {
+            Some(context) => json!({"install_id": app.install_id, "context_id": context}),
+            None => json!({"install_id": app.install_id}),
+        };
+    }
+    if let Some(conversation) = req.conversation {
+        params["conversation"] = Value::String(conversation);
     }
     match client::rpc(state_dir, "thread_send", params) {
         Ok(receipt) => json_response(receipt),
+        Err(e) => rpc_err(&e),
+    }
+}
+
+/// `GET /api/app-installations/<id>/conversations` — relays the
+/// daemon's `conversation_list` (which proves the installation).
+pub(super) fn conversations(
+    state_dir: &std::path::Path,
+    alias: &str,
+    query: &dyn Fn(&str) -> Option<String>,
+) -> HttpResp {
+    if !valid_alias(alias) {
+        return err_response(400, "bad agent alias");
+    }
+    let Some(install) = query("install").filter(|i| !i.is_empty()) else {
+        return err_response(400, "install is required");
+    };
+    match client::rpc(
+        state_dir,
+        "conversation_list",
+        json!({"alias": alias, "install_id": install}),
+    ) {
+        Ok(list) => json_response(list),
+        Err(e) => rpc_err(&e),
+    }
+}
+
+/// `POST /api/threads/<alias>/conversations` — relays the daemon's
+/// `conversation_create`. Operator-only: `operator::admit` has already
+/// run the guards and the process proof on the peer, and the daemon
+/// proves the connection again — the board is never less strict.
+pub(super) fn post_conversation(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    alias: &str,
+    path_install: Option<&str>,
+) -> HttpResp {
+    if !valid_alias(alias) {
+        return err_response(400, "bad agent alias");
+    }
+    let bytes = match read_body(request, MESSAGE_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let req: ConversationReq = match parse_json(&bytes) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+    // On `/api/app-installations/<id>/conversations` the path names the
+    // installation and a body `install_id` is refused, never reconciled.
+    let install = match (path_install, req.install_id) {
+        (Some(_), Some(_)) => return err_response(400, "install_id is named by the path"),
+        (Some(path), None) => path.to_string(),
+        (None, Some(body)) => body,
+        (None, None) => return err_response(400, "install_id is required"),
+    };
+    let mut params = json!({
+        "alias": alias,
+        "install_id": install,
+    });
+    if let Some(context) = req.context_id {
+        params["context_id"] = Value::String(context);
+    }
+    if let Some(subject) = req.subject {
+        params["subject"] = Value::String(subject);
+    }
+    if let Some(general) = req.general {
+        params["general"] = Value::Bool(general);
+    }
+    match client::rpc(state_dir, "conversation_create", params) {
+        Ok(created) => json_response(created),
         Err(e) => rpc_err(&e),
     }
 }

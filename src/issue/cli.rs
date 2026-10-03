@@ -809,6 +809,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             file,
             status,
         } => {
+            crate::master::refuse_in_app_conversation("issue new")?;
             let caller_is_master = crate::master::caller_is_master();
             write::master_issue_new_limits(
                 caller_is_master,

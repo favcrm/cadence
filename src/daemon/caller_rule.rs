@@ -141,6 +141,16 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "thread_send",
         Rule::Handler("rpc_thread_send: agents refused, operator on proof (CAD-384)"),
     ),
+    // CAD-1098: the app conversations are the operator's chat, like
+    // `thread_send` — one proof (`operator_chat`), identical on the board.
+    (
+        "conversation_list",
+        Rule::Handler("operator_chat: agents refused, operator on proof (CAD-1098 I1)"),
+    ),
+    (
+        "conversation_create",
+        Rule::Handler("operator_chat: agents refused, operator on proof (CAD-1098 I1)"),
+    ),
     ("agent_events", Rule::Read),
     (
         "agent_requests",

@@ -186,6 +186,61 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(cadence app content assistant-proposal-show *)",
 ];
 
+/// CAD-1098 Gate 1: which tool profile a master session launches with.
+/// `Home` is today's (the full [`CLAUDE_ALLOWED_TOOLS`]); `App` is the
+/// session of an app conversation — only the scoped `cadence app ...`
+/// verbs. The daemon picks it from the conversation row it holds, never
+/// from a prompt or a param, and a session is opened per conversation, so
+/// a profile never carries from one session to the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Profile {
+    #[default]
+    Home,
+    App,
+}
+
+/// The `Bash(cadence ...)` rules a session of `profile` may run. The app
+/// profile has no `issue`, `plan`, `report`, `wiki`, `agent`, `master`,
+/// `overview`, `status`, `thread` or `project` verb — and no health verb:
+/// the `health` RPC returns fleet metadata an app turn does not need.
+pub fn allowed_tools(profile: Profile) -> Vec<&'static str> {
+    CLAUDE_ALLOWED_TOOLS
+        .iter()
+        .copied()
+        .filter(|t| profile == Profile::Home || t.starts_with("Bash(cadence app "))
+        .collect()
+}
+
+/// Defense in depth only (CAD-1098 I6): an app session's environment
+/// names its scope so the CLI-side master checks refuse the local
+/// tracker verbs. The daemon never reads it as authority.
+pub const CONVERSATION_ENV: &str = "CADENCE_CONVERSATION";
+
+/// Empty the master's tmp dir (CAD-1098 I11). Spilled tool output and
+/// Pi's read tool live there; it is cleared whenever the session moves to
+/// another conversation, so one conversation's files never reach the
+/// next. Best effort per entry — a leftover is reported, not hidden.
+pub fn clear_tmp(state_dir: &Path) -> std::io::Result<()> {
+    let dir = tmpdir(state_dir);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut first_err = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let removed = match entry.file_type() {
+            Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        if let Err(e) = removed {
+            first_err.get_or_insert(e);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
 /// CAD-1009: the argument shape of each scoped verb, keyed by the
 /// allowlist stem after `cadence app `. The per-turn reference
 /// ([`scoped_verb_reference`]) is built by walking
@@ -868,6 +923,25 @@ pub fn caller_is_master() -> bool {
     std::env::var("CADENCE_ALIAS")
         .ok()
         .is_some_and(|alias| is_master(&alias))
+}
+
+/// CAD-1098 (defense in depth only): is this process an app
+/// conversation's session? The daemon sets [`CONVERSATION_ENV`] at launch
+/// and the CLI-side tracker verbs refuse when it is `app`. The daemon
+/// never reads it: scope comes from the stored conversation (Gate 1 and
+/// Gate 2).
+pub fn in_app_conversation() -> bool {
+    caller_is_master() && std::env::var(CONVERSATION_ENV).is_ok_and(|v| v == "app")
+}
+
+/// Refuse a local tracker verb from an app conversation's session.
+pub fn refuse_in_app_conversation(verb: &str) -> crate::error::Result<()> {
+    if in_app_conversation() {
+        return Err(crate::error::Error::rejected(format!(
+            "{verb} is not available in an app conversation — it is the home thread's"
+        )));
+    }
+    Ok(())
 }
 
 /// Refusal for a master `--file -` or a missing `--file`. Same text

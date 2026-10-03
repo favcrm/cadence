@@ -8,6 +8,21 @@ impl Shared {
     /// entry, the way `agent_events` does. Read-only.
     pub(super) fn rpc_thread_read(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-1098: `conversation` selects one thread of this alias by
+        // id (validated; unknown answers an error and creates nothing).
+        // Without it the read is the home thread, unchanged.
+        let conversation = match optional_text(params, "conversation")? {
+            None => None,
+            Some(id) => {
+                crate::proto::identifier(id, "conversation ID")?;
+                Some(
+                    self.store
+                        .thread_by_id(id)?
+                        .filter(|t| t.alias == alias)
+                        .ok_or_else(|| Error::rejected("Unknown conversation"))?,
+                )
+            }
+        };
         let after = optional_i64(params, "after").unwrap_or(0);
         if after < 0 {
             return Err(Error::rejected("Thread cursor must be nonnegative"));
@@ -32,8 +47,16 @@ impl Shared {
             if before.is_some_and(|b| b < 1) {
                 return Err(Error::rejected("Thread 'before' must be a positive seq"));
             }
-            let thread = self.store.thread(&alias)?;
-            let (entries, more) = self.store.thread_entries_before(&alias, before, limit)?;
+            let thread = match &conversation {
+                Some(thread) => Some(thread.clone()),
+                None => self.store.thread(&alias)?,
+            };
+            let (entries, more) = match &conversation {
+                Some(thread) => self
+                    .store
+                    .thread_entries_before_of(&thread.id, before, limit)?,
+                None => self.store.thread_entries_before(&alias, before, limit)?,
+            };
             let cursor = entries.last().map(|e| e.seq).unwrap_or(0);
             return Ok(json!({
                 "alias": alias,
@@ -46,8 +69,14 @@ impl Shared {
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
-            let thread = self.store.thread(&alias)?;
-            let entries = self.store.thread_entries(&alias, after, limit)?;
+            let thread = match &conversation {
+                Some(thread) => Some(thread.clone()),
+                None => self.store.thread(&alias)?,
+            };
+            let entries = match &conversation {
+                Some(thread) => self.store.thread_entries_of(&thread.id, after, limit)?,
+                None => self.store.thread_entries(&alias, after, limit)?,
+            };
             if !entries.is_empty()
                 || Instant::now() >= deadline
                 || self.closing.load(Ordering::SeqCst)
@@ -83,35 +112,23 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         if let Some(obj) = params.as_object() {
-            if let Some(field) = obj
-                .keys()
-                .find(|k| !matches!(k.as_str(), "alias" | "text" | "message" | "refs" | "app"))
-            {
+            if let Some(field) = obj.keys().find(|k| {
+                !matches!(
+                    k.as_str(),
+                    "alias" | "text" | "message" | "refs" | "app" | "conversation"
+                )
+            }) {
                 return Err(Error::rejected(format!(
-                    "thread send takes alias, text, message, refs and app only; field \
-                     '{field}' is not accepted"
+                    "thread send takes alias, text, message, refs, app and conversation \
+                     only; field '{field}' is not accepted"
                 )));
             }
         }
-        match self.caller_identity(peer_pid) {
-            // CAD-339 (review round 1): no agent identity is not enough —
-            // a detached child of an agent derives none. The connection
-            // must be provably the operator (CAD-276); the board relays
-            // browser writes from its own operator process (CAD-313 gap).
-            Ok(Caller::NoAgentIdentity) => self.proven_operator("thread send", peer_pid)?,
-            Ok(Caller::Agent(v)) => {
-                return Err(Error::rejected(format!(
-                    "thread send is the operator's chat — this connection is agent \
-                     '{}'; agents message each other with `cadence send`",
-                    v.agent.alias
-                )))
-            }
-            Err(e) => {
-                return Err(Error::rejected(format!(
-                    "thread send refused: caller identity underivable — {e}"
-                )))
-            }
-        }
+        // CAD-339 (review round 1): no agent identity is not enough — a
+        // detached child of an agent derives none. The connection must
+        // be provably the operator (CAD-276); the board relays browser
+        // writes from its own operator process (CAD-313 gap).
+        self.operator_chat("thread send", peer_pid)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         // CAD-802: a raw `app` binding rides through; `send_as`
         // proves it against the store and stamps the normalized form
@@ -122,9 +139,14 @@ impl Shared {
         // The thread starts inside the enqueue transaction: a refused
         // message leaves no thread and no `thread_created` event.
         let mut receipt = self.send_as(&send, &|_| Ok(store::Sender::OperatorChat))?;
-        receipt["thread"] = self
-            .store
-            .thread(&alias)?
+        // The thread the message landed in: its conversation, which is
+        // home for an unbound send (CAD-1098).
+        let landed = match receipt.get("message").and_then(Value::as_str) {
+            Some(id) => self.store.message_conversation(&alias, id)?,
+            None => None,
+        };
+        receipt["thread"] = landed
+            .or(self.store.thread(&alias)?)
             .as_ref()
             .map(store::Thread::to_json)
             .unwrap_or(Value::Null);

@@ -8,6 +8,7 @@ import { newMessageId } from "../../home/thread";
 import { audienceClient, type AudienceScope } from "../audienceClient";
 import { checkCampaignName, friendlyCampaignError, CAMPAIGN_NAME_MAX } from "../campaignGrammar";
 import { contentClient } from "../contentClient";
+import { openCampaignConversation } from "../conversationClient";
 import { friendlyAudienceError, newAudienceId } from "../segmentGrammar";
 import Field from "../shared/Field";
 import { setLanding } from "./landing";
@@ -143,10 +144,17 @@ export default function NewCampaignDialog({
       if (start === "ai") {
         const text = `Draft the email for campaign ${campaignId} (“${trimmed}”): ${brief.trim()}`;
         try {
-          await api.threadSend(MASTER, text, newMessageId(), undefined, {
-            install_id: scope.installId,
-            context_id: scope.contextId,
-          });
+          // CAD-1098: the brief goes to this campaign's own conversation
+          // (opened idempotently, then selected for the chat panel).
+          const conversation = await openCampaignConversation(scope.installId, scope.contextId, campaignId);
+          await api.threadSend(
+            MASTER,
+            text,
+            newMessageId(),
+            undefined,
+            { install_id: scope.installId, context_id: scope.contextId },
+            conversation ?? undefined,
+          );
         } catch (e) {
           setError(
             `The campaign is saved, but the brief was not sent to the assistant: ${
@@ -155,7 +163,7 @@ export default function NewCampaignDialog({
           );
           return;
         }
-        void resources.masterThread.refresh();
+        void resources.masterState.refresh();
       }
       land();
     } catch (e) {

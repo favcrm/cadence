@@ -316,13 +316,55 @@ impl Shared {
         // re-prove here so `agent_send`/`send` can never carry one.
         let app = match params.get("app") {
             None | Some(Value::Null) => None,
-            Some(v) => Some(thread_app(v, &self.store)?),
+            Some(v) => {
+                let normalized = thread_app(v, &self.store)?;
+                // An installation-only binding is proven by the catalog.
+                if normalized.get("context_id").is_none() {
+                    self.known_install(normalized["install_id"].as_str().unwrap_or_default())?;
+                }
+                Some(normalized)
+            }
+        };
+        // CAD-1098: `conversation` only selects among the conversations
+        // of the verified App binding's installation. It is checked
+        // here (exists, unarchived, same installation, subject still
+        // verifies) and again inside the enqueue transaction; it never
+        // decides scope, subject or installation.
+        let conversation = match params.get("conversation") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) => {
+                proto::identifier(id, "conversation ID")?;
+                Some(id.as_str())
+            }
+            Some(_) => return Err(Error::rejected("conversation must be a string id")),
+        };
+        let app = match (app, conversation) {
+            (Some(mut app), Some(id)) => {
+                self.verify_conversation_selector(&alias, &app, id)?;
+                app["conversation"] = json!(id);
+                Some(app)
+            }
+            (None, Some(_)) => {
+                return Err(Error::rejected(
+                    "conversation needs a verified app binding — without one a \
+                     send lands in the home thread",
+                ))
+            }
+            (app, None) => app,
         };
         let sender = sender_of(&alias)?;
         if refs.is_some() && sender != store::Sender::OperatorChat {
             return Err(Error::rejected(
                 "refs is a thread_send field — only the operator's chat cites \
                  needs rows; `cadence send` and `agent_send` carry none",
+            ));
+        }
+        // CAD-1098: app conversations are the master's. Another agent has
+        // no per-conversation session, so an app binding to it is refused.
+        if app.is_some() && !crate::master::is_master(&alias) {
+            return Err(Error::rejected(
+                "an app binding is only for the master's chat — other agents \
+                 have no per-app conversations",
             ));
         }
         if app.is_some() && sender != store::Sender::OperatorChat {
