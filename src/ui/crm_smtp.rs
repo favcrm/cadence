@@ -86,6 +86,17 @@ fn typed<T: serde::de::DeserializeOwned>(request: &mut Request) -> Result<T, Htt
     serde_json::from_slice(&body).map_err(|_| err_response(400, "invalid CRM SMTP request schema"))
 }
 
+fn typed_refusal(status: u16, code: &str) -> HttpResp {
+    let body = serde_json::to_vec_pretty(&serde_json::json!({
+        "error": "Hosted workspaces send through the platform email door; SMTP is for self-hosted Cadence",
+        "code": code,
+    }))
+    .unwrap_or_default();
+    let mut resp = HttpResp::from_data(body).with_status_code(tiny_http::StatusCode(status));
+    resp.add_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap());
+    resp
+}
+
 pub(super) fn handle(request: &mut Request, state: &Path, route: Route) -> HttpResp {
     if request
         .url()
@@ -165,6 +176,11 @@ pub(super) fn handle(request: &mut Request, state: &Path, route: Route) -> HttpR
                     _ => 503,
                 }
             };
+            // CAD-1121: the typed hosted refusal crosses the board with
+            // its stable code (never a secret or a message from custody).
+            if error.code() == Some(crate::daemon::HOSTED_SMTP_CODE) {
+                return typed_refusal(code, crate::daemon::HOSTED_SMTP_CODE);
+            }
             err_response(code, "CRM SMTP sender refused or unavailable")
         }
     }

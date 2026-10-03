@@ -53,7 +53,8 @@ export function sendReadiness(input: ReadinessInput): ReadinessItem[] {
 
   let senderReason: string | null = null;
   if (binding === undefined) senderReason = "the sender binding read (still loading)";
-  else if (binding === null || binding.state !== "live") senderReason = "a live SMTP sender binding";
+  else if (binding === null || binding.state !== "live" || binding.usable === false)
+    senderReason = binding !== null && binding.usable === false ? "the platform sender (SMTP can't send from a hosted workspace)" : "a live SMTP sender binding";
 
   let testReason: string | null = null;
   if (testEvidence === null) testReason = "an accepted test send of this content and binding";

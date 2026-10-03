@@ -17,6 +17,7 @@ function equal(actual: unknown, expected: unknown, why: string): void {
 
 interface World {
   connections: any[];
+  hosted?: { hosted: boolean; platform_sender: { available: boolean; missing: string | null } };
   binding: any | null;
   contexts: any[];
   origin: { unsubscribe_origin: string | null; stored: boolean };
@@ -71,7 +72,7 @@ async function mount(world: World, viewer = { operator: true, readOnly: false })
       case "GET /api/app-installations":
         return json([{ install_id: "install-crm", name: "crm", title: "CRM" }, { install_id: "install-social", name: "social-content", title: "Social" }]);
       case "GET /api/app-installations/install-crm/contexts": return json({ contexts: world.contexts });
-      case "GET /api/connections": return json({ connections: world.connections });
+      case "GET /api/connections": return json({ connections: world.connections, ...world.hosted });
       case "POST /api/crm-smtp/show":
         return world.binding ? json({ binding: world.binding }) : json({ error: "no SMTP sender is bound to this context" }, 409);
       case "GET /api/crm-send/origin": return json(world.origin);
@@ -189,6 +190,35 @@ async function main() {
     const m = await mount(world);
     await m.settle(() => assert(m.host.querySelector("[data-state=stale]"), "stale notice"));
     assert(m.host.querySelector("[data-state=live]") === null, "no sending claim on a stale binding");
+    await m.unmount();
+  }
+  // CAD-1121: a hosted daemon offers only the platform sender; raw SMTP is not a choice.
+  {
+    const row = hostedRow();
+    const world = fresh({
+      connections: [smtpRow("gmail"), row],
+      hosted: { hosted: true, platform_sender: { available: true, missing: null } },
+    });
+    const m = await mount(world);
+    await m.settle(() => assert(m.button("Use this sender"), "bind button"));
+    assert(!m.host.textContent!.includes("gmail"), "raw SMTP is not offered or named as a sender on hosted");
+    assert(m.host.querySelector("[data-state=sender-unusable]") === null, "no rotate-your-SMTP steer on hosted");
+    assert(m.host.textContent!.includes("acme@cadencecloud.app"), "the platform sender is the choice");
+    await m.unmount();
+  }
+  // CAD-1121: no platform sender yet -> plain waiting copy, missing piece behind Details.
+  {
+    const world = fresh({
+      connections: [smtpRow("gmail")],
+      hosted: { hosted: true, platform_sender: { available: false, missing: "CADENCE_HOSTED_EMAIL_FROM" } },
+    });
+    const m = await mount(world);
+    await m.settle(() => assert(m.host.querySelector("[data-state=platform-waiting]"), "waiting copy"));
+    assert(m.mainText().includes("Platform email isn't set up for this workspace yet"), "plain copy");
+    assert(m.mainText().includes("waiting on the platform"), "named as waiting on the platform");
+    assert(!m.mainText().includes("CADENCE_HOSTED_EMAIL_FROM"), "the missing piece is not in the main path");
+    assert(m.host.querySelector("details[data-details=platform-sender]")!.textContent!.includes("CADENCE_HOSTED_EMAIL_FROM"), "Details names the missing piece");
+    assert(m.button("Use this sender") === undefined, "nothing to bind");
     await m.unmount();
   }
   // Unsubscribe origin: set once, shown as set, then cleared.

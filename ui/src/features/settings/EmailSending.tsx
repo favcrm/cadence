@@ -18,7 +18,10 @@ import {
 import type { HostScope } from "../app-shell/hostActions";
 import { workspaceApps } from "../workspace-apps/workspaceApps";
 import {
+  hostedSenderFrom,
   isHostedTransport,
+  PLATFORM_EMAIL_WAITING,
+  PLATFORM_EMAIL_WAITING_NOTE,
   senderChoices,
   senderLine,
   sendingFrom,
@@ -126,6 +129,7 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
 function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
   const canWrite = viewer.operator && !viewer.readOnly;
   const [rows, setRows] = useState<Connection[] | null>(null);
+  const [hostedInfo, setHostedInfo] = useState(hostedSenderFrom({}));
   const [binding, setBinding] = useState<SmtpBinding | null | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState("");
@@ -139,6 +143,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
       ([list, bound]) => {
         if (controller.signal.aborted) return;
         setRows(list.connections ?? []);
+        setHostedInfo(hostedSenderFrom(list));
         setBinding(bound);
         setError(null);
       },
@@ -149,7 +154,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
     return () => controller.abort();
   }, [scope.installId, scope.contextId]);
 
-  const { usable, unusable } = senderChoices(rows ?? []);
+  const { usable, unusable } = senderChoices(rows ?? [], hostedInfo.hosted);
   const choice = usable.find((r) => r.id === picked) ?? usable.find((r) => binding && r.id === binding.connectionId) ?? usable[0];
   const chosenId = choice?.id ?? "";
 
@@ -188,7 +193,12 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
           <span aria-hidden="true">✓</span>
         </p>
       )}
-      {binding && live === null && (
+      {binding && binding.usable === false && (
+        <p className="text-label text-fail" role="alert" data-state="hosted-smtp-binding">
+          The saved SMTP sender can't send from a hosted workspace. Switch to the platform sender.
+        </p>
+      )}
+      {binding && live === null && binding.usable !== false && (
         <p className="text-label text-fail" role="alert" data-state="stale">
           The chosen sender needs re-checking. Choose it again below to continue sending.
         </p>
@@ -213,7 +223,21 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
           ))}
         </ul>
       )}
-      {rows !== null && usable.length === 0 && unusable.length === 0 && (
+      {rows !== null && hostedInfo.hosted && usable.length === 0 && (
+        <div className="text-label text-ink-300" data-state="platform-waiting">
+          <p>
+            {PLATFORM_EMAIL_WAITING}. {PLATFORM_EMAIL_WAITING_NOTE}
+          </p>
+          <details className="text-ink-400 mt-1" data-details="platform-sender">
+            <summary className="cursor-pointer">Details</summary>
+            <p className="mt-1 break-all">
+              Missing: the platform's sending address
+              {hostedInfo.missing ? ` (${hostedInfo.missing})` : ""}.
+            </p>
+          </details>
+        </div>
+      )}
+      {rows !== null && !hostedInfo.hosted && usable.length === 0 && unusable.length === 0 && (
         <p className="text-label text-ink-500">
           No email sender is available. Add an SMTP sender under{" "}
           <Link href="/settings/connections">Settings → Connections</Link>.

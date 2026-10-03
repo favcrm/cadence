@@ -41,6 +41,8 @@ mod crm_smtp_rpc;
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;
+#[cfg(all(test, feature = "test-seam"))]
+mod hosted_smtp_acceptance;
 mod idea_rpc;
 mod identity;
 mod installer_enrollment_wire;
@@ -122,6 +124,7 @@ pub use master_rpc::MASTER_ALLOWED;
 // module, not as a public API.
 pub(crate) use app_capabilities_rpc::operator_price_refusal;
 pub(crate) use app_screens_rpc::render_frame_html;
+pub(crate) use connections_rpc::HOSTED_SMTP_CODE;
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
 ///
@@ -469,6 +472,13 @@ pub struct Shared {
     /// CAD-1063: the hosted platform email door; `Some` only on a
     /// hosted daemon, where it replaces SMTP egress.
     hosted_email: Option<crate::platform::hosted_email::HostedEmail>,
+    /// CAD-1121: true when this daemon holds a hosted lease. Decided
+    /// from the lease, never from a caller field; see
+    /// [`Shared::is_hosted`].
+    hosted_lease: bool,
+    /// `test-seam`: flips hosted on/off for a fixture daemon.
+    #[cfg(feature = "test-seam")]
+    hosted_override: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// CAD-786: the base the unsubscribe links mint — the board's
     /// public origin; `None` refuses `crm_send_prepare`.
     unsubscribe_origin: Option<String>,
@@ -725,6 +735,9 @@ impl Shared {
                 opts.crm_send_pending_poll_ms
             }),
             hosted_email: opts.hosted_email.clone(),
+            hosted_lease: lease.is_some(),
+            #[cfg(feature = "test-seam")]
+            hosted_override: opts.hosted_workspace.clone(),
             unsubscribe_origin: opts.unsubscribe_origin.clone(),
             #[cfg(feature = "test-seam")]
             crm_send_row_gate: opts.crm_send_row_gate.clone(),
@@ -4798,6 +4811,11 @@ pub struct ServeOptions {
     /// lease (and by fixtures); `None` keeps the SMTP path. Never
     /// sourced from RPC or PM.
     pub hosted_email: Option<crate::platform::hosted_email::HostedEmail>,
+    /// `test-seam` (CAD-1121): when set, decides "hosted daemon"
+    /// instead of the lease; the fixture keeps the handle and flips
+    /// it. The field does not exist in production builds.
+    #[cfg(feature = "test-seam")]
+    pub hosted_workspace: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// CAD-786: the public origin unsubscribe links mint
     /// (`{origin}/unsubscribe/<token>`). `https://` anywhere or
     /// loopback `http://` for rigs; `None` refuses

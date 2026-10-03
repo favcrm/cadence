@@ -2,7 +2,14 @@ import Button from "../../../ui/Button";
 import type { ContentDoc } from "../campaignGrammar";
 import Link from "../../../ui/Link";
 import type { SmtpBinding } from "../sendClient";
-import { EMAIL_SENDING_HREF, isHostedTransport, sendingFrom } from "../../settings/emailSendingView";
+import {
+  EMAIL_SENDING_HREF,
+  isHostedTransport,
+  PLATFORM_EMAIL_WAITING,
+  PLATFORM_EMAIL_WAITING_NOTE,
+  sendingFrom,
+  type HostedSender,
+} from "../../settings/emailSendingView";
 import type { CampaignTab, FixTarget, ReadinessItem } from "./readiness";
 
 /** Jump to a panel on the Overview and move focus into it. */
@@ -22,12 +29,15 @@ export default function OverviewPane({
   items,
   doc,
   binding,
+  hostedSender,
   audienceLabel,
   onTab,
 }: {
   items: ReadinessItem[];
   doc: ContentDoc | null;
   binding: SmtpBinding | null | undefined;
+  /** CAD-1121: what the daemon says about the platform sender; null until read. */
+  hostedSender?: HostedSender | null;
   audienceLabel: string;
   onTab: (tab: CampaignTab) => void;
 }) {
@@ -71,9 +81,18 @@ export default function OverviewPane({
             </li>
           ))}
         </ul>
-        <p className="text-label" data-sending-status={from === null ? "unset" : "set"}>
+        <div className="text-label" data-sending-status={from === null ? "unset" : "set"}>
           {binding === undefined ? (
             <span className="text-ink-500">Checking the sender…</span>
+          ) : from === null && hostedSender?.hosted && !hostedSender.available ? (
+            <span className="text-ink-300" data-state="platform-waiting">
+              {PLATFORM_EMAIL_WAITING}. {PLATFORM_EMAIL_WAITING_NOTE}
+              <details className="text-ink-400" data-details="platform-sender">
+                <summary className="cursor-pointer">Details</summary>
+                Missing: the platform's sending address
+                {hostedSender.missing ? ` (${hostedSender.missing})` : ""}.
+              </details>
+            </span>
           ) : from === null ? (
             <Link href={EMAIL_SENDING_HREF}>Set up sending →</Link>
           ) : (
@@ -82,7 +101,7 @@ export default function OverviewPane({
               {isHostedTransport(binding) ? " via AgenticOS" : ""} <span aria-hidden="true">✓</span>
             </span>
           )}
-        </p>
+        </div>
       </section>
       <section aria-label="Campaign summary" className="card px-4 py-4 grid gap-2">
         <h4 className="text-cardtitle font-medium text-ink-100">Summary</h4>
