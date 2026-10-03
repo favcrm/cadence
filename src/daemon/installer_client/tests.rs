@@ -121,14 +121,16 @@ fn lost_truncated_malformed_oversized_and_uncorrelated_ack_unknown() {
         vec![0xff, b'\n'],
     ];
     for response in responses {
-        assert!(transport_case(
-            Action::Install,
-            response,
-            false,
-            Duration::ZERO,
-            Duration::from_secs(2)
-        )
-        .is_err());
+        assert!(matches!(
+            transport_case(
+                Action::Install,
+                response,
+                false,
+                Duration::ZERO,
+                Duration::from_secs(2)
+            ),
+            Err(Error::OutcomeUnknown(_))
+        ));
     }
 }
 

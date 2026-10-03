@@ -23,7 +23,7 @@ const SOCKET: &str = "/run/cadence-supervisor/grant.sock";
 
 fn unknown() -> Error {
     // Never interpolate a peer response, capsule, grant, receipt or OS path.
-    Error::rejected("installer transport UNKNOWN — refused, no retry or launch evidence")
+    Error::unknown("installer transport UNKNOWN — refused, no retry or launch evidence")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
