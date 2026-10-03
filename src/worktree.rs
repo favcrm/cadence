@@ -196,7 +196,153 @@ pub fn install_pre_push_hook(wt_dir: &Path) -> Result<PathBuf> {
             &hooks.to_string_lossy(),
         ],
     )?;
+    install_cargo_shim(wt_dir)?;
     Ok(script)
+}
+
+/// CAD-1021 slice 3: the lane's `cargo` shim, at
+/// `<git-dir>/cadence-hooks/bin/cargo`. Placed on the lane's PATH (via
+/// the worktree `.env`'s `PATH=` line) it routes cargo work through
+/// `cadence build-slot run <kind>` so a lane's compiles are always
+/// admitted. The routing is an ALLOWLIST of clearly-light subcommands —
+/// everything else, including unknown subcommands and aliases, queues on
+/// the build pool. That is the operator's goal: no local compile escapes
+/// the queue (AGENTS.md — allowlists, not denylists). `cargo test` takes
+/// the test pool and `cargo nextest` the suite pool.
+///
+/// Lane-local: the script and its PATH entry live under the lane's own
+/// git dir / `.env` — the main checkout and CI never see it. The shim
+/// fails OPEN to a real cargo when `cadence` is unreachable so a lane
+/// is never bricked by a missing daemon; the receipt/pre-push gate,
+/// not the shim, is the enforcement.
+const CARGO_SHIM: &str = r##"#!/bin/sh
+# CAD-1021: route cargo work through `cadence build-slot run`.
+# Only the clearly-light, never-compiling subcommands pass straight to
+# the real cargo — an allowlist (AGENTS.md: allowlists, not denylists),
+# so `cargo run`/`bench`/`doc`/`rustc`/`llvm-cov`/`package`/`publish`,
+# every alias and every unknown subcommand all queue as `build`.
+# Inside a slot (CADENCE_BUILD_SLOT_PID names a live holder) a nested
+# cargo passes through too, so `build-slot run` of a recipe that itself
+# calls cargo never re-queues on itself.
+
+real_cargo() {
+    # Resolve the real cargo: the shim dir is never on this lookup's
+    # PATH (we strip it) so it can never re-enter itself.
+    PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx "$shim_dir" | tr '\n' ':')"
+    export PATH
+    command -v cargo
+}
+
+shim_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+# Pass-through: a held slot's children re-use it — the pid must name a
+# LIVE holder, so a forged CADENCE_BUILD_SLOT_PID names no live pid and
+# falls through to the queue path like any caller.
+if [ -n "$CADENCE_BUILD_SLOT_PID" ] && kill -0 "$CADENCE_BUILD_SLOT_PID" 2>/dev/null; then
+    exec "$(real_cargo)" "$@"
+fi
+
+case "${1:-}" in
+    # Allowlist — subcommands that never compile. A bare `cargo` (no
+    # subcommand) prints help; version/help flags are light too.
+    ''|fmt|metadata|tree|locate-project|version|-V|--version|help|-h|--help|\
+    add|remove|search|pkgid|verify-project|read-manifest|generate-lockfile|\
+    owner|login|logout|yank)
+        exec "$(real_cargo)" "$@" ;;
+    test)
+        slot_kind=test ;;
+    nextest)
+        slot_kind=suite ;;
+    *)
+        slot_kind=build ;;
+esac
+
+# `cadence` the lane recorded in its env; fall back to PATH.
+cad="${CADENCE_BUILD_SLOT:-cadence}"
+"$cad" build-slot run "$slot_kind" -- cargo "$@"
+rc=$?
+[ "$rc" -eq 0 ] || exit "$rc"
+"##;
+
+/// Write the shim under `<git-dir>/cadence-hooks/bin/cargo` (0755) and
+/// record its PATH prefix in the worktree's `.env`. Idempotent; a lane
+/// minted before slice 3 re-heals on the next `issue start` (the reuse
+/// path calls `install_pre_push_hook`, which now calls this).
+fn install_cargo_shim(wt_dir: &Path) -> Result<PathBuf> {
+    let git_dir = PathBuf::from(git(wt_dir, &["rev-parse", "--absolute-git-dir"])?);
+    let bin = git_dir.join(HOOKS_DIR).join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let shim = bin.join("cargo");
+    let needs_write = match std::fs::read_to_string(&shim) {
+        Ok(existing) => existing != CARGO_SHIM,
+        Err(_) => true,
+    };
+    if needs_write {
+        let tmp = bin.join(".cargo.tmp");
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o755)
+                .open(&tmp)?;
+            f.write_all(CARGO_SHIM.as_bytes())?;
+        }
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::rename(&tmp, &shim)?;
+    }
+    // Record the shim dir on the lane's `.env` PATH so a shell that
+    // sources the lane env resolves `cargo` here first. `.env` is the
+    // existing lane-env file `write_slot_env` owns; we prepend our dir
+    // under the same tmp+rename discipline, keeping every other line AND
+    // an existing file's mode (a `0600`→`0640` the operator set survives).
+    let file = wt_dir.join(".env");
+    let mut mode = 0o600;
+    let mut text = String::new();
+    let mut wrote_path = false;
+    if let Ok(meta) = std::fs::symlink_metadata(&file) {
+        if meta.file_type().is_symlink() {
+            return Err(Error::rejected(format!(
+                "{} is a symlink — refusing to write the slot env through it",
+                file.display()
+            )));
+        }
+        mode = meta.permissions().mode() & 0o777;
+    }
+    if let Ok(existing) = std::fs::read_to_string(&file) {
+        for line in existing.lines() {
+            if let Some(rest) = line.strip_prefix("PATH=") {
+                if !rest.split(':').any(|p| p == bin.to_string_lossy()) {
+                    text.push_str(&format!("PATH={}:{rest}\n", bin.display()));
+                } else {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                wrote_path = true;
+            } else {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+    }
+    if !wrote_path {
+        text.push_str(&format!("PATH={}:$PATH\n", bin.display()));
+    }
+    let tmp = wt_dir.join(".env.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    }
+    std::fs::rename(&tmp, &file)?;
+    Ok(shim)
 }
 
 /// The `debug/` children cargo fills with *hashed* names —

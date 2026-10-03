@@ -141,6 +141,11 @@ tests = [
     "main_checkout_never_gets_the_hook",
     "lane_push_blocks_on_failed_pre_push_and_allows_on_pass",
     "lane_push_allowed_when_repo_has_no_pre_push_script",
+    "lane_gets_cargo_shim_on_env_path",
+    "cargo_build_in_a_lane_goes_through_build_slot",
+    "cargo_ungated_and_held_slot_pass_through",
+    "forged_slot_pid_does_not_skip_the_shim_queue",
+    "cargo_compiling_and_unknown_subcommands_queue_as_build",
 ]
 helpers = [
     "cli_dir",

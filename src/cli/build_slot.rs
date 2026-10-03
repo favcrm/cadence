@@ -241,6 +241,9 @@ pub(super) struct AcquireOpts<'a> {
     pub exec: bool,
     pub recipe: Option<&'a str>,
     pub wait_secs: u64,
+    /// The argv a `run` intends to exec — sent for `check` so the
+    /// daemon can bind it to the recipe's declared argv.
+    pub argv: Option<&'a [String]>,
 }
 
 /// fast-fail never leaves a waiter behind. Returns the grant payload.
@@ -264,6 +267,9 @@ pub(super) fn slot_acquire_loop(
         }
         if let Some(r) = opts.recipe {
             params["recipe"] = json!(r);
+        }
+        if let Some(argv) = opts.argv {
+            params["argv"] = json!(argv);
         }
         let r = client::rpc(state_dir, "slot_acquire", params)?;
         if r["granted"].as_bool().unwrap_or(false) {
@@ -323,6 +329,7 @@ pub(super) fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Resu
                     exec: false,
                     recipe: recipe.as_deref(),
                     wait_secs: *wait_secs,
+                    argv: None,
                 },
             )?;
             if *json_out {
@@ -350,7 +357,11 @@ pub(super) fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Resu
             let pid = std::process::id();
             let request_id = Uuid::new_v4().simple().to_string();
             // `exec`: the daemon verifies this requester IS the holder
-            // it records (CAD-230b) — never an ancestor.
+            // it records (CAD-230b) — never an ancestor. For `check` we
+            // also send the argv we intend to exec: the daemon refuses
+            // when it differs from the recipe's declared argv, and the
+            // grant echoes that argv back so a `run check` can never run
+            // a heavier command than the gated recipe (CAD-1021).
             let r = slot_acquire_loop(
                 state_dir,
                 kind,
@@ -361,21 +372,37 @@ pub(super) fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Resu
                     exec: true,
                     recipe: recipe.as_deref(),
                     wait_secs: *wait_secs,
+                    argv: Some(cmd.as_slice()),
                 },
             )?;
             let token = r["token"].as_str().unwrap_or_default().to_string();
+            // For kind=check the recipe's argv is the authority — exec
+            // exactly what the daemon validated, never the caller's text.
+            let exec_argv: Vec<String> = match r["recipe_argv"].as_array() {
+                Some(a) => a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect(),
+                None => cmd.clone(),
+            };
+            if exec_argv.is_empty() {
+                return Err(Error::rejected(
+                    "check slot granted no recipe argv to exec — the recipe \
+                     must declare a non-empty argv",
+                ));
+            }
             eprintln!(
                 "slot {token} acquired ({kind}, pid {pid}) — running {}",
-                cmd[0]
+                exec_argv[0]
             );
             use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new(&cmd[0])
-                .args(&cmd[1..])
+            let err = std::process::Command::new(&exec_argv[0])
+                .args(&exec_argv[1..])
                 .env("CADENCE_BUILD_SLOT_TOKEN", &token)
                 .env("CADENCE_BUILD_SLOT_PID", pid.to_string())
                 .env("CADENCE_BUILD_SLOT_LANE", &lane)
                 .exec();
-            Err(Error::internal(format!("exec {}: {err}", cmd[0])))
+            Err(Error::internal(format!("exec {}: {err}", exec_argv[0])))
         }
         BuildSlotAction::Release { token, lane, pid } => {
             let lane = lane

@@ -2593,3 +2593,64 @@ fn forged_slot_pid_does_not_skip_the_queue() {
     assert_eq!(honest["result"]["granted"], false, "{honest}");
     assert_eq!(honest["result"]["position"], 2, "{honest}");
 }
+
+/// `run check --recipe X -- <cmd>` binds X's DECLARED argv, not just
+/// its name: a `<cmd>` that differs is refused before any grant, and a
+/// grant echoes the recipe's argv so `run` execs exactly what was
+/// gated. This is the 20261002-231458 verdict's argv-bind close-out —
+/// a name-lie can no longer hold a check slot for non-check work.
+#[test]
+fn run_check_binds_the_recipe_argv_not_the_asked_command() {
+    let (dir, repo) = runner_project(
+        "    pre-push:
+      argv: [sh, -c, \"./scripts/pre-push\"]
+      kind: check
+      env: []
+",
+    );
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let mut lane = LaneShell::spawn(d.dir.path());
+    plant_pane(&d, "chk", lane.pid());
+    lane.run(&format!("cd {}", repo.display()));
+    // An argv that differs from the recipe's declared argv is refused
+    // — `run check --recipe pre-push -- cargo build` cannot hold a
+    // check slot while doing non-check work.
+    let bad = lane.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "check", "lane": "chk", "pid": lane.pid(),
+               "request_id": "r1",
+               "recipe": "pre-push", "argv": ["cargo", "build"]}),
+    );
+    assert_eq!(bad["ok"], false, "{bad}");
+    assert!(
+        bad["error"]["message"].as_str().unwrap().contains("argv"),
+        "{bad}"
+    );
+    // Matching the declared argv grants, and the answer carries the
+    // recipe argv for the caller to exec.
+    let ok = lane.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "check", "lane": "chk", "pid": lane.pid(),
+               "request_id": "r2",
+               "recipe": "pre-push",
+               "argv": ["sh", "-c", "./scripts/pre-push"]}),
+    );
+    assert_eq!(ok["ok"], true, "{ok}");
+    assert_eq!(ok["result"]["granted"], true, "{ok}");
+    assert_eq!(
+        ok["result"]["recipe_argv"],
+        json!(["sh", "-c", "./scripts/pre-push"]),
+        "{ok}"
+    );
+    // No argv at all also grants — the caller takes the recipe's argv.
+    let bare = lane.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "check", "lane": "chk", "pid": lane.pid(),
+               "request_id": "r3", "recipe": "pre-push"}),
+    );
+    assert_eq!(bare["result"]["granted"], true, "{bare}");
+    let _ = dir;
+}
