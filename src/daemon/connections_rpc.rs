@@ -63,45 +63,43 @@ impl Shared {
         let custody_available = record.is_none()
             || platform::load_credential(&self.store, &self.platform_custody, provider, account)
                 .is_ok();
-        // CAD-785: enrolled SMTP senders project their non-secret
-        // transport/sender material from custody. Best-effort: before
-        // the first custody write (or after a concurrent revoke) the
-        // load fails and the projection is simply absent — never an
-        // error, never a secret.
-        let smtp = match record {
-            Some(record) if record.exchange == platform::smtp::ENROLLMENT_SHAPE => self
-                .smtp_projection(record)
-                .ok()
-                .map(|projection| projection.to_json()),
-            _ => None,
+        // CAD-785/CAD-1064: enrolled SMTP senders project their
+        // non-secret transport/sender material from custody. A failure
+        // is never swallowed: the row stays an SMTP sender
+        // (`smtp_sender`, decided from the exchange shape) with
+        // `smtp: null` and a typed, secret-free `smtp_error`.
+        let smtp_sender =
+            matches!(record, Some(r) if r.exchange == platform::smtp::ENROLLMENT_SHAPE);
+        let (smtp, smtp_error) = match record {
+            Some(record) if smtp_sender => match self.smtp_projection_typed(record) {
+                Ok(projection) => (Some(projection.to_json()), None),
+                Err(fault) => (None, Some(fault.code())),
+            },
+            _ => (None, None),
         };
         Ok(
-            json!({"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"smtp":smtp,"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
+            json!({"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"smtp":smtp,"smtp_sender":smtp_sender,"smtp_error":smtp_error,"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
         )
     }
     /// Live non-secret SMTP material for one enrolled record.
     /// Custody-only: the secret never enters the projection by
     /// construction, and the projection is screened before return.
-    pub(super) fn smtp_projection(
+    pub(super) fn smtp_projection_typed(
         &self,
         record: &CredentialRecord,
-    ) -> Result<platform::smtp::SmtpProjection> {
+    ) -> std::result::Result<platform::smtp::SmtpProjection, platform::smtp::ProjectionFault> {
+        use platform::smtp::ProjectionFault;
         if record.exchange != platform::smtp::ENROLLMENT_SHAPE {
-            return Err(Error::rejected("connection is not an SMTP sender"));
+            return Err(ProjectionFault::Unavailable);
         }
         let bytes = platform::load_credential(
             &self.store,
             &self.platform_custody,
             &record.platform,
             &record.account,
-        )?;
-        let (envelope, projection) = platform::smtp::custody_decode(&bytes)?;
-        platform::refuse_leak(
-            "smtp connection projection",
-            &projection.to_json().to_string(),
-            envelope.secret(),
-        )?;
-        Ok(projection)
+        )
+        .map_err(|_| ProjectionFault::Unavailable)?;
+        platform::smtp::project_custody(&bytes)
     }
     fn connection_metadata_projection(&self, record: &CredentialRecord) -> Result<Value> {
         let mut projection =
@@ -338,8 +336,13 @@ impl Shared {
                             "SMTP rotation carries the fresh secret — no token",
                         ));
                     }
-                    let mut mapped =
-                        smtp_rotate_params(&record, params, &self.smtp_projection(&record)?)?;
+                    // With a readable projection absent fields inherit.
+                    // With none (corrupt, withheld or unavailable) the
+                    // operator re-enters every transport field.
+                    let mut mapped = match self.smtp_projection_typed(&record) {
+                        Ok(current) => smtp_rotate_params(&record, params, &current)?,
+                        Err(_) => smtp_rotate_full_params(params)?,
+                    };
                     mapped["platform"] = json!(record.platform);
                     mapped["account"] = json!(record.account);
                     mapped["shape"] = json!(record.exchange);
@@ -491,6 +494,22 @@ fn smtp_rotate_params(
     let merged = Value::Object(object.clone());
     platform::smtp::overlay_rotate(current, &merged)?;
     Ok(Value::Object(object.clone()))
+}
+
+/// Rotation of a sender whose settings cannot be read: nothing is
+/// inherited, so the full typed grammar must arrive.
+fn smtp_rotate_full_params(params: &Value) -> Result<Value> {
+    let mut out = params.clone();
+    let object = out
+        .as_object_mut()
+        .ok_or_else(|| Error::rejected("connection parameters must be an object"))?;
+    object.remove("connection_id");
+    platform::smtp::parse_enrollment(&out).map_err(|error| {
+        Error::rejected(format!(
+            "this sender's saved settings cannot be read, so every field must be re-entered: {error}"
+        ))
+    })?;
+    Ok(out)
 }
 
 fn connection_error(error: Error, token: &str) -> Error {

@@ -1416,6 +1416,14 @@ export interface Connection {
     sender: string;
     sender_name: string;
   } | null;
+  /**
+   * CAD-1064: true when the record's exchange shape is SMTP, even if the
+   * settings cannot be projected. Decide "is this an SMTP sender" from
+   * this, never from `smtp` presence.
+   */
+  smtp_sender?: boolean;
+  /** Why `smtp` is null on an SMTP sender — a typed, secret-free code. */
+  smtp_error?: "custody_corrupt" | "withheld_leak" | "unavailable" | null;
   status: {
     adapter_registered: boolean;
     descriptor_available: boolean;
