@@ -1004,8 +1004,9 @@ pub(crate) fn ready_pid(state_dir: &Path, nonce: &str) -> Option<i32> {
 }
 
 /// Is a detached `cadence ui` server alive for this state dir — the
-/// pidfile's pid, alive-checked. `daemon restart --ui` reads this to
-/// decide whether to bounce the board.
+/// pidfile's pid, identity-checked by [`read_pid`]. `daemon restart
+/// --ui` reads this to decide whether to bounce the board. Not a pure
+/// read: like `read_pid`, it deletes a `ui.pid` that names no board.
 pub fn detached_pid(state_dir: &Path) -> Option<i32> {
     read_pid(state_dir)
 }
@@ -1014,8 +1015,12 @@ pub fn detached_pid(state_dir: &Path) -> Option<i32> {
 /// (CAD-1081). A live pid is not enough: a `ui.pid` restored into a
 /// new container can name pid 1, another process, or a thread id, and
 /// trusting it skipped the board start and pointed `ui stop` at a
-/// stranger. Anything else is stale: the file is removed (only if it
-/// still holds what was read, so a concurrent `ui start` keeps its own).
+/// stranger. Anything else is stale.
+///
+/// Side effect: a pid proven not to be the board (`NotBoard`) deletes
+/// `ui.pid` — only if the file still holds what was read, so a
+/// concurrent `ui start` keeps its own. Every caller, `detached_pid`
+/// included, inherits that; an `Unknown` pid leaves the file alone.
 pub(crate) fn read_pid(state_dir: &Path) -> Option<i32> {
     read_pid_in(Path::new("/proc"), state_dir)
 }
