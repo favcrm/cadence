@@ -33,7 +33,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::Deserialize;
 
+use std::path::Path;
+
 use crate::board_identity::{self, PublicKey};
+use crate::error::Error;
 
 /// The bearer prefix the mint emits (`wikiActorBearer`, AOS-122) —
 /// `Bearer wikienv_<header>.<claims>.<sig>`; the cli family shares it.
@@ -426,4 +429,118 @@ pub fn scope_covers(actor: &CliActor, need: Scope) -> bool {
         Scope::Write => "cli.write",
     };
     actor.scopes.iter().any(|s| s == want)
+}
+
+// ---------- single-use `jti` ----------
+
+/// The contract calls the envelope single-use — and a captured bearer
+/// can be POSTed to this route directly, skipping the worker's
+/// live-bearer rebind, so the container is itself the single-use
+/// authority (spec review, PR #744). [`Spent`] is the persisted
+/// seen-set: `sha256(jti)` → the envelope's own `exp`, so a restart
+/// inside the ≤300 s window still refuses the replay, and an entry
+/// prunes once its `exp` passes — a replay after `exp` fails the time
+/// check first anyway.
+const SPENT_FILE: &str = "cli-jtis.json";
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct SpentFile {
+    /// `sha256(jti)` → `exp`. Only the digest is kept — the raw id is
+    /// never persisted, exactly as `operator_auth`'s sign-in jtis.
+    #[serde(default)]
+    jtis: std::collections::HashMap<String, i64>,
+}
+
+/// Per-`state_dir` seen-set. `load` reads it; [`Spent::consume`] is
+/// check-and-record in one step — the caller holds whatever lock keeps
+/// two calls from racing on the same file.
+pub struct Spent {
+    path: std::path::PathBuf,
+    jtis: std::collections::HashMap<String, i64>,
+    /// The persisted file existed but would not parse — the safe
+    /// failure is to refuse every consume until the set is writable
+    /// again, never to let a replay slip through a gap in memory.
+    corrupt: bool,
+}
+
+impl Spent {
+    /// Load the seen-set of `state_dir`. A missing file is an empty
+    /// set; a present-but-unreadable or unparseable one marks `corrupt`
+    /// so [`Spent::consume`] fails closed — a corrupted single-use
+    /// memory must never silently permit the replay it cannot see.
+    pub fn load(state_dir: &Path) -> Self {
+        let path = state_dir.join(SPENT_FILE);
+        match std::fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self {
+                path,
+                jtis: Default::default(),
+                corrupt: false,
+            },
+            Err(_) => Self {
+                path,
+                jtis: Default::default(),
+                corrupt: true,
+            },
+            Ok(b) => match serde_json::from_slice::<SpentFile>(&b) {
+                Ok(f) => Self {
+                    path,
+                    jtis: f.jtis,
+                    corrupt: false,
+                },
+                Err(_) => Self {
+                    path,
+                    jtis: Default::default(),
+                    corrupt: true,
+                },
+            },
+        }
+    }
+
+    /// First use records `sha256(jti)` until `exp` and returns `true`;
+    /// any second in-window use returns `false` — the caller's
+    /// `assertion_replayed` refusal — and writes nothing. A corrupt
+    /// seen-set or a failed persist also returns `false`: no in-window
+    /// envelope may run while the single-use memory is unreliable.
+    /// Expired entries prune on every consume.
+    pub fn consume(&mut self, jti: &str, exp: i64, now: i64) -> bool {
+        if self.corrupt {
+            return false;
+        }
+        self.jtis.retain(|_, e| now <= *e);
+        let key = crate::operator_auth::digest(jti);
+        if self.jtis.contains_key(&key) {
+            return false;
+        }
+        self.jtis.insert(key, exp);
+        // Persist BEFORE the caller dispatches — a crash after the write
+        // must still know the id is spent, and a failed persist refuses
+        // the call rather than silently keeping the id replayable.
+        self.persist().is_ok()
+    }
+
+    /// Atomic write: tmp + rename, 0600 — a partially-persisted set is
+    /// never read back as authoritative.
+    fn persist(&self) -> crate::error::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = self.path.with_extension("tmp");
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::internal(format!("{}: {e}", tmp.display()))),
+        }
+        let body = serde_json::to_vec_pretty(&SpentFile {
+            jtis: self.jtis.clone(),
+        })?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
 }

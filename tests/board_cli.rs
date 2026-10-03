@@ -20,6 +20,7 @@ use board_common::*;
 use cadence_agent::ui;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -85,6 +86,11 @@ fn cli_claims(issuer: &str, host: &str, scope: &[&str]) -> Value {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    // Every minted envelope carries its own jti — the mint makes each
+    // id distinct (uuid-ish), and the route consumes it on first use,
+    // so the fixture can never lean on a shared one.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     json!({
         "iss": issuer,
         "aud": format!("http://{host}"),
@@ -97,7 +103,7 @@ fn cli_claims(issuer: &str, host: &str, scope: &[&str]) -> Value {
         "credential_id": "hct_cli1",
         "iat": now - 5,
         "exp": now + 120,
-        "jti": format!("jti-{}", now),
+        "jti": format!("jti-{now}-{seq}"),
     })
 }
 
@@ -167,14 +173,18 @@ fn cli_read_and_write_happy_paths() {
     let _d = UiDaemon::start_on(state.path().to_path_buf());
     let (port, host, _board) = start_cli_board(pm.path(), state.path(), issuer.clone());
 
-    // cli.read: issue_ls lists the seeded tracker.
+    // cli.read: issue_ls lists the seeded tracker. Each call carries
+    // its own envelope — the contract's envelope is single-use, so the
+    // worker mints per call and the fixture does the same.
     let env = cli_envelope(&key, &cli_claims(&issuer, &host, &["cli.read"]));
     let (code, body) = cli_call(port, &host, "issue_ls", Some(&env), &json!({}));
     assert_eq!(code, 200, "{body}");
     let out: Value = serde_json::from_str(&body).unwrap();
     assert!(out["issues"].as_array().unwrap().len() >= 3, "{out}");
 
-    // issue_show / issue_history read the seeded issue.
+    // issue_show / issue_history read the seeded issue — each on a
+    // freshly minted envelope (single-use).
+    let env = cli_envelope(&key, &cli_claims(&issuer, &host, &["cli.read"]));
     let (code, body) = cli_call(
         port,
         &host,
@@ -183,6 +193,7 @@ fn cli_read_and_write_happy_paths() {
         &json!({"id": "CAD-1"}),
     );
     assert_eq!(code, 200, "{body}");
+    let env = cli_envelope(&key, &cli_claims(&issuer, &host, &["cli.read"]));
     let (code, body) = cli_call(
         port,
         &host,
@@ -461,4 +472,152 @@ fn cli_envelope_tampering_and_replay() {
     let (code, body) = cli_call(port, &host, "issue_ls", Some(&env), &json!({}));
     assert_eq!(code, 401, "{body}");
     assert!(body.contains("assertion_expired"), "{body}");
+}
+
+/// The contract calls the envelope single-use — and a captured bearer
+/// can be POSTed straight to this route, skipping the worker's
+/// live-bearer rebind, so the container is itself the single-use
+/// authority (spec review, PR #744): the second in-window use of one
+/// `jti` refuses — a read AND a write — with no side effect, and the
+/// refusal survives a board restart inside the ≤300 s window. Expired
+/// entries prune.
+#[test]
+fn a_cli_envelope_is_single_use_and_the_set_survives_a_restart() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let key = signer(0x9d);
+    let jwks = format!(
+        r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","kid":"k1","x":"{}"}}]}}"#,
+        pubkey(&key)
+    );
+    let jwks_port = jwks_stub(jwks);
+    let issuer = format!("http://127.0.0.1:{jwks_port}");
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (port, host, board) = start_cli_board(pm.path(), state.path(), issuer.clone());
+
+    // A read consumes its jti: the same envelope replayed refuses with
+    // assertion_replayed — nothing is read twice either.
+    let env = cli_envelope(&key, &cli_claims(&issuer, &host, &["cli.read"]));
+    let (code, body) = cli_call(port, &host, "issue_ls", Some(&env), &json!({}));
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = cli_call(port, &host, "issue_ls", Some(&env), &json!({}));
+    assert_eq!(code, 401, "{body}");
+    assert!(body.contains("assertion_replayed"), "{body}");
+
+    // A write the same way — and its refusal writes nothing.
+    let envw = cli_envelope(&key, &cli_claims(&issuer, &host, &["cli.write"]));
+    let (code, body) = cli_call(
+        port,
+        &host,
+        "issue_comment",
+        Some(&envw),
+        &json!({"id": "CAD-1", "body": "once"}),
+    );
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = cli_call(
+        port,
+        &host,
+        "issue_comment",
+        Some(&envw),
+        &json!({"id": "CAD-1", "body": "replay"}),
+    );
+    assert_eq!(code, 401, "{body}");
+    assert!(body.contains("assertion_replayed"), "{body}");
+    let (_code, body) = {
+        let env = cli_envelope(&key, &cli_claims(&issuer, &host, &["cli.read"]));
+        cli_call(
+            port,
+            &host,
+            "issue_show",
+            Some(&env),
+            &json!({"id": "CAD-1"}),
+        )
+    };
+    let out: Value = serde_json::from_str(&body).unwrap();
+    let comments = out["issue"]["comments"].as_array().unwrap().len();
+    assert_eq!(comments, 1, "the replayed write wrote anyway: {out}");
+
+    // A different jti on an otherwise identical envelope passes — the
+    // set is per-id, not per-principal.
+    let env = cli_envelope(&key, &cli_claims(&issuer, &host, &["cli.read"]));
+    let (code, body) = cli_call(port, &host, "issue_ls", Some(&env), &json!({}));
+    assert_eq!(code, 200, "{body}");
+
+    // And a forged replay can never burn the real jti: the consume
+    // runs only after the signature and every pin verify.
+    let mut claims = cli_claims(&issuer, &host, &["cli.read"]);
+    claims["jti"] = json!("jti-victim");
+    let stolen = cli_envelope(&signer(0x5e), &claims);
+    let (code, _) = cli_call(port, &host, "issue_ls", Some(&stolen), &json!({}));
+    assert_eq!(code, 401);
+    let real = cli_envelope(&key, &claims);
+    let (code, body) = cli_call(port, &host, "issue_ls", Some(&real), &json!({}));
+    assert_eq!(code, 200, "forged replay burned the real jti: {body}");
+
+    // A restart inside the window still refuses: the seen-set is
+    // persisted under state_dir, not kept in memory.
+    drop(board);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the board did not stop within 10s"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (port2, host2, _board2) = start_cli_board(pm.path(), state.path(), issuer.clone());
+    // jti changes with the port only in `aud` — mint one envelope for
+    // each listener; the SAME jti, replays across the restart.
+    let mut claims = cli_claims(&issuer, &host2, &["cli.read"]);
+    claims["jti"] = json!("jti-restart");
+    let env2 = cli_envelope(&key, &claims);
+    let (code, body) = cli_call(port2, &host2, "issue_ls", Some(&env2), &json!({}));
+    assert_eq!(code, 200, "{body}");
+    drop(_board2);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port2)).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the restarted board did not stop within 10s"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (port3, host3, _board3) = start_cli_board(pm.path(), state.path(), issuer.clone());
+    let mut claims = cli_claims(&issuer, &host3, &["cli.read"]);
+    claims["jti"] = json!("jti-restart");
+    let env3 = cli_envelope(&key, &claims);
+    let (code, body) = cli_call(port3, &host3, "issue_ls", Some(&env3), &json!({}));
+    assert_eq!(code, 401, "{body}");
+    assert!(body.contains("assertion_replayed"), "{body}");
+
+    // The persisted set prunes: mint an envelope already expired, let
+    // its refuse leave the file, then re-mint the same jti live — the
+    // expired row is gone so the fresh envelope still passes (the file
+    // can never wedge a jti beyond its exp).
+    let mut dead = cli_claims(&issuer, &host3, &["cli.read"]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    dead["jti"] = json!("jti-prune");
+    dead["iat"] = json!(now - 200);
+    dead["exp"] = json!(now - 100);
+    let envd = cli_envelope(&key, &dead);
+    let (code, _) = cli_call(port3, &host3, "issue_ls", Some(&envd), &json!({}));
+    assert_eq!(code, 401);
+    let set = state.path().join("cli-jtis.json");
+    let text = std::fs::read_to_string(&set).unwrap_or_default();
+    // Expired rows are pruned on consume — `jti-prune` was refused at
+    // verify (exp<=now) before ever touching the set, so the file must
+    // carry no entry that outlives its exp.
+    let file: Value = serde_json::from_str(&text).unwrap_or(json!({"jtis":{}}));
+    if let Some(map) = file["jtis"].as_object() {
+        for (h, exp) in map {
+            assert!(
+                exp.as_i64().unwrap_or(i64::MAX) >= now,
+                "an expired entry lingered in {set:?}: {h}"
+            );
+        }
+    }
 }

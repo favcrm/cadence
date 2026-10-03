@@ -51,6 +51,11 @@ use crate::issue::{board, history, model, write as issue_write, Pm};
 /// refetches, so per-fixture issuers in tests stay honest.
 static CLI_JWKS: Mutex<board_identity::JwksCache> = Mutex::new(board_identity::JwksCache::new());
 
+/// Serializes `Spent::load`+`consume` — the single-use check-and-record
+/// races on the on-disk set otherwise (two in-flight replays of one
+/// jti could both pass). Held for the file read+write only.
+static SPENT_LOCK: Mutex<()> = Mutex::new(());
+
 /// A refusal in the contract's `error.code` shape — `{ok:false,
 /// error:{code,message}}` plus `no-store`; never a redirect, never a
 /// cookie.
@@ -211,6 +216,34 @@ pub(super) fn post(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // The envelope is single-use (the contract, and the review's
+    // Important): a bearer can be replayed at this route directly,
+    // skipping the worker's live-bearer rebind, so the container is
+    // the single-use authority. Only a verified, authorized,
+    // well-formed call consumes — a forged replay never burns the
+    // real jti and a malformed call leaves it usable — and the
+    // consume is right before dispatch so a refused replay writes
+    // nothing. The set persists (`cli-jtis.json` in state_dir): a
+    // restart inside the ≤300 s window still refuses.
+    let spent = {
+        // The check-and-record is one critical section: two
+        // simultaneous replays of the same jti must not both load
+        // a pre-consume set.
+        let _guard = SPENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = cli_actor::Spent::load(state_dir);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default();
+        set.consume(&caller.jti, caller.exp, now)
+    };
+    if !spent {
+        return cli_fail(
+            401,
+            "assertion_replayed",
+            "the envelope's jti was already consumed",
+        );
+    }
     dispatch(verb, &args, &caller, state_dir, pm_dir, opts)
 }
 
