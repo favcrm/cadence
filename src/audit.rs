@@ -1296,6 +1296,8 @@ struct StoreEvidence {
     opened: bool,
     /// `approval_recorded` events on the approval stream, oldest first.
     approvals: Vec<ApprovalRec>,
+    /// CAD-1106: ticket scope pre-approvals (`action` scope), oldest first.
+    scopes: Vec<ScopeRec>,
     /// The first `approval_revoked` event per approval id.
     revocations: HashMap<String, Revocation>,
     /// Why the approval stream could not be read — approval state is
@@ -1321,6 +1323,17 @@ struct ApprovalRec {
     verdict_sha256: Vec<String>,
     reviewers: Vec<String>,
     at: f64,
+}
+
+/// One ticket scope pre-approval record (CAD-918): the ticket and the
+/// digest of its body at approval time.
+#[derive(Debug, Clone, Default)]
+struct ScopeRec {
+    id: String,
+    issue: String,
+    digest: String,
+    source: String,
+    recorded_via: Option<String>,
 }
 
 /// One operator revocation of an approval id.
@@ -1432,7 +1445,21 @@ fn read_approvals(conn: &rusqlite::Connection, ev: &mut StoreEvidence) {
         let Some(id) = text("approval_id") else {
             continue;
         };
-        if kind == APPROVAL_RECORDED_EVENT {
+        if kind == APPROVAL_RECORDED_EVENT && text("action").as_deref() == Some("scope") {
+            if let (Some(source), Some(issue), Some(digest)) = (
+                text("source"),
+                p["scope"]["issue"].as_str().map(str::to_string),
+                p["scope"]["digest"].as_str().map(str::to_string),
+            ) {
+                ev.scopes.push(ScopeRec {
+                    id,
+                    issue,
+                    digest,
+                    source,
+                    recorded_via: text("recorded_via"),
+                });
+            }
+        } else if kind == APPROVAL_RECORDED_EVENT {
             let (Some(source), Some(action), Some(head_sha), Some(repo), Some(pr)) = (
                 text("source"),
                 text("action"),
@@ -1900,6 +1927,37 @@ pub fn approval_check(state_dir: &Path, repo: &str, pr: u64, head: &str) -> (Val
     let ev = store_evidence(&state_dir.join(STORE_FILE));
     let v = approval_in_force(&ev, repo, pr, head);
     let code = i32::from(v["state"] != "in-force");
+    (v, code)
+}
+
+/// CAD-1106: the ticket scope pre-approvals recorded for `issue`, each with
+/// whether a revocation withdrew it. Read-only; the caller (the enqueue
+/// script) decides which one counts: it compares the digest with the
+/// ticket body as it reads now and requires `recorded_via`
+/// `operator-connection`. `unknown` when the store cannot answer.
+fn scope_approvals(ev: &StoreEvidence, issue: &str) -> Value {
+    if let Some(gap) = &ev.approvals_gap {
+        return json!({"state": "unknown", "reason": gap});
+    }
+    let rows: Vec<Value> = ev
+        .scopes
+        .iter()
+        .filter(|s| s.issue.eq_ignore_ascii_case(issue))
+        .map(|s| {
+            json!({"approval_id": s.id, "digest": s.digest, "source": s.source,
+                   "recorded_via": s.recorded_via,
+                   "revoked": ev.revocations.contains_key(&s.id)})
+        })
+        .collect();
+    json!({"state": "ok", "issue": issue, "approvals": rows})
+}
+
+/// `cadence audit scope --issue X`: read-only, no daemon. Exit 0 when the
+/// store answered (an empty list is an answer), 1 when it could not.
+pub fn scope_check(state_dir: &Path, issue: &str) -> (Value, i32) {
+    let ev = store_evidence(&state_dir.join(STORE_FILE));
+    let v = scope_approvals(&ev, issue);
+    let code = i32::from(v["state"] != "ok");
     (v, code)
 }
 
@@ -3411,6 +3469,76 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(in_force(&gap, &slug, 1, HEAD), "unknown");
+    }
+
+    #[test]
+    fn scope_approvals_list_per_issue_with_revocation_and_gap() {
+        let scope = |id: &str, issue: &str, via: Option<&str>| ScopeRec {
+            id: id.into(),
+            issue: issue.into(),
+            digest: "d".repeat(64),
+            source: "operator".into(),
+            recorded_via: via.map(str::to_string),
+        };
+        let e = StoreEvidence {
+            scopes: vec![
+                scope("s1", "CAD-9", Some("operator-connection")),
+                scope("s2", "CAD-9", None),
+                scope("s3", "CAD-8", Some("operator-connection")),
+            ],
+            revocations: [("s2".to_string(), revoke(2.0))].into(),
+            opened: true,
+            ..Default::default()
+        };
+        let v = scope_approvals(&e, "cad-9");
+        assert_eq!(v["state"], "ok");
+        let rows = v["approvals"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{v}");
+        assert_eq!(rows[0]["approval_id"], "s1");
+        assert_eq!(rows[0]["revoked"], false);
+        assert_eq!(rows[1]["revoked"], true);
+        assert_eq!(rows[1]["recorded_via"], Value::Null);
+        assert_eq!(scope_approvals(&e, "CAD-7")["approvals"], json!([]));
+        let gap = StoreEvidence {
+            approvals_gap: Some("no store".into()),
+            ..Default::default()
+        };
+        assert_eq!(scope_approvals(&gap, "CAD-9")["state"], "unknown");
+    }
+
+    /// CAD-1106 against a real store: the verb reads what the daemon's
+    /// writers recorded (digest, recorded_via, revocation) and never mixes
+    /// in merge approvals or another ticket.
+    #[test]
+    fn scope_check_reads_real_store_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join(STORE_FILE)).unwrap();
+        let digest = crate::delegation::scope_digest("body\n");
+        let (_, live) = store
+            .record_scope_approval("CAD-9", &digest, "op", "operator-connection")
+            .unwrap();
+        let (_, agent) = store
+            .record_scope_approval("CAD-9", &"f".repeat(64), "op", "agent:x")
+            .unwrap();
+        store
+            .record_scope_approval("CAD-8", &digest, "op", "operator-connection")
+            .unwrap();
+        store
+            .revoke_approval(&agent, "op", "why", "operator-connection")
+            .unwrap();
+        let (v, code) = scope_check(dir.path(), "CAD-9");
+        assert_eq!(code, 0, "{v}");
+        let rows = v["approvals"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{v}");
+        assert_eq!(rows[0]["approval_id"], live.as_str());
+        assert_eq!(rows[0]["digest"], digest.as_str());
+        assert_eq!(rows[0]["recorded_via"], "operator-connection");
+        assert_eq!(rows[0]["revoked"], false);
+        assert_eq!(rows[1]["recorded_via"], "agent:x");
+        assert_eq!(rows[1]["revoked"], true);
+        // No store at all: unknown, exit 1.
+        let (v, code) = scope_check(&dir.path().join("none"), "CAD-9");
+        assert_eq!((v["state"].as_str(), code), (Some("unknown"), 1));
     }
 
     #[test]

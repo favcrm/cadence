@@ -214,6 +214,7 @@ jobs:
       - run: python3 scripts/test_workflow_cleanup.py
       - run: python3 scripts/test_ci_change_scope.py
       - run: python3 -m unittest scripts/test_enqueue_human_paths.py
+      - run: python3 -m unittest scripts/test_enqueue_scope_approval.py
       - run: scripts/design-kit --check
       - name: Check contributor documentation paths
         run: python3 scripts/check-doc-links.py
