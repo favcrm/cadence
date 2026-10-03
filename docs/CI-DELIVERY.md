@@ -95,11 +95,11 @@ let that code poison the cache or exfiltrate the key. Therefore:
 - Every other job, including all gate jobs on `pull_request` and
   `merge_group` and on main pushes, gets only the read-only pair and no
   `environment:`.
-- The guard evaluator in `tests/scripts/test_ci_sccache.py` compares
+- The guard evaluator in `tests/scripts/test_ci_sccache.py` (retired under CAD-1073) compares
   strings case-insensitively like GitHub and supports `==` and `!=`; any
   other expression form (functions, `!`) is rejected. The test also rejects
   `secrets[...]`, `toJSON(secrets)` and any computed `environment:`.
-- `tests/scripts/test_ci_sccache.py` (run in `fmt`) fails if an RW secret
+- `tests/scripts/test_ci_sccache.py` (retired under CAD-1073) (run in `fmt`) fails if an RW secret
   appears anywhere but `cache-warm`, if its `if` admits any event but push
   to main, if the writer environment is attached to another job, or if
   any job waits on it.
@@ -247,12 +247,12 @@ and untracked files; use `--base REF` to override and `--list` to print the
 plan without running it. It sets `CARGO_BUILD_JOBS=4` unless already set and
 never runs the full suite; the merge queue does that.
 
-`tests/split-map.toml` and `tests/split-map-board.toml` list each
+`tests/split-map.toml` (retired under CAD-1073) and `tests/split-map-board.toml` (retired under CAD-1073) list each
 integration binary's tests. They are derived from the `#[test]` fns in
 `tests/<binary>.rs`: after adding, moving or deleting a test run
 `scripts/split-map-sync` to write the entries, or `--check` to see which file
 and section is out of step. CI runs the check and
-`tests/scripts/test_split_map_sync.py` / `test_pre_push.py` in the `fmt`
+`tests/scripts/test_split_map_sync.py` (retired under CAD-1073) / `test_pre_push.py` in the `fmt`
 job; the Rust guard `split_map_inventory` remains the exactly-once contract.
 
 ## Shared CI contracts
@@ -261,7 +261,7 @@ The required `fmt` job runs the shared scope/runner, shard-coverage,
 nextest-cost, delivery/staging/review-observation contracts and doctor/host
 split-map check once. Their failures still block the required gate and
 release evidence. They no longer repeat in every Rust test shard.
-`tests/scripts/test_ci_shared_checks.py` checks that each command remains
+`tests/scripts/test_ci_shared_checks.py` (retired under CAD-1073) checks that each command remains
 once-only and blocking, including early failures in multi-command steps.
 
 Each `test-shard` job selects the scope from the base policy, proves
@@ -382,7 +382,7 @@ from that file and runs `rustup toolchain install <channel>` with the
 profile and components the job passes. `--export` also sets
 `RUSTUP_TOOLCHAIN` for jobs that build another checkout (staging's
 `candidate-source`). Local `cargo` follows the file too, so a local
-`cargo clippy` matches CI. `tests/scripts/test_ci_toolchain_pin.py` fails
+`cargo clippy` matches CI. `tests/scripts/test_ci_toolchain_pin.py` (retired under CAD-1073) fails
 if a workflow installs a literal or floating channel.
 
 A new stable release can no longer turn the queue red: lints and
