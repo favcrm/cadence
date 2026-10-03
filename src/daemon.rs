@@ -62,6 +62,7 @@ mod requests_rpc;
 mod review_evidence_rpc;
 mod serve;
 mod slots_rpc;
+mod social_publish_driver;
 mod social_publish_rpc;
 mod supervisor_grant;
 mod test_queue_rpc;
@@ -487,6 +488,10 @@ pub struct Shared {
     /// adapter lands. Never set from PM, RPC, or worker input.
     social_publish_sender:
         Option<std::sync::Arc<dyn crate::platform::agenticos_external::publish::PublishSender>>,
+    /// CAD-1020: daemon-owned publish driver. `off` forces it inert even
+    /// with a sender attached (the canary kill switch); otherwise it
+    /// ticks at `social_publish_driver_every` while a sender is registered.
+    social_publish_driver: social_publish_driver::Driver,
     /// CAD-979: the retained-media import client, resolved once at attach
     /// beside the sender from the same `publish.send` credential. Serves the
     /// operator `social_publish_media_import` verb; absent → `capability_unavailable`.
@@ -726,6 +731,7 @@ impl Shared {
             platforms: opts.platforms.clone(),
             effect_execute_gate: opts.effect_execute_gate.clone(),
             social_publish_sender: opts.social_publish_sender.clone(),
+            social_publish_driver: social_publish_driver::Driver::new(opts),
             social_media_importer: opts.social_media_importer.clone(),
             social_media_resolver: opts.social_media_resolver.clone(),
             screen_caps: Mutex::new(HashMap::new()),
@@ -2589,6 +2595,10 @@ impl Shared {
                 // CAD-538: the hosted lease, when held — provider, epoch,
                 // expiry and the fence reason after a loss.
                 "lease": self.lease.as_ref().map(|l| l.status_json()),
+                // CAD-1020: the publish driver's last/next tick, status
+                // and last error — `sender_not_configured` when no send
+                // transport is attached.
+                "social_publish_driver": self.social_publish_driver.status_json(),
                 // CAD-561: a pending update and what it waits on, so
                 // `cadence daemon status` and the board's banner show it.
                 "pending_update": self.pending_update().map(|p| p.to_json()),
@@ -4674,6 +4684,24 @@ pub struct ServeOptions {
     /// adapter lands. Never set from PM, RPC, or worker input.
     pub social_publish_sender:
         Option<std::sync::Arc<dyn crate::platform::agenticos_external::publish::PublishSender>>,
+    /// CAD-1020: driver tick interval override in milliseconds — the
+    /// test seam; bypasses the production seconds clamp so tests run
+    /// the loop hot. `None` resolves env/default. Never from PM/RPC.
+    pub social_publish_driver_ms: Option<u64>,
+    /// CAD-1020: kill switch — opt-IN, not opt-out. `None` reads
+    /// `CADENCE_SOCIAL_PUBLISH_DRIVER`: only `on` runs the driver; any
+    /// other value (or unset) parks it, so a sender attached for the
+    /// CAD-979 import flow never starts the loop by itself.
+    /// `Some(true)` forces inert; `Some(false)` forces on (tests).
+    pub social_publish_driver_off: Option<bool>,
+    /// CAD-1020: test-only clock for the driver's due/lateness
+    /// comparisons — `None` is wall epoch. Tests pin it to schedule
+    /// in the past/future without sleeping.
+    pub social_publish_driver_clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
+    /// CAD-1020, lib tests only: runs inside the driver between a
+    /// committed claim and its send (the lease-loss window).
+    #[cfg(test)]
+    pub(crate) social_publish_driver_after_claim: Option<Arc<dyn Fn() + Send + Sync>>,
     /// CAD-979: retained-media import client resolved once at attach (same
     /// credential as the sender). Never set from PM, RPC, or worker input.
     pub social_media_importer:
@@ -5023,6 +5051,16 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_report_router());
     }
+    // CAD-1020: the publish driver — claims due intents, sends through
+    // the attached sender, reconciles processing rows through status.
+    // Joined before `Shared::shutdown` so a tick never outlives the
+    // daemon; a SIGKILL mid-send is safe by construction (the row is
+    // left `processing` for the next boot's reconcile).
+    let publish_driver = {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_social_publish_driver())
+    };
+
     // CAD-719: the wiki index refresh worker — a committed wiki
     // mutation kicks one coalesced rebuild; the query-time tree check
     // stays the correctness fallback. Joined at shutdown so a rebuild
@@ -5131,6 +5169,12 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // lets a kickoff from that last tick settle into the shutdown marker.
     let _ = monitor_watch.join();
     let _ = test_watch.join();
+    // CAD-1020: join the publish driver before `Shared::shutdown` — a
+    // tick can be mid-send; one in-flight send costs driver-preflight +
+    // up to 2 staged preflights + POST + status ≈ 5×DOOR_TIMEOUT ≈
+    // 150s worst case (the reconcile sweep's 16 status reads are
+    // interruptible between items via the fence/`closing` checks).
+    let _ = publish_driver.join();
     // CAD-702: the heartbeat is NOT joined here — it stays the single
     // renewal poster through the flush below. Joining it before the
     // flush would leave the final WAL checkpoint and tracker commit

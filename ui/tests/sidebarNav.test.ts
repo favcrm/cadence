@@ -31,10 +31,15 @@ const fs = require("fs");
 const hrefs = (html: string) => Array.from(html.matchAll(/<a [^>]*href="([^"]*)"/g)).map((m) => m[1]);
 const navHref = (route: { screen: string }) => `/${route.screen}`;
 const appMenu = {
-  title: "CRM",
-  sections: [
-    { label: "Customers", href: "/crm?c", current: false },
-    { label: "Segments", href: "/crm?s", current: true },
+  apps: [
+    {
+      installId: "install-crm", title: "CRM", href: "/crm?s", current: true,
+      sections: [
+        { label: "Customers", href: "/crm?c", current: false },
+        { label: "Segments", href: "/crm?s", current: true },
+      ],
+    },
+    { installId: "install-soc", title: "Social Content", href: "/soc", current: false, sections: null },
   ],
 };
 const nav = (screen: string, menu: typeof appMenu | null, label?: string) =>
@@ -59,10 +64,16 @@ assert(apps.includes('aria-current="true"') && apps.includes("data-parent-curren
 assert(!apps.includes('aria-current="page"'), "parent does not take the accent");
 assert(/class="navlink navlink-sub"[^>]*aria-current="page"[^>]*>Segments|aria-current="page"[^>]*class="navlink navlink-sub"[^>]*>Segments/.test(withMenu), "current sub row carries aria-current=page");
 assert(withMenu.includes('aria-label="CRM sections"'), "sub list is its own landmark");
-assert(withMenu.includes('<div class="text-micro text-ink-500 px-2 pt-0.5 pb-1 truncate" title="CRM">CRM</div>'), "app name is the muted first line");
+assert(/<a [^>]*href="\/crm\?s"[^>]*class="navlink navlink-sub"|<a [^>]*class="navlink navlink-sub"[^>]*href="\/crm\?s"/.test(withMenu), "each installed app is a link row");
+assert(hrefs(withMenu).includes("/soc"), "an app without sections still lists");
+assert(!/aria-label="Social Content sections"/.test(withMenu), "no sections list for an app that declares none");
 assert(!withMenu.includes("slabel"), "no separate app heading");
+// An open app without sections takes the accent alone; Apps is the quiet parent.
+const social = nav("apps", { apps: [{ ...appMenu.apps[1], current: true }] });
+assert(!/<a [^>]*aria-current="page"[^>]*>(?:(?!<\/a>).)*Apps<\/a>/.test(social), "Apps is not page-current when an app row is");
+assert(/aria-current="page"[^>]*>(?:(?!<\/a>).)*Social Content/.test(social), "the open app row is page-current");
 // Off the Apps screen the parent marker is absent even when a menu is passed.
-assert(!nav("home", appMenu).includes("data-parent-current"), "parent marker only when Apps is current");
+assert(!nav("home", appMenu).includes("data-parent-current") && !nav("home", appMenu).includes('aria-current="true"'), "parent marker only when Apps is current");
 
 // Projects: empty list shows a plain line instead of the All projects row.
 const state = (data: unknown[] | null, status = "ready") => ({ data, status, error: null }) as any;

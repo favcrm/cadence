@@ -31,13 +31,18 @@ cadence audit --json --limit 50        # machine form for digests/tiles
 `--since` accepts `24h`, `7d`, `2w`, `YYYY-MM-DD` or a unix epoch.
 `--limit 0` means no cap (default 200).
 
-Two read-only verbs serve `scripts/enqueue-reviewed` (CAD-959), which
+Three read-only verbs serve `scripts/enqueue-reviewed` (CAD-959), which
 decides before a merge what the audit reports after it:
 
 ```bash
 cadence audit approval --pr 84 --head <full-sha>   # JSON; exit 0 only when an approval is in force for exactly that head
 cadence audit verdicts --issue CAD-92 --pr 84 --head <full-sha>   # head-pinned verdict notes, plus why others were skipped
+cadence audit scope --issue CAD-92   # CAD-1106: ticket scope pre-approvals (id, body digest, recorded_via, revoked); exit 0 when the store answered
 ```
+
+`audit scope` only lists records; `scripts/enqueue-reviewed` decides which one
+counts (digest equals the sha256 of the trimmed current ticket body,
+`recorded_via` `operator-connection`, not revoked).
 
 `audit verdicts` uses the same note parser as the audit. A reviewer is the
 first whitespace token of `From:`, lower-cased (the rest is prose). Its kind
