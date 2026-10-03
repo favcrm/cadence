@@ -9,14 +9,25 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: RemoteAction,
     },
-    /// Authenticate to an AgenticOS issuer. Hosted Cadence RPC is not yet configured.
+    /// Authenticate to an AgenticOS issuer and map the workspace to a remote
+    /// org (CAD-1019). `--slug` names the board host; the issuer's grant must
+    /// echo exactly the workspace and audience requested.
     Login {
-        /// AgenticOS HTTPS issuer origin (no path).
+        /// AgenticOS HTTPS issuer origin (no path) — must match the
+        /// operator-pinned trusted issuer.
         #[arg(long)]
         issuer: String,
         /// Exact AgenticOS workspace ID to authorize.
         #[arg(long)]
         org: String,
+        /// Org slug: the board host is `https://<slug>.cadencecloud.app`.
+        /// Required for org login (not for `--token-stdin`).
+        #[arg(long)]
+        slug: Option<String>,
+        /// Select the new org as the saved default. Without it, login records
+        /// the org but keeps an existing default.
+        #[arg(long = "use")]
+        use_: bool,
         /// Read an existing credential from stdin; never accept secrets in argv.
         #[arg(long)]
         token_stdin: bool,

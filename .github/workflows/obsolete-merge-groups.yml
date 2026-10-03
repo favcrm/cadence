@@ -6,7 +6,6 @@ on:
     paths:
       - .github/workflows/obsolete-merge-groups.yml
       - scripts/ci-obsolete-merge-groups.py
-      - tests/scripts/test_ci_obsolete_merge_groups.py
 
 permissions:
   contents: read
@@ -20,7 +19,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - run: python3 tests/scripts/test_ci_obsolete_merge_groups.py
+      # CAD-1073: tests/scripts/test_ci_obsolete_merge_groups.py retired
+      # with the suite; the delete event still exercises the script live.
+      - run: python3 -c "import ast; ast.parse(open('scripts/ci-obsolete-merge-groups.py').read())"
 
   deleted-group:
     # delete uses default-branch workflow/code, never candidate queue code.

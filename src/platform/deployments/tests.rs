@@ -200,7 +200,7 @@ fn hosted_media_transport_assertion_refuses_malformed_or_mismatched_composition(
 }
 
 #[test]
-fn hosted_media_attach_without_external_url_exposes_only_builtin_media() {
+fn hosted_lease_attach_without_external_url_exposes_only_builtin_source_and_media() {
     const ISOLATED: &str = "CADENCE_TEST_CAD868_HOSTED_MEDIA_ISOLATED";
     if std::env::var_os(ISOLATED).is_none() {
         // Follow the existing reaper test's self-relaunch convention: remove
@@ -208,7 +208,7 @@ fn hosted_media_attach_without_external_url_exposes_only_builtin_media() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "platform::deployments::tests::hosted_media_attach_without_external_url_exposes_only_builtin_media",
+                "platform::deployments::tests::hosted_lease_attach_without_external_url_exposes_only_builtin_source_and_media",
                 "--test-threads",
                 "1",
                 "--nocapture",
@@ -279,41 +279,39 @@ fn hosted_media_attach_without_external_url_exposes_only_builtin_media() {
     );
     let table = adapter.table();
     assert_eq!(table.platform, "agenticos_external");
-    assert_eq!(table.tools.len(), 1);
-    assert_eq!(table.tools[0].tool, "generate_image");
-    assert_eq!(table.tools[0].effect.as_deref(), Some("draft"));
-    assert_eq!(table.tools[0].scopes, vec!["provider.draft"]);
+    // CAD-1060: exactly the reviewed read and draft on one builtin, nothing else.
+    assert_eq!(
+        table
+            .tools
+            .iter()
+            .map(|t| (t.tool.as_str(), t.effect.as_deref(), t.scopes.join(",")))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "scrapecreators.instagram.user.posts",
+                Some("read"),
+                "provider.read".into()
+            ),
+            ("generate_image", Some("draft"), "provider.draft".into()),
+        ]
+    );
     let descriptor = adapter.connection_descriptor().unwrap();
     descriptor.validate(table).unwrap();
-    assert_eq!(descriptor.provider, "agenticos_external");
-    assert_eq!(descriptor.builtin_accounts, vec!["hosted"]);
-    assert!(descriptor.enrollment_shapes.is_empty());
-    assert_eq!(descriptor.capabilities.len(), 1);
-    let capability = &descriptor.capabilities[0];
-    assert_eq!(capability.id, "media.generate");
-    assert_eq!(capability.version, 1);
-    assert_eq!(capability.tools, vec!["generate_image"]);
-    assert_eq!(capability.scopes, vec!["provider.draft"]);
-    assert_eq!(capability.effect, "draft");
-    assert!(matches!(
-        capability.semantics,
-        crate::platform::connections::CapabilitySemantics::PreviewOnly
-    ));
-    assert_eq!(descriptor.action_mappings.len(), 1);
-    let mapping = &descriptor.action_mappings[0];
-    assert_eq!(mapping.capability, "media.generate");
-    assert_eq!(mapping.version, 1);
-    assert_eq!(mapping.action, "generate_image");
-    assert_eq!(mapping.resource_kind, "connection_account");
-    assert_eq!(mapping.tool, "generate_image");
-    assert_eq!(mapping.scopes, vec!["provider.draft"]);
-    assert_eq!(mapping.effect, "draft");
-    assert!(matches!(
-        mapping.semantics,
-        crate::platform::connections::CapabilitySemantics::PreviewOnly
-    ));
-    assert_eq!(mapping.input_contract, "media.image.prompt@1");
-    assert_eq!(mapping.output_contract, "media.image.asset@1");
+    assert_eq!(
+        serde_json::to_value(&descriptor).unwrap(),
+        serde_json::json!({
+            "schema":1,"provider":"agenticos_external","revision":"agenticos-hosted-connections/2",
+            "enrollment_shapes":[],"builtin_accounts":["hosted"],
+            "capabilities":[
+                {"id":"social.read","version":1,"tools":["scrapecreators.instagram.user.posts"],"scopes":["provider.read"],"effect":"read","semantics":"metadata_read"},
+                {"id":"media.generate","version":1,"tools":["generate_image"],"scopes":["provider.draft"],"effect":"draft","semantics":"preview_only"}
+            ],
+            "action_mappings":[
+                {"capability":"social.read","version":1,"action":"list_posts","resource_kind":"connection_account","tool":"scrapecreators.instagram.user.posts","scopes":["provider.read"],"effect":"read","semantics":"metadata_read","input_contract":"social.posts.query@1","output_contract":"social.posts.receipt@1"},
+                {"capability":"media.generate","version":1,"action":"generate_image","resource_kind":"connection_account","tool":"generate_image","scopes":["provider.draft"],"effect":"draft","semantics":"preview_only","input_contract":"media.image.prompt@1","output_contract":"media.image.asset@1"}
+            ]
+        })
+    );
     assert!(adapter
         .execute(
             b"",

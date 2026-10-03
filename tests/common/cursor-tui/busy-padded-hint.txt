@@ -1,9 +1,0 @@
-Mock Cursor TUI
-  ⠠ Working
-    Tip: Use /run-everything to skip all approvals.
-
-  → Add a follow-up                                                                                ctrl+c to stop                        
-
-  1 task
-  Grok 4.7 256K High
-  /mock · main

@@ -16,9 +16,9 @@ use super::write_path::{
     write_route, HttpResp,
 };
 use super::{
-    app_audiences, app_content, app_contexts, app_records, app_release, app_runs, apps,
-    connections, crm_send, delivery_sync, home, lane, operator, platform_account, read_model,
-    social_publish, stages, threads, updates, wiki, workflows,
+    app_audiences, app_content, app_contexts, app_records, app_release, app_runs, app_screens,
+    apps, cli_route, connections, crm_send, delivery_sync, home, lane, operator, platform_account,
+    read_model, social_publish, stages, threads, updates, wiki, workflows,
 };
 use super::{push_device_login_config, ready_file, tailnet_url, ServeOpts, READY_NONCE_ENV};
 use crate::adapter::registry;
@@ -69,14 +69,25 @@ pub(crate) const CSP: &str = "default-src 'self'; img-src 'self' data: https://c
 
 /// Every response gets nosniff + no-referrer; HTML additionally gets
 /// the CSP. Returns whether the response is HTML.
+///
+/// CAD-1006: a response that already carries a `Content-Security-Policy`
+/// header keeps it — `send` must not append the board's own CSP onto the
+/// private screen frame, which carries its own nonce-pinned policy. This
+/// never removes or weakens the board CSP on any other response; it only
+/// refrains from stacking a second, contradictory policy on a response
+/// that deliberately set one.
 pub(crate) fn add_security_headers(resp: &mut Response<std::io::Cursor<Vec<u8>>>) -> bool {
     let is_html = resp
         .headers()
         .iter()
         .any(|h| h.field.equiv("Content-Type") && h.value.as_str().starts_with("text/html"));
+    let has_csp = resp
+        .headers()
+        .iter()
+        .any(|h| h.field.equiv("Content-Security-Policy"));
     resp.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
     resp.add_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap());
-    if is_html {
+    if is_html && !has_csp {
         resp.add_header(Header::from_bytes("Content-Security-Policy", CSP).unwrap());
     }
     is_html
@@ -936,6 +947,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             send(request, resp);
             return;
         }
+        // CAD-1019: `POST /api/cli/<verb>` — the container end of the
+        // remote CLI (AOS-128's `/__platform/cli/call` forwards here).
+        // The `wikienv_` bearer is the credential — cookie sessions
+        // never satisfy it and it satisfies no other route — so the
+        // family is diverted ahead of the session gates and the write
+        // path's guards (its content-type/origin marks are the
+        // platform relay's, not a browser's). The verb's own checks
+        // run inside `cli_route::post`, before any body or handler.
+        if let Some(tail) = path.strip_prefix("/api/cli/") {
+            let resp = cli_route::post(&mut request, &method, tail, state_dir, pm_dir, opts);
+            send(request, resp);
+            return;
+        }
         if is_write {
             let send_write = |req: Request, resp: HttpResp| {
                 read_model::get(state_dir, pm_dir).invalidate();
@@ -1364,6 +1388,17 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     }
                     return;
                 }
+            }
+            // CAD-1006: the nonce-consumed frame document — exact prefix,
+            // ordered before every `/api/app-installations/` arm. The
+            // nonce is the SOLE authority relayed to `app_screen_consume`
+            // (peer guard + burned cap + stored-session liveness + digest/
+            // approval re-proof), so it deliberately does NOT run
+            // `admit_operator_read`.
+            if let Some(nonce) = app_screens::frame_route(&path) {
+                let response = app_screens::frame(&request, state_dir, opts, nonce);
+                send(request, response);
+                return;
             }
             if let Some(route) = app_contexts::route(&path) {
                 if !route.is_read() {

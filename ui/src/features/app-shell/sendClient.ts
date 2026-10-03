@@ -1,4 +1,5 @@
 import { ApiError } from "../../lib/api";
+import { hostErrorText } from "./shared/hostErrors";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { assertRecordId, assertScope, type HostScope } from "./hostActions";
 
@@ -646,9 +647,7 @@ export const sendClient = {
 
 /** Server refusals stay verbatim; transport failures name the retry. */
 export function friendlySendError(error: unknown): string {
-  if (error instanceof ApiError) return error.message;
-  if (error instanceof TypeError) return "The host did not answer — retry.";
-  return "The send request was refused — retry.";
+  return hostErrorText(error, "The send request was refused — retry.");
 }
 
 /** `smtpShow`'s "none bound" refusal is the host's report of an

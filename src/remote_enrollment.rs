@@ -1212,6 +1212,172 @@ pub fn enroll_browser(
     )
 }
 
+/// A verified login: the operator named the slug, and the issuer's grant
+/// echoed exactly the workspace and audience that were requested.
+pub struct LoginGrant {
+    pub organization_id: String,
+    pub slug: String,
+    pub endpoint: String,
+    pub expires_at: u64,
+    token: String,
+}
+
+const CLOUD_SUFFIX: &str = ".cadencecloud.app";
+
+/// A DNS label: lowercase letters, digits and inner hyphens, 1..=63.
+fn slug(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Accept only an owner grant for exactly the requested workspace and
+/// audience (`https://<slug>.cadencecloud.app`), with only `cli.*`
+/// capabilities. The issuer binds slug to workspace itself; the response
+/// carries no slug field.
+fn login_grant(value: &Value, org: &str, slug_value: &str) -> Result<LoginGrant> {
+    let at = now()?;
+    let (principal, credential) = (&value["principal"], &value["credential"]);
+    let caps = value["capabilities"]
+        .as_array()
+        .ok_or_else(|| reject("Invalid hosted login capabilities"))?;
+    let every_cli = !caps.is_empty()
+        && caps.iter().all(|c| {
+            c.as_str()
+                .is_some_and(|s| s.starts_with("cli.") && s.len() <= 32)
+        });
+    let endpoint = format!("https://{slug_value}{CLOUD_SUFFIX}");
+    if field(value, "version")? != VERSION
+        || field(value, "organization_id")? != org
+        || !slug(slug_value)
+        || field(value, "audience")? != endpoint
+        || field(principal, "kind")? != "user"
+        || field(principal, "current_role")? != "owner"
+        || !id(field(principal, "subject_id")?)
+        || !every_cli
+        || field(credential, "token_type")? != "Bearer"
+        || !token(field(credential, "access_token")?, "hct_")
+        || !id(field(credential, "credential_id")?)
+        || timestamp(credential, "issued_at")? > at
+        || timestamp(credential, "expires_at")? <= at
+    {
+        return Err(reject("Issuer grant did not match hosted login consent"));
+    }
+    Ok(LoginGrant {
+        organization_id: org.to_string(),
+        slug: slug_value.to_string(),
+        endpoint,
+        expires_at: timestamp(credential, "expires_at")?,
+        token: field(credential, "access_token")?.to_string(),
+    })
+}
+
+impl LoginGrant {
+    /// Write the `hct_` to `cli-<slug>.json` at 0600 (temp file, then
+    /// rename), separate from `orgs.json`. Never printed.
+    pub fn save_credential(&self, dir: &Path) -> Result<()> {
+        let _guard = lock(dir, true)?;
+        let tmp = dir.join(format!(".cli-{}.tmp", self.slug));
+        let body = serde_json::to_vec(&json!({"version": VERSION,
+            "organization_id": self.organization_id, "audience": self.endpoint,
+            "access_token": self.token, "expires_at": self.expires_at}))
+        .map_err(|e| Error::internal(e.to_string()))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)
+            .map_err(|_| reject("CLI credential path refused"))?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+        fs::rename(&tmp, dir.join(format!("cli-{}.json", self.slug)))?;
+        Ok(())
+    }
+}
+
+/// `cadence login` (CAD-1019 slice 1b): the hosted-cadence device grant
+/// (PKCE, `hcd_` device code, `hct_` bridge) against the operator-pinned
+/// issuer. The operator names the workspace and slug; the request carries
+/// audience `https://<slug>.cadencecloud.app`, and `login_grant` accepts
+/// only a grant that echoes both. Nothing is persisted here: the caller
+/// records the org, then saves.
+pub fn login_browser(
+    issuer: &str,
+    org: &str,
+    slug_value: &str,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<LoginGrant> {
+    let issuer = origin(issuer, cfg!(test))?;
+    if !id(org) || !slug(slug_value) {
+        return Err(reject("Invalid hosted login request"));
+    }
+    let audience = format!("https://{slug_value}{CLOUD_SUFFIX}");
+    private_dir(dir, false)?;
+    let _guard = lock(dir, true)?;
+    require_trusted_issuer(dir, &issuer)?;
+    let access = read_access_ingress(dir, &issuer)?;
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).map_err(|_| reject("Unable to create PKCE verifier"))?;
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
+    confirm_access_ingress(dir, &issuer, &access)?;
+    let (status, code) = post_public_with_access(
+        &issuer,
+        "/v1/hosted-cadence/device/code",
+        json!({"version":DEVICE_VERSION,"organization_id":org,"audience":audience,
+            "client_label":"cadence-cli","requested_capabilities":["cli.read","cli.write"],
+            "code_challenge":challenge}),
+        access.as_ref(),
+    )?;
+    if status != 200 {
+        return Err(reject("Hosted issuer refused device authorization"));
+    }
+    let (device, user, verification, mut interval) = device_code(&code)?;
+    show_code(verification, user)?;
+    let deadline = Instant::now() + Duration::from_secs(timestamp(&code, "expires_in")?);
+    let expired = || reject("Hosted browser authorization expired; start again");
+    let grant = loop {
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        std::thread::sleep(Duration::from_secs(interval));
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        confirm_access_ingress(dir, &issuer, &access)?;
+        let (status, response) = post_public_with_access(
+            &issuer,
+            "/v1/hosted-cadence/device/token",
+            json!({"device_code":device,"code_verifier":verifier}),
+            access.as_ref(),
+        )?;
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        if status == 200 {
+            break response;
+        }
+        match (status, response["error"].as_str()) {
+            (400, Some("authorization_pending")) => {}
+            (400, Some("slow_down")) => interval = interval.saturating_add(5).min(30),
+            (400, Some("access_denied")) => return Err(reject("Hosted browser consent denied")),
+            (400, Some("expired_token")) => return Err(reject("Hosted device code expired")),
+            _ => return Err(reject("Hosted browser grant refused; start again")),
+        }
+    };
+    let grant = login_grant(&grant, org, slug_value)?;
+    confirm_access_ingress(dir, &issuer, &access)?;
+    Ok(grant)
+}
+
 /// Bootstrap only against an explicitly trusted issuer origin. The `hcs_` service
 /// token is read by the CLI from protected stdin, never from an argv or outbox row.
 pub fn enroll(
@@ -1372,6 +1538,7 @@ mod tests {
     use crate::remote_result_outbox::{deliver_with, ResultCommand, ResultOutbox};
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
+    use std::path::PathBuf;
     use std::thread;
 
     const SERVICE: &str = "hcs_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -2669,6 +2836,208 @@ mod tests {
                 "terminal response allowed child request"
             );
             assert!(!dir.join(RECORD).exists());
+        }
+    }
+
+    // --- CAD-1019 slice 1b: `cadence login` device grant ---
+
+    const LOGIN_ENDPOINT: &str = "https://acme.cadencecloud.app";
+
+    /// The AgenticOS device/code request contract (`requestShape` in
+    /// apps/api/src/hosted-cadence/device.ts): exactly these keys, an exact
+    /// HTTPS audience, a 43-char PKCE challenge. Anything else is a 400.
+    fn real_code_request_ok(body: &Value) -> bool {
+        let keys = [
+            "version",
+            "organization_id",
+            "audience",
+            "client_label",
+            "requested_capabilities",
+            "code_challenge",
+        ];
+        body.as_object().is_some_and(|o| {
+            o.len() == keys.len()
+                && keys.iter().all(|k| o.contains_key(*k))
+                && body["version"] == DEVICE_VERSION
+                && body["audience"]
+                    .as_str()
+                    .is_some_and(|a| origin(a, false).is_ok())
+                && body["client_label"]
+                    .as_str()
+                    .is_some_and(|l| (1..=120).contains(&l.len()))
+                && body["code_challenge"]
+                    .as_str()
+                    .is_some_and(|c| c.len() == 43)
+        })
+    }
+
+    /// The real token response (`hostedCadenceExchangeResponseFor`): exactly
+    /// these fields and no `organization_slug`.
+    fn login_grant_body() -> Value {
+        let at = now().unwrap();
+        json!({"version":VERSION,"organization_id":"ws_real","audience":LOGIN_ENDPOINT,
+            "principal":{"kind":"user","subject_id":"user_1","current_role":"owner"},
+            "capabilities":["cli.read","cli.write"],
+            "credential":{"credential_id":"hcp_credential","access_token":BRIDGE,
+                "token_type":"Bearer","issued_at":at,"expires_at":at+120,"renewal":"reexchange"}})
+    }
+
+    /// Drive `login_browser` for slug `acme` against a loopback fake issuer
+    /// that enforces the real request contract, answers any `token_errors`
+    /// in order, then `grant`.
+    fn run_login(
+        grant: Value,
+        token_errors: Vec<&'static str>,
+    ) -> (Result<LoginGrant>, PathBuf, tempfile::TempDir) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut code, body) = public_request(&listener, "/v1/hosted-cadence/device/code");
+            if !real_code_request_ok(&body)
+                || body["organization_id"] != "ws_real"
+                || body["audience"] != LOGIN_ENDPOINT
+                || body["requested_capabilities"] != json!(["cli.read", "cli.write"])
+            {
+                respond_error(&mut code, "invalid_request");
+                return;
+            }
+            respond(&mut code, &browser_code(60));
+            for e in &token_errors {
+                let (mut token, _) = public_request(&listener, "/v1/hosted-cadence/device/token");
+                respond_error(&mut token, e);
+                if matches!(*e, "access_denied" | "expired_token") {
+                    return;
+                }
+            }
+            let (mut token, _) = public_request(&listener, "/v1/hosted-cadence/device/token");
+            respond(&mut token, &grant);
+        });
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        trust(&dir, &issuer);
+        let out = login_browser(&issuer, "ws_real", "acme", &dir, |_, _| Ok(()));
+        server.join().unwrap();
+        (out, dir, root)
+    }
+
+    fn assert_nothing_stored(dir: &Path) {
+        assert!(!dir.join("cli-acme.json").exists());
+        assert!(!dir.join(RECORD).exists());
+    }
+
+    #[test]
+    fn the_fake_issuer_refuses_an_extra_or_missing_request_key() {
+        let ok = json!({"version":DEVICE_VERSION,"organization_id":"ws_real",
+            "audience":LOGIN_ENDPOINT,"client_label":"cadence-cli",
+            "requested_capabilities":["cli.read"],"code_challenge":"A".repeat(43)});
+        assert!(real_code_request_ok(&ok));
+        let mut extra = ok.clone();
+        extra["organization_slug"] = json!("acme");
+        assert!(!real_code_request_ok(&extra));
+        let mut missing = ok.clone();
+        missing.as_object_mut().unwrap().remove("audience");
+        assert!(!real_code_request_ok(&missing));
+    }
+
+    #[test]
+    fn login_sends_the_slug_audience_and_returns_the_verified_org() {
+        let (out, dir, _root) = run_login(login_grant_body(), vec![]);
+        let grant = out.unwrap();
+        assert_eq!(
+            (
+                grant.organization_id.as_str(),
+                grant.slug.as_str(),
+                grant.endpoint.as_str()
+            ),
+            ("ws_real", "acme", LOGIN_ENDPOINT)
+        );
+        // Verification persists nothing; the caller records, then saves.
+        assert_nothing_stored(&dir);
+        grant.save_credential(&dir).unwrap();
+        let cred = dir.join("cli-acme.json");
+        assert_eq!(cred.metadata().unwrap().mode() & 0o777, 0o600);
+        let body: Value = serde_json::from_slice(&fs::read(&cred).unwrap()).unwrap();
+        assert_eq!(body["access_token"], BRIDGE);
+        assert_eq!(body["audience"], LOGIN_ENDPOINT);
+        assert!(!dir.join(RECORD).exists());
+    }
+
+    #[test]
+    fn login_denied_expired_and_slow_down() {
+        let (out, dir, _r) = run_login(login_grant_body(), vec!["access_denied"]);
+        assert!(out.err().unwrap().to_string().contains("denied"));
+        assert_nothing_stored(&dir);
+        let (out, dir, _r) = run_login(login_grant_body(), vec!["expired_token"]);
+        assert!(out.err().unwrap().to_string().contains("expired"));
+        assert_nothing_stored(&dir);
+        // slow_down is not terminal: back off, then the grant lands.
+        let (out, _dir, _r) = run_login(login_grant_body(), vec!["slow_down"]);
+        assert_eq!(out.unwrap().slug, "acme");
+    }
+
+    #[test]
+    fn login_rejects_a_grant_for_a_different_workspace() {
+        // `--org` asked for ws_real; the issuer answers for another one.
+        let mut grant = login_grant_body();
+        grant["organization_id"] = json!("ws_other");
+        let (out, dir, _r) = run_login(grant, vec![]);
+        assert!(out.is_err());
+        assert_nothing_stored(&dir);
+    }
+
+    #[test]
+    fn login_rejects_a_grant_for_a_different_audience() {
+        // The requested audience must come back byte for byte.
+        for audience in [
+            "https://other.cadencecloud.app",
+            "https://acme.cadencecloud.app.evil.test",
+            "https://acme.cadencecloud.app/",
+            "http://acme.cadencecloud.app",
+        ] {
+            let mut grant = login_grant_body();
+            grant["audience"] = json!(audience);
+            let (out, dir, _r) = run_login(grant, vec![]);
+            assert!(out.is_err(), "{audience}");
+            assert_nothing_stored(&dir);
+        }
+    }
+
+    #[test]
+    fn login_refuses_a_slug_that_is_not_one_dns_label_before_any_request() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        for bad in [
+            "evil.example",
+            "acme/x",
+            "Acme",
+            "-acme",
+            "acme-",
+            "",
+            "a_b",
+            "acme:443",
+        ] {
+            // No listener exists: refusal must precede any network call.
+            let out = login_browser("http://127.0.0.1:1", "ws_real", bad, &dir, |_, _| Ok(()));
+            assert!(
+                out.err()
+                    .unwrap()
+                    .to_string()
+                    .contains("Invalid hosted login request"),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_rejects_agent_capabilities_and_non_owner() {
+        let mut agent = login_grant_body();
+        agent["capabilities"] = json!(["bridge.enroll", "results.submit"]);
+        let mut member = login_grant_body();
+        member["principal"]["current_role"] = json!("member");
+        for grant in [agent, member] {
+            let (out, dir, _r) = run_login(grant, vec![]);
+            assert!(out.is_err());
+            assert_nothing_stored(&dir);
         }
     }
 

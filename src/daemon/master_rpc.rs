@@ -86,6 +86,27 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "master_ask_permission",
     "master_peek_grant",
     "master_permission_use",
+    // CAD-1014(b): the master's scoped-chat redeem verbs — a bounded CSV
+    // import and a segment save, each redeeming the operator's own
+    // stamped scoped chat message on the live assigned turn. Narrow
+    // delegated writes, never the operator verbs or a generic app write.
+    "app_record_csv_assistant_import",
+    "app_segment_assistant_save",
+    // CAD-1014(b): the composer-free scoped-chat email draft — the turn
+    // IS the request (no manual mint); one turn one inert proposal.
+    "app_content_assistant_draft",
+    // CAD-1014(b): the scoped-chat reads behind the commits — segment
+    // revision/membership and the CSV preview. Read-only, no claim.
+    "app_segment_assistant_list",
+    "app_segment_assistant_show",
+    "app_record_csv_assistant_preview",
+    // Bounded membership preview over a saved segment — counts + a
+    // bounded sample, never the full list, never a freeze or send.
+    "app_segment_assistant_preview",
+    // The agent's inert pending draft must be discoverable in the
+    // campaign's proposal list before the operator applies it.
+    "app_content_assistant_proposals",
+    "app_content_assistant_proposal_show",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for
@@ -1133,11 +1154,17 @@ impl Shared {
             "permission_used",
             json!({"argv": argv, "cwd": cwd, "use": out["use"].clone(), "code": out["code"].clone()}),
         );
+        // CAD-1076: a command that printed nothing says so — the notice
+        // never implies output the master should look for.
+        let silent = ["stdout", "stderr"]
+            .iter()
+            .all(|k| out[*k].as_str().unwrap_or("").trim().is_empty());
         self.tell_master(
             &format!("use/{}-{}", argv.join(" "), now),
             &format!(
-                "Ran approved command (exit {}): `{}`",
+                "Ran approved command (exit {}{}): `{}`",
                 out["code"].as_i64().unwrap_or(1),
+                if silent { ", no output" } else { "" },
                 argv.join(" ")
             ),
         );
@@ -1721,5 +1748,46 @@ mod tests {
         for closed in ["wiki_mkdir", "wiki_mv", "wiki_rm", "wiki_put_blob"] {
             assert!(!master_may_call(closed), "{closed} must stay refused");
         }
+    }
+
+    /// CAD-1009: delivering the turn token to the master widens nothing.
+    /// The operator-only scoped verbs stay off its method allowlist, and
+    /// the `app_*` methods it holds are exactly the assistant set — an
+    /// allowlist, so a new verb must be named here to be reachable.
+    #[test]
+    fn delivered_turn_token_reaches_only_the_assistant_verbs() {
+        for operator_only in [
+            "app_record_csv_confirm",
+            "app_record_csv_preview",
+            "app_record_csv_import",
+            "app_segment_save",
+            "app_content_approve",
+            "app_content_apply",
+            "app_content_send",
+            "app_audience_freeze",
+            "app_campaign_freeze",
+        ] {
+            assert!(!master_may_call(operator_only), "{operator_only}");
+        }
+        let mut held: Vec<&str> = MASTER_ALLOWED
+            .iter()
+            .copied()
+            .filter(|m| m.starts_with("app_"))
+            .collect();
+        held.sort_unstable();
+        assert_eq!(
+            held,
+            [
+                "app_content_assistant_draft",
+                "app_content_assistant_proposal_show",
+                "app_content_assistant_proposals",
+                "app_record_csv_assistant_import",
+                "app_record_csv_assistant_preview",
+                "app_segment_assistant_list",
+                "app_segment_assistant_preview",
+                "app_segment_assistant_save",
+                "app_segment_assistant_show",
+            ]
+        );
     }
 }

@@ -1,7 +1,8 @@
 //! The AgenticOS external provider door, separate from its hosted publisher.
 //! Only app-run capability authority may execute these fixed, reviewed tools.
 //! External tokens stay in custody; the upstream door derives their company.
-//! Trusted hosted media instead uses the fixed lease-owned door with no bearer.
+//! Trusted hosted media and source reads (CAD-868, CAD-1060) instead use the
+//! fixed lease-owned door with no bearer; the Worker derives the company.
 mod image;
 pub mod media_import;
 pub mod publish;
@@ -103,12 +104,8 @@ impl AgenticosExternalAdapter {
             .http_status_as_error(false)
             .max_redirects(0)
             .build();
-        let mut table =
-            ToolTable::from_json(&serde_json::from_str(TABLE_JSON).expect("table JSON"))
-                .expect("reviewed tool table");
-        if transport == Transport::HostedMediaLease {
-            table.tools.retain(|tool| tool.tool == IMAGE_TOOL);
-        }
+        let table = ToolTable::from_json(&serde_json::from_str(TABLE_JSON).expect("table JSON"))
+            .expect("reviewed tool table");
         let adapter = Self {
             table,
             transport,
@@ -144,8 +141,9 @@ impl AgenticosExternalAdapter {
     }
 
     /// Hosted custody is empty and the bound account is actually builtin.
-    /// This runs before every price/submit request, independent of the broker.
-    fn media_token<'a>(
+    /// This runs before every quote, call, price and submit request,
+    /// independent of the broker.
+    fn lease_token<'a>(
         &self,
         credential: &'a [u8],
         config: &Value,
@@ -158,7 +156,7 @@ impl AgenticosExternalAdapter {
                     || config["connection_kind"] != "builtin"
                 {
                     return Err(
-                        "hosted media requires the credentialless builtin hosted account".into(),
+                        "hosted lease requires the credentialless builtin hosted account".into(),
                     );
                 }
                 Ok(None)
@@ -175,12 +173,9 @@ impl AgenticosExternalAdapter {
         cap: u64,
         err: &'static str,
     ) -> std::result::Result<(u16, Value), String> {
-        let request = self.http.get(url);
-        let request = match token {
-            Some(token) => request.header("authorization", &format!("Bearer {token}")),
-            None => request,
-        };
-        let mut response = request.call().map_err(|_| err.to_owned())?;
+        let mut response = authorized(self.http.get(url), token)
+            .call()
+            .map_err(|_| err.to_owned())?;
         let status = response.status().as_u16();
         let bytes = response
             .body_mut()
@@ -197,9 +192,6 @@ impl AgenticosExternalAdapter {
         credential: &[u8],
         binding: &Value,
     ) -> std::result::Result<(u64, String), String> {
-        if self.transport == Transport::HostedMediaLease {
-            return Err("hosted media does not expose source actions".into());
-        }
         let config = &binding["config"];
         let mapping = &config["mapping"];
         if config["provider"] != PLATFORM
@@ -221,16 +213,9 @@ impl AgenticosExternalAdapter {
             }
             _ => return Err("provider quote names an unreviewed action".into()),
         };
-        let token = std::str::from_utf8(credential)
-            .map_err(|_| "AgenticOS provider credential is invalid UTF-8")?;
-        if token.is_empty() || token.len() > 8192 || token.chars().any(char::is_whitespace) {
-            return Err("AgenticOS provider credential has an invalid shape".into());
-        }
+        let token = self.lease_token(credential, config)?;
         let url = format!("{}/v1/runtime/tools/{tool}", self.base);
-        let mut response = self
-            .http
-            .get(&url)
-            .header("authorization", &format!("Bearer {token}"))
+        let mut response = authorized(self.http.get(&url), token)
             .call()
             .map_err(|_| "AgenticOS provider quote could not reach the provider")?;
         let status = response.status().as_u16();
@@ -268,15 +253,8 @@ impl AgenticosExternalAdapter {
         input: &Value,
         idempotency_key: &str,
     ) -> std::result::Result<Value, String> {
-        if self.transport == Transport::HostedMediaLease {
-            return Err("hosted media does not expose source actions".into());
-        }
         let handle = validate_source_authority(authority, input)?;
-        let token = std::str::from_utf8(credential)
-            .map_err(|_| "AgenticOS provider credential is invalid UTF-8")?;
-        if token.is_empty() || token.len() > 8192 || token.chars().any(char::is_whitespace) {
-            return Err("AgenticOS provider credential has an invalid shape".into());
-        }
+        let token = self.lease_token(credential, &authority["binding"]["config"])?;
         if idempotency_key.len() < 8
             || idempotency_key.len() > 200
             || !idempotency_key
@@ -287,10 +265,7 @@ impl AgenticosExternalAdapter {
         }
         let url = format!("{}{CALL_PATH}", self.base);
         let ceiling = frozen_charge_ceiling(authority)?;
-        let mut response = self
-            .http
-            .post(&url)
-            .header("authorization", &format!("Bearer {token}"))
+        let mut response = authorized(self.http.post(&url), token)
             .header("idempotency-key", idempotency_key)
             .send_json(json!({
                 "slug": POSTS_TOOL,
@@ -377,7 +352,7 @@ impl AgenticosExternalAdapter {
         {
             return Err("provider quote names an unreviewed action".into());
         }
-        let token = self.media_token(credential, config)?;
+        let token = self.lease_token(credential, config)?;
         let (status, envelope) = self.get_media(
             &format!("{}{MEDIA_PRICE_PATH}", self.base),
             token,
@@ -459,16 +434,12 @@ impl AgenticosExternalAdapter {
         // The frozen quote still proves shape (schema/currency/units); its
         // amount is recorded, never enforced as a charge ceiling.
         let quoted = frozen_charge_ceiling(authority)?;
-        let token = self.media_token(credential, &authority["binding"]["config"])?;
+        let token = self.lease_token(credential, &authority["binding"]["config"])?;
         if !valid_caller_key(idempotency_key) {
             return Err("provider idempotency key is invalid".into());
         }
         let request = self.http.post(format!("{}{MEDIA_SUBMIT_PATH}", self.base));
-        let request = match token {
-            Some(token) => request.header("authorization", &format!("Bearer {token}")),
-            None => request,
-        };
-        let mut response = request
+        let mut response = authorized(request, token)
             .header("idempotency-key", idempotency_key)
             .send_json(json!({
                 "model": IMAGE_MODEL,
@@ -584,11 +555,7 @@ impl AgenticosExternalAdapter {
         let request = self
             .http
             .get(format!("{}{MEDIA_ARTIFACTS_PATH}{artifact_ref}", self.base));
-        let request = match token {
-            Some(token) => request.header("authorization", &format!("Bearer {token}")),
-            None => request,
-        };
-        let mut response = request
+        let mut response = authorized(request, token)
             .call()
             .map_err(|_| "AgenticOS media artifact read failed")?;
         if response.status().as_u16() != 200 {
@@ -634,6 +601,14 @@ impl AgenticosExternalAdapter {
                 bytes: asset_bytes,
             }),
         })
+    }
+}
+
+/// The hosted lease door takes no bearer; the external door always has one.
+fn authorized<B>(request: ureq::RequestBuilder<B>, token: Option<&str>) -> ureq::RequestBuilder<B> {
+    match token {
+        Some(token) => request.header("authorization", &format!("Bearer {token}")),
+        None => request,
     }
 }
 
@@ -1020,15 +995,11 @@ impl PlatformAdapter for AgenticosExternalAdapter {
             ],
         };
         if self.transport == Transport::HostedMediaLease {
-            descriptor.revision = "agenticos-hosted-media-connections/1".into();
+            // CAD-1060: the same lease door also serves the source read, so
+            // the revision moves and every media-only hosted binding stales.
+            descriptor.revision = "agenticos-hosted-connections/2".into();
             descriptor.enrollment_shapes.clear();
             descriptor.builtin_accounts = vec!["hosted".into()];
-            descriptor
-                .capabilities
-                .retain(|capability| capability.id == "media.generate");
-            descriptor
-                .action_mappings
-                .retain(|mapping| mapping.capability == "media.generate");
         }
         Some(descriptor)
     }
@@ -1861,6 +1832,8 @@ mod tests {
             assert_eq!(seen.iter().filter(|r| r.method == "POST").count(), 1);
         }
     }
+
+    mod hosted_source;
 
     /// Poll, deadline and drift paths need the short test-seam clock.
     #[cfg(feature = "test-seam")]

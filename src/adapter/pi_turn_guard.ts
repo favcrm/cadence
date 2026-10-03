@@ -3,11 +3,29 @@
 // No socket, credential access, timers, model calls or resource side effects.
 import { VERSION } from "@earendil-works/pi-coding-agent";
 
+// CAD-1076: never hand the provider an empty text block. A command that
+// printed nothing, an empty prompt or blank text becomes one stable
+// placeholder; strict gateways refuse empty text, and a refused history
+// is refused on every later call of the session.
+const EMPTY_TEXT = "(no output)";
+const blank = block => block?.type === "text" && !String(block.text ?? "").trim();
+const filled = content => typeof content === "string"
+  ? (content.trim() ? content : EMPTY_TEXT)
+  : !Array.isArray(content) ? content
+  : content.some(block => !blank(block)) ? content.filter(block => !blank(block))
+  : [{ type: "text", text: EMPTY_TEXT }];
+const nonEmpty = messages => (Array.isArray(messages) ? messages : []).map(message =>
+  ["user", "toolResult", "custom"].includes(message?.role)
+    ? { ...message, content: filled(message.content) } : message);
+
 export default function install(pi) {
   // These semantics were verified on this exact runtime: awaited lifecycle
   // boundaries and synchronous streaming custom-message queue admission.
   // An upgrade must be validated, not silently granted this capability.
-  if (VERSION !== "1.0.0") return;
+  if (VERSION !== "1.0.0") {
+    pi.on("context", event => ({ messages: nonEmpty(event.messages) }));
+    return;
+  }
   let pending = null;
   let current = null;
   let accepting = false;
@@ -41,9 +59,9 @@ export default function install(pi) {
   // or history. The adapter clears the queue before dispatching a successor;
   // this projection also excludes old guidance from every later model input.
   pi.on("context", event => ({
-    messages: Array.isArray(event.messages) ? event.messages.filter(message =>
+    messages: nonEmpty(Array.isArray(event.messages) ? event.messages.filter(message =>
       message.role !== "custom" || message.customType !== "cadence-turn-guidance"
-      || (current !== null && message.details?.turn === current)) : [],
+      || (current !== null && message.details?.turn === current)) : []),
   }));
 
   const receipt = (operation, request, turn, outcome, reason = null) => {

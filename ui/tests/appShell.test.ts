@@ -113,8 +113,8 @@ const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/app-installations/install-shell" });
 for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
-for (const name of ["addEventListener", "removeEventListener"])
-  Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
+for (const name of ["addEventListener", "removeEventListener", "requestAnimationFrame", "cancelAnimationFrame"])
+  Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true, writable: true });
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
 let eventSources = 0;
@@ -141,6 +141,9 @@ const { createRoot } = require("react-dom/client") as typeof import("react-dom/c
 const AppShellModule = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell"));
 const AppShell = AppShellModule.default;
 const entryApp = AppShellModule.entryApp;
+// Context moves ride real URL writes — the same `navigate` the shell
+// uses, so tests exercise adoption exactly like a pasted link.
+const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 // Only a daemon-stamped binding renders: browser claims never do.
 // The stamp trims to ids — revision/digest stay server-side.
 equal(
@@ -160,6 +163,10 @@ const generic = {
 };
 const social = { ...generic, install_id: "install-social", title: "Social Content", name: "social-content" };
 const second = { ...generic, install_id: "install-second", title: "Second", name: "reports" };
+const crm = { ...generic, install_id: "install-crm", title: "CRM", name: "crm" };
+// A CRM install with two active scopes — proves the bound scope still
+// hides every switch link (CAD-1008) while the unbound state keeps them.
+const crmMulti = { ...generic, install_id: "install-crm-multi", title: "CRM Multi", name: "crm" };
 const contextsFor: Record<string, unknown> = {
   "install-shell": { contexts: [
     { id: "ctx-a", install_id: "install-shell", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
@@ -171,6 +178,13 @@ const contextsFor: Record<string, unknown> = {
   "install-social": { contexts: [
     { id: "ctx-brand", install_id: "install-social", revision: 1, state: "active", digest: "cs", config: { schema: 1, label: "Brand", input_defaults: {} } },
     { id: "ctx-beta", install_id: "install-social", revision: 1, state: "active", digest: "cb2", config: { schema: 1, label: "Beta brand", input_defaults: {} } },
+  ] },
+  "install-crm": { contexts: [
+    { id: "ctx-a", install_id: "install-crm", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
+  ] },
+  "install-crm-multi": { contexts: [
+    { id: "ctx-a", install_id: "install-crm-multi", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
+    { id: "ctx-b", install_id: "install-crm-multi", revision: 1, state: "active", digest: "cb", config: { schema: 1, label: "Beta", input_defaults: {} } },
   ] },
 };
 const thread = {
@@ -196,7 +210,24 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (path === "/api/app-installations/install-shell/contexts") return json(contextsFor["install-shell"]);
   if (path === "/api/app-installations/install-second/contexts") return json(contextsFor["install-second"]);
   if (path === "/api/app-installations/install-social/contexts") return json(contextsFor["install-social"]);
+  if (path === "/api/app-installations/install-crm") return json(crm);
+  if (path === "/api/app-installations/install-crm/contexts") return json(contextsFor["install-crm"]);
+  if (path === "/api/app-installations/install-crm-multi") return json(crmMulti);
+  if (path === "/api/app-installations/install-crm-multi/contexts") return json(contextsFor["install-crm-multi"]);
   if (path.startsWith("/api/threads/master")) return json(thread);
+  // CRM section reads: empty server receipts only — the mounted
+  // dedupe assertions below exercise real list/new/detail paths, so
+  // every section must answer its own read with the host's shape.
+  const url = new URL(path, "http://localhost");
+  if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
+  if (url.pathname === "/api/crm-send/origin") return json({ unsubscribe_origin: null, stored: false });
+  if (url.pathname.endsWith("/records")) return json({ records: [], truncated: false, next_cursor: null });
+  if (url.pathname.endsWith("/segments/list")) return json({ segments: [] });
+  if (url.pathname.endsWith("/exclusions/list")) return json({ exclusions: [] });
+  if (url.pathname.endsWith("/suppressions/list")) return json({ suppressions: [] });
+  if (url.pathname.endsWith("/content/campaigns/list")) return json({ contents: [] });
+  if (url.pathname.endsWith("/content/proposals/list")) return json({ proposals: [] });
+  if (url.pathname.endsWith("/sender-bindings/list")) return json({ bindings: [] });
   throw new Error(`Unexpected read ${path}`);
 }) as typeof fetch;
 
@@ -238,15 +269,15 @@ await React.act(async () => {
   root.render(React.createElement(AppShell, { installId: "install-shell", viewer: { operator: true, readOnly: false } }));
 });
 await flush(); await flush(); await flush();
-assert(text().includes("Apps") && text().includes("Reports"), "nested Apps → installed App breadcrumb");
+assert(text().includes("All apps") && text().includes("Reports"), "← All apps back-link plus installed App title, deduped");
 assert(text().includes("No records yet"), "generic outlet is truthfully empty, never fake rows");
 assert(text().includes("not installed yet") && !text().includes("CAD-781"), "non-CRM outlet copy stays neutral");
 assert(text().includes("Master answer stays connected"), "the left pane shows the real master thread");
-assert(text().includes("✓ ctx-a"), "the read-back verified stamp renders, never a sent claim");
+assert(!text().includes("ctx-a"), "CAD-1051: internal context ids never render in the chat");
 equal(panes(), 1, "exactly one chat pane in the document");
 equal(boxes(), 1, "exactly one chat draft box id in the document");
 equal(eventSources, 1, "exactly one SSE subscription for the shell");
-assert(host.querySelector('[aria-label="App context"]'), "verified context selector is present");
+assert(!host.querySelector('[aria-label="App context"]'), "context selector removed — context follows URL only");
 
 // Drawer keyboard: toggle opens into the pane, Escape closes back to
 // the trigger, the closed drawer keeps no tab stop yet keeps the draft.
@@ -256,6 +287,9 @@ equal(toggle.getAttribute("aria-expanded"), "false", "drawer starts closed");
 assert(!host.querySelector("#app-shell-chat")?.hasAttribute("data-open"), "closed drawer carries no open marker");
 await click(toggle);
 equal(toggle.getAttribute("aria-expanded"), "true", "drawer opens with accessible state");
+// Focus is deferred two frames so it lands after the pointer/keyboard
+// activation's own focus; flush lets each queued frame run.
+await flush(); await flush(); await flush();
 assert(document.activeElement?.id === "app-shell-chat-box", "opening moves focus into the pane");
 await fill("#app-shell-chat-box", "unsent shell draft");
 await React.act(async () => {
@@ -265,16 +299,59 @@ await flush();
 equal(toggle.getAttribute("aria-expanded"), "false", "Escape closes the drawer");
 assert(document.activeElement === toggle, "closing returns focus to the trigger");
 equal(eventSources, 1, "drawer cycles open no second stream");
+// Controlled-frame proof that closing mid-deferral cancels the queued
+// composer focus instead of stealing it back. Capture the rAF queue so
+// we can run the outer frame (which schedules the inner focus frame),
+// close before the inner frame fires, then prove the pending inner
+// frame was cancelled — the composer is never focused after close.
+const rafQueue = new Map<number, FrameRequestCallback>();
+let rafNext = 0;
+const cancelled = new Set<number>();
+const realRaf = globalThis.requestAnimationFrame;
+const realCaf = globalThis.cancelAnimationFrame;
+globalThis.requestAnimationFrame = ((cb: FrameRequestCallback) => {
+  const id = ++rafNext;
+  rafQueue.set(id, cb);
+  return id;
+}) as typeof requestAnimationFrame;
+globalThis.cancelAnimationFrame = ((id: number) => {
+  cancelled.add(id);
+  rafQueue.delete(id);
+}) as typeof cancelAnimationFrame;
+try {
+  await React.act(async () => {
+    toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  equal(toggle.getAttribute("aria-expanded"), "true", "drawer open before the deferred frame runs");
+  // The outer rAF is queued; run it so it schedules the inner focus frame.
+  equal(rafQueue.size, 1, "one outer frame queued");
+  const outerCb = rafQueue.get(1)!;
+  rafQueue.delete(1);
+  await React.act(async () => { outerCb(performance.now()); });
+  equal(rafQueue.size, 1, "outer frame queued the inner focus frame");
+  // Close before the inner focus frame fires.
+  await React.act(async () => {
+    toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  equal(toggle.getAttribute("aria-expanded"), "false", "closed before the focus frame");
+  assert(cancelled.has(2), "the pending inner focus frame was cancelled on close");
+  equal(rafQueue.size, 0, "no frame survives to refocus after close");
+  assert(document.activeElement === toggle, "focus returned to the trigger, never the composer");
+} finally {
+  globalThis.requestAnimationFrame = realRaf;
+  globalThis.cancelAnimationFrame = realCaf;
+}
 await click(toggle);
 equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value, "unsent shell draft", "one pane keeps one draft across close/open");
 await click(toggle);
 
 // Chat sends carry the verified-scope request; refusal would surface.
-// (Two active contexts and no preference select none — pick one first.)
-await click(host.querySelector('[aria-label="App context"]'));
-await click(Array.from(document.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes("Acme")));
+// Context is adopted from the URL — no selector needed.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a"); });
 await flush();
-assert(location.search.includes("ctx=ctx-a"), "picking a context binds it in the URL");
+assert(location.search.includes("ctx=ctx-a"), "context is adopted from the URL");
 posts.length = 0;
 await fill("#app-shell-chat-box", "scoped question");
 await click(host.querySelector(".app-chat-form button[type=submit]"));
@@ -284,16 +361,13 @@ assert(chatPost, "chat send posted");
 equal(chatPost?.body.app, { install_id: "install-shell", context_id: "ctx-a" }, "send binds the selected scope, never actor claims");
 assert(!("actor" in (chatPost?.body ?? {})) && !("verified" in (chatPost?.body ?? {})), "send carries no authority claim");
 
-// Outlet navigation: New view + typed draft, then a context switch
+// Outlet navigation: New view + typed draft, then a URL context change
 // clears the view, the selection and the unsaved draft.
 const newTab = Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "New");
 await click(newTab);
 assert(location.search.includes("appview=new"), "New view lands in the URL for direct links");
 await fill("#app-outlet-draft", "typed outlet draft");
-const ctxButton = host.querySelector('[aria-label="App context"]') as HTMLButtonElement;
-await click(ctxButton);
-const beta = Array.from(document.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes("Beta"));
-await click(beta);
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-b"); });
 await flush();
 assert(!location.search.includes("appview="), "context switch returns the outlet to the list");
 assert(!location.search.includes("record="), "context switch clears the stale selection");
@@ -301,6 +375,151 @@ assert(location.search.includes("ctx=ctx-b"), "context switch binds the new scop
 const newTab2 = Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "New");
 await click(newTab2);
 equal((host.querySelector("#app-outlet-draft") as HTMLInputElement)?.value, "", "unsaved draft dies with the context switch");
+
+// Authored cross-context links keep their params verbatim: a URL
+// carrying ctx+record together is a deep link for that ctx — record
+// ids are scoped per-context, so the same id may legitimately exist
+// under a different scope. Adoption must not strip it.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a&record=rec-1"); });
+await flush(); await flush();
+assert(location.search.includes("record=rec-1"), "deep link lands its record");
+assert(text().includes("Record details"), "record drawer opens on the deep link");
+// An authored ctx+record link for a different context keeps its record.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-b&record=rec-2"); });
+await flush(); await flush();
+assert(location.search.includes("ctx=ctx-b") && location.search.includes("record=rec-2"), "cross-context record link is preserved");
+assert(text().includes("Record details"), "the new context's record opens");
+// An authored cross-context New-view link keeps its view too.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a&appview=new"); });
+await flush(); await flush();
+assert(location.search.includes("ctx=ctx-a") && location.search.includes("appview=new"), "cross-context New view link is preserved");
+assert(host.querySelector("#app-outlet-draft"), "the New form opens for the linked scope");
+// A context-only transition (the scoped-entry link shape: bare ctx,
+// no record/appview) lands clean — the carry state was cleared at the
+// link origin, not guessed at adoption.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-b"); });
+await flush(); await flush();
+assert(!location.search.includes("record=") && !location.search.includes("appview="), "a bare ctx link carries no stale record/view");
+// Browser back restores the prior authored entry (ctx-a + New view).
+history.back();
+await flush(); await flush();
+assert(location.search.includes("ctx=ctx-a") && location.search.includes("appview=new"), "browser back restores the authored New-view scope");
+
+// Scoped entry: an unselected multi-context install offers one
+// `?ctx=` link per active context — explicit, never a silent default.
+// Clear the remembered preference so the multi-context install lands
+// genuinely unscoped, like a fresh browser.
+win.sessionStorage.removeItem("cadence.workspace-app.context.install-shell");
+await React.act(async () => { navigate("/app-installations/install-shell"); });
+await flush(); await flush();
+assert(location.search === "" || !location.search.includes("ctx="), "no silent context is picked");
+const scopeLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>("[data-scope-link]"));
+equal(scopeLinks.length, 2, "one scoped-entry link per active context");
+assert(scopeLinks.every((a) => a.getAttribute("href")?.includes("ctx=")), "every entry is a real ?ctx= link");
+const acmeEntry = scopeLinks.find((a) => a.getAttribute("data-scope-link") === "ctx-a");
+assert(acmeEntry, "scoped entry exists for ctx-a");
+await click(acmeEntry);
+assert(location.search.includes("ctx=ctx-a"), "scoped entry lands its context in the URL");
+// The links stay after a scope binds: a compact switch keeps every
+// active context reachable without hand-editing the URL — the
+// regression the removed header picker introduced. The bound context
+// carries aria-current instead of disappearing.
+const switchLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>("[data-scope-link]"));
+equal(switchLinks.length, 2, "context links stay reachable once a scope is bound");
+assert(switchLinks.every((a) => a.getAttribute("href")?.includes("ctx=")), "switch entries stay real ?ctx= links");
+const betaEntry = switchLinks.find((a) => a.getAttribute("data-scope-link") === "ctx-b");
+assert(betaEntry, "the other context stays linkable once a scope is bound");
+equal(
+  host.querySelector('[data-scope-link="ctx-a"]')?.getAttribute("aria-current"),
+  "page",
+  "the bound context carries aria-current",
+);
+assert(
+  !host.querySelector('[data-scope-link="ctx-b"]')?.hasAttribute("aria-current"),
+  "unselected contexts carry no aria-current",
+);
+await click(betaEntry);
+assert(location.search.includes("ctx=ctx-b"), "the switch rebinds the new scope in the URL");
+assert(!location.search.includes("appview=") && !location.search.includes("record="), "the switch clears any stale record/view");
+assert((host.textContent ?? "").includes("Beta · 0.1.0"), "the header label follows the switched context");
+
+// The bound context's own link is a same-URL no-op: re-selecting the
+// already-bound scope is not a context switch, so the URL, the open
+// New view and an unsaved draft all survive the click. The href is
+// still a real link to the current page — never a dead control.
+const selfNewTab = Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "New");
+await click(selfNewTab);
+assert(location.search.includes("ctx=ctx-b") && location.search.includes("appview=new"), "New view opens on the bound context");
+await fill("#app-outlet-draft", "same-context draft survives");
+equal(
+  host.querySelector('[data-scope-link="ctx-b"]')?.getAttribute("href"),
+  "/app-installations/install-shell?ctx=ctx-b&appview=new",
+  "the bound context's link resolves to the current URL",
+);
+await click(host.querySelector('[data-scope-link="ctx-b"]'));
+assert(
+  location.search.includes("ctx=ctx-b") && location.search.includes("appview=new"),
+  "clicking the bound context keeps the query and the New view",
+);
+equal(
+  (host.querySelector("#app-outlet-draft") as HTMLInputElement)?.value,
+  "same-context draft survives",
+  "the unsaved draft survives the same-context click",
+);
+assert(
+  host.querySelector('[data-scope-link="ctx-b"]')?.getAttribute("aria-current") === "page",
+  "the bound link keeps aria-current after the no-op click",
+);
+// A different context still switches and clears both view and draft.
+await click(host.querySelector('[data-scope-link="ctx-a"]'));
+assert(location.search.includes("ctx=ctx-a"), "switching to ctx-a rebinds the scope");
+assert(!location.search.includes("appview=") && !location.search.includes("record="), "the different-context switch clears view and record");
+const selfNewTab2 = Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "New");
+await click(selfNewTab2);
+equal(
+  (host.querySelector("#app-outlet-draft") as HTMLInputElement)?.value,
+  "",
+  "the draft died on the real context switch",
+);
+// The same no-op holds with a record open: an authored record link
+// under the bound scope keeps its drawer through a self-click.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a&record=rec-7"); });
+await flush(); await flush();
+assert(location.search.includes("record=rec-7"), "record link lands under the bound context");
+assert(text().includes("Record details"), "the record drawer opens");
+equal(
+  host.querySelector('[data-scope-link="ctx-a"]')?.getAttribute("href"),
+  "/app-installations/install-shell?ctx=ctx-a&record=rec-7",
+  "the bound link still resolves to the current URL with a record open",
+);
+await click(host.querySelector('[data-scope-link="ctx-a"]'));
+assert(
+  location.search.includes("ctx=ctx-a") && location.search.includes("record=rec-7"),
+  "same-context click keeps the record selection",
+);
+assert(text().includes("Record details"), "the record drawer stays open");
+
+// A remembered context (sessionStorage) no longer traps the operator:
+// the switch stays rendered and clicking through clears stale state.
+win.sessionStorage.setItem("cadence.workspace-app.context.install-shell", "ctx-a");
+await React.act(async () => { navigate("/app-installations/install-shell"); });
+await flush(); await flush();
+assert(location.search === "" || !location.search.includes("ctx="), "a remembered context needs no ?ctx in the URL");
+assert((host.textContent ?? "").includes("Acme · 0.1.0"), "the remembered context binds without a URL param");
+const rememberedLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>("[data-scope-link]"));
+equal(rememberedLinks.length, 2, "the switch still renders under a remembered context");
+const rememberedBeta = rememberedLinks.find((a) => a.getAttribute("data-scope-link") === "ctx-b");
+assert(rememberedBeta, "ctx-b stays linkable while ctx-a is remembered");
+// Stale outlet state on the remembered scope: a carried record and a
+// New view both die on the switch, matching the scoped-entry contract.
+await React.act(async () => { navigate("/app-installations/install-shell?appview=new&record=rec-stale"); });
+await flush(); await flush();
+assert(host.querySelector("#app-outlet-draft"), "stale New view mounts for the remembered context");
+await click(rememberedBeta);
+assert(location.search.includes("ctx=ctx-b"), "switching under a remembered context binds the new scope");
+assert(!location.search.includes("record=") && !location.search.includes("appview="), "switching clears the stale record and view");
+assert((host.textContent ?? "").includes("Beta · 0.1.0"), "the switched context renders its own label");
+win.sessionStorage.removeItem("cadence.workspace-app.context.install-shell");
 
 // A context-bound direct link restores scope; browser back keeps it.
 history.pushState(null, "", "/app-installations/install-shell?ctx=ctx-a&record=rec-9");
@@ -334,6 +553,8 @@ await React.act(async () => {
 await flush(); await flush(); await flush();
 assert(!location.search.includes("record=") && !location.search.includes("ctx="), "install switch strips stale outlet query");
 assert(text().includes("Second"), "new installation renders");
+// A single-context install keeps the switch hidden — no link clutter.
+assert(!host.querySelector("[data-scope-link]"), "single-context installs render no switch links");
 equal(panes(), 1, "install switch keeps one chat pane");
 equal(eventSources, 1, "install switch opens no second stream");
 assert(text().includes("Scoped follow-up"), "install switch keeps the live thread");
@@ -376,9 +597,15 @@ await React.act(async () => {
   }));
 });
 await flush(); await flush(); await flush();
-assert(!host.querySelector('[aria-label="App context"]'), "no second shell selector beside the workspace one");
+assert(!host.querySelector('[aria-label="App context"]'), "no shell selector — social workspace owns its own");
 assert(host.querySelector("#brand"), "the workspace keeps its own selector");
-assert(text().includes("managed inside the workspace screen"), "shell display defers to the workspace owner");
+// The Social private screen renders its own chrome — the shell must NOT
+// emit the technical `installId · version · context` subtitle.
+assert(
+  !text().includes("managed inside the workspace screen") &&
+    !text().includes("install-social · 0.1.0"),
+  "shell emitted the removed Social technical subtitle",
+);
 posts.length = 0;
 await fill("#app-shell-chat-box", "stale scope question");
 await click(host.querySelector(".app-chat-form button[type=submit]"));
@@ -407,7 +634,7 @@ await React.act(async () => {
   root.render(React.createElement(AppShell, { installId: "install-second", viewer: { operator: true, readOnly: false } }));
 });
 await settle(() => assert(
-  host.querySelector('[aria-label="App context"]')?.textContent?.includes("Only"),
+  host.textContent?.includes("Only"),
   "second install adopts its sole active context",
 ));
 posts.length = 0;
@@ -418,7 +645,299 @@ const secondPost = posts.find((p) => p.path === "/api/threads/master/messages");
 assert(secondPost, "second install send posted");
 equal(secondPost?.body.app, { install_id: "install-second", context_id: "ctx-only" }, "install switch clears stale social scope");
 
+// Cold deep links (CAD-863, browser blocker): a fresh mount of the
+// real URL — no manual selection, no same-key navigation — must adopt
+// the authored scope exactly once receipts land. Fresh mounts exercise
+// the async detail→contexts→adopt path a first-render adoption never
+// sees. The viewer.operator false→true transition is covered at the
+// end of the block.
+// The long-lived root above ends on install-second; unmount it so the
+// cold mounts below are the only live shell and carry no install-
+// switch or remembered-scope residue from the earlier flow.
 await React.act(async () => { root.unmount(); });
+win.sessionStorage.clear();
+async function mountColdCold(url: string, install: string) {
+  const hostEl = document.createElement("div");
+  document.body.append(hostEl);
+  const cold = createRoot(hostEl);
+  history.pushState(null, "", url);
+  await React.act(async () => {
+    cold.render(React.createElement(AppShell, { installId: install, viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert((hostEl.textContent ?? "").includes("Reports"), `cold mount renders: ${url}`));
+  await flush(); await flush();
+  return { hostEl, cold };
+}
+
+// Canonical link: every authored param survives and the scope binds.
+{
+  const { hostEl, cold } = await mountColdCold(
+    "/app-installations/install-shell?ctx=ctx-a&crm=customers&record=rec-1",
+    "install-shell",
+  );
+  // The adopted label "<label> · version" distinguishes adoption from
+  // the un-adopted scope picker (which also prints context labels as
+  // link text). Assert the bound label, not the picker's options.
+  assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), "cold ctx+record link adopts the authored context");
+  assert(!(hostEl.textContent ?? "").includes("No context ·"), "cold ctx+record link does not fall back to the scope picker");
+  assert((hostEl.textContent ?? "").includes("Record details"), "cold ctx+record link opens the record");
+  assert(location.search.includes("ctx=ctx-a") && location.search.includes("record=rec-1"), "cold link params survive adoption");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// Explicit default section: `crm=customers` is already canonical — it
+// must not be rewritten, and the ctx must adopt alongside it.
+{
+  const { hostEl, cold } = await mountColdCold(
+    "/app-installations/install-shell?ctx=ctx-a&crm=customers",
+    "install-shell",
+  );
+  assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), "explicit crm=customers cold link adopts the context");
+  assert(!(hostEl.textContent ?? "").includes("No context ·"), "explicit crm=customers does not fall back to the scope picker");
+  assert(location.search.includes("ctx=ctx-a"), "explicit crm=customers keeps the ctx");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// Unknown section: only `crm` normalizes — the authored ctx and
+// record still adopt, and no record from another scope can be
+// displayed under this URL (the ctx-bound drawer keys the load).
+{
+  const { hostEl, cold } = await mountColdCold(
+    "/app-installations/install-shell?ctx=ctx-a&crm=bogus&record=rec-2",
+    "install-shell",
+  );
+  assert(!location.search.includes("crm="), "unknown crm section is stripped");
+  assert(location.search.includes("ctx=ctx-a"), "unknown crm keeps the authored ctx");
+  assert(location.search.includes("record=rec-2"), "unknown crm keeps the authored record");
+  assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), "unknown crm still adopts the context");
+  assert(!(hostEl.textContent ?? "").includes("No context ·"), "unknown crm does not fall back to the scope picker");
+  assert((hostEl.textContent ?? "").includes("Record details"), "unknown crm keeps the ctx-bound record");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// Malformed record: only the record is stripped — the authored ctx
+// adopts rather than dropping the whole link.
+{
+  const { hostEl, cold } = await mountColdCold(
+    "/app-installations/install-shell?ctx=ctx-b&record=../escape",
+    "install-shell",
+  );
+  assert(!location.search.includes("record="), "malformed record id is stripped");
+  assert(location.search.includes("ctx=ctx-b"), "malformed record keeps the authored ctx");
+  assert((hostEl.textContent ?? "").includes("Beta · 0.1.0"), "malformed record still adopts the context");
+  assert(!(hostEl.textContent ?? "").includes("No context ·"), "malformed record does not fall back to the scope picker");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// Stale linked context on a cold mount still refuses cleanly.
+{
+  const { hostEl, cold } = await mountColdCold(
+    "/app-installations/install-shell?ctx=ctx-gone&record=rec-9",
+    "install-shell",
+  );
+  assert(!location.search.includes("ctx=") && !location.search.includes("record="), "stale cold link clears scope and record");
+  assert((hostEl.textContent ?? "").includes("not active"), "stale cold link explains itself");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// The real cold-open path (browser finding): the viewer proves
+// operator asynchronously, so receipts land on the false→true
+// transition, not the first render. Adoption must follow.
+{
+  const hostEl = document.createElement("div");
+  document.body.append(hostEl);
+  const cold = createRoot(hostEl);
+  history.pushState(null, "", "/app-installations/install-shell?ctx=ctx-a&record=rec-3");
+  await React.act(async () => {
+    cold.render(React.createElement(AppShell, { installId: "install-shell", viewer: { operator: false, readOnly: false } }));
+  });
+  await flush();
+  assert((hostEl.textContent ?? "").includes("Sign in as the operator"), "unproven viewer sees the sign-in note, never records");
+  await React.act(async () => {
+    cold.render(React.createElement(AppShell, { installId: "install-shell", viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert((hostEl.textContent ?? "").includes("Record details"), "operator false→true cold link opens the record"));
+  assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), "operator false→true cold link adopts the context");
+  assert(!(hostEl.textContent ?? "").includes("No context ·"), "operator transition does not fall back to the scope picker");
+  assert(location.search.includes("ctx=ctx-a") && location.search.includes("record=rec-3"), "operator transition keeps the authored link");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// CAD-863 release blocker: a CRM install renders the shell's one
+// Apps → App crumb row and each section renders its own real
+// heading — the duplicate inner "Apps / CRM / <section>" breadcrumb
+// nav is gone. One mounted assertion per section, each on a fresh
+// cold mount so an un-remounted leftover nav can never pass. The
+// shared mountColdCold above waits on the generic install's "Reports"
+// title, so the CRM mount waits on its own section paint instead.
+async function mountCrm(url: string) {
+  const hostEl = document.createElement("div");
+  document.body.append(hostEl);
+  const cold = createRoot(hostEl);
+  history.pushState(null, "", url);
+  await React.act(async () => {
+    cold.render(React.createElement(AppShell, { installId: "install-crm", viewer: { operator: true, readOnly: false } }));
+  });
+  // A bound CRM scope renders no context/scope subtitle at all — the
+  // page is the company's records (CAD-1008). Wait for the outlet to
+  // paint any CRM section as the mount signal instead of a scope label.
+  await settle(() => assert(hostEl.querySelector("[data-outlet-heading]"), `crm mount binds ctx-a: ${url}`));
+  assert(!(hostEl.textContent ?? "").match(/Workspace|No context ·/), "bound CRM shows no scope/context subtitle");
+  await flush(); await flush();
+  return { hostEl, cold };
+}
+const appsLinks = (hostEl: HTMLElement) =>
+  Array.from(hostEl.querySelectorAll<HTMLAnchorElement>("a[href='/apps']"));
+// The shell row renders the one back-link as "← All apps"; a second
+// "Apps" crumb entry was the duplication. Count every /apps anchor.
+{
+  const { hostEl, cold } = await mountCrm(
+    "/app-installations/install-crm?ctx=ctx-a",
+  );
+  await settle(() => assert((hostEl.textContent ?? "").includes("No customers yet"), "customers list paints its server-driven empty state"));
+  equal(appsLinks(hostEl).length, 1, "customers renders exactly one Apps link — the shell row only");
+  assert(!hostEl.querySelector('.crm-crumb'), "no inner CRM breadcrumb nav on customers");
+  equal(
+    hostEl.querySelector("[data-outlet-heading]")?.textContent?.trim(),
+    "Customers",
+    "customers keeps a real section heading",
+  );
+  assert(
+    !hostEl.querySelector('nav[aria-label="CRM sections"]'),
+    "customers navigation stays in the host sidebar without duplicate outlet tabs",
+  );
+  // New view is an independent page: its own heading, still one link.
+  await React.act(async () => { navigate("/app-installations/install-crm?ctx=ctx-a&appview=new"); });
+  await settle(() => assert(hostEl.querySelector("#crm-display-name"), "customers new page opens"));
+  equal(appsLinks(hostEl).length, 1, "customers new page still renders exactly one Apps link");
+  assert(!hostEl.querySelector('.crm-crumb'), "no inner CRM breadcrumb nav on customers new");
+  equal(
+    hostEl.querySelector("[data-outlet-heading]")?.textContent?.trim(),
+    "New customer",
+    "customers new keeps its own page heading",
+  );
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+{
+  const { hostEl, cold } = await mountCrm(
+    "/app-installations/install-crm?ctx=ctx-a&crm=segments",
+  );
+  await settle(() => assert((hostEl.textContent ?? "").includes("No segments yet"), "segments list paints its server-driven empty state"));
+  equal(appsLinks(hostEl).length, 1, "segments renders exactly one Apps link — the shell row only");
+  assert(!hostEl.querySelector('.crm-crumb'), "no inner CRM breadcrumb nav on segments");
+  equal(
+    hostEl.querySelector("[data-outlet-heading]")?.textContent?.trim(),
+    "Segments",
+    "segments keeps a real section heading",
+  );
+  assert(
+    !hostEl.querySelector('nav[aria-label="CRM sections"]'),
+    "segments navigation stays in the host sidebar without duplicate outlet tabs",
+  );
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+{
+  const { hostEl, cold } = await mountCrm(
+    "/app-installations/install-crm?ctx=ctx-a&crm=campaigns",
+  );
+  await settle(() => assert((hostEl.textContent ?? "").includes("No campaigns yet"), "campaigns list paints its server-driven empty state"));
+  equal(appsLinks(hostEl).length, 1, "campaigns renders exactly one Apps link — the shell row only");
+  assert(!hostEl.querySelector('.crm-crumb'), "no inner CRM breadcrumb nav on campaigns");
+  equal(
+    hostEl.querySelector("[data-outlet-heading]")?.textContent?.trim(),
+    "Campaigns",
+    "campaigns keeps a real section heading",
+  );
+  assert(
+    !hostEl.querySelector('nav[aria-label="CRM sections"]'),
+    "campaigns navigation stays in the host sidebar without duplicate outlet tabs",
+  );
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// CAD-1008: a bound CRM scope renders no scope switch links at all,
+// even on a multi-context install — the single-company surface is the
+// company's records, never a picker. Mount a two-scope CRM install on
+// the bound `ctx-a` URL; the switch nav must be absent entirely.
+{
+  win.sessionStorage.clear();
+  const multi = document.createElement("div");
+  document.body.append(multi);
+  const multiRoot = createRoot(multi);
+  history.pushState(null, "", "/app-installations/install-crm-multi?ctx=ctx-a");
+  await React.act(async () => {
+    multiRoot.render(React.createElement(AppShell, { installId: "install-crm-multi", viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert(multi.querySelector("[data-outlet-heading]"), "multi-context CRM mounts bound"));
+  equal(multi.querySelectorAll("[data-scope-link]").length, 0, "bound CRM multi-context renders zero scope links (CAD-1008)");
+  assert(!(multi.textContent ?? "").match(/Scope:|Context:|Switch context|Choose a context/), "bound CRM shows no scope switcher or label");
+  await React.act(async () => { multiRoot.unmount(); });
+  multi.remove();
+}
+// The exceptional unbound multi-context CRM install keeps the explicit
+// scoped-entry links with administrator setup guidance — the only place
+// a scope choice ever surfaces (CAD-1008).
+{
+  win.sessionStorage.clear();
+  const unbound = document.createElement("div");
+  document.body.append(unbound);
+  const unboundRoot = createRoot(unbound);
+  history.pushState(null, "", "/app-installations/install-crm-multi");
+  await React.act(async () => {
+    unboundRoot.render(React.createElement(AppShell, { installId: "install-crm-multi", viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert(unbound.querySelectorAll("[data-scope-link]").length === 2, "unbound multi-context CRM keeps the two scope-entry links"));
+  assert((unbound.textContent ?? "").includes("administrator CRM setup"), "unbound CRM names administrator setup");
+  await React.act(async () => { unboundRoot.unmount(); });
+  unbound.remove();
+}
+
+// CAD-1009: the app writes `?crm=customers&record=cust-…` after Create/Open.
+// A reload of that scopeless link resolves to the only active context in
+// single-company mode and keeps the record; a genuinely ambiguous
+// (multi-context) link is still refused, as a compact notice.
+{
+  win.sessionStorage.clear();
+  const sole = document.createElement("div");
+  document.body.append(sole);
+  const soleRoot = createRoot(sole);
+  history.pushState(null, "", "/app-installations/install-crm?crm=customers&record=cust-0123456789ab");
+  await React.act(async () => {
+    soleRoot.render(React.createElement(AppShell, { installId: "install-crm", viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert(location.search.includes("ctx=ctx-a"), "a scopeless record link resolves to the sole active context"));
+  assert(location.search.includes("record=cust-0123456789ab"), "the record survives resolution");
+  assert(!(sole.textContent ?? "").includes("does not say which scope"), "single-company mode shows no refusal");
+  assert(!sole.querySelector("[data-link-notice]"), "single-company mode shows no notice at all");
+  await React.act(async () => { soleRoot.unmount(); });
+  sole.remove();
+
+  win.sessionStorage.clear();
+  const ambiguous = document.createElement("div");
+  document.body.append(ambiguous);
+  const ambiguousRoot = createRoot(ambiguous);
+  history.pushState(null, "", "/app-installations/install-crm-multi?crm=customers&record=cust-0123456789ab");
+  await React.act(async () => {
+    ambiguousRoot.render(React.createElement(AppShell, { installId: "install-crm-multi", viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert((ambiguous.textContent ?? "").includes("does not say which scope"), "a multi-context scopeless link is still refused"));
+  assert(!location.search.includes("record="), "the refused record is stripped");
+  const notice = ambiguous.querySelector("[data-link-notice]");
+  assert(notice, "the refusal renders as a link notice");
+  assert(!notice!.className.includes("card") && notice!.className.includes("py-1.5"), "the refusal is a compact notice, not a card");
+  await React.act(async () => { ambiguousRoot.unmount(); });
+  ambiguous.remove();
+}
+
 console.log("app shell checks passed");
 }
 void main();

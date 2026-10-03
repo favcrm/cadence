@@ -36,6 +36,8 @@
 //! follows the CAD-768 strict-peer contract (URL IDs are authority,
 //! exact transport grammar, POST-only writes) and exposes no
 //! assistant-mint route.
+use super::app_audiences_rpc::{audience_expected, audience_name, audience_predicates};
+use super::app_records_rpc::{csv_decisions, csv_text};
 use super::*;
 use crate::issue::app_catalog::workspace;
 use crate::store::app_content::Draft;
@@ -56,6 +58,40 @@ fn content_draft(params: &Value) -> Result<Draft> {
         .ok_or_else(|| Error::rejected("email blocks must be an array"))?;
     Draft::parse(subject, preheader, blocks)
         .map_err(|_| Error::rejected("email content exceeds its supported shape or bounds"))
+}
+
+/// CAD-1056: the operator save body is exactly one of `blocks`
+/// (structured) or `html` (pasted, host-sanitised), plus an optional
+/// plain-text override. Proposals keep the blocks-only `content_draft`.
+fn content_save_draft(params: &Value) -> Result<Draft> {
+    let subject = required_str(params, "subject")?;
+    let preheader = match params.get("preheader") {
+        None => "",
+        Some(Value::String(text)) => text.as_str(),
+        Some(_) => return Err(Error::rejected("email preheader must be a string")),
+    };
+    let text = match params.get("text") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.as_str()),
+        Some(_) => return Err(Error::rejected("email plain text must be a string")),
+    };
+    let draft = match (params.get("blocks"), params.get("html")) {
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(Error::rejected(
+                "email content needs exactly one of blocks or html",
+            ));
+        }
+        (Some(_), None) => content_draft(params)?,
+        (None, Some(Value::String(html))) => Draft::parse_html(subject, preheader, html)
+            .map_err(|_| Error::rejected("email HTML exceeds its supported shape or bounds"))?,
+        (None, Some(_)) => return Err(Error::rejected("email HTML must be a string")),
+    };
+    let name = match params.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(name.as_str()),
+        Some(_) => return Err(Error::rejected("campaign name must be a string")),
+    };
+    draft.with_text(text)?.with_name(name)
 }
 
 fn content_expected(params: &Value) -> Result<Option<i64>> {
@@ -157,9 +193,12 @@ impl Shared {
                 "install_id",
                 "context_id",
                 "campaign_id",
+                "name",
                 "subject",
                 "preheader",
                 "blocks",
+                "html",
+                "text",
                 "expected_revision",
             ],
             "app_content_show" => &["install_id", "context_id", "campaign_id"],
@@ -189,6 +228,13 @@ impl Shared {
                 "request_id",
             ],
             "app_content_proposal_show" => &["install_id", "context_id", "proposal_id"],
+            "app_content_proposal_render" => &[
+                "install_id",
+                "context_id",
+                "proposal_id",
+                "sample_first_name",
+                "binding_id",
+            ],
             "app_content_proposal_list" => &["install_id", "context_id", "campaign_id"],
             "app_content_proposal_apply" => &[
                 "install_id",
@@ -238,6 +284,7 @@ impl Shared {
                 | "app_content_render"
                 | "app_content_proposal_show"
                 | "app_content_proposal_list"
+                | "app_content_proposal_render"
                 | "app_sender_binding_show"
                 | "app_sender_binding_list"
         );
@@ -253,12 +300,27 @@ impl Shared {
         })?;
         let records = RecordStore::open(&self.state_dir, install)?;
         let result = match method {
-            "app_content_save" => records.app_content_save(
-                context,
-                required_str(params, "campaign_id")?,
-                content_expected(params)?,
-                &content_draft(params)?,
-            ),
+            "app_content_save" => {
+                let draft = content_save_draft(params)?;
+                if let Some(html) = &draft.html {
+                    // The host's own unsubscribe URL shapes: saved
+                    // bindings, the preview base and the configured
+                    // send origin (`{origin}/unsubscribe/<token>`).
+                    let mut endpoints = records.app_unsubscribe_endpoints(context)?;
+                    if let Ok(origin) = self.crm_send_origin() {
+                        endpoints.extend(crate::store::app_content_html::HostEndpoint::origin(
+                            &origin,
+                        ));
+                    }
+                    crate::store::app_content_html::refuse_host_unsubscribe(html, &endpoints)?;
+                }
+                records.app_content_save(
+                    context,
+                    required_str(params, "campaign_id")?,
+                    content_expected(params)?,
+                    &draft,
+                )
+            }
             "app_content_show" => {
                 records.app_content_show(context, required_str(params, "campaign_id")?)
             }
@@ -340,6 +402,19 @@ impl Shared {
             }
             "app_content_proposal_show" => {
                 records.app_content_proposal_show(context, required_str(params, "proposal_id")?)
+            }
+            // CAD-1014: the operator's before-Apply preview of a pending
+            // proposal — the SAME safe render_html/text the saved-content
+            // path uses, over the stored proposal draft. Pure read; no
+            // apply/save/approve/send, send_ready always false.
+            "app_content_proposal_render" => {
+                let (_, sample) = content_render_scope(params)?;
+                records.app_content_proposal_render(
+                    context,
+                    required_str(params, "proposal_id")?,
+                    sample.as_deref(),
+                    content_binding(params)?,
+                )
             }
             "app_content_proposal_list" => {
                 let campaign = match params.get("campaign_id") {
@@ -472,6 +547,365 @@ impl Shared {
                 "app content payload has unsupported fields",
             ));
         }
+        let ScopedChat {
+            caller,
+            install,
+            context,
+            message_id,
+            ..
+        } = self.scoped_chat_assistant(params, peer_pid, "assistant proposal")?;
+        let campaign = required_str(params, "campaign_id")?;
+        let proposal = required_str(params, "proposal_id")?;
+        let draft = content_draft(params)?;
+        let request_id = content_request_id(params)?;
+        let records = RecordStore::open(&self.state_dir, &install)?;
+        let claim = crate::store::app_content::AssistantClaim {
+            agent: &caller,
+            message: &message_id,
+            request: request_id,
+        };
+        let result =
+            records.app_content_assistant_propose(&context, campaign, proposal, &draft, &claim)?;
+        let digest = result
+            .get("proposal")
+            .and_then(|proposal| proposal.get("content_digest"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        self.store.note_app_content_by(
+            &install,
+            &context,
+            "app_content_assistant_propose",
+            digest,
+            &caller,
+        );
+        self.wake();
+        Ok(result)
+    }
+
+    /// CAD-1014(b): a scoped chat turn's delegated customer CSV import.
+    /// The intent is the OPERATOR's own genuine scoped chat message
+    /// (`thread_send` carrying the daemon-verified App binding), not a
+    /// separate mint verb: [`Self::scoped_chat_assistant`] proves the
+    /// caller is a connection-derived agent on the live assigned turn
+    /// whose `message_app` stamp names exactly this install+context, and
+    /// that the caller lives in the endpoint's own session (a detached
+    /// child is refused). The exact CSV bytes are still bound by the
+    /// existing `preview_token` (a `sha256:` of the very bytes the
+    /// operator previewed) and `request_id` is the idempotency key — the
+    /// user-facing explicit-confirm gate lives in the chat surface,
+    /// which the agent cannot reach; an agent can only commit the bytes
+    /// the operator previewed. Agent-supplied `install_id`/`context_id`
+    /// must EQUAL the stamped scope, never widen it. This verb can never
+    /// send, approve or touch a record outside the stamped context.
+    pub(super) fn rpc_app_record_csv_assistant_import(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("app record payload must be an object"))?;
+        const ALLOWED: &[&str] = &[
+            "install_id",
+            "context_id",
+            "request_id",
+            "confirm_token",
+            "message",
+            "token",
+        ];
+        if fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+            return Err(Error::rejected("app record payload has unsupported fields"));
+        }
+        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant CSV import")?;
+        let records = RecordStore::open(&self.state_dir, &scoped.install)?;
+        let request_id = required_str(params, "request_id")?;
+        let confirm_token = required_str(params, "confirm_token")?;
+        // The durable server-held plan IS the intent: the agent names
+        // only request_id + the operator's one-use nonce; the host
+        // resolves the confirmed csv_text + decisions + their digests
+        // from the confirm row. Bytes/decisions/preview_token are never
+        // on the wire — the agent can never substitute a plan the
+        // operator did not confirm (CSV runs to 256KiB, the chat ≤48KB;
+        // bytes can't and don't ride the message).
+        let (csv_text, decisions_value, decisions_digest, preview_token) =
+            records.app_record_csv_confirm_plan(&scoped.context, request_id, confirm_token)?;
+        // One stamped message redeems one action across all request ids
+        // (CAD-1014). The claim binds the resolved plan handle (request
+        // id + the plan's own digests) so a changed plan under a spent
+        // claim refuses as a second intent, never a replay.
+        let payload_digest = crate::store::app_runs::material_digest(&json!({
+            "domain": "cadence-app-csv-assistant-import-v1",
+            "request_id": request_id,
+            "preview_token": preview_token,
+            "decisions_digest": decisions_digest,
+        }));
+        records.app_assistant_claim(
+            &scoped.context,
+            &scoped.message_id,
+            "app_record_csv_assistant_import",
+            Some(request_id),
+            &payload_digest,
+            &scoped.caller,
+        )?;
+        // Reuse the strict decisions parser over the stored array.
+        let decisions = csv_decisions(&json!({"decisions": decisions_value}))?;
+        // Identical replay (same request id + bytes + confirmed digest,
+        // already completed) returns the stored receipt WITHOUT spending
+        // a confirm — the claim bound this exact plan.
+        let already = records.app_record_csv_receipt_exists(
+            &scoped.context,
+            request_id,
+            &preview_token,
+            &decisions_digest,
+        )?;
+        // The operator's confirm is spent atomically inside the import's
+        // own reservation transaction — a crash can never burn it
+        // without a pending receipt. A replay needs no confirm (the
+        // receipt IS the receipt); a fresh import spends it here.
+        let confirm = if already {
+            None
+        } else {
+            Some((confirm_token, decisions_digest.as_str()))
+        };
+        let result = records.app_record_csv_import(
+            &scoped.context,
+            &csv_text,
+            &preview_token,
+            request_id,
+            decisions,
+            confirm,
+        )?;
+        self.store.note_app_record_csv_import(
+            &scoped.install,
+            &scoped.context,
+            required_str(params, "request_id").unwrap_or(""),
+            result["summary"]["applied"].as_i64().unwrap_or(0),
+            result["summary"]["skipped"].as_i64().unwrap_or(0),
+            result["summary"]["failed"].as_i64().unwrap_or(0),
+        );
+        self.wake();
+        Ok(result)
+    }
+
+    /// CAD-1014(b): a scoped chat turn's delegated segment save. Same
+    /// intent source and redeem gate as the CSV import; the segment id
+    /// stays agent-chosen inside the stamped scope and `expected_revision`
+    /// is the CAS the operator path already uses, so an agent can create
+    /// or revise only the segment it names inside the verified context —
+    /// never a blanket write. No send/approve.
+    pub(super) fn rpc_app_segment_assistant_save(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("app audience payload must be an object"))?;
+        const ALLOWED: &[&str] = &[
+            "install_id",
+            "context_id",
+            "segment_id",
+            "name",
+            "predicates",
+            "expected_revision",
+            "message",
+            "token",
+        ];
+        if fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+            return Err(Error::rejected(
+                "app audience payload has unsupported fields",
+            ));
+        }
+        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant segment save")?;
+        let records = RecordStore::open(&self.state_dir, &scoped.install)?;
+        // One stamped message redeems one action across all ids
+        // (CAD-1014); `expected_revision` is the CAS on the named
+        // segment. The claim binds the normalized segment payload — a
+        // re-save of the SAME segment replays, a same-id segment with a
+        // changed name/predicates/revision refuses as a different intent.
+        let payload_digest = crate::store::app_runs::material_digest(&json!({
+            "domain": "cadence-app-segment-assistant-save-v1",
+            "segment_id": required_str(params, "segment_id")?,
+            "name": required_str(params, "name")?,
+            "predicates": params.get("predicates").cloned().unwrap_or(Value::Null),
+            "expected_revision": params.get("expected_revision").cloned().unwrap_or(Value::Null),
+        }));
+        records.app_assistant_claim(
+            &scoped.context,
+            &scoped.message_id,
+            "app_segment_assistant_save",
+            Some(required_str(params, "segment_id")?),
+            &payload_digest,
+            &scoped.caller,
+        )?;
+        let result = records.app_segment_save(
+            &scoped.context,
+            required_str(params, "segment_id")?,
+            audience_expected(params)?,
+            &audience_name(params)?,
+            &audience_predicates(params)?,
+        )?;
+        let digest = result
+            .get("segment")
+            .and_then(|segment| segment.get("digest"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        self.store.note_app_audience(
+            &scoped.install,
+            &scoped.context,
+            "app_segment_assistant_save",
+            digest,
+        );
+        self.wake();
+        Ok(result)
+    }
+
+    /// CAD-1014(b): scoped-chat read/preview verbs — the agent's read of
+    /// the stamped install/context. Same redeem gate (connection-derived
+    /// agent, live turn, re-proved scope) but NO claim: reads and
+    /// inert previews do not consume the message. Agent-supplied
+    /// install/context must equal the stamp; a foreign scope refuses.
+    pub(super) fn rpc_app_assistant_read(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("app assistant read payload must be an object"))?;
+        const ALLOWED: &[&str] = &[
+            "install_id",
+            "context_id",
+            "segment_id",
+            "campaign_id",
+            "proposal_id",
+            "limit",
+            "cursor",
+            "csv_text",
+            "message",
+            "token",
+        ];
+        if fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+            return Err(Error::rejected(
+                "app assistant read payload has unsupported fields",
+            ));
+        }
+        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant read")?;
+        let records = RecordStore::open(&self.state_dir, &scoped.install)?;
+        // Reads only — no claim, no mutation, no audit write.
+        match method {
+            "app_segment_assistant_list" => records.app_segment_list(&scoped.context),
+            "app_segment_assistant_show" => {
+                records.app_segment_show(&scoped.context, required_str(params, "segment_id")?)
+            }
+            "app_record_csv_assistant_preview" => {
+                records.app_record_csv_preview(&scoped.context, &csv_text(params)?)
+            }
+            // A bounded membership preview over a SAVED segment —
+            // counts + bounded sample, never the full member list,
+            // never a freeze or send (root's required segment-preview
+            // acceptance).
+            "app_segment_assistant_preview" => {
+                records.app_segment_preview(&scoped.context, required_str(params, "segment_id")?)
+            }
+            // The agent's inert pending draft must be discoverable in
+            // the campaign's proposal list BEFORE the operator applies
+            // it — list by campaign (optionally) and show one proposal.
+            "app_content_assistant_proposals" => records.app_content_proposal_list(
+                &scoped.context,
+                params.get("campaign_id").and_then(Value::as_str),
+            ),
+            "app_content_assistant_proposal_show" => records
+                .app_content_proposal_show(&scoped.context, required_str(params, "proposal_id")?),
+            _ => Err(Error::rejected("unknown app assistant read method")),
+        }
+    }
+
+    /// CAD-1014(b) composer-free email draft: the agent turn drafts a
+    /// campaign email straight from the scoped chat — NO operator mint,
+    /// no request id. The host derives campaign source revision (0 for a
+    /// first draft) and stamps the proposal `pending` /
+    /// `assistant-receipt` with the message id as the receipt — the
+    /// verified turn IS the intent. The unique per-message claim makes
+    /// one turn produce one draft; an identical proposal id + bytes +
+    /// same message replays idempotently. Never edits live content,
+    /// approves or sends — Apply/Discard stay the operator's.
+    pub(super) fn rpc_app_content_assistant_draft(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("app content payload must be an object"))?;
+        const ALLOWED: &[&str] = &[
+            "install_id",
+            "context_id",
+            "campaign_id",
+            "proposal_id",
+            "subject",
+            "preheader",
+            "blocks",
+            "message",
+            "token",
+        ];
+        if fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+            return Err(Error::rejected(
+                "app content payload has unsupported fields",
+            ));
+        }
+        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant email draft")?;
+        let draft = content_draft(params)?;
+        let records = RecordStore::open(&self.state_dir, &scoped.install)?;
+        let result = records.app_content_assistant_draft(
+            &scoped.context,
+            required_str(params, "campaign_id")?,
+            required_str(params, "proposal_id")?,
+            &draft,
+            &scoped.caller,
+            &scoped.message_id,
+        )?;
+        let digest = result
+            .get("proposal")
+            .and_then(|proposal| proposal.get("content_digest"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        self.store.note_app_content_by(
+            &scoped.install,
+            &scoped.context,
+            "app_content_assistant_draft",
+            digest,
+            &scoped.caller,
+        );
+        self.wake();
+        Ok(result)
+    }
+}
+
+/// The verified scoped-chat redeem context a delegated assistant verb
+/// runs under (CAD-1014). The caller is the connection-derived agent;
+/// install+context come from the re-proved `message_app` stamp on the
+/// operator's own scoped chat message — never agent text.
+pub(super) struct ScopedChat {
+    pub(super) caller: String,
+    pub(super) install: String,
+    pub(super) context: String,
+    pub(super) message_id: String,
+}
+
+impl Shared {
+    /// The shared CAD-813/CAD-1014(b) scoped-chat redeem gate. `desc`
+    /// names the verb in refusal text. Returns the connection-derived
+    /// caller and the stamped install/context; a detached child, an
+    /// unproven caller, the operator, a foreign or stale turn, and any
+    /// scope mismatch all refuse before any file opens.
+    pub(super) fn scoped_chat_assistant(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+        desc: &str,
+    ) -> Result<ScopedChat> {
         // The caller is the connection's alone: identity-shaped,
         // receipt-shaped and routing fields are not transport fields
         // here at all — the allowlist above already refused them —
@@ -479,13 +913,13 @@ impl Shared {
         let caller = match self.connection_caller(peer_pid)? {
             caller_rule::Who::Agent(alias) => alias,
             caller_rule::Who::Operator => {
-                return Err(Error::rejected(
-                    "assistant proposal is an agent turn's verb — the operator proposes through app_content_propose",
-                ));
+                return Err(Error::rejected(format!(
+                    "{desc} is an agent turn's verb — the operator acts through the app record, segment and content verbs"
+                )));
             }
             caller_rule::Who::Unproven(why) => {
                 return Err(Error::rejected(format!(
-                    "assistant proposal refused: this connection derives no agent identity and is \
+                    "{desc} refused: this connection derives no agent identity and is \
                      not provably the operator: {why} (caller rule, CAD-384)"
                 )));
             }
@@ -503,14 +937,14 @@ impl Shared {
         );
         if !seam_agent {
             let caller_session = crate::peer::proc_session(peer_pid)
-                .map_err(|_| Error::rejected("assistant proposal caller session is unreadable"))?;
+                .map_err(|_| Error::rejected(format!("{desc} caller session is unreadable")))?;
             let inside = match self.slot_identity(peer_pid)? {
                 Some(SlotWho::Strict(proof)) => {
                     let root = *proof.segment.last().ok_or_else(|| {
-                        Error::rejected("assistant proposal endpoint ancestry is empty")
+                        Error::rejected(format!("{desc} endpoint ancestry is empty"))
                     })?;
                     let endpoint_session = crate::peer::proc_session(root).map_err(|_| {
-                        Error::rejected("assistant proposal endpoint session is unreadable")
+                        Error::rejected(format!("{desc} endpoint session is unreadable"))
                     })?;
                     proof.lane == caller
                         && (caller_session == endpoint_session
@@ -540,35 +974,33 @@ impl Shared {
         let install = required_str(params, "install_id")?;
         crate::proto::identifier(install, "installation ID")?;
         let context = required_str(params, "context_id")?;
-        let campaign = required_str(params, "campaign_id")?;
-        let proposal = required_str(params, "proposal_id")?;
         let message_id = required_str(params, "message")?;
         let token = required_str(params, "token")?;
         if message_id.is_empty() || message_id.len() > 128 {
-            return Err(Error::rejected("proposal message identity is malformed"));
+            return Err(Error::rejected(format!(
+                "{desc} message identity is malformed"
+            )));
         }
         if token.is_empty() || token.len() > 256 {
-            return Err(Error::rejected("proposal turn token is malformed"));
+            return Err(Error::rejected(format!("{desc} turn token is malformed")));
         }
         // The live assigned turn, from the daemon's own rows: the
         // message addresses the caller, is running under exactly this
         // token, and the token is current under the endpoint's own
-        // scheme and live generation — a token for another turn, a
-        // stale generation, or an endpoint with no checkable scheme
-        // refuses here.
+        // scheme and live generation.
         let stored = self
             .store
             .message(message_id)?
-            .ok_or_else(|| Error::rejected("assistant proposal turn is unknown"))?;
+            .ok_or_else(|| Error::rejected(format!("{desc} turn is unknown")))?;
         if stored.alias != caller {
-            return Err(Error::rejected(
-                "assistant proposal turn belongs to another agent",
-            ));
+            return Err(Error::rejected(format!(
+                "{desc} turn belongs to another agent"
+            )));
         }
         if stored.state != "running" || stored.turn_id.as_deref() != Some(token) {
-            return Err(Error::rejected(
-                "assistant proposal needs the active assigned chat turn",
-            ));
+            return Err(Error::rejected(format!(
+                "{desc} needs the active assigned chat turn"
+            )));
         }
         let agent = self.store.agent(&caller)?;
         if !registry::turn_token_current(
@@ -577,24 +1009,23 @@ impl Shared {
             agent.generation.as_deref(),
             token,
         ) {
-            return Err(Error::rejected(
-                "assistant proposal turn token is no longer current",
-            ));
+            return Err(Error::rejected(format!(
+                "{desc} turn token is no longer current"
+            )));
         }
         // The turn's server-verified App binding, re-proved against
         // the live store: the stamp names exactly this installation
-        // and context, or the call has no verified chat scope — a
-        // browser value, a turn from another install/context, or a
-        // binding revised or archived after send refuses here.
-        let hint = self.store.message_app(message_id)?.ok_or_else(|| {
-            Error::rejected("assistant proposal turn carries no verified App scope")
-        })?;
+        // and context, or the call has no verified chat scope.
+        let hint = self
+            .store
+            .message_app(message_id)?
+            .ok_or_else(|| Error::rejected(format!("{desc} turn carries no verified App scope")))?;
         if hint.get("install_id").and_then(Value::as_str) != Some(install)
             || hint.get("context_id").and_then(Value::as_str) != Some(context)
         {
-            return Err(Error::rejected(
-                "assistant proposal scope does not match its verified chat turn",
-            ));
+            return Err(Error::rejected(format!(
+                "{desc} scope does not match its verified chat turn"
+            )));
         }
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, install, |_, _| {
@@ -605,29 +1036,11 @@ impl Shared {
             self.store.app_context_proof(install, context)?;
             Ok(())
         })?;
-        let draft = content_draft(params)?;
-        let request_id = content_request_id(params)?;
-        let records = RecordStore::open(&self.state_dir, install)?;
-        let claim = crate::store::app_content::AssistantClaim {
-            agent: &caller,
-            message: message_id,
-            request: request_id,
-        };
-        let result =
-            records.app_content_assistant_propose(context, campaign, proposal, &draft, &claim)?;
-        let digest = result
-            .get("proposal")
-            .and_then(|proposal| proposal.get("content_digest"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        self.store.note_app_content_by(
-            install,
-            context,
-            "app_content_assistant_propose",
-            digest,
-            &caller,
-        );
-        self.wake();
-        Ok(result)
+        Ok(ScopedChat {
+            caller,
+            install: install.to_string(),
+            context: context.to_string(),
+            message_id: message_id.to_string(),
+        })
     }
 }

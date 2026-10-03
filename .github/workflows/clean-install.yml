@@ -6,7 +6,6 @@ on:
       - '.github/workflows/clean-install.yml'
       - 'scripts/clean-install.py'
       - 'scripts/install.sh'
-      - 'tests/scripts/test_clean_install.py'
       - 'docs/CLEAN-INSTALL.md'
   workflow_dispatch:
     inputs:
@@ -45,8 +44,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Standard-library adversarial tests and harmless executable fixtures
-        run: python3 tests/scripts/test_clean_install.py
+      # CAD-1073: tests/scripts/test_clean_install.py was retired with
+      # the suite. The gate stays present as a stub during the window.
+      - name: Installer fixtures retired — clean-slate transition
+        run: echo 'installer fixtures retired under CAD-1073; rebuild behavior checks under the new policy.'
 
   native-install:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'

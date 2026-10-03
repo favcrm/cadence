@@ -501,6 +501,13 @@ impl FakePublishLedger {
         self.inner.lock().unwrap().provider_calls
     }
 
+    /// CAD-1041: the request keys the ledger has staged or sent — the
+    /// send-now identity pin test reads them to prove only the named
+    /// intent's key ever reached the provider.
+    pub fn keys(&self) -> Vec<String> {
+        self.inner.lock().unwrap().rows.keys().cloned().collect()
+    }
+
     /// Preflight stages a send without claiming execution or calling the
     /// provider. Same key + different binding fails; same key + same
     /// binding replays the staged verdict.
@@ -700,6 +707,29 @@ pub trait PublishSender: Send + Sync {
     /// Reconcile one stable key against the provider door. Never a second
     /// provider call for an already-accepted send.
     fn status(&self, key: &str) -> Result<LedgerOutcome, Refusal>;
+    /// CAD-1041: pre-claim staging probe. The default approves — senders
+    /// without a separate staging door (the in-memory test fakes, which
+    /// validate inside `execute`) need no preflight; the production HTTP
+    /// sender overrides it so the operator's send-now can stay queued on
+    /// ambiguity instead of claiming a row it cannot send.
+    fn preflight(&self, _binding: &SendBinding) -> Preflight {
+        Preflight::Approved
+    }
+}
+
+/// CAD-1041: the pre-claim staging verdict an explicit send-now needs
+/// before committing a row to `processing`. `Approved` means the door
+/// staged the exact binding — claiming and executing is safe. `Refused`
+/// is a definitive door refusal — the claim may proceed and report it.
+/// `Uncertain` means a transport-ambiguous staging answer (timeout, 5xx,
+/// drift): nothing was sent and nothing can be proven, so the row must
+/// stay `queued` for a later send-now — claiming it would burn the
+/// intent to `refused` on a transient door blip.
+#[derive(Debug)]
+pub enum Preflight {
+    Approved,
+    Refused(Refusal),
+    Uncertain(Refusal),
 }
 
 impl LedgerOutcome {

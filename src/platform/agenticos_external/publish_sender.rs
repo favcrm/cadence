@@ -228,8 +228,11 @@ impl HttpPublishSender {
                 Err(Fault::Ambiguous) => {
                     attempts += 1;
                     if attempts >= PREFLIGHT_ATTEMPTS {
+                        // `nothing_sent`: the POST provably never left —
+                        // the caller holds the row (re-stagable), never
+                        // burns it refused on a door blip.
                         return Err(Refusal::new(
-                            "refused",
+                            "nothing_sent",
                             "publish preflight is uncertain after retry; nothing was sent — \
                              retry staging under a fresh key, never execution",
                         ));
@@ -320,6 +323,35 @@ impl super::publish::PublishSender for HttpPublishSender {
 
     fn status(&self, key: &str) -> std::result::Result<LedgerOutcome, Refusal> {
         self.status_request(key)
+    }
+
+    /// CAD-1041: pre-claim staging for an explicit send-now. Resolves
+    /// the exact approved material the same way `execute` does (store
+    /// re-proof), then stages once. Ambiguity maps to
+    /// `Preflight::Uncertain` — the caller leaves the row queued and
+    /// tells the operator to retry; a definitive door refusal maps to
+    /// `Preflight::Refused`, which the caller claims and reports.
+    /// Staging never sends, so this probe is always safe to repeat.
+    fn preflight(&self, binding: &SendBinding) -> super::publish::Preflight {
+        use super::publish::Preflight;
+        let material = match (self.material)(binding) {
+            Ok(material) => material,
+            // A transient material-read failure (store unavailable /
+            // busy) is Uncertain — the caller tells the operator to
+            // retry, never burns the row on a blip.
+            Err(refusal) if refusal.code == "store_unavailable" => {
+                return Preflight::Uncertain(refusal);
+            }
+            Err(refusal) => return Preflight::Refused(refusal),
+        };
+        match self.preflight_inner(binding, &material) {
+            Ok(_) => Preflight::Approved,
+            Err(Fault::Refused(refusal)) => Preflight::Refused(refusal),
+            Err(Fault::Ambiguous) => Preflight::Uncertain(Refusal::new(
+                "refused",
+                "publish preflight is uncertain; row stays queued",
+            )),
+        }
     }
 }
 
@@ -798,22 +830,31 @@ fn store_material(
     binding: &SendBinding,
 ) -> std::result::Result<SendMaterial, Refusal> {
     let db_path = state_dir.join("cadence.sqlite3");
+    // Transient store failures (open / busy) are `store_unavailable` —
+    // the send-now preflight maps them to Uncertain (row stays queued,
+    // the operator retries), never Refused: a SQLITE_BUSY blip must not
+    // burn a row.
     let conn =
         rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|_| Refusal::new("bad_effect", "publish material store is unavailable"))?;
+            .map_err(|_| {
+                Refusal::new("store_unavailable", "publish material store is unavailable")
+            })?;
     conn.busy_timeout(crate::store::BUSY_TIMEOUT)
-        .map_err(|_| Refusal::new("bad_effect", "publish material store is unavailable"))?;
+        .map_err(|_| Refusal::new("store_unavailable", "publish material store is unavailable"))?;
     let frozen_text: String = conn
         .query_row(
             "SELECT frozen FROM social_publish_intents WHERE request=?1",
             rusqlite::params![binding.key],
             |row| row.get(0),
         )
-        .map_err(|_| {
-            Refusal::new(
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Refusal::new(
                 "unknown_key",
                 "no frozen publish intent holds this idempotency key",
-            )
+            ),
+            // SQLITE_BUSY after the busy timeout, or any other read
+            // failure, is transient: never a definitive refusal.
+            _ => Refusal::new("store_unavailable", "publish material store is unavailable"),
         })?;
     let frozen: Value = serde_json::from_str(&frozen_text)
         .map_err(|_| Refusal::new("bad_effect", "frozen publish intent is corrupt"))?;
@@ -902,6 +943,30 @@ pub fn test_resolver(caption: &str, media_key: Option<&str>) -> MaterialResolver
 mod tests {
     use super::super::publish::{caption_digest_of, Toolkit};
     use super::*;
+
+    /// CAD-1041: only a missing row is `unknown_key` (definitive); any
+    /// other read failure — a store without the table, or SQLITE_BUSY once
+    /// the busy timeout runs out — is `store_unavailable`, which send-now's
+    /// preflight treats as Uncertain (the row stays queued).
+    #[test]
+    fn store_material_maps_read_failures_to_store_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        db.execute_batch("CREATE TABLE unrelated (x INTEGER)")
+            .unwrap();
+        let refusal = super::store_material(dir.path(), &binding()).unwrap_err();
+        assert_eq!(refusal.code, "store_unavailable", "{refusal}");
+        db.execute_batch("CREATE TABLE social_publish_intents (request TEXT, frozen TEXT)")
+            .unwrap();
+        let refusal = super::store_material(dir.path(), &binding()).unwrap_err();
+        assert_eq!(refusal.code, "unknown_key", "{refusal}");
+        // A writer holding an exclusive lock (rollback journal): the read
+        // waits out the busy timeout, then SQLITE_BUSY.
+        db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let refusal = super::store_material(dir.path(), &binding()).unwrap_err();
+        assert_eq!(refusal.code, "store_unavailable", "{refusal}");
+        db.execute_batch("ROLLBACK").unwrap();
+    }
 
     fn binding() -> SendBinding {
         // Fixture idempotency key built from parts: no secret-shaped

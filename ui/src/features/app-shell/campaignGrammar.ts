@@ -1,4 +1,5 @@
 import { ApiError } from "../../lib/api";
+import { hostErrorText } from "./shared/hostErrors";
 
 /**
  * Campaign content grammar mirrors (CAD-782 bounds, CAD-784 screens).
@@ -27,6 +28,25 @@ export function checkCampaignId(id: string): void {
   if (id.length < 1 || id.length > 128 || !/^[A-Za-z0-9_-]+$/.test(id)) {
     throw new ApiError("campaign ID uses letters, digits, - and _ (1–128)", 400);
   }
+}
+
+/** CAD-1058: the human campaign name mirrors the host bound — one
+ *  trimmed plain line, up to 80 characters, no markup or braces. */
+export const CAMPAIGN_NAME_MAX = 80;
+export function checkCampaignName(name: string): void {
+  if (
+    name.length < 1 ||
+    name.length > CAMPAIGN_NAME_MAX ||
+    name.trim() !== name ||
+    /[<>`{}\u0000-\u001f\u007f]/.test(name)
+  ) {
+    throw new ApiError("Give the campaign a short plain name (up to 80 characters).", 400);
+  }
+}
+
+/** The name an operator sees: the human name, else the subject. */
+export function campaignTitle(doc: { name: string | null; subject: string }): string {
+  return doc.name ?? doc.subject;
 }
 
 function checkTokens(text: string): void {
@@ -151,10 +171,17 @@ export function withToken(text: string, fallback: string): string {
 
 export interface ContentDoc {
   campaignId: string;
+  /** CAD-1058: optional human name; null for campaigns without one. */
+  name: string | null;
   revision: number;
   subject: string;
   preheader: string;
   blocks: CampaignBlock[];
+  /** CAD-1056: `html` when the operator saved a (host-sanitised) HTML body. */
+  mode: "blocks" | "html";
+  html: string | null;
+  /** Operator plain-text override, or null for the generated text. */
+  textOverride: string | null;
   contentDigest: string;
   approval: { revision: number | null; digest: string | null; valid: boolean; scope: string };
 }
@@ -178,10 +205,14 @@ export function parseContentDoc(value: unknown): ContentDoc {
   }
   return {
     campaignId: row.campaign_id,
+    name: typeof row.name === "string" && row.name !== "" ? row.name : null,
     revision: row.revision,
     subject: row.subject,
     preheader: row.preheader,
     blocks: row.blocks as CampaignBlock[],
+    mode: row.mode === "html" && typeof row.html === "string" ? "html" : "blocks",
+    html: typeof row.html === "string" ? row.html : null,
+    textOverride: typeof row.text_override === "string" ? row.text_override : null,
     contentDigest: row.content_digest,
     approval: {
       revision: typeof approval.revision === "number" ? approval.revision : null,
@@ -242,6 +273,61 @@ export function parseRender(value: unknown): ContentRender {
   };
 }
 
+/** CAD-1016: the before-Apply preview of a pending assistant draft —
+ *  `app_content_proposal_render` renders the inert proposal's own
+ *  subject/preheader/blocks through the same safe renderer, bound to
+ *  `proposal_id`/`source_revision` (the draft's stamp, never a saved
+ *  revision), `preview_only:true`/`send_ready:false` always. Carries
+ *  no `revision` — a proposal is unsaved by definition. */
+export interface ProposalRenderDoc {
+  proposalId: string;
+  sourceRevision: number;
+  state: string;
+  html: string;
+  text: string;
+  previewOnly: boolean;
+  sendReady: boolean;
+  sender: { name: string; address: string };
+  unsubscribeUrl: string;
+  bindingId: string;
+  contentDigest: string;
+}
+
+export function parseProposalRender(value: unknown): ProposalRenderDoc {
+  const render = (value as { render?: unknown } | null)?.render;
+  if (!render || typeof render !== "object") {
+    throw new ApiError("The server returned an invalid proposal render receipt", 502);
+  }
+  const row = render as Record<string, unknown>;
+  const sender = (row.sender as Record<string, unknown> | null) ?? {};
+  if (
+    typeof row.proposal_id !== "string" ||
+    typeof row.source_revision !== "number" ||
+    typeof row.state !== "string" ||
+    typeof row.html !== "string" ||
+    typeof row.text !== "string" ||
+    typeof sender.name !== "string" ||
+    typeof sender.address !== "string" ||
+    typeof row.unsubscribe_url !== "string"
+  ) {
+    throw new ApiError("The server returned an invalid proposal render receipt", 502);
+  }
+  const binding = (row.binding as Record<string, unknown> | null) ?? {};
+  return {
+    proposalId: row.proposal_id,
+    sourceRevision: row.source_revision,
+    state: row.state,
+    html: row.html,
+    text: row.text,
+    previewOnly: row.preview_only === true,
+    sendReady: row.send_ready === true,
+    sender: { name: sender.name, address: sender.address },
+    unsubscribeUrl: row.unsubscribe_url,
+    bindingId: typeof binding.binding_id === "string" ? binding.binding_id : "preview",
+    contentDigest: typeof row.content_digest === "string" ? row.content_digest : "",
+  };
+}
+
 /** CAD-813: the host-stamped assistant provenance on a proposal.
  *  Every field is server-typed from the durable receipt — the
  *  assistant's claim is never the authority. */
@@ -285,6 +371,10 @@ export interface ProposalDoc {
   campaignId: string;
   sourceRevision: number;
   subject: string;
+  preheader: string;
+  /** The inert draft's bounded blocks — the proposal body the host
+   *  renders for the pre-Apply preview (CAD-1016). */
+  blocks: CampaignBlock[];
   state: string;
   actor: string;
   origin: string;
@@ -303,7 +393,8 @@ export function parseProposal(value: unknown): ProposalDoc {
     typeof row.campaign_id !== "string" ||
     typeof row.source_revision !== "number" ||
     typeof row.subject !== "string" ||
-    typeof row.state !== "string"
+    typeof row.state !== "string" ||
+    !Array.isArray(row.blocks)
   ) {
     throw new ApiError("The server returned an invalid proposal receipt", 502);
   }
@@ -312,6 +403,8 @@ export function parseProposal(value: unknown): ProposalDoc {
     campaignId: row.campaign_id,
     sourceRevision: row.source_revision,
     subject: row.subject,
+    preheader: typeof row.preheader === "string" ? row.preheader : "",
+    blocks: row.blocks as CampaignBlock[],
     state: row.state,
     actor: typeof row.actor === "string" ? row.actor : "operator",
     origin: typeof row.origin === "string" ? row.origin : "operator-direct",
@@ -377,7 +470,5 @@ export function parseProposalList(value: unknown): ProposalDoc[] {
 
 /** Server refusals stay generic; transport failures name the retry. */
 export function friendlyCampaignError(error: unknown): string {
-  if (error instanceof ApiError) return error.message;
-  if (error instanceof TypeError) return "The host did not answer — retry.";
-  return "The campaign request was refused — retry.";
+  return hostErrorText(error, "The campaign request was refused — retry.");
 }

@@ -1,67 +1,11 @@
-# CAD-173: explicit profile for the pinned wrapper in scripts/cadence-nextest.
-# This file does not activate nextest in cadence-review.toml.
+# CAD-1073: reduced profile for the clean-slate transition window.
+# Overrides and test-groups for deleted binaries are removed; they would
+# fail nextest config validation ("no binary IDs matched").
 [profile.cadence]
-# Retries mask flakes and bypass the review flake ledger; keep the gate strict.
 retries = 0
 fail-fast = false
-
-# CAD-920: a hung test fails the run in about 3 minutes instead of holding a
-# queue slot until the 20-minute job timeout. nextest marks a test SLOW after
-# one period, then terminates it after `terminate-after` periods (60s x 3).
-# The longest weighted test is 52s (tests/shard-weights.json), so a healthy
-# test never gets near this; a hang is reported as TIMEOUT and names the test.
 slow-timeout = { period = "60s", terminate-after = 3 }
 
-# CAD-920: test-groups serialize the families that contend for one shared
-# resource. This is throttling, never skipping: every test still runs, none
-# is retried, and the shard assignment (scripts/ci-rust-tests.py) is untouched.
-# A group only limits concurrency inside one nextest process, i.e. one shard.
-[test-groups]
-# `sandbox up` and `ui start` pick a port in 3110-3199, then bind it later.
-# Concurrent sandbox tests (and the board tests' flock leases in
-# tests/common/port.rs) race that pick-to-bind gap; evidence: CAD-817, four
-# merge-queue ejections by ui_start_refuses_a_port_another_board_already_serves.
-sandbox-ports = { max-threads = 1 }
-# These tests run a daemon with a 1-2s lease TTL and renew period and expect it
-# to start, renew and fence inside that window. A starved daemon misses a renew
-# and the lease expires early (cad538_*, "lease expired ... successor may hold
-# it"). Serializing keeps the TTL window from competing with sibling daemons.
-lease-ttl = { max-threads = 1 }
-# Each PTY test launches its own tmux server and pane processes and waits on
-# rendered output under a deadline. Two at a time keep the timing slack that
-# pty_silent_end_reminder_is_not_resent_after_restart and its siblings need.
-pty-panes = { max-threads = 2 }
-# Daemon-per-test flakes that ejected queue entries or recur on PRs, each with
-# several daemons, mock agents and short deadlines: cad323_* (x5 on PRs and a
-# queue ejection), setup_creates_once_*, and the two delivery_* queue flakes.
-daemon-deadlines = { max-threads = 2 }
-
-[[profile.cadence.overrides]]
-filter = 'binary_id(=cadence-agent::sandbox)'
-test-group = 'sandbox-ports'
-
-[[profile.cadence.overrides]]
-filter = 'binary_id(=cadence-agent::hosted_lease)'
-test-group = 'lease-ttl'
-
-[[profile.cadence.overrides]]
-filter = 'binary_id(=cadence-agent::agents_pty) | binary_id(=cadence-agent::pty_interact) | binary_id(=cadence-agent::pty_lifecycle)'
-test-group = 'pty-panes'
-
-[[profile.cadence.overrides]]
-filter = '(binary_id(=cadence-agent::threads) & test(/^cad323_/)) | (binary_id(=cadence-agent::setup) & test(/^setup_creates_once_/)) | (binary_id(=cadence-agent::delivery) & (test(/^delivery_unreviewed_or_unmerged_/) | test(/^delivery_failed_done_write_is_retried_/)))'
-test-group = 'daemon-deadlines'
-
-# The four heaviest healthy tests (tests/shard-weights.json: 52s, 31s, 28s, 26s)
-# get twice the room: cad446_* took 60s on a loaded host and a legitimate
-# test must not be killed for a busy runner. They still fail in 6 minutes.
-[[profile.cadence.overrides]]
-filter = 'test(=cad446_board_syncs_delivery_without_a_terminal) | test(=board_reads_p95_under_budget_on_a_400_issue_tracker) | test(=overview_is_never_served_past_a_change_or_the_age_cap) | test(=pty_hot_restart_submitting_never_records_running)'
-slow-timeout = { period = "60s", terminate-after = 6 }
-
-# The activation follow-up consumes this report after every nextest command.
-# Review deletes the prior file before launch and rejects missing or empty
-# reports, so a stale report cannot launder a zero-test run into a pass.
 [profile.cadence.junit]
 path = "junit.xml"
 report-skipped = "all"

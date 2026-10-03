@@ -1,5 +1,29 @@
 # Integration and production candidates
 
+## Current state: reduced-gate window
+
+CAD-1073 / PR #738 retired the legacy integration suite. The required `test`
+check compiles and runs four `safety_floor` tests; green means that floor
+passed, **not** full behavior coverage. `fmt`, `clippy`, `build` and `ui`
+remain required on PRs and merge groups. CAD-1088 selects PR feedback from a
+classifier loaded from the base commit: isolated docs use no compilation;
+isolated UI code runs UI validation but not unrelated default Rust gates.
+Required contexts explicitly report not-applicable commands rather than
+claiming to build. Governance, workflow, scripts, dependency manifests, mixed
+or unknown changes run all gates. Merge groups always run the full current
+validation (including the reduced floor); fast PR feedback is not evidence
+for skipping integration validation. The committed `.github/reduced-gates`
+marker and `scripts/require-full-gates` refuse release artifacts, candidate
+staging and promotion from a reduced-gate source SHA. Do not remove them as a
+CI-speed optimization.
+
+The shard/inventory benchmarks and old fixture journeys described below are
+historical full-gate design, not current measurements or restored coverage.
+See [development-loop simplification](DEV-CYCLE.md) for the #738 reflection,
+current local check recipe and approval handoff.
+
+## Full-gate delivery design (historical while reduced gates apply)
+
 PRs continue to target main. The merge queue keeps the full fmt, clippy,
 test, build and UI gates. Main CI reuses exact-SHA queue evidence and
 builds an attested artifact. A successful main build is available for
@@ -95,11 +119,11 @@ let that code poison the cache or exfiltrate the key. Therefore:
 - Every other job, including all gate jobs on `pull_request` and
   `merge_group` and on main pushes, gets only the read-only pair and no
   `environment:`.
-- The guard evaluator in `tests/scripts/test_ci_sccache.py` compares
+- The guard evaluator in `tests/scripts/test_ci_sccache.py` (retired under CAD-1073) compares
   strings case-insensitively like GitHub and supports `==` and `!=`; any
   other expression form (functions, `!`) is rejected. The test also rejects
   `secrets[...]`, `toJSON(secrets)` and any computed `environment:`.
-- `tests/scripts/test_ci_sccache.py` (run in `fmt`) fails if an RW secret
+- `tests/scripts/test_ci_sccache.py` (retired under CAD-1073) (run in `fmt`) fails if an RW secret
   appears anywhere but `cache-warm`, if its `if` admits any event but push
   to main, if the writer environment is attached to another job, or if
   any job waits on it.
@@ -188,7 +212,7 @@ one failed test. Compilation/setup failure, zero tests, a skipped test,
 an error or a different failed test makes the experiment fail. Ordinary
 CI must still prove the original implementation passes the test.
 
-## PR test selection and review coverage
+## PR test selection and review coverage (historical pre-transition policy)
 
 The required `test` job reads its selection policy from the PR base.
 A missing base policy or any uncertainty runs the full suite. Documentation
@@ -233,27 +257,26 @@ the first failing step, judges every step by its exit code alone and prints
 one line per step (`[ OK ]`, `[FAIL] name: exit N`, `[SKIP] name: why`):
 
 1. `cargo fmt --all -- --check` (always);
-2. `scripts/split-map-sync --check` (always, well under a second);
+2. `scripts/split-doctor-host --check` (live source inventory); legacy
+   `scripts/split-map-sync --check` only when its inventory exists;
 3. `cargo clippy --all-targets --locked -- -D warnings`, then the same with
    `--features test-seam`, when Rust or Cargo files changed;
 4. `pnpm --dir ui run typecheck` when `ui/` changed;
-5. the `tests/scripts/*.py` contracts that CI's `fmt` job runs, when
-   `scripts/`, `.github/` or `tests/scripts/` changed;
-6. with `--tests`, `scripts/cadence-nextest --test <binary> --test-threads 2`
-   for each changed top-level `tests/*.rs`.
+5. the active Python test commands that CI's `fmt` job runs, including
+   review-recipe and release-freeze regressions, when `scripts/`, `.github/`
+   or `tests/scripts/` changed;
+6. with `--tests`, `cargo test --locked --test safety_floor -- --test-threads 2`
+   regardless of whether the floor's source appears in the diff.
 
 "Changed" is the union of commits since `origin/main`, working-tree edits
 and untracked files; use `--base REF` to override and `--list` to print the
 plan without running it. It sets `CARGO_BUILD_JOBS=4` unless already set and
-never runs the full suite; the merge queue does that.
+does not run the full suite. During CAD-1073 the merge queue runs the same
+reduced floor, not a hidden full integration suite.
 
-`tests/split-map.toml` and `tests/split-map-board.toml` list each
-integration binary's tests. They are derived from the `#[test]` fns in
-`tests/<binary>.rs`: after adding, moving or deleting a test run
-`scripts/split-map-sync` to write the entries, or `--check` to see which file
-and section is out of step. CI runs the check and
-`tests/scripts/test_split_map_sync.py` / `test_pre_push.py` in the `fmt`
-job; the Rust guard `split_map_inventory` remains the exactly-once contract.
+The legacy `tests/split-map*.toml` and `split_map_inventory` contract were
+retired. Do not run `split-map-sync` against missing inputs; see
+[SPLIT-MANIFESTS.md](SPLIT-MANIFESTS.md) for the retained doctor source guard.
 
 ## Shared CI contracts
 
@@ -261,7 +284,7 @@ The required `fmt` job runs the shared scope/runner, shard-coverage,
 nextest-cost, delivery/staging/review-observation contracts and doctor/host
 split-map check once. Their failures still block the required gate and
 release evidence. They no longer repeat in every Rust test shard.
-`tests/scripts/test_ci_shared_checks.py` checks that each command remains
+`tests/scripts/test_ci_shared_checks.py` (retired under CAD-1073) checks that each command remains
 once-only and blocking, including early failures in multi-command steps.
 
 Each `test-shard` job selects the scope from the base policy, proves
@@ -382,7 +405,7 @@ from that file and runs `rustup toolchain install <channel>` with the
 profile and components the job passes. `--export` also sets
 `RUSTUP_TOOLCHAIN` for jobs that build another checkout (staging's
 `candidate-source`). Local `cargo` follows the file too, so a local
-`cargo clippy` matches CI. `tests/scripts/test_ci_toolchain_pin.py` fails
+`cargo clippy` matches CI. `tests/scripts/test_ci_toolchain_pin.py` (retired under CAD-1073) fails
 if a workflow installs a literal or floating channel.
 
 A new stable release can no longer turn the queue red: lints and

@@ -29,6 +29,33 @@ use super::*;
 use crate::issue::app_catalog::workspace;
 use crate::store::app_records::{email_shape_valid, RecordStore};
 
+/// CAD-1063: what actually carries a CRM message. SMTP is the
+/// self-hosted path, unchanged; Hosted is the platform email door a
+/// hosted daemon uses because the tenant container has no egress.
+pub(super) enum SenderTransport {
+    Smtp(crate::platform::smtp::SmtpEnvelope),
+    Hosted(crate::platform::hosted_email::HostedEmail),
+}
+
+impl SenderTransport {
+    /// `"smtp"` or `"agenticos"` — what the board labels the sender.
+    pub(super) fn kind(&self) -> &'static str {
+        match self {
+            Self::Smtp(_) => "smtp",
+            Self::Hosted(_) => "agenticos",
+        }
+    }
+
+    /// The custody secret to screen receipts against; the hosted
+    /// transport holds none.
+    pub(super) fn secret(&self) -> &[u8] {
+        match self {
+            Self::Smtp(envelope) => envelope.secret(),
+            Self::Hosted(_) => &[],
+        }
+    }
+}
+
 fn link_revision(params: &Value) -> Result<i64> {
     params
         .get("expected_revision")
@@ -94,12 +121,18 @@ impl Shared {
         &self,
         connection_id: &str,
         auth_revision: i64,
-    ) -> Result<(
-        crate::store::CredentialRecord,
-        crate::platform::smtp::SmtpEnvelope,
-        crate::platform::smtp::SmtpProjection,
-        Value,
-    )> {
+    ) -> Result<(SenderTransport, crate::platform::smtp::SmtpProjection)> {
+        // CAD-1063: on a hosted daemon the platform sends. There is no
+        // custody, no secret and no socket; the authority is the live
+        // hosted door and its sending address.
+        if let Some(hosted) = self.hosted_sender(connection_id)? {
+            if auth_revision != crate::platform::hosted_email::AUTH_REVISION {
+                return Err(Error::rejected(
+                    "SMTP sender authorization revision is stale; rebind the sender",
+                ));
+            }
+            return Ok((SenderTransport::Hosted(hosted.clone()), hosted.projection()));
+        }
         let record = self
             .store
             .connection_credential(connection_id)?
@@ -150,7 +183,28 @@ impl Shared {
                 "SMTP sender connection changed under claim",
             ));
         }
-        Ok((record, envelope, projection, row))
+        let _ = (record, row);
+        Ok((SenderTransport::Smtp(envelope), projection))
+    }
+
+    /// The authorization revision a bind or rebind pins: the hosted
+    /// platform sender has none to rotate; an SMTP sender pins its
+    /// custody record's.
+    fn crm_sender_revision(&self, connection: &str) -> Result<i64> {
+        if self.hosted_sender(connection)?.is_some() {
+            return Ok(crate::platform::hosted_email::AUTH_REVISION);
+        }
+        let record = self
+            .store
+            .connection_credential(connection)?
+            .ok_or_else(|| Error::rejected("SMTP sender connection is unavailable or stale"))?;
+        if record.exchange != crate::platform::smtp::ENROLLMENT_SHAPE {
+            return Err(Error::rejected(
+                "SMTP sender connection is unavailable or stale",
+            ));
+        }
+        i64::try_from(record.credential_revision)
+            .map_err(|_| Error::rejected("SMTP sender connection is unavailable or stale"))
     }
 
     pub(super) fn rpc_crm_smtp(
@@ -211,33 +265,16 @@ impl Shared {
                         .platform_custody_lock
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    let record = self
-                        .store
-                        .connection_credential(connection)?
-                        .ok_or_else(|| {
-                            Error::rejected("SMTP sender connection is unavailable or stale")
-                        })?;
-                    if record.exchange != crate::platform::smtp::ENROLLMENT_SHAPE {
-                        return Err(Error::rejected(
-                            "SMTP sender connection is unavailable or stale",
-                        ));
-                    }
+                    let revision = self.crm_sender_revision(connection)?;
                     // Bind through the same reviewed-registration and
                     // custody gate the send path enforces, so a bind
                     // can never name an unverified connection.
-                    let (_, _, projection, _) = self.crm_smtp_authority(
-                        connection,
-                        i64::try_from(record.credential_revision).map_err(|_| {
-                            Error::rejected("SMTP sender connection is unavailable or stale")
-                        })?,
-                    )?;
+                    let (_, projection) = self.crm_smtp_authority(connection, revision)?;
                     self.store.crm_smtp_bind(
                         install,
                         context,
                         connection,
-                        i64::try_from(record.credential_revision).map_err(|_| {
-                            Error::internal("SMTP authorization revision overflows")
-                        })?,
+                        revision,
                         &projection,
                         request,
                     )
@@ -251,30 +288,13 @@ impl Shared {
                         .platform_custody_lock
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    let record = self
-                        .store
-                        .connection_credential(connection)?
-                        .ok_or_else(|| {
-                            Error::rejected("SMTP sender connection is unavailable or stale")
-                        })?;
-                    if record.exchange != crate::platform::smtp::ENROLLMENT_SHAPE {
-                        return Err(Error::rejected(
-                            "SMTP sender connection is unavailable or stale",
-                        ));
-                    }
-                    let (_, _, projection, _) = self.crm_smtp_authority(
-                        connection,
-                        i64::try_from(record.credential_revision).map_err(|_| {
-                            Error::rejected("SMTP sender connection is unavailable or stale")
-                        })?,
-                    )?;
+                    let revision = self.crm_sender_revision(connection)?;
+                    let (_, projection) = self.crm_smtp_authority(connection, revision)?;
                     self.store.crm_smtp_rebind(
                         install,
                         context,
                         connection,
-                        i64::try_from(record.credential_revision).map_err(|_| {
-                            Error::internal("SMTP authorization revision overflows")
-                        })?,
+                        revision,
                         &projection,
                         expected,
                     )
@@ -308,8 +328,13 @@ impl Shared {
                         "SMTP sender binding is revoked; bind it again instead",
                     ));
                 }
-                let (_, _, projection, row) =
+                let (transport, projection) =
                     self.crm_smtp_authority(&link.connection_id, link.auth_revision)?;
+                let row = self
+                    .connection_list_locked()?
+                    .into_iter()
+                    .find(|row| row["id"] == link.connection_id)
+                    .unwrap_or(Value::Null);
                 Ok(json!({
                     "binding": {
                         "install_id": install,
@@ -321,6 +346,7 @@ impl Shared {
                         "digest": link.digest,
                         "sender": {"name": projection.sender_name, "address": projection.sender},
                         "transport": {"host": projection.host, "port": projection.port, "tls_mode": projection.tls_mode, "username": projection.username},
+                        "transport_kind": transport.kind(),
                         "connection": row,
                     },
                 }))
@@ -372,7 +398,7 @@ impl Shared {
                             "SMTP sender binding changed under claim",
                         ));
                     }
-                    let (_, envelope, projection, _) =
+                    let (transport, projection) =
                         self.crm_smtp_authority(&link.connection_id, link.auth_revision)?;
                     let rendered = records.app_content_verified_test_bytes(
                         context,
@@ -380,35 +406,90 @@ impl Shared {
                         &projection.sender_name,
                         &projection.sender,
                     )?;
-                    let message = crate::platform::smtp::SmtpMessage {
-                        to: to.to_string(),
-                        subject: rendered["subject"]
-                            .as_str()
-                            .ok_or_else(|| Error::internal("SMTP render lost its subject"))?
-                            .to_string(),
-                        html: rendered["html"]
-                            .as_str()
-                            .ok_or_else(|| Error::internal("SMTP render lost its HTML"))?
-                            .to_string(),
-                        text: rendered["text"]
-                            .as_str()
-                            .ok_or_else(|| Error::internal("SMTP render lost its text"))?
-                            .to_string(),
-                        unsubscribe_url: rendered["unsubscribe_url"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string(),
-                        idempotency_key: None,
-                    };
+                    let subject = rendered["subject"]
+                        .as_str()
+                        .ok_or_else(|| Error::internal("SMTP render lost its subject"))?
+                        .to_string();
+                    let html = rendered["html"]
+                        .as_str()
+                        .ok_or_else(|| Error::internal("SMTP render lost its HTML"))?
+                        .to_string();
+                    let text = rendered["text"]
+                        .as_str()
+                        .ok_or_else(|| Error::internal("SMTP render lost its text"))?
+                        .to_string();
                     let content_digest = rendered["content_digest"]
                         .as_str()
                         .ok_or_else(|| Error::internal("SMTP render lost its digest"))?;
-                    let outcome = crate::platform::smtp::send(
-                        &envelope,
-                        &message,
-                        content_digest,
-                        self.smtp_test_ca.as_deref(),
-                    )?;
+                    let (html_bytes, text_bytes) = (html.len(), text.len());
+                    let unsubscribe_authority = "test send (no unsubscribe token)";
+                    let outcome = match &transport {
+                        SenderTransport::Smtp(envelope) => {
+                            let message = crate::platform::smtp::SmtpMessage {
+                                to: to.to_string(),
+                                subject,
+                                html,
+                                text,
+                                unsubscribe_url: rendered["unsubscribe_url"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string(),
+                                idempotency_key: None,
+                            };
+                            let receipt = crate::platform::smtp::send(
+                                envelope,
+                                &message,
+                                content_digest,
+                                self.smtp_test_ca.as_deref(),
+                            )?;
+                            crate::platform::smtp::SmtpOutcome::Accepted {
+                                code: receipt.code,
+                                message: receipt.message,
+                            }
+                        }
+                        SenderTransport::Hosted(hosted) => {
+                            // The key follows (context, campaign,
+                            // recipient, exact bytes): re-sending the
+                            // same test after the owner approved it
+                            // re-presents the same key and executes.
+                            let message = crate::platform::hosted_email::HostedMessage {
+                                to: to.to_string(),
+                                subject,
+                                text,
+                                html,
+                            };
+                            let digest = crate::platform::hosted_email::content_digest(&message);
+                            let seed = crate::store::app_runs::material_digest(&json!({
+                                "domain": "cadence-crm-hosted-test-send-v1",
+                                "install_id": install,
+                                "context_id": context,
+                                "campaign_id": campaign,
+                                "to_email": to.to_lowercase(),
+                            }));
+                            let key = crate::platform::hosted_email::idempotency_key(&seed, &digest);
+                            match hosted.send_outcome(&message, &key)? {
+                                crate::platform::smtp::SmtpOutcome::Accepted { code, message } => {
+                                    crate::platform::smtp::SmtpOutcome::Accepted { code, message }
+                                }
+                                pending @ crate::platform::smtp::SmtpOutcome::PendingApproval { .. } => pending,
+                                crate::platform::smtp::SmtpOutcome::Deferred { message, .. }
+                                | crate::platform::smtp::SmtpOutcome::Rejected { message, .. }
+                                | crate::platform::smtp::SmtpOutcome::NotSubmitted { message }
+                                | crate::platform::smtp::SmtpOutcome::Uncertain { message } => {
+                                    return Err(Error::rejected(message))
+                                }
+                            }
+                        }
+                    };
+                    let (accepted, pending, code, outcome_message) = match outcome {
+                        crate::platform::smtp::SmtpOutcome::Accepted { code, message } => {
+                            (true, false, code, message)
+                        }
+                        crate::platform::smtp::SmtpOutcome::PendingApproval { message } => {
+                            (false, true, 0, message)
+                        }
+                        _ => unreachable!("other outcomes returned above"),
+                    };
                     let receipt = json!({
                         "test_send": true,
                         "kind": "test",
@@ -432,12 +513,14 @@ impl Shared {
                         })),
                         "transport": {"host": projection.host, "port": projection.port, "tls_mode": projection.tls_mode},
                         "sender": {"name": projection.sender_name, "address": projection.sender},
-                        "multipart": {"html_bytes": message.html.len(), "text_bytes": message.text.len()},
-                        "accepted": outcome.accepted,
-                        "smtp_code": outcome.code,
-                        "smtp_message": outcome.message,
+                        "multipart": {"html_bytes": html_bytes, "text_bytes": text_bytes},
+                        "accepted": accepted,
+                        "pending_approval": pending,
+                        "transport_kind": transport.kind(),
+                        "smtp_code": code,
+                        "smtp_message": outcome_message,
                         "delivery_claim": "smtp-acceptance-only",
-                        "unsubscribe_authority": "test send (no unsubscribe token)",
+                        "unsubscribe_authority": unsubscribe_authority,
                     });
                     // The receipt must not carry the secret even when
                     // the server echoed credential-shaped bytes — the
@@ -445,14 +528,14 @@ impl Shared {
                     crate::platform::refuse_leak(
                         "smtp test receipt",
                         &receipt.to_string(),
-                        envelope.secret(),
+                        transport.secret(),
                     )?;
                     // CAD-786: an accepted test send is the only
                     // "sent after preview" evidence a campaign
                     // prepare accepts, and it binds this exact
                     // content + link digest — an edit or rebind
                     // makes the evidence stale by construction.
-                    if outcome.accepted {
+                    if accepted {
                         records.app_campaign_test_send_record(
                             context,
                             campaign,

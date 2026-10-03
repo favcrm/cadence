@@ -4,6 +4,7 @@ import Button from "../../ui/Button";
 import type { WorkspaceRun, AppEffect } from "./workspaceApps";
 import {
   socialPublish,
+  PUBLISH_LIST_CAP,
   publishStateText,
   publishStateTone,
   type PublishIntent,
@@ -48,7 +49,7 @@ import "./schedule-calendar.css";
  *  - Read-only for non-operators; every write stays in existing handlers.
  */
 
-const LIST_CAP = 100; // daemon caps the list at 100, ORDER BY intent_id
+const LIST_CAP = PUBLISH_LIST_CAP; // daemon list cap, ORDER BY intent_id
 
 interface DayGroup {
   date: string;

@@ -342,10 +342,98 @@ fn ensure_local(state_dir: &Path, tracker_dir: &Path) -> Result<()> {
     file.write(&registry)
 }
 
-/// Resolve this invocation's daemon state dir once. `org` is `--org`; a
+/// Pure registry mutation for `cadence login` (CAD-1019 slice 1b), unit-tested
+/// without the registry file. `org_name` is the issuer-verified slug and
+/// `endpoint`/`org_id` come only from the verified grant. A stored remote is
+/// never re-pointed, a `local` row is never overwritten, and the new org is
+/// selected only when there is no default or `use_default`.
+fn apply_record_remote(
+    registry: &mut Registry,
+    org_name: &str,
+    endpoint: &str,
+    org_id: &str,
+    use_default: bool,
+) -> Result<(Connection, bool)> {
+    let org = cadence_agent::proto::identifier(org_name, "org")?;
+    let destination = Destination::Remote {
+        endpoint: endpoint.to_string(),
+        org_id: org_id.to_string(),
+    };
+    validate_destination(&destination)?;
+    let selection = Selection { org: org.clone() };
+    if let Some(existing) = registry
+        .connections
+        .iter()
+        .find(|c| c.selection == selection)
+    {
+        // Re-login must re-point at the same endpoint + org id — a changed
+        // slug or forged audience refuses, never silently moves the org.
+        match &existing.destination {
+            Destination::Remote {
+                endpoint: ep,
+                org_id: oid,
+            } if ep == endpoint && oid == org_id => {}
+            Destination::Remote { .. } => {
+                return Err(Error::rejected(
+                    "a different endpoint or org id is already stored for this org; \
+                     remove it first",
+                ));
+            }
+            Destination::Local { .. } => {
+                return Err(Error::rejected(
+                    "an org with this name exists as a local connection; pick another name",
+                ));
+            }
+        }
+    } else {
+        registry.connections.push(Connection {
+            selection: selection.clone(),
+            destination: destination.clone(),
+        });
+    }
+    let selected = if use_default || registry.selected.is_none() {
+        registry.selected = Some(selection.clone());
+        true
+    } else {
+        registry.selected.as_ref() == Some(&selection)
+    };
+    Ok((
+        Connection {
+            selection,
+            destination,
+        },
+        selected,
+    ))
+}
+
+/// File-locked wrapper over `apply_record_remote`; returns the stored view.
+pub(super) fn record_remote(
+    org_name: &str,
+    endpoint: &str,
+    org_id: &str,
+    use_default: bool,
+) -> Result<Value> {
+    let file = RegistryFile::open()?;
+    let mut registry = file.read()?;
+    let (connection, selected) =
+        apply_record_remote(&mut registry, org_name, endpoint, org_id, use_default)?;
+    file.write(&registry)?;
+    Ok(view(&connection, selected))
+}
+
+/// What `resolve` settled for this invocation: a local daemon state dir,
+/// or a pinned remote destination (CAD-1019 slice 2). `Remote` carries the
+/// issuer-verified endpoint + workspace — never a credential, and never
+/// re-derived after this call.
+pub(super) enum Resolved {
+    Local(PathBuf),
+    Remote(cadence_agent::remote_cli::RemoteTarget),
+}
+
+/// Resolve this invocation's destination once. `org` is `--org`; a
 /// managed caller keeps its ambient binding and never consults the
 /// registry. `state`/`tracker` are explicit pins — either wins over the
-/// registry and refuses `--org`. Returns the state dir; a local-org
+/// registry and refuses `--org`. Returns [`Resolved`]; a local-org
 /// selection also exports `CADENCE_PM_DIR` so the tracker lands on the
 /// org's root. Never resolves the tracker for a managed, pinned or
 /// ambient caller — those never needed it (the CAD-313 `ui login`
@@ -354,7 +442,7 @@ pub(super) fn resolve(
     org: Option<&str>,
     state: Option<PathBuf>,
     tracker: Option<PathBuf>,
-) -> Result<PathBuf> {
+) -> Result<Resolved> {
     // A managed caller's inherited binding always wins over a saved
     // preference — it cannot be retargeted by a default the operator
     // changed mid-run, and it never reads the registry at all.
@@ -365,8 +453,9 @@ pub(super) fn resolve(
             ));
         }
         return state
+            .map(Resolved::Local)
             .map(Ok)
-            .unwrap_or_else(cadence_agent::client::state_dir);
+            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
     }
     // An explicit flag or inherited binding is a pin; it conflicts with
     // `--org` rather than mixing roots.
@@ -388,8 +477,9 @@ pub(super) fn resolve(
             ));
         }
         return state
+            .map(Resolved::Local)
             .map(Ok)
-            .unwrap_or_else(cadence_agent::client::state_dir);
+            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
     }
     let org_env = std::env::var("CADENCE_ORG").ok();
     let org = org.or(org_env.as_deref());
@@ -407,7 +497,7 @@ pub(super) fn resolve(
         None => None,
     };
     let Some(conn) = selection else {
-        return cadence_agent::client::state_dir();
+        return cadence_agent::client::state_dir().map(Resolved::Local);
     };
     match conn.destination {
         Destination::Local {
@@ -421,13 +511,19 @@ pub(super) fn resolve(
                 conn.selection.org,
                 state_dir.display()
             );
-            Ok(state_dir)
+            Ok(Resolved::Local(state_dir))
         }
-        Destination::Remote { endpoint, org_id } => Err(Error::rejected(format!(
-            "org '{}' selects remote endpoint {endpoint} (org {org_id}) but remote \
-             transport is not configured in this build — refusing local fallback",
-            conn.selection.org
-        ))),
+        Destination::Remote { endpoint, org_id } => {
+            // The destination is the issuer-verified endpoint recorded at
+            // login — `remote_cli` refuses to send this org's credential
+            // anywhere else, and there is no local fallback.
+            eprintln!("cadence org={} remote={}", conn.selection.org, endpoint);
+            Ok(Resolved::Remote(cadence_agent::remote_cli::RemoteTarget {
+                org: conn.selection.org,
+                endpoint,
+                org_id,
+            }))
+        }
     }
 }
 
@@ -447,4 +543,65 @@ pub(crate) enum OrgAction {
         /// Org name; default is the saved/`CADENCE_ORG` selection.
         name: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EP_A: &str = "https://alpha.cadencecloud.app";
+    const EP_B: &str = "https://beta.cadencecloud.app";
+
+    #[test]
+    fn changed_endpoint_or_org_id_is_refused_never_moved() {
+        // A changed slug or forged audience refuses instead of silently
+        // re-pointing the stored remote at another workspace.
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        assert!(apply_record_remote(&mut registry, "alpha", EP_B, "ws_alpha", false).is_err());
+        assert!(apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).is_err());
+        let stored = registry
+            .connections
+            .iter()
+            .find(|c| c.selection.org == "alpha")
+            .unwrap();
+        match &stored.destination {
+            Destination::Remote { endpoint, org_id } => {
+                assert_eq!(endpoint, EP_A);
+                assert_eq!(org_id, "ws_alpha");
+            }
+            Destination::Local { .. } => panic!("stored remote changed shape"),
+        }
+    }
+
+    #[test]
+    fn non_https_or_credentialed_endpoint_is_refused() {
+        let mut registry = Registry::default();
+        assert!(apply_record_remote(
+            &mut registry,
+            "alpha",
+            "http://evil.example/",
+            "ws_a",
+            false
+        )
+        .is_err());
+        assert!(apply_record_remote(
+            &mut registry,
+            "alpha",
+            "https://user:pass@evil.example/",
+            "ws_a",
+            false
+        )
+        .is_err());
+        assert!(apply_record_remote(
+            &mut registry,
+            "alpha",
+            "https://evil.example/?next=1",
+            "ws_a",
+            false
+        )
+        .is_err());
+        assert!(registry.connections.is_empty());
+        assert!(registry.selected.is_none());
+    }
 }

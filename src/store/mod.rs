@@ -64,6 +64,7 @@ pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
 pub mod app_audiences;
 pub use app_audiences::{AudienceBase, Predicate};
 pub mod app_content;
+pub mod app_content_html;
 pub use app_content::{Block, Draft};
 pub mod app_bindings;
 pub mod app_capabilities;

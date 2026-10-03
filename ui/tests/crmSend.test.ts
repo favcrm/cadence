@@ -268,6 +268,7 @@ async function mountedFlow() {
   const json = (value: unknown, status = 200) =>
     new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
   const refused = (message: string, status = 409) => json({ error: message }, status);
+  let smtpError: string | null = null;
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const path = String(input);
     const url = new URL(path, "http://localhost");
@@ -391,7 +392,8 @@ async function mountedFlow() {
     if (path === "/api/connections") return json({ connections: [{
       id: "conn-1", provider: "smtp", account: "isolated", kind: "enrolled",
       revision: 1, registration_digest: "sha256:reg1", scopes: ["email:send"],
-      smtp: { host: "localhost", port: 465, tls_mode: "implicit", username: "u", sender: "news@example.com", sender_name: "CRM News" },
+      smtp_sender: true, smtp_error: smtpError,
+      smtp: smtpError ? null : { host: "localhost", port: 465, tls_mode: "implicit", username: "u", sender: "news@example.com", sender_name: "CRM News" },
       status: { adapter_registered: true, descriptor_available: true, custody_available: true, manifest_status: "matched", reviewed_pin: null, reported_pin: null, execution_authority: true, network_checked: true },
     }] });
     if (method === "POST" && url.pathname.endsWith("/audience/preview")) {
@@ -448,6 +450,12 @@ async function mountedFlow() {
     await React.act(async () => { element!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
     await flush();
   }
+  // CAD-1055: the saved detail is tabbed and mounts only the active
+  // panel — open the tab that owns the control a step needs.
+  const openTab = async (name: string) => {
+    if (host.querySelector(`[data-tab="${name}"][aria-selected="true"]`)) return;
+    await click(host.querySelector(`[data-tab="${name}"]`));
+  };
   const byText = (tag: string, label: string) =>
     Array.from(host.querySelectorAll(tag)).find((el) => (el.textContent ?? "").trim() === label) ?? null;
   async function fillInput(selector: string, value: string) {
@@ -503,8 +511,10 @@ async function mountedFlow() {
   assert(text().includes("not proof of inbox delivery"), "the test receipt labels acceptance only");
 
   // Recheck the freeze — validity lands, prepare unlocks.
+  await openTab("audience");
   await click(byText("button", "Recheck freeze"));
   await settle(() => assert(text().includes("Valid"), "freeze validity reports"));
+  await openTab("overview");
   await settle(() => {
     const btn = prepareButton();
     if (btn?.disabled) {
@@ -607,6 +617,42 @@ async function mountedFlow() {
   assert(text().includes("a live SMTP sender binding"), "the missing sender is named");
 
   await React.act(async () => { root.unmount(); });
+
+  // CAD-1064: an enrolled SMTP sender whose settings cannot be read
+  // is still a sender. The panel says why and links to Connections —
+  // it never claims nothing is enrolled.
+  const expectations: [string, string][] = [
+    ["custody_corrupt", "Rotate it to re-enter"],
+    ["withheld_leak", "different password"],
+    ["unavailable", "Rotate it to re-enter"],
+  ];
+  for (const [code, phrase] of expectations) {
+    smtpError = code;
+    const host2 = document.createElement("div");
+    document.body.append(host2);
+    const root2 = createRoot(host2);
+    win.sessionStorage.clear();
+    history.pushState(null, "", "/app-installations/install-crm?ctx=ctx-a&crm=campaigns&record=launch-1");
+    await React.act(async () => {
+      root2.render(
+        React.createElement(AppShell, { installId: "install-crm", viewer: { operator: true, readOnly: false } }),
+      );
+    });
+    const panel2 = () => host2.querySelector('section[aria-label="SMTP sender binding"]');
+    await settle(() => {
+      const t = panel2()?.textContent ?? "";
+      assert(t.includes("can't be used yet"), `${code}: names the unusable sender`);
+      assert(t.includes(phrase), `${code}: gives the fix (${phrase})`);
+    });
+    const t2 = panel2()!.textContent!;
+    assert(!t2.includes("No enrolled SMTP connections"), `${code}: never says nothing is enrolled`);
+    const link = panel2()!.querySelector('a[href="/settings/connections"]');
+    assert(link, `${code}: links to Settings → Connections`);
+    await React.act(async () => { root2.unmount(); });
+    host2.remove();
+  }
+  smtpError = null;
+
   console.log("crm send checks passed");
 }
 
