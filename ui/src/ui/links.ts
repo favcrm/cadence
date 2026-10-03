@@ -8,17 +8,21 @@
  * clickable — defence in depth. Pure, so tests/links.test.ts runs it in
  * plain node.
  */
-export function isLoopbackHref(href: string): boolean {
+export function isLoopbackHref(rawHref: string): boolean {
+  const href = rawHref.trim();
   // react-markdown hands the href percent-encoded (`http://%5B::1%5D/`),
   // which URL rejects; decode only the bracket escapes of an absolute href.
   const absolute = /^([a-z][a-z0-9+.-]*:|\/\/)/i.test(href);
   const candidate = absolute ? href.replace(/%5b/gi, "[").replace(/%5d/gi, "]") : href;
   let url: URL;
   try {
-    url = new URL(candidate);
+    // The fixed non-loopback base lets a `//host/x` network-path href
+    // parse (it has no scheme of its own) so its real host is checked.
+    url = new URL(candidate, "http://base.invalid");
   } catch {
-    // An http(s) or network-path href that will not parse fails CLOSED
-    // (CAD-1075). Only a genuinely relative href is this board's own origin.
+    // An http(s) or network-path href that will not parse even against the
+    // base fails CLOSED (CAD-1075). Only a genuinely relative href is this
+    // board's own origin.
     return /^(https?:|\/\/)/i.test(href);
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return false;

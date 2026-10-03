@@ -101,4 +101,12 @@ for (const md of ["[x](javascript:alert(1))", "[x](ISSUE:CAD-1)"]) {
 const ext = render("[x](https://example.com/p)");
 equal(ext.includes('<a class="lnk" href="https://example.com/p" target="_blank" rel="noreferrer">x</a>'), true, "external link unchanged");
 
+// CAD-1075: a loopback link shows the warning span, never an anchor; a
+// protocol-relative link to another host stays an anchor.
+const lo = render("[x](http://[::1]/)");
+equal(lo.includes("<a "), false, "no anchor for [::1]");
+equal(lo.includes("text-warn"), true, "loopback warning span for [::1]");
+equal(render("[x](//example.com/a)").includes("<a "), true, "//example.com stays an anchor");
+equal(render("[x](//[::1]/a)").includes("<a "), false, "//[::1] is not an anchor");
+
 console.log("md issue link checks passed");

@@ -1,6 +1,3 @@
-import { createElement } from "react";
-import { renderToStaticMarkup } from "react-dom/server";
-import Md from "../src/ui/Md";
 import { isLoopbackHref } from "../src/ui/links";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
@@ -29,6 +26,9 @@ for (const href of [
   "http://%5B::ffff:7f00:1%5D/",
   "http://%5Bzz%5D/",
   "//%5B::1%5D/x",
+  "//[::1]/x",
+  " http://%5B::1%5D/",
+  "\thttp://[::1]/",
 ]) {
   equal(isLoopbackHref(href), true, href);
 }
@@ -45,12 +45,11 @@ for (const href of [
   "https://example.com",
   "http://[2001:db8::1]/",
   "http://%5B2001:db8::1%5D/",
+  "http://%5b2001:db8::1%5d/",
+  "//example.com/x",
+  " https://example.com/",
 ]) {
   equal(isLoopbackHref(href), false, href);
 }
 
-// CAD-1075 end to end: Md shows the warning span, never an anchor.
-const html = renderToStaticMarkup(createElement(Md, { text: "[x](http://[::1]/)" }));
-equal(html.includes("<a "), false, "no anchor for [::1]");
-equal(html.includes("text-warn"), true, "loopback warning span for [::1]");
 console.log("loopback link checks passed");
