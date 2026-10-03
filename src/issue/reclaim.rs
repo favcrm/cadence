@@ -309,7 +309,7 @@ fn reclaim_lane(
     // Test seam: let a test inject a just-started build into the real
     // check→delete gap, proving the re-scan below catches it.
     #[cfg(test)]
-    tests::before_rescan(&lane);
+    tests::before_rescan(lane);
     // I-C: a build could have started in the gap between the idleness
     // check above and this point. Re-run the fast live-process scan on
     // the lane — a just-started build takes the lane as cwd / holds its
@@ -406,7 +406,14 @@ mod tests {
         let lane = repo.join(".cadence").join("wt").join("d-1");
         assert!(git(
             &repo,
-            &["worktree", "add", "-q", lane.to_str().unwrap(), "-b", "x-lane"]
+            &[
+                "worktree",
+                "add",
+                "-q",
+                lane.to_str().unwrap(),
+                "-b",
+                "x-lane"
+            ]
         ));
         (repo, lane)
     }
