@@ -88,6 +88,37 @@ fn test_recipient(address: &str) -> Result<()> {
 }
 
 impl Shared {
+    /// Deliver one enrolled-SMTP message. Self-hosted opens the direct
+    /// TLS socket. A hosted daemon (CAD-1126) builds the very same
+    /// RFC 5322 bytes and sends them, with the custodied credential,
+    /// through `smtp.internal`; it never dials. The credential is read
+    /// here from the envelope (decoded from custody just now) and goes
+    /// only into that one request body.
+    pub(super) fn smtp_deliver(
+        &self,
+        envelope: &crate::platform::smtp::SmtpEnvelope,
+        message: &crate::platform::smtp::SmtpMessage,
+        content_digest: &str,
+    ) -> Result<crate::platform::smtp::SmtpOutcome> {
+        let Some(relay) = self.smtp_internal.as_ref() else {
+            return crate::platform::smtp::send_outcome(
+                envelope,
+                message,
+                content_digest,
+                self.smtp_test_ca.as_deref(),
+            );
+        };
+        let body = crate::platform::smtp::prepare_message(envelope, message, content_digest)?;
+        let server = crate::platform::smtp_internal::Server {
+            host: &envelope.host,
+            port: envelope.port,
+            tls_mode: &envelope.tls_mode,
+            username: &envelope.username,
+            secret: envelope.secret(),
+        };
+        relay.send_outcome(&server, &envelope.sender, &message.to, body.as_bytes())
+    }
+
     /// Resolve the live installation/context, then run `action`.
     /// Unknown or diverted installations and unknown, archived or
     /// foreign contexts refuse before any file or socket opens.
@@ -328,8 +359,33 @@ impl Shared {
                         "SMTP sender binding is revoked; bind it again instead",
                     ));
                 }
-                let (transport, projection) =
-                    self.crm_smtp_authority(&link.connection_id, link.auth_revision)?;
+                // CAD-1126: after a rotate (hosted Replace) the link is
+                // pinned to the old credential revision. Report it as
+                // `stale`, with its link revision and the sender the new
+                // custody projects, so the board can rebind in place
+                // instead of dead-ending. Sending stays refused: the
+                // authority check above still gates every send.
+                let (transport_kind, projection, state) =
+                    match self.crm_smtp_authority(&link.connection_id, link.auth_revision) {
+                        Ok((transport, projection)) => {
+                            (transport.kind(), projection, link.state.clone())
+                        }
+                        Err(refusal) => {
+                            let stale = self
+                                .store
+                                .connection_credential(&link.connection_id)?
+                                .filter(|record| {
+                                    record.exchange == crate::platform::smtp::ENROLLMENT_SHAPE
+                                        && i64::try_from(record.credential_revision)
+                                            .is_ok_and(|rev| rev != link.auth_revision)
+                                })
+                                .and_then(|record| self.smtp_projection_typed(&record).ok());
+                            match stale {
+                                Some(projection) => ("smtp", projection, "stale".to_string()),
+                                None => return Err(refusal),
+                            }
+                        }
+                    };
                 let row = self
                     .connection_list_locked()?
                     .into_iter()
@@ -342,11 +398,11 @@ impl Shared {
                         "connection_id": link.connection_id,
                         "auth_revision": link.auth_revision,
                         "link_revision": link.link_revision,
-                        "state": link.state,
+                        "state": state,
                         "digest": link.digest,
                         "sender": {"name": projection.sender_name, "address": projection.sender},
                         "transport": {"host": projection.host, "port": projection.port, "tls_mode": projection.tls_mode, "username": projection.username},
-                        "transport_kind": transport.kind(),
+                        "transport_kind": transport_kind,
                         "connection": row,
                     },
                 }))
@@ -436,15 +492,17 @@ impl Shared {
                                     .to_string(),
                                 idempotency_key: None,
                             };
-                            let receipt = crate::platform::smtp::send(
-                                envelope,
-                                &message,
-                                content_digest,
-                                self.smtp_test_ca.as_deref(),
-                            )?;
-                            crate::platform::smtp::SmtpOutcome::Accepted {
-                                code: receipt.code,
-                                message: receipt.message,
+                            match self.smtp_deliver(envelope, &message, content_digest)? {
+                                accepted @ crate::platform::smtp::SmtpOutcome::Accepted {
+                                    ..
+                                } => accepted,
+                                crate::platform::smtp::SmtpOutcome::Deferred { message, .. }
+                                | crate::platform::smtp::SmtpOutcome::Rejected { message, .. }
+                                | crate::platform::smtp::SmtpOutcome::NotSubmitted { message }
+                                | crate::platform::smtp::SmtpOutcome::Uncertain { message }
+                                | crate::platform::smtp::SmtpOutcome::PendingApproval {
+                                    message,
+                                } => return Err(Error::rejected(message)),
                             }
                         }
                         SenderTransport::Hosted(hosted) => {

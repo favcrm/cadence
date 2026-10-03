@@ -16,6 +16,8 @@ import {
   type SmtpBinding,
 } from "../app-shell/sendClient";
 import type { HostScope } from "../app-shell/hostActions";
+import HostedSmtpConnect, { type ConnectDetails } from "./HostedSmtpConnect";
+import { HOSTED_ACCOUNT, SMTP_SEND_SCOPE } from "./hostedSmtpView";
 import { workspaceApps } from "../workspace-apps/workspaceApps";
 import {
   isHostedTransport,
@@ -126,6 +128,8 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
 function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
   const canWrite = viewer.operator && !viewer.readOnly;
   const [rows, setRows] = useState<Connection[] | null>(null);
+  const [hostedSmtp, setHostedSmtp] = useState(false);
+  const [replacing, setReplacing] = useState(false);
   const [binding, setBinding] = useState<SmtpBinding | null | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState("");
@@ -139,6 +143,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
       ([list, bound]) => {
         if (controller.signal.aborted) return;
         setRows(list.connections ?? []);
+        setHostedSmtp(list.hosted_smtp === true);
         setBinding(bound);
         setError(null);
       },
@@ -166,10 +171,83 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
       .finally(() => setPending(false));
   };
 
+  const emailRow = rows?.find((r) => r.provider === "smtp" && r.account === HOSTED_ACCOUNT) ?? null;
+  const emailAddress = emailRow?.smtp?.sender ?? null;
+
+  // CAD-1126: connect (or replace) the tenant's own SMTP and bind it as
+  // the CRM sender in one step. A refusal from the verify step throws to
+  // the form, which shows plain words; a bind failure shows here.
+  const connectEmail = async (d: ConnectDetails, acceptRisk: boolean) => {
+    const fields = {
+      host: d.host,
+      port: d.port,
+      tls_mode: d.tls_mode,
+      username: d.username,
+      secret: d.password,
+      sender: d.sender,
+      ...(d.sender_name ? { sender_name: d.sender_name } : {}),
+      // Only after the daemon refused with custody_unprotected and the
+      // operator ticked the honest consent (CAD-1013 pattern).
+      ...(acceptRisk ? { accept_same_uid_risk: true } : {}),
+    };
+    const out = emailRow
+      ? await api.connectionRotate(emailRow.id, fields)
+      : await api.connectionCreate({
+          provider: "smtp",
+          account: HOSTED_ACCOUNT,
+          shape: "smtp",
+          scopes: [SMTP_SEND_SCOPE],
+          ...fields,
+        });
+    setReplacing(false);
+    setError(null);
+    try {
+      const [list, fresh] = await Promise.all([api.connections(), readSmtpBinding(scope)]);
+      setRows(list.connections ?? []);
+      const id = out.connection.id;
+      const bound = fresh
+        ? await sendClient.smtpRebind(scope, id, fresh.linkRevision)
+        : await sendClient.smtpBind(scope, id, newAudienceId("bind"));
+      setBinding(parseSmtpBinding(bound));
+      setNote(`Connected. Campaigns now send from ${d.sender}.`);
+    } catch (e: unknown) {
+      setError(friendlySendError(e));
+    }
+  };
+
   const live = sendingFrom(binding);
   return (
     <section aria-label="Sender" className="card px-4 py-4 grid gap-3 min-w-0">
       <h2 className="text-cardtitle font-medium text-ink-100">Sender</h2>
+      {hostedSmtp && canWrite && rows !== null && (
+        <div className="grid gap-2 min-w-0" data-section="connect-email">
+          <h3 className="text-body font-medium text-ink-100">Connect your email (SMTP)</h3>
+          {emailRow && !replacing ? (
+            <div className="grid gap-2">
+              <p className="text-label text-ink-300 break-words" data-state="email-connected">
+                Connected: {emailAddress ?? emailRow.account}
+              </p>
+              <div className="crm-toolbar">
+                <Button size="sm" onClick={() => setReplacing(true)}>
+                  Replace email account
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <p className="text-label text-ink-400 break-words">
+                Send campaigns from your own email account. Pick your provider, then paste an
+                app password. We check the login before saving anything.
+              </p>
+              <HostedSmtpConnect
+                connected={emailAddress}
+                onConnect={connectEmail}
+                onCancel={emailRow ? () => setReplacing(false) : undefined}
+              />
+            </>
+          )}
+        </div>
+      )}
       {binding === undefined && error === null && (
         <p className="text-label text-ink-400" role="status">
           Reading the sender…
@@ -177,7 +255,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
       )}
       {binding === null && (
         <p className="text-label text-ink-400" data-state="unbound">
-          No sender chosen yet. Pick one below.
+          {hostedSmtp ? "No sender chosen yet." : "No sender chosen yet. Pick one below."}
         </p>
       )}
       {binding && live !== null && (
@@ -213,13 +291,13 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
           ))}
         </ul>
       )}
-      {rows !== null && usable.length === 0 && unusable.length === 0 && (
+      {rows !== null && !hostedSmtp && usable.length === 0 && unusable.length === 0 && (
         <p className="text-label text-ink-500">
           No email sender is available. Add an SMTP sender under{" "}
           <Link href="/settings/connections">Settings → Connections</Link>.
         </p>
       )}
-      {canWrite && usable.length > 0 && (
+      {canWrite && usable.length > 0 && !(hostedSmtp && usable.length === 1 && emailRow && live !== null) && (
         <div className="crm-field-row">
           <div className="crm-field">
             <label className="text-label text-ink-300" htmlFor="email-sender">

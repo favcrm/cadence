@@ -113,6 +113,25 @@ impl Shared {
         Ok((id == connection_id).then_some(hosted))
     }
 
+    /// CAD-1126: on a hosted daemon an SMTP enrolment is proven live
+    /// before anything is stored: connect, TLS and login through
+    /// `smtp.internal` (`/v1/verify`, no send). A wrong password or a
+    /// blocked host refuses here, in plain words, and custody stays
+    /// untouched. Self-hosted enrolment is unchanged (no live check).
+    fn verify_hosted_smtp(&self, params: &Value) -> Result<()> {
+        let Some(relay) = self.smtp_internal.as_ref() else {
+            return Ok(());
+        };
+        let enrollment = platform::smtp::parse_enrollment(params)?;
+        relay.verify(&platform::smtp_internal::Server {
+            host: &enrollment.host,
+            port: enrollment.port,
+            tls_mode: &enrollment.tls_mode,
+            username: &enrollment.username,
+            secret: &enrollment.secret,
+        })
+    }
+
     /// Live non-secret SMTP material for one enrolled record.
     /// Custody-only: the secret never enters the projection by
     /// construction, and the projection is screened before return.
@@ -234,7 +253,11 @@ impl Shared {
                     .unwrap_or_else(|e| e.into_inner());
                 let rows = self.connection_list_locked()?;
                 if method == "connection_list" {
-                    return Ok(json!({"connections":rows}));
+                    // `hosted_smtp`: enrolled senders send through the
+                    // hosted `smtp.internal` pass-through (CAD-1126).
+                    return Ok(
+                        json!({"connections":rows,"hosted_smtp":self.smtp_internal.is_some()}),
+                    );
                 }
                 let id = connection_id(params)?;
                 let row = rows
@@ -272,6 +295,7 @@ impl Shared {
                         ));
                     }
                     let shapeliness = smtp_create_params(&provider, &account, params)?;
+                    self.verify_hosted_smtp(&shapeliness)?;
                     let enrolled = self
                         .enroll_inner(
                             &shapeliness,
@@ -378,6 +402,7 @@ impl Shared {
                     mapped["platform"] = json!(record.platform);
                     mapped["account"] = json!(record.account);
                     mapped["shape"] = json!(record.exchange);
+                    self.verify_hosted_smtp(&mapped)?;
                     let secret = params.get("secret").and_then(Value::as_str).unwrap_or("");
                     self.enroll_inner(
                         &mapped,

@@ -1066,12 +1066,7 @@ impl Shared {
                     unsubscribe_url,
                     idempotency_key: Some(delivery.idempotency_key.clone()),
                 };
-                crate::platform::smtp::send_outcome(
-                    envelope,
-                    &message,
-                    &content_digest,
-                    self.smtp_test_ca.as_deref(),
-                )?
+                self.smtp_deliver(envelope, &message, &content_digest)?
             }
             SenderTransport::Hosted(hosted) => {
                 let message = crate::platform::hosted_email::HostedMessage {

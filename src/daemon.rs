@@ -470,6 +470,10 @@ pub struct Shared {
     /// CAD-1063: the hosted platform email door; `Some` only on a
     /// hosted daemon, where it replaces SMTP egress.
     hosted_email: Option<crate::platform::hosted_email::HostedEmail>,
+    /// CAD-1126: `Some` on a hosted daemon — enrolled SMTP senders send
+    /// and verify through the `smtp.internal` pass-through instead of
+    /// opening a socket the offline container does not have.
+    smtp_internal: Option<crate::platform::smtp_internal::SmtpInternal>,
     /// CAD-786: the base the unsubscribe links mint — the board's
     /// public origin; `None` refuses `crm_send_prepare`.
     unsubscribe_origin: Option<String>,
@@ -726,6 +730,7 @@ impl Shared {
                 opts.crm_send_pending_poll_ms
             }),
             hosted_email: opts.hosted_email.clone(),
+            smtp_internal: opts.smtp_internal.clone(),
             unsubscribe_origin: opts.unsubscribe_origin.clone(),
             #[cfg(feature = "test-seam")]
             crm_send_row_gate: opts.crm_send_row_gate.clone(),
@@ -4802,6 +4807,11 @@ pub struct ServeOptions {
     /// lease (and by fixtures); `None` keeps the SMTP path. Never
     /// sourced from RPC or PM.
     pub hosted_email: Option<crate::platform::hosted_email::HostedEmail>,
+    /// CAD-1126: the hosted `smtp.internal` pass-through. Set by
+    /// `platform::agenticos::attach` on a daemon holding a hosted lease
+    /// (and by fixtures); `None` keeps direct SMTP. Never sourced from
+    /// RPC or PM.
+    pub smtp_internal: Option<crate::platform::smtp_internal::SmtpInternal>,
     /// CAD-786: the public origin unsubscribe links mint
     /// (`{origin}/unsubscribe/<token>`). `https://` anywhere or
     /// loopback `http://` for rigs; `None` refuses

@@ -759,7 +759,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     STANDARD.decode(input).ok()
 }
 
-fn base64_encode(input: &[u8]) -> String {
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine};
     STANDARD.encode(input)
 }
@@ -969,12 +969,24 @@ enum Wire {
     Tls(Box<BufReader<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>>),
 }
 
+/// CAD-1126: every direct SMTP socket attempt passes through
+/// `SmtpSession::dial`, which counts it first. A hosted daemon must
+/// never dial (the container is offline and sends through
+/// `smtp.internal`), so the acceptance check reads this counter.
+static DIRECT_DIALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many direct SMTP socket attempts this process has made.
+pub fn direct_dial_count() -> usize {
+    DIRECT_DIALS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 struct SmtpSession {
     wire: Wire,
 }
 
 impl SmtpSession {
     fn dial(host: &str, port: u16) -> Result<TcpStream> {
+        DIRECT_DIALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let addresses: Vec<_> = (host, port)
             .to_socket_addrs()
             .map_err(|_| Error::rejected("SMTP host does not resolve"))?
@@ -1188,7 +1200,7 @@ fn fail_outcome(fail: Fail, data_written: bool) -> SmtpOutcome {
 /// Screen any server-supplied text against the secret before it
 /// becomes a receipt, a row value, an error, or a log line. A hit
 /// withholds the text, never the verdict.
-fn screened(text: &str, secret: &[u8]) -> String {
+pub(crate) fn screened(text: &str, secret: &[u8]) -> String {
     if carries_secret(text, secret) {
         return "SMTP submission refused".to_string();
     }
@@ -1197,6 +1209,26 @@ fn screened(text: &str, secret: &[u8]) -> String {
         excerpt.push('…');
     }
     excerpt
+}
+
+/// CAD-1126: the "build" half of a submission, shared by the direct
+/// socket path and the hosted `smtp.internal` pass-through so both put
+/// the exact same bytes (Date, Message-ID, List-Unsubscribe, ...) on
+/// the wire. Validates the envelope and returns the RFC 5322 message.
+pub fn prepare_message(
+    envelope: &SmtpEnvelope,
+    message: &SmtpMessage,
+    content_digest: &str,
+) -> Result<String> {
+    validate_port_tls(&envelope.host, envelope.port, &envelope.tls_mode)?;
+    if envelope.secret.iter().any(|b| *b == b'\r' || *b == b'\n') {
+        return Err(Error::rejected(
+            "SMTP secret exceeds its supported shape or bounds",
+        ));
+    }
+    std::str::from_utf8(&envelope.secret)
+        .map_err(|_| Error::rejected("SMTP secret exceeds its supported shape or bounds"))?;
+    assemble_message(envelope, message, content_digest)
 }
 
 /// Submit one message, returning the classified outcome (CAD-786).
@@ -1209,15 +1241,9 @@ pub fn send_outcome(
     content_digest: &str,
     extra_ca_pem: Option<&[u8]>,
 ) -> Result<SmtpOutcome> {
-    validate_port_tls(&envelope.host, envelope.port, &envelope.tls_mode)?;
-    if envelope.secret.iter().any(|b| *b == b'\r' || *b == b'\n') {
-        return Err(Error::rejected(
-            "SMTP secret exceeds its supported shape or bounds",
-        ));
-    }
+    let body = prepare_message(envelope, message, content_digest)?;
     let secret_text = std::str::from_utf8(&envelope.secret)
         .map_err(|_| Error::rejected("SMTP secret exceeds its supported shape or bounds"))?;
-    let body = assemble_message(envelope, message, content_digest)?;
     let tls = tls_config(extra_ca_pem)?;
     let outcome = send_inner(envelope, message, &body, &tls, secret_text);
     Ok(match outcome {
