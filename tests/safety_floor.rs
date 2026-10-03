@@ -311,7 +311,7 @@ fn safety_floor_port_fence_refuses_occupied_lock() {
 fn safety_floor_cli_refuses_unknown_verb() {
     // Basic CLI refusal: unknown verbs exit non-zero. This proves the binary
     // still enforces its command surface during the clean-slate window.
-    let mut cmd = Command::new("target/debug/cadence");
+    let mut cmd = Command::new(BINARY);
     cmd.args(["nonexistent-verb"]);
     let out = reaper::output(&mut cmd).expect("cadence binary must exist to test refusal");
     assert!(!out.status.success(), "unknown verb must refuse");
