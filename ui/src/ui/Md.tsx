@@ -12,7 +12,10 @@ interface MdNode {
   children?: MdNode[];
 }
 
-const ISSUE_ID = /\b[A-Z]{2,6}-\d+\b/g;
+// One id shape for both the linkifier (bounded, global) and the `issue:`
+// validator (anchored); digits are capped so a long run is not an id.
+const ISSUE_ID_SRC = "[A-Z]{2,6}-\\d{1,9}";
+const ISSUE_ID = new RegExp(`\\b${ISSUE_ID_SRC}\\b`, "g");
 
 function linkifyChildren(node: MdNode): void {
   const kids = node.children;
@@ -51,7 +54,7 @@ function markdownImageSrc(src?: string): string | null {
 
 // Only well-formed ids may reach `onOpen`; `issue:` hrefs can come from
 // agent-written Markdown, so the remainder is checked, not trusted.
-const WHOLE_ISSUE_ID = /^[A-Z]{2,6}-\d+$/;
+const WHOLE_ISSUE_ID = new RegExp(`^${ISSUE_ID_SRC}$`);
 
 export default function Md({
   text,
@@ -73,12 +76,17 @@ export default function Md({
           const safe = markdownImageSrc(src);
           return safe ? <img src={safe} alt={alt ?? ""} /> : <span>{alt || "Image unavailable"}</span>;
         },
-        a: ({ href, children }) =>
-          href?.startsWith("issue:") ? (
-            WHOLE_ISSUE_ID.test(href.slice(6)) ? (
+        a: ({ href, children }) => {
+          const issueId = href?.startsWith("issue:") ? href.slice(6) : null;
+          return !href ? (
+            // react-markdown blanked an unsafe target: show text, not an
+            // anchor that would reopen the board in a new tab.
+            <>{children}</>
+          ) : issueId !== null ? (
+            WHOLE_ISSUE_ID.test(issueId) ? (
               <button
                 className="lnk num"
-                onClick={() => onOpen?.(href.slice(6))}
+                onClick={() => onOpen?.(issueId)}
               >
                 {children}
               </button>
@@ -86,7 +94,7 @@ export default function Md({
               // A malformed id is shown as text: no button, no anchor.
               <>{children}</>
             )
-          ) : href && isLoopbackHref(href) ? (
+          ) : isLoopbackHref(href) ? (
             // A link to this machine is shown, never followed (CAD-313).
             <span
               className="text-warn"
@@ -103,7 +111,8 @@ export default function Md({
             >
               {children}
             </a>
-          ),
+          );
+        },
       }}
     >
       {text}

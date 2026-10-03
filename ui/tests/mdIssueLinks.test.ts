@@ -74,8 +74,8 @@ const good = anchor("issue:CAD-12", (id) => opened.push(id)) as El;
 equal(good.type, "button", "valid id renders a button");
 good.props.onClick();
 equal(opened, ["CAD-12"], "valid id reaches onOpen");
-for (const bad of ["issue:javascript:alert(1)", "issue:", "issue:cad-12", "issue:CAD-12/../x", "issue:CAD-12 ", "issue:A-1"]) {
-  const el = anchor(bad, (id) => opened.push(id)) as unknown as { type: unknown; props: Record<string, any> };
+for (const bad of ["issue:javascript:alert(1)", "issue:", "issue:cad-12", "issue:CAD-12/../x", "issue:CAD-12 ", "issue:A-1", "issue:../CAD-12", "issue:xCAD-12", "issue:CAD-1234567890"]) {
+  const el = anchor(bad, (id) => opened.push(id)) as El;
   equal(el.type === "button" || el.type === "a", false, `${bad}: no button or anchor`);
   equal(el.props.children, "x", `${bad}: link text kept as plain text`);
 }
@@ -84,5 +84,21 @@ equal(opened, ["CAD-12"], "hostile ids never call onOpen");
 const hostile = render("[x](issue:javascript:alert(1)) and [y](issue:cad-12)");
 equal(/<button|<a /.test(hostile), false, "hostile issue: links render as text");
 equal(hostile.includes("javascript"), false, "hostile target does not leak into markup");
+
+// Ids are capped at 9 digits: a 10-digit run is neither linked in prose nor opened.
+const long = render("see CAD-1234567890 now");
+equal(linked(long), false, "10-digit id is not linkified in prose");
+const nine = render("see CAD-123456789 now");
+equal(linked(nine), true, "9-digit id is still linkified");
+
+// An unsafe target is blanked by react-markdown; render text, not `<a href="">`.
+for (const md of ["[x](javascript:alert(1))", "[x](ISSUE:CAD-1)"]) {
+  const html = render(md);
+  equal(/<a |<button/.test(html), false, `${md}: no anchor or button`);
+  equal(html.includes(">x<") || html.includes("x</p>"), true, `${md}: text kept`);
+}
+// A valid external link still renders as an anchor.
+const ext = render("[x](https://example.com/p)");
+equal(ext.includes('<a class="lnk" href="https://example.com/p" target="_blank" rel="noreferrer">x</a>'), true, "external link unchanged");
 
 console.log("md issue link checks passed");

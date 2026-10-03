@@ -34,8 +34,8 @@ equal(/<svg/i.test(svg), false, "no svg element is produced");
 // Probe 3 — a javascript: link loses its target.
 const js = render("[click](javascript:alert(1))");
 equal(/javascript:/i.test(js), false, "the javascript: url is stripped");
-equal(js.includes('href=""'), true, "the anchor renders without a target");
-equal(js.includes(">click</a>"), true, "the link's text still shows");
+equal(/<a /.test(js), false, "no anchor renders for a blanked target (CAD-1070)");
+equal(js.includes(">click</p>"), true, "the link's text still shows");
 const mixed = render("[x](JaVaScRiPt:alert(1))");
 equal(/javascript:/i.test(mixed), false, "case does not smuggle the scheme through");
 const img = render("![x](javascript:alert(1))");
