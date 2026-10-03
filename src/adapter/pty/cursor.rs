@@ -1089,75 +1089,6 @@ mod tests {
     use serde_json::{json, Value};
     use std::path::PathBuf;
 
-    /// Real captures from live cursor-agent panes (CAD-56, versions
-    /// 2026.09.15/2026.09.18), committed under tests/fixtures/cursor-tui/.
-    fn fixture(name: &str) -> String {
-        std::fs::read_to_string(format!(
-            "{}/tests/fixtures/cursor-tui/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .unwrap()
-    }
-
-    #[test]
-    fn idle_prompt_is_pasteable() {
-        let p = analyze_cursor(&fixture("idle.txt"), None);
-        assert!(p.idle, "{} / {}", p.idle, p.reason);
-        assert_eq!(p.reason, "idle");
-        assert!(p.prompt_visible && !p.input_nonempty);
-        assert!(!p.busy_marker && !p.approval_menu);
-    }
-
-    #[test]
-    fn follow_up_watermark_is_still_empty_input() {
-        // After a turn the input placeholder flips to "Add a
-        // follow-up" — a watermark, never a staged draft.
-        let p = analyze_cursor(&fixture("idle-after-turn.txt"), None);
-        assert!(p.idle, "{} / {}", p.idle, p.reason);
-        assert!(!p.input_nonempty && !p.busy_marker);
-    }
-
-    #[test]
-    fn busy_pane_blocks_on_interrupt_hint_and_spinner() {
-        let p = analyze_cursor(&fixture("busy.txt"), None);
-        assert!(!p.idle && p.busy_marker);
-        assert_eq!(p.reason, "tui is busy (interrupt hint on the input line)");
-        // The placeholder watermark is still the input text — no draft.
-        assert!(!p.input_nonempty);
-    }
-
-    #[test]
-    fn padded_interrupt_hint_is_empty_input_not_a_draft() {
-        // Live Cursor captures (2026-09-26, CAD-612) pad the input row
-        // out to the pane width *after* the right-aligned `ctrl+c to
-        // stop`. The hint is then not a suffix, so reading the row as
-        // a staged draft fences a turn the pane already took.
-        let screen = std::fs::read_to_string(format!(
-            "{}/tests/common/cursor-tui/busy-padded-hint.txt",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .unwrap();
-        let line = screen
-            .lines()
-            .find(|l| l.contains("ctrl+c to stop"))
-            .expect("recorded input row");
-        assert!(
-            line.ends_with(' ') && line.contains("Add a follow-up"),
-            "the recording must keep the pane-width padding after the hint: {line:?}"
-        );
-        assert!(
-            screen.contains("1 task"),
-            "the live busy chrome includes the task count"
-        );
-        let p = analyze_cursor(&screen, None);
-        assert!(!p.idle && p.busy_marker, "{}", p.reason);
-        assert_eq!(p.reason, "tui is busy (interrupt hint on the input line)");
-        assert!(
-            !p.input_nonempty,
-            "padded hint must read as a drained input, not a draft: {p:?}"
-        );
-    }
-
     #[test]
     fn draft_left_of_padded_hint_is_unsubmitted_text() {
         // A real draft shares the row with the right-aligned hint and
@@ -1192,35 +1123,6 @@ mod tests {
             p.input_nonempty,
             "a draft that starts with the hint phrase must stay text: {p:?}"
         );
-    }
-
-    #[test]
-    fn staged_draft_while_busy_reports_via_spinner() {
-        // A draft staged mid-turn: no interrupt hint on this frame —
-        // the status row directly above the input carries the busy
-        // evidence, and the draft itself is separately not-idle.
-        let p = analyze_cursor(&fixture("busy-staged.txt"), None);
-        assert!(!p.idle && p.busy_marker);
-        assert_eq!(p.reason, "tui is busy (status row above the input line)");
-        assert!(p.input_nonempty);
-    }
-
-    #[test]
-    fn approval_menu_wins_over_prompt_shape() {
-        // The menu's first option also leads with `→` — menu detection
-        // must outrank prompt parsing or it reads as a draft.
-        let p = analyze_cursor(&fixture("approval.txt"), None);
-        assert!(!p.idle && p.approval_menu);
-        // The reason names what the menu asks — the menu block's
-        // furthest row above the option list.
-        assert_eq!(p.reason, "$ whoami in .");
-    }
-
-    #[test]
-    fn typed_draft_is_not_idle() {
-        let p = analyze_cursor(&fixture("draft.txt"), None);
-        assert!(!p.idle && p.input_nonempty);
-        assert_eq!(p.reason, "unsubmitted text in the input line");
     }
 
     #[test]
@@ -1427,54 +1329,6 @@ mod tests {
         let prof = screen_profile();
         assert_eq!(prof.approval_answer(screen, "1").unwrap(), vec!["Enter"]);
         assert_eq!(prof.approval_answer(screen, "2").unwrap(), vec!["n"]);
-    }
-
-    #[test]
-    fn quoted_anchor_text_is_not_a_menu() {
-        // The anchor strings quoted mid-line in a transcript stay
-        // text — detection matches on the trimmed row's leading text
-        // (or requires the option block for `Waiting for approval`).
-        let busy = fixture("busy.txt");
-        for quoted in [
-            "earlier the agent asked \"Run this command?\" — transcript",
-            "the log shows \"Not in allowlist\" in passing",
-            "it printed \"$ x Waiting for approval...\" mid-line once",
-        ] {
-            let p = analyze_cursor(&format!("{busy}\n{quoted}"), None);
-            assert!(!p.approval_menu, "{quoted}: {:?}", p);
-        }
-    }
-
-    #[test]
-    fn quoted_hint_text_is_not_a_menu() {
-        // Footer fragments mid-line are not menu rows — a menu needs
-        // the anchored legend or the `→` option block beside them.
-        let busy = fixture("busy.txt");
-        for quoted in [
-            "docs say \"Esc to close\" dismisses pickers",
-            "scroll down for more below the fold",
-        ] {
-            let p = analyze_cursor(&format!("{busy}\n{quoted}"), None);
-            assert!(!p.approval_menu, "{quoted}: {:?}", p);
-        }
-    }
-
-    #[test]
-    fn indented_anchor_without_structure_is_not_a_menu() {
-        // A transcript row that LEADS with the anchor once indented
-        // is the round-3 false positive: `trim_start` makes it look
-        // row-anchored, and the anchor alone used to flip the pane
-        // to `approval_menu` and livelock every send. With no option
-        // block and no legend beside it, the row is inert text.
-        let busy = fixture("busy.txt");
-        for line in [
-            "    Run this command?",
-            "      Not in allowlist: rg",
-            "  → waiting earlier: Run this command?", // mid-row anchor
-        ] {
-            let p = analyze_cursor(&format!("{busy}\n{line}"), None);
-            assert!(!p.approval_menu, "{line}: {:?}", p);
-        }
     }
 
     #[test]

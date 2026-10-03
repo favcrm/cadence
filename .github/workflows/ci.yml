@@ -275,7 +275,8 @@ jobs:
         run: cargo test --doc --locked
       # CAD-1090: every cargo test target (scripts/result-test-args), with
       # the test seam on and a 0-test target treated as a failure.
-      - name: Run every integration test target
+      # CAD-1105: then the lib unit tests, with PATH cut to the toolchain.
+      - name: Run every integration test target and the lib suite
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         env:
           CARGO_BUILD_JOBS: 4
