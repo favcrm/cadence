@@ -2,7 +2,7 @@
 """CAD-922: one local command that catches the cheap failures before CI.
 
     scripts/pre-push              # run every step the diff calls for
-    scripts/pre-push --tests      # also run the safety floor, regardless of diff
+    scripts/pre-push --tests      # also run every tests/*.rs target, regardless of diff
     scripts/pre-push --list       # print the plan, run nothing
     scripts/pre-push --base REF   # diff base (default origin/main, else main)
 
@@ -152,20 +152,22 @@ def plan(root, changed, with_tests):
     # CAD-1021: cheap focused unit tests gated on the file they guard.
     for name, argv in focused_tests(root, changed):
         steps.append((name, argv, None))
-    # CAD-1073 clean-slate: only the safety floor is wired to --tests.
+    # CAD-1073 clean-slate: every tests/*.rs target is wired to --tests.
     if not with_tests:
         steps.append(("tests", None, "pass --tests to run the safety floor"))
     else:
-        steps.append(("tests safety_floor", ["cargo", "test", "--locked",
-                                             "--test", "safety_floor", "--",
-                                             "--test-threads", "2"], None))
+        # CAD-1090: same selection as CI (scripts/result-test-args).
+        sel = subprocess.run([os.path.join(root, "scripts/result-test-args")],
+                             capture_output=True, text=True, check=True).stdout.split()
+        steps.append(("tests integration", ["cargo", "test", "--locked", *sel,
+                                            "--", "--test-threads", "2"], None))
     return steps
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--tests", action="store_true",
-                    help="also run the safety floor (even when its source is unchanged)")
+                    help="also run every tests/*.rs target")
     ap.add_argument("--list", action="store_true", help="print the plan and exit")
     ap.add_argument("--base", help="diff base ref (default origin/main, else main)")
     ap.add_argument("--root", default=os.path.dirname(os.path.dirname(

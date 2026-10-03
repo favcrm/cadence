@@ -272,11 +272,19 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 4
         run: cargo test --doc --locked
-      - name: Build and run the safety floor
+      # CAD-1090: every top-level tests/*.rs target (safety_floor and the
+      # result tests), picked up by glob so a new file needs no edit here.
+      - name: Run every integration test target
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         env:
           CARGO_BUILD_JOBS: 4
-        run: cargo test --locked --test safety_floor
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          targets=$(scripts/result-test-args)
+          echo "integration targets:" $(echo "$targets" | grep -v '^--test$')
+          # shellcheck disable=SC2086
+          cargo test --locked $targets -- --test-threads 2
 
   build:
     needs: [queue-evidence, change-scope]

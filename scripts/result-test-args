@@ -1,0 +1,14 @@
+#!/bin/sh
+# CAD-1090: the one selection rule for CI and `scripts/pre-push --tests`.
+# Prints `--test <name>` for every top-level tests/*.rs, one per line, so a
+# new result-test file is picked up with no workflow edit. Fails when none
+# match: an empty selection would pass without running anything.
+set -eu
+root=$(cd "$(dirname "$0")/.." && pwd)
+found=0
+for f in "$root"/tests/*.rs; do
+  [ -e "$f" ] || continue
+  printf -- '--test\n%s\n' "$(basename "$f" .rs)"
+  found=1
+done
+[ "$found" = 1 ] || { echo "result-test-args: no tests/*.rs targets" >&2; exit 1; }
