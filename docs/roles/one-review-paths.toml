@@ -18,33 +18,116 @@
 # - An empty diff, an unreadable or malformed TOML file disqualifies.
 # A disqualified PR keeps two reviews. `human` triggers apply on top.
 #
-# CAD-965 (operator decision 2026-10-01): top-level integration test files
-# (`tests/*.rs`; `*` stays within one segment) need one review. Not listed,
-# so they keep two: `src/**` (including src/**/tests.rs) and `tests/common/**`,
-# which holds harness and isolation code (NO_REAL_TMUX, PM dir/HOME isolation,
-# port lease, suite lock) that CI cannot see being weakened.
-# The single reviewer must state in the verdict that no adversarial gate test
-# and no test-isolation or fail-closed default was weakened or deleted,
-# naming what was checked (AGENTS.md).
+# CAD-965 (operator decision 2026-10-01) put top-level integration tests on
+# this list; CAD-1099 below supersedes it with a wider list. `tests/common/**`
+# (harness and isolation code) stays two-review via the exclude list.
+#
+# CAD-1099 (operator decision 2026-10-03, "spec > dev > review > pr > deploy is
+# taking too long"): ONE independent review is the default for normal code,
+# UI and docs. Two reviews remain for every path in docs/roles/risk-paths.toml
+# triggers 1 (trust boundary/identity), 3 (secrets), 4 (supply chain/CI),
+# 6 (release/rollout) and 7 (rules/gates/their proofs), plus the remote-CLI
+# auth modules below. Includes are explicit directories, so a new top-level
+# path keeps two reviews until it is listed here. Exclude wins.
+
 one_review_include = [
-  "docs/guides/**",
-  "docs/ui/**",
-  "tests/*.rs",
+  "src/**",
+  "ui/**",
+  "docs/**",
+  "tests/**",
+  "skills/**",
+  "apps/**",
+  "app-previews/**",
+  "workspace-apps/**",
+  "workflows/**",
+  "agents/**",
+  "contracts/**",
+  "design/**",
+  "README.md",
+  "CONTEXT.md",
+  "CONTRIBUTING.md",
 ]
-# Redundant with the allowlist on purpose: these stay two-review even if an
-# include glob is ever widened.
+# Two reviews for these, even though an include glob matches them.
 one_review_exclude = [
-  "tests/scripts/**",
-  "tests/split-map*.toml",
-  "tests/split_map_inventory.rs",
-  "tests/shard-weights.json",
-  "tests/fixtures/**",
-  "docs/cadence/**",
-  "docs/AUDIT.md",
-  "docs/design/**",
+  # risk-paths.toml trigger 1: trust boundary and identity
+  "src/peer.rs",
+  "src/daemon.rs",
+  "src/daemon/identity.rs",
+  "src/daemon/caller_rule.rs",
+  "src/daemon/slots_rpc.rs",
+  "src/adapter/pty/**",
+  "src/ui.rs",
+  "src/ui/**",
+  "ui/**",
+  "src/operator_auth.rs",
+  "src/tailnet_proof.rs",
+  "src/test_seam.rs",
+  "src/master_perm.rs",
+  "src/agent_uid.rs",
+  "src/cli/agent_uid.rs",
+  # remote-CLI and board auth modules (CAD-1019, CAD-526/777): identity
+  "src/cli_actor.rs",
+  "src/board_identity.rs",
+  "src/remote_auth.rs",
+  "src/remote_enrollment.rs",
+  "src/remote_cli.rs",
+  "src/device_login.rs",
+  # trigger 2 (schema and store version)
+  "src/store/schema.rs",
+  "src/remote_result_outbox.rs",
+  # trigger 3: secrets, credentials, redaction
+  "src/secret/**",
+  "src/cli/secret.rs",
+  "src/cli/connection.rs",
+  # trigger 4: supply chain and CI (outside the include dirs except these)
+  "**/package.json",
+  "**/pnpm-lock.yaml",
+  # trigger 6: outward or fleet actions, installs and rollouts
+  "src/rollout.rs",
+  "src/update.rs",
+  "src/upgrade.rs",
+  "src/cli/rollout.rs",
+  "src/cli/daemon.rs",
+  "src/cli/update.rs",
+  "src/cli/upgrade.rs",
+  # trigger 7: the rules, the gates, their inputs and their proofs
   "docs/roles/**",
   "docs/TEAM.md",
   "docs/CHARTER.md",
-  "AGENTS.md",
-  ".gitignore",
+  "docs/AUDIT.md",
+  "docs/design/**",
+  "docs/cadence/**",
+  "docs/START-HERE.md",
+  "docs/ARCHITECTURE.md",
+  "docs/BOARD.md",
+  "src/review.rs",
+  "src/review/**",
+  "src/audit.rs",
+  "src/audit/**",
+  "src/delegation.rs",
+  "src/delegation/**",
+  "src/daemon/approvals_rpc.rs",
+  "src/store/events.rs",
+  "src/overview.rs",
+  "src/delivery.rs",
+  "src/issue/delivery_policy.rs",
+  "src/issue/model.rs",
+  "src/issue/board.rs",
+  "src/issue/parse.rs",
+  "src/cli/audit.rs",
+  "src/cli/mod.rs",
+  "tests/scripts/**",
+  "tests/common/**",
+  "tests/split-map*.toml",
+  "tests/split_map_inventory.rs",
+  "tests/shard-weights.json",
+  "tests/ci_test_plan.rs",
+  "tests/test_seam.rs",
+  "tests/safety_floor.rs",
+  "tests/audit_review.rs",
+  "tests/delegated_approval.rs",
+  "tests/fixtures/**",
+  "tests/operator_lineage.rs",
+  "tests/master_permission.rs",
+  "tests/build_identity.rs",
 ]
