@@ -16,9 +16,10 @@ export function isLoopbackHref(rawHref: string): boolean {
   const candidate = absolute ? href.replace(/%5b/gi, "[").replace(/%5d/gi, "]") : href;
   let url: URL;
   try {
-    // The fixed non-loopback base lets a `//host/x` network-path href
-    // parse (it has no scheme of its own) so its real host is checked.
-    url = new URL(candidate, "http://base.invalid");
+    // The fixed non-loopback base exists only so a network-path `//host/x`
+    // href is judged by its host. A scheme'd href is always parsed absolute:
+    // on an https board a browser treats `http:/host` as absolute.
+    url = new URL(candidate, candidate.startsWith("//") ? "http://base.invalid" : undefined);
   } catch {
     // An http(s) or network-path href that will not parse even against the
     // base fails CLOSED (CAD-1075). Only a genuinely relative href is this
