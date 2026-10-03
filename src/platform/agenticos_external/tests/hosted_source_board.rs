@@ -18,7 +18,7 @@ fn generic_door(method: &str, url: &str, body: &Value) -> Reply {
     match (method, url) {
         ("GET", "/v1/runtime/tools/read_instagram_posts") => json_response(
             200,
-            json!({"ok":true,"data":{"slug":"read_instagram_posts","effect":"read","chargePrecondition":"max_charge_minor@1","price":price,"unitPrice":null}}),
+            json!({"ok":true,"data":{"slug":"read_instagram_posts","displayName":"Read Instagram posts","effect":"read","chargePrecondition":"max_charge_minor@1","price":price,"unitPrice":null}}),
         ),
         ("POST", CALL_PATH) if body["slug"] == "read_instagram_posts" => json_response(
             200,
