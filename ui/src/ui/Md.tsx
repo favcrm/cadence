@@ -49,6 +49,10 @@ function markdownImageSrc(src?: string): string | null {
   }
 }
 
+// Only well-formed ids may reach `onOpen`; `issue:` hrefs can come from
+// agent-written Markdown, so the remainder is checked, not trusted.
+const WHOLE_ISSUE_ID = /^[A-Z]{2,6}-\d+$/;
+
 export default function Md({
   text,
   onOpen,
@@ -71,12 +75,17 @@ export default function Md({
         },
         a: ({ href, children }) =>
           href?.startsWith("issue:") ? (
-            <button
-              className="lnk num"
-              onClick={() => onOpen?.(href.slice(6))}
-            >
-              {children}
-            </button>
+            WHOLE_ISSUE_ID.test(href.slice(6)) ? (
+              <button
+                className="lnk num"
+                onClick={() => onOpen?.(href.slice(6))}
+              >
+                {children}
+              </button>
+            ) : (
+              // A malformed id is shown as text: no button, no anchor.
+              <>{children}</>
+            )
           ) : href && isLoopbackHref(href) ? (
             // A link to this machine is shown, never followed (CAD-313).
             <span
