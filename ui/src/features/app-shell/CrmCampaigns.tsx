@@ -29,8 +29,8 @@ import {
   type ProposalRenderDoc,
 } from "./campaignGrammar";
 import { contentClient } from "./contentClient";
-import { resources } from "../../lib/resources";
-import { useQuery } from "../../lib/useResource";
+import { useMaybeResource } from "../../lib/useResource";
+import { autoSelectCampaignConversation, useActiveConversation } from "./conversationClient";
 import {
   DELIVERY_CLAIM,
   friendlySendError,
@@ -1756,15 +1756,24 @@ function CampaignWorkspace({
   // a new non-operator entry landing in the scoped thread (the assistant's
   // reply after the operator's ask), not merely the operator's send.
   // `useQuery` subscribes to the live thread store the SSE stream feeds.
-  const thread = useQuery(resources.masterThread);
+  // CAD-1098: the selected conversation's thread, not the home thread.
+  const active = useActiveConversation(scope.installId);
+  const thread = useMaybeResource(active.store);
   const lastAssistantSeq = (() => {
-    const entries = thread.data?.entries ?? [];
+    const entries = thread?.data?.entries ?? [];
     let max = 0;
     for (const e of entries) {
       if (e.role !== "operator" && e.seq > max) max = e.seq;
     }
     return max;
   })();
+  // The campaign page opens on its own conversation; the picker still
+  // switches to General. Runs per campaign, never on every render.
+  useEffect(() => {
+    if (scope.contextId === "" || !viewer.operator) return;
+    void autoSelectCampaignConversation(scope.installId, campaignId, !viewer.readOnly).catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope.installId, scope.contextId, campaignId]);
   const seenAssistantSeq = useRef(0);
   useEffect(() => {
     if (lastAssistantSeq > seenAssistantSeq.current) {
