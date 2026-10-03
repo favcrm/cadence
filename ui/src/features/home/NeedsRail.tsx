@@ -83,7 +83,7 @@ export function NeedMenu({
       />
       <div className="needmenu" role="menu" aria-label={`actions for ${need.title}`}>
         {need.link && (
-          <SafeLink className={`${item} block`} href={need.link} role="menuitem">
+          <SafeLink className={`${item} block`} warnClassName={`${item} block`} href={need.link} role="menuitem">
             Open
           </SafeLink>
         )}

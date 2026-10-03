@@ -84,5 +84,9 @@ for (const [name, render] of Object.entries(surfaces)) {
   equal(ok.includes(`href="${GOOD}"`) && ok.includes('target="_blank"') && ok.includes('rel="noreferrer"'), true, `${name}: https anchor attributes`);
 }
 equal(menu("javascript:alert(1)").includes("javascript:"), false, "needs menu drops javascript:");
+// Non-anchor renderings keep the menu item semantics (role and item classes).
+for (const l of [...LOOPBACK, "javascript:alert(1)"]) {
+  equal(/<span[^>]*role="menuitem"/.test(menu(l)), true, `needs menu keeps menuitem role for ${l}`);
+}
 
 console.log("safe link checks passed");
