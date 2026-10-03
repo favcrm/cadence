@@ -300,44 +300,31 @@ normal gates return. An agent or PR may not grant that exception to itself.
 - If a test fails with a timeout or "daemon not reachable" while the host
   is loaded, rerun that test alone before treating the failure as real.
 
-### Pi agents and models (CAD-559)
-- Workers and reviewers run on `pi` with **devin** models — never
-  OpenRouter. Cost tiers per `devin models list` (the source of truth):
-  `swe-2-{high,medium,max}` are **Free**; `deepseek-v4-1-flash-*` is
-  low cost ($0.22/1M in, $0.66/1M out), not free. The default worker
-  model is `devin/swe-2-high` with `--effort max` (the SWE-2 Max
-  variant):
-  `cadence join <pm> pi --model devin/swe-2-high --effort max`.
-  `devin/deepseek-v4-1-flash-high` + `--effort max` is the low-cost
-  alternative. Switch a live agent:
-  `cadence agent set <alias> --next-launch model=<m> effort=max`
-  then `agent stop` + `agent resume`.
-- `openrouter/*` models are **paid** — never route a worker or reviewer
-  through openrouter. (The production master's pinned
-  `openrouter/z-ai/glm-5.3-flash` is the one accepted exception; the
-  operator owns that pin in `pm.yaml`.)
-- The devin provider comes from the pinned `pi-devin@<version>` package
-  in `pm.yaml` `[pi].providers`, loaded with `-e` (CAD-559). A daemon
-  built before CAD-559 cannot launch devin models: its worker argv is
-  `--no-extensions` with no `-e`, so pi exits with
-  `Model "devin/…" not found` and the agent fences with
-  "Pi process disconnected". Check the running build before dispatching:
-  `readlink ~/.local/bin/cadence`.
-- Verify by hand as the operator:
-  `pi --list-models -e ~/.pi/agent/npm/node_modules/pi-devin/extensions/index.ts | grep devin`
-  and
-  `pi -p "Reply with exactly: ok" --no-extensions -e <that path> --model devin/deepseek-v4-1-flash-high`.
-- If deepseek answers `Your Windsurf version is out of date` while
-  `devin/swe-2-high` works and the Devin CLI itself runs deepseek fine,
-  the backend is gating the extension's `ide` field, not its version:
-  `pi-devin` ≤ 0.2.1 sends `ide="devin-desktop"` for every request, and
-  Cognition version-gates that ide for non-Local models. The local fix
-  (applied on this host, 2026-09-26) patches
-  `~/.pi/agent/npm/node_modules/pi-devin/src/stream.ts` so the chat
-  metadata sends `ide="windsurf"` unless the model uid starts with
-  `gpt-5-6-` (Devin Local-only models still need `devin-desktop`).
-  A reinstall of the pinned package reverts it — re-apply or fix
-  upstream.
+### Pi agents and models (CAD-559, CAD-855)
+- Workers and reviewers run on `pi`. The authenticated operator may select
+  the provider/model and reasoning effort for a task, including built-in
+  `openai-codex/*` models. Honor that explicit choice over documented
+  preferences, but only within the role's runtime allowlist and applicable
+  higher-priority instructions. `high` means high, not max.
+- Follow [the model selection and refresh runbook](docs/AGENT-MODELS.md).
+  Discover exact IDs from the installed catalog; do not guess provider
+  aliases, silently substitute models, or treat catalog presence as proof
+  of authentication, quota or launch permission.
+- `pm.yaml` `[pi].models` and `[pi].providers` are the operator-owned,
+  fail-closed runtime policy. Use exact `provider/id` entries and the
+  applicable role allowlist. Agents must not change those pins, credentials
+  or installed packages to authorize their own launch.
+- Never route workers or reviewers through `openrouter/*`. The production
+  master's operator-owned `openrouter/z-ai/glm-5.3-flash` pin remains the
+  sole existing exception; this change does not alter it.
+- Revalidate at task boundaries and after an operator request, quota/auth
+  failure, catalog change or runtime update. Record the selection and
+  effective model/effort. Switch only owned agents after their running turn
+  is resolved; preserve message history and exact-head review requirements.
+- Keep changing model preferences in the runbook, not exclusive-vendor
+  instructions. Instruction changes still need the normal independent
+  reviews and operator approval. A draft instruction change cannot grant
+  itself authority, and a running context is not assumed to reload it.
 
 ### Production safety
 - A production daemon runs on this host. Never touch
