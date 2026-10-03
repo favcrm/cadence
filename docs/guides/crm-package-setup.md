@@ -162,3 +162,30 @@ behaviour on a disposable workspace. The host-compiled CRM UI and send path
 are verified separately; installing or approving this package is **not**
 proof of the production send path, and a host binary rollout is a separate
 operator-owned action.
+
+## MVP acceptance matrix (CAD-865)
+
+One row per promised MVP flow, mapped to its source and existing evidence,
+at lane source `d379ae54` (this work's parent). Historical CAD-786 browser
+evidence under `/home/ubuntu/.cache/fb597/e2e` is retained at its own SHA
+and does not validate this head. `browser-pending` means the flow is proven
+in daemon tests and mounted UI tests but awaits the real-browser run; the
+browser run needs a test-seam build (cargo slot unavailable to this lane).
+
+| Flow | Source | Existing evidence | Verdict |
+|---|---|---|---|
+| Package install + approve | `workspace-apps/crm`, `app_workspace_install`, `app_local_install_approve` | `tests/crm_package.rs` | pass |
+| Customer list/search/detail | `CrmCustomers.tsx`, `hostActions`, `src/ui/app_records.rs` | `ui/tests/crmCustomers.test.ts`, `tests/crm_customers_csv.rs` | browser-pending |
+| Customer create/edit | `CrmCustomers.tsx`, `app_record_create/update` | `ui/tests/crmCustomers.test.ts` | browser-pending |
+| **CSV preview/import** | `CustomerCsvImport.tsx`, `csvClient.ts`; daemon `app_record_csv_*`; HTTP `records/csv-preview\|csv-import` | `tests/crm_customers_csv.rs`, `ui/tests/crmCsv.test.ts`, `ui/tests/crmCustomers.test.ts` | **fixed** (was missing: no UI) |
+| Segments create/detail/preview | `CrmSegments.tsx`, `audienceClient`, `app_audience_*` | `tests/app_audiences*.rs`, `ui/tests/crmSegments.test.ts` | browser-pending |
+| Campaign create/edit/approve | `CrmCampaigns.tsx`, `contentClient`, `app_content_*` | `tests/app_content*.rs`, `ui/tests/crmCampaigns.test.ts` | browser-pending |
+| Visual composer + render | `CrmCampaigns.tsx`, `campaignGrammar`, `app_content_render` | `ui/tests/crmCampaigns.test.ts` | browser-pending |
+| Assistant Apply/Discard | `CrmCampaigns.tsx` proposals, CAD-813 mint | `tests/cad813_verified_assistant*.rs`, `ui/tests/crmCampaigns.test.ts` | browser-pending |
+| SMTP bind | `CrmCampaigns.tsx` sender panel, `crm_smtp_bind` | `tests/crm_smtp*.rs` | browser-pending |
+| Test send | `sendClient.smtpTestSend`, `crm_smtp_test_send` | `tests/crm_smtp_send.rs`, `tests/crm_send.rs` | browser-pending |
+| Freeze + prepare + typed-count approve | `audienceClient.prepare`, `sendClient.sendPrepare/Approve` | `tests/crm_send.rs`, `ui/tests/crmSend.test.ts` | browser-pending |
+| Bounded send + durable outcomes | `crm_send_rpc`, `sendClient.sendShow/List` | `tests/crm_send.rs` | browser-pending |
+| Unsubscribe suppression | `src/ui/crm_send.rs` GET+POST | `tests/crm_send.rs` | browser-pending |
+| Reload/deep links, empty/error/stale/read-only | route `?ctx=&crm=&record=` + `data-state` | `ui/tests/crm*.test.ts` | browser-pending |
+| Persistent single chat | `AppShell.tsx` | `ui/tests/appShell.test.ts` | browser-pending |

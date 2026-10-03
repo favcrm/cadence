@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
-import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
+import Field from "./shared/Field";
 import {
   audienceClient,
   type AudienceScope,
@@ -32,6 +32,10 @@ import {
  * action addresses a saved rule, so Create lands atomically on the
  * detail drawer where the exact counts, suppression breakdown and
  * bounded sample render.
+ *
+ * The shell's own header row is the single Apps → App breadcrumb and
+ * title; the section renders its own real heading instead of a
+ * second crumb (CAD-863 release correction).
  */
 
 export interface SegmentDoc {
@@ -139,23 +143,6 @@ export default function CrmSegments({
 }) {
   return (
     <div className="crm-list" data-section="segments">
-      <nav className="crm-crumb" aria-label="Breadcrumb">
-        <Link href="/apps" className="lnk text-label">
-          Apps
-        </Link>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="text-label text-ink-300">CRM</span>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="text-label text-ink-100" aria-current="page">
-          Segments{view === "new" ? " / New" : ""}
-          {recordId !== null ? " / Details" : ""}
-        </span>
-      </nav>
-
       {view === "list" && (
         <SegmentList
           scope={scope}
@@ -229,8 +216,11 @@ function SegmentList({
   }, [reloadToken]);
 
   return (
-    <section aria-label="Segments list">
-      <div className="crm-toolbar">
+    <section aria-label="Segments list" className="crm-list">
+      <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
+        Segments
+      </h3>
+      <div className="crm-toolbar mb-4">
         <p className="text-secondary text-ink-300">
           Saved rules over customer tags, source, consent and email domain.
         </p>
@@ -348,50 +338,52 @@ function RuleRows({
       {rules.map((rule, index) => (
         <li key={index} className="card px-3 py-3">
           <div className="crm-field-row">
-            <div className="crm-field">
-              <label className="text-label text-ink-300" htmlFor={`seg-rule-field-${index}`}>
-                Field {index + 1}
-              </label>
-              <Select
-                id={`seg-rule-field-${index}`}
-                value={rule.field}
-                onChange={(value) => isSegmentField(value) && set(index, { field: value })}
-                options={SEGMENT_FIELDS.map((entry) => ({ value: entry.value, label: entry.label }))}
-                aria-label={`Rule ${index + 1} field`}
-                disabled={disabled}
-                full
-              />
-            </div>
-            <div className="crm-field">
-              <label className="text-label text-ink-300" htmlFor={`seg-rule-op-${index}`}>
-                Operator {index + 1}
-              </label>
-              <Select
-                id={`seg-rule-op-${index}`}
-                value={rule.op}
-                onChange={(value) => isSegmentOp(value) && set(index, { op: value })}
-                options={SEGMENT_OPS.map((entry) => ({ value: entry.value, label: entry.label }))}
-                aria-label={`Rule ${index + 1} operator`}
-                disabled={disabled}
-                full
-              />
-            </div>
+            <Field label={`Field ${index + 1}`} id={`seg-rule-field-${index}`} className="crm-field">
+              {(c) => (
+                <Select
+                  id={c.id}
+                  value={rule.field}
+                  onChange={(value) => isSegmentField(value) && set(index, { field: value })}
+                  options={SEGMENT_FIELDS.map((entry) => ({ value: entry.value, label: entry.label }))}
+                  aria-label={`Rule ${index + 1} field`}
+                  disabled={disabled}
+                  full
+                />
+              )}
+            </Field>
+            <Field label={`Operator ${index + 1}`} id={`seg-rule-op-${index}`} className="crm-field">
+              {(c) => (
+                <Select
+                  id={c.id}
+                  value={rule.op}
+                  onChange={(value) => isSegmentOp(value) && set(index, { op: value })}
+                  options={SEGMENT_OPS.map((entry) => ({ value: entry.value, label: entry.label }))}
+                  aria-label={`Rule ${index + 1} operator`}
+                  disabled={disabled}
+                  full
+                />
+              )}
+            </Field>
           </div>
-          <div className="crm-field mt-2">
-            <label className="text-label text-ink-300" htmlFor={`seg-rule-value-${index}`}>
-              Value {index + 1} — {ruleHint(rule.field)}
-            </label>
-            <input
-              id={`seg-rule-value-${index}`}
-              className="field"
-              value={rule.value}
-              onChange={(e) => set(index, { value: e.target.value })}
-              maxLength={120}
-              autoComplete="off"
-              disabled={disabled}
-              placeholder={rule.field === "consent_email" ? "granted" : rule.field === "email_domain" ? "example.com" : "vip"}
-            />
-          </div>
+          <Field
+            label={`Value ${index + 1}`}
+            id={`seg-rule-value-${index}`}
+            hint={ruleHint(rule.field)}
+            disabled={disabled}
+            className="crm-field mt-2"
+          >
+            {(c) => (
+              <input
+                {...c}
+                className="field"
+                value={rule.value}
+                onChange={(e) => set(index, { value: e.target.value })}
+                maxLength={120}
+                autoComplete="off"
+                placeholder={rule.field === "consent_email" ? "granted" : rule.field === "email_domain" ? "example.com" : "vip"}
+              />
+            )}
+          </Field>
           {rules.length > 1 && !disabled && (
             <p className="mt-2">
               <button
@@ -477,20 +469,18 @@ function SegmentNew({
               .finally(() => setPending(false));
           }}
         >
-          <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="seg-name">
-              Segment name (required)
-            </label>
-            <input
-              id="seg-name"
-              className="field"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              maxLength={80}
-              autoComplete="off"
-              required
-            />
-          </div>
+          <Field label="Segment name" id="seg-name" required className="crm-field">
+            {(c) => (
+              <input
+                {...c}
+                className="field"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                maxLength={80}
+                autoComplete="off"
+              />
+            )}
+          </Field>
           <RuleRows rules={rules} disabled={pending} onChange={setRules} />
           {rules.length < 8 && (
             <p>
@@ -843,21 +833,18 @@ function SegmentEdit({
       <h4 className="text-label font-medium text-ink-200">
         Edit — expected revision r{segment.revision}
       </h4>
-      <div className="crm-field">
-        <label className="text-label text-ink-300" htmlFor="seg-edit-name">
-          Segment name
-        </label>
-        <input
-          id="seg-edit-name"
-          className="field"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          maxLength={80}
-          autoComplete="off"
-          disabled={pending}
-          required
-        />
-      </div>
+      <Field label="Segment name" id="seg-edit-name" required disabled={pending} className="crm-field">
+        {(c) => (
+          <input
+            {...c}
+            className="field"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            maxLength={80}
+            autoComplete="off"
+          />
+        )}
+      </Field>
       <RuleRows rules={rules} disabled={pending} onChange={setRules} />
       {rules.length < 8 && (
         <p>

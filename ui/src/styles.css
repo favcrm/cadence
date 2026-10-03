@@ -233,6 +233,17 @@ body {
   border-color: var(--color-accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 10%, transparent);
 }
+/* Multi-line fields keep the .field tokens but own their height: the
+   fixed 2.25rem control height would flatten the declared `rows`
+   contract (CRM campaign heading/paragraph editors ask for 2/4). The
+   element's own rows sizing applies, vertical padding keeps the first
+   line off the border, and resize stays vertical-only so a drag can
+   never push the document sideways. */
+textarea.field {
+  height: auto;
+  padding-block: 0.5rem;
+  resize: vertical;
+}
 
 /* Shared Button. Text is centred in the fixed height — a full-width
    control must not sit on the left, and IBM Plex must not inherit the
