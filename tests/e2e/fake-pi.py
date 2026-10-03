@@ -349,10 +349,12 @@ def run_prompt(message):
         # the daemon actually delivered (envelope lines included).
         reply = "fake-pi prompt: " + message
     slow = MODE == "slow"  # CAD-551: a visible turn for the working row
-    for key, error in FAIL_SHAPES.items():
-        if "fake-fail " + key in message:
+    # Exact token after "fake-fail ": no key may shadow another.
+    words = message.split()
+    for i, word in enumerate(words[:-1]):
+        if word == "fake-fail" and words[i + 1] in FAIL_SHAPES:
             live_turn = False
-            finish_turn("error", "", error)
+            finish_turn("error", "", FAIL_SHAPES[words[i + 1]])
             return
     if gateway_refused():
         return
