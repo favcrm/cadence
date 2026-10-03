@@ -26,6 +26,8 @@ struct Door {
     lose_reply: AtomicBool,
     /// Runs once the door has accepted a post (the crash point).
     after_accept: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Runs once, inside the next status read (a slow door).
+    on_status: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Staging waits until this many callers stage at once (or 5s).
     meet: (Mutex<(usize, usize)>, Condvar),
 }
@@ -73,6 +75,9 @@ impl PublishSender for Door {
     }
 
     fn status(&self, key: &str) -> std::result::Result<LedgerOutcome, Refusal> {
+        if let Some(slow) = self.on_status.lock().unwrap().take() {
+            slow();
+        }
         match self.accepted.lock().unwrap().get(key) {
             Some(binding) => Ok(Self::outcome(PublishState::Posted, binding)),
             None => Err(Refusal::new("unknown_key", "the door has no record")),
@@ -110,23 +115,70 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// A daemon on `dir` with the driver forced on, hot, on `clock`.
     fn start(dir: &Path, door: &Arc<Door>, clock: &Arc<AtomicI64>) -> Self {
+        Self::open(dir, door, clock, |_| {}).run()
+    }
+
+    /// The daemon without its driver thread yet; `configure` adjusts the
+    /// options after the defaults below.
+    fn open(
+        dir: &Path,
+        door: &Arc<Door>,
+        clock: &Arc<AtomicI64>,
+        configure: impl FnOnce(&mut ServeOptions),
+    ) -> Self {
         let clock = clock.clone();
-        let opts = ServeOptions {
+        let mut opts = ServeOptions {
             social_publish_sender: Some(door.clone()),
+            // Explicitly unleased; never read a pm.yaml.
+            lease: Some(crate::lease::Hosted::default()),
             social_publish_driver_off: Some(false),
             social_publish_driver_ms: Some(20),
             social_publish_driver_clock: Some(Arc::new(move || clock.load(Ordering::SeqCst))),
             ..ServeOptions::default()
         };
-        let shared = Shared::new(dir, &opts).unwrap();
-        let driver = {
-            let shared = shared.clone();
-            std::thread::spawn(move || shared.run_social_publish_driver())
-        };
+        configure(&mut opts);
         Self {
-            shared,
-            driver: Some(driver),
+            shared: Shared::new(dir, &opts).unwrap(),
+            driver: None,
+        }
+    }
+
+    fn run(mut self) -> Self {
+        let shared = self.shared.clone();
+        self.driver = Some(std::thread::spawn(move || {
+            shared.run_social_publish_driver()
+        }));
+        self
+    }
+
+    /// Wait until the driver has finished `n` more ticks, so a whole tick
+    /// started after this call. Absence checks follow this, not a sleep.
+    fn ticks(&self, n: usize) {
+        let tick = || self.shared.social_publish_driver.status_json()["last_tick"].clone();
+        let until = Instant::now() + Duration::from_secs(20);
+        let mut seen = tick();
+        for _ in 0..n {
+            while tick() == seen {
+                assert!(Instant::now() < until, "the driver stopped ticking");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            seen = tick();
+        }
+    }
+
+    /// The state the intent settles in once it leaves `queued` and
+    /// `processing`.
+    fn settled(&self, intent: &Value) -> String {
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = self.state(intent);
+            if state != "queued" && state != "processing" {
+                return state;
+            }
+            assert!(Instant::now() < until, "intent never settled");
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -349,7 +401,11 @@ fn rig() -> (tempfile::TempDir, Arc<Door>, Arc<AtomicI64>) {
 fn cad1020_due_approved_intent_publishes_once_with_no_operator() {
     let (dir, door, clock) = rig();
     let daemon = Daemon::start(dir.path(), &door, &clock);
-    let intent = approved_intent(&daemon.shared.store, "due", wall() - 1);
+    let intent = approved_intent(
+        &daemon.shared.store,
+        "due",
+        clock.load(Ordering::SeqCst) - 1,
+    );
     daemon.wait_state(&intent, "posted");
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(door.sent(), vec![key(&intent)], "published exactly once");
@@ -363,7 +419,11 @@ fn cad1020_two_daemons_racing_publish_once() {
     *door.meet.0.lock().unwrap() = (2, 0);
     let first = Daemon::start(dir.path(), &door, &clock);
     let second = Daemon::start(dir.path(), &door, &clock);
-    let intent = approved_intent(&first.shared.store, "race", wall() - 1);
+    let intent = approved_intent(
+        &first.shared.store,
+        "race",
+        clock.load(Ordering::SeqCst) - 1,
+    );
     let until = Instant::now() + Duration::from_secs(20);
     while door.sent().is_empty() {
         assert!(Instant::now() < until, "nothing was published");
@@ -390,7 +450,11 @@ fn cad1020_crash_after_door_accepts_reconciles_without_resend() {
     *door.after_accept.lock().unwrap() = Some(Box::new(move || {
         closing.closing.store(true, Ordering::SeqCst);
     }));
-    let intent = approved_intent(&crashed.shared.store, "crash", wall() - 1);
+    let intent = approved_intent(
+        &crashed.shared.store,
+        "crash",
+        clock.load(Ordering::SeqCst) - 1,
+    );
     crashed.wait_state(&intent, "processing");
     crashed.stop();
     door.lose_reply.store(false, Ordering::SeqCst);
@@ -457,4 +521,31 @@ fn cad1020_not_due_or_cancelled_intent_is_never_sent() {
     assert_eq!(daemon.state(&later), "queued");
     assert_eq!(daemon.state(&cancelled), "cancelled");
     assert_eq!(door.sent(), vec![key(&witness), key(&next)]);
+}
+
+/// Forbidden harm: a post published well after its window. The bound is
+/// judged when the row is reached, after slow door calls earlier in the
+/// same tick, not when the tick started.
+#[test]
+fn cad1020_overdue_intent_is_held_not_sent() {
+    let (dir, door, clock) = rig();
+    let daemon = Daemon::open(dir.path(), &door, &clock, |_| {});
+    let store = &daemon.shared.store;
+    let now = clock.load(Ordering::SeqCst);
+    // A predecessor claimed this one and died before sending; reading its
+    // status from the door takes 800 s.
+    let stuck = approved_intent(store, "stuck", now - 1);
+    store
+        .social_publish_claim_id(id(&stuck), INSTALL, None)
+        .unwrap()
+        .unwrap();
+    let late = approved_intent(store, "late", now - 200);
+    let slow = clock.clone();
+    *door.on_status.lock().unwrap() = Some(Box::new(move || {
+        slow.fetch_add(800, Ordering::SeqCst);
+    }));
+    let daemon = daemon.run();
+    assert_eq!(daemon.settled(&late), "held", "1000 s late: held, not sent");
+    daemon.ticks(2);
+    assert!(door.sent().is_empty(), "nothing was published");
 }

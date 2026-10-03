@@ -247,7 +247,6 @@ impl Shared {
         let mut reconcile_after: Option<String> = None;
         let mut backoff: HashMap<String, i64> = HashMap::new();
         while !self.closing.load(Ordering::SeqCst) {
-            let now = (driver.clock)();
             // Lease-holder-only: an unleased daemon skips the check; a
             // fenced one parks the tick before any claim or send.
             if let Some(reason) = self.lease.as_ref().and_then(|l| l.fence().check()) {
@@ -268,8 +267,11 @@ impl Shared {
                 sleep_until(&self.closing, Instant::now() + driver.interval);
                 continue;
             }
-            self.reconcile_processing(&mut reconcile_after, &mut backoff);
-            self.claim_due(now, &mut backoff);
+            // One wall bound covers the whole tick: reconcile's status
+            // reads and the claims after them.
+            let deadline = Instant::now() + Duration::from_secs(TICK_DEADLINE_SECS);
+            self.reconcile_processing(&mut reconcile_after, &mut backoff, deadline);
+            self.claim_due(&mut backoff, deadline);
             driver.set_status("ok", Some(epoch_secs() + driver.interval.as_secs_f64()));
             sleep_until(&self.closing, Instant::now() + driver.interval);
         }
@@ -282,11 +284,11 @@ impl Shared {
         self: &Arc<Self>,
         after: &mut Option<String>,
         backoff: &mut HashMap<String, i64>,
+        deadline: Instant,
     ) {
         let Some(sender) = self.social_publish_sender.clone() else {
             return;
         };
-        let now = (self.social_publish_driver.clock)();
         let rows = match self
             .store
             .social_publish_processing(RECONCILE_CAP, after.as_deref())
@@ -307,7 +309,7 @@ impl Shared {
             *after = None;
         }
         for (id, key, updated) in rows {
-            if self.closing.load(Ordering::SeqCst) {
+            if self.closing.load(Ordering::SeqCst) || Instant::now() >= deadline {
                 return;
             }
             // Lease-holder-only between items — a mid-tick loss stops
@@ -368,6 +370,7 @@ impl Shared {
                     // and send. Past the bound the row can never
                     // reconcile: escalate to `held` for a human decision
                     // rather than spinning forever.
+                    let now = (self.social_publish_driver.clock)();
                     if now as f64 - updated >= UNKNOWN_KEY_HOLD_SECS as f64 {
                         backoff.remove(&id);
                         self.social_publish_driver.clear_error(&id);
@@ -409,20 +412,22 @@ impl Shared {
     /// backoff (grown 10s→300s); definitive refusal claims and reports.
     /// A row due past `max_lateness` is claimed and held ("missed
     /// publish window") — never sent.
-    fn claim_due(self: &Arc<Self>, now: i64, backoff: &mut HashMap<String, i64>) {
+    fn claim_due(self: &Arc<Self>, backoff: &mut HashMap<String, i64>, deadline: Instant) {
         let driver = &self.social_publish_driver;
         let sender = self.social_publish_sender.clone();
         let Some(sender) = sender else { return };
-        let batch = match self.store.social_publish_due_batch(now, PER_TICK_CAP) {
+        let batch = match self
+            .store
+            .social_publish_due_batch((driver.clock)(), PER_TICK_CAP)
+        {
             Ok(batch) => batch,
             Err(e) => {
                 driver.fail(&e.to_string());
                 return;
             }
         };
-        let tick_deadline = Instant::now() + Duration::from_secs(TICK_DEADLINE_SECS);
         for due in batch {
-            if self.closing.load(Ordering::SeqCst) || Instant::now() >= tick_deadline {
+            if self.closing.load(Ordering::SeqCst) || Instant::now() >= deadline {
                 return;
             }
             // Mid-tick lease check — before every claim, so a lost lease
@@ -455,6 +460,9 @@ impl Shared {
                 .or_else(|| frozen["due_epoch"].as_i64())
                 .unwrap_or(0);
             // Stale backlog: claim the peeked row and hold, never send.
+            // Lateness is judged on the clock now, after any slow door
+            // calls earlier in this tick, never on the tick's start.
+            let now = (driver.clock)();
             if now - due_epoch > driver.max_lateness_secs {
                 match self.claim_and_end(&due, "held", &json!({"reason": "missed publish window"}))
                 {
