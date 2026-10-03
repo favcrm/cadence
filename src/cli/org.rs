@@ -421,10 +421,19 @@ pub(super) fn record_remote(
     Ok(view(&connection, selected))
 }
 
-/// Resolve this invocation's daemon state dir once. `org` is `--org`; a
+/// What `resolve` settled for this invocation: a local daemon state dir,
+/// or a pinned remote destination (CAD-1019 slice 2). `Remote` carries the
+/// issuer-verified endpoint + workspace — never a credential, and never
+/// re-derived after this call.
+pub(super) enum Resolved {
+    Local(PathBuf),
+    Remote(cadence_agent::remote_cli::RemoteTarget),
+}
+
+/// Resolve this invocation's destination once. `org` is `--org`; a
 /// managed caller keeps its ambient binding and never consults the
 /// registry. `state`/`tracker` are explicit pins — either wins over the
-/// registry and refuses `--org`. Returns the state dir; a local-org
+/// registry and refuses `--org`. Returns [`Resolved`]; a local-org
 /// selection also exports `CADENCE_PM_DIR` so the tracker lands on the
 /// org's root. Never resolves the tracker for a managed, pinned or
 /// ambient caller — those never needed it (the CAD-313 `ui login`
@@ -433,7 +442,7 @@ pub(super) fn resolve(
     org: Option<&str>,
     state: Option<PathBuf>,
     tracker: Option<PathBuf>,
-) -> Result<PathBuf> {
+) -> Result<Resolved> {
     // A managed caller's inherited binding always wins over a saved
     // preference — it cannot be retargeted by a default the operator
     // changed mid-run, and it never reads the registry at all.
@@ -444,8 +453,9 @@ pub(super) fn resolve(
             ));
         }
         return state
+            .map(Resolved::Local)
             .map(Ok)
-            .unwrap_or_else(cadence_agent::client::state_dir);
+            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
     }
     // An explicit flag or inherited binding is a pin; it conflicts with
     // `--org` rather than mixing roots.
@@ -467,8 +477,9 @@ pub(super) fn resolve(
             ));
         }
         return state
+            .map(Resolved::Local)
             .map(Ok)
-            .unwrap_or_else(cadence_agent::client::state_dir);
+            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
     }
     let org_env = std::env::var("CADENCE_ORG").ok();
     let org = org.or(org_env.as_deref());
@@ -486,7 +497,7 @@ pub(super) fn resolve(
         None => None,
     };
     let Some(conn) = selection else {
-        return cadence_agent::client::state_dir();
+        return cadence_agent::client::state_dir().map(Resolved::Local);
     };
     match conn.destination {
         Destination::Local {
@@ -500,13 +511,19 @@ pub(super) fn resolve(
                 conn.selection.org,
                 state_dir.display()
             );
-            Ok(state_dir)
+            Ok(Resolved::Local(state_dir))
         }
-        Destination::Remote { endpoint, org_id } => Err(Error::rejected(format!(
-            "org '{}' selects remote endpoint {endpoint} (org {org_id}) but remote \
-             transport is not configured in this build — refusing local fallback",
-            conn.selection.org
-        ))),
+        Destination::Remote { endpoint, org_id } => {
+            // The destination is the issuer-verified endpoint recorded at
+            // login — `remote_cli` refuses to send this org's credential
+            // anywhere else, and there is no local fallback.
+            eprintln!("cadence org={} remote={}", conn.selection.org, endpoint);
+            Ok(Resolved::Remote(cadence_agent::remote_cli::RemoteTarget {
+                org: conn.selection.org,
+                endpoint,
+                org_id,
+            }))
+        }
     }
 }
 
