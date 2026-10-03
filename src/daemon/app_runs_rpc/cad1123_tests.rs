@@ -109,7 +109,6 @@ fn start_and_team_are_operator_only() {
             ("app_install_team_show", json!({"install_id": fx.install})),
         ] {
             let error = scoped(who.clone(), || fx.shared.dispatch(method, &params, pid()))
-                .map_err(|e| e)
                 .expect_err(&format!("{who:?} {method} was admitted"))
                 .to_string();
             assert!(
