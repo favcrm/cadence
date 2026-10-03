@@ -1,7 +1,7 @@
 # Workflow inventory after #738 (CAD-1088)
 
-This inventory describes the reduced-gate window, not the eventual restored
-suite. Required branch checks observed at the start of CAD-1088 are **fmt,
+This inventory was taken during the reduced-gate window; CAD-1102 ended that
+window and made the current gate permanent. Required branch checks observed at the start of CAD-1088 are **fmt,
 clippy, test, build, ui**; neither `test-shard` nor `test-once` is required.
 No branch/ruleset settings are changed by this cleanup.
 
@@ -48,7 +48,7 @@ indefinitely. `cadence-nextest` itself is still live in the review recipe.
   a network/toolchain error must not look like a passing refusal proof.
 - Remove obsolete staging PR filters and fix the candidate UI cache path.
   Preserve every release guard and its ordering. Stage frontend setup remains
-  as restoration scaffolding in this increment; it is behind the freeze.
+  as restoration scaffolding in this increment; it was behind the freeze, which CAD-1102 lifted.
 - Align local/documented commands with the reduced-window state.
 
 ## Deliberately not changed
@@ -59,9 +59,10 @@ speedup. Consolidation needs measured warm/cold comparisons and a plan for
 stable required names. `cache-warm` alone owns write credentials; no shortcut
 may give them to PR or queue code.
 
-Main release-artifact attempts are deliberately **red** while reduced gates
-are active. This can cause alert noise, but `continue-on-error` is not the
-answer: it would conceal an enforced refusal. A future eligibility/reporting
+During the CAD-1073 window, main release-artifact attempts were deliberately
+**red** (now ended by CAD-1102, so they pass require-full-gates). If a future
+window re-adds the marker, keep them red: `continue-on-error` would conceal an
+enforced refusal. A future eligibility/reporting
 step could explicitly mark a frozen release as ineligible *before* requesting
 a release, with fail-closed exact-source-tree tests; keep the guard as defense
 in depth and distinguish eligibility from successful release evidence.

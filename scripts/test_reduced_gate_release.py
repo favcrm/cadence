@@ -70,7 +70,9 @@ class ReducedGateReleaseTest(unittest.TestCase):
         self.assertLess(promote.index("scripts/require-full-gates"),
                         promote.index("delivery-candidate.py prepare"))
         self.assertIn("SOURCE_SHA: ${{ github.sha }}", promote)
-        self.assertTrue((ROOT / MARKER).is_file())
+        # CAD-1102 ended the CAD-1073 window, so the marker is absent on main.
+        # The guard stays wired above; the first test proves a committed
+        # marker still refuses release when a future window adds one.
 
 
 if __name__ == "__main__":
