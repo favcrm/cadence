@@ -71,6 +71,7 @@ globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
   if (path === "/api/app-installations/install-crm") return json(crm);
   if (path === "/api/app-installations/install-crm/contexts") return json(ctxs);
+  if (path.endsWith("/conversations")) return new Response("{}", { status: 404 });
   if (path.startsWith("/api/threads/master")) return json(thread);
   const url = new URL(path, "http://localhost");
   if (url.pathname === "/api/crm-send/list") return json({ sends: [] });

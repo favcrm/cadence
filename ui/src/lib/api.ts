@@ -352,8 +352,13 @@ export const api = {
     `/api/issues/${id}/artifacts/${encodeURIComponent(name)}`,
 
   /** `GET /api/threads/<alias>` — one page after `after`. */
-  thread: (alias: string, at: { after?: number; before?: number; tail?: boolean; limit?: number } = {}) => {
+  thread: (
+    alias: string,
+    at: { after?: number; before?: number; tail?: boolean; limit?: number; conversation?: string } = {},
+  ) => {
     const q = new URLSearchParams({ limit: String(at.limit ?? 200) });
+    // CAD-1098: a selector only — the daemon validates it (404 creates nothing).
+    if (at.conversation) q.set("conversation", at.conversation);
     if (at.tail) q.set("tail", "1");
     else if (at.before !== undefined) q.set("before", String(at.before));
     else q.set("after", String(at.after ?? 0));
@@ -371,6 +376,7 @@ export const api = {
     message: string,
     refs?: ThreadRef[],
     app?: { install_id: string; context_id: string },
+    conversation?: string,
   ) =>
     post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
@@ -379,7 +385,18 @@ export const api = {
         message,
         ...(refs && refs.length > 0 ? { refs } : {}),
         ...(app ? { app } : {}),
+        // CAD-1098: only a selector; the daemon resolves scope, subject and install.
+        ...(conversation ? { conversation } : {}),
       },
+    ),
+  /** `GET /api/app-installations/<id>/conversations` (CAD-1098; wire shape owned by conversationClient). */
+  conversationList: (installId: string) =>
+    get<Record<string, unknown>>(`/api/app-installations/${encodeURIComponent(installId)}/conversations`),
+  /** `POST` the same path: `subject` (`campaign:<id>`) is idempotent, none always makes a new one. */
+  conversationCreate: (installId: string, subject?: string) =>
+    post<Record<string, unknown>>(
+      `/api/app-installations/${encodeURIComponent(installId)}/conversations`,
+      subject ? { subject } : {},
     ),
   /**
    * `POST /api/needs/<verb>` — the rail's snooze/dismiss (CAD-574);

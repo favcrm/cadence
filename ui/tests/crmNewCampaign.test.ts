@@ -110,6 +110,8 @@ async function mounted() {
   };
   const saveBodies: any[] = [];
   const sendBodies: any[] = [];
+  const createBodies: any[] = [];
+  const convs: any[] = [{ id: "conv-general", subject: null, is_general: true, title: null }];
   let failNextSend = false;
   const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
   const refused = (message: string, status = 409) => json({ error: message }, status);
@@ -127,6 +129,17 @@ async function mounted() {
     if (path === "/api/app-installations/install-crm/contexts") return json({ contexts: [
       { id: "ctx-a", install_id: "install-crm", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
     ] });
+    // CAD-1098: conversations — General plus one per campaign subject (idempotent).
+    if (url.pathname === "/api/app-installations/install-crm/conversations") {
+      if (method === "POST") {
+        const body = JSON.parse(String(init!.body));
+        createBodies.push(body);
+        const c = { id: `conv-${body.subject}`, subject: body.subject, is_general: false, title: null };
+        if (!convs.find((x: any) => x.id === c.id)) convs.push(c);
+        return json({ conversation: c });
+      }
+      return json({ conversations: convs });
+    }
     if (method === "POST" && url.pathname === "/api/threads/master/messages") {
       const body = JSON.parse(String(init!.body));
       sendBodies.push(body);
@@ -315,6 +328,11 @@ async function mounted() {
   equal(sendBodies.length, 2, "the retry sent the brief again");
   equal(sendBodies.at(-1).app, { install_id: "install-crm", context_id: "ctx-a" }, "the brief is scoped");
   assert(String(sendBodies.at(-1).text).includes("Welcome people warmly."), "the brief text is sent");
+  // CAD-1098: the brief lands in the campaign's own conversation, opened once per campaign.
+  const briefCampaign = saveBodies[2].campaign_id as string;
+  equal(sendBodies.at(-1).conversation, `conv-campaign:${briefCampaign}`, "the brief goes to the campaign conversation");
+  equal(createBodies.filter((b: any) => b.subject === `campaign:${briefCampaign}`).length, 2, "each attempt opens the same subject (idempotent server side)");
+  assert(createBodies.every((b: any) => String(b.subject).startsWith("campaign:")), "only campaign subjects are created here");
 
   // ---- Name rules: a bad name refuses before any request; Escape and Cancel close with nothing saved.
   await mount("&appview=new");

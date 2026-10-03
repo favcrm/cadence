@@ -214,6 +214,8 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (path === "/api/app-installations/install-crm/contexts") return json(contextsFor["install-crm"]);
   if (path === "/api/app-installations/install-crm-multi") return json(crmMulti);
   if (path === "/api/app-installations/install-crm-multi/contexts") return json(contextsFor["install-crm-multi"]);
+  // Daemon without conversations: the chat keeps the home thread (legacy).
+  if (path.endsWith("/conversations")) return new Response("{}", { status: 404 });
   if (path.startsWith("/api/threads/master")) return json(thread);
   // CRM section reads: empty server receipts only — the mounted
   // dedupe assertions below exercise real list/new/detail paths, so

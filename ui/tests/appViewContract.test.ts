@@ -341,6 +341,7 @@ const shellBase = {
 };
 globalThis.fetch = (async (input: unknown) => {
   const url = String(input);
+  if (url.endsWith("/conversations")) return new Response("{}", { status: 404 });
   const receipt = url.endsWith("/contexts") ? { contexts: [] }
     : url.startsWith("/api/threads/master") ? { entries: [], more_before: false }
     : url === "/api/app-installations/install-a" ? { ...shellBase, install_id: "install-a" }
