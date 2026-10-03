@@ -515,7 +515,7 @@ impl Store {
                     let mut assignments = BTreeMap::new();
                     for step in &workflow.steps {
                         let agent = self.agent_in(&tx, &step.assignee)?;
-                        if !agent.enabled
+                        if !(agent.enabled || Self::agent_auto_parked_in(&tx, &agent)?)
                             || agent.role != "worker"
                             || !matches!(
                                 (agent.provider.as_str(), agent.endpoint_kind.as_str()),
@@ -532,7 +532,7 @@ impl Store {
                                 "local team needs an enabled registered managed local worker; PTY and remote endpoints are unsupported",
                             ));
                         }
-                        let generation = material_digest(&Self::agent_identity(&agent));
+                        let generation = material_digest(&Self::app_binding_identity(&agent));
                         let group = agent
                             .params
                             .as_ref()
@@ -543,7 +543,7 @@ impl Store {
                                 "local worker must belong to the run owner group",
                             ));
                         }
-                        assignments.insert(step.id.clone(),json!({"alias":agent.alias,"identity_digest":generation,"identity":Self::agent_identity(&agent),"role":agent.role,"provider":agent.provider,"endpoint_kind":agent.endpoint_kind}));
+                        assignments.insert(step.id.clone(),json!({"alias":agent.alias,"identity_digest":generation,"identity":Self::app_binding_identity(&agent),"role":agent.role,"provider":agent.provider,"endpoint_kind":agent.endpoint_kind}));
                     }
                     let mut snapshot = json!({"schema":1,"install_id":install_id,"bundle_digest":bundle_digest,"epoch":epoch,"workflow":workflow,"inputs":inputs,"assignments":assignments,"owner_pm":owner_pm,"project_link":project_link,"artifact_policy":{"types":["text/plain","text/markdown"],"max_bytes":ARTIFACT_BYTES,"aggregate_bytes":RUN_ARTIFACT_BYTES}});
                     if !input_origins.is_empty() {
@@ -948,6 +948,54 @@ impl Store {
 }
 
 impl Store {
+    /// CAD-1120: the identity an app run binds a worker to — the
+    /// registered agent and its native session, not one endpoint process.
+    /// `generation` is left out: every open mints a new one, so binding
+    /// it would refuse a worker that the idle timer stopped and dispatch
+    /// woke. Each turn is still bound to the live generation by
+    /// `local_token_current`.
+    pub(super) fn app_binding_identity(agent: &Agent) -> Value {
+        let mut identity = Self::agent_identity(agent);
+        if let Some(fields) = identity.as_object_mut() {
+            fields.remove("generation");
+        }
+        identity
+    }
+
+    /// CAD-1120: whether `agent` is parked by the idle timer rather than
+    /// stopped by a person. It must be disabled and `stopped`, and its
+    /// newest stop record must be the timer's own `agent_auto_stopped`.
+    /// An operator or PM stop (`stop_requested`), an open (`ready`), or an
+    /// auto-resume in flight or failed, written after it, makes this
+    /// false. Only the daemon's idle timer writes that record, so no
+    /// caller can mark a stopped worker as parked. A parked worker is
+    /// woken by the CAD-413 auto-resume once its kickoff is queued.
+    pub(super) fn agent_auto_parked_in(
+        conn: &impl super::StoreConn,
+        agent: &Agent,
+    ) -> Result<bool> {
+        if agent.enabled || agent.state != "stopped" {
+            return Ok(false);
+        }
+        let placeholders = vec!["?"; AUTO_STOP_MARKER_KINDS.len()].join(",");
+        let sql = format!(
+            "SELECT kind FROM events WHERE alias=? AND kind IN ({placeholders})
+             ORDER BY seq DESC LIMIT 1"
+        );
+        let mut args: Vec<&dyn rusqlite::ToSql> = vec![&agent.alias];
+        args.extend(
+            AUTO_STOP_MARKER_KINDS
+                .iter()
+                .map(|kind| kind as &dyn rusqlite::ToSql),
+        );
+        let newest: Option<String> = conn
+            .query_row(&sql, args.as_slice(), |row| row.get(0))
+            .optional()?;
+        Ok(newest.as_deref() == Some(AUTO_STOP_EVENT))
+    }
+}
+
+impl Store {
     /// Called only while the daemon holds the installation's PM lock. SQL
     /// rechecks the epoch and dependency state in the enqueue transaction.
     pub fn app_run_dispatch(&self, id: &str, current_bundle: &str) -> Result<Value> {
@@ -964,7 +1012,8 @@ impl Store {
                     for assignment in run["snapshot"]["assignments"].as_object().unwrap().values() {
                         let alias = assignment["alias"].as_str().unwrap();
                         let worker = self.agent_in(&tx, alias)?;
-                        if !worker.enabled || Self::agent_identity(&worker) != assignment["identity"] {
+                        if !(worker.enabled || Self::agent_auto_parked_in(&tx, &worker)?)
+ || Self::app_binding_identity(&worker) != assignment["identity"] {
                             return Err(Error::rejected("registered app assignment changed"));
                         }
                     }
@@ -991,7 +1040,7 @@ impl Store {
                         }
                         let worker = self.agent_in(&tx, &step.assignee)?;
                         let expected = &run["snapshot"]["assignments"][&step_id];
-                        if material_digest(&Self::agent_identity(&worker)) != generation
+                        if material_digest(&Self::app_binding_identity(&worker)) != generation
                             || worker.role != expected["role"].as_str().unwrap()
                             || worker.provider != expected["provider"].as_str().unwrap()
                             || worker.endpoint_kind != expected["endpoint_kind"].as_str().unwrap()
@@ -1148,8 +1197,9 @@ impl Store {
             let generation = self.agent_in(&conn, &msg.alias)?.generation;
             let assigned = &run["snapshot"]["assignments"][&step.id];
             if step.assignee != msg.alias
-                || material_digest(&Self::agent_identity(&self.agent_in(&conn, &msg.alias)?))
-                    != assigned["identity_digest"].as_str().unwrap()
+                || material_digest(&Self::app_binding_identity(
+                    &self.agent_in(&conn, &msg.alias)?,
+                )) != assigned["identity_digest"].as_str().unwrap()
                 || !step.dependencies.contains(&producer_step)
                 || !local_token_current(
                     assigned["provider"].as_str().unwrap(),
@@ -1384,7 +1434,7 @@ impl Store {
             .ok_or_else(|| Error::rejected("app material result needs its active turn"))?;
         if turn_id != token
             || result.get("turn_id").and_then(Value::as_str) != Some(token)
-            || material_digest(&Self::agent_identity(&worker)) != generation
+            || material_digest(&Self::app_binding_identity(&worker)) != generation
             || message.alias != step.assignee
             || task.assignee.as_deref() != Some(&step.assignee)
             || task.revision != 1
@@ -1763,7 +1813,7 @@ impl Store {
         let pinned = &run["snapshot"]["assignments"][&step.id];
         if !actual.enabled
             || actual.alias != message.alias
-            || material_digest(&Self::agent_identity(&actual)) != generation
+            || material_digest(&Self::app_binding_identity(&actual)) != generation
             || actual.role != pinned["role"].as_str().unwrap()
             || actual.provider != pinned["provider"].as_str().unwrap()
             || actual.endpoint_kind != pinned["endpoint_kind"].as_str().unwrap()

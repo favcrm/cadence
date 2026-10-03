@@ -434,7 +434,15 @@ impl Shared {
                 self.store
                     .app_run_decide(required_str(params, "run_id")?, None, true, None)
             }
-            "app_run_dispatch" => self.dispatch_app_run(required_str(params, "run_id")?),
+            "app_run_dispatch" => {
+                let run = self.dispatch_app_run(required_str(params, "run_id")?)?;
+                // CAD-1120: a kickoff queued for a worker the idle timer
+                // parked wakes it now, through the CAD-413 auto-resume
+                // (which re-checks that the timer's stop is still the
+                // newest); the stall watch does the same for later steps.
+                self.auto_resume_tick();
+                Ok(run)
+            }
             "app_run_show" => self.store.app_run_show(required_str(params, "run_id")?),
             "app_run_list" => self.store.app_run_list_filtered(
                 optional_str(params, "install_id"),
@@ -618,6 +626,9 @@ impl Shared {
         })
     }
 }
+
+#[cfg(test)]
+mod cad1120_tests;
 
 #[cfg(test)]
 mod cad742_tests {
