@@ -335,7 +335,9 @@ fn classify_sent(data: &Value, to: &str, secret: &[u8]) -> SmtpOutcome {
 /// timeout there, is unresolved and never retried.
 fn classify_failure(code: &str, step: &str, message: String) -> SmtpOutcome {
     match (code, step) {
-        ("data" | "timeout", "data") => SmtpOutcome::Uncertain { message },
+        // Whatever the code, a failure at step `data` came after the
+        // body may have been written: acceptance is unknowable.
+        (_, "data") => SmtpOutcome::Uncertain { message },
         ("recipient", _) => SmtpOutcome::Rejected { code: 550, message },
         ("data", _) => SmtpOutcome::Rejected { code: 554, message },
         ("rejected", _) => SmtpOutcome::Deferred { code: 429, message },
@@ -357,6 +359,22 @@ mod tests {
         assert!(plain_message("auth", "auth").starts_with("Couldn't sign in"));
         assert!(plain_message("zzz", "auth").starts_with("Couldn't sign in"));
         assert_eq!(plain_message("", ""), "The mail server could not be used.");
+    }
+
+    #[test]
+    fn any_failure_at_step_data_is_never_retried() {
+        for code in [
+            "connect", "rejected", "tls", "auth", "invalid", "recipient", "data", "timeout", "",
+            "zzz",
+        ] {
+            assert!(
+                matches!(
+                    classify_failure(code, "data", String::new()),
+                    SmtpOutcome::Uncertain { .. }
+                ),
+                "code {code} at step data must be Uncertain"
+            );
+        }
     }
 
     #[test]
