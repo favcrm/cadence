@@ -323,6 +323,19 @@ impl Shared {
     }
 }
 
+// ACCEPTANCE-CHECK SLOT (CAD-1123 HP4). Reserved for the independent
+// acceptance check, written by the reviewer or the ticket author, not the
+// implementer, in a new `tests/cad1123_hp4_acceptance.rs` (feature
+// `test-seam`). It must prove, against the real guards, that these are
+// refused: a double send (two `social_publish_start now` taps, or start then
+// `social_publish_send_now`) beyond one provider call; a non-operator (agent,
+// detached child, board member) on `social_publish_start`,
+// `social_publish_reschedule` and `app_binding_publish_set`, over RPC and
+// HTTP; a reschedule race (stale `expected_due_epoch`, or a claim in
+// between) that changes the schedule; and a forged destination (a
+// `destination_id`, `toolkit`, `grant_id`, `timezone`, scope or
+// `approval_id` in the request).
+
 #[cfg(test)]
 mod tests {
     use super::*;

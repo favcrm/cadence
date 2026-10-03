@@ -109,8 +109,8 @@ store/seal.rs	sqlite-guard-owner-and-inline-tests	guarded_write	21
 store/seal.rs	sqlite-guard-owner-and-inline-tests	open	20
 store/seal.rs	sqlite-guard-owner-and-inline-tests	prepare	2
 store/seal.rs	sqlite-guard-owner-and-inline-tests	transaction	7
-store/social_publish.rs	guarded-store-and-read-queries	execute	6
-store/social_publish.rs	guarded-store-and-read-queries	guarded_write	6
+store/social_publish.rs	guarded-store-and-read-queries	execute	7
+store/social_publish.rs	guarded-store-and-read-queries	guarded_write	7
 store/tests/agents.rs	test-fixtures	execute	2
 store/tests/agents.rs	test-fixtures	guarded_write	1
 store/tests/agents.rs	test-fixtures	open	5
