@@ -2,14 +2,40 @@ import Markdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { isLoopbackHref } from "./links";
 
-// Bare issue ids become `issue:` links before rendering; matches inside
-// code spans or existing markdown links are left alone.
-function linkify(md: string): string {
-  return md.replace(
-    /(`[^`\n]*`)|\[[^\]\n]*\]\([^)\n]*\)|\b[A-Z]{2,6}-\d+\b/g,
-    (m) => (m[0] === "`" || m[0] === "[" ? m : `[${m}](issue:${m})`),
-  );
+// Bare issue ids become `issue:` links as a remark pass over `text` nodes
+// only, so code blocks, inline code, existing links and autolinked URLs
+// (none of which hold the id as a text node) are never touched.
+interface MdNode {
+  type: string;
+  value?: string;
+  url?: string;
+  children?: MdNode[];
 }
+
+const ISSUE_ID = /\b[A-Z]{2,6}-\d+\b/g;
+
+function linkifyChildren(node: MdNode): void {
+  const kids = node.children;
+  if (!kids || node.type === "link" || node.type === "linkReference") return;
+  const out: MdNode[] = [];
+  for (const kid of kids) {
+    if (kid.type !== "text" || !kid.value) {
+      linkifyChildren(kid);
+      out.push(kid);
+      continue;
+    }
+    let last = 0;
+    for (const m of kid.value.matchAll(ISSUE_ID)) {
+      if (m.index > last) out.push({ type: "text", value: kid.value.slice(last, m.index) });
+      out.push({ type: "link", url: `issue:${m[0]}`, children: [{ type: "text", value: m[0] }] });
+      last = m.index + m[0].length;
+    }
+    out.push(last === 0 ? kid : { type: "text", value: kid.value.slice(last) });
+  }
+  node.children = out;
+}
+
+const remarkIssueLinks = () => (tree: MdNode) => linkifyChildren(tree);
 
 // Agent-written Markdown must not initiate third-party image requests. The
 // board permits two CDN families for reviewed Social Content source cards,
@@ -34,7 +60,7 @@ export default function Md({
     <Markdown
       // GFM (CAD-551): tables, task lists, strikethrough, autolinks —
       // the providers' answers lean on them.
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={[remarkGfm, remarkIssueLinks]}
       // `issue:` ids are ours; everything else takes react-markdown's
       // safe transform (no `javascript:` and friends).
       urlTransform={(url) => (url.startsWith("issue:") ? url : defaultUrlTransform(url))}
@@ -71,7 +97,7 @@ export default function Md({
           ),
       }}
     >
-      {linkify(text)}
+      {text}
     </Markdown>
   );
 }
