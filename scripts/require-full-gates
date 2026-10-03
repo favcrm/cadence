@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Refuse release and staging while the exact checked-out source commit is reduced-gate.
+set -euo pipefail
+if [ "$#" -ne 2 ] || ! [[ "$2" =~ ^[0-9a-f]{40}$ ]]; then
+  echo 'require-full-gates: expected checkout directory and full source SHA' >&2
+  exit 1
+fi
+checkout=$1
+source_sha=$2
+head=$(git -C "$checkout" rev-parse --verify HEAD) || exit 1
+if [ "$head" != "$source_sha" ]; then
+  echo "require-full-gates: checkout $head does not match source $source_sha" >&2
+  exit 1
+fi
+# Read the Git tree, not the mutable working-tree file. A missing marker in
+# a sparse checkout or a local deletion must never enable release.
+# ls-tree succeeds with empty output only when the committed path is absent;
+# errors (including an inaccessible source tree) refuse instead of enabling.
+marker=$(git -C "$checkout" ls-tree "$source_sha" -- .github/reduced-gates) || exit 1
+if [ -n "$marker" ]; then
+  echo "require-full-gates: reduced gates active at $source_sha; release/staging prohibited" >&2
+  exit 1
+fi
+echo "require-full-gates: full-gate source $source_sha"

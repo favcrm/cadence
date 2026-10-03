@@ -132,6 +132,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - name: Refuse automatic selection under reduced gates
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: scripts/require-full-gates "$GITHUB_WORKSPACE" "$SOURCE_SHA"
       - name: Select the newest eligible attested candidate
         id: select
         env:
@@ -179,6 +183,10 @@ jobs:
         with:
           path: control
           persist-credentials: false
+      - name: Refuse manual or automatic staging under reduced gates
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: control/scripts/require-full-gates "$GITHUB_WORKSPACE/control" "$SOURCE_SHA"
       - name: Verify candidate identity, digest and build attestation
         id: candidate
         env:
@@ -196,6 +204,10 @@ jobs:
           ref: ${{ steps.candidate.outputs.source_sha }}
           path: candidate-source
           persist-credentials: false
+      - name: Refuse a reduced-gate candidate, even under a later full-gate control SHA
+        env:
+          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+        run: control/scripts/require-full-gates "$GITHUB_WORKSPACE/candidate-source" "$SOURCE_SHA"
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           package_json_file: candidate-source/ui/package.json
@@ -286,6 +298,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - name: Refuse promotion under reduced gates after approval wait
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: scripts/require-full-gates "$GITHUB_WORKSPACE" "$SOURCE_SHA"
       - name: Re-verify the artifact after the approval wait
         env:
           GH_TOKEN: ${{ github.token }}
