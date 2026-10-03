@@ -34,6 +34,7 @@ export type ContentBlock =
 /** Body keys the HTTP peer accepts, per operation. */
 const SAVE_KEYS = [
   "campaign_id",
+  "name",
   "subject",
   "preheader",
   "blocks",
@@ -187,6 +188,8 @@ async function get<T>(path: string): Promise<T> {
  */
 export type ContentDraftInput = {
   campaignId: string;
+  /** CAD-1058: optional human campaign name (operator save only). */
+  name?: string;
   subject: string;
   preheader?: string;
   text?: string;
@@ -210,7 +213,7 @@ export interface ProposalInput {
 export const contentClient = {
   paths: contentPaths,
   save(scope: ContentScope, input: ContentDraftInput): Promise<unknown> {
-    assertInputClean(input as unknown as Record<string, unknown>, ["campaignId", "subject", "preheader", "blocks", "html", "text", "expectedRevision"], "save");
+    assertInputClean(input as unknown as Record<string, unknown>, ["campaignId", "name", "subject", "preheader", "blocks", "html", "text", "expectedRevision"], "save");
     if ((input.blocks === undefined) === (input.html === undefined)) {
       throw new ApiError("content save needs exactly one of blocks or html", 400, {
         code: "invalid_body",
@@ -224,6 +227,7 @@ export const contentClient = {
     if (input.blocks !== undefined) body.blocks = input.blocks;
     if (input.html !== undefined) body.html = input.html;
     if (input.text !== undefined) body.text = input.text;
+    if (input.name !== undefined) body.name = input.name;
     if (input.expectedRevision !== undefined) body.expected_revision = input.expectedRevision;
     assertClean(body, SAVE_KEYS, "save");
     return post(contentPaths.savePath(scope), body);
