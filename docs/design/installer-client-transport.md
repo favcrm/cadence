@@ -109,11 +109,39 @@ unqualified dynamic startup graph is refused, not guessed.
 
 Construction-only bootstrap may permit one bounded withheld host stdin read;
 it is separate from signed enrollment/release/current-owner authority. EOF,
-trailing/oversized frame or deadline cannot open a socket or consume. The
-receiver r3 mapping/release adapter is awaiting the concrete root integration
-checkpoint; no new receipt-receiver wire change has been made at this source
-checkpoint. Existing UID0 admission and the independent production-refusal
-acceptance remain unchanged.
+trailing/oversized frame or deadline cannot open a socket or consume. Root
+approved the concrete r3 checkpoint and distinct generation mapping. The new
+private `installer_enrolled` route carries BOTH existing signed envelopes:
+`enrolled-install-r3 <grant> <receipt>\n`, total32768bytes including framing,
+one request plus EOF. Existing UID0 admission and the old independent
+production-refusal acceptance remain unchanged.
+
+`production_release_authority()` and `production_enrolled_receiver()` obtain
+separate unavailable `production_closed_custody()` before caller proof or
+effects. Protected recipient enrollment, image trust and authenticated
+ExecutorAdmission+CompanyControl owner port also remain unavailable.
+`release_host_frame()` is the actual private guardable release entry, without
+test argv. The fixed waiting entry preserves its original absolute deadline
+into this path; it never rewrites the frame to grant-only delivery.
+
+The existing grant parser verifies its original domain/keyring, then parses the
+verified receipt's canonical binding with the EXISTING challenge parser and
+compares the full typed challenge, including imageLane presence. No new codec,
+installerGeneration claim or signature schema is introduced. Private PREPARED
+and CONSUMED-current observations compare exact canonical full binding bytes,
+phase, owner revisions, current epoch, open closure and lineage. Unknown/lost
+consume ACK is terminal UNKNOWN, never retried or locally reopened. Peer
+credentials and held executable/procfs handles recheck before and after owner
+calls/consume; no local replay ledger is authority.
+
+Only after combined consume/current recheck may the receiver write
+`ok enrolled-consumed-r3 <operation> <signedAttemptGeneration> <recipientGeneration> <barrierNonce>\n`
+plus EOF. Client requires exact bytes and re-observes kernel self/recipient,
+topology and authenticated consumed-current owner. Success represents only
+consumption acknowledgement; no spawn, launch, enrollment or retirement call
+exists. Test-only thread-local counters permit an independently authored guard
+to check zero effects at the real missing-qualification paths; they never
+supply a capability/override/factory in a release build.
 
 Observer holds the real procfs PID directory and executable, compares actual
 IDs (including filesystem IDs), groups, five caps, NoNewPrivs, single-thread
@@ -124,8 +152,12 @@ not exposed by procfs: diagnostic fields stay unavailable/null and qualified
 observation refuses. Querying the observer's own prctl would NOT measure the
 target. Only the waiting client can inspect its own prctl for construction;
 that is not external enrollment or earlier-root provenance. No ptrace fallback.
-Closed qualified carrier-seal provenance, if later selected, must remain a
-separate owner evidence type, never an invented procfs field.
+Root selected separate private `ClosedCarrierCustody`, binding independently
+qualified immutable seal/no-alternate-exec custody to the exact construction
+PID/starttime/client/carrier/observer and namespaces. Its private fields and
+unavailable factory cannot be populated from diagnostics, observer-own prctl,
+stdout, a signed receipt, env or caller assertions. The procfs diagnostic fields
+remain null/UNKNOWN even when this separate evidence is checked.
 
 ## Acceptance and delivery
 

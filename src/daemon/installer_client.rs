@@ -171,18 +171,19 @@ impl Capsule {
 }
 
 #[derive(Clone, Copy)]
-struct Deadline(Instant);
+pub(super) struct Deadline(Instant);
 impl Deadline {
+    pub(super) fn until(until:Instant)->Self {Self(until)}
     fn new(budget: Duration) -> Self {
         Self(Instant::now() + budget)
     }
-    fn remaining(self) -> Result<Duration> {
+    pub(super) fn remaining(self) -> Result<Duration> {
         self.0
             .checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
             .ok_or_else(unknown)
     }
-    fn wait(self, fd: RawFd, events: i16) -> Result<()> {
+    pub(super) fn wait(self, fd: RawFd, events: i16) -> Result<()> {
         loop {
             let left = self.remaining()?;
             // Round up fractional milliseconds without extending the absolute deadline.
@@ -272,18 +273,18 @@ fn open_at(parent: RawFd, name: &std::ffi::OsStr, directory: bool) -> Result<Fil
 
 /// Anchored traversal retains EVERY descriptor (including the O_PATH socket).
 /// Production only uses the fixed root/run/supervisor/socket table below.
-struct Topology {
+pub(super) struct Topology {
     held: Vec<File>,
     snapshots: Vec<Node>,
 }
-const POLICY: &[(&str, u32, u32, u32)] = &[
+pub(super) const POLICY: &[(&str, u32, u32, u32)] = &[
     ("/", 0, 0, libc::S_IFDIR | 0o755),
     ("run", 0, 0, libc::S_IFDIR | 0o755),
     ("cadence-supervisor", 21000, 21000, libc::S_IFDIR | 0o700),
     ("grant.sock", 21000, 21000, libc::S_IFSOCK | 0o600),
 ];
 impl Topology {
-    fn capture(policy: &[(&str, u32, u32, u32)]) -> Result<Self> {
+    pub(super) fn capture(policy: &[(&str, u32, u32, u32)]) -> Result<Self> {
         let mut held = Vec::new();
         let mut snapshots = Vec::new();
         for (name, uid, gid, mode) in policy {
@@ -305,7 +306,7 @@ impl Topology {
         }
         Ok(Self { held, snapshots })
     }
-    fn recheck(&self, policy: &[(&str, u32, u32, u32)]) -> Result<()> {
+    pub(super) fn recheck(&self, policy: &[(&str, u32, u32, u32)]) -> Result<()> {
         let current = Self::capture(policy)?;
         if current.snapshots != self.snapshots {
             return Err(unknown());
@@ -317,7 +318,7 @@ impl Topology {
         }
         Ok(())
     }
-    fn connect(&self, deadline: Deadline) -> Result<UnixStream> {
+    pub(super) fn connect(&self, deadline: Deadline) -> Result<UnixStream> {
         // The connect follows the held parent, not a re-resolved /run path.
         let parent = self.held[self.held.len() - 2].as_raw_fd();
         connect(
@@ -383,7 +384,7 @@ fn connect(path: &Path, deadline: Deadline) -> Result<UnixStream> {
     Ok(stream)
 }
 
-fn write_frame(stream: &UnixStream, frame: &[u8], deadline: Deadline) -> Result<()> {
+pub(super) fn write_frame(stream: &UnixStream, frame: &[u8], deadline: Deadline) -> Result<()> {
     if frame.len() > MAX_FRAME || frame.last() != Some(&b'\n') {
         return Err(unknown());
     }
@@ -414,7 +415,7 @@ fn write_frame(stream: &UnixStream, frame: &[u8], deadline: Deadline) -> Result<
     }
     Ok(())
 }
-fn read_response(stream: &UnixStream, deadline: Deadline) -> Result<Vec<u8>> {
+pub(super) fn read_response(stream: &UnixStream, deadline: Deadline) -> Result<Vec<u8>> {
     let mut response = Vec::with_capacity(256);
     let mut buf = [0; 1024];
     loop {
@@ -456,11 +457,11 @@ fn read_response(stream: &UnixStream, deadline: Deadline) -> Result<Vec<u8>> {
 
 /// Private immutable enrolled identity, NOT derived from the capsule or peer.
 /// No production constructor is available. Test literals confer no authority.
-struct Enrollment {
-    pid: u32,
-    starttime: u64,
-    generation: String,
-    digest: [u8; 32],
+pub(super) struct Enrollment {
+    pub(super) pid: u32,
+    pub(super) starttime: u64,
+    pub(super) generation: String,
+    pub(super) digest: [u8; 32],
 }
 fn measured_process(pid: u32, enrollment: &Enrollment, generation: &str) -> Result<()> {
     if pid != enrollment.pid || generation != enrollment.generation || enrollment.digest == [0; 32]
@@ -477,7 +478,7 @@ fn measured_process(pid: u32, enrollment: &Enrollment, generation: &str) -> Resu
     }
     Ok(())
 }
-fn admit_supervisor(stream: &UnixStream, enrollment: &Enrollment, generation: &str) -> Result<()> {
+pub(super) fn admit_supervisor(stream: &UnixStream, enrollment: &Enrollment, generation: &str) -> Result<()> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
     if unsafe {

@@ -47,6 +47,9 @@ mod identity;
 #[cfg(target_os = "linux")]
 mod installer_client;
 mod installer_enrollment_wire;
+pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) mod installer_enrolled;
 mod jobs_rpc;
 mod lane_rpc;
 mod master_rpc;

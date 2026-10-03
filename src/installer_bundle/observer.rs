@@ -71,8 +71,24 @@ pub(super) struct Diagnostic {
     pid:u32, starttime:u64, state:Status, namespaces:Namespaces, executable:files::Stamp, client_digest:[u8;32],
     // No process-local PR_GET_SECUREBITS can observe another process.
     securebits:Option<u32>, keepcaps:Option<u32>,
+    // Keep actual inode/exec handles THROUGH peer/owner/consume rechecks.
+    held_proc:File, held_pid:File, held_exe:File, protected:files::HeldArtifact,
+    pid_stamp:files::Stamp,
 }
 impl Diagnostic {
+    pub(super) fn starttime(&self)->u64 {self.starttime}
+    pub(super) fn recheck(&self,image:&QualifiedImage,deadline:Deadline)->Result<()> {
+        if files::stamp(&self.held_pid)?!=self.pid_stamp || files::stamp(&self.held_exe)?!=self.executable
+            || start(&self.held_pid,self.pid,deadline)?!=self.starttime {return Err(refused());}
+        let dir=open(&self.held_proc,&self.pid.to_string(),libc::O_RDONLY|libc::O_DIRECTORY|libc::O_NOFOLLOW)?;
+        let exe=open(&dir,"exe",libc::O_RDONLY|libc::O_NONBLOCK)?;
+        if files::stamp(&dir)?!=self.pid_stamp || files::stamp(&exe)?!=self.executable
+            || files::measure(&exe,image.client,0,deadline)?!=self.executable
+            || start(&dir,self.pid,deadline)?!=self.starttime
+            || status(&bounded(&dir,"status",65536,deadline)?)?!=self.state
+            || namespaces(&dir)?!=self.namespaces {return Err(refused());}
+        self.protected.recheck(deadline)?;deadline.check()
+    }
     pub(super) fn require_release_measurement(&self)->Result<()> {
         if self.securebits!=Some(super::seal::SECUREBITS) || self.keepcaps!=Some(0) {return Err(refused());}
         Ok(())
@@ -91,7 +107,8 @@ impl Diagnostic {
             "version":1,"operation":operation,"barrierNonce":barrier,
             "pid":self.pid,"starttime":self.starttime.to_string(),
             "clientDigest":self.client_digest.iter().map(|b|format!("{b:02x}")).collect::<String>(),
-            "uid":self.state.uids,"gid":self.state.gids,"caps":self.state.caps,
+            "uid":self.state.uids,"gid":self.state.gids,"groups":self.state.groups,
+            "caps":self.state.caps,"threads":self.state.threads,
             "noNewPrivs":self.state.nnp,"securebits":self.securebits,"keepcaps":self.keepcaps,
             "namespaces":{"user":[self.namespaces.user.0.to_string(),self.namespaces.user.1.to_string()],
                 "pid":[self.namespaces.pid.0.to_string(),self.namespaces.pid.1.to_string()],
@@ -127,7 +144,8 @@ pub(super) fn observe(pid:u32,image:&QualifiedImage,deadline:Deadline)->Result<D
         || status(&bounded(&dir_again,"status",65536,deadline)?)?!=status_a || namespaces(&dir_again)?!=ns_a {return Err(refused());}
     selected.recheck(deadline)?;
     deadline.check()?;
-    Ok(Diagnostic {pid,starttime:a,state:status_a,namespaces:ns_a,executable:measured,client_digest:image.client,securebits:None,keepcaps:None})
+    Ok(Diagnostic {pid,starttime:a,state:status_a,namespaces:ns_a,executable:measured,client_digest:image.client,securebits:None,keepcaps:None,
+        held_proc:root,held_pid:dir,held_exe:exe,protected:selected,pid_stamp:initial_dir})
 }
 fn uuid(s:&str)->bool {
     s.len()==36 && s.bytes().enumerate().all(|(i,b)| if [8,13,18,23].contains(&i) {b==b'-'}else{b.is_ascii_digit()||(b'a'..=b'f').contains(&b)})

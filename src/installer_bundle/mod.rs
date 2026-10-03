@@ -54,6 +54,37 @@ struct QualifiedImage {
 }
 fn production_image() -> Result<QualifiedImage> { Err(refused()) }
 
+/// Separate independently qualified immutable seal/no-alternate-exec/process
+/// custody. Not procfs observation, caller assertion, stdout or signature.
+/// Fields are private, no JSON/CLI/env/public/test-seam production constructor.
+pub(crate) struct ClosedCarrierCustody { image:QualifiedImage, pid:u32, starttime:u64 }
+pub(crate) fn production_closed_custody()->Result<ClosedCarrierCustody> {
+    Err(refused()) // exact host-held process construction evidence unavailable
+}
+pub(crate) struct CustodyObservation { facts:observer::Diagnostic }
+impl ClosedCarrierCustody {
+    pub(crate) fn observe_record(&self,record:&crate::daemon::InstallerProcessRecord,until:Instant)->Result<CustodyObservation> {
+        let hex=|b:&[u8;32]|b.iter().map(|v|format!("{v:02x}")).collect::<String>();
+        if record.pid!=self.pid || record.starttime!=self.starttime.to_string()
+            || record.uid!=u64::from(IDS) || record.gid!=u64::from(IDS)
+            || record.client_digest!=hex(&self.image.client) || record.carrier_digest!=hex(&self.image.carrier)
+            || record.observer_digest!=hex(&self.image.observer) {return Err(refused());}
+        let deadline=Deadline(until);
+        // Current image artifacts and target measurements corroborate this
+        // private provenance; they NEVER create it or fill remote prctl facts.
+        for (kind,pin) in [(files::Artifact::Carrier,self.image.carrier),(files::Artifact::Observer,self.image.observer)] {
+            let held=files::HeldArtifact::open(kind,pin,deadline)?;held.recheck(deadline)?;
+        }
+        let facts=observer::observe(self.pid,&self.image,deadline)?;
+        if facts.starttime()!=self.starttime {return Err(refused());}
+        Ok(CustodyObservation {facts})
+    }
+    pub(crate) fn recheck(&self,seen:&CustodyObservation,until:Instant)->Result<()> {
+        if seen.facts.starttime()!=self.starttime {return Err(refused());}
+        seen.facts.recheck(&self.image,Deadline(until))
+    }
+}
+
 /// Construction is separate from externally enrolled RELEASE authority. It
 /// authorizes only one withheld host stdin read, never connect/consume/launch.
 struct WaitingConstruction { image: QualifiedImage }
@@ -66,16 +97,17 @@ pub(crate) fn carrier_entry() -> Result<()> { carrier::entry() }
 pub(crate) fn observer_entry() -> Result<()> { observer::entry() }
 pub(crate) fn client_entry() -> Result<()> {
     fixed_arguments()?;
-    let construction = production_construction()?; // before reading host stdin
     let deadline = Deadline::new();
+    let construction = production_construction()?; // before reading host stdin
     let stdin = std::io::stdin();
     use std::os::fd::AsRawFd;
-    // The selected waiting client performs no further exec/fork. The receipt
-    // receiver mapping/release adapter is deliberately not guessed here.
+    // Construction permits only this withheld read. No further exec/fork,
+    // connection or consume before an independently verified owner release.
     let self_facts = observer::observe(std::process::id(), &construction.image, deadline)?;
     self_facts.require_construction_measurement()?;
-    let _frame = waiting_frame(stdin.as_raw_fd(), deadline)?;
-    Err(refused()) // no signed PREPARED/current-owner release adapter yet
+    let frame = waiting_frame(stdin.as_raw_fd(), deadline)?;
+    crate::daemon::installer_enrolled::release_host_frame_until(&frame.0,deadline.0)
+    // Ok is consumption-only transport evidence, NEVER launch or retirement.
 }
 
 struct HostFrame(Vec<u8>);
