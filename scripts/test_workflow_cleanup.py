@@ -25,6 +25,89 @@ def job(text, name):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_pr_rehearsal_cache_is_read_only_and_never_replaces_real_checks(self):
+        # CAD-1135: inspect the actual consumer configuration. This proves
+        # wiring, not a remote cache hit or GitHub's runtime save refusal.
+        staging = workflow("staging.yml")
+        body = job(staging, "rehearsal-check")
+        self.assertRegex(staging, r"(?m)^permissions:\n  contents: read\n  actions: read$")
+        self.assertNotRegex(staging, r"(?m)^env:")
+        self.assertRegex(body, r"(?m)^    if: github.event_name == 'pull_request'$")
+        self.assertRegex(body, r"(?m)^    runs-on: ubuntu-24.04$")
+        self.assertNotRegex(body, r"(?m)^    (?:permissions|defaults|environment|container):")
+        self.assertNotIn("continue-on-error:", body)
+        self.assertNotRegex(body, r"(?m)^      (?:- |  )shell:")
+        self.assertNotIn("secrets.", body)
+        self.assertNotIn("cache-hit", body)
+        env = re.search(r"^    env:\n((?:      [^\n]*\n)+)", body, re.M)
+        self.assertIsNotNone(env, "missing producer-matching pre-cache environment")
+        self.assertEqual(env.group(1).splitlines(), [
+            "      CARGO_TERM_COLOR: always", "      RUSTFLAGS: -D warnings",
+        ])
+        steps = [step for step in re.split(r"(?=^      - )", body, flags=re.M)
+                 if step.startswith("      - ")]
+
+        def step_index(field, value):
+            matches = [i for i, step in enumerate(steps) if re.search(
+                rf"^      (?:- |  ){field}: {re.escape(value)}(?: #.*)?$", step, re.M)]
+            self.assertEqual(len(matches), 1, (field, value))
+            return matches[0]
+
+        install = step_index("run", "scripts/ci-rust-toolchain --profile minimal")
+        cache = step_index("uses", "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6")
+        export = step_index("run", "scripts/ci-rust-toolchain --export --profile minimal")
+        ui_install = step_index("run", "pnpm install --frozen-lockfile")
+        ui_build = step_index("run", "pnpm build")
+        build = step_index("run", "cargo build --release --locked --features ui")
+        rehearsal = step_index("name", "Real-binary migration and backup recovery rehearsal")
+        self.assertLess(install, cache)
+        self.assertLess(cache, export)
+        self.assertLess(export, build)
+        self.assertLess(ui_install, ui_build)
+        self.assertLess(ui_build, build)
+        self.assertLess(build, rehearsal)
+        # No cache-dependent conditions on preparation, compile or proof:
+        # a cold cache follows exactly the same required real-binary path.
+        for step in steps[:rehearsal + 1]:
+            self.assertNotRegex(step, r"(?m)^      (?:- |  )if:")
+        for step in steps[:cache + 1]:
+            self.assertNotRegex(step, r"(?m)^        env:")
+            self.assertNotIn("GITHUB_ENV", step)
+            self.assertNotIn("--export", step)
+        cache_inputs = re.search(r"^        with:\n((?:          [^\n]*\n)+)", steps[cache], re.M)
+        self.assertIsNotNone(cache_inputs)
+        # Explicit literal false; no PR-writable expression, tracked-env
+        # suppression or second cache action can grant cache-write authority.
+        self.assertEqual(cache_inputs.group(1).splitlines(), [
+            "          shared-key: gate-release-full", "          save-if: false",
+        ])
+        uses = re.findall(r"^      (?:- |  )uses: ([^ #\n]+)", body, re.M)
+        self.assertCountEqual(uses, [
+            "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+            "pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1",
+            "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+            "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        ])
+        checkout = step_index("uses", "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683")
+        self.assertRegex(steps[checkout], r"(?m)^          persist-credentials: false$")
+        for i in (ui_install, ui_build):
+            self.assertRegex(steps[i], r"(?m)^        working-directory: ui$")
+        self.assertRegex(steps[build], r"(?m)^        env:\n          CARGO_BUILD_JOBS: 4$")
+        # Exact baseline verification and local release candidate, not a
+        # downloaded replacement, mock binary, or swallowed proof failure.
+        proof = re.search(r"^        run: \|\n((?:          [^\n]*\n)+)", steps[rehearsal], re.M)
+        self.assertIsNotNone(proof)
+        self.assertEqual(textwrap.dedent(proof.group(1)),
+                         'baseline=$(gh run list -R "$REPO" --workflow ci.yml --event push --branch main --status success --limit 1 --json databaseId --jq \'.[0].databaseId\')\n' +
+                         'python3 scripts/delivery-candidate.py prepare --repo "$REPO" --run-id "$baseline" --dest "$RUNNER_TEMP/baseline"\n' +
+                         'python3 scripts/staging-rehearsal.py --baseline "$RUNNER_TEMP/baseline/cadence" \\\n' +
+                         '  --candidate "$GITHUB_WORKSPACE/target/release/cadence" --sha "$SOURCE_SHA" --out "$RUNNER_TEMP/rehearsal"\n')
+        for key, value in (("GH_TOKEN", "${{ github.token }}"),
+                           ("REPO", "${{ github.repository }}"),
+                           ("SOURCE_SHA", "${{ github.sha }}")):
+            self.assertRegex(steps[rehearsal], rf"(?m)^          {key}: {re.escape(value)}$")
+
     def test_required_gates_still_have_real_checks_and_scope_wiring(self):
         ci = workflow("ci.yml")
         self.assertIn("  merge_group:", ci)

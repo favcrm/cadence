@@ -58,6 +58,10 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    # Match CAD-1131's trusted main-only release-full cache producer.
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -68,6 +72,14 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
+      # Cache fingerprints include RUSTUP_TOOLCHAIN: restore before the
+      # foreign-checkout pin is exported, as in the main cache producer.
+      - run: scripts/ci-rust-toolchain --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate-release-full
+          save-if: false
+      # Preserve the pin for the build and the foreign-checkout rehearsal.
       - run: scripts/ci-rust-toolchain --export --profile minimal
       - run: pnpm install --frozen-lockfile
         working-directory: ui
