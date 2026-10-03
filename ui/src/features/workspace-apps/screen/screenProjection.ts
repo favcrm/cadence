@@ -49,14 +49,50 @@ function scopedIntents(read: IntentRead | undefined, installId: string, contextI
     rows.push({ intent_id: intent.intent_id, install_id: installId, context_id: context,
       run_id: intent.run_id, effect_id: intent.effect_id, state: intent.state, channel: intent.channel,
       destination_id: intent.destination_id, due_epoch: intent.due_epoch, timezone: intent.timezone,
-      ...(v2 ? present({ refusal: refusalOf(intent.refusal?.code ?? "", intent.refusal?.message ?? ""),
-        permalink: instagramLink(intent.permalink) }) : {}) });
+      ...(v2 ? present({ refusal: intentRefusal(intent), permalink: instagramLink(intent.permalink) }) : {}) });
   }
   return { status: read.intents.length >= PUBLISH_LIST_CAP ? "truncated" : "ok",
     withheld: read.intents.length - rows.length, rows };
 }
 
 const text = (value: string, limit = 512) => value.slice(0, limit);
+
+/** Plain frame copy for a refused publish, keyed by the daemon's refusal
+ *  code. The daemon's detail (provider text, URLs, trace ids, store
+ *  errors) never reaches the frame: only the code and this host-owned line. */
+const REFUSED_COPY: Record<string, string> = {
+  provider_refused: "Instagram refused the post. Nothing was published.",
+  image_required: "Instagram needs an image for this post. Nothing was published.",
+  send_disabled: "Sending is turned off on this Cadence. Nothing was published.",
+  approval_replay: "This post needs approving again. Nothing was published.",
+  bad_approval: "This post needs approving again. Nothing was published.",
+  grant_exhausted: "Publishing permission has run out. Nothing was published.",
+  grant_revoked: "Publishing permission was withdrawn. Nothing was published.",
+  grant_window: "Publishing permission is not valid right now. Nothing was published.",
+  wrong_destination: "The Instagram account is not available for posting. Nothing was published.",
+  bad_destination: "The Instagram account is not available for posting. Nothing was published.",
+  not_publishable: "The Instagram account is not available for posting. Nothing was published.",
+};
+const REFUSED_FALLBACK = "The post was refused. Nothing was published.";
+/** Held reasons the daemon writes verbatim (social_publish_driver.rs). */
+const HELD_COPY: Record<string, [string, string]> = {
+  "missed publish window": ["missed_window", "The scheduled time passed before it could be sent. Nothing was sent."],
+  "approved material changed since freeze": ["material_changed", "The post changed after it was scheduled. Nothing was sent."],
+};
+const HELD_FALLBACK = "Held — nothing was sent.";
+/** The frame's refusal for one intent: a code from the daemon's `code:`
+ *  prefix (grammar-checked) and host copy. Never the daemon's detail. */
+export function intentRefusal(intent: Pick<PublishIntent, "state" | "refusal">): ScreenRefusal | null {
+  if (intent.state === "refused") {
+    const code = /^([a-z][a-z0-9_]{0,63}): /.exec(intent.refusal?.message ?? "")?.[1];
+    return code ? { code, text: REFUSED_COPY[code] ?? REFUSED_FALLBACK } : { code: "refused", text: REFUSED_FALLBACK };
+  }
+  if (intent.state === "held") {
+    const known = HELD_COPY[intent.refusal?.message ?? ""];
+    return known ? { code: known[0], text: known[1] } : { code: "held", text: HELD_FALLBACK };
+  }
+  return null;
+}
 
 /** CAD-1123 HP1 — the board-held reads the v2 projection adds, each tagged
  *  with the scope it was issued for. A read for another scope is ignored. */

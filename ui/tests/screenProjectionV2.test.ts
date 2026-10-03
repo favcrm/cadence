@@ -4,7 +4,7 @@
 import { screenProjection, type ScreenExtras } from "../src/features/workspace-apps/screen/screenProjection";
 import { pushBytes, PUSH_BYTES_MAX, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
 import { ScreenChannel, ASSET_QUEUE_MAX } from "../src/features/workspace-apps/screen/screenLifecycle";
-import type { PublishIntent } from "../src/features/workspace-apps/socialPublish";
+import { toPublishIntent, type PublishIntent } from "../src/features/workspace-apps/socialPublish";
 import type { AppBinding, AppContext, AppEffect, Installation, SourceReceipt, WorkspaceRun } from "../src/features/workspace-apps/workspaceApps";
 
 function check(value: unknown, label: string): void { if (!value) throw new Error(label); }
@@ -72,9 +72,20 @@ const intent = (over: Partial<PublishIntent>): PublishIntent => ({ intent_id: "i
   image_digest: null, frozen_digest: "f", idempotency_key: `${SECRET}-key`, due_epoch: 1_790_001_000, timezone: "Asia/Hong_Kong",
   grant_id: `${SECRET}-grant`, approval_id: `apv-${SECRET}`, writer: null, reviewer: null,
   permalink: "https://www.instagram.com/p/abc/", receipt: { token: `${SECRET}-receipt` }, refusal: null, upstream: { k: SECRET }, ...over });
+const daemonIntent = (intent_id: string, state: string, receipt: Record<string, unknown>): PublishIntent => toPublishIntent({
+  intent_id, request: `${SECRET}-request`, state, frozen_digest: `${SECRET}-frozen`, upstream: null, receipt,
+  frozen: { install_id: "inst-1", context_id: "ctx-a", run_id: "run-ready", effect_id: "e1", artifact_id: "art-1",
+    toolkit: "instagram", destination_id: "dest", caption_digest: "c".repeat(64), image_digest: null, due_epoch: 1_790_001_000,
+    timezone: "Asia/Hong_Kong", grant_id: `dpq_${SECRET}grant`, approval_id: `apv-${SECRET}` } } as never);
 const intents = { installId: "inst-1", contextId: "ctx-a", status: "ok" as const, intents: [
   intent({}),
-  intent({ intent_id: "i2", state: "refused", permalink: null, refusal: { code: "provider_refused", message: "Instagram\nrefused the image size." } }),
+  // Refusals as the daemon stores them (receipt.error = "<code>: <detail>",
+  // receipt.reason for a hold), mapped by the board's real toPublishIntent.
+  daemonIntent("i2", "refused", { error: `provider_refused: door provider_refused: (#9004) The media could not be fetched from https://media.example/u/abc?X-Amz-Signature=${SECRET}SIGNED fbtrace_id=${SECRET}TRACE` }),
+  daemonIntent("i5", "refused", { error: `refused: posted report failed: sqlite error: database is locked at /tmp/${SECRET}/state.db` }),
+  daemonIntent("i6", "held", { reason: "missed publish window" }),
+  daemonIntent("i7", "held", { reason: `the door has no record of this publish ${SECRET}` }),
+  daemonIntent("i8", "refused", { error: `Some Provider Text ${SECRET}` }),
   intent({ intent_id: "i3", permalink: "javascript:alert(1)" }),
   intent({ intent_id: "i4", permalink: "https://evil.example/p/abc/" }),
   intent({ intent_id: "i-foreign-context", context_id: "ctx-b", run_id: "run-other-context" }),
@@ -162,8 +173,18 @@ void (async () => {
   check(!("refusal" in byId.get("run-ready")!), "a ready run has no refusal");
   const rows = new Map(p.publish_intents!.rows.map(r => [r.intent_id, r]));
   check(rows.get("i1")!.permalink === "https://www.instagram.com/p/abc/", "posted permalink pushed");
-  check(rows.get("i2")!.refusal!.code === "provider_refused" && rows.get("i2")!.refusal!.text === "Instagram refused the image size.",
-    "intent refusal pushed as one plain line");
+  const refusal = (id: string) => JSON.stringify(rows.get(id)!.refusal);
+  check(refusal("i2") === JSON.stringify({ code: "provider_refused", text: "Instagram refused the post. Nothing was published." }),
+    `a provider refusal keeps its code and gets host copy, never the provider text: ${refusal("i2")}`);
+  check(refusal("i5") === JSON.stringify({ code: "refused", text: "The post was refused. Nothing was published." }),
+    `a store failure is the generic refusal: ${refusal("i5")}`);
+  check(refusal("i6") === JSON.stringify({ code: "missed_window", text: "The scheduled time passed before it could be sent. Nothing was sent." }),
+    `a known hold gets host copy: ${refusal("i6")}`);
+  check(refusal("i7") === JSON.stringify({ code: "held", text: "Held — nothing was sent." }), `an unknown hold is generic: ${refusal("i7")}`);
+  check(refusal("i8") === JSON.stringify({ code: "refused", text: "The post was refused. Nothing was published." }),
+    `an uncoded error is generic: ${refusal("i8")}`);
+  for (const leak of ["X-Amz", "fbtrace", "sqlite", "media.example", "door", "Provider Text"])
+    check(!JSON.stringify(p).includes(leak), `daemon detail reached the frame: ${leak}`);
   check(!("permalink" in rows.get("i3")!) && !("permalink" in rows.get("i4")!) && !("refusal" in rows.get("i1")!),
     "non-https or non-Instagram permalinks are dropped; absent fields are omitted");
   check(p.defaults!.context_id === "ctx-a" && p.defaults!.revision === 4 && p.defaults!.values.content_prompt === "Warm and short." &&
