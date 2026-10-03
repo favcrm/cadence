@@ -1,12 +1,14 @@
 # Design contract: CAD-1109 app-chat/v1: one host Conversation, apps describe chat as data
 
-Status: draft for Standards and independent Spec/security review. Docs only:
-no product code, schema file or test lands in this PR. CAD-1110 implements,
-CAD-1111 proves it with a fixture app. Epic: CAD-1108. Companion contract:
+Status: revised 2026-10-03 per the operator decisions on CAD-1109 (D1-D7:
+Tier 2 decided; see Decisions). Docs only: no product code, schema file or
+test lands with this note. It ships inside the single CAD-1108 feature PR
+(CAD-1110 implements, CAD-1111's fixture app proves Tier 1 and Tier 2). Epic: CAD-1108. Companion contract:
 CAD-1098 (per-app conversations; contract PR #764 head 73bcf117, UI slice PR
-#771). Human trigger: none of the `docs/roles/risk-classes.md` code paths
-change here; the implementation PRs re-check this (message delivery and
-scoped turns stay CAD-1098's).
+#771). Risk: this note changes no code. CAD-1110 adds a daemon read route, an install-time
+validator and Tier 2 frame mounting, and CRM/Social bundle digests need operator
+re-approval, so the implementation PR must be classified against
+`docs/roles/risk-classes.md` and may be `human` class.
 
 ## Goals and non-goals
 
@@ -19,16 +21,26 @@ built-in `ChatCsvImport`, and `installation.name === "crm"` /
 ref chips and retry/discard exist on Home only. A third app would add another
 branch.
 
+Guiding principle (operator): apps work like WordPress plugins, so the core
+must not limit apps. One package is installed and approved, extends the host
+through defined hooks, and adding an app needs no core change; the core keeps
+no list of apps. Unlike WP, no app code runs in the board origin, because the
+board holds the operator session. The three tiers: Tier 1 data (descriptor
+cards, prompts, attachments, subjects), Tier 2 the app's own sandboxed screen
+inline in chat (CAD-1006), Tier 3 package-declared capabilities and actions
+(direction only, Out of scope).
+
 Goals:
 - The host owns ONE Conversation component for Home and every app.
 - An app describes its chat with a data-only, versioned, fail-closed
   `app-chat/v1` descriptor, mirroring `contracts/app-views/v1` and the typed
   host actions (`hostActions.ts`).
-- A fixture third app works with data only (CAD-1111).
+- A fixture third app works with a package alone, no core change (CAD-1111).
 - Home behaviour is unchanged. Nothing CRM or Social does today is lost.
 
-Non-goals: new daemon verbs or message transport; changing who may send;
-mutating host actions from a card (see Open decisions D3); app-supplied
+Non-goals: new message transport or send verbs; changing who may send;
+data-changing actions from a card in v1 (D3); a bundled or built-in list of
+apps in core (D1); app-supplied
 components, markup, links, styles or code; per-user chat preferences.
 
 Division of labour with CAD-1098. CAD-1098 decides WHICH conversation a pane
@@ -81,7 +93,7 @@ The host ALWAYS renders (no descriptor can remove, reorder or restyle these):
    conversation id as a selector only (#771 / #764), no descriptor field
    reaches the request.
 10. The host-fixed app-mode guards (not options): internal ids (`ctx-…`)
-    never print; and a message body that is a JSON object carrying a
+    never print (host constant above); and a message body that is a JSON object carrying a
     `confirm_token` or `request_id` key at any depth never prints raw: with no
     matching declared directive it shows the generic card "Confirmation sent"
     (today's `parseDirective` fallback). These apply in app mode, including
@@ -90,9 +102,15 @@ The host ALWAYS renders (no descriptor can remove, reorder or restyle these):
 
 An app may influence only: the context chip label and up to 3 prompts per
 screen or record type; which host capabilities (attachments) appear; how
-each declared directive kind renders as a card, and which declared host
-actions its (at most 2) buttons run; which subject kinds the picker may label;
-and two presentation options. Nothing else.
+each declared directive kind renders (a text card with at most 2 buttons that
+run declared host actions, OR the app's own sandboxed screen mounted inline,
+Tier 2); which subject kinds the picker may label; and whether the header
+shows the context name (`presentation.showContext`). Nothing else.
+
+Host constants (not descriptor fields, D4): internal ids (`ctx-...`) are
+always rewritten to "this workspace" in app mode; steps are folded to the
+one-line summary ("Done", "Working", "Finished with an issue" plus the step
+count) in app mode and expandable (`StepsGroup`) in Home.
 
 ### The `app-chat/v1` descriptor
 
@@ -120,10 +138,13 @@ descriptor is data: JSON object, plain JSON types only, no accessors.
       "card": { "title": "Customer import",              // 1..80
                 "text": "You confirmed the reviewed rows. The assistant applies them.", // 0..240
                 "fields": [ { "label": "Name", "from": "name" } ],   // 0..4; label 1..40; from IDENT
-                "buttons": [ { "label": "Open customers", "run": "open-view", "view": "customers" } ] } } // 0..2
-  ],
+                "buttons": [ { "label": "Open customers", "run": "open-view", "view": "customers" } ] } }, // 0..2
+    { "match": "cadence_post_preview",    // Tier 2: instead of "card"
+      "render": "screen:post-preview",    // ^screen:[a-z0-9][a-z0-9-]{0,31}$ (CAD-1006 tag grammar)
+      "size": "medium" }                  // optional: small|medium|large = 160|320|480 px high; default medium
+  ],                                      // exactly one of card | render per directive
   "subjects": [ { "kind": "campaign", "label": "Campaign" } ],      // 0..8; kind IDENT unique; label 1..40
-  "presentation": { "steps": "summary", "hideInternalIds": true }   // optional
+  "presentation": { "showContext": false }                           // optional; default false
 }
 ```
 
@@ -151,10 +172,16 @@ Field notes:
   declared kind the daemon does not know produces no conversation, and a
   conversation whose kind the descriptor does not declare is listed under
   "Other" with its server title.
-- `presentation.steps`: `"summary"` (one line "✓ Done · N steps", today's
-  app pane) or `"expandable"` (Home's `StepsGroup`). Default `"summary"` in
-  app mode. `hideInternalIds` default `true`; setting `false` only stops
-  rewriting `ctx-…`; it never relaxes guard 10's token rule.
+- `presentation.showContext` (boolean, default false, D2): the shared header
+  shows "Assistant · {route context name}" only when true and the route has a
+  context. CRM sets true; Social omits it and keeps today's header.
+- `directives[].render` (Tier 2, D6 below): `screen:<tag>` names a screen the
+  app's OWN installed bundle declares (CAD-1006). The tag grammar is the
+  protocol's own `^[a-z0-9][a-z0-9-]{0,31}$`. A directive has exactly one of
+  `card` or `render`; both or neither refuses. The tag is only a name: the
+  mount route proves it against the approved bundle, and an unknown tag fails
+  the mount (the message then renders as plain text). `size` is a host-owned
+  height step; the app cannot set pixels, styles or classes.
 
 Bounds enforced by BOTH notations unless noted: strings as above; no control
 or line-separator characters (`[\u0000-\u001f\u007f  ]`) in any
@@ -186,28 +213,29 @@ never uses `dangerouslySetInnerHTML`, `Md`, an anchor, an `href`, `style` or
 
 ### Where it ships, how the host loads and pins it
 
-- Ships in the app package next to the app-views descriptor (file name
-  `app-chat.json` beside whatever CAD-811 names the app-views file). The
-  install validator (CAD-811) runs the same grammar; today `app.md` front
-  matter refuses `ui`/`schema`/`actions`, so package-shipped descriptors are
-  CAD-811 work. Until then CAD-1110 loads descriptors from a bundled map
-  `app-chat/bundled.ts` keyed by installation kind (`crm`,
-  `social-content`, plus the fixture), living only in the loader module. The
-  chat component never sees `installation.name`. See Open decision D1.
-- Loading. `loadAppChat(installId)` returns `AppChat | null`. Source of truth
-  is the installation record: the daemon returns, for the route's install id
-  only, `{descriptor, package_revision, descriptor_digest}` for the CURRENT
-  approved revision. The client validates the bytes with `parseAppChat`,
-  and requires `descriptor.app` to equal the installation's kind (a CRM
-  descriptor served for a Social install is a mismatch, fail closed).
-- Pinning. The cache key is `(installId, descriptor_digest)`. The digest and
-  package revision are server-computed at install/update approval; the
-  descriptor's own text never asserts either (`digest`/`revision` are forbidden
-  keys). The loader refetches whenever the installation's `package_revision`
-  changes (the shell already refreshes the installation). A response whose
-  revision or digest differs from the installation record's current values is
-  discarded: plain chat until it matches. A 404 or older daemon means plain
-  chat.
+- Ships in the app package, next to `app.md` and the app-views descriptor
+  (`app-chat.json`), and is covered by the bundle digest the operator
+  approves. The install validator (CAD-811's package slice, extended in
+  CAD-1110) runs the same grammar at install and update and refuses a package
+  whose `app-chat.json` fails it (an invalid descriptor is caught at approval
+  time, and still fails closed at load time). Core keeps NO list of apps: no
+  bundled descriptor map, no `installation.name` lookup anywhere (D1, I1).
+- CRM and Social Content packages each gain an `app-chat.json`. Their bundle
+  digests change, so the operator must re-approve each (the existing update
+  approval; nothing is auto-approved). Until re-approved, the old digest has
+  no descriptor, the route returns 404 and the pane shows plain shared chat.
+- Loading. `loadAppChat(installId)` calls the one generic read route (see
+  Routing and APIs), validates the returned bytes with `parseAppChat`, and
+  requires `descriptor.app` to equal the installation's kind (a CRM descriptor
+  served for a Social install is a mismatch, fail closed).
+- Pinning. The route serves the descriptor from the bundle at the digest the
+  operator approved for that installation, never from a newer unapproved
+  bundle on disk. The cache key is `(installId, descriptor_digest)` where the
+  digest is the approved bundle digest (the same digest the CAD-1006 mount
+  proves). The loader refetches whenever the installation's digest changes.
+  A response whose digest differs from the installation's current approved
+  digest is discarded: plain chat until it matches. The descriptor's own text
+  never asserts a digest or revision (`digest`/`revision` are forbidden keys).
 - After an app upgrade, old messages render with the NEW descriptor: a
   directive kind no longer declared falls to plain text (its JSON, with the
   guard-10 token rule still applying). Old messages never keep a descriptor
@@ -240,7 +268,7 @@ Matching, in order, all must hold, else the message renders as plain text
 
 Rendering: a card with the descriptor's `title`, `text`, each field as
 `label: value` (value truncated to 120 chars, rendered as text, and passed
-through `hideInternalIds`), then the declared buttons. A directive can never
+through the host id-hiding constant), then the declared buttons. A directive can never
 make a link: no value is parsed as markdown or URL, and the card has no anchor.
 
 Actions. A card's buttons come ONLY from the descriptor's `card.buttons`. The
@@ -254,6 +282,59 @@ choose which declared card appears and fill its declared text fields. The same
 shape arriving from the operator (the CSV confirm handoff) is rendered
 identically; origin never widens what a directive can do.
 
+### Tier 2: the app's own screen inline in chat (`render: "screen:<tag>"`)
+
+A matched directive whose kind declares `render` mounts the app's own
+sandboxed screen inline in the message list instead of a text card. Social post
+previews and a future Open Slide deck preview need this and no core change.
+It reuses the CAD-1006 protocol unchanged for isolation; read
+`ui/src/features/workspace-apps/screen/screenProtocol.ts`, `screenLifecycle.ts`
+and `ScreenOutlet.tsx`.
+
+What stays exactly as CAD-1006 defines it:
+- The frame is created by the host only: `<iframe sandbox="allow-scripts">`
+  (no `allow-same-origin`, `allow-top-navigation`, `allow-forms`,
+  `allow-popups`, `allow-modals`), `referrerPolicy="no-referrer"`, opaque
+  origin (`event.origin === "null"`).
+- Authority is the one-use FrameCap: the host POSTs
+  `/api/app-installations/<install>/screens/<tag>/mount` (operator session, as
+  today), receives `{mount,bridge_nonce,generation,tag}`, and the frame
+  document is fetched with the 256-bit, 60 s, one-use cap bound to the live
+  session and digest. The cap and the session cookie never enter the frame or
+  any message. The bridge nonce, single init, source and generation checks are
+  unchanged. `<install>` is the pane's route install, never the payload's.
+- The child can send only `ready` and `state` over the port; anything else
+  closes it (`parseChild`). It makes no network requests the host can see and
+  no links: the sandbox gives it no navigation, and chat adds no link target.
+
+What chat adds (CAD-1110 implements; a host-side extension in the style of
+`publish-intents.v1`, the child opts in with
+`{v:1, op:"ready", accepts:["chat-directive.v1"]}`):
+- A chat mount is NOT pushed the CAD-1006 scope projection (installation,
+  contexts, runs, outbox). It receives only the directive push
+  `{v:1, op:"directive", tag, kind, data}` where `kind` is the matched `match`
+  string and `data` is the validated payload. Least authority: a preview frame
+  needs its payload, not the workspace.
+- `data` is the payload after matcher rules 1-4: a flat plain object, at most
+  16 keys, leaves string (at most 512 chars), finite number or boolean, whole
+  push at most 4 KiB (far under `PUSH_BYTES_MAX`, which still binds). JSON
+  text only: no functions, no binary, no nested objects, no URLs parsed.
+- The identity rule applies to the frame too: rule 5's forbidden identity keys
+  (`FORBIDDEN_DESCRIPTOR_KEYS` plus `record_id`, `request_id`,
+  `confirm_token`, `id`) refuse a screen directive's payload to plain text, so
+  no id, install, context or token ever reaches the frame through chat. Unlike
+  a card, a screen directive has no opaque form: its payload is always scanned.
+- A new directive for the same `(install, tag)` re-pushes to the live frame
+  (push-only); the frame never reaches the host except `ready`/`state`.
+- One live chat frame per `(install, tag)` mount generation; at most 3 chat
+  frames mount per pane, older ones unmount to a text row ("Preview closed").
+  A frame that does not send `ready` within 10 s (CAD-1006's timer) is
+  replaced by the plain-text rendering of the message.
+- Frame failure (mount refused, bad receipt, digest mismatch, timeout, port
+  closed) falls back to plain text of the message and fires nothing else.
+- The screen is part of the approved bundle: what it can do is what its
+  bundle digest was approved to do, and in the board origin it can do nothing.
+
 ### Host action registry (for card buttons)
 
 Host-owned, versioned with the host, ids only:
@@ -262,12 +343,12 @@ Host-owned, versioned with the host, ids only:
 |---|---|---|
 | `open-view` | `view` (a declared app-views view id of this install) | navigates the shell to that view within the route's installation and context; data loads through the existing scoped, server-authorised record routes |
 
-v1 has no mutating button. Any future id that mutates must (a) be a typed
+v1 has no mutating button (D3: `open-view` is the only v1 action). Any future id that mutates must (a) be a typed
 client in the style of `hostActions.ts` with `assertCleanBody`, (b) have a
 daemon route with the existing operator proof, and (c) take every identity
 from the route and its parameters from the descriptor, never the payload.
 Adding an id is a host PR plus a `docs/design` note; apps cannot add one.
-Open decision D3 covers whether v1 should ship a mutating action at all.
+Decision D3: v1 ships none.
 
 ### Host capability registry (attachments)
 
@@ -277,6 +358,11 @@ The host implements each once; the descriptor only names it.
 | id | host component | requires | emits |
 |---|---|---|---|
 | `csv-import` | `ChatCsvImport` (CAD-1016, moved unchanged out of `ChatPane`) | route scope present, operator and not read-only | operator message `{"cadence_csv_import":{request_id,confirm_token}}` via the normal send path |
+
+Tier 3 direction (recorded, not built): which capabilities and future
+data-changing actions an app may use will be declared in the package manifest
+and approved with the bundle digest; see Out of scope. In v1 the registry is
+host code and an attachment id outside it refuses the descriptor.
 
 Rules: a capability is rendered only when the app mode scope is present and
 the viewer is the operator; it keys its own state by `${installId}:${contextId}`
@@ -317,15 +403,41 @@ No new daemon RPC is defined by this contract. It reuses:
 - the CAD-1098 conversation list/create RPCs and board routes;
 - the existing scoped record routes (`/api/app-installations/:install/
   contexts/:context/records…`) for `open-view` data;
-- one read for the descriptor: `GET /api/app-installations/:install/
-  chat-descriptor` returning `{descriptor, package_revision,
-  descriptor_digest}` for the CURRENT approved revision of that install, or
-  404. It is implemented in CAD-811's package slice; until then the bundled
-  loader stands in and nothing calls the route. The route is read-only, takes
-  the install id from the path only, is operator-session proven like the other
-  `/api/app-installations/*` reads, and is at least as strict as the daemon
-  read it relays (same proof on the HTTP peer). It returns no descriptor for a
-  removed, unapproved or other-install id.
+- the app-chat descriptor read, specified below; CAD-1110 includes it.
+- the CAD-1006 screen mount route, unchanged, for Tier 2.
+
+### `GET /api/app-installations/:install/chat-descriptor` (read-only)
+
+- Authorization: the same as the existing `/api/app-installations/*` reads:
+  an operator session (board cookie plus `X-Cadence-Board`, same-origin), with
+  the installation id taken from the path only and validated by the
+  `segment()` grammar. An agent pane or endpoint, a detached child, a peer
+  without the operator session, and a request for any other install id get the
+  refusal those sibling routes give. The daemon has the matching read
+  (`app_chat_descriptor(install)`), operator-proven like the sibling app reads;
+  the board route calls that RPC and is at least as strict: the same proof is
+  re-run on the HTTP peer, with no extra input that widens it (relay parity,
+  I13). A board adversarial test asserts parity for an agent caller, a
+  forged/other install id and a removed install.
+- Response 200: `{"descriptor": <app-chat.json parsed>, "digest": "<approved
+  bundle digest>", "app": "<installation kind>"}`, `Cache-Control: no-store`
+  (the client caches by `(install, digest)`; the server never serves a
+  cacheable body). The descriptor is read from the approved bundle at that
+  digest, by the same confined resolver the screen mount uses (no symlinks, no
+  path from the request), and is at most 16 KiB.
+- 404: the installation does not exist or is removed; its approved bundle has
+  no `app-chat.json`; the installation is unapproved or its approval is stale
+  (the bundle on disk differs from the approved digest). The body names no
+  other install and no path. The client treats any 404 as "no descriptor":
+  plain shared chat.
+- Mismatch: if the client already holds a descriptor for `(install, digest A)`
+  and the installation record now shows digest B, it discards A and refetches;
+  a response whose `digest` differs from the installation's current digest, or
+  whose `app` differs from its kind, is discarded (plain chat).
+- Server never parses chat semantics beyond size and JSON validity; the
+  grammar check is the validator's (install-time and client-side), and a
+  server that served an invalid descriptor would still fail closed in the
+  client.
 
 Identity rules (all of them, restated so a reviewer can grep): `installId`,
 `contextId`, record ids and conversation ids come from the route and the
@@ -343,14 +455,16 @@ behaviour, no descriptor.
 | `ChatPage = customers\|segments\|campaigns`; `PAGE_LABEL`/`RECORD_LABEL`/`PAGE_PROMPTS`/`RECORD_PROMPTS` (CRM) | Descriptor `contexts[]` (3 entries, `record` sub-objects), values identical |
 | `chatContext(page, recordOpen)` chip "Customer (open)" | Host: chip from `contexts[id]`, `record` when `recordOpen`; " (open)" suffix is host |
 | Prompt buttons fill the composer, never send | Host (unchanged) |
-| Header "Assistant · {contextLabel}", null for Social | Host from route context name; see Open decision D2 for Social |
+| Header "Assistant · {contextLabel}", null for Social | Descriptor `presentation.showContext` (CRM true, Social unset, so Social keeps today's look, D2) |
 | `ChatCsvImport` inside `ChatPane` when `crm === true && binding.scope` | Descriptor `attachments:[{id:"csv-import"}]` plus host capability `csv-import` |
 | `parseDirective`: `cadence_csv_import` card "Customer import" | Descriptor `directives[]` entry (opaque card, same title/text) |
 | `parseDirective` fallback: body mentioning `confirm_token`\|`request_id` shows "Confirmation sent" | Host guard 10, in app mode only |
-| `hideIds` rewriting `ctx-…` to "this workspace" | Host in app mode; descriptor `presentation.hideInternalIds` (default true) |
-| Folded steps line "✓ Done · N steps" / "Working" / "Finished with an issue" | `presentation.steps: "summary"` (default in app mode); `"expandable"` gives Home's `StepsGroup` |
+| `hideIds` rewriting `ctx-…` to "this workspace" | Host constant in app mode (D4) |
+| Folded steps line "✓ Done · N steps" / "Working" / "Finished with an issue" | Host constant in app mode; Home keeps expandable `StepsGroup` (D4) |
 | System rows `· {stepSummary}` | Host |
-| Social chat: no chip, no prompts, no import, same pane | Descriptor with `contexts: []`, `attachments: []` (or no descriptor at all) |
+| Social chat: no chip, no prompts, no import, same pane | Social package ships a descriptor with `contexts: []`, `attachments: []`, `subjects: []` (or none: plain chat is identical). Its package digest changes and needs operator re-approval |
+| CRM package descriptor delivery | CRM package gains `app-chat.json`; new digest needs operator re-approval; no bundled map in core |
+| (new) inline previews | Tier 2 `render: "screen:<tag>"`; no CRM/Social behaviour depends on it |
 | Collapse rail, waiting dot, composer disabled when read-only, empty/loading/failed states | Host |
 | CAD-1098 picker, `/new`, `/clear`, queued notice, "Earlier history is in Home" (#771) | Host, in the shared component |
 | Home `ThreadView` permission cards, ref chips, retry/discard | Host, now also in app panes (CAD-1079 in every app) |
@@ -362,11 +476,13 @@ table that CAD-1110 cannot place is a blocker, not a silent drop.
 
 ## Invariants
 
-- I1 (no app branch): chat code (`Conversation` and everything it imports
+- I1 (no app branch, no app list): chat code (`Conversation` and everything it imports
   under `features/app-shell/chat/` and `features/home/ThreadView*`) contains no
   reference to `installation.name`, `crm`, `isSocial`, `social-content`, or any
-  app kind. Test: a source scan fails on those tokens, and the fixture app
-  renders with its descriptor and no code change.
+  app kind. The loader has no map of apps either: no file in `ui/src` names an app
+  kind to choose a descriptor. Test: a source scan fails on those tokens, and
+  the fixture app renders, cards and screen, with its package alone and no
+  code change.
 - I2 (identity from the route): a directive, descriptor, prompt or attachment
   never supplies an install, context, record, conversation or subject id; sends
   carry only the route's scope and a conversation selector. Test: sends in a
@@ -382,13 +498,13 @@ table that CAD-1110 cannot place is a blocker, not a silent drop.
   registry, and its parameters came from the descriptor and the route. A payload
   key cannot add or change a button. Test: spy on every network and navigation
   call.
-- I5 (text only): every descriptor string and every payload value renders as
+- I5 (text only): every descriptor string (frame content is the app's own bundle in an opaque origin, never board DOM) and every payload value renders as
   React text: no HTML, markdown, anchor, `href`, style or class from descriptor
   or payload data.
 - I6 (links): every anchor in chat is produced by `Md` (SafeLink `encoded`
   path) or `SafeLink` strict. Descriptor cards and directives produce none. A
   loopback href warns, never links.
-- I7 (fail closed): any descriptor violation (forbidden key at any depth,
+- I7 (fail closed): any descriptor violation (forbidden key, a directive with both or neither of `card` and `render` at any depth,
   bound, unknown key, unknown registry id, unknown contract tag, `app`
   mismatch, digest/revision mismatch, parse error) yields plain shared chat for
   that install, all host behaviours intact; it never throws into the pane and
@@ -410,8 +526,27 @@ table that CAD-1110 cannot place is a blocker, not a silent drop.
   install's conversation.
 - I12 (Home unchanged): `mode.kind === "home"` renders exactly as `ThreadView`
   does on main: the #719/CAD-1029/1062 tests pass unmodified.
-- I13 (relay parity): the descriptor read route and every route this contract
-  uses are at least as strict on the HTTP peer as on the daemon RPC they relay.
+- I14 (frame isolation, Tier 2): a chat frame is only ever created by the host
+  with `sandbox="allow-scripts"` (no same-origin, navigation, forms, popups,
+  modals), `no-referrer`, from a one-use FrameCap minted for the pane's route
+  install and the tag the descriptor names; the session cookie, FrameCap and
+  any id never enter the frame or a message. Test: assert the exact sandbox
+  token set and that the frame document request is the cap URL only.
+- I15 (frame input is bounded text): the only host-to-frame data in chat is
+  the `directive` push: the matched kind plus a flat, at most 16-key, at most
+  4 KiB payload of string, number and boolean leaves with no forbidden or
+  identity key; the CAD-1006 projection is never pushed to a chat frame.
+- I16 (frame output is closed): a chat frame can send only `ready` and `state`
+  (`parseChild`); any other message, a wrong source, a non-`"null"` origin, a
+  second init, a wrong tag/generation/bridge nonce, or an oversized `state`
+  closes the port and falls back to the text row.
+- I17 (frame is this install's): the frame is mounted only for a directive the
+  pane's own installation's descriptor declares, with a cap bound to that
+  install, tag, session and digest; a cap is single-use (a replay fetches
+  nothing); a directive from another install's conversation or Home never
+  mounts a frame.
+- I13 (relay parity): the descriptor read route, the screen mount route and
+  every route this contract uses are at least as strict on the HTTP peer as on the daemon RPC they relay.
 
 ## Failure modes
 
@@ -465,15 +600,17 @@ table that CAD-1110 cannot place is a blocker, not a silent drop.
   the confirm token TTL are CAD-1098 / CAD-1016's. Boundary test: a descriptor
   exactly at each bound (80/240/16 KiB) accepts, one over refuses.
 - [ ] Descriptor/version mismatch after an app upgrade: the installation
-  moves to revision N+1 while the browser holds N's descriptor, or the
+  moves to bundle digest B while the browser holds A's descriptor, or an
+  upgraded package ships no descriptor (404, plain chat), or the
   descriptor says `app-chat/v2` or an `app` of another kind. The cache key
-  and the server revision/digest check discard N; an unknown contract tag
-  refuses (I7, I8). Old messages re-render under N+1; an undeclared kind is
+  and the server digest check discard A; an unknown contract tag
+  refuses (I7, I8). Old messages re-render under the new descriptor; an undeclared kind is
   plain text. Rolling an app back works the same way.
-- [ ] Malicious app package: ships a descriptor with script-looking strings
+- [ ] Malicious app package: it can only ship what the operator approved with
+  the digest. It ships a descriptor with script-looking strings
   (rendered inert text, I5), oversized or deeply nested JSON (refused before
   shape checks, I7), forbidden keys (I7), a `run` outside the registry (I7,
-  I4), an `attachments` id outside the registry (I7, I9), a `view` naming a
+  I4), a `render` tag not in its bundle (mount refused, text fallback, I17), an `attachments` id outside the registry (I7, I9), a `view` naming a
   view that does not exist (button dropped or descriptor refused, I4), a
   `match` shadowing a host directive (collides with the host's guard 10 and
   cannot reveal secrets: a field-bearing card refuses payloads with token keys and an opaque card never reads them, I10), or prompts meant to
@@ -485,6 +622,28 @@ table that CAD-1110 cannot place is a blocker, not a silent drop.
   for entries the server returned for that conversation (CAD-1098 I2). The
   same text in Home, or in a Social conversation while CRM declares the kind,
   renders as plain text and fires nothing (I3).
+- [ ] Frame escape (Tier 2): the screen tries to reach the board origin,
+  cookies, `window.top`, storage or the parent DOM. The opaque origin
+  (`sandbox="allow-scripts"` only) denies same-origin access, the cookie is
+  never sent to the frame document (cap URL only), and the host reads only
+  port messages through `parseChild` (I14, I16). A frame that sends anything
+  but `ready`/`state` is closed.
+- [ ] Frame tries to navigate or open links (Tier 2): the sandbox has no
+  top-navigation, popups or forms; chat provides no anchor for frame content;
+  an attempted `location` change only reloads inside the frame and cannot leave
+  the cap-bound document (I14). Frame content never becomes a board link (I6).
+- [ ] Frame from another install (Tier 2): a directive for install A's kind
+  seen in B's pane, or in Home, is plain text and mounts nothing; the mount
+  route is called with the pane's install, and the daemon proves the tag
+  against that install's approved bundle, refusing unknown tags (I17, I3).
+- [ ] Cap replay (Tier 2): the FrameCap is one-use, 60 s, bound to session
+  and digest; a second fetch of the same `/api/app-screen/<nonce>` is refused
+  by the daemon, and a stale `generation` or bridge nonce closes the port
+  (I14, I16, I17). The cap never appears in a message, log or the descriptor.
+- [ ] Oversized or malformed push (Tier 2): a payload over 4 KiB, over 16 keys,
+  a nested leaf, or a forbidden/identity key fails matcher rules 1-5 and the
+  message renders as plain text; nothing is mounted or pushed (I15). The
+  CAD-1006 `PUSH_BYTES_MAX` stays as the hard backstop.
 - [ ] Unsafe links: a prompt, card title or field value containing
   `javascript:` or a URL renders as plain text (I5, I6); assistant markdown
   links still go through `Md`/SafeLink, loopback warns (I6).
@@ -506,17 +665,27 @@ and on the shell navigation callback.
 Case: the message list contains (a) a valid `{"cadence_note":{"title":"Hi"}}`,
 which must render a card with the title, the text "Hi" and exactly one button
 (proving the guard is not vacuous), and (b) the forged
-`{"cadence_note":{"title":"Hi","action":"open-view","view":"campaigns"}}`
-and (c) a descriptor naming `run:"delete-everything"`.
+`{"cadence_note":{"title":"Hi","action":"open-view","view":"campaigns"}}`,
+(c) a descriptor naming `run:"delete-everything"`, and (d) a second
+declared kind with `render:"screen:post-preview"` receiving
+`{"cadence_post_preview":{"text":"Hi","install_id":"other"}}`.
 
 | Check | Proves (I#) | Guard | Wrong outcome without the guard |
 |---|---|---|---|
-| `directive_naming_an_undeclared_action_renders_text_and_issues_no_host_request` | I4 (also I2, I7) | forbidden-key refusal in the directive matcher (`matchDirective` rule 5), `run` registry check in `parseAppChat`, and the button list built only from the descriptor | (b) renders a card with a second or retargeted button, or clicking runs `open-view` for `campaigns`, so `fetch`/navigation is called; (c) is accepted and the button calls an unknown id |
+| `directive_naming_an_undeclared_action_renders_text_and_issues_no_host_request` | I4 (also I2, I7) | forbidden-key refusal in the directive matcher (`matchDirective` rule 5), `run` registry check in `parseAppChat`, and the button list built only from the descriptor | (b) renders a card with a second or retargeted button, or clicking runs `open-view` for `campaigns`, so `fetch`/navigation is called; (c) is accepted and the button calls an unknown id; (d) mounts a frame (a mount request is issued) with a forged install id in its push |
 
 Pass requires: (b) renders as plain message text (the JSON as text), shows no
 button, and clicking anything issues zero `fetch` calls and zero navigation
 calls except the one declared button in (a) navigating to `customers`; (c)
-yields plain shared chat with the composer intact.
+yields plain shared chat with the composer intact; (d) renders as plain text
+and issues no `/screens/…/mount` request (spy shows zero mount fetches).
+
+One check suffices for Tier 2 because its chat-specific bad case (an identity or
+action key reaching the frame) fails at the same matcher rule 5 the card case
+uses, so (b) and (d) exercise one guard. The frame's own isolation (sandbox,
+one-use FrameCap, push-only, closed child messages) is CAD-1006's guard with its
+existing adversarial tests, which CAD-1110 must keep green; CAD-1110 adds
+tests for I14-I17 as supporting tests, not a second acceptance check.
 
 Supporting tests CAD-1110 adds, each failing without its guard (not the
 acceptance check, listed so the implementation is not trusted on one test):
@@ -525,41 +694,60 @@ equality with `app-views`; unknown `app`/tag/bound refusals; a cross-install
 directive; a descriptor swap after revision change; token-bearing message
 never printed; Home snapshot unchanged (#719 tests).
 
-## Open decisions
+## Decisions
 
-- D1 Descriptor source before packages carry it. Recommend: CAD-1110 ships a
-  bundled map `app-chat/bundled.ts` (loader module only) for `crm`,
-  `social-content` and the fixture, replaced by the `chat-descriptor` route when
-  CAD-811 lands. Alternative: block CAD-1110 on CAD-811 (cleaner provenance,
-  delays the epic).
-- D2 Social header. Today `isSocial` hides the context label. Recommend: the
-  shared header shows the route's context name whenever the route has one, so
-  Social shows its brand (one visible, intended change). Alternative: a
-  `presentation.showContext` boolean, which spends a grammar field on one app.
-- D3 Mutating card actions. Recommend: v1 registry has only `open-view` (no
-  mutation, nothing for an agent to abuse). Alternative: add a typed
-  `record-update` button now (needs a daemon route and a `docs/design` note per
-  action); defer to a v1.1 once a real app needs it.
-- D4 Presentation options. The epic lists "hide ids, fold steps". Recommend
-  dropping both descriptor fields and making them host constants (hide ids
-  always, steps summary in app mode, expandable in Home), because no app needs
-  the other value; the grammar then has no `presentation`. This contract keeps
-  them to match the epic text; deleting them is a backwards-compatible
-  simplification before CAD-1110 starts.
-- D5 Where a screen id comes from. Recommend the shell exposes `screen` as an
-  IDENT it already holds (CRM section) and `contexts[].id` matches it.
-  Alternative: key by app-views view ids, which would force CRM's Segments and
-  Campaigns into app-views before chat can describe them.
+All decided by the operator on 2026-10-03 (CAD-1109 comment, relayed by
+cc13-pm). No open decisions remain.
+
+- D1 Descriptor source: DECIDED. It ships in the package (`app-chat.json` next
+  to `app.md`), covered by the approved bundle digest, served per installation
+  through one generic operator-session-gated read-only route pinned to the
+  approved digest (specified in Routing and APIs). The bundled loader map is
+  rejected: core keeps no list of apps. CRM and Social packages gain
+  descriptors; their new digests need operator re-approval. CAD-1110 includes
+  the route.
+- D2 Header: DECIDED. `presentation.showContext` (boolean, default false);
+  Social keeps today's look.
+- D3 Card actions: DECIDED. `open-view` is the only v1 button action; no
+  data-changing actions from chat cards in v1.
+- D4 Presentation constants: DECIDED. Hide-internal-ids and fold-steps are host
+  constants, not descriptor fields.
+- D5 Screen ids: DECIDED. `contexts[].id` is matched to the shell's own section
+  id (CRM's section ids today), never to app-views view ids.
+- D6 Tier 2 in v1: DECIDED. A directive may declare `render: "screen:<tag>"`
+  and the host mounts the app's own sandboxed screen inline via CAD-1006.
+- D7 Tier 3 direction: DECIDED as direction only (Out of scope below).
+
+## Use cases
+
+Each row is delivered by that app's package alone (descriptor plus, for Tier 2,
+its own screen); no core change for any of them.
+
+| App | What its package declares | Core change |
+|---|---|---|
+| CRM | contexts for Customers/Segments/Campaigns with record prompts, `csv-import` attachment, `cadence_csv_import` opaque card, `subjects:[campaign]`, `showContext: true` | none beyond the one-time move out of `ChatPane` |
+| Social Content | an empty or minimal descriptor (today's look), or `cadence_post_preview` with `render: "screen:post-preview"` for inline post previews | none |
+| Blog Post | contexts per screen (Drafts, Published) with prompts, a card for "draft ready" with `open-view` to its drafts view, optional `screen:draft-preview` | none |
+| Open Slide deck app (future) | a `cadence_deck_preview` directive with `render: "screen:deck-preview"`, `size: "large"`, prompts per screen | none |
+| Agency running two clients | one installation with two contexts; the shared header names the client (`showContext: true`); context comes from the route so a directive can never address the other client; conversations are per `(installation, subject)` | none |
 
 ## Out of scope
 
 - Implementation of the Conversation component, the validator and schema files,
-  the registries, the bundled loader and tests: CAD-1110.
-- The fixture third app and its descriptor: CAD-1111.
+  the registries, the descriptor route, Tier 2 chat mounting and tests:
+  CAD-1110.
+- The fixture third app and its package (Tier 1 and Tier 2): CAD-1111.
 - Per-app conversations backend, subject verification, conversation RPCs,
   scoped powers, session switching: CAD-1098 (contract #764; UI #771).
-- Package-shipped descriptors, the install validator accepting
-  `app-chat.json`, the `chat-descriptor` daemon/board read: CAD-811.
+- Package install/approval pipeline generally (CAD-811). The `app-chat.json`
+  validator-at-install and the `chat-descriptor` daemon/board read are in
+  CAD-1110 (D1).
+- Tier 3 (direction, not built, forward reference: a later CAD-1108 follow-up
+  ticket to be filed): capabilities (attachments) and any future data-changing
+  card actions will be declared in the package manifest and approved by the
+  operator with the bundle digest, replacing the host-code-only registries; a
+  capability the package does not declare stays unavailable. v1 keeps the host
+  registries (`csv-import`, `open-view`) and no declared mutation.
 - Any mutating card action, new attachments beyond `csv-import`, richer card
   layouts, descriptor-defined slash commands, localisation of descriptor
   strings: not scheduled; each needs its own contract note.
