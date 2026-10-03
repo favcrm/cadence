@@ -1,3 +1,4 @@
+import SafeLink from "../../ui/SafeLink";
 import { useEffect, useRef, useState } from "react";
 import { Resource, type ResourceState } from "../../lib/cache";
 import { api } from "../../lib/api";
@@ -235,9 +236,9 @@ function PageBody({
             <Button href={tabHref("conversation")}>Ask agent</Button>
           )}
           {pr?.href && (
-            <a className="btn" href={pr.href} target="_blank" rel="noreferrer">
+            <SafeLink className="btn" warnClassName="btn" href={pr.href}>
               Open pull request
-            </a>
+            </SafeLink>
           )}
         </div>
       </header>

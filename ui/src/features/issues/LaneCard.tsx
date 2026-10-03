@@ -1,3 +1,4 @@
+import SafeLink from "../../ui/SafeLink";
 import { useContext, useState } from "react";
 import { WriteGate } from "../auth/WriteGate";
 import { UNFENCE_CHOICES } from "../home/needs";
@@ -105,7 +106,7 @@ export function LaneCard({
         <dt>PR</dt>
         <dd data-testid="lane-pr">
           {lane.pr?.url ? (
-            <a href={lane.pr.url}>{lane.pr.label || lane.pr.url}</a>
+            <SafeLink href={lane.pr.url}>{lane.pr.label || lane.pr.url}</SafeLink>
           ) : (
             "—"
           )}

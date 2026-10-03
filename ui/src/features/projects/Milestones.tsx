@@ -1,3 +1,4 @@
+import SafeLink from "../../ui/SafeLink";
 import { useState } from "react";
 import type { ResourceState } from "../../lib/cache";
 import type { IssueCard, MilestoneRow } from "../../lib/types";
@@ -65,7 +66,7 @@ export function MilestoneCheckpoint({ milestone: m, rows, onOpenIssue }: {
           {m.epics.length > 0 && <div className="mt-4"><h3 className="slabel mb-2">Contributing epics</h3><ul className="checkpoint-links">{m.epics.map((e) => <li key={e.id}><button onClick={() => onOpenIssue(e.id)}><span className="num text-micro text-accent">{e.id}</span><span>{e.title}</span>{e.task_count !== undefined && <small>{e.task_count} tasks</small>}</button></li>)}</ul></div>}
           {tasks.length > 0 && <div className="mt-4"><h3 className="slabel mb-2">{m.tasks ? "Scoped tasks" : "Issues outside epics"}</h3><ul className="checkpoint-links">{tasks.map((task) => <li key={task.id}><button onClick={() => onOpenIssue(task.id)}><span className="num text-micro text-accent">{task.id}</span><span>{task.title}</span><small className={task.blocked ? "text-warn" : ""}>{task.blocked ? "Blocked" : task.status}</small></button></li>)}</ul></div>}
         </section>
-        <section className="min-w-0"><h3 className="slabel mb-2">Completion evidence</h3>{m.evidence?.length ? <ul className="space-y-2 text-label text-ink-300 break-words">{m.evidence.map((entry, i) => <li key={i}>{/^https?:\/\//i.test(entry) ? <a className="lnk break-all" href={entry} target="_blank" rel="noopener noreferrer">{entry} ↗</a> : entry}</li>)}</ul> : <p className="text-label text-ink-500">No evidence recorded.</p>}
+        <section className="min-w-0"><h3 className="slabel mb-2">Completion evidence</h3>{m.evidence?.length ? <ul className="space-y-2 text-label text-ink-300 break-words">{m.evidence.map((entry, i) => <li key={i}>{/^https?:\/\//i.test(entry) ? <SafeLink className="lnk break-all" href={entry}>{entry} ↗</SafeLink> : entry}</li>)}</ul> : <p className="text-label text-ink-500">No evidence recorded.</p>}
           {!!m.depends_on?.length && <div className="mt-5"><h3 className="slabel mb-2">Dependencies</h3><ul className="space-y-2 text-label text-ink-400">{m.depends_on.map((id) => { const row = rows.find((r) => r.id === id); return <li key={id}><span className="num">{id}</span>{row?.title ? ` · ${row.title}` : ""} · {row ? checkpointLabel(row) : "Unknown checkpoint"}</li>; })}</ul></div>}
         </section>
       </div>

@@ -1,3 +1,4 @@
+import SafeLink from "../../ui/SafeLink";
 import { useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { fmtTime } from "../../lib/fmt";
@@ -35,14 +36,9 @@ export function PrPanel({
               View live checks and merge queue status on the pull request.
             </p>
             {pr.href ? (
-              <a
-                className="lnk text-secondary break-all"
-                href={pr.href}
-                target="_blank"
-                rel="noreferrer"
-              >
+              <SafeLink className="lnk text-secondary break-all" href={pr.href}>
                 {pr.href}
-              </a>
+              </SafeLink>
             ) : (
               <p className="text-secondary text-ink-400 m-0">
                 This reference has no URL.

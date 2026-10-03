@@ -15,7 +15,11 @@ const isNetworkPath = (href: string): boolean => /^[\\/]{2}/.test(href);
  * are network paths too (CAD-1078): any mix of two slashes or backslashes.
  */
 export function isLoopbackHref(rawHref: string): boolean {
-  const href = rawHref.trim();
+  // The WHATWG URL pre-processing a browser applies before it follows a
+  // link: strip leading/trailing C0 controls and spaces, drop TAB/LF/CR
+  // anywhere (CAD-1080). `\u0001//localhost/` and `/\t/localhost/` are
+  // network paths to the browser, so judge the string it will follow.
+  const href = rawHref.replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "").replace(/[\t\n\r]/g, "");
   // react-markdown hands the href percent-encoded (`http://%5B::1%5D/`),
   // which URL rejects; decode only the bracket escapes of an absolute href.
   const absolute = /^[a-z][a-z0-9+.-]*:/i.test(href) || isNetworkPath(href);
