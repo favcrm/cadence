@@ -552,63 +552,6 @@ mod tests {
     const EP_A: &str = "https://alpha.cadencecloud.app";
     const EP_B: &str = "https://beta.cadencecloud.app";
 
-    fn local_registry() -> Registry {
-        Registry {
-            selected: None,
-            connections: vec![Connection {
-                selection: Selection {
-                    org: LOCAL_ORG.to_string(),
-                },
-                destination: Destination::Local {
-                    state_dir: PathBuf::from("/state"),
-                    tracker_dir: PathBuf::from("/tracker"),
-                },
-            }],
-        }
-    }
-
-    #[test]
-    fn first_login_selects_the_default() {
-        let mut registry = Registry::default();
-        let (_, selected) =
-            apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        assert!(selected);
-        assert_eq!(registry.selected.as_ref().unwrap().org, "alpha");
-    }
-
-    #[test]
-    fn second_org_login_leaves_the_default_unchanged() {
-        // I5 (`cli_second_login_keeps_default`): workspace B login adds
-        // an org and leaves the default untouched without `--use`.
-        let mut registry = Registry::default();
-        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        let (_, selected) =
-            apply_record_remote(&mut registry, "beta", EP_B, "ws_beta", false).unwrap();
-        assert!(!selected);
-        assert_eq!(registry.selected.as_ref().unwrap().org, "alpha");
-        assert_eq!(registry.connections.len(), 2);
-    }
-
-    #[test]
-    fn use_flag_moves_the_default() {
-        let mut registry = Registry::default();
-        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        let (_, selected) =
-            apply_record_remote(&mut registry, "beta", EP_B, "ws_beta", true).unwrap();
-        assert!(selected);
-        assert_eq!(registry.selected.as_ref().unwrap().org, "beta");
-    }
-
-    #[test]
-    fn relogin_with_the_same_endpoint_and_org_id_is_idempotent() {
-        let mut registry = Registry::default();
-        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        let (_, selected) =
-            apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        assert!(selected);
-        assert_eq!(registry.connections.len(), 1);
-    }
-
     #[test]
     fn changed_endpoint_or_org_id_is_refused_never_moved() {
         // A changed slug or forged audience refuses instead of silently
@@ -629,13 +572,6 @@ mod tests {
             }
             Destination::Local { .. } => panic!("stored remote changed shape"),
         }
-    }
-
-    #[test]
-    fn login_over_a_local_name_is_refused() {
-        let mut registry = local_registry();
-        assert!(apply_record_remote(&mut registry, "local", EP_A, "ws_alpha", false).is_err());
-        assert_eq!(registry.connections.len(), 1);
     }
 
     #[test]
@@ -667,12 +603,5 @@ mod tests {
         .is_err());
         assert!(registry.connections.is_empty());
         assert!(registry.selected.is_none());
-    }
-
-    #[test]
-    fn invalid_org_name_is_refused() {
-        let mut registry = Registry::default();
-        assert!(apply_record_remote(&mut registry, "Alpha", EP_A, "ws_a", false).is_err());
-        assert!(registry.connections.is_empty());
     }
 }

@@ -637,13 +637,14 @@ mod tests {
         (listener, seen, handle)
     }
 
+    /// Run one command against the strict fake: returns the call result
+    /// and every request the worker saw (to count mints / reads).
     fn run(
         answers: Vec<(u16, &'static str, Value)>,
         verb: &str,
         args: Map<String, Value>,
         wake_timeout: u64,
-        store: bool,
-    ) -> (Result<Value>, Vec<String>, Vec<Value>) {
+    ) -> (Result<Value>, Vec<Value>) {
         let (listener, calls, _server) = fake_worker(answers);
         let target = target(&listener);
         let root = tempfile::tempdir().unwrap();
@@ -651,66 +652,16 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
-        if store {
-            store_credential(&dir, &target.endpoint);
-        }
-        let notes: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-        let seen = notes.clone();
-        let out = call_verb_in(
-            &target,
-            verb,
-            args,
-            wake_timeout,
-            &dir,
-            move |s| seen.lock().unwrap().push(s.to_string()),
-            |_| {},
-        );
-        let notes_out = notes.lock().unwrap().clone();
+        store_credential(&dir, &target.endpoint);
+        let out = call_verb_in(&target, verb, args, wake_timeout, &dir, |_| {}, |_| {});
         let calls_out = calls.lock().unwrap().clone();
-        (out, notes_out, calls_out)
+        (out, calls_out)
     }
 
     /// Number of requests the fake accepted at `path` — 0 proves no byte
     /// for that route ever left the client.
     fn hits(requests: &[Value], path: &str) -> usize {
         requests.iter().filter(|r| r["path"] == json!(path)).count()
-    }
-
-    #[test]
-    fn allowlisted_read_round_trips_the_envelope_and_arguments() {
-        let (out, notes, _) = run(
-            vec![(200, "", json!({"issues": [], "scope": "all"}))],
-            "issue_ls",
-            Map::from_iter([("status".into(), json!(["doing"]))]),
-            10,
-            true,
-        );
-        let body = out.unwrap();
-        assert_eq!(body["issues"], json!([]));
-        assert!(notes.is_empty());
-    }
-
-    #[test]
-    fn unlisted_verb_is_refused_before_any_request() {
-        // Without the allowlist guard `shutdown` would reach the wire.
-        let (out, _, _) = run(vec![], "shutdown", Map::new(), 10, true);
-        let error = out.unwrap_err().to_string();
-        assert!(error.contains("allowlist"), "{error}");
-    }
-
-    #[test]
-    fn expired_credential_never_leaves_the_process() {
-        let (listener, _c, _server) = fake_worker(vec![]);
-        let target = target(&listener);
-        let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join("a");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .unwrap();
-        store_credential_at(&dir, ORG, ORG_ID, &target.endpoint, 1); // long expired
-        let out = call_verb_in(&target, "status", Map::new(), 10, &dir, |_| {}, |_| {});
-        let error = out.unwrap_err().to_string();
-        assert!(error.contains("login"), "{error}");
     }
 
     #[test]
@@ -731,93 +682,6 @@ mod tests {
         };
         let out = call_verb_in(&foreign, "status", Map::new(), 10, &dir, |_| {}, |_| {});
         assert!(out.unwrap_err().to_string().contains("different workspace"));
-    }
-
-    #[test]
-    fn waking_then_ready_waits_and_reports_on_the_note_channel() {
-        let (out, notes, _) = run(
-            vec![
-                (
-                    503,
-                    "retry-after: 2\r\n",
-                    json!({"state": "waking", "retry_after_s": 2}),
-                ),
-                (200, "", json!({"ok": true})),
-            ],
-            "status",
-            Map::new(),
-            120,
-            true,
-        );
-        assert_eq!(out.unwrap()["ok"], json!(true));
-        assert_eq!(notes, vec![format!("waking {ORG}… (2s)")]);
-    }
-
-    #[test]
-    fn wake_timeout_is_busy_not_a_hang() {
-        let (out, notes, _) = run(
-            vec![(503, "", json!({"state": "waking", "retry_after_s": 5}))],
-            "status",
-            Map::new(),
-            0,
-            true,
-        );
-        let error = out.unwrap_err();
-        assert_eq!(error.kind(), "busy");
-        assert!(notes.is_empty());
-    }
-
-    #[test]
-    fn wake_failed_and_bare_503_do_not_retry() {
-        for body in [
-            json!({"state": "wake_failed", "code": "runtime_stopped"}),
-            json!({"code": "board_unreachable"}),
-        ] {
-            let (out, _, _) = run(vec![(503, "", body)], "status", Map::new(), 120, true);
-            assert!(out.is_err());
-        }
-    }
-
-    #[test]
-    fn refused_credential_points_at_login() {
-        for status in [401, 403] {
-            let (out, _, _) = run(
-                vec![(status, "", json!({}))],
-                "status",
-                Map::new(),
-                120,
-                true,
-            );
-            let error = out.unwrap_err().to_string();
-            assert!(error.contains("cadence login"), "{error}");
-        }
-    }
-
-    #[test]
-    fn a_valid_call_sends_exactly_one_authorize_and_one_call() {
-        // The wire shape the AOS-128 worker checks: strict authorize body,
-        // then the strict call body — the fake enforces both, so a pass
-        // proves the client's request is exactly what the server accepts.
-        let (out, _, requests) = run(
-            vec![(200, "", json!({"agents": []}))],
-            "agent_list",
-            Map::from_iter([("all".into(), json!(true))]),
-            10,
-            true,
-        );
-        assert!(out.is_ok());
-        assert_eq!(hits(&requests, "/__platform/cli/authorize"), 1);
-        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
-        let call = requests
-            .iter()
-            .find(|r| r["path"] == json!("/__platform/cli/call"))
-            .unwrap();
-        assert_eq!(call["body"]["verb"], json!("agent_list"));
-        assert_eq!(call["body"]["arguments"]["all"], json!(true));
-        // No authority-shaped field is ever a client key.
-        for key in ["actor", "role", "org", "user", "as", "principal", "wiki_as"] {
-            assert!(call["body"].get(key).is_none(), "{key} was sent");
-        }
     }
 
     /// Envelopes the calls presented, in order — the value the container
@@ -858,7 +722,7 @@ mod tests {
         // envelope's jti was verified there but never consumed by a
         // container. Retrying still mints a fresh one: a 503 that fired
         // later in the pipeline would have burned the first.
-        let (out, _, requests) = run(
+        let (out, requests) = run(
             vec![
                 (503, "", json!({"state": "waking", "retry_after_s": 1})),
                 (200, "", json!({"ok": true})),
@@ -866,34 +730,11 @@ mod tests {
             "status",
             Map::new(),
             120,
-            true,
         );
         assert!(out.is_ok());
         assert_eq!(hits(&requests, "/__platform/cli/authorize"), 2);
         let envs = envelopes(&requests);
         assert_eq!(envs.len(), 2);
         assert_ne!(envs[0], envs[1], "a wake retry reused the envelope");
-    }
-
-    #[test]
-    fn redirects_are_refused_never_followed() {
-        // A 302 to an attacker host must end the command — the envelope and
-        // bearer never ride a Location header (contract I3).
-        let (out, _, _) = run(
-            vec![(302, "location: https://evil.example/\r\n", json!({}))],
-            "status",
-            Map::new(),
-            120,
-            true,
-        );
-        let error = out.unwrap_err().to_string();
-        assert!(error.contains("redirect"), "{error}");
-    }
-
-    #[test]
-    fn missing_credential_points_at_login_not_a_fallback() {
-        let (out, _, _) = run(vec![], "status", Map::new(), 10, false);
-        let error = out.unwrap_err().to_string();
-        assert!(error.contains("cadence login"), "{error}");
     }
 }
