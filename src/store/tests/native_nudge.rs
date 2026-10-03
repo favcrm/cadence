@@ -547,7 +547,14 @@
                 s.orphan_submitting_nudges("crash").unwrap_err(),
             ];
             for error in errors {
-                assert_eq!(error.is_fenced(), !sealed, "{error}");
+                let crate::error::Error::Rejected(reason) = error else {
+                    panic!("nudge barrier must reject the write: {error}");
+                };
+                if sealed {
+                    assert!(reason.starts_with("store sealed:"), "{reason}");
+                } else {
+                    assert!(reason.contains("hosted lease is lost"), "{reason}");
+                }
             }
             assert!(s.message("n2").unwrap().is_none());
             let after = s.message("n1").unwrap().unwrap();
