@@ -17,8 +17,8 @@ use super::write_path::{
 };
 use super::{
     app_audiences, app_content, app_contexts, app_records, app_release, app_runs, app_screens,
-    apps, connections, crm_send, delivery_sync, home, lane, operator, platform_account, read_model,
-    social_publish, stages, threads, updates, wiki, workflows,
+    apps, cli_route, connections, crm_send, delivery_sync, home, lane, operator, platform_account,
+    read_model, social_publish, stages, threads, updates, wiki, workflows,
 };
 use super::{push_device_login_config, ready_file, tailnet_url, ServeOpts, READY_NONCE_ENV};
 use crate::adapter::registry;
@@ -944,6 +944,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 }
                 _ => operator::platform_unknown(),
             };
+            send(request, resp);
+            return;
+        }
+        // CAD-1019: `POST /api/cli/<verb>` — the container end of the
+        // remote CLI (AOS-128's `/__platform/cli/call` forwards here).
+        // The `wikienv_` bearer is the credential — cookie sessions
+        // never satisfy it and it satisfies no other route — so the
+        // family is diverted ahead of the session gates and the write
+        // path's guards (its content-type/origin marks are the
+        // platform relay's, not a browser's). The verb's own checks
+        // run inside `cli_route::post`, before any body or handler.
+        if let Some(tail) = path.strip_prefix("/api/cli/") {
+            let resp = cli_route::post(&mut request, &method, tail, state_dir, pm_dir, opts);
             send(request, resp);
             return;
         }
