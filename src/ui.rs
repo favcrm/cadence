@@ -2517,6 +2517,15 @@ mod pidfile_tests {
             BoardPid::Unknown,
             "no Tgid line"
         );
+        // Another user's process holding the pid is not the board.
+        let me = unsafe { libc::getuid() };
+        let foreign = status(45).replace(&format!("Uid:\t{me}\t"), &format!("Uid:\t{}\t", me + 1));
+        fake_proc(root, 45, &foreign, &board);
+        assert_eq!(
+            board_identity(root, 45, st),
+            BoardPid::NotBoard,
+            "other uid"
+        );
         // A `status` that exists but cannot be read (EISDIR here; EACCES,
         // EMFILE in the field) proves nothing either way.
         std::fs::create_dir_all(root.join("44/status")).unwrap();
