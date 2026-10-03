@@ -1,0 +1,415 @@
+import { useEffect, useState } from "react";
+import { api } from "../../lib/api";
+import type { Connection } from "../../lib/types";
+import Button from "../../ui/Button";
+import Link from "../../ui/Link";
+import Select from "../../ui/Select";
+import type { Viewer } from "../projects/work";
+import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
+import { newAudienceId } from "../app-shell/segmentGrammar";
+import {
+  friendlySendError,
+  parseOriginReceipt,
+  parseSmtpBinding,
+  readSmtpBinding,
+  sendClient,
+  type SmtpBinding,
+} from "../app-shell/sendClient";
+import type { HostScope } from "../app-shell/hostActions";
+import { workspaceApps } from "../workspace-apps/workspaceApps";
+import {
+  isHostedTransport,
+  senderChoices,
+  senderLine,
+  sendingFrom,
+} from "./emailSendingView";
+
+/**
+ * Settings → Email sending (CAD-1059, CAD-1063 slice 2): the one place
+ * the CRM sender and the unsubscribe origin are chosen. Campaigns only
+ * show a status line and link here. The write verbs are the existing
+ * crm_smtp bind/rebind/revoke; link and auth revisions stay behind the
+ * Details disclosure and never reach a form.
+ */
+
+interface Target {
+  scope: HostScope;
+  label: string;
+}
+
+/** Every active CRM context, flattened. One entry means no selector. */
+async function loadTargets(signal: AbortSignal): Promise<Target[]> {
+  const installs = (await workspaceApps.installations(signal)).filter((i) => i.name === "crm");
+  const out: Target[] = [];
+  for (const install of installs) {
+    const contexts = await workspaceApps.contexts(install.install_id, signal);
+    for (const ctx of contexts.filter((c) => c.state === "active")) {
+      out.push({
+        scope: { installId: install.install_id, contextId: ctx.id },
+        label: `${install.title || install.name} · ${ctx.config.label || ctx.id}`,
+      });
+    }
+  }
+  return out;
+}
+
+export default function EmailSending({ viewer }: { viewer: Viewer }) {
+  const [targets, setTargets] = useState<Target[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [picked, setPicked] = useState(0);
+
+  useEffect(() => {
+    if (!viewer.operator) return;
+    const controller = new AbortController();
+    loadTargets(controller.signal).then(
+      (rows) => {
+        if (!controller.signal.aborted) setTargets(rows);
+      },
+      (e: unknown) => {
+        if (!controller.signal.aborted) setError(friendlySendError(e));
+      },
+    );
+    return () => controller.abort();
+  }, [viewer.operator]);
+
+  const target = targets?.[picked] ?? null;
+  return (
+    <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="email-sending-title">
+      <h1 id="email-sending-title" className="text-section font-medium text-ink-100">
+        Email sending
+      </h1>
+      <p className="text-label text-ink-400 mt-1 mb-4 break-words">
+        Choose where CRM campaign email is sent from. Campaigns use this sender; nothing is sent
+        until an operator approves a campaign.
+      </p>
+      {!viewer.operator ? (
+        <div className="card px-4 py-5 text-label text-ink-400">
+          Email sending is available to the operator. Use Sign in in the top bar.
+        </div>
+      ) : error !== null ? (
+        <p className="text-label text-fail" role="alert">
+          {error}
+        </p>
+      ) : targets === null ? (
+        <p className="text-label text-ink-400" role="status">
+          Loading…
+        </p>
+      ) : target === null ? (
+        <p className="text-label text-ink-400" data-state="no-crm">
+          No CRM is installed in this workspace, so there is nothing to send from yet.
+        </p>
+      ) : (
+        <div className="grid gap-3 min-w-0">
+          {targets.length > 1 && (
+            <div className="crm-field">
+              <label className="text-label text-ink-300" htmlFor="email-sending-target">
+                CRM context
+              </label>
+              <Select
+                id="email-sending-target"
+                value={String(picked)}
+                onChange={(v) => setPicked(Number(v))}
+                options={targets.map((t, i) => ({ value: String(i), label: t.label }))}
+                aria-label="CRM context"
+                full
+              />
+            </div>
+          )}
+          <SenderCard key={`${target.scope.installId}:${target.scope.contextId}`} scope={target.scope} viewer={viewer} />
+          <OriginCard viewer={viewer} />
+        </div>
+      )}
+    </section>
+  );
+}
+
+function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
+  const canWrite = viewer.operator && !viewer.readOnly;
+  const [rows, setRows] = useState<Connection[] | null>(null);
+  const [binding, setBinding] = useState<SmtpBinding | null | undefined>(undefined);
+  const [error, setError] = useState<string | null>(null);
+  const [picked, setPicked] = useState("");
+  const [pending, setPending] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const [confirmRevoke, setConfirmRevoke] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    Promise.all([api.connections(), readSmtpBinding(scope)]).then(
+      ([list, bound]) => {
+        if (controller.signal.aborted) return;
+        setRows(list.connections ?? []);
+        setBinding(bound);
+        setError(null);
+      },
+      (e: unknown) => {
+        if (!controller.signal.aborted) setError(friendlySendError(e));
+      },
+    );
+    return () => controller.abort();
+  }, [scope.installId, scope.contextId]);
+
+  const { usable, unusable } = senderChoices(rows ?? []);
+  const choice = usable.find((r) => r.id === picked) ?? usable.find((r) => binding && r.id === binding.connectionId) ?? usable[0];
+  const chosenId = choice?.id ?? "";
+
+  const run = (action: () => Promise<SmtpBinding | null>, ok: string) => {
+    setPending(true);
+    setError(null);
+    setNote(null);
+    void action()
+      .then((value) => {
+        setBinding(value);
+        setNote(ok);
+      })
+      .catch((e: unknown) => setError(friendlySendError(e)))
+      .finally(() => setPending(false));
+  };
+
+  const live = sendingFrom(binding);
+  return (
+    <section aria-label="Sender" className="card px-4 py-4 grid gap-3 min-w-0">
+      <h2 className="text-cardtitle font-medium text-ink-100">Sender</h2>
+      {binding === undefined && error === null && (
+        <p className="text-label text-ink-400" role="status">
+          Reading the sender…
+        </p>
+      )}
+      {binding === null && (
+        <p className="text-label text-ink-400" data-state="unbound">
+          No sender chosen yet. Pick one below.
+        </p>
+      )}
+      {binding && live !== null && (
+        <p className="text-body text-ink-100 break-words" data-state="live">
+          {isHostedTransport(binding)
+            ? `Sending via AgenticOS — ${live}`
+            : `Sending from ${live}`}{" "}
+          <span aria-hidden="true">✓</span>
+        </p>
+      )}
+      {binding && live === null && (
+        <p className="text-label text-fail" role="alert" data-state="stale">
+          The chosen sender needs re-checking. Choose it again below to continue sending.
+        </p>
+      )}
+      {error && (
+        <p className="text-label text-fail break-words" role="alert">
+          {error}
+        </p>
+      )}
+      {note && (
+        <p className="text-label text-ok" role="status">
+          {note}
+        </p>
+      )}
+      {rows !== null && unusable.length > 0 && (
+        <ul className="grid gap-1" aria-label="Senders that cannot be used">
+          {unusable.map(({ row, reason }) => (
+            <li key={row.id} className="text-label text-fail break-words" data-state="sender-unusable">
+              {row.account} can't be used yet. {reason}{" "}
+              <Link href="/settings/connections">Fix it in Settings → Connections</Link>.
+            </li>
+          ))}
+        </ul>
+      )}
+      {rows !== null && usable.length === 0 && unusable.length === 0 && (
+        <p className="text-label text-ink-500">
+          No email sender is available. Add an SMTP sender under{" "}
+          <Link href="/settings/connections">Settings → Connections</Link>.
+        </p>
+      )}
+      {canWrite && usable.length > 0 && (
+        <div className="crm-field-row">
+          <div className="crm-field">
+            <label className="text-label text-ink-300" htmlFor="email-sender">
+              Send campaign email from
+            </label>
+            <Select
+              id="email-sender"
+              value={chosenId}
+              onChange={setPicked}
+              options={usable.map((r) => ({ value: r.id, label: senderLine(r) }))}
+              aria-label="Send campaign email from"
+              disabled={pending}
+              full
+            />
+          </div>
+          <div className="crm-toolbar" style={{ alignSelf: "end" }}>
+            {binding === null ? (
+              <Button
+                size="sm"
+                variant="primary"
+                loading={pending}
+                disabled={pending || chosenId === ""}
+                onClick={() =>
+                  run(
+                    () => sendClient.smtpBind(scope, chosenId, newAudienceId("bind")).then(parseSmtpBinding),
+                    "Sender chosen.",
+                  )
+                }
+              >
+                Use this sender
+              </Button>
+            ) : (
+              binding && (
+                <>
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    loading={pending}
+                    disabled={pending || chosenId === "" || (live !== null && chosenId === binding.connectionId)}
+                    onClick={() =>
+                      run(
+                        () => sendClient.smtpRebind(scope, chosenId, binding.linkRevision).then(parseSmtpBinding),
+                        "Sender changed.",
+                      )
+                    }
+                  >
+                    {live === null || chosenId !== binding.connectionId ? "Switch to this sender" : "Current sender"}
+                  </Button>
+                  <Button size="sm" variant="danger" disabled={pending} onClick={() => setConfirmRevoke(true)}>
+                    Stop using
+                  </Button>
+                </>
+              )
+            )}
+          </div>
+        </div>
+      )}
+      {binding && (
+        <details className="text-label text-ink-400" data-details="sender">
+          <summary className="cursor-pointer">Details</summary>
+          <p className="num break-all mt-1">
+            link r{binding.linkRevision} · auth r{binding.authRevision} · {binding.state} ·{" "}
+            {binding.digest.slice(0, 18)}…
+          </p>
+        </details>
+      )}
+      {confirmRevoke && binding && (
+        <ConfirmDialog
+          title="Stop using this sender?"
+          body={
+            <p>
+              Campaigns can't send or test-send from {binding.sender.address} until a sender is
+              chosen again. A prepared send loses its approval.
+            </p>
+          }
+          confirmLabel="Stop using"
+          pending={pending}
+          error={null}
+          onCancel={() => setConfirmRevoke(false)}
+          onConfirm={() => {
+            setConfirmRevoke(false);
+            run(async () => {
+              await sendClient.smtpRevoke(scope, binding.linkRevision);
+              return null;
+            }, "Sender removed.");
+          }}
+        />
+      )}
+    </section>
+  );
+}
+
+/** The daemon-wide unsubscribe origin — set once; every campaign uses it. */
+function OriginCard({ viewer }: { viewer: Viewer }) {
+  const canWrite = viewer.operator && !viewer.readOnly;
+  const [origin, setOrigin] = useState<string | null | undefined>(undefined);
+  const [stored, setStored] = useState(false);
+  const [input, setInput] = useState("");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  const apply = (value: unknown) => {
+    const receipt = parseOriginReceipt(value);
+    setOrigin(receipt.unsubscribeOrigin);
+    setStored(receipt.stored);
+    setInput(receipt.unsubscribeOrigin ?? "");
+    return receipt;
+  };
+  useEffect(() => {
+    sendClient.sendOriginShow().then(apply, (e: unknown) => setError(friendlySendError(e)));
+  }, []);
+
+  const save = (value: string | null) => {
+    setPending(true);
+    setError(null);
+    setNote(null);
+    void sendClient
+      .sendOriginSet(value)
+      .then((value2) => {
+        const receipt = apply(value2);
+        setNote(
+          receipt.unsubscribeOrigin === null
+            ? "Unsubscribe address cleared — sends refuse until one is set."
+            : `Unsubscribe links now use ${receipt.unsubscribeOrigin}.`,
+        );
+      })
+      .catch((e: unknown) => setError(friendlySendError(e)))
+      .finally(() => setPending(false));
+  };
+
+  return (
+    <section aria-label="Unsubscribe origin" className="card px-4 py-4 grid gap-3 min-w-0">
+      <h2 className="text-cardtitle font-medium text-ink-100">Unsubscribe address</h2>
+      {origin === undefined && error === null ? (
+        <p className="text-label text-ink-400" role="status">
+          Reading…
+        </p>
+      ) : (
+        <p className="text-label text-ink-300 break-words">
+          Every email's unsubscribe link is built on{" "}
+          <span className="num">{origin ?? "nothing — sends refuse until one is set"}</span>
+          {stored ? " (set here)" : origin ? " (server default)" : ""}.
+        </p>
+      )}
+      {error && (
+        <p className="text-label text-fail break-words" role="alert">
+          {error}
+        </p>
+      )}
+      {note && (
+        <p className="text-label text-ok" role="status">
+          {note}
+        </p>
+      )}
+      {canWrite && (
+        <form
+          className="crm-field-row"
+          onSubmit={(e) => {
+            e.preventDefault();
+            save(input);
+          }}
+        >
+          <div className="crm-field">
+            <label className="text-label text-ink-300" htmlFor="email-origin">
+              Origin (https; http on a loopback host)
+            </label>
+            <input
+              id="email-origin"
+              className="field"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              maxLength={200}
+              autoComplete="off"
+              disabled={pending}
+              placeholder="https://cadence.example.com"
+            />
+          </div>
+          <div className="crm-toolbar" style={{ alignSelf: "end" }}>
+            <Button type="submit" size="sm" loading={pending} disabled={pending}>
+              Save
+            </Button>
+            {stored && (
+              <Button size="sm" disabled={pending} onClick={() => save(null)}>
+                Clear
+              </Button>
+            )}
+          </div>
+        </form>
+      )}
+    </section>
+  );
+}

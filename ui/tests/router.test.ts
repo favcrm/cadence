@@ -42,6 +42,7 @@ const paths: [string, Route][] = [
   ["/settings", { screen: "settings", section: "models" }],
   ["/settings/memory", { screen: "settings", section: "memory" }],
   ["/settings/permissions", { screen: "settings", section: "permissions" }],
+  ["/settings/email", { screen: "settings", section: "email" }],
   ["/outbox", { screen: "outbox" }],
   ["/login", { screen: "login" }],
 ];
