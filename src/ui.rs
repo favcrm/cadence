@@ -1004,22 +1004,158 @@ pub(crate) fn ready_pid(state_dir: &Path, nonce: &str) -> Option<i32> {
 }
 
 /// Is a detached `cadence ui` server alive for this state dir — the
-/// pidfile's pid, alive-checked. `daemon restart --ui` reads this to
-/// decide whether to bounce the board.
+/// pidfile's pid, identity-checked by [`read_pid`]. `daemon restart
+/// --ui` reads this to decide whether to bounce the board. Not a pure
+/// read: like `read_pid`, it deletes a `ui.pid` that names no board.
 pub fn detached_pid(state_dir: &Path) -> Option<i32> {
     read_pid(state_dir)
 }
 
+/// The pidfile's pid, but only when it is this state dir's board
+/// (CAD-1081). A live pid is not enough: a `ui.pid` restored into a
+/// new container can name pid 1, another process, or a thread id, and
+/// trusting it skipped the board start and pointed `ui stop` at a
+/// stranger. Anything else is stale.
+///
+/// Side effect: a pid proven not to be the board (`NotBoard`) deletes
+/// `ui.pid` — only if the file still holds what was read, so a
+/// concurrent `ui start` keeps its own. Every caller, `detached_pid`
+/// included, inherits that; an `Unknown` pid leaves the file alone.
+///
+/// Linux only: with no `/proc` (macOS) no pid proves itself, so the
+/// board reads as stopped there — the macOS board is unsupported until
+/// CAD-315.
 pub(crate) fn read_pid(state_dir: &Path) -> Option<i32> {
-    std::fs::read_to_string(pid_file(state_dir))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-        .filter(|pid| {
-            // Alive check — a stale pidfile is cleaned, not trusted.
-            unsafe { libc::kill(*pid, 0) == 0 }
+    read_pid_in(Path::new("/proc"), state_dir)
+}
+
+fn read_pid_in(proc_root: &Path, state_dir: &Path) -> Option<i32> {
+    let path = pid_file(state_dir);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let pid: i32 = text.trim().parse().ok()?;
+    match board_identity(proc_root, pid, state_dir) {
+        BoardPid::Board => Some(pid),
+        // Unproven either way: not ours to signal, not ours to delete.
+        BoardPid::Unknown => None,
+        BoardPid::NotBoard => {
+            if std::fs::read_to_string(&path).is_ok_and(|now| now == text) {
+                let _ = std::fs::remove_file(&path);
+            }
+            None
+        }
+    }
+}
+
+/// What `/proc` proves about a pidfile's pid. A failed read proves
+/// nothing: only a missing entry (ENOENT/ESRCH) or a field that
+/// contradicts the board is `NotBoard`; every other error is `Unknown`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BoardPid {
+    Board,
+    NotBoard,
+    Unknown,
+}
+
+fn proc_read(dir: &Path, name: &str) -> std::result::Result<Vec<u8>, BoardPid> {
+    std::fs::read(dir.join(name)).map_err(|e| gone_or_unknown(&e))
+}
+
+fn gone_or_unknown(e: &std::io::Error) -> BoardPid {
+    if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH) {
+        BoardPid::NotBoard
+    } else {
+        BoardPid::Unknown
+    }
+}
+
+/// Is `pid` (under `proc_root`, `/proc` outside tests) a live
+/// thread-group leader running `cadence … ui run` for `state_dir`?
+/// Stricter than state-bridge.sh `kill_pidfile`, which only looks for
+/// `cadence` in the cmdline: `Tgid` must be the pid itself (a thread id
+/// answers `kill(tid, 0)` too), not a zombie, and the argv must be the
+/// one `start_inner` spawns, for this state dir.
+pub(crate) fn board_identity(proc_root: &Path, pid: i32, state_dir: &Path) -> BoardPid {
+    if pid <= 0 {
+        return BoardPid::NotBoard;
+    }
+    let dir = dir_of(proc_root, pid);
+    let status = match proc_read(&dir, "status") {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(v) => return v,
+    };
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(str::trim)
+    };
+    let real_uid = field("Uid:").and_then(|u| u.split_whitespace().next());
+    let (Some(tgid), Some(state), Some(uid)) = (field("Tgid:"), field("State:"), real_uid) else {
+        return BoardPid::Unknown;
+    };
+    // The board runs as whoever started it — the owner of this state
+    // dir. Never the exe path: an update's recovery stops the board the
+    // previous release binary still runs.
+    let me = unsafe { libc::getuid() }.to_string();
+    if tgid != pid.to_string() || state.starts_with('Z') || uid != me {
+        return BoardPid::NotBoard;
+    }
+    let raw = match proc_read(&dir, "cmdline") {
+        Ok(b) => b,
+        Err(v) => return v,
+    };
+    let argv: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let Some(dir) = board_argv_state_dir(&argv) else {
+        return BoardPid::NotBoard;
+    };
+    // A relative `--state-dir` is the board's, read from its own cwd —
+    // never the reader's.
+    let dir = if dir.is_relative() {
+        match std::fs::read_link(dir_of(proc_root, pid).join("cwd")) {
+            Ok(cwd) => cwd.join(dir),
+            Err(e) => return gone_or_unknown(&e),
+        }
+    } else {
+        dir
+    };
+    if same_dir(&dir, state_dir) {
+        BoardPid::Board
+    } else {
+        BoardPid::NotBoard
+    }
+}
+
+fn dir_of(proc_root: &Path, pid: i32) -> PathBuf {
+    proc_root.join(pid.to_string())
+}
+
+/// The `--state-dir` of a board argv — `<…/cadence> … --state-dir
+/// <dir> … ui run …`, as `start_inner` has always spawned it — or
+/// `None` for anything else, an argv without `--state-dir` included.
+pub(crate) fn board_argv_state_dir(argv: &[String]) -> Option<PathBuf> {
+    let (exe, args) = argv.split_first()?;
+    if Path::new(exe).file_name().and_then(|n| n.to_str()) != Some("cadence")
+        || !args.windows(2).any(|w| w[0] == "ui" && w[1] == "run")
+    {
+        return None;
+    }
+    args.iter()
+        .position(|a| a == "--state-dir")
+        .and_then(|i| args.get(i + 1).cloned())
+        .or_else(|| {
+            args.iter()
+                .find_map(|a| a.strip_prefix("--state-dir=").map(str::to_string))
         })
+        .map(PathBuf::from)
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
 }
 
 /// Tiny blocking GET — enough for health checks without an HTTP client
@@ -1219,7 +1355,9 @@ pub(crate) fn start_inner(
         .env_remove("CADENCE_DEVICE_LOGIN_SUBJECTS");
     command
         .arg("--state-dir")
-        .arg(state_dir)
+        // CAD-1081: absolute, so the board's argv names its state dir
+        // from any reader's cwd.
+        .arg(std::path::absolute(state_dir)?)
         .args(["ui", "run", "--host", &host, "--port"])
         .arg(port.to_string());
     if let Some(dist) = &eff.dist {
@@ -2334,5 +2472,115 @@ mod tests {
             }))
             .is_err()
         );
+    }
+}
+
+/// CAD-1081: board identity against a fake proc root; the live cases
+/// (pid 1, another process, a thread id, the real board) run against
+/// the real binary in tests/board_tailnet.rs.
+#[cfg(test)]
+mod pidfile_tests {
+    use super::{board_argv_state_dir, board_identity, pid_file, read_pid_in, same_dir, BoardPid};
+    use std::path::Path;
+
+    /// A live leader's `status`, owned by this test's uid.
+    fn status(tgid: i32) -> String {
+        let uid = unsafe { libc::getuid() };
+        format!("State:\tS (sleeping)\nTgid:\t{tgid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+    }
+
+    /// A fake `/proc/<pid>` with the given `status` and argv.
+    fn fake_proc(root: &Path, pid: i32, status: &str, argv: &[&str]) {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("status"), status).unwrap();
+        std::fs::write(dir.join("cmdline"), argv.join("\0")).unwrap();
+    }
+
+    #[test]
+    fn unreadable_proc_is_unknown_and_keeps_the_pidfile() {
+        let (root, state) = (
+            tempfile::TempDir::new().unwrap(),
+            tempfile::TempDir::new().unwrap(),
+        );
+        let (root, st) = (root.path(), state.path());
+        let s = st.to_str().unwrap();
+        let board = ["cadence", "--state-dir", s, "ui", "run"];
+        fake_proc(root, 40, &status(40), &board);
+        assert_eq!(board_identity(root, 40, st), BoardPid::Board);
+        assert_eq!(board_identity(root, 41, st), BoardPid::NotBoard, "no entry");
+        fake_proc(root, 42, &status(40), &board);
+        assert_eq!(board_identity(root, 42, st), BoardPid::NotBoard, "a thread");
+        fake_proc(root, 43, "State:\tS\n", &board);
+        assert_eq!(
+            board_identity(root, 43, st),
+            BoardPid::Unknown,
+            "no Tgid line"
+        );
+        // Another user's process holding the pid is not the board.
+        let me = unsafe { libc::getuid() };
+        let foreign = status(45).replace(&format!("Uid:\t{me}\t"), &format!("Uid:\t{}\t", me + 1));
+        fake_proc(root, 45, &foreign, &board);
+        assert_eq!(
+            board_identity(root, 45, st),
+            BoardPid::NotBoard,
+            "other uid"
+        );
+        // A `status` that exists but cannot be read (EISDIR here; EACCES,
+        // EMFILE in the field) proves nothing either way.
+        std::fs::create_dir_all(root.join("44/status")).unwrap();
+        assert_eq!(board_identity(root, 44, st), BoardPid::Unknown);
+        std::fs::write(pid_file(st), "44").unwrap();
+        assert_eq!(read_pid_in(root, st), None);
+        assert!(pid_file(st).exists(), "an unproven pid deleted ui.pid");
+        std::fs::write(pid_file(st), "41").unwrap();
+        assert_eq!(read_pid_in(root, st), None);
+        assert!(!pid_file(st).exists(), "a gone pid kept ui.pid");
+    }
+
+    #[test]
+    fn relative_state_dir_resolves_against_the_boards_cwd() {
+        let (root, base) = (
+            tempfile::TempDir::new().unwrap(),
+            tempfile::TempDir::new().unwrap(),
+        );
+        let (root, st) = (root.path(), base.path().join("st"));
+        std::fs::create_dir(&st).unwrap();
+        let board = ["cadence", "--state-dir", "st", "ui", "run"];
+        fake_proc(root, 50, &status(50), &board);
+        // No cwd entry: the process is gone.
+        assert_eq!(board_identity(root, 50, &st), BoardPid::NotBoard);
+        std::os::unix::fs::symlink(base.path(), root.join("50/cwd")).unwrap();
+        assert_eq!(board_identity(root, 50, &st), BoardPid::Board);
+        fake_proc(root, 51, &status(51), &board);
+        std::os::unix::fs::symlink(root, root.join("51/cwd")).unwrap();
+        assert_eq!(
+            board_identity(root, 51, &st),
+            BoardPid::NotBoard,
+            "other cwd"
+        );
+        // An unreadable cwd link (not a link: EINVAL) is unproven.
+        fake_proc(root, 52, &status(52), &board);
+        std::fs::write(root.join("52/cwd"), "").unwrap();
+        assert_eq!(board_identity(root, 52, &st), BoardPid::Unknown);
+    }
+
+    #[test]
+    fn board_argv_names_cadence_ui_run_for_this_state_dir() {
+        let state = tempfile::TempDir::new().unwrap();
+        let s = state.path().to_str().unwrap();
+        let ok = |a: &[&str]| {
+            let argv: Vec<String> = a.iter().map(|x| x.to_string()).collect();
+            board_argv_state_dir(&argv).is_some_and(|d| same_dir(&d, state.path()))
+        };
+        assert!(ok(&["/r/cadence", "--state-dir", s, "ui", "run"]));
+        assert!(ok(&["cadence", &format!("--state-dir={s}"), "ui", "run"]));
+        // No `--state-dir`: an allowlist names the dir, never assumes it.
+        assert!(!ok(&["cadence", "ui", "run", "--host", "127.0.0.1"]));
+        assert!(!ok(&["/sbin/init", "splash"]));
+        assert!(!ok(&["cadence", "--state-dir", s, "ui", "start"]));
+        assert!(!ok(&["cadence", "--state-dir", "/elsewhere", "ui", "run"]));
+        assert!(!ok(&["python3", "--state-dir", s, "ui", "run"]));
+        assert!(!ok(&[]));
     }
 }
