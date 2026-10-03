@@ -126,7 +126,11 @@ def plan(root, changed, with_tests):
     rs = rust_changed(changed)
     steps = [
         ("fmt", ["cargo", "fmt", "--all", "--", "--check"], None),
-        ("split-map", ["python3", "scripts/split-map-sync", "--check"], None),
+        # CAD-1073: split-map's manifest was retired with tests/ — a
+        # missing tests/split-map.toml means there is nothing to check.
+        ("split-map", ["python3", "scripts/split-map-sync", "--check"],
+         None if os.path.exists(os.path.join(root, "tests/split-map.toml"))
+         else "tests/split-map.toml retired"),
     ]
     why = None if rs else "no Rust changes"
     steps.append(("clippy", ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"], why))
