@@ -1021,6 +1021,10 @@ pub fn detached_pid(state_dir: &Path) -> Option<i32> {
 /// `ui.pid` — only if the file still holds what was read, so a
 /// concurrent `ui start` keeps its own. Every caller, `detached_pid`
 /// included, inherits that; an `Unknown` pid leaves the file alone.
+///
+/// Linux only: with no `/proc` (macOS) no pid proves itself, so the
+/// board reads as stopped there — the macOS board is unsupported until
+/// CAD-315.
 pub(crate) fn read_pid(state_dir: &Path) -> Option<i32> {
     read_pid_in(Path::new("/proc"), state_dir)
 }
