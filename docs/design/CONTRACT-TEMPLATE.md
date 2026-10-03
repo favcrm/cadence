@@ -23,14 +23,16 @@ reason. A bare "n/a" fails review.
 - [ ] Partial write (torn file, half-applied multi-record update, event without its effect)
 - [ ] Clock or TTL edges (expiry at the boundary, clock step, restart mid-lease)
 
-## Adversarial tests
-One row per test. Each is written first and must fail without the guard.
-Name the test, the invariant, the guard it proves, and how it fails without
-the guard. "Would pass anyway" means the test is wrong.
+## Acceptance check
+ONE check proving the bad case is refused (AGENTS.md "Gates and security
+work"). It is written from the ticket by someone other than the implementer
+(the reviewer or the ticket author), and the implementer may not edit it.
+Name the check, the invariant it proves, the real guard it exercises, and the
+observable wrong outcome without the guard.
 
-| Test name | Proves (I#) | Guard | Fails without the guard because |
+| Check | Proves (I#) | Guard | Wrong outcome without the guard |
 |---|---|---|---|
-| `<test_fn_name>` | I1 | `<fn or check>` | `<observable wrong outcome>` |
+| `<check name>` | I1 | `<fn or check>` | `<observable wrong outcome>` |
 
 ## Out of scope
 What this change does not enforce, and where that is tracked (ticket id).

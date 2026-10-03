@@ -24,7 +24,10 @@
 #
 # CAD-1099 (operator decision 2026-10-03, "spec > dev > review > pr > deploy is
 # taking too long"): ONE independent review is the default for normal code
-# and docs. UI (`ui/**`, `src/ui/**`) is trigger 1 and keeps two. Two reviews remain for every path in docs/roles/risk-paths.toml
+# and docs. Two reviews also cover trigger 2-schema, whole sensitive source
+# trees (src/daemon, src/bin, src/platform, src/adapter, src/store,
+# src/agent_uid) and nested build/lock files, because risk-paths.toml is a
+# delegation allowlist, not a complete map. UI (`ui/**`, `src/ui/**`) is trigger 1 and keeps two. Two reviews remain for every path in docs/roles/risk-paths.toml
 # triggers 1 (trust boundary/identity), 3 (secrets), 4 (supply chain/CI),
 # 6 (release/rollout) and 7 (rules/gates/their proofs), plus the remote-CLI
 # auth modules below. Includes are explicit directories, so a new top-level
@@ -39,7 +42,6 @@ one_review_include = [
   "app-previews/**",
   "workspace-apps/**",
   "workflows/**",
-  "agents/**",
   "contracts/**",
   "design/**",
   "README.md",
@@ -72,6 +74,8 @@ one_review_exclude = [
   "src/platform/**",
   "src/adapter/**",
   "src/store/**",
+  "src/agent_uid/**",
+  "src/cli/platform.rs",
   "src/pi_policy.rs",
   "src/confine.rs",
   "agents/**",
@@ -82,6 +86,10 @@ one_review_exclude = [
   "**/.cargo/**",
   "**/package-lock.json",
   "**/.npmrc",
+  "**/.github/**",
+  "**/yarn.lock",
+  "**/bun.lockb",
+  "**/rust-toolchain.toml",
   # remote-CLI and board auth modules (CAD-1019, CAD-526/777): identity
   "src/cli_actor.rs",
   "src/board_identity.rs",

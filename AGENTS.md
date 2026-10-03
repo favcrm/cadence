@@ -55,7 +55,9 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   The path list is a floor, not a complete map: a single reviewer who sees
   auth, identity, credential, signature, secret, confinement or gate logic
   in a one-review PR returns REVISE asking for a second (Spec/security)
-  reviewer, and states the trigger in `Risk:`. When unsure, two. A single
+  reviewer, and states the trigger in `Risk:`. When unsure, two. The PR
+  then follows the two-review path: the same reviewer refiles as the
+  Standards review on the head, and a different reviewer files Spec/security. A single
   reviewer of a PR that changes or deletes a check states that no gate check
   and no isolation or fail-closed default was weakened, naming what was
   checked.
