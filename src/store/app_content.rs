@@ -2591,4 +2591,20 @@ mod tests {
         assert!(html.contains("Hello Amina"), "{html}");
         assert!(html.contains("https://example.com/x"), "{html}");
     }
+
+    /// CAD-1056: the digest binds the HTML body and the text override,
+    /// so approval can never carry across a changed body.
+    #[test]
+    fn digest_binds_html_and_text_override() {
+        let digest = |draft: &Draft| content_digest("i", "c", "k", 1, draft);
+        let a = Draft::parse_html("Hi", "", "<p>one</p>").unwrap();
+        let b = Draft::parse_html("Hi", "", "<p>two</p>").unwrap();
+        assert_ne!(digest(&a), digest(&b));
+        let with_text = a.clone().with_text(Some("plain")).unwrap();
+        assert_ne!(digest(&a), digest(&with_text));
+        assert_ne!(
+            digest(&with_text),
+            digest(&a.clone().with_text(Some("other")).unwrap())
+        );
+    }
 }
