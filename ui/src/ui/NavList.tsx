@@ -1,7 +1,7 @@
 import { Fragment, type ReactNode } from "react";
 import { countLabel, issueCounts } from "../lib/counts";
 import type { ResourceState } from "../lib/cache";
-import type { AppMenu } from "../features/app-shell/CrmOutlet";
+import type { AppNav } from "../features/app-shell/appNav";
 import { navMatches } from "../features/issues/model";
 import { NAV, type Route, type Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
@@ -22,8 +22,8 @@ interface NavListProps {
   screen: Screen;
   /** The href of a main-nav route (scope and drawer carried along). */
   navHref: (route: Route) => string;
-  /** Host-owned App menu (CAD-784), or null off an installation. */
-  appMenu?: AppMenu | null;
+  /** Host-owned installed-apps menu (CAD-784, CAD-1116), or null before it is known. */
+  appMenu?: AppNav | null;
   /** Landmark name; the phone menu is "Workspace". */
   label?: string;
   /** The phone menu closes itself when a link is followed. */
@@ -37,37 +37,53 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
     <nav className="grid gap-[2px]" aria-label={label}>
       {NAV.map((item) => {
         const here = navMatches(screen, item.screen);
-        const parent = item.screen === "apps" && appMenu !== null;
+        const apps = item.screen === "apps" && appMenu !== null ? appMenu.apps : [];
+        // A section list open under an app carries the accent; the parent
+        // stays current for assistive tech only.
+        const parent = apps.some((a) => a.current && a.sections !== null);
         return (
           <Fragment key={item.screen}>
             <Link
               href={navHref(item.route)}
               onClick={onNavigate}
               className="navlink"
-              // With an app menu open the sub-item carries the accent; the
-              // parent stays current for assistive tech only.
               aria-current={here ? (parent ? "true" : "page") : undefined}
               data-parent-current={here && parent ? "" : undefined}
             >
               {NAV_ICONS[item.screen]}
               {item.label}
             </Link>
-            {parent && (
-              <div className="mt-[2px] mb-[2px]">
-                <nav aria-label={`${appMenu.title} sections`} className="grid gap-[1px] ml-[10px] border-l border-ink-700 pl-[6px]">
-                  <div className="text-micro text-ink-500 px-2 pt-0.5 pb-1 truncate" title={appMenu.title}>{appMenu.title}</div>
-                  {appMenu.sections.map((s) => (
+            {apps.length > 0 && (
+              <div className="mt-[2px] mb-[2px] grid gap-[1px] ml-[10px] border-l border-ink-700 pl-[6px]">
+                {apps.map((app) => (
+                  <Fragment key={app.installId}>
                     <Link
-                      key={s.label}
-                      href={s.href}
+                      href={app.href}
                       onClick={onNavigate}
                       className="navlink navlink-sub"
-                      aria-current={s.current ? "page" : undefined}
+                      title={app.title}
+                      aria-current={app.current ? (app.sections ? "true" : "page") : undefined}
+                      data-parent-current={app.current && app.sections ? "" : undefined}
                     >
-                      {s.label}
+                      <span className="truncate">{app.title}</span>
                     </Link>
-                  ))}
-                </nav>
+                    {app.sections && (
+                      <nav aria-label={`${app.title} sections`} className="grid gap-[1px] ml-[10px] border-l border-ink-700 pl-[6px]">
+                        {app.sections.map((s) => (
+                          <Link
+                            key={s.label}
+                            href={s.href}
+                            onClick={onNavigate}
+                            className="navlink navlink-sub"
+                            aria-current={s.current && app.current ? "page" : undefined}
+                          >
+                            {s.label}
+                          </Link>
+                        ))}
+                      </nav>
+                    )}
+                  </Fragment>
+                ))}
               </div>
             )}
           </Fragment>
