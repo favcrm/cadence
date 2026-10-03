@@ -10,6 +10,13 @@
 //!   cli actor envelope. Body is exactly `{version:"hosted-cadence-cli.v1",
 //!   organization_id, audience, requested_scopes:["cli.read","cli.write"],
 //!   ttl_seconds}` (a strict object — an extra key is `invalid_request`).
+//!   The envelope is **single-use** — the container (#744) consumes its `jti`.
+//!   [`call_once`] mints a fresh one for every command invocation, and the wake
+//!   loop re-mints on every retry: a `503 waking` is produced by the worker's
+//!   `wakeBoardRuntime` *before* any container forward, so the just-minted
+//!   envelope's `jti` was never consumed — but re-minting is still the only
+//!   safe posture (a `503` that came later in the pipeline would have burned
+//!   it). An envelope is never reused across calls or retries.
 //! - `POST {endpoint}/__platform/cli/call` — same bearer + `{version,
 //!   envelope, verb, arguments?}` — `verb` is one of
 //!   [`REMOTE_VERBS`]; `arguments` is an object the container's
@@ -529,6 +536,11 @@ mod tests {
         let server = listener.try_clone().unwrap();
         let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
         let requests = seen.clone();
+        // The container (#744) consumes each cli envelope's `jti` once —
+        // the fake does the same so a reused envelope is refused, not
+        // silently accepted.
+        let spent: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let consumed = spent.clone();
         let handle = thread::spawn(move || {
             loop {
                 let Ok((socket, _)) = server.accept() else {
@@ -550,12 +562,22 @@ mod tests {
                         continue;
                     }
                     // Envelope shape only — the worker signs the real one.
+                    // A distinct envelope per mint lets a test prove the
+                    // client never reuses one across commands/retries (#744:
+                    // the container treats each cli envelope as single-use).
+                    let mint = requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|r| r["path"] == json!("/__platform/cli/authorize"))
+                        .count();
+                    let envelope = format!("h.e.{mint}");
                     answer(
                         socket,
                         "200 OK",
                         "",
-                        &json!({"version": CLI_VERSION, "envelope": "h.e.a",
-                            "bearer": "wikienv_h.e.a", "expires_at": 0,
+                        &json!({"version": CLI_VERSION, "envelope": envelope,
+                            "bearer": format!("wikienv_{envelope}"), "expires_at": 0,
                             "actor": "users/o", "scope": ["cli.read"], "issuer": "i"}),
                     );
                     continue;
@@ -575,6 +597,22 @@ mod tests {
                             &json!({"code": "invalid_request"}),
                         );
                         continue;
+                    }
+                    // Single-use: a replayed envelope is unauthorized —
+                    // the jti was already spent by an earlier call.
+                    let env = req.body["envelope"].as_str().unwrap().to_string();
+                    {
+                        let mut spent = consumed.lock().unwrap();
+                        if spent.contains(&env) {
+                            answer(
+                                socket,
+                                "401 Unauthorized",
+                                "",
+                                &json!({"code": "envelope_reused"}),
+                            );
+                            continue;
+                        }
+                        spent.push(env);
                     }
                     let Some((status, extra, body)) = answers.get(n - 1) else {
                         // More attempts than answers — a test bug or an
@@ -780,6 +818,61 @@ mod tests {
         for key in ["actor", "role", "org", "user", "as", "principal", "wiki_as"] {
             assert!(call["body"].get(key).is_none(), "{key} was sent");
         }
+    }
+
+    /// Envelopes the calls presented, in order — the value the container
+    /// would consume as single-use `jti`.
+    fn envelopes(requests: &[Value]) -> Vec<String> {
+        requests
+            .iter()
+            .filter(|r| r["path"] == json!("/__platform/cli/call"))
+            .map(|r| r["body"]["envelope"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn every_command_mints_a_fresh_envelope() {
+        // Single-use contract (#744): the container consumes the envelope's
+        // `jti`, so two commands must present two different mints — an
+        // envelope is never reused across calls.
+        let (listener, requests, _s) =
+            fake_worker(vec![(200, "", json!({"a": 1})), (200, "", json!({"b": 2}))]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        for verb in ["status", "agent_list"] {
+            call_verb_in(&target, verb, Map::new(), 10, &dir, |_| {}, |_| {}).unwrap();
+        }
+        let envs = envelopes(&requests.lock().unwrap());
+        assert_eq!(envs.len(), 2);
+        assert_ne!(envs[0], envs[1], "two commands reused one envelope");
+    }
+
+    #[test]
+    fn a_wake_retry_remints_the_envelope() {
+        // The waking 503 came from the worker before any forward — the
+        // envelope's jti was verified there but never consumed by a
+        // container. Retrying still mints a fresh one: a 503 that fired
+        // later in the pipeline would have burned the first.
+        let (out, _, requests) = run(
+            vec![
+                (503, "", json!({"state": "waking", "retry_after_s": 1})),
+                (200, "", json!({"ok": true})),
+            ],
+            "status",
+            Map::new(),
+            120,
+            true,
+        );
+        assert!(out.is_ok());
+        assert_eq!(hits(&requests, "/__platform/cli/authorize"), 2);
+        let envs = envelopes(&requests);
+        assert_eq!(envs.len(), 2);
+        assert_ne!(envs[0], envs[1], "a wake retry reused the envelope");
     }
 
     #[test]
