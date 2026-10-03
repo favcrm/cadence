@@ -847,11 +847,14 @@ fn store_material(
             rusqlite::params![binding.key],
             |row| row.get(0),
         )
-        .map_err(|_| {
-            Refusal::new(
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Refusal::new(
                 "unknown_key",
                 "no frozen publish intent holds this idempotency key",
-            )
+            ),
+            // SQLITE_BUSY after the busy timeout, or any other read
+            // failure, is transient: never a definitive refusal.
+            _ => Refusal::new("store_unavailable", "publish material store is unavailable"),
         })?;
     let frozen: Value = serde_json::from_str(&frozen_text)
         .map_err(|_| Refusal::new("bad_effect", "frozen publish intent is corrupt"))?;
@@ -940,6 +943,30 @@ pub fn test_resolver(caption: &str, media_key: Option<&str>) -> MaterialResolver
 mod tests {
     use super::super::publish::{caption_digest_of, Toolkit};
     use super::*;
+
+    /// CAD-1041: only a missing row is `unknown_key` (definitive); any
+    /// other read failure — a store without the table, or SQLITE_BUSY once
+    /// the busy timeout runs out — is `store_unavailable`, which send-now's
+    /// preflight treats as Uncertain (the row stays queued).
+    #[test]
+    fn store_material_maps_read_failures_to_store_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        db.execute_batch("CREATE TABLE unrelated (x INTEGER)")
+            .unwrap();
+        let refusal = super::store_material(dir.path(), &binding()).unwrap_err();
+        assert_eq!(refusal.code, "store_unavailable", "{refusal}");
+        db.execute_batch("CREATE TABLE social_publish_intents (request TEXT, frozen TEXT)")
+            .unwrap();
+        let refusal = super::store_material(dir.path(), &binding()).unwrap_err();
+        assert_eq!(refusal.code, "unknown_key", "{refusal}");
+        // A writer holding an exclusive lock (rollback journal): the read
+        // waits out the busy timeout, then SQLITE_BUSY.
+        db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let refusal = super::store_material(dir.path(), &binding()).unwrap_err();
+        assert_eq!(refusal.code, "store_unavailable", "{refusal}");
+        db.execute_batch("ROLLBACK").unwrap();
+    }
 
     fn binding() -> SendBinding {
         // Fixture idempotency key built from parts: no secret-shaped
