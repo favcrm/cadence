@@ -1265,3 +1265,261 @@ fn cad1056_host_unsubscribe_links_refuse_but_third_party_links_pass() {
         .unwrap()
         .contains("unsubscribe-tips"));
 }
+
+/// CAD-1058: save a campaign carrying a human `name`.
+fn named_save(
+    w: &Content,
+    install: &str,
+    context: &str,
+    campaign: &str,
+    rev: Option<u64>,
+    name: Value,
+) -> cadence_agent::Result<Value> {
+    let mut params = json!({"install_id": install, "context_id": context, "campaign_id": campaign, "subject": "Spring launch", "preheader": "News", "blocks": blocks(), "name": name});
+    if let Some(expected) = rev {
+        params["expected_revision"] = json!(expected);
+    }
+    w.daemon.operator_rpc("app_content_save", params)
+}
+
+#[test]
+fn cad1058_name_is_stored_listed_kept_and_renamed() {
+    let w = Content::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-content-n1");
+    let context_id = context["id"].as_str().unwrap();
+
+    // An unnamed campaign reports a null name (fallback is the UI's).
+    let plain = w.save(install, context_id, "plain-1", None);
+    assert!(plain["content"]["name"].is_null());
+
+    let saved = named_save(
+        &w,
+        install,
+        context_id,
+        "launch-n",
+        None,
+        json!("Spring launch 2026"),
+    )
+    .unwrap();
+    assert_eq!(saved["content"]["name"], "Spring launch 2026");
+    assert_eq!(
+        w.show(install, context_id, "launch-n")["content"]["name"],
+        "Spring launch 2026"
+    );
+    let listed = w
+        .daemon
+        .operator_rpc(
+            "app_content_list",
+            json!({"install_id": install, "context_id": context_id}),
+        )
+        .unwrap();
+    let names: Vec<_> = listed["contents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["campaign_id"].as_str().unwrap().to_string(),
+                c["name"].clone(),
+            )
+        })
+        .collect();
+    assert!(names.contains(&("launch-n".to_string(), json!("Spring launch 2026"))));
+    assert!(names.contains(&("plain-1".to_string(), Value::Null)));
+
+    // A later save without a name keeps it; one with a name renames it.
+    let kept = w.daemon.operator_rpc(
+        "app_content_save",
+        json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-n", "subject": "Edited", "blocks": blocks(), "expected_revision": 1}),
+    ).unwrap();
+    assert_eq!(kept["content"]["name"], "Spring launch 2026");
+    let renamed = named_save(
+        &w,
+        install,
+        context_id,
+        "launch-n",
+        Some(2),
+        json!("Autumn sale"),
+    )
+    .unwrap();
+    assert_eq!(renamed["content"]["name"], "Autumn sale");
+    // HTML mode carries a name too.
+    let html = w.daemon.operator_rpc(
+        "app_content_save",
+        json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-h", "subject": "Own", "html": "<p>x</p>", "name": "Pasted"}),
+    ).unwrap();
+    assert_eq!(html["content"]["name"], "Pasted");
+}
+
+#[test]
+fn cad1058_bad_names_refuse_without_mutation() {
+    let w = Content::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-content-n2");
+    let context_id = context["id"].as_str().unwrap();
+    let created = named_save(
+        &w,
+        install,
+        context_id,
+        "launch-1",
+        None,
+        json!("Good name"),
+    )
+    .unwrap();
+    let cases: Vec<(&str, Value)> = vec![
+        ("empty", json!("")),
+        ("padded", json!(" Padded ")),
+        ("too long", json!("n".repeat(81))),
+        ("markup", json!("<b>Big</b>")),
+        ("newline", json!("two\nlines")),
+        ("control", json!("a\u{7}b")),
+        ("merge token", json!("Hi {{first_name|friend}}")),
+        ("brace", json!("a{b")),
+        ("script scheme", json!("javascript:alert(1)")),
+        ("not a string", json!(5)),
+        ("array", json!(["x"])),
+    ];
+    for (label, name) in cases {
+        assert!(
+            named_save(&w, install, context_id, "launch-1", Some(1), name.clone()).is_err(),
+            "{label} name was admitted"
+        );
+        assert!(
+            named_save(&w, install, context_id, "launch-new", None, name).is_err(),
+            "{label} name created a campaign"
+        );
+    }
+    assert_eq!(
+        w.show(install, context_id, "launch-1")["content"],
+        created["content"]
+    );
+    assert!(w
+        .daemon
+        .operator_rpc(
+            "app_content_show",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-new"}),
+        )
+        .is_err());
+    // A name exactly at the bound is admitted.
+    assert!(named_save(
+        &w,
+        install,
+        context_id,
+        "launch-edge",
+        None,
+        json!("n".repeat(80))
+    )
+    .is_ok());
+}
+
+#[test]
+fn cad1058_agent_detached_and_proposal_paths_cannot_set_a_name() {
+    let w = Content::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-content-n3");
+    let context_id = context["id"].as_str().unwrap();
+    let created = named_save(
+        &w,
+        install,
+        context_id,
+        "launch-1",
+        None,
+        json!("Operator name"),
+    )
+    .unwrap();
+
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "content-name-worker", "claude", None, lane.pid());
+    let evil = json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "subject": "Evil", "blocks": blocks(), "name": "Agent name", "expected_revision": 1});
+    let frame = lane.rpc(&w.daemon.state, "app_content_save", evil.clone());
+    assert_eq!(frame["ok"], false, "agent set a name");
+    assert!(frame.to_string().contains("operator"), "{frame}");
+    let mut fresh = evil.clone();
+    fresh["campaign_id"] = json!("launch-evil");
+    fresh.as_object_mut().unwrap().remove("expected_revision");
+    assert_eq!(
+        lane.rpc(&w.daemon.state, "app_content_save", fresh)["ok"],
+        false
+    );
+
+    let request = lane.dir.path().join("detached-name.json");
+    std::fs::write(
+        &request,
+        cadence_agent::proto::request("app_content_save", evil).to_string(),
+    )
+    .unwrap();
+    let (rc, output) = lane.run(&format!("setsid python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");print(s.makefile().readline())' {} {}", cadence_agent::client::socket_path(&w.daemon.state).display(), request.display()));
+    assert_eq!(rc, 0);
+    let frame: Value = serde_json::from_str(output.trim()).unwrap();
+    assert_eq!(frame["ok"], false);
+    assert!(frame.to_string().contains("operator"));
+
+    // The proposal flow does not take a name (strict grammar), and
+    // applying a proposal leaves the operator's name untouched.
+    let proposal = json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "proposal_id": "p-1", "subject": "Proposed", "blocks": blocks()});
+    let mut with_name = proposal.clone();
+    with_name["name"] = json!("Sneaky");
+    assert!(w
+        .daemon
+        .operator_rpc("app_content_propose", with_name)
+        .is_err());
+    w.daemon
+        .operator_rpc("app_content_propose", proposal)
+        .unwrap();
+    let applied = w.daemon.operator_rpc(
+        "app_content_proposal_apply",
+        json!({"install_id": install, "context_id": context_id, "proposal_id": "p-1", "expected_revision": 1}),
+    ).unwrap();
+    assert_eq!(applied["content"]["revision"], 2);
+    assert_eq!(applied["content"]["name"], "Operator name");
+    assert!(w
+        .daemon
+        .operator_rpc(
+            "app_content_show",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-evil"}),
+        )
+        .is_err());
+    assert_eq!(created["content"]["name"], "Operator name");
+}
+
+#[test]
+fn cad1058_name_save_is_cas_safe_under_concurrency() {
+    let w = Content::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-content-n4");
+    let context_id = context["id"].as_str().unwrap();
+    named_save(&w, install, context_id, "launch-1", None, json!("Start")).unwrap();
+    let results = std::thread::scope(|scope| {
+        (0..6)
+            .map(|n| {
+                let w = &w;
+                scope.spawn(move || {
+                    named_save(
+                        w,
+                        install,
+                        context_id,
+                        "launch-1",
+                        Some(1),
+                        json!(format!("Racer {n}")),
+                    )
+                    .is_ok()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|ok| **ok).count(), 1, "{results:?}");
+    let shown = w.show(install, context_id, "launch-1");
+    assert_eq!(shown["content"]["revision"], 2);
+    assert!(shown["content"]["name"]
+        .as_str()
+        .unwrap()
+        .starts_with("Racer "));
+}

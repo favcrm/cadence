@@ -86,7 +86,12 @@ fn content_save_draft(params: &Value) -> Result<Draft> {
             .map_err(|_| Error::rejected("email HTML exceeds its supported shape or bounds"))?,
         (None, Some(_)) => return Err(Error::rejected("email HTML must be a string")),
     };
-    draft.with_text(text)
+    let name = match params.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(name.as_str()),
+        Some(_) => return Err(Error::rejected("campaign name must be a string")),
+    };
+    draft.with_text(text)?.with_name(name)
 }
 
 fn content_expected(params: &Value) -> Result<Option<i64>> {
@@ -188,6 +193,7 @@ impl Shared {
                 "install_id",
                 "context_id",
                 "campaign_id",
+                "name",
                 "subject",
                 "preheader",
                 "blocks",

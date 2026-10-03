@@ -139,6 +139,9 @@ struct ContentSave {
     html: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
+    /// CAD-1058: optional human campaign name; the daemon validates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_revision: Option<u64>,
 }
@@ -275,6 +278,9 @@ pub(super) fn handle(
             }
             if let Some(text) = body.text {
                 params["text"] = Value::String(text);
+            }
+            if let Some(name) = body.name {
+                params["name"] = Value::String(name);
             }
             if let Some(expected) = body.expected_revision {
                 params["expected_revision"] = match revision(expected) {

@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS app_content_docs(
  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
  approval_revision INTEGER, approval_digest TEXT,
  actor TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
- html TEXT, text_override TEXT,
+ html TEXT, text_override TEXT, name TEXT,
  PRIMARY KEY(context_id, campaign_id));
 CREATE TABLE IF NOT EXISTS app_content_revisions(
  context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
@@ -590,7 +590,7 @@ impl RecordStore {
                  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
                  approval_revision INTEGER, approval_digest TEXT,
                  actor TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
-                 html TEXT, text_override TEXT,
+                 html TEXT, text_override TEXT, name TEXT,
                  PRIMARY KEY(context_id, campaign_id));
                  CREATE TABLE IF NOT EXISTS app_content_revisions(
                  context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
@@ -702,6 +702,20 @@ impl RecordStore {
                         .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
                     }
                 }
+            }
+            // CAD-1058: the optional human campaign name lives on the
+            // doc only (not in revisions or the digest). Older files
+            // gain a nullable column; unnamed campaigns keep NULL.
+            let needs_name = match conn.prepare("SELECT name FROM app_content_docs LIMIT 0") {
+                Ok(_) => false,
+                Err(error) if is_contention(&error) => {
+                    return Err(Error::internal("record file is busy"));
+                }
+                Err(_) => true,
+            };
+            if needs_name {
+                conn.execute_batch("ALTER TABLE app_content_docs ADD COLUMN name TEXT")
+                    .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
             }
             conn.execute_batch(
                 "CREATE UNIQUE INDEX IF NOT EXISTS app_content_proposal_claim ON app_content_proposals(context_id, receipt_message);
