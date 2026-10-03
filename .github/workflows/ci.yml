@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       test_shards:
-        description: Legacy benchmark input (inactive during the reduced-gate window)
+        description: Legacy benchmark input (inactive since CAD-1073 retired the shard suite)
         type: choice
         options: ["4", "8"]
         default: "8"
@@ -213,6 +213,9 @@ jobs:
       - run: python3 scripts/test_pre_push_plan.py
       - run: python3 scripts/test_workflow_cleanup.py
       - run: python3 scripts/test_ci_change_scope.py
+      - run: python3 scripts/test_ci_fast_linker.py
+      - run: python3 -m unittest scripts/test_enqueue_human_paths.py
+      - run: python3 -m unittest scripts/test_enqueue_scope_approval.py
       - run: scripts/design-kit --check
       - name: Check contributor documentation paths
         run: python3 scripts/check-doc-links.py
@@ -272,11 +275,15 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 4
         run: cargo test --doc --locked
-      - name: Build and run the safety floor
+      # CAD-1090: every cargo test target (scripts/result-test-args), with
+      # the test seam on and a 0-test target treated as a failure.
+      # CAD-1105: then the lib unit tests, with PATH cut to the toolchain.
+      - name: Run every integration test target and the lib suite
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         env:
           CARGO_BUILD_JOBS: 4
-        run: cargo test --locked --test safety_floor
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+        run: scripts/run-result-tests
 
   build:
     needs: [queue-evidence, change-scope]
@@ -295,6 +302,10 @@ jobs:
         with:
           shared-key: gate-release
           save-if: false
+      # CAD-1103: the linker flag follows rust-cache, which hashes RUST* env.
+      - name: Enable fast linker (mold/lld; falls back to the default linker)
+        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
       - name: Enable shared sccache (no-op without credentials)
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         env:
@@ -302,12 +313,12 @@ jobs:
           SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
           SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
-      - run: cargo build --release --locked
+      - run: cargo build --profile ci --locked
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
       - name: Rehearse offline hosted migration with the built CLI
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         env:
-          CADENCE_REHEARSAL_BINARY: ${{ github.workspace }}/target/release/cadence
+          CADENCE_REHEARSAL_BINARY: ${{ github.workspace }}/target/ci/cadence
         run: python3 scripts/test-hosted-migration.py -v
       # CAD-778: the release binary parses with production features (no
       # dev-deps), so only it proves frozen snapshot digests survive the
@@ -322,10 +333,10 @@ jobs:
       # shipped default-feature binary proves its bytes carry none of
       # the seam. The step below is the guard's own tripwire: it builds
       # the forbidden combination and asserts the compile_error fires.
-      - name: Assert the release binary carries no test seam
+      - name: Assert the ci-profile gate binary carries no test seam
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         run: |
-          if grep -aq 'cadence-test-seam-v1' target/release/cadence; then
+          if grep -aq 'cadence-test-seam-v1' target/ci/cadence; then
             echo "release binary contains the CAD-482 test seam" >&2
             exit 1
           fi
@@ -397,6 +408,9 @@ jobs:
         with:
           shared-key: gate-release
           save-if: false
+      - name: Enable fast linker (mold/lld; falls back to the default linker)
+        if: ${{ needs.change-scope.outputs.ui != 'false' }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
       - name: Enable shared sccache (no-op without credentials)
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
         env:
@@ -404,7 +418,7 @@ jobs:
           SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
           SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
-      - run: cargo build --release --locked --features ui
+      - run: cargo build --profile ci --locked --features ui
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
         working-directory: ${{ github.workspace }}
       - name: sccache statistics
@@ -419,7 +433,7 @@ jobs:
   # Nothing `needs` it and it never fails the run.
   # CAD-926: it is also the ONLY saver of the gate jobs' rust-cache. One leg
   # per profile, each with its own target dir and the shared key the gates
-  # restore (gate-test: test-shard + test-once; gate-release: build + ui;
+  # restore (gate-test: test; gate-release: build + ui;
   # gate-clippy: clippy). The rust-cache step precedes `ci-sccache enable`
   # exactly as in the gates, because the cache key hashes RUST* env vars and
   # enable exports RUSTC_WRAPPER. The builds run without sccache too (the saved
@@ -446,6 +460,11 @@ jobs:
           cache-on-failure: true
       # The clippy leg has no sccache: clippy-driver calls are not cacheable
       # and no gate reads clippy objects from it.
+      # CAD-1103: the gates' linker flag is part of the cargo fingerprint, so
+      # the release leg warms the cache with the same flag the gates use.
+      - name: Enable fast linker (release leg; same flags as the gates)
+        if: matrix.profile == 'release'
+        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
       - name: Enable shared sccache (read-write; no-op without credentials)
         id: sccache
         if: matrix.profile != 'clippy'
@@ -459,9 +478,11 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 4
         run: cargo test --no-run --locked --all-targets --features test-seam
-      - name: Warm the release profile
+      # CAD-1103: gates build the `ci` profile, so that is what this leg
+      # warms (dependencies are shared with the `ui` feature build). release-artifact keeps its own cache.
+      - name: Warm the ci profile
         if: matrix.profile == 'release' && (steps.cache.outputs.cache-hit != 'true' || steps.sccache.outputs.enabled == 'true')
-        run: cargo build --release --locked
+        run: cargo build --profile ci --locked
       - name: Warm the clippy profile (not sccache-cacheable; rust-cache only)
         if: matrix.profile == 'clippy' && steps.cache.outputs.cache-hit != 'true'
         run: |

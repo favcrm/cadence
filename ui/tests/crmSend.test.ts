@@ -269,6 +269,7 @@ async function mountedFlow() {
     new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
   const refused = (message: string, status = 409) => json({ error: message }, status);
   let smtpError: string | null = null;
+  let testPending = false;
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const path = String(input);
     const url = new URL(path, "http://localhost");
@@ -295,6 +296,15 @@ async function mountedFlow() {
       const doc = contents[body.campaign_id];
       if (bindings.current === null) return refused("CRM SMTP sender refused or unavailable", 409);
       if (!doc) return refused("CRM SMTP sender refused or unavailable", 409);
+      if (testPending) {
+        return json({ receipt: {
+          test_send: true, kind: "test", campaign_id: body.campaign_id, to_email: body.to_email,
+          accepted: false, pending_approval: true, transport_kind: "agenticos",
+          smtp_code: null, smtp_message: "waiting for owner approval in AgenticOS",
+          content_revision: doc.revision, content_digest: doc.content_digest,
+          link_digest: "sha256:link1", delivery_claim: "smtp-acceptance-only",
+        } });
+      }
       testAccepted = true;
       return json({ receipt: {
         test_send: true, kind: "test", campaign_id: body.campaign_id, to_email: body.to_email,
@@ -341,6 +351,7 @@ async function mountedFlow() {
           { send_id: send.send_id, customer_id: "customer-a", email: "a***@example.com", idempotency_key: "k1", state: "accepted", attempts: 1, smtp_code: 250, reason: null, resolved_by: null, delivery_claim: "smtp-acceptance-only" },
           { send_id: send.send_id, customer_id: "customer-c", email: "c***@example.com", idempotency_key: "k2", state: "accepted", attempts: 1, smtp_code: 250, reason: null, resolved_by: null, delivery_claim: "smtp-acceptance-only" },
           { send_id: send.send_id, customer_id: "customer-e", email: "e***@example.com", idempotency_key: "k3", state: "uncertain", attempts: 1, smtp_code: null, reason: "connection lost mid-submission", resolved_by: null, delivery_claim: "smtp-acceptance-only" },
+          { send_id: send.send_id, customer_id: "customer-w", email: "w***@example.com", idempotency_key: "k4", state: "queued", attempts: 0, smtp_code: null, reason: "waiting for owner approval in AgenticOS", resolved_by: null, delivery_claim: "smtp-acceptance-only" },
         ],
       };
       return json({
@@ -483,9 +494,10 @@ async function mountedFlow() {
   // armed, and the frozen-audience panel.
   await settle(() => assert(host.querySelector('section[aria-label="Campaign details"]'), "detail renders"));
   await settle(() => assert(text().includes("news@example.com"), "bound sender paints"));
-  assert(text().includes("smtp.example.com:465") || text().includes("localhost:465"), "transport paints");
-  assert(text().includes("link r1"), "link revision paints");
-  assert(text().includes("http://127.0.0.1:3111"), "the effective unsubscribe origin paints");
+  // CAD-1059: the campaign shows one status line; the sender and the
+  // unsubscribe origin are chosen in Settings -> Email sending.
+  assert(host.querySelector('[data-sending-status="set"]')?.textContent?.includes("news@example.com"), "one status line names the sender");
+  assert(!text().includes("link r1") && !text().includes("auth r1"), "no link or auth revision in the main path");
 
   // No "locked" copy anywhere.
   assert(!text().includes("locked until"), "no locked-until copy remains");
@@ -565,6 +577,8 @@ async function mountedFlow() {
   await sleep(2300);
   equal(showPolls, pollsAfterComplete, "the poll stops on the terminal state — no busy loop");
 
+  const waitingRow = host.querySelector('[data-delivery="customer-w"]');
+  assert(waitingRow?.querySelector('[data-state="pending"]') && !waitingRow.textContent!.includes("failed"), "waiting is not an error state");
   const uncertainRow = host.querySelector('[data-delivery="customer-e"]');
   assert(uncertainRow, "the uncertain row renders");
   const acceptedRow = host.querySelector('[data-delivery="customer-a"]');
@@ -597,60 +611,60 @@ async function mountedFlow() {
     "the resolve wire body is exactly the allowlist",
   );
 
-  // Revoke: the binding's confirm dialog removes the sender — the
-  // test-send control disables with its reason and prepare re-gates.
-  const senderSection = host.querySelector('section[aria-label="SMTP sender"]');
-  assert(senderSection, "the sender section renders");
-  await click(
-    Array.from(senderSection!.querySelectorAll("button")).find((b) => b.textContent === "Revoke binding"),
-  );
-  await settle(() => assert(host.querySelector('section[role="dialog"]'), "revoke confirm opens"));
-  testAccepted = false;
-  const revokeDialog = host.querySelector('section[role="dialog"]');
-  await click(
-    Array.from(revokeDialog!.querySelectorAll("button")).find((b) => b.textContent === "Revoke binding"),
-  );
-  await settle(() => assert(text().includes("No SMTP sender is bound"), "revocation paints unbound"));
-  const testButton = byText("button", "Send test") as HTMLButtonElement | null;
-  assert(testButton && testButton.disabled, "test send disables without a binding");
-  await settle(() => assert(prepareButton()!.disabled, "prepare re-gates without a sender"));
-  assert(text().includes("a live SMTP sender binding"), "the missing sender is named");
-
+  // No sender (revoked in Settings): the status line asks to set up
+  // sending, test send disables and prepare re-gates with its reason.
   await React.act(async () => { root.unmount(); });
+  bindings.current = null;
+  testAccepted = false;
+  const host2 = document.createElement("div");
+  document.body.append(host2);
+  const root2 = createRoot(host2);
+  win.sessionStorage.clear();
+  history.pushState(null, "", "/app-installations/install-crm?ctx=ctx-a&crm=campaigns&record=launch-1");
+  await React.act(async () => {
+    root2.render(
+      React.createElement(AppShell, { installId: "install-crm", viewer: { operator: true, readOnly: false } }),
+    );
+  });
+  await settle(() => assert(host2.querySelector('[data-sending-status="unset"] a[href="/settings/email"]'), "Set up sending links to Settings -> Email sending"));
+  const testButton2 = Array.from(host2.querySelectorAll("button")).find((b) => b.textContent === "Send test") as HTMLButtonElement | undefined;
+  assert(testButton2 && testButton2.disabled, "test send disables without a sender");
+  assert((host2.textContent ?? "").includes("a live SMTP sender binding"), "the missing sender is named");
+  await React.act(async () => { root2.unmount(); });
+  host2.remove();
 
-  // CAD-1064: an enrolled SMTP sender whose settings cannot be read
-  // is still a sender. The panel says why and links to Connections —
-  // it never claims nothing is enrolled.
-  const expectations: [string, string][] = [
-    ["custody_corrupt", "Rotate it to re-enter"],
-    ["withheld_leak", "different password"],
-    ["unavailable", "Rotate it to re-enter"],
-  ];
-  for (const [code, phrase] of expectations) {
-    smtpError = code;
-    const host2 = document.createElement("div");
-    document.body.append(host2);
-    const root2 = createRoot(host2);
-    win.sessionStorage.clear();
-    history.pushState(null, "", "/app-installations/install-crm?ctx=ctx-a&crm=campaigns&record=launch-1");
-    await React.act(async () => {
-      root2.render(
-        React.createElement(AppShell, { installId: "install-crm", viewer: { operator: true, readOnly: false } }),
-      );
-    });
-    const panel2 = () => host2.querySelector('section[aria-label="SMTP sender binding"]');
-    await settle(() => {
-      const t = panel2()?.textContent ?? "";
-      assert(t.includes("can't be used yet"), `${code}: names the unusable sender`);
-      assert(t.includes(phrase), `${code}: gives the fix (${phrase})`);
-    });
-    const t2 = panel2()!.textContent!;
-    assert(!t2.includes("No enrolled SMTP connections"), `${code}: never says nothing is enrolled`);
-    const link = panel2()!.querySelector('a[href="/settings/connections"]');
-    assert(link, `${code}: links to Settings → Connections`);
-    await React.act(async () => { root2.unmount(); });
-    host2.remove();
-  }
+  // Hosted owner approval: a pending test send reads as waiting, not refused.
+  bindings.current = {
+    install_id: "install-crm", context_id: "ctx-a", connection_id: "conn-1",
+    auth_revision: 1, link_revision: 1, state: "live", digest: "sha256:link1",
+    sender: { name: "", address: "acme@cadencecloud.app" },
+    transport: { host: "api.internal", port: 0, tls_mode: "platform", username: "" },
+    transport_kind: "agenticos",
+  };
+  testPending = true;
+  const host3 = document.createElement("div");
+  document.body.append(host3);
+  const root3 = createRoot(host3);
+  win.sessionStorage.clear();
+  history.pushState(null, "", "/app-installations/install-crm?ctx=ctx-a&crm=campaigns&record=launch-1");
+  await React.act(async () => {
+    root3.render(
+      React.createElement(AppShell, { installId: "install-crm", viewer: { operator: true, readOnly: false } }),
+    );
+  });
+  await settle(() => assert(host3.querySelector('[data-sending-status="set"]')?.textContent?.includes("acme@cadencecloud.app"), "hosted sender status line"));
+  const input3 = host3.querySelector("#cmp-test-email") as HTMLInputElement;
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input3, "operator@example.com");
+    input3.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await click(Array.from(host3.querySelectorAll("button")).find((b) => b.textContent === "Send test"));
+  await settle(() => assert(host3.querySelector('[data-testreceipt] [data-state="pending"]'), "pending test send reads as waiting"));
+  assert(!host3.querySelector('[data-testreceipt] [data-state="failed"]') && !host3.textContent!.includes("Refused"), "pending approval is not shown as refused");
+  assert(!host3.querySelector('section[aria-label="Test send"] [role="alert"]'), "pending approval raises no error");
+  await React.act(async () => { root3.unmount(); });
+  host3.remove();
+  testPending = false;
   smtpError = null;
 
   console.log("crm send checks passed");

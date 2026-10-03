@@ -22,7 +22,7 @@ use std::process::Command;
 /// processes it watches. A directory that exists but cannot be listed
 /// marks the walk truncated: the byte count is a lower bound, not a
 /// complete measurement. Returns `(bytes, truncated)`.
-pub(super) fn dir_size(path: &Path) -> (u64, bool) {
+pub(crate) fn dir_size(path: &Path) -> (u64, bool) {
     let (bytes, truncated, _) = dir_size_limited(path, DIR_WALK_BUDGET);
     (bytes, truncated)
 }

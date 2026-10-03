@@ -15,6 +15,7 @@ import DrawerShell, { type DrawerTab } from "./shared/DrawerShell";
 import {
   activityItems,
   buildConsentChange,
+  buildCreateProvenance,
   buildCustomerProfile,
   CONSENT_METHODS,
   CONSENT_NOTE_MAX,
@@ -28,7 +29,7 @@ import {
   viewProfile,
   type CustomerFormFields,
 } from "./customerProfile";
-import { hostActions, type ConsentMethod, type HostRecord, type HostScope } from "./hostActions";
+import { hostActions, type ConsentMethod, type ConsentProvenance, type HostRecord, type HostScope } from "./hostActions";
 
 /**
  * The CRM workspace inside the trusted shared App shell (CAD-781
@@ -412,7 +413,7 @@ function CustomerList({
               {
                 key: "email",
                 header: "Email",
-                cellClassName: "num text-ink-300",
+                cellClassName: "num text-ink-300 crm-nowrap",
                 cell: (record) => viewProfile(record.profile).email ?? "—",
               },
               {
@@ -495,9 +496,12 @@ function CustomerForm({
   formError,
   formId,
   hideConsent,
+  consentMethod,
   onSubmit,
 }: {
   initial: CustomerFormFields;
+  /** Create only: optional "How was consent given?" when a channel is Granted. */
+  consentMethod?: boolean;
   submitLabel: string;
   /** Set when a drawer footer owns the Save button; the form then has none. */
   formId?: string;
@@ -505,9 +509,12 @@ function CustomerForm({
   hideConsent?: boolean;
   pending: boolean;
   formError: string | null;
-  onSubmit: (fields: CustomerFormFields) => void;
+  onSubmit: (fields: CustomerFormFields, provenance: ConsentProvenance | null) => void;
 }) {
   const [fields, setFields] = useState<CustomerFormFields>(initial);
+  const [method, setMethod] = useState<ConsentMethod | "">("");
+  const [note, setNote] = useState("");
+  const granted = fields.consentEmail === "granted" || fields.consentSms === "granted";
   const [fieldError, setFieldError] = useState<string | null>(null);
   const set = (patch: Partial<CustomerFormFields>) => {
     setFields((prev) => ({ ...prev, ...patch }));
@@ -519,13 +526,15 @@ function CustomerForm({
       className={formId ? "grid gap-3" : "card px-4 py-4 grid gap-3"}
       onSubmit={(e) => {
         e.preventDefault();
+        let provenance: ConsentProvenance | null = null;
         try {
           buildCustomerProfile(fields);
+          if (consentMethod && granted) provenance = buildCreateProvenance(method, note);
         } catch (e: unknown) {
           setFieldError(e instanceof ApiError ? e.message : String(e));
           return;
         }
-        onSubmit(fields);
+        onSubmit(fields, provenance);
       }}
     >
       <Field label="Display name" id="crm-display-name" required className="crm-field">
@@ -624,6 +633,36 @@ function CustomerForm({
           )}
         </Field>
       </div>
+      )}
+      {!hideConsent && consentMethod && granted && (
+        <div className="crm-field-row" data-testid="create-consent-method">
+          <Field label="How was consent given? (optional)" id="crm-create-method" className="crm-field">
+            {(c) => (
+              <Select
+                id={c.id}
+                value={method}
+                onChange={(v) => { setMethod(v as ConsentMethod | ""); setFieldError(null); }}
+                options={[{ value: "", label: "Not recorded" }, ...CONSENT_METHODS]}
+                aria-label="How consent was given"
+                full
+              />
+            )}
+          </Field>
+          {method !== "" && (
+            <Field label="Note (optional)" id="crm-create-note" className="crm-field">
+              {(c) => (
+                <input
+                  {...c}
+                  className="field"
+                  value={note}
+                  onChange={(e) => { setNote(e.target.value); setFieldError(null); }}
+                  maxLength={CONSENT_NOTE_MAX}
+                  autoComplete="off"
+                />
+              )}
+            </Field>
+          )}
+        </div>
       )}
       {(fieldError ?? formError) && (
         <ErrorNotice bare>{fieldError ?? formError}</ErrorNotice>
@@ -782,9 +821,10 @@ function CustomerNew({
           <CustomerForm
             initial={EMPTY_CUSTOMER_FORM}
             submitLabel="Create customer"
+            consentMethod
             pending={pending}
             formError={formError}
-            onSubmit={(fields) => {
+            onSubmit={(fields, provenance) => {
               setPending(true);
               setFormError(null);
               let profile: Record<string, unknown>;
@@ -796,7 +836,7 @@ function CustomerNew({
                 return;
               }
               void hostActions
-                .create(scope, newCustomerId(), profile)
+                .create(scope, newCustomerId(), profile, provenance ?? undefined)
                 .then((record) => onCreated(record.id))
                 .catch((e: unknown) => setFormError(friendlyError(e)))
                 .finally(() => setPending(false));
@@ -1047,28 +1087,19 @@ function CustomerDrawer({
               }
           : null
       }
-      menu={
-        ready
-          ? [
-              ...(view?.email
-                ? [{ key: "copy-email", label: "Copy email", onSelect: () => void navigator.clipboard?.writeText(view.email ?? "") }]
-                : []),
-              { key: "outbox", label: "View in Outbox", onSelect: () => {}, disabled: true, title: "Per-customer Outbox view is not available yet" },
-              ...(canWrite
-                ? [{ key: "archive", label: "Archive customer", onSelect: () => {}, destructive: true, disabled: true, title: "Archiving customers is not available yet" }]
-                : []),
-            ]
-          : []
-      }
       secondary={
-        ready && canWrite ? (
+        ready ? (
           <>
-            <Button size="sm" disabled title="Adding to a segment from here is not available yet">
-              Add to segment
-            </Button>
-            <Button size="sm" onClick={() => { setMode("edit"); setFormError(null); }}>
-              Edit
-            </Button>
+            {view?.email ? (
+              <Button size="sm" onClick={() => void navigator.clipboard?.writeText(view.email ?? "")}>
+                Copy email
+              </Button>
+            ) : null}
+            {canWrite ? (
+              <Button size="sm" onClick={() => { setMode("edit"); setFormError(null); }}>
+                Edit
+              </Button>
+            ) : null}
           </>
         ) : undefined
       }

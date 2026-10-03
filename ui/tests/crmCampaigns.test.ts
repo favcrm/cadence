@@ -315,6 +315,8 @@ async function mountedFlow() {
   const applyBodies: any[] = [];
   const saveBodies: any[] = [];
   const sendBodies: any[] = [];
+  const createBodies: any[] = [];
+  const convs: any[] = [{ id: "conv-general", subject: null, is_general: true, title: null }];
   let propSeq = 0;
   // CAD-1016: no manual mint — a scoped chat turn lands the assistant's
   // inert pending proposal on the campaign directly. `landAssistantDraft`
@@ -545,6 +547,17 @@ async function mountedFlow() {
     if (path === "/api/app-installations/install-crm/contexts") return json({ contexts: [
       { id: "ctx-a", install_id: "install-crm", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
     ] });
+    // CAD-1098: conversations — General plus one per campaign subject (idempotent).
+    if (url.pathname === "/api/app-installations/install-crm/conversations") {
+      if (method === "POST") {
+        const body = JSON.parse(String(init!.body));
+        createBodies.push(body);
+        const c = { id: `conv-${body.subject}`, subject: body.subject, is_general: false, title: null };
+        if (!convs.find((x: any) => x.id === c.id)) convs.push(c);
+        return json({ conversation: c });
+      }
+      return json({ conversations: convs });
+    }
     // The shared master thread: sends append a verified-scope entry
     // exactly as the daemon stamps them, and page reads replay it.
     if (method === "POST" && url.pathname === "/api/threads/master/messages") {
@@ -716,6 +729,7 @@ async function mountedFlow() {
   const unsavedCampaignId = saveBodies[0].campaign_id as string;
   await settle(() => assert(sendBodies.length === 1, "the brief went to the scoped chat"));
   equal(sendBodies.at(-1)!.app, { install_id: "install-crm", context_id: "ctx-a" }, "the brief carried the scope");
+  equal(sendBodies.at(-1)!.conversation, `conv-campaign:${unsavedCampaignId}`, "the brief went to the campaign conversation");
   assert(String(sendBodies.at(-1)!.text).includes("Welcome new customers warmly.") && String(sendBodies.at(-1)!.text).includes(unsavedCampaignId), "the brief and the campaign id travel together");
   await settle(() => assert(location.search.includes(`record=${unsavedCampaignId}`), "the first save moves the URL to record=<campaign_id>"));
   assert(!location.search.includes("appview=new"), "the saved campaign leaves the New view");
@@ -934,10 +948,19 @@ async function mountedFlow() {
   // Re-open the saved campaign from its record URL (a fresh mount): the
   // preview auto-renders on open, not on the earlier tab choice.
   const savedCampaignId = openDoc().campaign_id as string;
+  // CAD-1098: the operator switches the chat to General, leaves, and the
+  // campaign page auto-selects its own conversation again.
+  const picker = () => host.querySelector('select[aria-label="Conversation"]') as HTMLSelectElement;
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(picker(), "conv-general");
+    picker().dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  equal(picker().value, "conv-general", "the picker switches to General");
   await openPage("customers");
   await React.act(async () => { navigate(`${location.pathname}?ctx=ctx-a&crm=campaigns&record=${savedCampaignId}`); });
   await flush();
   await settle(() => assert(host.querySelector('[data-tab="overview"][aria-selected="true"]'), "a fresh detail opens on Overview"));
+  await settle(() => equal(picker().value, `conv-campaign:${savedCampaignId}`, "the campaign page auto-selects its conversation"));
   await openTab("audience");
   await settle(() => assert(host.querySelector('section[aria-label="Frozen audience"]'), "detail names its freeze panel"));
   await openTab("email");
@@ -956,7 +979,7 @@ async function mountedFlow() {
         .map((el) => el.getAttribute("aria-label"));
     };
     const overview = await panelsOf("overview");
-    for (const label of ["Ready to send", "Campaign summary", "Content approval", "SMTP sender", "Test send", "Final send"]) {
+    for (const label of ["Ready to send", "Campaign summary", "Content approval", "Test send", "Final send"]) {
       assert(overview.includes(label), `Overview carries: ${label}`);
     }
     assert(!overview.includes("Frozen audience") && !overview.includes("Email preview"), "Overview mounts no other tab's panels");

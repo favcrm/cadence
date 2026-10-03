@@ -22,32 +22,65 @@ this workflow exactly.
   carry a different id.
 - Work in the lane worktree that `cadence issue start <ID>` creates,
   never on main.
+- One PR per feature (CAD-1099, CAD-1107), behind a flag if it must land
+  incomplete, not a chain of small slices: each extra PR repeats CI, review,
+  approval and queue. Size a PR by what it delivers (the ticket's acceptance
+  end to end), never by a line cap. Sub-tickets of one feature ship in that
+  one PR under the parent ticket's id in the title; the body lists them.
+  Split only per repository, or to keep a small trigger 1/3 part on the
+  two-review path so the rest needs one. Unfinished parts go into the open
+  PR before review; REVISE fixes go into the same PR; notes on a PASS go to
+  a follow-up PR (see "Notes never block"). Don't stack a PR on an unmerged
+  branch: squash merges break the stack. Before asking for review,
+  `git fetch origin && git rebase origin/main` so the reviewed head is
+  current; after approval, rebase only if the PR conflicts.
 
-### Design contract first (CAD-957)
-A ticket needs a design contract when it touches a daemon-enforced rule
-(gate, lease, lock, fence, operator-only action, exactly-once) or a
-`docs/roles/risk-classes.md` trigger 1-3, or trigger 7 when it changes a
-gate or who approves what. The PM or ticket author
-declares it, a reviewer may add it, and when unsure it counts.
-- The assignee writes it from `docs/design/CONTRACT-TEMPLATE.md`, in the
-  ticket or the PR, before code.
-- One Spec/security reviewer (not the author) passes it BEFORE code, in a
-  verdict note titled `# Verdict: <ID> Design contract review — pass|revise`,
-  pinned to the contract's commit or blob SHA (for a contract kept in a
-  ticket, the sha256 of the contract text). A changed contract has a
-  changed hash and voids the pass.
-- The code PR links the contract and cites that note. Its reviewers check
-  the code against the contract, and each adversarial test it names must
-  exist and fail without its guard. The contract reviewer MAY also do the
-  code's Spec/security review.
+### Design note in the PR (CAD-957, revised by CAD-1099)
+When a change touches a daemon-enforced rule (gate, lease, lock, fence,
+operator-only action, exactly-once) or a `docs/roles/risk-classes.md`
+trigger 1-3, or trigger 7 when it changes a gate or who approves what, the PR
+description carries a short design note: the approach, the rules it enforces
+and the cases it refuses. There is no separate pre-code contract review
+round; the code review checks the note and the code together. The operator
+may still ask for a design to be agreed on the ticket before code.
 
 ### Review: what a merge needs (interim, CAD-815)
 Until the delivery loop enforces a per-project policy (CAD-814), every
 PR needs each of the following as a PASS on the exact head you enqueue:
-- **Standards** and **Spec/security** reviews, by two different
-  independent reviewers. Neither may be the author. Prefer a reviewer
-  whose model vendor differs from the author's.
-  - **Reviewer-count scaling (CAD-814):** the default is two distinct
+- **One independent review by default (CAD-1099, CAD-1104).** A PR needs ONE
+  independent review covering standards and spec, filed as
+  `# Verdict: <ID> Review (standards+spec) — pass|revise`, when every
+  changed path qualifies under `docs/roles/one-review-paths.toml`. That list
+  covers code, docs, CI/workflows, scripts, rules, dependencies and rollout.
+  It EXCLUDES only trust-boundary/identity and secrets (risk-classes
+  triggers 1 and 3: the auth/identity modules, the identity-heavy source
+  trees listed in that file, and UI, since the board runs with the
+  operator's session). A PR touching an excluded path needs **Standards**
+  and **Spec/security** reviews by two different independent reviewers.
+  For a `human`-class PR (see below) the operator's approval is the second
+  check, so one reviewer plus the operator is enough outside triggers 1
+  and 3. No reviewer may be the author. Prefer a reviewer whose model
+  vendor differs from the author's.
+- **Notes never block (CAD-1104).** REVISE only for a correctness,
+  security or ticket-requirement gap. Everything else (wording, docs,
+  comments, style, extra tests) is a note: the reviewer PASSes with notes,
+  and the author fixes them in a follow-up PR, not in the reviewed PR,
+  because a new head voids every verdict. A gate or daemon-enforced rule
+  change without its acceptance check ("Gates and security work") is a
+  REVISE, not a note.
+- **The path list is a floor.** A single reviewer who sees auth, identity,
+  credential, signature, secret or confinement logic (triggers 1 and 3) in
+  a one-review PR returns REVISE asking for a second (Spec/security)
+  reviewer, and states the trigger in `Risk:`. When unsure, two. Gate,
+  CI and rules logic stays one review: the operator's approval (enforced
+  from `docs/roles/risk-paths.toml` by `scripts/enqueue-reviewed`) is its
+  second check. The PR
+  then follows the two-review path: the same reviewer refiles as the
+  Standards review on the head, and a different reviewer files Spec/security. A single
+  reviewer of a PR that changes or deletes a check states that no gate check
+  and no isolation or fail-closed default was weakened, naming what was
+  checked.
+  - **Reviewer-count scaling (CAD-814):** for a two-review PR, the default is two distinct
     reviewers. When the project runs a solo-operator lane — the author is
     the only registered reviewer-capable identity on the project — a
     single independent registered-identity reviewer (not the author) may
@@ -61,20 +94,11 @@ PR needs each of the following as a PASS on the exact head you enqueue:
     policy, not per PR; it does not apply to any `human` trigger other
     than reviewer count, and it never lowers the Browser QA,
     qa-verdict-status, or risk-class gates.
-  - **Risk-sized count (CAD-957):** an exception to the two-reviewer
-    default. A PR whose every change qualifies under
-    `docs/roles/one-review-paths.toml` (an allowlist of plain prose
-    guides and, per CAD-965, top-level integration test files
-    (`tests/*.rs`); test helpers under tests/common keep two reviews;
-    match rules in its header) needs ONE independent review covering
-    standards and spec, filed as
-    `# Verdict: <ID> Review (standards+spec) — pass|revise`. Unlike
-    solo-operator scaling, it needs no operator approval for the count.
-    For a test-only PR the single reviewer must state in the verdict
-    that no adversarial gate test and no test-isolation or fail-closed
-    default was weakened or deleted, naming what was checked. Any other
-    PR (including any with `src/**`) keeps two. `human` triggers are
-    unchanged. That file is the only list; scripts read it.
+  - **The list is mechanical (CAD-957/1099):** `docs/roles/one-review-paths.toml`
+    (match rules in its header; exclude wins) is the only list, and
+    `scripts/enqueue-reviewed` reads it at the PR's base. It needs no
+    operator approval for the count. `human` triggers are unchanged: a
+    one-review PR that hits a `human` trigger still needs the operator.
 - **Browser QA** at desktop and narrow widths when the PR changes
   `ui/**`.
 - **Operator approval** when any `human` trigger in
@@ -91,6 +115,25 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   an operator connection (not an agent pane or endpoint):
   `cadence audit approve --pr <n> --head <full-sha> --source "<who decided, where>"`.
   A note or ticket comment is not approval evidence (`docs/AUDIT.md`).
+  **Approve once per ticket (CAD-1106):** instead of a per-head approval the
+  operator may run `cadence audit approve --issue <ID> --action scope` once;
+  `scripts/enqueue-reviewed` then accepts it for every in-scope PR of that
+  ticket when: the PR title names the ticket, its branch is an open lane
+  branch recorded on it, the approval is operator-connection, unrevoked and
+  its digest equals the sha256 of the ticket body as it reads now, every
+  head-pinned verdict's `Risk:` line is `auto` or `human (<numbers>)` without
+  trigger 1 or 3, and each counted verdict carries `Scope: in-scope <ID>`.
+  The ticket body declares its triggers (`Risk: human (4, 7)`; missing or
+  unparseable means no scope approval) and the approval covers only those:
+  the triggers of the changed paths (risk-paths `[schema]`/`[trigger4]`/
+  `[trigger6]`/`[trigger7]`) and of every verdict must be declared, and a
+  human-class path in no trigger list needs the per-head approval. A diff
+  touching a risk-paths trigger 1/3 path or a two-review path always needs
+  the per-head approval, and so does a ticket not in ready, doing or review (backlog, done, dropped). A
+  verdict with more than one `Risk:` line, or a ticket body with more than
+  one line containing `Risk:` (Markdown markers stripped; fenced code and
+  HTML comments count), gives no scope approval. Editing the ticket body voids the scope
+  approval (the digest changes); `cadence audit revoke <id>` withdraws it.
 - **Delegated approval** (CAD-918) when the reviewers class the PR
   `delegated` (`docs/roles/risk-classes.md`): the agent designated for
   the project runs, from its own pane,
@@ -174,75 +217,29 @@ Bot reviews (Devin Review, CodeRabbit and similar) are advisory:
 
 ### Behavior-first verification and delivery outcomes (CAD-1071)
 
-Verify the promised behavior, not the shape of the implementation or the
-number of tests. A green suite is regression evidence, not product acceptance.
-These are working instructions, not a claim of new automated enforcement.
+Done means the ticket's expected result works, not a test count. A green
+suite is regression evidence, not product acceptance.
 
-- Before implementation, derive acceptance from the issue and reviewed design
-  contract: given state/input, expected observable result, relevant refusal or
-  recovery result, and forbidden side effects. Resolve consequential ambiguity;
-  do not derive expected results solely from the code the agent just wrote.
-- Map each promised outcome to an executable check or observed demonstration
-  in the appropriate isolated environment. Existing checks may suffice; do not
-  add a case just because a function changed. For bug fixes, run a reproduction
-  that fails on the defective behavior and passes after the fix. Setup/build
-  failures and empty selections are not evidence that the behavior was caught.
-- Iterate with focused behavior checks and sandbox probes, inspect actual
-  execution feedback, then repair. Prefer cheap state/property checks for logic;
-  use real process, RPC/HTTP, persistence and browser boundaries when their
-  wiring is the contract. Fakes cannot establish real-provider compatibility.
-  Do not turn every assertion into a slow end-to-end journey.
-- Select checks by the changed contract AND its consumers, not only changed
-  test filenames: a new CLI verb can affect help snapshots; a shared model can
-  break another target's compilation. Mandatory pre-push, admission/isolation,
-  independent review, Browser QA and required CI/merge-queue gates still apply.
-  A focused pass, temporary probe or LLM judgment does not replace those gates.
-- At handoff, record who ran each check, actual revision and any uncommitted
-  tree changes, command, selected scope and test count (where applicable), exit
-  status/result, and evidence artifact or log. Label earlier-head, stacked-head
-  and simulated-environment results explicitly; do not call them exact-final-
-  head or live-system proof. State skipped checks and limitations. If execution
-  is blocked, report it and use an authorized runner; never narrate an unrun pass.
-- Acceptance links each promised outcome to that evidence, including material
-  failure paths. Keep implemented, reviewed, merged, installed and operationally
-  verified distinct; do not touch production to obtain acceptance evidence.
+- Read the acceptance items from the ticket and build to them. Don't derive
+  the expected result from the code you just wrote.
+- The evidence is required CI green plus the independent review of the code
+  against the ticket. Do not add routine unit tests, snapshot or fixture
+  tests, stress runs, sandbox demos or evidence ledgers unless the ticket asks
+  for one. For a bug fix, show the failing case once, then fixed.
+- Self-written tests confirm the author's own assumptions: a fake that mirrors
+  the client proves nothing about the real server. When a change talks to
+  another repo's API, check the request and response against that repo's
+  current schema.
+- Never claim a check passed that you did not run. Keep implemented, reviewed,
+  merged, installed and operationally verified distinct; do not touch
+  production to obtain acceptance evidence.
 
-#### Rebuild tests from current contracts, not legacy inheritance
+#### Legacy tests
 
-Existing tests are migration evidence, not the specification of intended
-behavior and not an automatic reason to retain them. A clean-slate family
-replacement may remove obsolete or implementation-coupled tests, but it does
-not reduce the protected contracts or merge gates. A replacement PR must:
-
-1. Name the current intended behaviors, forbidden effects and required controls
-   it covers. Security/identity, agent and detached-child refusals, concurrency
-   and exactly-once behavior, RPC/HTTP parity, persistence/migration/recovery,
-   timing bounds, test isolation and fail-closed defaults remain required where
-   the system enforces them; gate inputs, inventory contracts, default-feature
-   refusal proofs and release test-seam exclusion are protected too. A logic
-   fake cannot replace a required boundary proof.
-2. In the same family-scoped PR, provide behavior checks for every still-
-   required contract it retires, or state the operator-approved reduced-
-   coverage transition and its exclusions. An authorization or delivery gate
-   may never retain an unprotected production effect merely because its legacy
-   test was removed. A genuinely obsolete contract needs a reviewed spec change.
-3. Demonstrate that a replacement catches the relevant wrong behavior with the
-   historical reproduction, a deliberate guard mutation or another concrete
-   counterexample; the failure must come from the behavioral assertion, not
-   broken setup. Independent reviewers verify the contract mapping and
-   execution evidence before removal. Temporary exploration probes alone are
-   not retained coverage.
-4. New development rebuilds checks for the behavior it changes rather than
-   recreating implementation-coupled suites. Consolidate redundant setup/cases
-   by shared behavior and update affected inventory/split maps and required
-   gate wiring without silently reducing protected contracts. Classify each
-   replacement PR from its own diff under existing risk/review rules; this
-   policy grants no approval or exception to them. Never skip, ignore or weaken
-   checks merely to get green.
-5. Do not claim equivalence or speed from deletion alone. Measure the
-   replacement on comparable runs, distinguish compile/setup, test execution,
-   admission/runner waits and workflow wall time, and list residual unprotected
-   contracts. Diagnose fixture failures rather than masking them with retries.
+Do not port, restore or rebuild deleted or legacy tests. Add a check only when
+the ticket's outcome cannot be shown without one, or under "Gates and security
+work" below. Removing an existing check that guards merged code needs the
+operator's explicit decision, recorded on the ticket.
 
 #### Emergency clean-slate transition
 
@@ -287,7 +284,7 @@ normal gates return. An agent or PR may not grant that exception to itself.
   clippy, UI typecheck and active script contracts for what you changed).
   Use `scripts/pre-push --tests` before requesting review of Rust changes:
   during CAD-1073 it always runs the safety floor, even when its source is
-  unchanged. It does not replace behavior tests for the changed contract.
+  unchanged. It is the regression floor, not proof of the ticket's outcome (see "Behavior-first verification").
   Integration split manifests are retired; do not run `split-map-sync`
   until a reviewed inventory restoration establishes its inputs.
 - sccache is the host-wide rustc wrapper (set in `~/.cargo/config.toml`).
@@ -389,10 +386,13 @@ mapping, process owner, permitted operations and rollback artifact.
   by name. Never run `rm <scratchpad>/*`.
 
 ### Gates and security work
-- For any rule the daemon enforces (operator-only actions, "exactly
-  once", a gate), write the adversarial test first. That means an agent
-  caller, a detached child (`setsid`), concurrent calls, and a forged
-  field. Prove the test fails without the guard.
+- A rule the daemon or an HTTP route enforces (auth, operator-only,
+  exactly-once, a gate), whether new or changed, or a change that deletes
+  data, ships with ONE acceptance check proving the bad case is refused (for
+  example an agent caller, a forged field or a replay). It is written from
+  the ticket by someone other than the implementer (the reviewer or the
+  ticket author), and the implementer may not edit or weaken it. The
+  reviewer confirms it exercises the real guard. No other ceremony.
 - A board or HTTP path must be at least as strict as the daemon RPC it
   relays, so run the same operator proof on the HTTP peer.
 - Restrict actors with allowlists, not denylists.

@@ -103,13 +103,13 @@ fn external_provider_pin_accepts_only_the_registered_underscore_name() {
 fn legacy_image_hosts_key_is_accepted_and_ignored() {
     let config = serde_json::json!({"schema":1,"providers":[{
         "provider":"agenticos_external","origin":"https://app-v2.agenticos.hk",
-        "manifest_pin":"agenticos-external-provider-tools@2",
+        "manifest_pin":"agenticos-external-provider-tools@3",
         "image_hosts":["cdn.example.test"]
     }]});
     let parsed = DeploymentMetadata::parse(&serde_json::to_vec(&config).unwrap()).unwrap();
     assert_eq!(
         parsed.pin("agenticos_external", "https://app-v2.agenticos.hk"),
-        Some("agenticos-external-provider-tools@2")
+        Some("agenticos-external-provider-tools@3")
     );
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -124,7 +124,7 @@ fn legacy_image_hosts_key_is_accepted_and_ignored() {
 }
 
 // CAD-868: this is a trusted embedding assertion, not a caller-selected mode.
-const HOSTED_MEDIA_CONFIG: &str = r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@2","transport":"hosted-media-lease@1"}]}"#;
+const HOSTED_MEDIA_CONFIG: &str = r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#;
 
 #[test]
 fn hosted_media_transport_assertion_accepts_exact_composition() {
@@ -132,7 +132,7 @@ fn hosted_media_transport_assertion_accepts_exact_composition() {
         .expect("trusted hosted media composition must be admitted");
     assert_eq!(
         metadata.pin("agenticos_external", "http://api.internal"),
-        Some("agenticos-external-provider-tools@2")
+        Some("agenticos-external-provider-tools@3")
     );
 }
 
@@ -160,9 +160,10 @@ fn hosted_media_transport_assertion_refuses_malformed_or_mismatched_composition(
             "manifest_pin",
             serde_json::json!("agenticos-external-manifest@1"),
         ),
+        // CAD-1096: an image still baking @2 refuses against this build.
         (
             "manifest_pin",
-            serde_json::json!("agenticos-external-provider-tools@3"),
+            serde_json::json!("agenticos-external-provider-tools@2"),
         ),
     ] {
         let mut invalid = config.clone();
@@ -238,7 +239,7 @@ fn hosted_lease_attach_without_external_url_exposes_only_builtin_source_and_medi
     for config in [
         CONFIG,
         r#"{"schema":1,"providers":[]}"#,
-        r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@2"}]}"#,
+        r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3"}]}"#,
     ] {
         let metadata = DeploymentMetadata::parse(config.as_bytes()).unwrap();
         assert!(metadata.hosted_media().is_none());
@@ -275,7 +276,7 @@ fn hosted_lease_attach_without_external_url_exposes_only_builtin_source_and_medi
         .expect("trusted metadata alone must register hosted media");
     assert_eq!(
         adapter.reported_manifest_version().as_deref(),
-        Some("agenticos-external-provider-tools@2")
+        Some("agenticos-external-provider-tools@3")
     );
     let table = adapter.table();
     assert_eq!(table.platform, "agenticos_external");
@@ -287,11 +288,7 @@ fn hosted_lease_attach_without_external_url_exposes_only_builtin_source_and_medi
             .map(|t| (t.tool.as_str(), t.effect.as_deref(), t.scopes.join(",")))
             .collect::<Vec<_>>(),
         vec![
-            (
-                "scrapecreators.instagram.user.posts",
-                Some("read"),
-                "provider.read".into()
-            ),
+            ("read_instagram_posts", Some("read"), "provider.read".into()),
             ("generate_image", Some("draft"), "provider.draft".into()),
         ]
     );
@@ -303,11 +300,11 @@ fn hosted_lease_attach_without_external_url_exposes_only_builtin_source_and_medi
             "schema":1,"provider":"agenticos_external","revision":"agenticos-hosted-connections/2",
             "enrollment_shapes":[],"builtin_accounts":["hosted"],
             "capabilities":[
-                {"id":"social.read","version":1,"tools":["scrapecreators.instagram.user.posts"],"scopes":["provider.read"],"effect":"read","semantics":"metadata_read"},
+                {"id":"social.read","version":1,"tools":["read_instagram_posts"],"scopes":["provider.read"],"effect":"read","semantics":"metadata_read"},
                 {"id":"media.generate","version":1,"tools":["generate_image"],"scopes":["provider.draft"],"effect":"draft","semantics":"preview_only"}
             ],
             "action_mappings":[
-                {"capability":"social.read","version":1,"action":"list_posts","resource_kind":"connection_account","tool":"scrapecreators.instagram.user.posts","scopes":["provider.read"],"effect":"read","semantics":"metadata_read","input_contract":"social.posts.query@1","output_contract":"social.posts.receipt@1"},
+                {"capability":"social.read","version":1,"action":"list_posts","resource_kind":"connection_account","tool":"read_instagram_posts","scopes":["provider.read"],"effect":"read","semantics":"metadata_read","input_contract":"social.posts.query@1","output_contract":"social.posts.receipt@1"},
                 {"capability":"media.generate","version":1,"action":"generate_image","resource_kind":"connection_account","tool":"generate_image","scopes":["provider.draft"],"effect":"draft","semantics":"preview_only","input_contract":"media.image.prompt@1","output_contract":"media.image.asset@1"}
             ]
         })

@@ -118,9 +118,20 @@ impl Shared {
                  an enrolled endpoint — caller identity ambiguous",
                 chain[p]
             ))),
-            (pane, Some(r)) if pane.is_none_or(|p| r < p) => Ok(Some(SlotWho::Strict(
-                slots.strict_caller(peer_pid, chain[r])?,
-            ))),
+            (pane, Some(r)) if pane.is_none_or(|p| r < p) => {
+                let caller = slots.strict_caller(peer_pid, chain[r])?;
+                // CAD-1021: a runner an UNREGISTERED caller launched is
+                // enrolled under the daemon's `unregistered:<uid>` label.
+                // That label is a queue position, never an agent: its
+                // process tree derives NO identity here — the single
+                // choke point every `slot_identity` consumer (the caller
+                // rule, requests, operator verbs) reads — so it stays as
+                // unproven as the caller that launched it.
+                if crate::slots::is_unregistered_lane(&caller.lane) {
+                    return Ok(None);
+                }
+                Ok(Some(SlotWho::Strict(caller)))
+            }
             (Some(p), _) => {
                 let lane = adapter::pty::nearest_pane(&chain[p..], &panes)
                     .cloned()
@@ -140,6 +151,28 @@ impl Shared {
                  underivable"
             ))
         })
+    }
+
+    /// CAD-1021: [`Self::slot_caller`] widened by exactly one clean
+    /// answer — a caller that derives NO pane and NO managed endpoint
+    /// (`slot_identity` is `Ok(None)`) is [`SlotPeer::Unregistered`],
+    /// labelled `unregistered:<uid>` from the socket peer's kernel
+    /// credentials. An unreadable ancestry, an ambiguous node or a failed
+    /// strict verification still REFUSE (`slot_identity`'s `Err`): only
+    /// the clean "no identity" falls through, never an error. The label
+    /// is never read from a request, so a forged `lane`/`alias` field has
+    /// nowhere to land.
+    fn slot_or_unregistered(&self, peer_pid: u32) -> Result<SlotPeer> {
+        match self.slot_identity(peer_pid)? {
+            Some(who) => Ok(SlotPeer::Known(who)),
+            None => {
+                let uid = super::serve::frame_peer_uid(self.agent_uid)?;
+                Ok(SlotPeer::Unregistered {
+                    lane: format!("{}{uid}", crate::slots::UNREGISTERED_LANE_PREFIX),
+                    peer: peer_pid,
+                })
+            }
+        }
     }
 
     /// The pid a slot request may bind: the socket peer itself or one
@@ -165,8 +198,29 @@ impl Shared {
     /// for a strict caller, off its verified segment) is refused.
     pub(super) fn rpc_slot_acquire(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.revalidate_enrollments()?;
-        let who = self.slot_caller(peer_pid)?;
+        let who = self.slot_or_unregistered(peer_pid)?;
         let kind = SlotKind::parse(required_str(params, "kind")?)?;
+        // CAD-1021: what an unregistered caller may ask for is an
+        // ALLOWLIST — a build or test slot, exec-bound to the process
+        // that asked (`build-slot run`), nothing else. No `suite` (its
+        // pool and priority lanes are the registered lanes'), no `check`
+        // (the recipe-bound pre-push gate), no hand-held `acquire`
+        // bound to an ancestor.
+        if let SlotPeer::Unregistered { lane, .. } = &who {
+            let exec = params["exec"].as_bool().unwrap_or(false);
+            if !matches!(kind, SlotKind::Build | SlotKind::Test) || !exec {
+                return Err(Error::rejected(format!(
+                    "{lane}: a caller with no registered pane or managed endpoint \
+                     may queue only a build or test slot through `cadence build-slot \
+                     run` — {} is refused",
+                    if exec {
+                        kind.as_str().to_string()
+                    } else {
+                        "a hand-held acquire".to_string()
+                    }
+                )));
+            }
+        }
         let request_id = required_str(params, "request_id")?;
         if request_id.len() > 128 {
             return Err(Error::rejected("Slot request_id must be <= 128 bytes"));
@@ -219,8 +273,10 @@ impl Shared {
         let clk = crate::slots::SlotClock::at((self.slot_clock)(), epoch_secs());
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let (mut result, events) = match &who {
-            SlotWho::Pane { lane, .. } => slots.acquire(kind, lane, pid, request_id, probe, clk)?,
-            SlotWho::Strict(caller) => {
+            SlotPeer::Known(SlotWho::Pane { lane, .. }) | SlotPeer::Unregistered { lane, .. } => {
+                slots.acquire(kind, lane, pid, request_id, probe, clk)?
+            }
+            SlotPeer::Known(SlotWho::Strict(caller)) => {
                 slots.acquire_strict_bound(kind, caller, pid, request_id, probe, clk, exec)?
             }
         };
@@ -299,7 +355,22 @@ impl Shared {
     /// lineage.
     pub(super) fn rpc_slot_release(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.revalidate_enrollments()?;
-        let who = self.slot_caller(peer_pid)?;
+        let who = match self.slot_caller(peer_pid) {
+            Ok(who) => who,
+            // CAD-1021: an unregistered caller's `run` hold is bound to
+            // the exec'd process and ends with it — there is no release
+            // verb for a lane the daemon cannot name.
+            Err(e) => {
+                return Err(match self.slot_identity(peer_pid) {
+                    Ok(None) => Error::rejected(
+                        "slot release needs a registered pane or managed endpoint — \
+                         an unregistered caller's `build-slot run` hold ends with its \
+                         process and is never released by hand",
+                    ),
+                    _ => e,
+                })
+            }
+        };
         let token = required_str(params, "token")?;
         let pid = Self::claimed_slot_pid(params, who.chain(), peer_pid)?;
         let now = (self.slot_clock)();
@@ -319,7 +390,7 @@ impl Shared {
     /// pid. A `lane` param is ignored — identity is the connection's.
     pub(super) fn rpc_slot_status(&self, _params: &Value, peer_pid: u32) -> Result<Value> {
         self.revalidate_enrollments()?;
-        let who = self.slot_caller(peer_pid)?;
+        let who = self.slot_or_unregistered(peer_pid)?;
         let (status, events) = self.slots.lock().unwrap_or_else(|e| e.into_inner()).status(
             crate::slots::SlotCaller {
                 lane: who.lane(),
@@ -376,7 +447,12 @@ impl Shared {
     /// enrolled managed endpoint (phase a), or — deriving neither — the
     /// proven operator ([`crate::peer::operator_proof`]). A runner's own
     /// process tree, a revoked or expired endpoint, a failed strict
-    /// verification and anything unproven are refused, naming the rule.
+    /// verification are refused, naming the rule. CAD-1021: anything else
+    /// that derives no identity and is not provably the operator queues as
+    /// the daemon-labelled `unregistered:<uid>` (build/test recipes with no
+    /// env only — [`Self::unregistered_launch_allowed`]); that label is not
+    /// an agent, and the runner tree it enrolls derives no identity either
+    /// ([`Self::slot_identity`]).
     fn launch_requester(&self, peer_pid: u32) -> Result<crate::runner::Requester> {
         let requester = |kind: &str, lane: String| crate::runner::Requester {
             kind: kind.to_string(),
@@ -394,17 +470,50 @@ impl Shared {
             }
             // `(operator)` can never be an agent alias, so the operator's
             // runners never share a lane (or its events) with an agent.
+            //
+            // CAD-1021: deriving no identity AND no operator proof is
+            // not a refusal any more — the caller queues as the
+            // daemon-labelled `unregistered:<uid>`, restricted by
+            // `unregistered_launch_allowed` to a recipe that is only a
+            // build or test with no daemon env passed through. The label
+            // is never an alias and never the operator.
             None => match self.operator_evidence(peer_pid) {
                 Ok(()) => Ok(requester("operator", OPERATOR_LANE.to_string())),
-                Err(why) => Err(Error::rejected(format!(
-                    "build-slot launch needs a pane agent, an enrolled managed \
-                     endpoint or the proven operator — this connection derives no \
-                     slot identity and is not provably the operator: {why}. Launch \
-                     from an agent's pane or managed endpoint, or from an attached \
-                     operator shell"
-                ))),
+                Err(_) => match self.slot_or_unregistered(peer_pid)? {
+                    SlotPeer::Unregistered { lane, .. } => Ok(requester("unregistered", lane)),
+                    SlotPeer::Known(_) => Err(Error::rejected(
+                        "slot caller identity changed while launching",
+                    )),
+                },
             },
         }
+    }
+
+    /// CAD-1021: what an unregistered launch may run — an ALLOWLIST on
+    /// the resolved recipe. Only a `build` or `test` recipe, and only
+    /// one that passes NO daemon environment through (`env` empty): a
+    /// recipe's env allowlist names daemon-held variables, which a caller
+    /// the daemon cannot name must never receive. The recipe itself still
+    /// comes only from the project's config.
+    fn unregistered_launch_allowed(intent: &crate::runner::Intent) -> Result<()> {
+        if !matches!(intent.kind, SlotKind::Build | SlotKind::Test) {
+            return Err(Error::rejected(format!(
+                "recipe '{}' is kind '{}' — a caller with no registered pane or \
+                 managed endpoint may launch only build or test recipes",
+                intent.recipe,
+                intent.kind.as_str()
+            )));
+        }
+        if !intent.env.is_empty() {
+            return Err(Error::rejected(format!(
+                "recipe '{}' passes daemon environment through ({}) — a caller with \
+                 no registered pane or managed endpoint may launch only a recipe \
+                 that declares no env",
+                intent.recipe,
+                intent.env.join(", ")
+            )));
+        }
+        Ok(())
     }
 
     /// `slot_launch` (CAD-230b) — run one of a project's recipes as a
@@ -448,6 +557,9 @@ impl Shared {
                 .min(RUNNER_MAX_WAIT_SECS),
         };
         let intent = crate::runner::resolve(&self.pm_dir()?, project, recipe, worktree)?;
+        if requester.kind == "unregistered" {
+            Self::unregistered_launch_allowed(&intent)?;
+        }
         let log = crate::runner::log_path(&self.state_dir, &intent.runner_id);
         let mut receipt =
             crate::runner::Receipt::pending(&intent, requester.clone(), &log, epoch_secs());
@@ -699,19 +811,44 @@ impl Shared {
     pub(super) fn rpc_slot_runner(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         // CAD-422: the one caller verifier decides — a derived agent or
         // the proven operator reads a receipt; an unproven connection
-        // is refused.
-        match self.connection_caller(peer_pid)? {
-            caller_rule::Who::Operator | caller_rule::Who::Agent(_) => {}
-            caller_rule::Who::Unproven(why) => {
-                return Err(Error::rejected(format!(
-                    "slot runner is an operator or registered-agent read — this \
-                     connection derives no agent identity and is not provably \
-                     the operator: {why} (caller rule, CAD-422)"
-                )));
-            }
-        }
+        // is refused. CAD-1021: the one addition is an unregistered
+        // caller reading ITS OWN receipt (its daemon-minted label is the
+        // receipt's requester lane) — `launch` follows its runner with it.
+        let unproven = match self.connection_caller(peer_pid)? {
+            caller_rule::Who::Operator | caller_rule::Who::Agent(_) => None,
+            caller_rule::Who::Unproven(why) => Some(why),
+        };
+        // Authorize BEFORE reading: an unproven caller learns nothing
+        // about whether a runner id exists beyond its own label's.
+        let own_label = match unproven {
+            None => None,
+            Some(why) => match self.slot_or_unregistered(peer_pid)? {
+                SlotPeer::Unregistered { lane, .. } => Some(lane),
+                SlotPeer::Known(_) => {
+                    return Err(Error::rejected(format!(
+                        "slot runner is an operator or registered-agent read — this \
+                         connection derives no agent identity and is not provably \
+                         the operator: {why} (caller rule, CAD-422)"
+                    )))
+                }
+            },
+        };
         let id = required_str(params, "runner_id")?;
-        let receipt = crate::runner::read_receipt(&self.state_dir, id)?;
+        let Some(lane) = own_label else {
+            let receipt = crate::runner::read_receipt(&self.state_dir, id)?;
+            return serde_json::to_value(&receipt).map_err(|e| Error::internal(e.to_string()));
+        };
+        // One answer for "absent", "unreadable" and "someone else's".
+        let refuse = || {
+            Error::rejected(
+                "slot runner: an unregistered caller reads only its own runner \
+                 (or none — the same answer for an absent id)",
+            )
+        };
+        let receipt = crate::runner::read_receipt(&self.state_dir, id).map_err(|_| refuse())?;
+        if !(receipt.requester.kind == "unregistered" && receipt.requester.lane == lane) {
+            return Err(refuse());
+        }
         serde_json::to_value(&receipt).map_err(|e| Error::internal(e.to_string()))
     }
 
@@ -733,3 +870,6 @@ impl Shared {
         }
     }
 }
+
+#[cfg(test)]
+mod unregistered_tests;

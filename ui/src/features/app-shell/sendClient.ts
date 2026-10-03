@@ -134,6 +134,8 @@ export interface SmtpBinding {
   digest: string;
   sender: { name: string; address: string };
   transport: { host: string; port: number; tlsMode: string; username: string };
+  /** CAD-1063: "agenticos" when the platform sends, else "smtp". */
+  transportKind: string;
 }
 
 /** `null` where the host reports no live binding (its refusal is
@@ -173,12 +175,16 @@ export function parseSmtpBinding(value: unknown): SmtpBinding {
       tlsMode: transport.tls_mode,
       username: typeof transport.username === "string" ? transport.username : "",
     },
+    transportKind: typeof row.transport_kind === "string" ? row.transport_kind : "smtp",
   };
 }
 
 /** The one-recipient test-send receipt — SMTP acceptance only. */
 export interface TestSendReceipt {
   accepted: boolean;
+  /** CAD-1063: hosted send parked until the owner approves it in
+   *  AgenticOS — not accepted, not an error. */
+  pendingApproval: boolean;
   smtpCode: number | null;
   smtpMessage: string;
   to: string;
@@ -199,6 +205,7 @@ export function parseTestSendReceipt(value: unknown): TestSendReceipt {
   }
   return {
     accepted: row.accepted,
+    pendingApproval: row.pending_approval === true,
     smtpCode: typeof row.smtp_code === "number" ? row.smtp_code : null,
     smtpMessage: typeof row.smtp_message === "string" ? row.smtp_message : "",
     to: typeof row.to_email === "string" ? row.to_email : "",
@@ -659,4 +666,13 @@ export function isNoSenderBound(error: unknown): boolean {
       error.message.includes("sender binding is revoked") ||
       error.message.includes("sender refused or unavailable"))
   );
+}
+
+/** `smtpShow` read as a binding; the none-bound refusal is `null`
+ *  (an empty state), every other refusal is thrown verbatim. */
+export function readSmtpBinding(scope: SendScope): Promise<SmtpBinding | null> {
+  return sendClient.smtpShow(scope).then(parseSmtpBinding, (error: unknown) => {
+    if (isNoSenderBound(error)) return null;
+    throw error;
+  });
 }

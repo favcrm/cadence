@@ -1073,6 +1073,27 @@ pub(crate) fn write_route(
         send(request, response);
         return;
     }
+    // CAD-1098: the app panel's conversations — the master's, scoped to
+    // the installation in the path. Same operator-only class and daemon
+    // proof as `/api/threads/master/conversations`.
+    if let Some(install) = path
+        .strip_prefix("/api/app-installations/")
+        .and_then(|tail| tail.strip_suffix("/conversations"))
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+    {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = threads::post_conversation(
+            &mut request,
+            state_dir,
+            crate::master::ALIAS,
+            Some(install),
+        );
+        send(request, resp);
+        return;
+    }
     let catalog_recovery = path
         .strip_prefix("/api/app-installations/migrations/")
         .and_then(|tail| tail.strip_suffix("/recover"))
@@ -1237,11 +1258,15 @@ pub(crate) fn write_route(
     // The operator's chat message to an agent (CAD-319) — guarded and
     // caller-attributed inside `threads::post_message`.
     if let Some((alias, sub)) = threads::route(path) {
-        if *method != Method::Post || sub != Some("messages") {
+        if *method != Method::Post || !matches!(sub, Some("messages" | "conversations")) {
             send(request, err_response(404, "no such thread write route"));
             return;
         }
-        let resp = threads::post_message(&mut request, state_dir, alias);
+        let resp = if sub == Some("conversations") {
+            threads::post_conversation(&mut request, state_dir, alias, None)
+        } else {
+            threads::post_message(&mut request, state_dir, alias)
+        };
         send(request, resp);
         return;
     }

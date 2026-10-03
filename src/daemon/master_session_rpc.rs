@@ -97,11 +97,22 @@ impl Shared {
         // The turn the working row mirrors: `running` first, else the
         // queue head. `since` is epoch seconds — `started` while it
         // runs, `created` while it waits.
+        // CAD-1098: the conversation the turn belongs to, so a panel can
+        // say "queued" while another conversation's turn runs.
+        let conversation_of = |id: &str| -> Value {
+            self.store
+                .message_conversation(alias, id)
+                .ok()
+                .flatten()
+                .map(|t| json!(t.id))
+                .unwrap_or(Value::Null)
+        };
         let running = self.store.running_message(alias)?;
         let turn = match &running {
             Some(m) => json!({
                 "state": "working",
                 "message": m.id,
+                "conversation": conversation_of(&m.id),
                 "summary": m.body,
                 "since": m.started.unwrap_or(m.created),
             }),
@@ -109,6 +120,7 @@ impl Shared {
                 Some(m) => json!({
                     "state": "queued",
                     "message": m.id,
+                    "conversation": conversation_of(&m.id),
                     "summary": m.body,
                     "since": m.created,
                 }),

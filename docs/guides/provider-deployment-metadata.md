@@ -14,7 +14,7 @@ The hosted image composition may bake `/etc/cadence/provider-deployments.json`:
     {
       "provider": "agenticos_external",
       "origin": "https://api-v2.agenticos.hk",
-      "manifest_pin": "agenticos-external-provider-tools@2"
+      "manifest_pin": "agenticos-external-provider-tools@3"
     }
   ]
 }
@@ -23,7 +23,9 @@ The hosted image composition may bake `/etc/cadence/provider-deployments.json`:
 The external entry is illustrative. The `@2` manifest removes the CDN
 pinning mode entirely: generated images arrive as durable AgenticOS media
 artifacts fetched from the pinned origin itself, so an `image_hosts` key in
-an older file is accepted and ignored rather than rejected.
+an older file is accepted and ignored rather than rejected. `@3` (CAD-1096)
+reads posts through the generic `read_instagram_posts`. A hosted image moves
+its pin with its Cadence binary: any other hosted pin refuses startup.
 
 This is an image-owned assertion about an independently reviewed deployed
 contract. It is not remote discovery, an account binding, consent, a credential,

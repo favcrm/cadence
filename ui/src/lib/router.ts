@@ -33,7 +33,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  */
 
 export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows";
-export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections";
+export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). */
 export type WikiMode = "browse" | "edit" | "history" | "search" | "upload";
 
@@ -202,6 +202,7 @@ export function matchRoute(pathname: string): Route {
       if (a === "account") return { screen: "settings", section: "account" };
       if (a === "permissions") return { screen: "settings", section: "permissions" };
       if (a === "connections") return { screen: "settings", section: "connections" };
+      if (a === "email") return { screen: "settings", section: "email" };
     }
   }
   return { screen: "notFound", path: pathname };
@@ -249,6 +250,7 @@ export function routePath(route: Route): string {
       if (route.section === "update") return "/settings/update";
       if (route.section === "permissions") return "/settings/permissions";
       if (route.section === "connections") return "/settings/connections";
+      if (route.section === "email") return "/settings/email";
       return "/settings";
     case "notFound":
       return route.path;
@@ -298,6 +300,9 @@ function scopedRoute(route: Route, project: string): Route {
   return { screen: "projects", slug, section: slug ? route.section : route.section === "overview" ? "overview" : "issues" };
 }
 
+/** Query parameters only the mounted CRM app route owns. */
+const CRM_APP_PARAMS = ["crm", "record", "ctx", "appview", "segment"] as const;
+
 /** Path plus query for a location, keeping query parameters the app does not own. */
 export function locationHref(loc: AppLocation, search = ""): string {
   const q = new URLSearchParams(search);
@@ -310,6 +315,9 @@ export function locationHref(loc: AppLocation, search = ""): string {
   for (const key of ["tab", "view", "project", "issue", "run", "new", "screen"]) q.delete(key);
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
+  // CAD-1068: the mounted CRM app (`workspaceApp`) owns these; they stay
+  // on its own route and never follow the user to /settings and the like.
+  if (route.screen !== "workspaceApp") for (const key of CRM_APP_PARAMS) q.delete(key);
   if (route.screen === "issue") {
     if (route.tab !== "overview") q.set("tab", route.tab);
     const issueSearch = q.toString();

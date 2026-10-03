@@ -35,6 +35,7 @@ pub mod plan;
 mod pmlock;
 pub mod project;
 pub mod project_new;
+pub mod reclaim;
 pub mod reconcile;
 pub mod relay;
 pub mod report;

@@ -915,6 +915,42 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=31", [])?;
                 tx.commit()?;
             }
+            if version < 32 {
+                // CAD-1098: per-app conversations. One transaction rebuilds
+                // `threads` (the inline `alias UNIQUE` cannot be dropped in
+                // place) with the conversation columns, then adds the
+                // partial unique indexes. Entries key by `thread_id` and are
+                // untouched: nothing is deleted, moved or rewritten (I10).
+                // The column check makes a half-applied store converge.
+                // Foreign keys are switched off around the rebuild (the pragma
+                // is a no-op inside a transaction) so dropping the parent
+                // table does not trip `thread_entries`; the integrity check
+                // below proves no reference dangles before commit.
+                let fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+                conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+                let migrated = (|| -> Result<()> {
+                    let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                    super::threads::migrate_v32(&tx)?;
+                    let dangling: i64 = tx.query_row(
+                        "SELECT count(*) FROM thread_entries e
+                         WHERE NOT EXISTS (SELECT 1 FROM threads t WHERE t.id=e.thread_id)",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if dangling != 0 {
+                        return Err(crate::error::Error::internal(
+                            "v32 migration would orphan thread entries",
+                        ));
+                    }
+                    tx.execute("UPDATE schema_version SET version=32", [])?;
+                    tx.commit()?;
+                    Ok(())
+                })();
+                if fk != 0 {
+                    conn.execute_batch("PRAGMA foreign_keys=ON")?;
+                }
+                migrated?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

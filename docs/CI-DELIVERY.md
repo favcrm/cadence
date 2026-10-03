@@ -1,6 +1,6 @@
 # Integration and production candidates
 
-## Current state: reduced-gate window
+## Current state: the permanent gate (CAD-1102; window history below)
 
 CAD-1073 / PR #738 retired the legacy integration suite. The required `test`
 check compiles and runs four `safety_floor` tests; green means that floor
@@ -12,17 +12,19 @@ Required contexts explicitly report not-applicable commands rather than
 claiming to build. Governance, workflow, scripts, dependency manifests, mixed
 or unknown changes run all gates. Merge groups always run the full current
 validation (including the reduced floor); fast PR feedback is not evidence
-for skipping integration validation. The committed `.github/reduced-gates`
-marker and `scripts/require-full-gates` refuse release artifacts, candidate
-staging and promotion from a reduced-gate source SHA. Do not remove them as a
-CI-speed optimization.
+for skipping integration validation. `scripts/require-full-gates` refuses
+release artifacts, candidate staging and promotion from any source SHA that
+commits `.github/reduced-gates`. CAD-1102 ended the CAD-1073 window by
+re-declaring the current gate as permanent, and removed the marker; a future
+transition window may add it again under an operator-approved declaration.
+Never remove a marker as a CI-speed optimization.
 
 The shard/inventory benchmarks and old fixture journeys described below are
 historical full-gate design, not current measurements or restored coverage.
 See [development-loop simplification](DEV-CYCLE.md) for the #738 reflection,
 current local check recipe and approval handoff.
 
-## Full-gate delivery design (historical while reduced gates apply)
+## Full-gate delivery design (historical, before CAD-1073)
 
 PRs continue to target main. The merge queue keeps the full fmt, clippy,
 test, build and UI gates. Main CI reuses exact-SHA queue evidence and
@@ -423,3 +425,19 @@ To bump the pin, in one PR:
    every new lint or format change in the same PR.
 3. Run `scripts/pre-push`. The PR touches `rust-toolchain.toml`, so expect
    it to be reviewed like any other CI change.
+
+## PR-gate `ci` profile and fast linker (CAD-1103)
+
+The `build` and `ui` jobs compile with `cargo build --profile ci` (inherits
+`release`; opt-level 1, 256 codegen units, no debuginfo, no incremental, no
+LTO) and link with mold, or lld, installed by `scripts/ci-fast-linker enable`
+(it falls back to the default linker when neither works). These jobs prove the
+tree compiles, links, carries no test seam and passes the migration rehearsal;
+none of that depends on optimisation. `release-artifact`, `release-build`,
+staging and promotion keep the full `--release` profile, `require-full-gates`
+and the `cargo check --release --features test-seam` refusal probe. The
+`cache-warm` release leg warms the same `ci` profile with the same linker flag
+(the flag is part of cargo's fingerprint). Not merged: `build` and `ui` stay two
+compiles (default features vs `--features ui`, different path scopes), and the
+two clippy passes stay (default vs `test-seam` lint different cfg code).
+Tree-hash artifact reuse is a follow-up.

@@ -1093,3 +1093,41 @@ p.sfield-hint {
   font-size: var(--text-label);
   color: var(--color-ink-500);
 }
+
+/* Programmatic focus on an outlet heading keeps a11y focus but shows a
+   ring only for keyboard focus (CAD-1097). */
+[data-outlet-heading]:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Emails stay on one line; the table scrolls inside its card. Link
+   buttons in cells wrap left-aligned (CAD-1097). */
+.crm-table td.crm-nowrap {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.crm-table .lnk {
+  text-align: left;
+}
+
+/* CAD-1098: conversation picker + "+ New" in the chat header. */
+.app-chat-conv {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  min-width: 0;
+}
+.app-chat-conv-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: transparent;
+  color: var(--color-ink-100);
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.375rem;
+  padding: 0.25rem 0.4rem;
+}
+.app-chat-conv-select:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}

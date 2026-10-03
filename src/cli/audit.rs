@@ -60,6 +60,14 @@ pub(crate) enum AuditAction {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Read-only (CAD-1106): the ticket scope pre-approvals recorded for
+    /// `--issue` (id, body digest, how recorded, revoked or not). Prints one
+    /// JSON object; exits 0 when the store answered. Never records.
+    Scope {
+        /// Tracker issue id the scope approvals name.
+        #[arg(long)]
+        issue: String,
+    },
     /// Read-only (CAD-959): the verdict notes of ISSUE that name PR `--pr`
     /// and the full `--head`, parsed by the audit's own note parser, plus
     /// a `skipped` list with the reason for every note of the issue that
@@ -141,6 +149,11 @@ pub(super) fn run(
                 &head,
             )?);
             Ok(0)
+        }
+        Some(AuditAction::Scope { issue }) => {
+            let (v, code) = cadence_agent::audit::scope_check(&state_dir, issue.trim());
+            print_json(&v);
+            Ok(code)
         }
         Some(AuditAction::Approval { pr, head, repo }) => {
             let head = full_head(&head)?;

@@ -105,3 +105,21 @@ incremental = false
 # 6.2 GB target dir. Line tables keep panic locations and backtrace
 # file:line while cutting that to ~3.2 GB and ~3.0 GB.
 debug = "line-tables-only"
+
+# CAD-1103: PR/merge-queue gate profile. Used ONLY by the ci.yml `build` and
+# `ui` jobs, which prove "compiles, links, no test seam, migration rehearsal",
+# not performance. opt-level 1 with many codegen units compiles the single
+# `cadence-agent` crate far faster than `--release`. Release artifacts,
+# staging and promotion builds keep the full `--release` profile.
+[profile.ci]
+inherits = "release"
+opt-level = 1
+codegen-units = 256
+debug = 0
+incremental = false
+lto = false
+
+# Dependencies keep opt-level 1; the one workspace crate is front-end bound,
+# so skipping its LLVM optimisation is the cheap win (CAD-1103 measurements).
+[profile.ci.package.cadence-agent]
+opt-level = 0

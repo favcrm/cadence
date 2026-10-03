@@ -42,6 +42,12 @@ pub(crate) enum BuildSlotAction {
     /// EXECS the command — the slot's holder is the real cargo/test
     /// process itself, and its exit frees the slot. Wrap gates like
     /// `cadence build-slot run test -- cargo test --lib`.
+    ///
+    /// A caller with no registered pane or managed endpoint (a subagent,
+    /// an operator shell) may queue a `build` or `test` slot this way as
+    /// the daemon-labelled `unregistered:<uid>`: it gets a queue position
+    /// behind every registered lane and no authority. `--lane` is not
+    /// read by the daemon.
     Run {
         /// build, test, suite or check — `check` additionally needs
         /// `--recipe <name>` (a `build.recipes` entry of kind `check`).
@@ -212,7 +218,11 @@ pub(super) fn print_slot_status(s: &Value) {
         "#", "LANE", "KIND", "WAITED", "REASON"
     );
     for (i, w) in waiting.iter().enumerate() {
-        let flags = if w["starved"].as_bool().unwrap_or(false) {
+        // An unregistered caller (CAD-1021) always ranks last, so the
+        // flag names why it sits behind lanes that arrived after it.
+        let flags = if w["unregistered"].as_bool().unwrap_or(false) {
+            "unregistered (behind registered lanes)"
+        } else if w["starved"].as_bool().unwrap_or(false) {
             "starved"
         } else if w["priority"].as_bool().unwrap_or(false) {
             "priority"

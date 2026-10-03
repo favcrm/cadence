@@ -388,15 +388,8 @@ assert(text().includes("beta-two@example.com"), "drawer shows the profile");
 assert(host.querySelector('[data-testid="drawer-warning"]')?.textContent?.includes("can't receive campaigns"), "denied customer shows the status warning");
 assert(!host.querySelector('[data-testid="drawer-warning"] button'), "the warning strip holds no controls");
 const foot = host.querySelector(".crm-drawer-foot")!;
-const footLabels = Array.from(foot.querySelectorAll("button")).map((b) => b.textContent?.trim());
-equal(footLabels.filter((l) => ["Add to segment", "Edit", "Record consent"].includes(l ?? "")), ["Add to segment", "Edit", "Record consent"], "footer order: Add to segment, Edit, primary Record consent");
-assert(foot.querySelector("button.btn-primary")?.textContent === "Record consent", "Record consent is the single primary");
-assert((Array.from(foot.querySelectorAll("button")).find((b) => b.textContent === "Add to segment") as HTMLButtonElement).disabled, "Add to segment is disabled until it has a backend");
-await click(foot.querySelector('button[aria-label="More actions"]'));
-const menuItems = Array.from(host.querySelectorAll('[role="menuitem"]')) as HTMLButtonElement[];
-equal(menuItems.map((m) => m.textContent), ["Copy email", "View in Outbox", "Archive customer"], "menu order");
-assert(menuItems[2].classList.contains("danger") && menuItems[2].getAttribute("aria-disabled") === "true" && menuItems[2].title.length > 0, "Archive is red, disabled and explains why");
-await click(foot.querySelector('button[aria-label="More actions"]'));
+// CAD-1072: unbuilt actions are not shown.
+for (const dead of ["Add to segment", "Archive customer", "View in Outbox"]) assert(!foot.textContent!.includes(dead), `${dead} is not built and not shown`);
 assert(host.querySelector('[data-consent="email"]')?.textContent?.includes("Withdrawn"), "Overview consent card shows the email state");
 assert(text().includes("Profile") && text().includes("Segments") && text().includes("Campaigns"), "Overview carries Profile, Segments and Campaigns");
 // Activity is a human timeline; ids stay under Details.
@@ -518,6 +511,42 @@ await settle(() => assert(host.querySelector("#crm-display-name"), "edit form op
 await fill("#crm-display-name", "New Person Edited");
 await click(host.querySelector('[data-drawer="customer"] button[type="submit"]'));
 await settle(() => assert(text().includes("stale"), "stale write explains itself with a next step"));
+
+// CAD-1072: optional consent method on create, shown only when a channel is Granted.
+await click(host.querySelector('[data-drawer="customer"] button[aria-label^="Close"]'));
+await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "New customer"));
+await settle(() => assert(host.querySelector("#crm-display-name"), "new form reopens"));
+assert(!host.querySelector('[data-testid="create-consent-method"]'), "no method field while consent is Unknown");
+await fill("#crm-display-name", "Consent Person");
+await pick("crm-consent-email", "Granted");
+assert(host.querySelector('[data-testid="create-consent-method"]'), "method field appears once a channel is Granted");
+posts.length = 0;
+await click(host.querySelector('button[type="submit"]'));
+await settle(() => assert(posts.length === 1, "a Granted create without a method still posts (method is optional)"));
+assert(!("consent_provenance" in posts[0].body), "no provenance is sent when no method is chosen");
+await click(host.querySelector('[data-drawer="customer"] button[aria-label^="Close"]'));
+await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "New customer"));
+await settle(() => assert(host.querySelector("#crm-display-name"), "new form reopens again"));
+await fill("#crm-display-name", "Method Person");
+await pick("crm-consent-sms", "Granted");
+await pick("crm-create-method", "Website sign-up form");
+await fill("#crm-create-note", "  Footer form  ");
+posts.length = 0;
+await click(host.querySelector('button[type="submit"]'));
+await settle(() => assert(posts.length === 1, "create with a method posts once"));
+equal(posts[0].body.consent_provenance, { method: "web_form", note: "Footer form" }, "provenance ships as the existing {method, note} shape");
+await click(host.querySelector('[data-drawer="customer"] button[aria-label^="Close"]'));
+await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "New customer"));
+await settle(() => assert(host.querySelector("#crm-display-name"), "new form reopens a third time"));
+await fill("#crm-display-name", "Plain Person");
+await pick("crm-consent-email", "Granted");
+await pick("crm-create-method", "In person (counter / event)");
+await pick("crm-consent-email", "Unknown");
+assert(!host.querySelector('[data-testid="create-consent-method"]'), "method field leaves when nothing is Granted");
+posts.length = 0;
+await click(host.querySelector('button[type="submit"]'));
+await settle(() => assert(posts.length === 1, "non-granted create posts"));
+assert(!("consent_provenance" in posts[0].body), "a stale method is never sent when consent is not Granted");
 
 // ---- CAD-865: the CSV import flow — preview, per-row decisions,
 // commit. The fixture answers the two reserved bulk routes with the

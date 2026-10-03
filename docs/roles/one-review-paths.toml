@@ -18,33 +18,91 @@
 # - An empty diff, an unreadable or malformed TOML file disqualifies.
 # A disqualified PR keeps two reviews. `human` triggers apply on top.
 #
-# CAD-965 (operator decision 2026-10-01): top-level integration test files
-# (`tests/*.rs`; `*` stays within one segment) need one review. Not listed,
-# so they keep two: `src/**` (including src/**/tests.rs) and `tests/common/**`,
-# which holds harness and isolation code (NO_REAL_TMUX, PM dir/HOME isolation,
-# port lease, suite lock) that CI cannot see being weakened.
-# The single reviewer must state in the verdict that no adversarial gate test
-# and no test-isolation or fail-closed default was weakened or deleted,
-# naming what was checked (AGENTS.md).
+# CAD-965 (operator decision 2026-10-01) put top-level integration tests on
+# this list; CAD-1099 and CAD-1104 below supersede it with a wider list.
+#
+# CAD-1099 / CAD-1104 (operator decisions 2026-10-03, "simplify and make the
+# dev cycle more smooth and fast"): ONE independent review is the default for
+# code, docs, CI/workflows, scripts, rules, dependencies and rollout. Many of
+# those are `human` class, where the operator's approval is the second check
+# (scripts/enqueue-reviewed requires it independently of this list). Two
+# reviews remain ONLY for trust boundary/identity and secrets (risk triggers 1
+# and 3): the risk-paths trigger 1/3 lists, the auth modules, the
+# identity-heavy source trees and UI (the board runs with the operator's
+# session). risk-paths.toml is a delegation allowlist, not a complete map, so
+# the identity-heavy trees are excluded by directory. Includes are explicit, so
+# an unknown new top-level path keeps two reviews until listed. Exclude wins.
+
 one_review_include = [
-  "docs/guides/**",
-  "docs/ui/**",
-  "tests/*.rs",
-]
-# Redundant with the allowlist on purpose: these stay two-review even if an
-# include glob is ever widened.
-one_review_exclude = [
-  "tests/scripts/**",
-  "tests/split-map*.toml",
-  "tests/split_map_inventory.rs",
-  "tests/shard-weights.json",
-  "tests/fixtures/**",
-  "docs/cadence/**",
-  "docs/AUDIT.md",
-  "docs/design/**",
-  "docs/roles/**",
-  "docs/TEAM.md",
-  "docs/CHARTER.md",
+  "src/**",
+  "docs/**",
+  "tests/**",
+  "skills/**",
+  "apps/**",
+  "app-previews/**",
+  "workspace-apps/**",
+  "workflows/**",
+  "contracts/**",
+  "design/**",
+  "config/**",
+  "tools/**",
+  ".github/**",
+  ".config/**",
+  ".cargo/**",
+  "scripts/**",
   "AGENTS.md",
+  "README.md",
+  "CONTEXT.md",
+  "CONTRIBUTING.md",
+  "Cargo.toml",
+  "Cargo.lock",
+  "build.rs",
+  "rust-toolchain.toml",
+  "clippy.toml",
+  "cadence-review.toml",
   ".gitignore",
+  ".gitattributes",
+]
+# Two reviews (Standards + Spec/security) for these, even though an include
+# glob matches them. Trust boundary/identity and secrets ONLY.
+one_review_exclude = [
+  # risk-paths.toml trigger 1: trust boundary and identity
+  "src/peer.rs",
+  "src/daemon.rs",
+  "src/daemon/identity.rs",
+  "src/daemon/caller_rule.rs",
+  "src/daemon/slots_rpc.rs",
+  "src/adapter/pty/**",
+  "src/ui.rs",
+  "src/ui/**",
+  "ui/**",
+  "src/operator_auth.rs",
+  "src/tailnet_proof.rs",
+  "src/test_seam.rs",
+  "src/master_perm.rs",
+  "src/agent_uid.rs",
+  "src/cli/agent_uid.rs",
+  # identity-heavy trees (risk-paths is not a complete map; by directory)
+  "src/daemon/**",
+  "src/bin/**",
+  "src/platform/**",
+  "src/adapter/**",
+  "src/store/**",
+  "src/agent_uid/**",
+  "src/pi_policy.rs",
+  "src/confine.rs",
+  # the production master's prompt and confinement policy
+  "agents/**",
+  # remote-CLI and board auth modules (CAD-1019, CAD-526/777)
+  "src/cli_actor.rs",
+  "src/board_identity.rs",
+  "src/remote_auth.rs",
+  "src/remote_enrollment.rs",
+  "src/remote_cli.rs",
+  "src/device_login.rs",
+  "src/cli/platform.rs",
+  # risk-paths.toml trigger 3: secrets, credentials, redaction
+  "src/secret/**",
+  "src/cli/secret.rs",
+  "src/cli/connection.rs",
 ]

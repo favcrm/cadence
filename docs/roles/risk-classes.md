@@ -29,7 +29,7 @@ Each path must satisfy ALL four criteria:
 3. It cannot touch production, the installed binary, the tracker, secrets or credentials, or install software on a host.
 4. Any effect is behind a human-class control downstream: diagnostics do not authorize delivery, and changes to gates, releases or production still require operator approval.
 
-A PR is auto-eligible under this allowlist only when every `scripts/**` path it touches is allowlisted, the changes preserve all four criteria, and no other human trigger applies (for example, `.github/**` stays human under trigger 4). New paths and new gate or delivery wiring are not implicitly allowlisted: a PR that gives an allowlisted script a gate, release or promotion caller must remove its allowlist entry in the same PR. Changing this allowlist is itself trigger 7 (`human`). The two-independent-review requirement is unchanged.
+A PR is auto-eligible under this allowlist only when every `scripts/**` path it touches is allowlisted, the changes preserve all four criteria, and no other human trigger applies (for example, `.github/**` stays human under trigger 4). New paths and new gate or delivery wiring are not implicitly allowlisted: a PR that gives an allowlisted script a gate, release or promotion caller must remove its allowlist entry in the same PR. Changing this allowlist is itself trigger 7 (`human`). The review count follows AGENTS.md "Review" (CAD-1104): one independent review plus the operator's approval for `human` diffs, and two reviews only for triggers 1 and 3.
 
 ## Class `delegated` — a designated agent approves (CAD-918, operator decision 2026-10-01)
 
@@ -40,7 +40,7 @@ These become `delegated`: the rest of trigger 2 (data and deletion paths, the tr
 A designated agent approves a `delegated` PR with `cadence audit approve --pr <n> --head <full sha> --delegated [--scope <id>] --source "<notes>"`, run from its own pane. The daemon refuses it unless every safeguard holds:
 1. Two PASS verdict notes for the ticket and PR, each pinned to the exact head, from two distinct reviewers, compared by the alias their `From:` names. Neither reviewer is an author (the ticket's owner, the loop's worker, the PR's GitHub login) or the approver. No verdict note on that head may state anything but `auto` or `delegated`.
 2. CI green at that head: every check the base branch requires has a completed, successful run from its required app (GitHub Actions), inside the check suite of a `pull_request` run of `.github/workflows/ci.yml` for that head; a same-named run from any other workflow counts for nothing. Commit statuses count for nothing, and a `qa-verdict` in any state but success refuses.
-3. Any gate change carries an adversarial test that fails without its guard. Reviewers check this, and their PASS states it.
+3. Any gate change carries an independent acceptance check proving the bad case is refused (AGENTS.md "Gates and security work"). Reviewers check this, and their PASS states it.
 4. A mechanical path check, an allowlist that fails closed. Every changed path, both sides of a rename included, must be `delegable` and in no trigger list; a schema path passes only under a live scope pre-approval. Anything else needs the operator. The lists live in one place, [`docs/roles/risk-paths.toml`](risk-paths.toml), which the binary compiles in, and are enumerated below.
 5. The approval is recorded as `delegated:<alias>`. The alias comes from the caller's connection (the CAD-411 derivation), never from a flag, so the operator, a detached child and an unprovable caller are all refused. Only an agent the operator designated for the ticket's project may record it (`cadence audit designate <alias> --project <key>`, operator only, listed by `cadence audit designations`), and only for that project's own repo.
 6. `cadence audit digest [--since 24h]` lists delegated approvals with both reviewers, a revoke command, and a revert command once merged. `cadence audit revoke` withdraws a delegated approval, and a revoked head can then be approved only by the operator.
@@ -68,7 +68,7 @@ Everything else, provided ALL hold: qa-1 verdict `pass` on the exact head SHA; C
 qa-1 states `Risk: auto`, `Risk: delegated (<triggers>)` or `Risk: human (<trigger numbers>)` in every verdict with one line of reasons. ops-1 re-checks mechanically (paths touched, `Cargo.toml`/workflow diffs, line count, round count). If either says `human`, it is `human`. When unsure, `human`.
 
 ### Reviewer count on a solo-operator lane
-The default is two distinct independent reviewers (Standards and
+For a two-review PR (AGENTS.md "Review", CAD-1099), the default is two distinct independent reviewers (Standards and
 Spec/security must come from different people). On a project where the
 author is the only registered reviewer-capable identity — a solo-operator
 lane — a **single** independent reviewer (never the author) may cover both

@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { api, ApiError } from "../../lib/api";
-import type { Connection } from "../../lib/types";
-import { isSmtpSender, smtpErrorMessage, smtpSummary } from "../settings/connectionsView";
+import { ApiError } from "../../lib/api";
+import {
+  EMAIL_SENDING_HREF,
+  WAITING_APPROVAL_TEXT,
+  sendingFrom,
+  waitingApproval,
+} from "../settings/emailSendingView";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
@@ -25,17 +29,15 @@ import {
   type ProposalRenderDoc,
 } from "./campaignGrammar";
 import { contentClient } from "./contentClient";
-import { resources } from "../../lib/resources";
-import { useQuery } from "../../lib/useResource";
+import { useMaybeResource } from "../../lib/useResource";
+import { autoSelectCampaignConversation, useActiveConversation } from "./conversationClient";
 import {
   DELIVERY_CLAIM,
   friendlySendError,
-  isNoSenderBound,
-  parseOriginReceipt,
   parsePreparedSend,
   parseSendList,
   parseSendView,
-  parseSmtpBinding,
+  readSmtpBinding,
   parseTestSendReceipt,
   sendClient,
   sendTerminal,
@@ -49,6 +51,7 @@ import {
 import { PreviewPanel, parsePreview, type AudiencePreview } from "./CrmSegments";
 import { friendlyAudienceError, newAudienceId } from "./segmentGrammar";
 import { ErrorNotice } from "./shared/States";
+import ConfirmDialog from "./shared/ConfirmDialog";
 import "./crm-campaign.css";
 import CampaignTabs from "./campaign/CampaignTabs";
 import EmailPane from "./campaign/EmailPane";
@@ -61,7 +64,6 @@ import { clearLanding, peekLanding } from "./campaign/landing";
 import { audienceSummary } from "./campaign/audienceSummary";
 import {
   APPROVAL_ANCHOR,
-  SENDER_ANCHOR,
   TEST_ANCHOR,
   missingReasons,
   sendReadiness,
@@ -1090,460 +1092,6 @@ function AudienceSection({
 /* Send controls (CAD-785 binding + CAD-786 approved bounded send).     */
 /* ------------------------------------------------------------------ */
 
-/** `smtpShow` answers `null` on the host's none-bound refusal; every
- *  other refusal is an error the panel shows verbatim. */
-function readBinding(scope: AudienceScope): Promise<SmtpBinding | null> {
-  return sendClient.smtpShow(scope).then(parseSmtpBinding, (error: unknown) => {
-    if (isNoSenderBound(error)) return null;
-    throw error;
-  });
-}
-
-/** A modal confirm: the operator's typed `expect` must equal
- *  `match` before `confirmLabel` enables. Esc cancels, the input
- *  autofocuses and a submit re-arms only through a fresh open. */
-function ConfirmDialog({
-  title,
-  body,
-  expect,
-  match,
-  inputLabel,
-  confirmLabel,
-  pending,
-  error,
-  onConfirm,
-  onCancel,
-}: {
-  title: string;
-  body: React.ReactNode;
-  /** When set, the input gate: confirm enables only when the typed
-   *  text equals `match` exactly. */
-  expect?: string;
-  match?: string;
-  inputLabel?: string;
-  confirmLabel: string;
-  pending: boolean;
-  error: string | null;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  const [typed, setTyped] = useState("");
-  const inputRef = useRef<HTMLInputElement | null>(null);
-  useEffect(() => {
-    if (expect !== undefined) inputRef.current?.focus();
-  }, [expect]);
-  const gated = expect !== undefined ? typed.trim() === (match ?? "") : true;
-  return (
-    <div className="crm-confirm-wrap" role="presentation">
-      <div className="crm-confirm-scrim" onClick={onCancel} />
-      <section
-        className="card crm-confirm grid gap-3"
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") {
-            e.stopPropagation();
-            onCancel();
-          }
-        }}
-      >
-        <h4 className="text-cardtitle font-medium text-ink-100">{title}</h4>
-        <div className="text-label text-ink-300">{body}</div>
-        {expect !== undefined && (
-          <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="crm-confirm-input">
-              {inputLabel ?? `Type ${match} to confirm`}
-            </label>
-            <input
-              id="crm-confirm-input"
-              ref={inputRef}
-              className="field num"
-              inputMode="numeric"
-              value={typed}
-              onChange={(e) => setTyped(e.target.value)}
-              maxLength={12}
-              autoComplete="off"
-              disabled={pending}
-            />
-          </div>
-        )}
-        {error && (
-          <p className="text-label text-fail" role="alert">
-            {error}
-          </p>
-        )}
-        <div className="crm-toolbar">
-          <Button size="sm" onClick={onCancel} disabled={pending}>
-            Cancel
-          </Button>
-          <Button
-            size="sm"
-            variant="danger"
-            loading={pending}
-            disabled={pending || !gated}
-            onClick={onConfirm}
-          >
-            {confirmLabel}
-          </Button>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-/**
- * The bound SMTP sender: connection pick list (SMTP-enrolled rows
- * only), bind/rebind under link CAS, revoke behind a confirm, and
- * the effective unsubscribe origin with its operator override form.
- * Host refusals surface verbatim; nothing secret ever renders.
- */
-function SenderBindPanel({
-  scope,
-  viewer,
-  binding,
-  onBinding,
-}: {
-  scope: AudienceScope;
-  viewer: Viewer;
-  binding: SmtpBinding | null;
-  onBinding: (binding: SmtpBinding | null) => void;
-}) {
-  const canWrite = viewer.operator && !viewer.readOnly;
-  const [connections, setConnections] = useState<Connection[]>([]);
-  // CAD-1064: SMTP senders that exist but cannot be bound (unreadable
-  // settings or custody) — named, never reported as "none enrolled".
-  const [unusable, setUnusable] = useState<Connection[]>([]);
-  const [connError, setConnError] = useState<string | null>(null);
-  const [picked, setPicked] = useState("");
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
-  const [confirmRevoke, setConfirmRevoke] = useState(false);
-  const [revokeError, setRevokeError] = useState<string | null>(null);
-
-  const connToken = `${scope.installId}:${scope.contextId}`;
-  useEffect(() => {
-    if (scope.contextId === "" || !viewer.operator) return;
-    const controller = new AbortController();
-    api
-      .connections()
-      .then((value) => {
-        if (controller.signal.aborted) return;
-        const senders = (value.connections ?? []).filter(isSmtpSender);
-        const usable = (row: Connection) =>
-          (row.smtp ?? null) !== null && row.status.custody_available === true;
-        setConnections(senders.filter(usable));
-        setUnusable(senders.filter((row) => !usable(row)));
-        setConnError(null);
-      })
-      .catch((e: unknown) => {
-        if (!controller.signal.aborted) setConnError(friendlySendError(e));
-      });
-    return () => controller.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connToken]);
-
-  useEffect(() => {
-    if (picked === "" && connections.length > 0) setPicked(connections[0].id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connections.length]);
-
-  const run = (action: () => Promise<unknown>, ok: string) => {
-    setPending(true);
-    setError(null);
-    setNote(null);
-    void action()
-      .then((value) => {
-        onBinding(parseSmtpBinding(value));
-        setNote(ok);
-      })
-      .catch((err: unknown) => setError(friendlySendError(err)))
-      .finally(() => setPending(false));
-  };
-
-  return (
-    <section aria-label="SMTP sender binding" className="grid gap-3">
-      <h4 className="text-label font-medium text-ink-200">
-        Sender — one host-custodied SMTP connection per context
-      </h4>
-      {connError && (
-        <p className="text-label text-fail" role="alert">
-          {connError}
-        </p>
-      )}
-      {binding === null ? (
-        <p className="text-label text-ink-400" data-state="unbound">
-          No SMTP sender is bound to this installation and context. Bind one below — the binding
-          pins the credential's authorization revision, so a rotation refuses sends until the
-          operator rebinds.
-        </p>
-      ) : (
-        <dl className="crm-detail" aria-label="Bound sender">
-          <div>
-            <dt>From</dt>
-            <dd className="num">
-              {binding.sender.name} · {binding.sender.address}
-            </dd>
-          </div>
-          <div>
-            <dt>Transport</dt>
-            <dd className="num">
-              {binding.transport.host}:{binding.transport.port} ·{" "}
-              {binding.transport.tlsMode === "implicit" ? "implicit TLS" : "STARTTLS"} · login{" "}
-              {binding.transport.username}
-            </dd>
-          </div>
-          <div>
-            <dt>Binding</dt>
-            <dd className="num">
-              link r{binding.linkRevision} · auth r{binding.authRevision} ·{" "}
-              {binding.digest.slice(0, 18)}… · {binding.state}
-            </dd>
-          </div>
-        </dl>
-      )}
-      {error && (
-        <p className="text-label text-fail" role="alert">
-          {error}
-        </p>
-      )}
-      {note && (
-        <p className="text-label text-ok" role="status">
-          {note}
-        </p>
-      )}
-      {canWrite && connections.length === 0 && connError === null && unusable.length === 0 && (
-        <p className="text-label text-ink-500">
-          No enrolled SMTP connections — enroll one under Settings → Connections first.
-        </p>
-      )}
-      {canWrite && connections.length === 0 && connError === null && unusable.length > 0 && (
-        <p className="text-label text-fail break-words" role="alert" data-state="sender-unusable">
-          {unusable.length === 1 ? "An SMTP sender is enrolled but" : "SMTP senders are enrolled but"}{" "}
-          can't be used yet.{" "}
-          {smtpErrorMessage(unusable[0]) ?? "Its credential is not available. Rotate it to re-enter its settings."}{" "}
-          <Link href="/settings/connections">Fix it in Settings → Connections</Link>.
-        </p>
-      )}
-      {canWrite && connections.length > 0 && (
-        <div className="crm-field-row">
-          <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="smtp-conn">
-              SMTP connection
-            </label>
-            <Select
-              id="smtp-conn"
-              value={picked}
-              onChange={setPicked}
-              options={connections.map((row) => ({
-                value: row.id,
-                label: smtpSummary(row) ?? `${row.provider} · ${row.account}`,
-              }))}
-              aria-label="SMTP connection"
-              disabled={pending}
-              full
-            />
-          </div>
-          <div>
-            <span className="text-label text-ink-300">
-              {binding === null ? "Bind" : `Rebind (expects link r${binding.linkRevision})`}
-            </span>
-            <div className="mt-1 crm-toolbar">
-              {binding === null ? (
-                <Button
-                  size="sm"
-                  variant="primary"
-                  loading={pending}
-                  disabled={pending || picked === ""}
-                  onClick={() =>
-                    run(
-                      () => sendClient.smtpBind(scope, picked, newAudienceId("bind")),
-                      "Sender bound — the link pins this credential's current authorization revision.",
-                    )
-                  }
-                >
-                  Bind sender
-                </Button>
-              ) : (
-                <>
-                  <Button
-                    size="sm"
-                    loading={pending}
-                    disabled={pending || picked === ""}
-                    title="Rebind under compare-and-set on the observed link revision"
-                    onClick={() =>
-                      run(
-                        () => sendClient.smtpRebind(scope, picked, binding.linkRevision),
-                        "Sender rebound — authorization revision re-pinned.",
-                      )
-                    }
-                  >
-                    Rebind sender
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="danger"
-                    disabled={pending}
-                    onClick={() => {
-                      setRevokeError(null);
-                      setConfirmRevoke(true);
-                    }}
-                  >
-                    Revoke binding
-                  </Button>
-                </>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-      {confirmRevoke && binding !== null && (
-        <ConfirmDialog
-          title="Revoke the SMTP sender binding?"
-          body={
-            <p>
-              This releases {binding.sender.address} from this context. Sends and test sends refuse
-              until a sender is bound again; a prepared send loses its approval material.
-            </p>
-          }
-          confirmLabel="Revoke binding"
-          pending={pending}
-          error={revokeError}
-          onCancel={() => setConfirmRevoke(false)}
-          onConfirm={() => {
-            setPending(true);
-            setRevokeError(null);
-            void sendClient
-              .smtpRevoke(scope, binding.linkRevision)
-              .then(() => {
-                onBinding(null);
-                setConfirmRevoke(false);
-                setNote("Sender binding revoked.");
-              })
-              .catch((err: unknown) => setRevokeError(friendlySendError(err)))
-              .finally(() => setPending(false));
-          }}
-        />
-      )}
-      <OriginPanel viewer={viewer} />
-    </section>
-  );
-}
-
-/** The daemon-global unsubscribe origin: the base every minted
- *  `/unsubscribe/<token>` link is built on. The operator sets or
- *  clears it; validation failures surface verbatim from the host. */
-function OriginPanel({ viewer }: { viewer: Viewer }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
-  const [origin, setOrigin] = useState<string | null | undefined>(undefined);
-  const [stored, setStored] = useState(false);
-  const [input, setInput] = useState("");
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
-
-  const read = () => {
-    sendClient
-      .sendOriginShow()
-      .then((value) => {
-        const receipt = parseOriginReceipt(value);
-        setOrigin(receipt.unsubscribeOrigin);
-        setStored(receipt.stored);
-        setInput(receipt.unsubscribeOrigin ?? "");
-      })
-      .catch((e: unknown) => setError(friendlySendError(e)));
-  };
-  useEffect(() => {
-    if (!viewer.operator) return;
-    read();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [viewer.operator]);
-
-  const save = (value: string | null) => {
-    setPending(true);
-    setError(null);
-    setNote(null);
-    void sendClient
-      .sendOriginSet(value)
-      .then((receipt) => {
-        const parsed = parseOriginReceipt(receipt);
-        setOrigin(parsed.unsubscribeOrigin);
-        setStored(parsed.stored);
-        setInput(parsed.unsubscribeOrigin ?? "");
-        setNote(
-          parsed.unsubscribeOrigin === null
-            ? "Unsubscribe origin cleared — sends refuse until one is configured."
-            : `Unsubscribe origin set to ${parsed.unsubscribeOrigin}.`,
-        );
-      })
-      .catch((err: unknown) => setError(friendlySendError(err)))
-      .finally(() => setPending(false));
-  };
-
-  return (
-    <section aria-label="Unsubscribe origin" className="grid gap-2">
-      <h4 className="text-label font-medium text-ink-200">Unsubscribe origin</h4>
-      {origin === undefined ? (
-        <p className="text-label text-ink-500" role="status">
-          Reading the effective origin…
-        </p>
-      ) : (
-        <p className="text-label text-ink-300">
-          Every send's unsubscribe links build on{" "}
-          <span className="num">{origin ?? "nothing — sends refuse until one is set"}</span>
-          {stored ? " (operator-set)" : origin !== null ? " (serve option)" : ""}.
-        </p>
-      )}
-      {error && (
-        <p className="text-label text-fail" role="alert">
-          {error}
-        </p>
-      )}
-      {note && (
-        <p className="text-label text-ok" role="status">
-          {note}
-        </p>
-      )}
-      {canWrite && (
-        <form
-          className="crm-field-row"
-          onSubmit={(e) => {
-            e.preventDefault();
-            save(input);
-          }}
-        >
-          <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="unsub-origin">
-              Origin (https; http on a loopback host)
-            </label>
-            <input
-              id="unsub-origin"
-              className="field"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              maxLength={200}
-              autoComplete="off"
-              disabled={pending}
-              placeholder="https://cadence.example.com"
-            />
-          </div>
-          <div className="crm-toolbar" style={{ alignSelf: "end" }}>
-            <Button type="submit" size="sm" loading={pending} disabled={pending}>
-              Set origin
-            </Button>
-            {stored && (
-              <Button size="sm" disabled={pending} onClick={() => save(null)}>
-                Clear override
-              </Button>
-            )}
-          </div>
-        </form>
-      )}
-    </section>
-  );
-}
-
 /** One recipient's masked row plus the uncertain-only resolve pair. */
 function DeliveryRows({
   scope,
@@ -1595,8 +1143,11 @@ function DeliveryRows({
               <tr key={row.customerId} data-delivery={row.customerId}>
                 <td className="num text-ink-200">{row.email}</td>
                 <td>
-                  <span className="chip crm-send-chip" data-state={row.state}>
-                    {row.state}
+                  <span
+                    className="chip crm-send-chip"
+                    data-state={waitingApproval(row) ? "pending" : row.state}
+                  >
+                    {waitingApproval(row) ? WAITING_APPROVAL_TEXT : row.state}
                   </span>
                   {row.resolvedBy !== null && (
                     <span className="text-micro text-ink-500"> · by {row.resolvedBy}</span>
@@ -1604,7 +1155,7 @@ function DeliveryRows({
                 </td>
                 <td className="num text-ink-400">{row.attempts}</td>
                 <td className="num text-ink-400">{row.smtpCode ?? "—"}</td>
-                <td className="text-ink-400">{row.reason ?? "—"}</td>
+                <td className="text-ink-400">{waitingApproval(row) ? "—" : (row.reason ?? "—")}</td>
                 <td>
                   {canWrite && row.state === "uncertain" && (
                     <span className="crm-toolbar">
@@ -1944,8 +1495,12 @@ function FinalSendPanel({
             </div>
             <div>
               <dt>Sender</dt>
-              <dd className="num">
-                {prepared.send.connectionId} · link r{prepared.send.linkRevision}
+              <dd className="num break-all">
+                {binding?.sender.address ?? "—"}
+                <details>
+                  <summary className="cursor-pointer text-ink-400">Details</summary>
+                  {prepared.send.connectionId} · link r{prepared.send.linkRevision}
+                </details>
               </dd>
             </div>
             <div>
@@ -2181,7 +1736,7 @@ function CampaignWorkspace({
   useEffect(() => {
     if (scope.contextId === "" || !viewer.operator) return;
     const controller = new AbortController();
-    readBinding(scope)
+    readSmtpBinding(scope)
       .then((value) => {
         if (!controller.signal.aborted) {
           setBinding(value);
@@ -2201,15 +1756,24 @@ function CampaignWorkspace({
   // a new non-operator entry landing in the scoped thread (the assistant's
   // reply after the operator's ask), not merely the operator's send.
   // `useQuery` subscribes to the live thread store the SSE stream feeds.
-  const thread = useQuery(resources.masterThread);
+  // CAD-1098: the selected conversation's thread, not the home thread.
+  const active = useActiveConversation(scope.installId);
+  const thread = useMaybeResource(active.store);
   const lastAssistantSeq = (() => {
-    const entries = thread.data?.entries ?? [];
+    const entries = thread?.data?.entries ?? [];
     let max = 0;
     for (const e of entries) {
       if (e.role !== "operator" && e.seq > max) max = e.seq;
     }
     return max;
   })();
+  // The campaign page opens on its own conversation; the picker still
+  // switches to General. Runs per campaign, never on every render.
+  useEffect(() => {
+    if (scope.contextId === "" || !viewer.operator) return;
+    void autoSelectCampaignConversation(scope.installId, campaignId).catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope.installId, scope.contextId, campaignId]);
   const seenAssistantSeq = useRef(0);
   useEffect(() => {
     if (lastAssistantSeq > seenAssistantSeq.current) {
@@ -2450,14 +2014,16 @@ function CampaignWorkspace({
         </section>
   );
 
-  const senderSection = doc !== null && (
-        <section aria-label="SMTP sender" id={SENDER_ANCHOR} tabIndex={-1} className="card px-4 py-4 grid gap-2">
-          <h4 className="text-cardtitle font-medium text-ink-100">Sender binding</h4>
-          {binding === undefined && bindingError === null && (
-            <p className="text-label text-ink-400" role="status">
-              Reading the sender binding…
-            </p>
-          )}
+  const testSection = doc !== null && (
+        <section aria-label="Test send" id={TEST_ANCHOR} tabIndex={-1} className="card px-4 py-4 grid gap-2 crm-test">
+          <h4 className="text-cardtitle font-medium text-ink-100">
+            Test send — one operator address
+          </h4>
+          <p className="text-label text-ink-400">
+            Sends the exact frozen content through the campaign sender to one operator-typed
+            address. The receipt records acceptance or refusal only — a campaign send needs one
+            accepted test send of this exact content and sender.
+          </p>
           {bindingError !== null && (
             <p className="text-label text-fail" role="alert">
               {bindingError}{" "}
@@ -2474,30 +2040,10 @@ function CampaignWorkspace({
               </button>
             </p>
           )}
-          {binding !== undefined && (
-            <SenderBindPanel
-              scope={scope}
-              viewer={viewer}
-              binding={binding}
-              onBinding={setBinding}
-            />
-          )}
-        </section>
-  );
-
-  const testSection = doc !== null && (
-        <section aria-label="Test send" id={TEST_ANCHOR} tabIndex={-1} className="card px-4 py-4 grid gap-2 crm-test">
-          <h4 className="text-cardtitle font-medium text-ink-100">
-            Test send — one operator address, real SMTP
-          </h4>
-          <p className="text-label text-ink-400">
-            Submits the exact frozen content bytes to the bound sender's SMTP server for one
-            operator-typed address. The receipt records SMTP acceptance or refusal only — a
-            campaign send needs one accepted test send of this exact content and binding.
-          </p>
-          {binding === null && bindingError === null && (
+          {binding !== undefined && sendingFrom(binding) === null && bindingError === null && (
             <p className="text-label text-ink-500" data-testsend="disabled">
-              No SMTP sender is bound — bind one above to send a test.
+              No sender is set up — <Link href={EMAIL_SENDING_HREF}>set up sending</Link> to send a
+              test.
             </p>
           )}
           <form
@@ -2530,7 +2076,7 @@ function CampaignWorkspace({
                 onChange={(e) => setTestEmail(e.target.value)}
                 maxLength={254}
                 autoComplete="off"
-                disabled={!canWrite || testPending || binding !== undefined && binding === null}
+                disabled={!canWrite || testPending || sendingFrom(binding) === null}
                 placeholder="name@example.com"
               />
             </div>
@@ -2542,11 +2088,11 @@ function CampaignWorkspace({
                   variant="primary"
                   size="sm"
                   loading={testPending}
-                  disabled={!canWrite || testPending || binding === null || binding === undefined}
+                  disabled={!canWrite || testPending || sendingFrom(binding) === null}
                   title={
-                    binding === null
-                      ? "No SMTP sender is bound"
-                      : "Submit one test message to the bound SMTP server"
+                    sendingFrom(binding) === null
+                      ? "No sender is set up"
+                      : "Send one test message through the campaign sender"
                   }
                 >
                   Send test
@@ -2564,15 +2110,23 @@ function CampaignWorkspace({
               <div>
                 <dt>Result</dt>
                 <dd>
-                  <span
-                    className="chip crm-send-chip"
-                    data-state={testReceipt.accepted ? "accepted" : "failed"}
-                  >
-                    {testReceipt.accepted ? "Accepted" : "Refused"}
-                  </span>{" "}
-                  <span className="num">
-                    SMTP {testReceipt.smtpCode ?? "—"} {testReceipt.smtpMessage}
-                  </span>
+                  {testReceipt.pendingApproval ? (
+                    <span className="chip crm-send-chip" data-state="pending">
+                      {WAITING_APPROVAL_TEXT}
+                    </span>
+                  ) : (
+                    <>
+                      <span
+                        className="chip crm-send-chip"
+                        data-state={testReceipt.accepted ? "accepted" : "failed"}
+                      >
+                        {testReceipt.accepted ? "Accepted" : "Refused"}
+                      </span>{" "}
+                      <span className="num">
+                        SMTP {testReceipt.smtpCode ?? "—"} {testReceipt.smtpMessage}
+                      </span>
+                    </>
+                  )}
                 </dd>
               </div>
               <div>
@@ -2580,15 +2134,22 @@ function CampaignWorkspace({
                 <dd className="num">{testReceipt.to}</dd>
               </div>
               <div>
-                <dt>Content</dt>
-                <dd className="num">
-                  r{testReceipt.contentRevision} · {testReceipt.contentDigest.slice(0, 18)}…
+                <dt>Claim</dt>
+                <dd className="text-ink-300">
+                  {testReceipt.pendingApproval
+                    ? "Nothing was sent yet. Send the same test again once the owner has approved it."
+                    : "The sender accepted the message — this is not proof of inbox delivery."}
                 </dd>
               </div>
               <div>
-                <dt>Claim</dt>
-                <dd className="text-ink-300">
-                  SMTP accepted the message — this is not proof of inbox delivery.
+                <dt>Details</dt>
+                <dd>
+                  <details>
+                    <summary className="cursor-pointer text-ink-400">Show</summary>
+                    <span className="num break-all">
+                      r{testReceipt.contentRevision} · {testReceipt.contentDigest.slice(0, 18)}…
+                    </span>
+                  </details>
                 </dd>
               </div>
             </dl>
@@ -2705,7 +2266,6 @@ function CampaignWorkspace({
           {previewSection}
         </div>
         {approvalSection}
-        {senderSection}
         {testSection}
         {proposalsSection}
         {finalSend}
@@ -2749,8 +2309,7 @@ function CampaignWorkspace({
             onTab={setTab}
           />
           {approvalSection}
-          {senderSection}
-          {testSection}
+            {testSection}
           {finalSend}
         </>
       )}

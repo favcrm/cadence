@@ -11,7 +11,7 @@ fn fixture() -> (
     BindingProof,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let metadata = DeploymentMetadata::parse(br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@2","transport":"hosted-media-lease@1"}]}"#).unwrap();
+    let metadata = DeploymentMetadata::parse(br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#).unwrap();
     let mut opts = ServeOptions::default();
     opts.platforms.insert(
         agenticos_external::PLATFORM.into(),
@@ -97,10 +97,7 @@ fn cad868_builtin_discovery_binding_and_app_credential_are_registration_dependen
     assert_eq!(source["account"], "hosted");
     assert_eq!(source["connection_kind"], "builtin");
     assert_eq!(source["mapping"]["capability"], "social.read");
-    assert_eq!(
-        source["mapping"]["tool"],
-        "scrapecreators.instagram.user.posts"
-    );
+    assert_eq!(source["mapping"]["tool"], "read_instagram_posts");
     assert_eq!(source["mapping"]["effect"], "read");
     assert!(shared
         .app_capability_credential(&source)
@@ -352,4 +349,48 @@ fn cad868_canonical_external_account_requires_enrolled_nonempty_custody() {
         shared.app_capability_quote(&missing).is_err(),
         "missing external custody must refuse before price traffic"
     );
+}
+
+/// CAD-1096 redaction: only `[A-Za-z0-9_]{1,64}` after "refused: " reaches
+/// the operator; the board re-checks the exact shape before relaying it.
+#[test]
+fn cad1096_quote_refusal_surfaces_only_a_bounded_code() {
+    let bare = PRICE_REFUSED;
+    let ok = "a".repeat(64);
+    let shaped = format!("{bare}: {ok}");
+    assert_eq!(price_refusal(&format!("door refused: {ok}")), shaped);
+    assert_eq!(operator_price_refusal(&shaped), Some(shaped.as_str()));
+    assert_eq!(operator_price_refusal(bare), Some(bare));
+    let long = "a".repeat(65);
+    for code in [
+        long.as_str(),
+        "n\u{f6}t_allowed",
+        "a\nb",
+        "a\n",
+        r#"{"code":"x"}"#,
+        "https://evil.test/x",
+        "a b",
+        "x refused: a b",
+        "a: b",
+        ":a",
+        "",
+        "\0",
+    ] {
+        assert_eq!(
+            price_refusal(&format!("door refused: {code}")),
+            bare,
+            "{code:?}"
+        );
+        let relayed = format!("{bare}: {code}");
+        assert_eq!(operator_price_refusal(&relayed), None, "{code:?}");
+    }
+    for message in [
+        format!("{bare}x"),
+        format!("{bare}:a"),
+        format!("{bare}: a: b"),
+        format!("x {bare}"),
+    ] {
+        assert_eq!(operator_price_refusal(&message), None, "{message:?}");
+    }
+    assert_eq!(price_refusal("provider quote is not JSON"), bare);
 }

@@ -54,6 +54,10 @@ pub struct FakeAdapter {
     next_request: AtomicU64,
     next_turn: AtomicU64,
     disconnected: AtomicBool,
+    /// CAD-1098: the profile the next open launches with, and every
+    /// profile a session actually opened with, in order.
+    profile: Mutex<crate::master::Profile>,
+    opened_with: Mutex<Vec<crate::master::Profile>>,
 }
 
 impl FakeAdapter {
@@ -64,7 +68,14 @@ impl FakeAdapter {
             next_request: AtomicU64::new(0),
             next_turn: AtomicU64::new(0),
             disconnected: AtomicBool::new(false),
+            profile: Mutex::new(crate::master::Profile::Home),
+            opened_with: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The profile of every session this adapter opened, oldest first.
+    pub fn opened_with(&self) -> Vec<crate::master::Profile> {
+        self.opened_with.lock().unwrap().clone()
     }
 
     fn turn_id(&self) -> String {
@@ -76,6 +87,14 @@ impl FakeAdapter {
 }
 
 impl ProviderAdapter for FakeAdapter {
+    fn set_session_profile(&self, profile: crate::master::Profile) {
+        *self.profile.lock().unwrap() = profile;
+    }
+
+    fn session_profile(&self) -> crate::master::Profile {
+        *self.profile.lock().unwrap()
+    }
+
     fn open(&self, agent: &Agent) -> Result<Identity> {
         let fail_if = agent
             .params
@@ -85,6 +104,10 @@ impl ProviderAdapter for FakeAdapter {
         if let Some(path) = fail_if.filter(|p| std::path::Path::new(p).exists()) {
             return Err(Error::provider(format!("fake open refused: {path} exists")));
         }
+        self.opened_with
+            .lock()
+            .unwrap()
+            .push(*self.profile.lock().unwrap());
         Ok(Identity {
             thread_id: format!("fake-thread-{}", agent.alias),
             session_id: format!("fake-session-{}", agent.alias),

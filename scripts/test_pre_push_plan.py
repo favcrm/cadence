@@ -14,14 +14,17 @@ loader.exec_module(pre_push)
 
 
 class PlanTests(unittest.TestCase):
-    def test_explicit_tests_runs_floor_even_without_test_source_changes(self):
+    def test_explicit_tests_runs_every_target_even_without_test_source_changes(self):
         for changed in ({"src/review.rs"}, {"docs/START-HERE.md"}, set(), None):
             with self.subTest(changed=changed):
                 steps = pre_push.plan(str(ROOT), changed, True)
-                floor = [argv for _, argv, skip in steps if argv and not skip
-                         and "safety_floor" in argv]
+                floor = [(name, argv) for name, argv, skip in steps if argv and not skip
+                         and argv == ["scripts/run-result-tests"]]
                 self.assertEqual(len(floor), 1)
-                self.assertIn("--locked", floor[0])
+                # CAD-1105: the shared runner covers the lib unit tests too.
+                self.assertEqual(floor[0][0], "tests integration+lib")
+        runner = (ROOT / "scripts/run-result-tests").read_text()
+        self.assertIn("cargo test --locked --features test-seam --lib --no-fail-fast", runner)
 
     def test_active_script_contracts_are_in_local_plan(self):
         steps = pre_push.plan(str(ROOT), {".github/workflows/ci.yml"}, False)

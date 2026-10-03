@@ -370,6 +370,20 @@ fn audit_approval_readback_parses() {
 }
 
 #[test]
+fn audit_scope_readback_parses() {
+    let cli = Cli::try_parse_from(["cadence", "audit", "scope", "--issue", "CAD-9"]).unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Scope { issue }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit scope must parse to AuditAction::Scope");
+    };
+    assert_eq!(issue, "CAD-9");
+    assert!(Cli::try_parse_from(["cadence", "audit", "scope"]).is_err());
+}
+
+#[test]
 fn audit_approve_and_revoke_parse() {
     let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
     let cli = Cli::try_parse_from([

@@ -615,6 +615,15 @@ pub trait ProviderAdapter: Send + Sync {
     fn reset_rejected_session(&self, _result: &TurnResult) -> Result<bool> {
         Ok(false)
     }
+    /// CAD-1098 Gate 1: the tool profile the NEXT `open` launches with
+    /// (the master only; others ignore it). Set by the daemon from the
+    /// conversation row before every open, so rules never carry over from
+    /// the previous session.
+    fn set_session_profile(&self, _profile: crate::master::Profile) {}
+    /// The profile the last/next `open` uses — for the live-switch check.
+    fn session_profile(&self) -> crate::master::Profile {
+        crate::master::Profile::Home
+    }
 }
 
 /// CAD-1009: the opener and closer of the scoped-turn block the daemon

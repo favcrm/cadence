@@ -1,3 +1,4 @@
+import SafeLink from "../../ui/SafeLink";
 import { useState } from "react";
 import { api } from "../../lib/api";
 import type { IssueDetail } from "../../lib/types";
@@ -88,14 +89,9 @@ export function Links({
               title={r.url ?? r.path ?? r.label}
             >
               {r.url ? (
-                <a
-                  className="lnk"
-                  href={r.url}
-                  target="_blank"
-                  rel="noreferrer"
-                >
+                <SafeLink className="lnk" href={r.url}>
                   {r.label ?? r.url}
-                </a>
+                </SafeLink>
               ) : (
                 <span>{r.label ?? r.path}</span>
               )}

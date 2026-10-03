@@ -2,7 +2,7 @@
 """CAD-922: one local command that catches the cheap failures before CI.
 
     scripts/pre-push              # run every step the diff calls for
-    scripts/pre-push --tests      # also run the safety floor, regardless of diff
+    scripts/pre-push --tests      # also run every tests/*.rs target, regardless of diff
     scripts/pre-push --list       # print the plan, run nothing
     scripts/pre-push --base REF   # diff base (default origin/main, else main)
 
@@ -19,7 +19,8 @@ Steps run in order and stop at the first failure:
   6. nextest wrapper  scripts/test-cadence-nextest, which includes the
                   `flock -o` leak regression (CAD-968)
                                                               (scripts/cadence-nextest or its test/installer changed)
-  7. tests        cargo test --locked --test safety_floor    (--tests only)
+  7. tests        scripts/run-result-tests (every test target, then the lib
+                  unit tests)                                (--tests only)
 
 Every step is judged by its exit code alone and gets one summary line. Host
 limits from AGENTS.md apply: CARGO_BUILD_JOBS defaults to 4 and tests run with
@@ -152,20 +153,19 @@ def plan(root, changed, with_tests):
     # CAD-1021: cheap focused unit tests gated on the file they guard.
     for name, argv in focused_tests(root, changed):
         steps.append((name, argv, None))
-    # CAD-1073 clean-slate: only the safety floor is wired to --tests.
+    # CAD-1073 clean-slate: every tests/*.rs target is wired to --tests.
     if not with_tests:
-        steps.append(("tests", None, "pass --tests to run the safety floor"))
+        steps.append(("tests", None, "pass --tests to run every test target"))
     else:
-        steps.append(("tests safety_floor", ["cargo", "test", "--locked",
-                                             "--test", "safety_floor", "--",
-                                             "--test-threads", "2"], None))
+        # CAD-1090/CAD-1105: the same runner CI uses, integration and lib.
+        steps.append(("tests integration+lib", ["scripts/run-result-tests"], None))
     return steps
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--tests", action="store_true",
-                    help="also run the safety floor (even when its source is unchanged)")
+                    help="also run every tests/*.rs target")
     ap.add_argument("--list", action="store_true", help="print the plan and exit")
     ap.add_argument("--base", help="diff base ref (default origin/main, else main)")
     ap.add_argument("--root", default=os.path.dirname(os.path.dirname(

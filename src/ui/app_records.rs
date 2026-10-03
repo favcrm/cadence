@@ -96,6 +96,8 @@ impl Route<'_> {
 struct Create {
     record_id: String,
     profile: Value,
+    #[serde(default)]
+    consent_provenance: Option<Value>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -258,6 +260,9 @@ pub(super) fn handle(
             let mut params = json!({"install_id": install, "context_id": context});
             params["record_id"] = Value::String(body.record_id);
             params["profile"] = body.profile;
+            if let Some(provenance) = body.consent_provenance {
+                params["consent_provenance"] = provenance;
+            }
             ("app_record_create", params)
         }
         Route::Show(install, context, record) => (

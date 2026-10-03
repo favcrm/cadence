@@ -33,6 +33,9 @@ mod area_rpc;
 mod caller_rule;
 mod checkup;
 mod connections_rpc;
+#[cfg(all(test, feature = "test-seam"))]
+mod conversations_acceptance;
+mod conversations_rpc;
 mod crm_send_rpc;
 mod crm_smtp_rpc;
 mod delivery_rpc;
@@ -59,6 +62,7 @@ mod requests_rpc;
 mod review_evidence_rpc;
 mod serve;
 mod slots_rpc;
+mod social_publish_driver;
 mod social_publish_rpc;
 mod supervisor_grant;
 mod test_queue_rpc;
@@ -116,6 +120,7 @@ pub use master_rpc::MASTER_ALLOWED;
 // CAD-1006: the frame-document renderer the board's consume route uses.
 // `pub(crate)` — the UI frame route calls it; unit tests live in the
 // module, not as a public API.
+pub(crate) use app_capabilities_rpc::operator_price_refusal;
 pub(crate) use app_screens_rpc::render_frame_html;
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
@@ -393,6 +398,11 @@ pub struct Shared {
     router_backlog: std::sync::atomic::AtomicUsize,
     /// CAD-339: serializes writers of the escalation record.
     escalation_lock: Mutex<()>,
+    /// CAD-1021: last time the reclaim pass (merged sweep + idle
+    /// `target/`) ran inside the checkup — the sweep is throttled to
+    /// [`checkup::RECLAIM_EVERY`] so a 60s checkup never re-runs a git
+    /// walk every tick.
+    reclaim_at: Mutex<Option<std::time::Instant>>,
     /// CAD-615: grant-execution token → the child this daemon spawned
     /// and the argv that child is allowed to run. A descendant, or a
     /// different argv, is not the operator.
@@ -478,6 +488,10 @@ pub struct Shared {
     /// adapter lands. Never set from PM, RPC, or worker input.
     social_publish_sender:
         Option<std::sync::Arc<dyn crate::platform::agenticos_external::publish::PublishSender>>,
+    /// CAD-1020: daemon-owned publish driver. `off` forces it inert even
+    /// with a sender attached (the canary kill switch); otherwise it
+    /// ticks at `social_publish_driver_every` while a sender is registered.
+    social_publish_driver: social_publish_driver::Driver,
     /// CAD-979: the retained-media import client, resolved once at attach
     /// beside the sender from the same `publish.send` credential. Serves the
     /// operator `social_publish_media_import` verb; absent → `capability_unavailable`.
@@ -677,6 +691,7 @@ impl Shared {
             checkup_dispatch: opts.checkup_dispatch.clone(),
             router_backlog: std::sync::atomic::AtomicUsize::new(0),
             escalation_lock: Mutex::new(()),
+            reclaim_at: Mutex::new(None),
             perm_exec: Mutex::new(HashMap::new()),
             dispatch_lock: Mutex::new(()),
             delivery_lock: Mutex::new(()),
@@ -716,6 +731,7 @@ impl Shared {
             platforms: opts.platforms.clone(),
             effect_execute_gate: opts.effect_execute_gate.clone(),
             social_publish_sender: opts.social_publish_sender.clone(),
+            social_publish_driver: social_publish_driver::Driver::new(opts),
             social_media_importer: opts.social_media_importer.clone(),
             social_media_resolver: opts.social_media_resolver.clone(),
             screen_caps: Mutex::new(HashMap::new()),
@@ -847,8 +863,18 @@ impl Shared {
         // survives a daemon restart; the event itself is recorded below
         // like every `cadence/<kind>`.
         if method == "cadence/session_compacted" {
-            if let Err(e) = self.store.thread_append(
+            // The compacting session serves the running message's
+            // conversation (CAD-1098 I7): the note and its pending pack
+            // belong to that thread.
+            let thread = self
+                .store
+                .running_message(alias)
+                .ok()
+                .flatten()
+                .and_then(|m| self.store.message_conversation(alias, &m.id).ok().flatten());
+            if let Err(e) = self.note_in(
                 alias,
+                thread.as_ref(),
                 store::NewEntry {
                     role: store::ROLE_SYSTEM,
                     kind: store::KIND_MESSAGE,
@@ -1008,7 +1034,7 @@ impl Shared {
             // for the provider turn. The stored text is untouched —
             // the thread keeps the operator's exact words.
             let mut body = message.body.clone();
-            if let Ok(Some(hint)) = self.store.message_app(&message.id) {
+            if let Some(hint) = self.delivery_hint(message) {
                 if let Some(envelope) = app_hint_envelope(&hint) {
                     // CAD-1009: the turn-token slot follows the hint on
                     // its own line; the adapter fills it with the token
@@ -1063,10 +1089,7 @@ impl Shared {
         // the pull (`message read`) carries the full envelope as
         // metadata. A hint that cannot be re-proved is simply absent.
         let app = self
-            .store
-            .message_app(&message.id)
-            .ok()
-            .flatten()
+            .delivery_hint(message)
             .and_then(|hint| app_hint_notice(&hint))
             .unwrap_or_default();
         format!(
@@ -1088,6 +1111,22 @@ impl Shared {
     /// caller of the scoped verbs) runs managed Pi or Claude; pty,
     /// Codex and cloud endpoints get the hint only. The slot is fresh
     /// per call and never stored — the message body cannot contain it.
+    /// CAD-1098 I4: the App hint a delivery may carry. The send-time
+    /// stamp must still re-prove (`message_app`) AND the message's own
+    /// conversation must belong to the stamped installation; on any
+    /// mismatch the hint — and with it the turn-token slot — is dropped
+    /// and the message still delivers unscoped.
+    fn delivery_hint(&self, message: &Message) -> Option<Value> {
+        let hint = self.store.message_app(&message.id).ok().flatten()?;
+        let conversation = self
+            .store
+            .message_conversation(&message.alias, &message.id)
+            .ok()
+            .flatten()?;
+        (conversation.install_id.as_deref() == hint.get("install_id").and_then(Value::as_str))
+            .then_some(hint)
+    }
+
     fn turn_slot(&self, agent: &Agent, message: &Message) -> Option<String> {
         if agent.endpoint_kind == "pty"
             || registry::spec_opt(&agent.provider, &agent.endpoint_kind)
@@ -1107,7 +1146,7 @@ impl Shared {
         {
             return None;
         }
-        let hint = self.store.message_app(&message.id).ok().flatten()?;
+        let hint = self.delivery_hint(message)?;
         app_hint_envelope(&hint)?;
         Some(format!("<<cadence-turn-slot:{}>>", Uuid::new_v4().simple()))
     }
@@ -1142,15 +1181,23 @@ impl Shared {
         // A new or lost session is decided at open (in memory: the next
         // open decides again); a compaction is a thread note, pending
         // until a pack note follows it.
+        // CAD-1098 I7: the pack, its notes and the compaction marker all
+        // belong to the MESSAGE's conversation (home when it has none).
+        let thread = self
+            .store
+            .message_conversation(alias, &message.id)
+            .ok()
+            .flatten()
+            .or_else(|| self.store.thread(alias).ok().flatten());
         let due = self
             .continuity_due
             .lock()
             .unwrap()
             .remove(alias)
             .or_else(|| {
-                self.store
-                    .compaction_pending(alias)
-                    .unwrap_or(false)
+                thread
+                    .as_ref()
+                    .is_some_and(|t| self.store.compaction_pending_of(&t.id).unwrap_or(false))
                     .then_some(crate::continuity::Reason::Compacted)
             });
         let Some(reason) = due else {
@@ -1160,15 +1207,28 @@ impl Shared {
             return body;
         }
         let pm_dir = self.pm_dir().ok().filter(|d| d.is_dir());
-        let built =
-            crate::continuity::assemble(&self.store, pm_dir.as_deref(), alias, reason, &message.id);
+        let built = crate::continuity::assemble(
+            &self.store,
+            pm_dir.as_deref(),
+            alias,
+            reason,
+            &message.id,
+            thread.as_ref(),
+        );
         let pack = match built {
             Ok(Some(pack)) => pack,
             Ok(None) => {
                 // Nothing to carry. A pending compaction is settled so
                 // later turns do not rebuild it.
                 if reason == crate::continuity::Reason::Compacted {
-                    self.continuity_settle(alias, reason, &message.id, "skipped", None);
+                    self.continuity_settle(
+                        alias,
+                        thread.as_ref(),
+                        reason,
+                        &message.id,
+                        "skipped",
+                        None,
+                    );
                 }
                 return body;
             }
@@ -1183,13 +1243,21 @@ impl Shared {
                     json!({"reason": reason.as_str(), "message": message.id,
                            "error": error}),
                 );
-                self.continuity_settle(alias, reason, &message.id, "failed", Some(&error));
+                self.continuity_settle(
+                    alias,
+                    thread.as_ref(),
+                    reason,
+                    &message.id,
+                    "failed",
+                    Some(&error),
+                );
                 return body;
             }
         };
         let payload = pack.payload(&message.id);
-        if let Err(e) = self.store.thread_append(
+        if let Err(e) = self.note_in(
             alias,
+            thread.as_ref(),
             store::NewEntry {
                 role: store::ROLE_SYSTEM,
                 kind: store::KIND_MESSAGE,
@@ -1235,8 +1303,14 @@ impl Shared {
         ) {
             eprintln!("provider_session_reset event for '{alias}' failed: {e}");
         }
-        if let Err(e) = self.store.thread_append(
+        let thread = self
+            .store
+            .message_conversation(alias, &message.id)
+            .ok()
+            .flatten();
+        if let Err(e) = self.note_in(
             alias,
+            thread.as_ref(),
             store::NewEntry {
                 role: store::ROLE_SYSTEM,
                 kind: store::KIND_MESSAGE,
@@ -1259,9 +1333,24 @@ impl Shared {
     /// CAD-324: record in the thread that a due pack was not delivered
     /// (`outcome`: `skipped` — nothing to carry — or `failed`). The note
     /// is a pack note, so it settles a pending compaction.
+    /// A daemon note (pack, settle, session reset) in the conversation it
+    /// is about — home when `thread` is `None` or home (CAD-1098).
+    fn note_in(
+        &self,
+        alias: &str,
+        thread: Option<&store::Thread>,
+        entry: store::NewEntry,
+    ) -> Result<Option<i64>> {
+        match thread {
+            Some(t) if !t.is_home() => self.store.thread_append_to(&t.id, entry),
+            _ => self.store.thread_append(alias, entry),
+        }
+    }
+
     fn continuity_settle(
         &self,
         alias: &str,
+        thread: Option<&store::Thread>,
         reason: crate::continuity::Reason,
         message: &str,
         outcome: &str,
@@ -1274,8 +1363,9 @@ impl Shared {
                 reason.as_str()
             ),
         };
-        if let Err(e) = self.store.thread_append(
+        if let Err(e) = self.note_in(
             alias,
+            thread,
             store::NewEntry {
                 role: store::ROLE_SYSTEM,
                 kind: store::KIND_MESSAGE,
@@ -1849,6 +1939,12 @@ impl Shared {
                     // CAD-1009: a scoped App turn's token slot (None for
                     // a nudge, a plain message or an endpoint that
                     // cannot redeem).
+                    // CAD-1098 I7: a session serves one conversation — switch
+                    // (new provider session, profile and pack) before the
+                    // prompt is built, so the pack is this conversation's.
+                    if !nudge {
+                        self.switch_session_if_needed(alias, &adapter, &message)?;
+                    }
                     let slot = if nudge {
                         None
                     } else {
@@ -2499,6 +2595,10 @@ impl Shared {
                 // CAD-538: the hosted lease, when held — provider, epoch,
                 // expiry and the fence reason after a loss.
                 "lease": self.lease.as_ref().map(|l| l.status_json()),
+                // CAD-1020: the publish driver's last/next tick, status
+                // and last error — `sender_not_configured` when no send
+                // transport is attached.
+                "social_publish_driver": self.social_publish_driver.status_json(),
                 // CAD-561: a pending update and what it waits on, so
                 // `cadence daemon status` and the board's banner show it.
                 "pending_update": self.pending_update().map(|p| p.to_json()),
@@ -2828,6 +2928,8 @@ impl Shared {
             "agent_ask" => self.rpc_ask(params, peer_pid),
             "thread_read" => self.rpc_thread_read(params),
             "thread_send" => self.rpc_thread_send(params, peer_pid),
+            "conversation_list" => self.rpc_conversation_list(params, peer_pid),
+            "conversation_create" => self.rpc_conversation_create(params, peer_pid),
             "agent_events" => self.rpc_events(params),
             // CAD-886: read-only wait with `agent_show` visibility.
             "agent_wait" => self.rpc_wait(params, peer_pid),
@@ -3697,7 +3799,15 @@ fn thread_app(value: &Value, store: &Store) -> Result<Value> {
             "app takes install_id and context_id only; field '{key}' is not accepted"
         )));
     }
-    for key in ["install_id", "context_id"] {
+    // `context_id` may be absent: an installation-only binding for an
+    // app whose chat has no context selected. The install is proven by
+    // the caller; no hint or turn token is ever made for it.
+    let keys: &[&str] = if obj.contains_key("context_id") {
+        &["install_id", "context_id"]
+    } else {
+        &["install_id"]
+    };
+    for key in keys.iter().copied() {
         let id = obj.get(key).and_then(Value::as_str).unwrap_or_default();
         if id.is_empty()
             || id.len() > 128
@@ -3711,7 +3821,9 @@ fn thread_app(value: &Value, store: &Store) -> Result<Value> {
         }
     }
     let install = obj["install_id"].as_str().unwrap();
-    let context = obj["context_id"].as_str().unwrap();
+    let Some(context) = obj.get("context_id").and_then(Value::as_str) else {
+        return Ok(json!({"install_id": install, "verified": true}));
+    };
     // Server proof: the installation exists and the context is
     // active in it — an unknown install, an unknown context, or an
     // archived one refuses here, before anything is queued.
@@ -4584,6 +4696,24 @@ pub struct ServeOptions {
     /// adapter lands. Never set from PM, RPC, or worker input.
     pub social_publish_sender:
         Option<std::sync::Arc<dyn crate::platform::agenticos_external::publish::PublishSender>>,
+    /// CAD-1020: driver tick interval override in milliseconds — the
+    /// test seam; bypasses the production seconds clamp so tests run
+    /// the loop hot. `None` resolves env/default. Never from PM/RPC.
+    pub social_publish_driver_ms: Option<u64>,
+    /// CAD-1020: kill switch — opt-IN, not opt-out. `None` reads
+    /// `CADENCE_SOCIAL_PUBLISH_DRIVER`: only `on` runs the driver; any
+    /// other value (or unset) parks it, so a sender attached for the
+    /// CAD-979 import flow never starts the loop by itself.
+    /// `Some(true)` forces inert; `Some(false)` forces on (tests).
+    pub social_publish_driver_off: Option<bool>,
+    /// CAD-1020: test-only clock for the driver's due/lateness
+    /// comparisons — `None` is wall epoch. Tests pin it to schedule
+    /// in the past/future without sleeping.
+    pub social_publish_driver_clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
+    /// CAD-1020, lib tests only: runs inside the driver between a
+    /// committed claim and its send (the lease-loss window).
+    #[cfg(test)]
+    pub(crate) social_publish_driver_after_claim: Option<Arc<dyn Fn() + Send + Sync>>,
     /// CAD-979: retained-media import client resolved once at attach (same
     /// credential as the sender). Never set from PM, RPC, or worker input.
     pub social_media_importer:
@@ -4933,6 +5063,16 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_report_router());
     }
+    // CAD-1020: the publish driver — claims due intents, sends through
+    // the attached sender, reconciles processing rows through status.
+    // Joined before `Shared::shutdown` so a tick never outlives the
+    // daemon; a SIGKILL mid-send is safe by construction (the row is
+    // left `processing` for the next boot's reconcile).
+    let publish_driver = {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_social_publish_driver())
+    };
+
     // CAD-719: the wiki index refresh worker — a committed wiki
     // mutation kicks one coalesced rebuild; the query-time tree check
     // stays the correctness fallback. Joined at shutdown so a rebuild
@@ -5041,6 +5181,12 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // lets a kickoff from that last tick settle into the shutdown marker.
     let _ = monitor_watch.join();
     let _ = test_watch.join();
+    // CAD-1020: join the publish driver before `Shared::shutdown` — a
+    // tick can be mid-send; one in-flight send costs driver-preflight +
+    // up to 2 staged preflights + POST + status ≈ 5×DOOR_TIMEOUT ≈
+    // 150s worst case (the reconcile sweep's 16 status reads are
+    // interruptible between items via the fence/`closing` checks).
+    let _ = publish_driver.join();
     // CAD-702: the heartbeat is NOT joined here — it stays the single
     // renewal poster through the flush below. Joining it before the
     // flush would leave the final WAL checkpoint and tracker commit
@@ -9165,7 +9311,7 @@ mod auto_stop_timer {
 // at `crate::daemon::<Item>`; `pub(super)` lines re-bind moved
 // helpers at module scope (CAD-534).
 #[allow(unused_imports)]
-use identity::{Caller, SlotWho, VerifiedAgent};
+use identity::{Caller, SlotPeer, SlotWho, VerifiedAgent};
 pub use serve::HotStart;
 #[allow(unused_imports)]
 use serve::{

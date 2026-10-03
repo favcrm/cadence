@@ -1,6 +1,6 @@
 name: e2e
 
-# CAD-1073 reduced window: the MVP journey is retired, not passing.
+# CAD-1073 retired the MVP journey (not passing); CAD-1102 made the current gate permanent.
 # Keep the release-seam refusal probe on nightly/tags/dispatch. It needs
 # only Cargo, not frontend dependencies or a browser. The job name stays
 # compatible; no end-to-end coverage is claimed.
@@ -27,7 +27,7 @@ env:
 
 jobs:
   mvp:
-    # No browser or live daemon is started during the reduced window.
+    # No browser or live daemon is started: the journey stays retired (CAD-1073).
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:

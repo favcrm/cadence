@@ -25,8 +25,9 @@ observations, not a controlled performance comparison.
 | Tracker contention | Shared PM writer was busy | Treat exit 75 as bounded retry; do not invent an approval/comment or bypass the lock |
 
 The author owns these mistakes. Deleting reviews or approvals would hide the
-failure, not fix it. One correctly bound scope approval, two independent
-exact-head verdicts, one correctly bound merge approval and a queue enqueue
+failure, not fix it. One correctly bound scope approval, the exact-head
+verdicts AGENTS.md "Review" requires (one by default, two for triggers 1/3),
+one correctly bound merge approval and a queue enqueue
 should be the normal path—not repeated requests for the same decision.
 
 ## Change-dependent PR feedback
@@ -61,6 +62,25 @@ threads), even if its source is unchanged or diff discovery is uncertain.
 Add filtered tests for the behavior you changed; the floor is not that proof.
 Host Rust builds use four jobs and normal build-slot admission. If admission
 is unavailable, report that limitation rather than claiming local validation.
+
+### Queueing without a pane (subagents, operator shells)
+
+A caller with no registered pane or managed endpoint queues through the same
+daemon instead of running cargo unqueued:
+
+```sh
+cadence build-slot run build -- cargo build      # or: run test -- cargo test ...
+cadence build-slot launch <recipe>               # a build/test recipe with no env
+cadence build-slot status                        # capacity, holders, waiters + reason
+```
+
+The daemon labels such a caller `unregistered:<uid>` from the socket peer's
+credentials (a `--lane` or `CADENCE_ALIAS` is never read). It gets a slot
+and nothing else: its waiters rank behind every registered lane, it may ask
+only for `build`/`test` (not `suite`, `check`, or a hand-held `acquire`),
+it cannot release, reconcile or launch an env-passing recipe, and operator
+and agent actions still need their positive proof. `status` lists each
+waiter's reason: `capacity`, `memory` or `disk`.
 
 Do not push fixture fixes repeatedly just to discover compiler errors in CI.
 Do not change `RUSTC_WRAPPER` or disable tests to get a passing receipt.
@@ -137,15 +157,15 @@ digest, no fresh full review for unchanged code, and no duplicate Node setup
 for cargo-only retired journeys. Measure failure-before-review rate and
 number of operator/reviewer handoffs as well as CI elapsed/runner minutes.
 
-The default policy still requires two independent reviewers and operator
-approval for human risk. Automating evidence collection, reviewer state,
+Review count follows AGENTS.md "Review" (CAD-1099): one independent review by
+default, two for the excluded paths in `docs/roles/one-review-paths.toml`, and
+operator approval for human risk. Automating evidence collection, reviewer state,
 head-drift notifications or an operator decision UI is a separate reviewed
 implementation—not a license to self-approve. Likewise, consolidating required
 build/UI checks or changing branch protection requires baseline measurements
 and an operator decision. Do not change names in YAML before migrating the
 required-check policy safely.
 
-During the reduced window, restoring approval-lineage, inventory/shard and
-remote-CLI adversarial contracts is more important than optimizing dormant
-legacy benchmarks. Releases stay frozen until restoration is independently
-reviewed and authorized.
+CAD-1102 ended the reduced window: the current gate is permanent and releases
+are no longer frozen. New behavior checks follow AGENTS.md (CAD-1099), one
+acceptance check per enforced rule, not restoration of the retired suites.

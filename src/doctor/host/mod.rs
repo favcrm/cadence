@@ -188,6 +188,13 @@ pub struct HostOverrides {
     pub load_warn_ratio: Option<f64>,
     pub io_stall_warn_pct: Option<f64>,
     pub io_stall_fail_pct: Option<f64>,
+    /// CAD-1021 — read by the daemon's reclaim pass, not by
+    /// `Thresholds`. A lane worktree's `target/` is deleted only after
+    /// it has had no write for this many seconds (default 21600 = 6 h):
+    /// the idle window the operator's evidence called a leak. A live
+    /// build (cwd or open fd inside the lane), a live message or pane,
+    /// or any in-window write keeps the target.
+    pub reclaim_target_idle_secs: Option<u64>,
     /// CAD-199 — read by the daemon's agent-gc timer, not by
     /// `Thresholds`. Unset (the default) keeps the timer OFF; set, the
     /// daemon sweeps dead agent registry rows idle longer than this
@@ -690,6 +697,9 @@ use task_targets::{
 };
 #[allow(unused_imports)]
 use temp_dirs::check_temp_dirs;
+/// CAD-1021 slice 4: `dir_size` is the reclaim actor's freed-bytes
+/// measurement — the same `du`-walk the read-only plan reports.
+pub(crate) use util::dir_size;
 #[allow(unused_imports)]
 pub(crate) use util::find_wals;
 #[allow(unused_imports)]
@@ -710,8 +720,8 @@ pub(crate) use util::WalScan;
 pub(crate) use util::SECRET_PREFIXES;
 #[allow(unused_imports)]
 use util::{
-    census_of, comm_family, dir_size, dir_size_limited, file_locked, file_size, group_line,
-    kill_lines, kill_remedy, pid_age_secs, proc_census, proc_stat, proc_uptime, read_u64_file,
+    census_of, comm_family, dir_size_limited, file_locked, file_size, group_line, kill_lines,
+    kill_remedy, pid_age_secs, proc_census, proc_stat, proc_uptime, read_u64_file,
     redact_argv_parts, repo_root, shell_quote, stale_worktrees, top_groups, GroupAgg, OldestProc,
     ProcStat, REDACTED,
 };

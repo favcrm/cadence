@@ -35,6 +35,7 @@ enqueues nothing. Exit: 0 enqueued (or dry-run clean) / 1 refused / 2 usage.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -42,6 +43,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import unicodedata
 
 ME = "enqueue-reviewed"
 DEFAULT_NOTES_DIR = "/var/www/agent-notes"
@@ -49,13 +51,43 @@ ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
 
 # Human-class path triggers: docs/roles/risk-classes.md (4, 7) and the
 # AGENTS.md list. A verdict note's `Risk: human` also makes a diff human.
-HUMAN_PREFIXES = (".github/", "scripts/", "docs/roles/")
+# CAD-1104: with one reviewer by default, the operator's approval is the second
+# check, so this list must catch every trigger 4/6/7 path mechanically rather
+# than rely on a single reviewer's `Risk:` line.
+HUMAN_PREFIXES = (".github/", "scripts/", "docs/roles/", ".config/", ".cargo/",
+                  "src/audit/", "src/delegation/", "tests/common/", "config/")
+# Every [schema]/[trigger4]/[trigger6]/[trigger7] glob in this file, read at the
+# PR's base, is human too (CAD-1104). Unreadable means human (fail closed).
+RISK_PATHS_FILE = "docs/roles/risk-paths.toml"
+RISK_HUMAN_TABLES = ("schema", "trigger4", "trigger6", "trigger7")
 HUMAN_LINES = 1500  # risk-classes trigger 5
-HUMAN_BASENAMES = {"Cargo.toml", "Cargo.lock", "package.json", "pnpm-lock.yaml"}
+HUMAN_BASENAMES = {"Cargo.toml", "Cargo.lock", "package.json", "pnpm-lock.yaml",
+                   "package-lock.json", ".npmrc", "yarn.lock", "bun.lockb",
+                   "build.rs", "rust-toolchain.toml"}
 HUMAN_EXACT = {
     "Cargo.toml", "Cargo.lock", "ui/package.json", "cadence-review.toml",
     "src/review.rs", "docs/TEAM.md", "docs/CHARTER.md", "AGENTS.md",
+    # trigger 4 build inputs
+    "build.rs", "rust-toolchain.toml", "clippy.toml",
+    # trigger 6: installs and rollouts (CAD-1104)
+    "src/rollout.rs", "src/update.rs", "src/upgrade.rs", "src/cli/rollout.rs",
+    "src/cli/daemon.rs", "src/cli/update.rs", "src/cli/upgrade.rs",
+    # trigger 7: approval and delivery rules (CAD-1104)
+    "src/audit.rs", "src/delegation.rs", "src/issue/delivery_policy.rs",
+    "docs/AUDIT.md", "tests/safety_floor.rs",
 }
+
+# CAD-1106: a scope approval never covers trust boundary/identity (1) or
+# secrets (3); those need a per-head approval.
+NEVER_SCOPE_TRIGGERS = {1, 3}
+# Tracker statuses (src/issue/model.rs STATUSES) a scope approval may cover:
+# work has started and the ticket is not closed. backlog, done, dropped: no.
+SCOPE_STATUSES = ("ready", "doing", "review")
+SCOPE_RECORDED_VIA = "operator-connection"  # the proof check_approval relies on
+# Rust's char::is_whitespace set: the daemon's scope_digest is sha256 of
+# body.trim(), and Python's str.strip() trims a different set.
+RUST_WS = "\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+RISK_TRIGGERS = re.compile(r"(?:triggers?\s*)?(\d+(?:\s*(?:,|and|&)\s*\d+)*)", re.I)
 
 REGULAR_MODES = ("100644", "100755")
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -181,10 +213,24 @@ def pr_changes(pr, head, base, base_oid):
     return parse_raw_diff(out), lines
 
 
-def is_human_path(path):
+def risk_globs(toml_text):
+    """The human-class globs of risk-paths.toml, or None if unreadable."""
+    if toml_text is None:
+        return None
+    try:
+        doc = tomllib.loads(toml_text)
+        globs = [g for t in RISK_HUMAN_TABLES for g in doc[t]["paths"]]
+    except (tomllib.TOMLDecodeError, KeyError, TypeError):
+        return None
+    return globs if all(isinstance(g, str) for g in globs) else None
+
+
+def is_human_path(path, risk=()):
     base = path.rsplit("/", 1)[-1]
+    segs = path.split("/")[:-1]
     return (path in HUMAN_EXACT or path.startswith(HUMAN_PREFIXES)
-            or base in HUMAN_BASENAMES)
+            or base in HUMAN_BASENAMES or ".github" in segs or ".cargo" in segs
+            or any(glob_match(g, path) for g in risk))
 
 
 # ---- required checks --------------------------------------------------------
@@ -353,11 +399,222 @@ def check_approval(repo, pr, head, report):
     return [f"human-class diff has no operator approval recorded for exactly head {head} ({why}); the operator records it with `cadence audit approve`"]
 
 
+# ---- ticket scope approval (CAD-1106) --------------------------------------
+
+def scope_digest(body):
+    """The daemon's delegation::scope_digest: sha256 of the trimmed body."""
+    return hashlib.sha256(body.strip(RUST_WS).encode()).hexdigest()
+
+
+def glob_list(toml_text, key_path):
+    """The string globs at doc[key_path...] of a TOML text, or None if the
+    text is missing, malformed or not a list of strings."""
+    if toml_text is None:
+        return None
+    try:
+        node = tomllib.loads(toml_text)
+        for k in key_path:
+            node = node[k]
+    except (tomllib.TOMLDecodeError, KeyError, TypeError):
+        return None
+    return node if isinstance(node, list) and all(isinstance(g, str) for g in node) else None
+
+
+# A ticket body that can hide or disguise a line from the rendered page gives
+# no scope approval (a per-PR approval still works): a Unicode format
+# character, an HTML character reference, or hidden HTML.
+HIDING_HTML = re.compile(r"<!--|<[^>]*\bhidden\b|display\s*:\s*none", re.I)
+HTML_REF = re.compile(r"&(?:#\w+|[a-z][a-z0-9]*);", re.I)
+RISK_LOOSE = re.compile(r"r\w?s\W*k\W*:")
+
+
+def hides_text(text):
+    return (any(unicodedata.category(c) == "Cf" for c in text)
+            or HTML_REF.search(text) is not None or HIDING_HTML.search(text) is not None)
+
+
+def risk_line(text, ticket=False):
+    """The one `Risk:` line (stripped, without the label), or None when there
+    is none or MORE THAN ONE (fail closed: which one counts is unknowable).
+    `ticket` (a ticket body) refuses text that can hide a line (`hides_text`),
+    then counts EVERY line that loosely looks like `Risk:` after NFKC and
+    casefold (lookalike letters, fullwidth forms, lowercase), fenced code
+    included. That one line must itself start with the ASCII `Risk:` once
+    Markdown markers are stripped."""
+    if ticket and hides_text(text or ""):
+        return None
+    lines = []
+    for raw in (text or "").splitlines():
+        l = raw.strip()
+        if ticket:
+            l = re.sub(r"[*_`]", "", l).lstrip(" \t>-").strip()
+            if RISK_LOOSE.search(unicodedata.normalize("NFKC", l).casefold()):
+                lines.append(l[5:].strip() if l.startswith("Risk:") else None)
+        elif l.startswith("Risk:"):
+            lines.append(l[5:].strip())
+    return lines[0] if len(lines) == 1 else None
+
+
+def risk_triggers(line):
+    """The trigger numbers a `Risk:` line names, or None when it is not
+    `auto` / `human (<numbers>)` (allowlist). Beyond the first group it reads
+    EVERY trigger number on the line: `trigger N` wording and single digits
+    inside any other parenthesised group, so a 1 or 3 cannot hide in prose."""
+    if line is None:
+        return None
+    if line.split()[:1] == ["auto"]:
+        return set()
+    m = re.match(r"human\s*\(([^)]*)\)", line)
+    t = RISK_TRIGGERS.fullmatch(m.group(1).strip()) if m else None
+    if not t:
+        return None
+    nums = {int(n) for n in re.findall(r"\d+", t.group(1))}
+    rest = line[m.end():]
+    for w in re.finditer(r"\btriggers?\s*(\d+(?:\s*(?:,|and|&)\s*\d+)*)", rest, re.I):
+        nums |= {int(n) for n in re.findall(r"\d+", w.group(1))}
+    for g in re.findall(r"\(([^)]*)\)", rest):
+        nums |= {int(n) for n in re.findall(r"(?<![\w#-])[1-9](?![\w-])", g)}
+    return nums
+
+
+def note_triggers(text):
+    return risk_triggers(risk_line(text))
+
+
+# docs/roles/risk-paths.toml tables that map a path to a risk trigger number
+PATH_TRIGGER_TABLES = (("schema", 2), ("trigger4", 4), ("trigger6", 6), ("trigger7", 7))
+
+
+def path_triggers(paths, risk_text):
+    """(triggers hit, [unmapped human paths]) from the risk-paths tables read
+    at the base, or (None, reason) when a table is unreadable. A human-class
+    path (is_human_path) in no table is unmapped: it needs a per-head approval."""
+    tables = []
+    for t, n in PATH_TRIGGER_TABLES:
+        g = glob_list(risk_text, (t, "paths"))
+        if g is None:
+            return None, f"cannot read the [{t}] list of {RISK_PATHS_FILE} at the base"
+        tables.append((n, g))
+    hit, unmapped = set(), []
+    for p in paths:
+        mine = {n for n, g in tables if any(glob_match(x, p) for x in g)}
+        hit |= mine
+        if not mine and is_human_path(p, ()):
+            unmapped.append(p)
+    return hit, unmapped
+
+
+def scope_reasons(issue, title, branch, ticket, paths, risk_text, one_text, verdicts, counted, scopes, read_note):
+    """Why a ticket scope approval does NOT cover this PR: [] only when every
+    condition holds. Pure but for `read_note(path)` (a verdict note's text or
+    None). Each condition fails closed on a missing or malformed input."""
+    why = []
+    if not issue:
+        return ["the PR title carries no ticket id"]
+    body = ticket.get("body")
+    if not isinstance(body, str) or str(ticket.get("id", "")).lower() != issue.lower():
+        why.append(f"cannot read the body of ticket {issue}")
+    # Paths: never trigger 1 or 3, never a two-review (exclude) path.
+    t13 = [g for t in ("trigger1", "trigger3") for g in (glob_list(risk_text, (t, "paths")) or [None])]
+    exc = glob_list(one_text, ("one_review_exclude",))
+    if None in t13 or exc is None:
+        why.append(f"cannot read the trigger 1/3 lists ({RISK_PATHS_FILE}, {ONE_REVIEW_FILE}) at the base")
+    else:
+        hit = [p for p in paths if any(glob_match(g, p) for g in t13 + exc)]
+        if hit:
+            why.append(f"trigger 1/3 or two-review path needs a per-head approval: {', '.join(hit[:5])}")
+    if not paths:
+        why.append("no changed paths")
+    if ticket.get("status") not in SCOPE_STATUSES:
+        why.append(f"ticket {issue} status is {ticket.get('status')!r}; a scope approval covers only a ticket in {'/'.join(SCOPE_STATUSES)}")
+    # The ticket declares its Risk triggers; the approval covers only those.
+    declared = risk_triggers(risk_line(body, ticket=True)) if isinstance(body, str) else None
+    pt, unmapped = path_triggers(paths, risk_text)
+    if not declared:
+        why.append(f"ticket {issue} declares no parseable `Risk: human (<numbers>)` line, so its scope is unknown")
+    elif declared & NEVER_SCOPE_TRIGGERS:
+        why.append(f"ticket {issue} declares trigger {sorted(declared & NEVER_SCOPE_TRIGGERS)}, which a scope approval never covers")
+    if pt is None:
+        why.append(unmapped)
+    else:
+        if unmapped:
+            why.append(f"human-class path in no risk trigger list needs a per-head approval: {', '.join(unmapped[:5])}")
+        if declared and not pt <= declared:
+            why.append(f"the diff hits trigger(s) {sorted(pt - declared)} the ticket does not declare (declared {sorted(declared)})")
+    # Lane branch the ticket recorded.
+    refs = ticket.get("refs")
+    if not (isinstance(refs, list) and branch and any(
+            isinstance(r, dict) and r.get("kind") == "branch" and r.get("closed") is not True
+            and r.get("path") == branch for r in refs)):
+        why.append(f"PR branch {branch!r} is not an open lane branch recorded on {issue}")
+    # Verdict notes: no trigger 1/3 Risk line; counted notes state in-scope.
+    for v in verdicts:
+        text = read_note(v.get("path"))
+        trig = note_triggers(text) if text is not None else None
+        if trig is None:
+            why.append(f"cannot show that {v.get('name')} avoids Risk triggers 1 and 3")
+        elif trig & NEVER_SCOPE_TRIGGERS:
+            why.append(f"{v.get('name')} names Risk trigger {sorted(trig & NEVER_SCOPE_TRIGGERS)}")
+        elif declared and not trig <= declared:
+            why.append(f"{v.get('name')} names Risk trigger(s) {sorted(trig - declared)} the ticket does not declare")
+    for n in counted:
+        text = read_note(n.get("path"))
+        if text is None or not re.search(rf"^\s*Scope:\s*in-scope\s+{re.escape(issue)}\b", text, re.I | re.M):
+            why.append(f"{n['name']} does not state `Scope: in-scope {issue}`")
+    # The approval itself.
+    if not isinstance(scopes, dict) or scopes.get("state") != "ok" or not isinstance(scopes.get("approvals"), list):
+        why.append(f"cannot read scope approvals via `cadence audit scope`: {scopes!r}"[:200])
+    elif str(scopes.get("issue", "")).lower() != issue.lower():
+        why.append(f"the scope approvals read are for {scopes.get('issue')!r}, not {issue}")
+    else:
+        digest = scope_digest(body) if isinstance(body, str) else None
+        live = [a for a in scopes["approvals"] if isinstance(a, dict) and a.get("revoked") is False]
+        if not live:
+            why.append(f"no live (unrevoked) scope approval is recorded for {issue}")
+        elif not any(a.get("digest") == digest and a.get("recorded_via") == SCOPE_RECORDED_VIA for a in live):
+            why.append(f"no live scope approval of {issue} matches the ticket as it reads now "
+                       f"(digest {str(digest)[:12]}; edited since approval, or not recorded via {SCOPE_RECORDED_VIA})")
+    return why
+
+
+def pick_scope_approval(scopes, body):
+    """The approval id scope_reasons accepted (call only when it returned [])."""
+    d = scope_digest(body)
+    return next(a for a in scopes["approvals"]
+                if a.get("revoked") is False and a.get("digest") == d and a.get("recorded_via") == SCOPE_RECORDED_VIA)
+
+
+def read_note_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def check_scope(issue, title, branch, ticket, paths, risk_text, one_text, verdicts, counted, report):
+    """Reasons ([] = covered). Appends which approval was used to `report`."""
+    try:
+        rc, out, _ = run(["cadence", "audit", "scope", "--issue", issue or ""])
+        try:
+            scopes = json.loads(out) if rc == 0 else {"state": f"rc {rc}"}
+        except ValueError:
+            scopes = {"state": "unparseable"}
+        why = scope_reasons(issue, title, branch, ticket, paths, risk_text, one_text, verdicts, counted, scopes, read_note_file)
+        if not why:
+            a = pick_scope_approval(scopes, ticket["body"])
+            report.append(f"scope approval in force: id {a.get('approval_id')}, ticket {issue}, digest {a['digest'][:12]}, "
+                          f"source {a.get('source')!r}, recorded_via {a.get('recorded_via')} (an operator claim until CAD-280)")
+        return why
+    except Exception as e:  # fail closed on any read error
+        return [f"scope approval check failed: {e}"]
+
+
 def evaluate(args, repo):
     """(reasons, report lines). Every rule is evaluated; none returns early."""
     reasons, report = [], []
     pr, head = args.pr, args.head
-    fields = "number,state,title,headRefOid,baseRefName,baseRefOid,mergeStateStatus,autoMergeRequest,statusCheckRollup,author"
+    fields = "number,state,title,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,autoMergeRequest,statusCheckRollup,author"
     view = gh_json(["pr", "view", str(pr), "-R", repo, "--json", fields])
 
     if view.get("state") != "OPEN":
@@ -398,6 +655,7 @@ def evaluate(args, repo):
     # One-review list, read at the PR's base commit.
     rc, toml_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
                             f"repos/{repo}/contents/{ONE_REVIEW_FILE}?ref={base_oid}"])
+    one_text = toml_text if rc == 0 and base_oid else None
     one = rc == 0 and bool(base_oid) and one_review_qualifies(changes, toml_text)
     report.append("reviews required: " + ("one (diff is on the one-review list)" if one else "two (Standards and Spec/security)"))
     need_qa = any(p.startswith("ui/") for p in paths)
@@ -441,7 +699,12 @@ def evaluate(args, repo):
         reasons += check_comment(ticket.get("comments"), head, counted)
 
     # Human class: paths, size, or any head-pinned note whose Risk is not exactly `auto`.
-    why = [p for p in paths if is_human_path(p)][:5]
+    rc, risk_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                            f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={base_oid}"])
+    risk_text = risk_text if rc == 0 and base_oid else None
+    risk = risk_globs(risk_text)
+    why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the base (fail closed)"]
+    why += [p for p in paths if is_human_path(p, risk or ())][:5]
     if lines > HUMAN_LINES:
         why.append(f"{lines} changed lines")
     not_auto = [v for v in verdicts if v["risk"] != "auto"]
@@ -449,7 +712,15 @@ def evaluate(args, repo):
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
     if why:
         report.append("class: human (" + "; ".join(why) + ")")
-        reasons += check_approval(repo, pr, head, report)
+        rs = check_approval(repo, pr, head, report)
+        if rs:  # CAD-1106: fall back to a live ticket scope approval
+            sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
+                             risk_text, one_text, verdicts, counted, report)
+            if sr:
+                report.append("scope approval not used: " + "; ".join(sr))
+            else:
+                rs = []
+        reasons += rs
     else:
         report.append("class: auto (every head-pinned note says Risk: auto; no path or size trigger)")
     return reasons, report

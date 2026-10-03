@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { ResourceState } from "../lib/cache";
-import type { AppMenu } from "../features/app-shell/CrmOutlet";
+import type { AppNav } from "../features/app-shell/appNav";
 import type { Route, Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
 import { Logo } from "./Logo";
@@ -29,7 +29,7 @@ interface Props {
    *  when no installation workspace is on screen. Host-owned App
    *  menu (CAD-784): sections arrive as data with real hrefs — the
    *  sidebar never invents entries from the bare route. */
-  appMenu?: AppMenu | null;
+  appMenu?: AppNav | null;
 }
 
 export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null }: Props) {

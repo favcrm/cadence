@@ -360,7 +360,16 @@ function SegmentList({
             </thead>
             <tbody>
               {segments.map((segment) => (
-                <tr key={segment.id} data-record-id={segment.id}>
+                <tr
+                  key={segment.id}
+                  data-record-id={segment.id}
+                  className="crm-row-open"
+                  onClick={(e) => {
+                    // A click on a control inside the row keeps its own meaning.
+                    if ((e.target as HTMLElement).closest("button, input, a")) return;
+                    onSelect(segment.id);
+                  }}
+                >
                   <td className="text-ink-100">
                     {segment.name}
                     <span className="num text-micro text-ink-500"> · {segment.id}</span>
@@ -905,20 +914,18 @@ function SegmentDrawer({
       tabs={tabs}
       tab={tab}
       onTab={setTab}
-      menu={
-        ready
-          ? [
-              { key: "duplicate", label: "Duplicate", onSelect: duplicate, disabled: !canWrite, title: canWrite ? undefined : "Operators only" },
-              { key: "export", label: "Export members", onSelect: () => {}, disabled: true, title: "Not available yet: the host has no segment export" },
-              { key: "delete", label: "Delete segment", onSelect: () => {}, disabled: true, destructive: true, title: "Not available yet: the host has no segment delete" },
-            ]
-          : undefined
-      }
       secondary={
-        ready && canWrite ? (
-          <Button size="sm" onClick={() => setEditing(true)}>
-            Edit rules
-          </Button>
+        ready ? (
+          <>
+            <Button size="sm" onClick={duplicate} disabled={!canWrite} title={canWrite ? undefined : "Operators only"}>
+              Duplicate
+            </Button>
+            {canWrite ? (
+              <Button size="sm" onClick={() => setEditing(true)}>
+                Edit rules
+              </Button>
+            ) : null}
+          </>
         ) : undefined
       }
       state={

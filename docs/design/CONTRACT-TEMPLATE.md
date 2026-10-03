@@ -1,9 +1,8 @@
 # Design contract: <ID> <rule being enforced>
 
-One page. Fill it before code, put it in the ticket or the PR, and have one
-Spec/security reviewer (not the author) pass it. Code reviewers then check the
-code against it. When a contract is required and how its pass is recorded:
-AGENTS.md "Design contract first". Delete none of the headings; write "none, because ..." where a section is empty.
+Optional long form of the design note (AGENTS.md "Design note in the PR",
+CAD-1099). Put it in the PR description, or on the ticket when the operator
+asks for agreement before code. Code reviewers check the code against it. Delete none of the headings; write "none, because ..." where a section is empty.
 
 ## Invariants
 What must always hold, as testable sentences. Name the actor allowed to act,
@@ -24,14 +23,16 @@ reason. A bare "n/a" fails review.
 - [ ] Partial write (torn file, half-applied multi-record update, event without its effect)
 - [ ] Clock or TTL edges (expiry at the boundary, clock step, restart mid-lease)
 
-## Adversarial tests
-One row per test. Each is written first and must fail without the guard.
-Name the test, the invariant, the guard it proves, and how it fails without
-the guard. "Would pass anyway" means the test is wrong.
+## Acceptance check
+ONE check proving the bad case is refused (AGENTS.md "Gates and security
+work"). It is written from the ticket by someone other than the implementer
+(the reviewer or the ticket author), and the implementer may not edit it.
+Name the check, the invariant it proves, the real guard it exercises, and the
+observable wrong outcome without the guard.
 
-| Test name | Proves (I#) | Guard | Fails without the guard because |
+| Check | Proves (I#) | Guard | Wrong outcome without the guard |
 |---|---|---|---|
-| `<test_fn_name>` | I1 | `<fn or check>` | `<observable wrong outcome>` |
+| `<check name>` | I1 | `<fn or check>` | `<observable wrong outcome>` |
 
 ## Out of scope
 What this change does not enforce, and where that is tracked (ticket id).
