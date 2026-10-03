@@ -72,6 +72,17 @@ impl RetryGate {
     }
 }
 
+/// The retry decision: only a deferred or provably-never-submitted
+/// outcome retries. `Uncertain` (maybe delivered) must never resend.
+fn retry_evidence(outcome: &crate::platform::smtp::SmtpOutcome) -> Option<(Option<u16>, &str)> {
+    use crate::platform::smtp::SmtpOutcome as O;
+    match outcome {
+        O::Deferred { code, message } => Some((Some(*code), message)),
+        O::NotSubmitted { message } => Some((None, message)),
+        _ => None,
+    }
+}
+
 /// The outcome of one claimed row, handed back across the scope
 /// proof so the caller can write the row's next state.
 enum Step {
@@ -912,35 +923,26 @@ impl Shared {
                                 &["submitting"],
                             )?;
                         }
-                        crate::platform::smtp::SmtpOutcome::Deferred { code, message } => {
-                            if let Some(attempts) = self.crm_send_delivery_retry(
-                                &records,
-                                context,
-                                send_id,
-                                &customer_id,
-                                Some(code),
-                                &message,
-                            )? {
-                                let now = started.elapsed().as_millis() as u64;
-                                gate.defer(&customer_id, attempts, now, interval_ms);
-                            }
-                        }
-                        crate::platform::smtp::SmtpOutcome::NotSubmitted { message } => {
-                            if let Some(attempts) = self.crm_send_delivery_retry(
-                                &records,
-                                context,
-                                send_id,
-                                &customer_id,
-                                None,
-                                &message,
-                            )? {
-                                let now = started.elapsed().as_millis() as u64;
-                                gate.defer(&customer_id, attempts, now, interval_ms);
-                            }
-                        }
                         // `crm_send_row_step` turns this into `Step::Waiting`.
                         crate::platform::smtp::SmtpOutcome::PendingApproval { .. } => {
                             return Err(Error::internal("pending approval escaped the row step"));
+                        }
+                        // The only outcomes left are the retryable ones.
+                        other => {
+                            let Some((code, message)) = retry_evidence(&other) else {
+                                return Err(Error::internal("unclassified submission outcome"));
+                            };
+                            if let Some(attempts) = self.crm_send_delivery_retry(
+                                &records,
+                                context,
+                                send_id,
+                                &customer_id,
+                                code,
+                                message,
+                            )? {
+                                let now = started.elapsed().as_millis() as u64;
+                                gate.defer(&customer_id, attempts, now, interval_ms);
+                            }
                         }
                     }
                 }
@@ -1205,6 +1207,29 @@ fn send_request_id(params: &Value) -> Result<String> {
 #[cfg(test)]
 mod backoff_tests {
     use super::*;
+    use crate::platform::smtp::SmtpOutcome as O;
+
+    #[test]
+    fn uncertain_is_never_retried() {
+        let m = || "m".to_string();
+        assert!(retry_evidence(&O::Uncertain { message: m() }).is_none());
+        assert!(retry_evidence(&O::Accepted {
+            code: 250,
+            message: m()
+        })
+        .is_none());
+        assert!(retry_evidence(&O::Rejected {
+            code: 550,
+            message: m()
+        })
+        .is_none());
+        assert!(retry_evidence(&O::Deferred {
+            code: 451,
+            message: m()
+        })
+        .is_some());
+        assert!(retry_evidence(&O::NotSubmitted { message: m() }).is_some());
+    }
 
     #[test]
     fn backoff_is_bounded_exponential_on_the_interval() {
