@@ -46,10 +46,23 @@ const MAX_DEPTH: usize = 32;
 const MAX_NODES: usize = 4_096;
 /// Most assets, declared and supplied alike.
 const MAX_ASSETS: usize = 32;
-/// Largest single asset body, UTF-8 bytes.
+/// Largest single `.js` asset body — the screen entry/leaves get the
+/// larger script budget (the frozen production bundle is ~239 KiB).
+const MAX_JS_BYTES: u64 = 262_144;
+/// Largest non-js asset body, UTF-8 bytes.
 const MAX_ASSET_BYTES: u64 = 131_072;
 /// Largest sum of every supplied asset body, bytes.
 const MAX_TOTAL_BYTES: u64 = 524_288;
+
+/// The per-leaf bound: `.js` gets the larger screen-script budget,
+/// every other asset the flat cap. Keyed on the leaf name's extension.
+fn asset_bound(name: &str) -> u64 {
+    if name.rsplit_once('.').map(|(_, e)| e) == Some("js") {
+        MAX_JS_BYTES
+    } else {
+        MAX_ASSET_BYTES
+    }
+}
 
 /// The one contract string this validator accepts.
 const CONTRACT: &str = "app-screens/v1";
@@ -167,11 +180,12 @@ pub fn validate_map(
         )));
     }
     let mut total_bytes = 0u64;
-    for body in assets.values() {
+    for (name, body) in assets.iter() {
         let len = body.len() as u64;
-        if len > MAX_ASSET_BYTES {
+        let bound = asset_bound(name);
+        if len > bound {
             return Err(Error::rejected(format!(
-                "an asset body is {len} bytes — at most {MAX_ASSET_BYTES}"
+                "asset {name:?} body is {len} bytes — at most {bound}"
             )));
         }
         total_bytes += len;
@@ -336,9 +350,10 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
         check_asset_name(&asset.name)?;
         check_media(&asset.name, &asset.media_type)?;
         check_digest(&asset.sha256, "asset sha256")?;
-        if asset.size > MAX_ASSET_BYTES {
+        let bound = asset_bound(&asset.name);
+        if asset.size > bound {
             return Err(Error::rejected(format!(
-                "asset {:?} declares {} bytes — at most {MAX_ASSET_BYTES}",
+                "asset {:?} declares {} bytes — at most {bound}",
                 asset.name, asset.size
             )));
         }

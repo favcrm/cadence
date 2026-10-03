@@ -27,6 +27,7 @@ mod app_contexts_rpc;
 mod app_effects_rpc;
 mod app_records_rpc;
 mod app_runs_rpc;
+mod app_screens_rpc;
 mod approvals_rpc;
 mod area_rpc;
 mod caller_rule;
@@ -112,6 +113,10 @@ use uuid::Uuid;
 
 /// CAD-339: the daemon methods a master connection may call.
 pub use master_rpc::MASTER_ALLOWED;
+// CAD-1006: the frame-document renderer the board's consume route uses.
+// `pub(crate)` — the UI frame route calls it; unit tests live in the
+// module, not as a public API.
+pub(crate) use app_screens_rpc::render_frame_html;
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
 ///
@@ -448,6 +453,12 @@ pub struct Shared {
     /// CAD-786: pause between campaign submissions; default 1 s,
     /// tests shorten it.
     crm_send_interval: Duration,
+    /// CAD-1063: how long a send waits before re-presenting deliveries
+    /// that the platform ledger holds for owner approval.
+    crm_send_pending_poll: Duration,
+    /// CAD-1063: the hosted platform email door; `Some` only on a
+    /// hosted daemon, where it replaces SMTP egress.
+    hosted_email: Option<crate::platform::hosted_email::HostedEmail>,
     /// CAD-786: the base the unsubscribe links mint — the board's
     /// public origin; `None` refuses `crm_send_prepare`.
     unsubscribe_origin: Option<String>,
@@ -479,6 +490,18 @@ pub struct Shared {
     /// `capability_unavailable`. Never set from PM, RPC, or worker input.
     pub(crate) social_media_resolver:
         Option<std::sync::Arc<crate::platform::agenticos_external::media_import::MediaResolver>>,
+    /// CAD-1006: outstanding one-use frame capabilities minted by
+    /// `app_screen_mint` — nonce → ScreenCap. Bounded (≤128 global,
+    /// ≤4/install, ≤8/session), 60 s TTL, atomic burn on consume.
+    /// In-memory: a daemon restart drops every minted mount.
+    screen_caps: Mutex<HashMap<String, app_screens_rpc::ScreenCap>>,
+    /// CAD-1006: the mint RATE bound — per verified session, a rolling
+    /// 60 s window of mint timestamps. Distinct from the outstanding-cap
+    /// count: an attacker who mints-then-consumes forever would otherwise
+    /// spin the expensive digest/approval/package re-proof each call.
+    /// session_id → Vec<Instant> (≤64 per window); the map is bounded
+    /// (≤128 sessions) and swept on each mint.
+    screen_mint_rate: Mutex<HashMap<String, Vec<Instant>>>,
     /// Serializes an app's checked execution claim through bounded Local
     /// commit/readback against binding/context/custody mutations.
     app_release_lock: Mutex<()>,
@@ -681,6 +704,12 @@ impl Shared {
             } else {
                 opts.crm_send_interval_ms
             }),
+            crm_send_pending_poll: Duration::from_millis(if opts.crm_send_pending_poll_ms == 0 {
+                30_000
+            } else {
+                opts.crm_send_pending_poll_ms
+            }),
+            hosted_email: opts.hosted_email.clone(),
             unsubscribe_origin: opts.unsubscribe_origin.clone(),
             #[cfg(feature = "test-seam")]
             crm_send_row_gate: opts.crm_send_row_gate.clone(),
@@ -689,6 +718,8 @@ impl Shared {
             social_publish_sender: opts.social_publish_sender.clone(),
             social_media_importer: opts.social_media_importer.clone(),
             social_media_resolver: opts.social_media_resolver.clone(),
+            screen_caps: Mutex::new(HashMap::new()),
+            screen_mint_rate: Mutex::new(HashMap::new()),
             app_release_lock: Mutex::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
@@ -965,7 +996,13 @@ impl Shared {
     /// false never-rendered fences (CAD-520, F26). The body itself
     /// stays durable on the message row; non-pty endpoints still take
     /// it whole.
-    fn delivery_body(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
+    fn delivery_body(
+        &self,
+        alias: &str,
+        endpoint_kind: &str,
+        message: &Message,
+        slot: Option<&str>,
+    ) -> String {
         if endpoint_kind != "pty" {
             // CAD-802: the verified App hint rides ahead of the body
             // for the provider turn. The stored text is untouched —
@@ -973,7 +1010,27 @@ impl Shared {
             let mut body = message.body.clone();
             if let Ok(Some(hint)) = self.store.message_app(&message.id) {
                 if let Some(envelope) = app_hint_envelope(&hint) {
-                    body = format!("{envelope}\n\n{body}");
+                    // CAD-1009: the turn-token slot follows the hint on
+                    // its own line; the adapter fills it with the token
+                    // it mints for this very turn.
+                    // The block carries the daemon-rendered verb reference
+                    // (`master::scoped_verb_reference`) with the slot
+                    // wherever the token goes.
+                    let block = slot.and_then(|slot| {
+                        let install = hint.get("install_id")?.as_str()?;
+                        let context = hint.get("context_id")?.as_str()?;
+                        Some(crate::master::scoped_verb_reference(
+                            install,
+                            context,
+                            &message.id,
+                            slot,
+                            &crate::master::tmpdir(&self.state_dir),
+                        ))
+                    });
+                    body = match block {
+                        Some(block) => format!("{envelope}\n{block}\n\n{body}"),
+                        None => format!("{envelope}\n\n{body}"),
+                    };
                 }
             }
             return body;
@@ -1019,6 +1076,42 @@ impl Shared {
         )
     }
 
+    /// CAD-1009: the one-use slot a scoped App turn's prompt carries for
+    /// the turn token. The Pi/Claude adapters mint the token inside
+    /// `run_turn`, after the prompt text is fixed, so the daemon leaves
+    /// this random slot after the App hint and the adapter replaces it
+    /// with a line naming the message id and the exact token it minted
+    /// (`master::scoped_verb_reference`). A slot exists only for an App
+    /// message whose stamp still re-proves (the same condition that
+    /// puts the hint in the prompt) on an endpoint that can redeem: a
+    /// turn-token scheme and not a pty paste. The master (the only
+    /// caller of the scoped verbs) runs managed Pi or Claude; pty,
+    /// Codex and cloud endpoints get the hint only. The slot is fresh
+    /// per call and never stored — the message body cannot contain it.
+    fn turn_slot(&self, agent: &Agent, message: &Message) -> Option<String> {
+        if agent.endpoint_kind == "pty"
+            || registry::spec_opt(&agent.provider, &agent.endpoint_kind)
+                .and_then(|spec| spec.turn_token)
+                .is_none()
+        {
+            return None;
+        }
+        // The id rides inside a quoted prompt line: a grammar the daemon
+        // already enforces on its own ids, re-checked here.
+        if message.id.is_empty()
+            || message.id.len() > 128
+            || !message
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        {
+            return None;
+        }
+        let hint = self.store.message_app(&message.id).ok().flatten()?;
+        app_hint_envelope(&hint)?;
+        Some(format!("<<cadence-turn-slot:{}>>", Uuid::new_v4().simple()))
+    }
+
     /// CAD-324: the prompt for `message` — its body, preceded by a
     /// continuity pack when one is due for `alias` and the endpoint takes
     /// one. Due-ness is consumed here, delivered or not: a pack goes with
@@ -1031,8 +1124,21 @@ impl Shared {
     /// CAD-565: for a pty endpoint the "body" the prompt carries is the
     /// one-line delivery notice (see [`Self::delivery_body`]); the full
     /// text is pulled, not pasted.
+    #[cfg(test)]
     fn continuity_prompt(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
-        let body = self.delivery_body(alias, endpoint_kind, message);
+        self.continuity_prompt_slotted(alias, endpoint_kind, message, None)
+    }
+
+    /// CAD-1009: [`Self::continuity_prompt`] with the scoped-turn token
+    /// `slot` (see [`Self::turn_slot`]) after the App hint.
+    fn continuity_prompt_slotted(
+        &self,
+        alias: &str,
+        endpoint_kind: &str,
+        message: &Message,
+        slot: Option<&str>,
+    ) -> String {
+        let body = self.delivery_body(alias, endpoint_kind, message, slot);
         // A new or lost session is decided at open (in memory: the next
         // open decides again); a compaction is a thread note, pending
         // until a pack note follows it.
@@ -1691,10 +1797,23 @@ impl Shared {
                     // so a later user message cannot inherit the flag.
                     let nudge = message.is_nudge();
                     // CAD-324: a nudge owns no turn and carries no pack.
+                    // CAD-1009: a scoped App turn's token slot (None for
+                    // a nudge, a plain message or an endpoint that
+                    // cannot redeem).
+                    let slot = if nudge {
+                        None
+                    } else {
+                        self.turn_slot(&agent, &message)
+                    };
                     let prompt = if nudge {
                         message.body.clone()
                     } else {
-                        self.continuity_prompt(alias, &agent.endpoint_kind, &message)
+                        self.continuity_prompt_slotted(
+                            alias,
+                            &agent.endpoint_kind,
+                            &message,
+                            slot.as_deref(),
+                        )
                     };
                     adapter.set_unclaimed_ok(message.is_routed() || nudge);
                     // CAD-520: a nudge may also enter through a busy
@@ -1710,16 +1829,21 @@ impl Shared {
                         .admit_app_submission(&message)
                         .and_then(|()| adapter.check_body(&message.body))
                         .and_then(|()| {
-                            adapter.run_turn(&prompt, &message.id, &move |turn| {
-                                // CAD-250: a nudge owns no turn — it never
-                                // becomes `running`, and its paste is not the
-                                // held turn's proof of life.
-                                if !nudge {
-                                    let _ = shared.store.mark_running(&started_id, turn);
-                                    watch.bump_activity();
-                                }
-                                shared.wake();
-                            })
+                            adapter.run_turn_slotted(
+                                &prompt,
+                                slot.as_deref(),
+                                &message.id,
+                                &move |turn| {
+                                    // CAD-250: a nudge owns no turn — it never
+                                    // becomes `running`, and its paste is not the
+                                    // held turn's proof of life.
+                                    if !nudge {
+                                        let _ = shared.store.mark_running(&started_id, turn);
+                                        watch.bump_activity();
+                                    }
+                                    shared.wake();
+                                },
+                            )
                         });
                     adapter.set_unclaimed_ok(false);
                     adapter.set_steer_ok(false);
@@ -2958,7 +3082,31 @@ impl Shared {
             "app_record_update" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_preview" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_import" => self.rpc_app_record(method, params, peer_pid),
+            "app_record_csv_confirm" => self.rpc_app_record(method, params, peer_pid),
             "app_segment_save" => self.rpc_app_audience(method, params, peer_pid),
+            "app_record_csv_assistant_import" => {
+                self.rpc_app_record_csv_assistant_import(params, peer_pid)
+            }
+            "app_segment_assistant_save" => self.rpc_app_segment_assistant_save(params, peer_pid),
+            // Scoped-chat reads — data exposes, never mutations; the
+            // same verified-turn gate, no claim (a read doesn't spend).
+            // One handler routes each to its store call. Each method is
+            // its own `=>` arm on ONE line: the caller-rule method-table
+            // parser scans per-arm lines for the `"name" =>` shape.
+            "app_segment_assistant_list" => self.rpc_app_assistant_read(method, params, peer_pid),
+            "app_segment_assistant_show" => self.rpc_app_assistant_read(method, params, peer_pid),
+            "app_record_csv_assistant_preview" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
+            "app_segment_assistant_preview" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
+            "app_content_assistant_proposals" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
+            "app_content_assistant_proposal_show" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
             "app_segment_show" => self.rpc_app_audience(method, params, peer_pid),
             "app_segment_list" => self.rpc_app_audience(method, params, peer_pid),
             "app_exclusion_save" => self.rpc_app_audience(method, params, peer_pid),
@@ -2982,7 +3130,9 @@ impl Shared {
             "app_content_assistant_propose" => {
                 self.rpc_app_content_assistant_propose(params, peer_pid)
             }
+            "app_content_assistant_draft" => self.rpc_app_content_assistant_draft(params, peer_pid),
             "app_content_proposal_show" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_render" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_list" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_apply" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_discard" => self.rpc_app_content(method, params, peer_pid),
@@ -2998,6 +3148,8 @@ impl Shared {
             "app_workspace_migrate" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_recover" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_migration_recover" => self.rpc_app_workspace(method, params, peer_pid),
+            "app_screen_mint" => self.rpc_app_screen_mint(params, peer_pid),
+            "app_screen_consume" => self.rpc_app_screen_consume(params, peer_pid),
             "app_approve" => self.rpc_app_approve(params, peer_pid),
             "app_revoke" => self.rpc_app_revoke(params, peer_pid),
             "app_set_team" => self.rpc_app_set_team(params, peer_pid),
@@ -3626,6 +3778,139 @@ mod app_hint_tests {
             assert!(app_hint_envelope(&hint).is_none(), "{hint}");
             assert!(app_hint_notice(&hint).is_none(), "{hint}");
         }
+    }
+
+    /// CAD-1009: a scoped App turn on a master-capable endpoint (managed
+    /// Pi / Claude — the only providers `master::PROVIDERS` launches)
+    /// carries a slot after the hint; the adapter fills it with the
+    /// turn's own token. Plain messages, a hint that no longer re-proves,
+    /// pty panes and endpoints that mint no turn token carry no slot —
+    /// nothing a model could mistake for a credential.
+    #[test]
+    fn scoped_app_turn_slots_a_token_only_where_it_can_redeem() {
+        use crate::store::app_contexts::ContextConfig;
+        use crate::store::NewAgent;
+        use crate::store::Steer;
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ServeOptions::default();
+        let no_pm = dir.path().join("no-pm");
+        opts.provider_env
+            .set("CADENCE_PM_DIR", no_pm.to_str().unwrap());
+        let shared = Shared::new(dir.path(), &opts).unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        let config = ContextConfig::new("Client", BTreeMap::new()).unwrap();
+        let created = shared
+            .store
+            .app_context_create("install-1", &config, "req-1")
+            .unwrap();
+        let context = created["context"]["id"].as_str().unwrap().to_string();
+        let (_, proof) = shared
+            .store
+            .app_context_proof("install-1", &context)
+            .unwrap();
+        let stamp = json!({
+            "install_id": "install-1", "context_id": context, "verified": true,
+            "context_revision": proof.revision, "context_digest": proof.digest,
+        });
+        let mut n = 0;
+        let mut send = |alias: &str, kind: &str, provider: &str, app: bool| -> (Agent, Message) {
+            n += 1;
+            if shared.store.agent(alias).is_err() {
+                shared
+                    .store
+                    .register_agent(&NewAgent {
+                        alias,
+                        provider,
+                        endpoint_kind: kind,
+                        role: "worker",
+                        cwd: &cwd,
+                        sandbox: "read-only",
+                        instructions: None,
+                        params: None,
+                        team_role: None,
+                        model_policy: None,
+                    })
+                    .unwrap();
+            }
+            shared
+                .store
+                .enqueue_steered(
+                    alias,
+                    "create segment QA agent VIP",
+                    None,
+                    &format!("m-{n}"),
+                    "user",
+                    None,
+                    None,
+                    None,
+                    &store::Sender::OperatorChat,
+                    &Steer::NONE,
+                    None,
+                    app.then_some(&stamp),
+                )
+                .unwrap();
+            let Take::Message(message) = shared.store.take_queued(alias).unwrap() else {
+                panic!("nothing queued for {alias}");
+            };
+            (shared.store.agent(alias).unwrap(), *message)
+        };
+        for (alias, provider, kind) in
+            [("m-pi", "pi", "managed"), ("m-claude", "claude", "managed")]
+        {
+            let (agent, message) = send(alias, kind, provider, true);
+            let slot = shared
+                .turn_slot(&agent, &message)
+                .unwrap_or_else(|| panic!("{alias}: no slot"));
+            let prompt = shared.continuity_prompt_slotted(alias, kind, &message, Some(&slot));
+            let hint = prompt.find("[App context").unwrap();
+            let at = prompt
+                .find(&slot)
+                .unwrap_or_else(|| panic!("{alias}: {prompt}"));
+            let words = prompt.find("create segment").unwrap();
+            assert!(hint < at && at < words, "{alias}: {prompt}");
+            // The block carries the daemon-rendered reference with the
+            // slot where the token goes, and the real ids.
+            assert!(
+                prompt.contains("segment-assistant-save: "),
+                "{alias}: {prompt}"
+            );
+            assert!(prompt.contains("--message m-"), "{alias}: {prompt}");
+            assert!(
+                prompt.contains("install-1 --context-id"),
+                "{alias}: {prompt}"
+            );
+            // The message body (stored, durable) never holds the slot.
+            assert!(!message.body.contains(&slot));
+            // A fresh slot per call: no value to replay between turns.
+            let (agent2, message2) = send(alias, kind, provider, true);
+            assert_ne!(shared.turn_slot(&agent2, &message2).unwrap(), slot);
+        }
+        // Not an App message: no slot, prompt unchanged.
+        let (agent, message) = send("m-pi", "managed", "pi", false);
+        assert_eq!(shared.turn_slot(&agent, &message), None);
+        assert_eq!(
+            shared.continuity_prompt_slotted("m-pi", "managed", &message, None),
+            "create segment QA agent VIP"
+        );
+        // Endpoints that cannot redeem (pty paste; no turn-token scheme).
+        for (alias, provider, kind) in [
+            ("p-claude", "claude", "pty"),
+            ("p-devin", "devin", "pty"),
+            ("w-codex", "codex", "managed"),
+            ("c-devin", "devin", "cloud"),
+        ] {
+            let (agent, message) = send(alias, kind, provider, true);
+            assert_eq!(shared.turn_slot(&agent, &message), None, "{alias}");
+        }
+        // The stamp stops re-proving (context revised): no hint, no slot.
+        let (agent, message) = send("m-pi", "managed", "pi", true);
+        let renamed = ContextConfig::new("Renamed", BTreeMap::new()).unwrap();
+        shared
+            .store
+            .app_context_update("install-1", &context, proof.revision, &renamed)
+            .unwrap();
+        assert_eq!(shared.turn_slot(&agent, &message), None);
     }
 }
 
@@ -4311,6 +4596,15 @@ pub struct ServeOptions {
     /// milliseconds; `0` is the production default (1 s). Tests pin
     /// a small value so waits stay short.
     pub crm_send_interval_ms: u64,
+    /// CAD-1063: pause before re-presenting deliveries waiting on the
+    /// platform's owner approval, in milliseconds; `0` is the
+    /// production default (30 s).
+    pub crm_send_pending_poll_ms: u64,
+    /// CAD-1063: the hosted CRM email transport. Set by
+    /// `platform::agenticos::attach` on a daemon holding a hosted
+    /// lease (and by fixtures); `None` keeps the SMTP path. Never
+    /// sourced from RPC or PM.
+    pub hosted_email: Option<crate::platform::hosted_email::HostedEmail>,
     /// CAD-786: the public origin unsubscribe links mint
     /// (`{origin}/unsubscribe/<token>`). `https://` anywhere or
     /// loopback `http://` for rigs; `None` refuses

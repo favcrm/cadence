@@ -17,6 +17,40 @@ for (const href of [
   "http://0.0.0.0:8080/",
   "http://[::1]:3000/",
   "http://[::ffff:127.0.0.1]/",
+  // CAD-1075: react-markdown percent-encodes the brackets; unparseable
+  // http(s) fails closed.
+  "http://%5B::1%5D/",
+  "http://%5b::1%5d:3010/x",
+  "http://[::1]/",
+  "http://[0:0:0:0:0:0:0:1]/",
+  "http://%5B::ffff:7f00:1%5D/",
+  "http://%5Bzz%5D/",
+  "//%5B::1%5D/x",
+  "//[::1]/x",
+  "http:/localhost:3138/",
+  "http:localhost:3138/",
+  "http:/127.0.0.1:3138/",
+  "http:/[::1]:3138/",
+  "http:[::1]/",
+  "http:/%5B::1%5D/",
+  "http:%5B::1%5D:3138/",
+  "HTTP:/localhost/",
+  "http://%5B::ffff:0:0%5D/",
+  "http://[::ffff:0.0.0.0]/",
+  "http://[::ffff:0:0]:3138/",
+  "http://[::ffff:127.255.1.2]/",
+  " http://%5B::1%5D/",
+  "\thttp://[::1]/",
+  // CAD-1078: backslash network paths (browsers treat `\` like `/`).
+  "\\\\[::1]/x",
+  "/\\[::1]/x",
+  "\\/localhost/",
+  "\\\\localhost/",
+  "\\\\127.0.0.1/",
+  "\\\\%5B::1%5D/x",
+  // Unparseable even against the base: the fail-closed rule must catch it.
+  "\\\\[::1/x",
+  "/\\[::1/x",
 ]) {
   equal(isLoopbackHref(href), true, href);
 }
@@ -28,7 +62,24 @@ for (const href of [
   "/projects/cadence",
   "issue:CAD-1",
   "mailto:someone@example.com",
+  "#frag",
+  "?q=1",
+  "https://example.com",
+  "http://[2001:db8::1]/",
+  "http://%5B2001:db8::1%5D/",
+  "http://%5b2001:db8::1%5d/",
+  "//example.com/x",
+  "http://[::ffff:8.8.8.8]/",
+  " https://example.com/",
+  "\\\\example.com/x",
+  "/\\example.com/x",
+  "/rel",
+  "./a",
+  "../a",
+  "#f",
+  "?q",
 ]) {
   equal(isLoopbackHref(href), false, href);
 }
+
 console.log("loopback link checks passed");

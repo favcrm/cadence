@@ -40,6 +40,10 @@ import ScheduleCalendar from "./ScheduleCalendar";
 import { forgetContext, initialContext, rememberedContext, rememberContext } from "./contextSelection";
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
+import ScreenHost from "./screen/ScreenHost";
+import { screenTag, screenProjection, settleIntentRead, type IntentRead } from "./screen/screenProjection";
+import { socialPublish } from "./socialPublish";
+import { supportsSocialContentWorkspace } from "./socialContentSupport";
 
 type Section =
   | "Board"
@@ -59,20 +63,6 @@ type Snapshot = {
   runs: WorkspaceRun[];
   effects: AppEffect[];
 };
-const socialContentWorkflows = new Map<string, readonly string[]>([
-  ["0.2.0", ["instagram", "facebook"]],
-  ["0.3.0", ["instagram", "facebook", "source-instagram"]],
-  ["0.4.0", ["instagram", "facebook", "source-instagram", "image-instagram"]],
-  ["0.5.0", ["instagram", "facebook", "source-instagram", "image-instagram", "image-manual"]],
-]);
-function supportsSocialContentWorkspace(installation: Installation): boolean {
-  const expected = socialContentWorkflows.get(installation.version);
-  if (installation.name !== "social-content" || !expected) return false;
-  const installed = installation.files
-    .filter(path => path.startsWith("workflows/") && path.endsWith(".md"))
-    .map(path => path.slice("workflows/".length, -".md".length));
-  return installed.length === expected.length && expected.every(name => installed.includes(name));
-}
 const message = (error: unknown) =>
   error instanceof Error
     ? error.message
@@ -119,6 +109,7 @@ export default function WorkspaceApp({
   const [outboxError, setOutboxError] = useState<string | null>(null);
   const [selectedEffectId, setSelectedEffectId] = useState("");
   const [accessDenied, setAccessDenied] = useState(false);
+  const [intentRead, setIntentRead] = useState<IntentRead | undefined>(undefined);
   const clearPrivate = useCallback(() => {
     activeRead.current?.abort();
     activeRead.current = null;
@@ -237,6 +228,35 @@ export default function WorkspaceApp({
       if (identity.current === expectedInstall) await refresh();
     }
   };
+  // CAD-1025: the mounted screen's publish intents, read with the existing
+  // operator-only list and tagged with its scope; the projection pushes it
+  // only while that tag still matches the route install and context. The
+  // read follows the scope (plus a slow refresh), not the 5 s board poll.
+  const screenInstall = data && screenTag(data.installation) ? data.installation.install_id : null;
+  useEffect(() => {
+    if (screenInstall !== installId || accessDenied) return;
+    let controller = new AbortController();
+    const read = () => {
+      controller.abort();
+      const current = controller = new AbortController();
+      socialPublish.list(installId, contextId || null, current.signal)
+        .then(reply => { if (!current.signal.aborted) setIntentRead(previous => settleIntentRead(previous, installId, contextId, reply.intents)); })
+        .catch((error: unknown) => {
+          if (current.signal.aborted) return;
+          if (error instanceof ApiError && [401, 403].includes(error.status)) {
+            clearPrivate();
+            setIntentRead(settleIntentRead(undefined, installId, contextId, null));
+            return;
+          }
+          setIntentRead(previous => settleIntentRead(previous, installId, contextId, null));
+        });
+    };
+    read();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "hidden") read();
+    }, 60000);
+    return () => { window.clearInterval(timer); controller.abort(); };
+  }, [screenInstall, installId, contextId, accessDenied, clearPrivate]);
   const runs =
     data?.runs.filter((run) => (run.context_id ?? "") === contextId) ?? [];
   const isSourceRun = (value: WorkspaceRun) => !!value.snapshot.inputs.profile_handle;
@@ -526,8 +546,16 @@ export default function WorkspaceApp({
     },
   ];
   if (!viewer.operator) return <main className="workspace-app" aria-label="Workspace app"><h1>Workspace app</h1><p className="wa-alert">Sign in as the operator to inspect this installation.</p><Button href="/apps">All apps</Button></main>;
+  const tag = data && screenTag(data.installation);
+  let projection = null;
+  if (data && tag && !accessDenied) {
+    try { projection = screenProjection(data.installation, tag, contextId, data.contexts, data.runs, data.effects, intentRead); }
+    catch { /* Oversized/unavailable scope retains the existing native outlet. */ }
+  }
+  const screen = (fallback: React.ReactNode) => projection
+    ? <ScreenHost projection={projection} fallback={fallback} /> : fallback;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
-    return <main className="workspace-app" aria-label="Workspace app">
+    return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
       <section className="wa-panel wa-stack">
         <p>{data.installation.summary}</p>
@@ -535,9 +563,9 @@ export default function WorkspaceApp({
         <p className="wa-kicker">Installation {installId} · version {data.installation.version}</p>
         <pre className="wa-preview">{data.installation.guide}</pre>
       </section>
-    </main>;
+    </main>);
   }
-  return (
+  return screen(
     <main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header">
         <div className="wa-heading">
@@ -737,8 +765,6 @@ export default function WorkspaceApp({
                 installId={installId}
                 contextId={contextId || null}
                 candidates={publishCandidates}
-                grantId=""
-                approvalId=""
                 canWrite={canWrite && !busy}
               />
             )}

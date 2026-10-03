@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
+import { navigate, useHref } from "../../lib/useLocation";
 import Button from "../../ui/Button";
-import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
+import Field from "./shared/Field";
+import { ErrorNotice } from "./shared/States";
+import DrawerShell, { type DrawerTab } from "./shared/DrawerShell";
 import {
   audienceClient,
   type AudienceScope,
@@ -20,6 +23,62 @@ import {
   SEGMENT_OPS,
 } from "./segmentGrammar";
 
+/** Human-readable predicate: the same labels the rule form offers.
+ *  Unknown stored values fall back to the raw tokens, never hide. */
+export function describeRule(rule: SegmentPredicate): string {
+  const field = SEGMENT_FIELDS.find((f) => f.value === rule.field)?.label ?? rule.field;
+  const op = SEGMENT_OPS.find((o) => o.value === rule.op)?.label ?? rule.op;
+  return `${field} ${op} ${rule.value}`;
+}
+
+/** Rule as a sentence of tokens: "Customers where [tag] [is] [vip]". */
+function RuleSentence({ rules }: { rules: SegmentPredicate[] }) {
+  return (
+    <p className="crm-rule-sentence" data-testid="rule-sentence">
+      <span>Customers where</span>
+      {rules.map((rule, i) => (
+        <span key={i} className="crm-rule-sentence">
+          {i > 0 && <span>and</span>}
+          <span className="chip">{SEGMENT_FIELDS.find((f) => f.value === rule.field)?.label ?? rule.field}</span>
+          <span className="chip">{SEGMENT_OPS.find((o) => o.value === rule.op)?.label ?? rule.op}</span>
+          <span className="chip">{rule.value}</span>
+        </span>
+      ))}
+    </p>
+  );
+}
+
+export interface FunnelStep {
+  label: string;
+  count: number;
+}
+
+/** Eligibility funnel built only from the host's membership-preview
+ *  counts, plus the one plain-language reason that blocks most people. */
+export function eligibilityFunnel(p: AudiencePreview): { steps: FunnelStep[]; reason: string | null } {
+  const valid = Math.max(p.finalCount, p.baseCount - p.excluded.invalid);
+  const consent = Math.max(p.finalCount, valid - p.excluded.noConsent - p.excluded.unsubscribed);
+  const steps = [
+    { label: "Match the rule", count: p.baseCount },
+    { label: "Valid email", count: valid },
+    { label: "Email consent", count: consent },
+    { label: "Can be emailed", count: p.finalCount },
+  ];
+  const causes: [number, string][] = [
+    [p.excluded.noConsent, "have not agreed to receive email"],
+    [p.excluded.unsubscribed, "have unsubscribed"],
+    [p.excluded.invalid, "have no valid email address"],
+    [p.excluded.suppressed, "are on the suppression list"],
+    [p.exclusionCount, "are on the saved exclusion list"],
+  ];
+  const top = causes.filter(([n]) => n > 0).sort((a, b) => b[0] - a[0])[0];
+  let reason: string | null = null;
+  if (p.baseCount === 0) reason = "No customers match this rule yet.";
+  else if (p.finalCount === 0 && top) reason = `Nobody can be emailed: ${top[0]} ${top[1]}.`;
+  else if (p.finalCount < p.baseCount && top) reason = `${top[0]} ${top[0] === 1 ? "customer" : "customers"} ${top[1]}.`;
+  return { steps, reason };
+}
+
 /**
  * Saved-rule segment screens inside the trusted CRM shell (CAD-784
  * over the CAD-780 audience engine). List, separate New page and a
@@ -32,6 +91,10 @@ import {
  * action addresses a saved rule, so Create lands atomically on the
  * detail drawer where the exact counts, suppression breakdown and
  * bounded sample render.
+ *
+ * The shell's own header row is the single Apps → App breadcrumb and
+ * title; the section renders its own real heading instead of a
+ * second crumb (CAD-863 release correction).
  */
 
 export interface SegmentDoc {
@@ -139,23 +202,6 @@ export default function CrmSegments({
 }) {
   return (
     <div className="crm-list" data-section="segments">
-      <nav className="crm-crumb" aria-label="Breadcrumb">
-        <Link href="/apps" className="lnk text-label">
-          Apps
-        </Link>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="text-label text-ink-300">CRM</span>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="text-label text-ink-100" aria-current="page">
-          Segments{view === "new" ? " / New" : ""}
-          {recordId !== null ? " / Details" : ""}
-        </span>
-      </nav>
-
       {view === "list" && (
         <SegmentList
           scope={scope}
@@ -185,6 +231,7 @@ export default function CrmSegments({
           viewer={viewer}
           canWrite={viewer.operator && !viewer.readOnly}
           onClose={() => onSelect(null)}
+          onOpen={onSelect}
         />
       )}
     </div>
@@ -207,6 +254,24 @@ function SegmentList({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
+  const [counts, setCounts] = useState<Record<string, AudiencePreview | null>>({});
+
+  // Per-row exact host counts (bounded); a failed row shows an em dash.
+  useEffect(() => {
+    const controller = new AbortController();
+    for (const segment of segments.slice(0, 25)) {
+      audienceClient
+        .preview(scope, { mode: "segment", segmentId: segment.id })
+        .then((value) => {
+          if (!controller.signal.aborted) setCounts((c) => ({ ...c, [segment.id]: parsePreview(value) }));
+        })
+        .catch(() => {
+          if (!controller.signal.aborted) setCounts((c) => ({ ...c, [segment.id]: null }));
+        });
+    }
+    return () => controller.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segments]);
 
   const reloadToken = `${scope.installId}:${scope.contextId}:${retry}`;
   useEffect(() => {
@@ -229,12 +294,14 @@ function SegmentList({
   }, [reloadToken]);
 
   return (
-    <section aria-label="Segments list">
-      <div className="crm-toolbar">
-        <p className="text-secondary text-ink-300">
+    <section aria-label="Segments list" className="crm-list">
+      <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
+        Segments
+      </h3>
+      <div className="crm-toolbar mb-4">
+        <p className="crm-toolbar-lede text-secondary text-ink-300">
           Saved rules over customer tags, source, consent and email domain.
         </p>
-        <span className="flex-1" />
         {canWrite && (
           <Button variant="primary" size="sm" onClick={onNew}>
             New segment
@@ -253,7 +320,7 @@ function SegmentList({
       )}
       {scope.contextId === "" && viewer.operator && (
         <p className="card px-4 py-3 text-label text-ink-400">
-          Pick an App context above to list its segments.
+          Administrator CRM setup is required before segments open.
         </p>
       )}
       {scope.contextId !== "" && viewer.operator && loading && (
@@ -262,16 +329,11 @@ function SegmentList({
         </p>
       )}
       {scope.contextId !== "" && viewer.operator && error !== null && !loading && (
-        <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
-          {error}{" "}
-          <button type="button" className="lnk" onClick={() => setRetry((count) => count + 1)}>
-            Retry
-          </button>
-        </p>
+        <ErrorNotice onRetry={() => setRetry((count) => count + 1)}>{error}</ErrorNotice>
       )}
       {scope.contextId !== "" && viewer.operator && error === null && !loading && segments.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400" data-empty="segments" role="status">
-          <p className="font-medium text-ink-200">No segments yet in this context</p>
+          <p className="font-medium text-ink-200">No segments yet</p>
           <p className="mt-1">
             Create the first saved rule with New segment. Only real server rows appear here.
           </p>
@@ -288,8 +350,9 @@ function SegmentList({
             <thead>
               <tr>
                 <th scope="col">Name</th>
-                <th scope="col">Rules</th>
-                <th scope="col">Rev</th>
+                <th scope="col">Rule</th>
+                <th scope="col">Matches</th>
+                <th scope="col">Can be emailed</th>
                 <th scope="col">
                   <span className="sr-only">Open</span>
                 </th>
@@ -297,15 +360,27 @@ function SegmentList({
             </thead>
             <tbody>
               {segments.map((segment) => (
-                <tr key={segment.id}>
+                <tr key={segment.id} data-record-id={segment.id}>
                   <td className="text-ink-100">
                     {segment.name}
                     <span className="num text-micro text-ink-500"> · {segment.id}</span>
                   </td>
-                  <td className="num text-ink-300">
-                    {segment.predicates.length} rule{segment.predicates.length === 1 ? "" : "s"}
+                  <td className="text-ink-300">
+                    <span className="chip">{segment.predicates[0] ? describeRule(segment.predicates[0]) : "—"}</span>
+                    {segment.predicates.length > 1 && (
+                      <span className="num text-micro text-ink-500"> +{segment.predicates.length - 1} more</span>
+                    )}
                   </td>
-                  <td className="num text-ink-500">r{segment.revision}</td>
+                  <td className="num text-ink-300">{counts[segment.id]?.baseCount ?? "—"}</td>
+                  <td>
+                    {counts[segment.id] ? (
+                      <span className="chip" data-tone={counts[segment.id]!.finalCount === 0 ? "warn" : "ok"}>
+                        {counts[segment.id]!.finalCount}
+                      </span>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
                   <td>
                     <button type="button" className="lnk" onClick={() => onSelect(segment.id)}>
                       Open
@@ -348,50 +423,52 @@ function RuleRows({
       {rules.map((rule, index) => (
         <li key={index} className="card px-3 py-3">
           <div className="crm-field-row">
-            <div className="crm-field">
-              <label className="text-label text-ink-300" htmlFor={`seg-rule-field-${index}`}>
-                Field {index + 1}
-              </label>
-              <Select
-                id={`seg-rule-field-${index}`}
-                value={rule.field}
-                onChange={(value) => isSegmentField(value) && set(index, { field: value })}
-                options={SEGMENT_FIELDS.map((entry) => ({ value: entry.value, label: entry.label }))}
-                aria-label={`Rule ${index + 1} field`}
-                disabled={disabled}
-                full
-              />
-            </div>
-            <div className="crm-field">
-              <label className="text-label text-ink-300" htmlFor={`seg-rule-op-${index}`}>
-                Operator {index + 1}
-              </label>
-              <Select
-                id={`seg-rule-op-${index}`}
-                value={rule.op}
-                onChange={(value) => isSegmentOp(value) && set(index, { op: value })}
-                options={SEGMENT_OPS.map((entry) => ({ value: entry.value, label: entry.label }))}
-                aria-label={`Rule ${index + 1} operator`}
-                disabled={disabled}
-                full
-              />
-            </div>
+            <Field label={`Field ${index + 1}`} id={`seg-rule-field-${index}`} className="crm-field">
+              {(c) => (
+                <Select
+                  id={c.id}
+                  value={rule.field}
+                  onChange={(value) => isSegmentField(value) && set(index, { field: value })}
+                  options={SEGMENT_FIELDS.map((entry) => ({ value: entry.value, label: entry.label }))}
+                  aria-label={`Rule ${index + 1} field`}
+                  disabled={disabled}
+                  full
+                />
+              )}
+            </Field>
+            <Field label={`Operator ${index + 1}`} id={`seg-rule-op-${index}`} className="crm-field">
+              {(c) => (
+                <Select
+                  id={c.id}
+                  value={rule.op}
+                  onChange={(value) => isSegmentOp(value) && set(index, { op: value })}
+                  options={SEGMENT_OPS.map((entry) => ({ value: entry.value, label: entry.label }))}
+                  aria-label={`Rule ${index + 1} operator`}
+                  disabled={disabled}
+                  full
+                />
+              )}
+            </Field>
           </div>
-          <div className="crm-field mt-2">
-            <label className="text-label text-ink-300" htmlFor={`seg-rule-value-${index}`}>
-              Value {index + 1} — {ruleHint(rule.field)}
-            </label>
-            <input
-              id={`seg-rule-value-${index}`}
-              className="field"
-              value={rule.value}
-              onChange={(e) => set(index, { value: e.target.value })}
-              maxLength={120}
-              autoComplete="off"
-              disabled={disabled}
-              placeholder={rule.field === "consent_email" ? "granted" : rule.field === "email_domain" ? "example.com" : "vip"}
-            />
-          </div>
+          <Field
+            label={`Value ${index + 1}`}
+            id={`seg-rule-value-${index}`}
+            hint={ruleHint(rule.field)}
+            disabled={disabled}
+            className="crm-field mt-2"
+          >
+            {(c) => (
+              <input
+                {...c}
+                className="field"
+                value={rule.value}
+                onChange={(e) => set(index, { value: e.target.value })}
+                maxLength={120}
+                autoComplete="off"
+                placeholder={rule.field === "consent_email" ? "granted" : rule.field === "email_domain" ? "example.com" : "vip"}
+              />
+            )}
+          </Field>
           {rules.length > 1 && !disabled && (
             <p className="mt-2">
               <button
@@ -438,8 +515,7 @@ function SegmentNew({
         <button type="button" className="lnk" onClick={onCancel}>
           ← Segments
         </button>{" "}
-        · Context {scope.contextId || "none"} — exact host preview counts render on the detail
-        after Create.
+        — exact recipient counts render on the detail after Create.
       </p>
       {!canWrite ? (
         <p className="card px-4 py-3 mt-2 text-label text-ink-400" data-state="read-only">
@@ -447,7 +523,7 @@ function SegmentNew({
         </p>
       ) : scope.contextId === "" ? (
         <p className="card px-4 py-3 mt-2 text-label text-ink-400">
-          Pick an App context above before creating a segment.
+          Administrator CRM setup is required before creating a segment.
         </p>
       ) : (
         <form
@@ -477,20 +553,18 @@ function SegmentNew({
               .finally(() => setPending(false));
           }}
         >
-          <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="seg-name">
-              Segment name (required)
-            </label>
-            <input
-              id="seg-name"
-              className="field"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              maxLength={80}
-              autoComplete="off"
-              required
-            />
-          </div>
+          <Field label="Segment name" id="seg-name" required className="crm-field">
+            {(c) => (
+              <input
+                {...c}
+                className="field"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                maxLength={80}
+                autoComplete="off"
+              />
+            )}
+          </Field>
           <RuleRows rules={rules} disabled={pending} onChange={setRules} />
           {rules.length < 8 && (
             <p>
@@ -613,45 +687,33 @@ function SegmentDrawer({
   viewer,
   canWrite,
   onClose,
+  onOpen,
 }: {
   scope: AudienceScope;
   segmentId: string;
   viewer: Viewer;
   canWrite: boolean;
   onClose: () => void;
+  onOpen: (segmentId: string) => void;
 }) {
   const [segment, setSegment] = useState<SegmentDoc | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
+  const [editPending, setEditPending] = useState(false);
   const [preview, setPreview] = useState<AudiencePreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(true);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewToken, setPreviewToken] = useState(0);
-  const headRef = useRef<HTMLHeadingElement | null>(null);
-  const opener = useRef<Element | null>(null);
-
-  useEffect(() => {
-    opener.current = document.activeElement;
-    headRef.current?.focus();
-    return () => {
-      if (opener.current instanceof HTMLElement) opener.current.focus();
-    };
-  }, []);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    addEventListener("keydown", onKey);
-    return () => removeEventListener("keydown", onKey);
-  }, [onClose]);
-
+  const [tab, setTab] = useState("overview");
+  const href = useHref();
   const reloadToken = `${scope.installId}:${scope.contextId}:${segmentId}`;
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
     setError(null);
     setEditing(false);
+    setTab("overview");
     audienceClient
       .segmentShow(scope, segmentId)
       .then((value) => {
@@ -689,121 +751,241 @@ function SegmentDrawer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [segment?.id, segment?.revision, previewToken]);
 
+  const reload = () => {
+    setError(null);
+    setLoading(true);
+    audienceClient
+      .segmentShow(scope, segmentId)
+      .then((value) => setSegment(parseSegment(value)))
+      .catch((e: unknown) => setError(friendlyAudienceError(e)))
+      .finally(() => setLoading(false));
+  };
+  const ready = !loading && error === null && segment !== null;
+
+  const members = preview?.sample ?? [];
+  const funnel = preview ? eligibilityFunnel(preview) : null;
+  const memberList = (rows: { id: string; displayName: string }[]) => (
+    <ul className="crm-history" aria-label="Segment members">
+      {rows.map((m) => (
+        <li key={m.id} className="text-label text-ink-300">
+          {m.displayName || "—"} <span className="chip" data-tone="ok">Can email</span>
+        </li>
+      ))}
+    </ul>
+  );
+  const tabs: DrawerTab[] =
+    ready && segment !== null
+      ? [
+          {
+            id: "overview",
+            label: "Overview",
+            panel: (
+              <>
+                <section aria-label="Segment rule">
+                  <RuleSentence rules={segment.predicates} />
+                </section>
+                <section aria-label="Who can be emailed" className="mt-3">
+                  <h4 className="text-label font-medium text-ink-200">Who can be emailed</h4>
+                  {previewLoading && (
+                    <p className="text-secondary text-ink-400" role="status">Reading host audience counts…</p>
+                  )}
+                  {previewError !== null && (
+                    <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
+                      {previewError}{" "}
+                      <button type="button" className="lnk" onClick={() => setPreviewToken((n) => n + 1)}>Retry</button>
+                    </p>
+                  )}
+                  {funnel && !previewLoading && previewError === null && (
+                    <>
+                      <ol className="crm-funnel" data-testid="funnel">
+                        {funnel.steps.map((step) => (
+                          <li key={step.label}>
+                            <span>{step.label}</span>
+                            <span className="crm-funnel-bar">
+                              <span style={{ width: `${funnel.steps[0].count === 0 ? 0 : Math.round((step.count / funnel.steps[0].count) * 100)}%` }} />
+                            </span>
+                            <span className="num">{step.count}</span>
+                          </li>
+                        ))}
+                      </ol>
+                      {funnel.reason !== null && (
+                        <p className="text-label text-ink-300 mt-1" data-testid="funnel-reason">{funnel.reason}</p>
+                      )}
+                    </>
+                  )}
+                </section>
+                <section aria-label="Members preview" className="mt-3">
+                  <h4 className="text-label font-medium text-ink-200">Members</h4>
+                  {members.length === 0 && !previewLoading && (
+                    <p className="text-secondary text-ink-400">No one can be emailed from this segment yet.</p>
+                  )}
+                  {memberList(members.slice(0, 10))}
+                  {members.length > 0 && (
+                    <button type="button" className="lnk text-label" onClick={() => setTab("members")}>View all</button>
+                  )}
+                </section>
+              </>
+            ),
+          },
+          {
+            id: "members",
+            label: "Members",
+            panel: (
+              <section aria-label="All members">
+                <p className="text-label text-ink-400">
+                  Showing {members.length} of {preview?.finalCount ?? 0} customers who can be emailed.
+                </p>
+                {memberList(members)}
+              </section>
+            ),
+          },
+          {
+            id: "details",
+            label: "Details",
+            panel: (
+              <section aria-label="Record diagnostics">
+                <p className="num text-micro text-ink-500">
+                  Segment <span className="num">{segmentId}</span> · scope{" "}
+                  <span className="num">{scope.contextId || "none"}</span> · revision r{segment.revision} · digest{" "}
+                  {segment.digest.slice(0, 18)}…
+                </p>
+                <div className="mt-3">
+                  <PreviewPanel
+                    preview={preview}
+                    loading={previewLoading}
+                    error={previewError}
+                    onRetry={() => setPreviewToken((count) => count + 1)}
+                    label="Current matches"
+                  />
+                </div>
+              </section>
+            ),
+          },
+        ]
+      : [];
+
+  const duplicate = () => {
+    if (segment === null) return;
+    void audienceClient
+      .segmentSave(scope, {
+        segmentId: newAudienceId("seg"),
+        name: `${segment.name} (copy)`.slice(0, 80),
+        predicates: segment.predicates.map((r) => ({ field: r.field, op: r.op, value: r.value })),
+      })
+      .then((value) => onOpen(parseSegment(value).id))
+      .catch((err: unknown) => setError(friendlyAudienceError(err)));
+  };
+  const useInCampaign = () => {
+    const [path, search] = href.split("?");
+    const q = new URLSearchParams(search ?? "");
+    q.set("crm", "campaigns");
+    q.set("appview", "new");
+    q.set("segment", segmentId);
+    q.delete("record");
+    navigate(`${path}?${q.toString()}`);
+  };
+
   return (
-    <div
-      className="crm-drawer"
-      role="dialog"
-      aria-modal="false"
-      aria-label="Segment details"
-      data-drawer="segment"
-    >
-      <div className="crm-drawer-head">
-        <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1}>
-          {loading ? "Segment details" : (segment?.name ?? "Segment details")}
-        </h3>
-        <Button size="sm" onClick={onClose} aria-label="Close segment details">
-          Close
-        </Button>
-      </div>
-      <p className="num text-micro text-ink-500">
-        {segmentId} · {scope.contextId || "no context"}
-      </p>
-      {loading && (
-        <p className="text-secondary text-ink-400 mt-2" role="status">
-          Reading the segment…
-        </p>
-      )}
-      {error !== null && !loading && (
-        <p className="card px-4 py-3 mt-2 text-label text-fail border-fail/40" role="alert">
-          {error}{" "}
-          <button
-            type="button"
-            className="lnk"
-            onClick={() => {
-              setError(null);
-              setLoading(true);
-              audienceClient
-                .segmentShow(scope, segmentId)
-                .then((value) => setSegment(parseSegment(value)))
-                .catch((e: unknown) => setError(friendlyAudienceError(e)))
-                .finally(() => setLoading(false));
-            }}
-          >
-            Retry
-          </button>
-        </p>
-      )}
-      {!loading && error === null && segment !== null && (
-        <>
-          <dl className="crm-detail mt-2">
-            <div>
-              <dt>Revision</dt>
-              <dd className="num">
-                r{segment.revision} · <span title="Server rule digest">{segment.digest.slice(0, 18)}…</span>
-              </dd>
-            </div>
-          </dl>
-          <section aria-label="Segment rules" className="mt-3">
-            <h4 className="text-label font-medium text-ink-200">Rules ({segment.predicates.length})</h4>
-            <ol className="crm-history">
-              {segment.predicates.map((rule, index) => (
-                <li key={index} className="num text-label text-ink-300">
-                  {rule.field} {rule.op} {rule.value}
-                </li>
-              ))}
-            </ol>
-          </section>
-          <section aria-label="Current matches" className="mt-3">
-            <h4 className="text-label font-medium text-ink-200">Current matches</h4>
-            <div className="mt-1">
-              <PreviewPanel
-                preview={preview}
-                loading={previewLoading}
-                error={previewError}
-                onRetry={() => setPreviewToken((count) => count + 1)}
-                label="Current matches"
-              />
-            </div>
-          </section>
-          {canWrite ? (
-            editing ? (
-              <SegmentEdit
-                scope={scope}
-                segment={segment}
-                onSaved={(next) => {
-                  setSegment(next);
-                  setEditing(false);
-                }}
-                onCancel={() => setEditing(false)}
-              />
-            ) : (
-              <p className="mt-3">
-                <Button size="sm" onClick={() => setEditing(true)}>
-                  Edit rules
-                </Button>
-              </p>
-            )
-          ) : (
-            <p className="text-label text-ink-400 mt-3" data-state="read-only">
-              Read-only view. {viewer.operator ? "Edits are disabled on this board." : "Sign in as the operator to edit."}
-            </p>
-          )}
-        </>
-      )}
-    </div>
+    <DrawerShell
+      kind="segment"
+      label="Segment details"
+      title={loading ? "Segment details" : (segment?.name ?? "Segment details")}
+      avatar="◎"
+      subtitle={segment ? `${segment.predicates.length} rule${segment.predicates.length === 1 ? "" : "s"}` : undefined}
+      pills={
+        ready && preview ? (
+          <>
+            <span className="chip">{preview.baseCount} match</span>
+            <span className="chip" data-tone={preview.finalCount === 0 ? "warn" : "ok"}>
+              {preview.finalCount} can be emailed
+            </span>
+          </>
+        ) : undefined
+      }
+      tabs={tabs}
+      tab={tab}
+      onTab={setTab}
+      menu={
+        ready
+          ? [
+              { key: "duplicate", label: "Duplicate", onSelect: duplicate, disabled: !canWrite, title: canWrite ? undefined : "Operators only" },
+              { key: "export", label: "Export members", onSelect: () => {}, disabled: true, title: "Not available yet: the host has no segment export" },
+              { key: "delete", label: "Delete segment", onSelect: () => {}, disabled: true, destructive: true, title: "Not available yet: the host has no segment delete" },
+            ]
+          : undefined
+      }
+      secondary={
+        ready && canWrite ? (
+          <Button size="sm" onClick={() => setEditing(true)}>
+            Edit rules
+          </Button>
+        ) : undefined
+      }
+      state={
+        loading ? (
+          <p className="text-secondary text-ink-400" role="status">
+            Reading the segment…
+          </p>
+        ) : error !== null ? (
+          <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
+            {error}{" "}
+            <button type="button" className="lnk" onClick={reload}>
+              Retry
+            </button>
+          </p>
+        ) : undefined
+      }
+      edit={
+        editing && canWrite && ready && segment !== null
+          ? {
+              formId: "crm-segment-edit",
+              title: "Edit rules — saving is refused if the segment changed since you opened it",
+              pending: editPending,
+              onCancel: () => setEditing(false),
+              body: (
+                <SegmentEdit
+                  formId="crm-segment-edit"
+                  scope={scope}
+                  segment={segment}
+                  onPending={setEditPending}
+                  onSaved={(next) => {
+                    setSegment(next);
+                    setEditing(false);
+                  }}
+                />
+              ),
+            }
+          : null
+      }
+      primary={
+        ready && canWrite ? (
+          <Button size="sm" variant="primary" onClick={useInCampaign}>
+            Use in campaign
+          </Button>
+        ) : undefined
+      }
+      note={
+        ready && !canWrite
+          ? `Read-only view. ${viewer.operator ? "Edits are disabled on this board." : "Sign in as the operator to edit."}`
+          : undefined
+      }
+      onClose={onClose}
+    />
   );
 }
 
 function SegmentEdit({
+  formId,
   scope,
   segment,
+  onPending,
   onSaved,
-  onCancel,
 }: {
+  formId: string;
   scope: AudienceScope;
   segment: SegmentDoc;
+  onPending: (pending: boolean) => void;
   onSaved: (segment: SegmentDoc) => void;
-  onCancel: () => void;
 }) {
   const [name, setName] = useState(segment.name);
   const [rules, setRules] = useState<RuleDraft[]>(() =>
@@ -813,7 +995,8 @@ function SegmentEdit({
   const [formError, setFormError] = useState<string | null>(null);
   return (
     <form
-      className="card px-4 py-4 mt-3 grid gap-3"
+      id={formId}
+      className="grid gap-3"
       onSubmit={(e) => {
         e.preventDefault();
         setFormError(null);
@@ -828,6 +1011,7 @@ function SegmentEdit({
           return;
         }
         setPending(true);
+        onPending(true);
         void audienceClient
           .segmentSave(scope, {
             segmentId: segment.id,
@@ -837,27 +1021,24 @@ function SegmentEdit({
           })
           .then((value) => onSaved(parseSegment(value)))
           .catch((err: unknown) => setFormError(friendlyAudienceError(err)))
-          .finally(() => setPending(false));
+          .finally(() => {
+            setPending(false);
+            onPending(false);
+          });
       }}
     >
-      <h4 className="text-label font-medium text-ink-200">
-        Edit — expected revision r{segment.revision}
-      </h4>
-      <div className="crm-field">
-        <label className="text-label text-ink-300" htmlFor="seg-edit-name">
-          Segment name
-        </label>
-        <input
-          id="seg-edit-name"
-          className="field"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          maxLength={80}
-          autoComplete="off"
-          disabled={pending}
-          required
-        />
-      </div>
+      <Field label="Segment name" id="seg-edit-name" required disabled={pending} className="crm-field">
+        {(c) => (
+          <input
+            {...c}
+            className="field"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            maxLength={80}
+            autoComplete="off"
+          />
+        )}
+      </Field>
       <RuleRows rules={rules} disabled={pending} onChange={setRules} />
       {rules.length < 8 && (
         <p>
@@ -873,18 +1054,10 @@ function SegmentEdit({
       )}
       {formError && (
         <p className="text-label text-fail" role="alert">
-          {formError} A stale revision means another operator saved first — close and reopen to
-          review their rules before retrying.
+          {formError} If another operator saved first, close and reopen to review their rules
+          before retrying.
         </p>
       )}
-      <div className="crm-toolbar">
-        <Button type="submit" variant="primary" loading={pending} disabled={pending}>
-          {`Save as r${segment.revision + 1}`}
-        </Button>
-        <button type="button" className="lnk text-label" onClick={onCancel}>
-          Discard edit
-        </button>
-      </div>
     </form>
   );
 }

@@ -13,6 +13,7 @@ pub mod agenticos_external;
 pub mod connections;
 pub mod custody;
 pub mod deployments;
+pub mod hosted_email;
 pub mod local;
 pub mod smtp;
 

@@ -34,6 +34,13 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: AudienceAction,
     },
+    /// Campaign email content — the scoped-chat inert assistant draft
+    /// (CAD-1014): drafts a pending proposal the operator applies or
+    /// discards. Never edits, approves or sends.
+    Content {
+        #[command(subcommand)]
+        action: ContentAction,
+    },
     /// Stable workspace installation IDs; execution and approval are separate.
     Catalog {
         #[command(subcommand)]
@@ -262,6 +269,13 @@ pub(crate) enum RecordAction {
         /// JSON file holding the customer profile object.
         #[arg(long)]
         profile: PathBuf,
+        /// How consent was given (in_person, web_form, written,
+        /// imported, other); required when the change grants consent.
+        #[arg(long)]
+        consent_method: Option<String>,
+        /// Optional consent note, at most 280 characters.
+        #[arg(long, requires = "consent_method")]
+        consent_note: Option<String>,
     },
     /// Preview bounded CSV text as per-row create/update/skip/error
     /// decisions without mutating anything; prints the preview token
@@ -294,6 +308,126 @@ pub(crate) enum RecordAction {
         #[arg(long)]
         decisions: Option<PathBuf>,
     },
+    /// CAD-1014(b): a scoped chat turn's delegated CSV import —
+    /// HANDLE-ONLY. The durable host plan (bytes + decisions the
+    /// operator confirmed) resolves server-side from `request_id` +
+    /// `confirm_token`; the agent never carries the CSV bytes, a preview
+    /// token or a decision set — those ride the operator's `csv-confirm`,
+    /// never the ≤48KB chat message. The caller must be the live
+    /// assigned agent on `--message`/`--token`.
+    CsvAssistantImport {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// Idempotency key; names the confirmed plan the agent redeems.
+        #[arg(long)]
+        request_id: String,
+        /// The host-minted confirm receipt nonce from `csv-confirm`
+        /// (the operator's explicit confirm of this exact plan).
+        #[arg(long)]
+        confirm_token: String,
+        /// The scoped chat message the operator sent (turn identity).
+        #[arg(long, requires = "token")]
+        message: String,
+        /// The live turn token for that message.
+        #[arg(long, requires = "message")]
+        token: String,
+    },
+    /// CAD-1014: the operator's explicit, host-side confirm of an exact
+    /// previewed CSV import plan — mints the one-use confirm receipt the
+    /// assistant import redeems AND stores the durable plan (csv_text +
+    /// decisions) the agent resolves by request id + nonce. Prints the
+    /// `confirm_token` nonce.
+    CsvConfirm {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// CSV file holding the exact confirmed bytes (the durable plan).
+        #[arg(long)]
+        csv: PathBuf,
+        /// Preview token from `csv-preview` over the confirmed bytes.
+        #[arg(long)]
+        preview_token: String,
+        /// Idempotency key the later import must reuse.
+        #[arg(long)]
+        request_id: String,
+        /// JSON array of `{row, action, expected_revision?}` decisions
+        /// whose digest the confirm binds (omit for the default plan).
+        #[arg(long)]
+        decisions: Option<PathBuf>,
+    },
+    /// CAD-1014: read-only CSV preview on the live scoped chat turn —
+    /// the agent's read of the stamped context. Writes nothing, claims
+    /// nothing; the `--message`/`--token` are the turn identity.
+    CsvAssistantPreview {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// CSV file (bounded to 256KiB, 500 rows).
+        #[arg(long)]
+        csv: PathBuf,
+        #[arg(long, requires = "token")]
+        message: String,
+        #[arg(long, requires = "message")]
+        token: String,
+    },
+}
+
+/// CAD-1014 scoped-chat email draft — the agent drafts an inert
+/// `pending`/`assistant-receipt` proposal on its live scoped turn.
+/// No manual mint, no request id: the verified turn IS the request.
+/// `blocks`/`subject`/`preheader` come from a JSON draft file.
+#[derive(Subcommand)]
+pub(crate) enum ContentAction {
+    /// Draft a campaign email on the live scoped chat turn (inert
+    /// pending proposal; first draft or a replacement revision).
+    #[command(name = "assistant-draft")]
+    Draft {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        campaign_id: String,
+        #[arg(long)]
+        proposal_id: String,
+        /// JSON file holding `{subject, preheader, blocks}`.
+        #[arg(long)]
+        draft: PathBuf,
+        /// The scoped chat message the operator sent (turn identity).
+        #[arg(long, requires = "token")]
+        message: String,
+        /// The live turn token for that message.
+        #[arg(long, requires = "message")]
+        token: String,
+    },
+    /// List the context's email proposals (optionally one campaign) on
+    /// the live scoped turn — the agent's inert pending draft must be
+    /// discoverable before the operator applies it.
+    #[command(name = "assistant-proposals")]
+    Proposals {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        campaign_id: Option<String>,
+        #[arg(long, requires = "token")]
+        message: String,
+        #[arg(long, requires = "message")]
+        token: String,
+    },
+    /// Show one proposal on the live scoped turn (read-only).
+    #[command(name = "assistant-proposal-show")]
+    ProposalShow {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        proposal_id: String,
+        #[arg(long, requires = "token")]
+        message: String,
+        #[arg(long, requires = "message")]
+        token: String,
+    },
 }
 
 /// CAD-780 audience verbs. JSON files hold predicates (`[{field,
@@ -317,6 +451,67 @@ pub(crate) enum AudienceAction {
         /// Observed revision; absent creates.
         #[arg(long)]
         expected_revision: Option<u64>,
+    },
+    /// CAD-1014(b): a scoped chat turn's delegated segment save. The
+    /// operator's own stamped scoped chat message is the intent.
+    SegmentAssistantSave {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        segment_id: String,
+        #[arg(long)]
+        name: String,
+        /// JSON file holding the predicates array.
+        #[arg(long)]
+        predicates: PathBuf,
+        /// Observed revision; absent creates.
+        #[arg(long)]
+        expected_revision: Option<u64>,
+        /// The scoped chat message the operator sent (turn identity).
+        #[arg(long, requires = "token")]
+        message: String,
+        /// The live turn token for that message.
+        #[arg(long, requires = "message")]
+        token: String,
+    },
+    /// CAD-1014: list the stamped context's segments on the live scoped
+    /// chat turn (read-only — revision/membership for the agent).
+    SegmentAssistantLs {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long, requires = "token")]
+        message: String,
+        #[arg(long, requires = "message")]
+        token: String,
+    },
+    /// CAD-1014: show one segment (revision/membership) on the live
+    /// scoped chat turn (read-only).
+    SegmentAssistantShow {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        segment_id: String,
+        #[arg(long, requires = "token")]
+        message: String,
+        #[arg(long, requires = "message")]
+        token: String,
+    },
+    /// CAD-1014: a bounded membership preview over a saved segment
+    /// (base/exclusion/final counts + a bounded sample — never the full
+    /// member list, never a freeze or send) on the live scoped turn.
+    SegmentAssistantPreview {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        segment_id: String,
+        #[arg(long, requires = "token")]
+        message: String,
+        #[arg(long, requires = "message")]
+        token: String,
     },
     /// Inspect one exact saved segment.
     SegmentShow {
@@ -631,10 +826,15 @@ fn record_params(action: &RecordAction) -> Result<(&'static str, serde_json::Val
             record_id,
             expected_revision,
             profile,
-        } => (
-            "app_record_update",
-            json!({"install_id": install_id, "context_id": context_id, "record_id": record_id, "expected_revision": expected_revision, "profile": read_record_profile(profile)?}),
-        ),
+            consent_method,
+            consent_note,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "record_id": record_id, "expected_revision": expected_revision, "profile": read_record_profile(profile)?});
+            if let Some(method) = consent_method {
+                params["consent_provenance"] = json!({"method": method, "note": consent_note});
+            }
+            ("app_record_update", params)
+        }
         RecordAction::CsvPreview {
             install_id,
             context_id,
@@ -657,6 +857,56 @@ fn record_params(action: &RecordAction) -> Result<(&'static str, serde_json::Val
             }
             ("app_record_csv_import", params)
         }
+        RecordAction::CsvAssistantImport {
+            install_id,
+            context_id,
+            request_id,
+            confirm_token,
+            message,
+            token,
+        } => {
+            // Handle-only: the daemon resolves the durable plan
+            // (csv_text + decisions + their digests) from request_id +
+            // confirm_token. No csv_text/preview_token/decisions params.
+            (
+                "app_record_csv_assistant_import",
+                json!({"install_id": install_id, "context_id": context_id, "request_id": request_id, "confirm_token": confirm_token, "message": message, "token": token}),
+            )
+        }
+        RecordAction::CsvConfirm {
+            install_id,
+            context_id,
+            csv,
+            preview_token,
+            request_id,
+            decisions,
+        } => {
+            // The confirm stores the durable plan: the exact csv_text +
+            // normalized decisions the daemon re-verifies against the
+            // preview_token + decisions_digest before minting. The agent
+            // later resolves the plan by request id + nonce.
+            let csv_text = read_record_csv(csv)?;
+            let decisions_value = match decisions {
+                Some(path) => read_csv_decisions(path)?,
+                None => json!([]),
+            };
+            let decisions_digest =
+                cadence_agent::store::app_records::csv_decisions_digest(&decisions_value)?;
+            (
+                "app_record_csv_confirm",
+                json!({"install_id": install_id, "context_id": context_id, "preview_token": preview_token, "request_id": request_id, "csv_text": csv_text, "decisions": decisions_value, "decisions_digest": decisions_digest}),
+            )
+        }
+        RecordAction::CsvAssistantPreview {
+            install_id,
+            context_id,
+            csv,
+            message,
+            token,
+        } => (
+            "app_record_csv_assistant_preview",
+            json!({"install_id": install_id, "context_id": context_id, "csv_text": read_record_csv(csv)?, "message": message, "token": token}),
+        ),
     })
 }
 
@@ -679,6 +929,65 @@ fn read_audience_json(path: &Path, kind: &str) -> Result<serde_json::Value> {
         .map_err(|_| Error::invalid("app_audience", format!("{kind} must be JSON")))
 }
 
+fn content_params(action: &ContentAction) -> Result<(&'static str, serde_json::Value)> {
+    Ok(match action {
+        ContentAction::Draft {
+            install_id,
+            context_id,
+            campaign_id,
+            proposal_id,
+            draft,
+            message,
+            token,
+        } => {
+            // The draft JSON file holds {subject, preheader, blocks};
+            // the daemon's content grammar validates every field. The
+            // message+token are the live scoped turn's identity.
+            let body = read_audience_json(draft, "email draft")?;
+            let obj = body
+                .as_object()
+                .ok_or_else(|| Error::invalid("app_content", "email draft must be an object"))?;
+            let mut params = json!({
+                "install_id": install_id,
+                "context_id": context_id,
+                "campaign_id": campaign_id,
+                "proposal_id": proposal_id,
+                "message": message,
+                "token": token,
+            });
+            for key in ["subject", "preheader", "blocks"] {
+                if let Some(v) = obj.get(key) {
+                    params[key] = v.clone();
+                }
+            }
+            ("app_content_assistant_draft", params)
+        }
+        ContentAction::Proposals {
+            install_id,
+            context_id,
+            campaign_id,
+            message,
+            token,
+        } => {
+            let mut params = json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token});
+            if let Some(campaign) = campaign_id {
+                params["campaign_id"] = json!(campaign);
+            }
+            ("app_content_assistant_proposals", params)
+        }
+        ContentAction::ProposalShow {
+            install_id,
+            context_id,
+            proposal_id,
+            message,
+            token,
+        } => (
+            "app_content_assistant_proposal_show",
+            json!({"install_id":install_id,"context_id":context_id,"proposal_id":proposal_id,"message":message,"token":token}),
+        ),
+    })
+}
+
 fn audience_params(action: &AudienceAction) -> Result<(&'static str, serde_json::Value)> {
     Ok(match action {
         AudienceAction::SegmentSave {
@@ -695,6 +1004,51 @@ fn audience_params(action: &AudienceAction) -> Result<(&'static str, serde_json:
             }
             ("app_segment_save", params)
         }
+        AudienceAction::SegmentAssistantSave {
+            install_id,
+            context_id,
+            segment_id,
+            name,
+            predicates,
+            expected_revision,
+            message,
+            token,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "segment_id": segment_id, "name": name, "predicates": read_audience_json(predicates, "predicates")?, "message": message, "token": token});
+            if let Some(revision) = expected_revision {
+                params["expected_revision"] = json!(revision);
+            }
+            ("app_segment_assistant_save", params)
+        }
+        AudienceAction::SegmentAssistantLs {
+            install_id,
+            context_id,
+            message,
+            token,
+        } => (
+            "app_segment_assistant_list",
+            json!({"install_id": install_id, "context_id": context_id, "message": message, "token": token}),
+        ),
+        AudienceAction::SegmentAssistantPreview {
+            install_id,
+            context_id,
+            segment_id,
+            message,
+            token,
+        } => (
+            "app_segment_assistant_preview",
+            json!({"install_id":install_id,"context_id":context_id,"segment_id":segment_id,"message":message,"token":token}),
+        ),
+        AudienceAction::SegmentAssistantShow {
+            install_id,
+            context_id,
+            segment_id,
+            message,
+            token,
+        } => (
+            "app_segment_assistant_show",
+            json!({"install_id": install_id, "context_id": context_id, "segment_id": segment_id, "message": message, "token": token}),
+        ),
         AudienceAction::SegmentShow {
             install_id,
             context_id,
@@ -1382,6 +1736,10 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
             let (method, params) = audience_params(action)?;
             client::rpc(state_dir, method, params)?
         }
+        AppAction::Content { action } => {
+            let (method, params) = content_params(action)?;
+            client::rpc(state_dir, method, params)?
+        }
         AppAction::Dev {
             name,
             source,
@@ -1543,5 +1901,79 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exceeds 32KiB"));
+    }
+
+    /// CAD-1014: the assistant CSV import is HANDLE-ONLY — the daemon's
+    /// durable plan resolves the bytes server-side, so the CLI emits only
+    /// request_id + confirm_token + the turn identity + scope. The wire
+    /// carries NO csv_text, preview_token or decisions — those are the
+    /// operator's confirm payload, never the agent's redeem.
+    #[test]
+    fn csv_assistant_import_cli_is_handle_only() {
+        let action = RecordAction::CsvAssistantImport {
+            install_id: "inst-1".into(),
+            context_id: "ctx-1".into(),
+            request_id: "req-1".into(),
+            confirm_token: "confirm-abc".into(),
+            message: "chat-1".into(),
+            token: "tok-1".into(),
+        };
+        let (method, params) = record_params(&action).unwrap();
+        assert_eq!(method, "app_record_csv_assistant_import");
+        assert_eq!(
+            params,
+            json!({"install_id":"inst-1","context_id":"ctx-1","request_id":"req-1",
+                   "confirm_token":"confirm-abc","message":"chat-1","token":"tok-1"})
+        );
+        // Bytes/decisions/preview_token never reach the redeem params.
+        for field in ["csv_text", "preview_token", "decisions"] {
+            assert!(
+                params.get(field).is_none(),
+                "assistant import carried {field}: {params}"
+            );
+        }
+    }
+
+    /// The operator's `csv-confirm` DOES carry the durable plan:
+    /// csv_text + the normalized decisions + their digest, bound to the
+    /// preview token + request id. This is the host-held plan the
+    /// assistant resolves by handle.
+    #[test]
+    fn csv_confirm_cli_carries_the_durable_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("in.csv");
+        std::fs::write(&csv, "record_id,display_name,email\nc1,A,a@b.co\n").unwrap();
+        let decisions = dir.path().join("decisions.json");
+        std::fs::write(&decisions, r#"[{"row":1,"action":"create"}]"#).unwrap();
+        let action = RecordAction::CsvConfirm {
+            install_id: "inst-1".into(),
+            context_id: "ctx-1".into(),
+            csv,
+            preview_token: "sha256:pt".into(),
+            request_id: "req-1".into(),
+            decisions: Some(decisions),
+        };
+        let (method, params) = record_params(&action).unwrap();
+        assert_eq!(method, "app_record_csv_confirm");
+        // The plan: bytes + decisions + their computed digest + the
+        // preview binding + request id — the durable host plan.
+        assert_eq!(
+            params["csv_text"],
+            "record_id,display_name,email\nc1,A,a@b.co\n"
+        );
+        assert_eq!(params["decisions"], json!([{"row":1,"action":"create"}]));
+        assert_eq!(params["preview_token"], "sha256:pt");
+        assert_eq!(params["request_id"], "req-1");
+        assert!(params["decisions_digest"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("sha256:")));
+        // Never smuggles identity/routing.
+        for field in ["by", "actor", "workspace", "install_id", "context_id"] {
+            // install_id/context_id are legitimate URL scope fields.
+            if matches!(field, "install_id" | "context_id") {
+                continue;
+            }
+            assert!(params.get(field).is_none());
+        }
     }
 }

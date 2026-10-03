@@ -1,4 +1,5 @@
 import { ApiError } from "../../lib/api";
+import { hostErrorText } from "./shared/hostErrors";
 
 /**
  * The approved saved-segment rule grammar (CAD-780 allowlist,
@@ -118,7 +119,5 @@ export function newAudienceId(prefix: string): string {
 
 /** Server refusals stay generic; transport failures name the retry. */
 export function friendlyAudienceError(error: unknown): string {
-  if (error instanceof ApiError) return error.message;
-  if (error instanceof TypeError) return "The host did not answer — retry.";
-  return "The audience request was refused — retry.";
+  return hostErrorText(error, "The audience request was refused — retry.");
 }

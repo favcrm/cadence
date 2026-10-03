@@ -55,7 +55,7 @@ impl Shared {
                     "due_epoch",
                     "timezone",
                 ],
-                "social_publish_cancel" => &["intent_id"],
+                "social_publish_cancel" => &["intent_id", "install_id", "context_id"],
                 "social_publish_show" => &["intent_id"],
                 "social_publish_list" => &["install_id", "context_id"],
                 "social_publish_claim_due" => &["now_epoch", "recheck"],
@@ -67,9 +67,13 @@ impl Shared {
         match method {
             "social_publish_media_import" => self.import_social_media(params),
             "social_publish_schedule" => self.schedule_social_publish(params),
-            "social_publish_cancel" => self
-                .store
-                .social_publish_cancel(required_str(params, "intent_id")?),
+            // CAD-1027: cancel is scoped — the intent's own install and
+            // exact context (strict: a non-string context refuses).
+            "social_publish_cancel" => self.store.social_publish_cancel(
+                required_str(params, "intent_id")?,
+                Self::required_segment(params, "install_id")?,
+                Self::strict_optional_segment(params, "context_id")?,
+            ),
             "social_publish_show" => self
                 .store
                 .social_publish_show(required_str(params, "intent_id")?),
