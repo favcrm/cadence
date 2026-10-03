@@ -507,6 +507,14 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             files.push((name.to_string(), entry.path()));
             continue;
         }
+        // CAD-1110: the data-only chat descriptor sits beside app.md.
+        if name == crate::issue::app_chat::FILE {
+            if !ft.is_file() {
+                return Err(entry_err(name, "app-chat.json is a regular file"));
+            }
+            files.push((name.to_string(), entry.path()));
+            continue;
+        }
         if TOP_DIRS.contains(&name) {
             if !ft.is_dir() {
                 return Err(entry_err(name, "expected a directory"));
@@ -515,8 +523,8 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             continue;
         }
         return Err(Error::rejected(format!(
-            "app source entry '{name}' — v0 knows app.md, workflows/, rubrics/, \
-             templates/; everything else refuses"
+            "app source entry '{name}' — v0 knows app.md, app-chat.json, workflows/, \
+             rubrics/, templates/; everything else refuses"
         )));
     }
     if !manifest {
@@ -825,6 +833,16 @@ fn validate_contents(
             guide: String::new(),
         },
     };
+    // CAD-1110: a package whose chat descriptor breaks the app-chat/v1
+    // grammar is refused at install and update, not at first use.
+    if let Some((_, text)) = files
+        .iter()
+        .find(|(rel, _)| rel == crate::issue::app_chat::FILE)
+    {
+        if let Err(e) = crate::issue::app_chat::validate(text, &manifest.app) {
+            errors.push(e.to_string());
+        }
+    }
     let mut notes = Vec::new();
     let mut workflow_count = 0usize;
     for (rel, text) in &files {

@@ -945,19 +945,6 @@ p.sfield-hint {
 .app-chat-collapse {
   display: none;
 }
-.app-chat-me {
-  justify-self: end;
-  max-width: 90%;
-  background: var(--color-ink-800);
-  border-radius: 0.5rem 0.5rem 0.15rem 0.5rem;
-  padding: 0.4rem 0.6rem;
-}
-.app-chat-ai > :first-child {
-  margin-top: 0;
-}
-.app-chat-ai > :last-child {
-  margin-bottom: 0;
-}
 .app-chat-card {
   padding: 0.5rem 0.65rem;
   background: var(--color-ink-850);

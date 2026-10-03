@@ -389,6 +389,13 @@ export const api = {
         ...(conversation ? { conversation } : {}),
       },
     ),
+  /** `GET /api/app-installations/<id>/chat-descriptor` (CAD-1110): the installed
+   *  package's `app-chat.json`, pinned to the digest its install consented to. A
+   *  404 means no descriptor (plain shared chat). */
+  appChatDescriptor: (installId: string) =>
+    get<{ descriptor: unknown; digest: unknown; app: unknown }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/chat-descriptor`,
+    ),
   /** `GET /api/app-installations/<id>/conversations` (CAD-1098; wire shape owned by conversationClient). */
   conversationList: (installId: string) =>
     get<Record<string, unknown>>(`/api/app-installations/${encodeURIComponent(installId)}/conversations`),

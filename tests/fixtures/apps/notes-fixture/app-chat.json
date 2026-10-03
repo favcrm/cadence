@@ -1,0 +1,32 @@
+{
+  "contract": "app-chat/v1",
+  "app": "notes-fixture",
+  "contexts": [
+    {
+      "id": "list",
+      "label": "Notes",
+      "prompts": ["Draft a note about…", "What changed this week?"],
+      "record": { "label": "Note", "prompts": ["Tighten this note"] }
+    },
+    {
+      "id": "new",
+      "label": "New note",
+      "prompts": ["Suggest a title"]
+    }
+  ],
+  "attachments": [{ "id": "csv-import", "label": "Import notes" }],
+  "directives": [
+    {
+      "match": "cadence_note",
+      "card": {
+        "title": "Note ready",
+        "text": "The assistant drafted a note for you.",
+        "fields": [{ "label": "Title", "from": "title" }],
+        "buttons": [{ "label": "Open the notes", "run": "open-view", "view": "list" }]
+      }
+    },
+    { "match": "cadence_post_preview", "render": "screen:post-preview", "size": "small" }
+  ],
+  "subjects": [{ "kind": "campaign", "label": "Campaign" }],
+  "presentation": { "showContext": true }
+}

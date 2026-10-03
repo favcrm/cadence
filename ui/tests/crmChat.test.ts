@@ -1,6 +1,7 @@
 /** CAD-1051 / CAD-1046: the shell chat — rail, markdown, folded steps,
  *  directive cards, context chip and quick prompts. */
 declare function require(name: string): any;
+declare const process: { cwd(): string };
 export {};
 function assert(value: unknown, why: string): asserts value {
   if (!value) throw new Error(why);
@@ -33,22 +34,29 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const AppShell = require("../src/features/app-shell/AppShell").default;
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
-const { parseDirective, hideIds, chatContext } = require("../src/features/app-shell/chatRender") as typeof import("../src/features/app-shell/chatRender");
+const { matchDirective, hideIds } = require("../src/features/app-shell/chat/directive") as typeof import("../src/features/app-shell/chat/directive");
+const { parseAppChat } = require("../src/features/app-shell/chat/contract") as typeof import("../src/features/app-shell/chat/contract");
+const { chatContext } = require("../src/features/app-shell/chat/Conversation") as typeof import("../src/features/app-shell/chat/Conversation");
+// The descriptor under test is the package's own file, not a copy.
+const crmDescriptor = JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "workspace-apps", "crm", "app-chat.json"), "utf8"));
+const crmChat = parseAppChat(crmDescriptor);
 
 const SECRET = ["tok", "en-", "abcdef0123456789"].join("");
 const confirm = JSON.stringify({ cadence_csv_import: { request_id: "req-9", confirm_token: SECRET } });
 
-// Pure directive rules.
-const d = parseDirective(confirm);
-assert(d && d.title === "Customer import", "csv confirm parses to a human summary");
+// Pure directive rules, against the CRM package's own descriptor.
+const d = matchDirective(confirm, crmChat);
+assert(d && d.kind === "card" && d.card.title === "Customer import", "csv confirm parses to a human summary");
 assert(!JSON.stringify(d).includes(SECRET) && !JSON.stringify(d).includes("req-9"), "summary carries no token or request id");
-equal(parseDirective("plain words"), null, "prose is not a directive");
-equal(parseDirective("{not json"), null, "broken JSON is not a directive");
-assert(parseDirective(JSON.stringify({ confirm_token: SECRET })) !== null, "any confirm_token JSON is carded, never shown");
+equal(matchDirective("plain words", crmChat), null, "prose is not a directive");
+equal(matchDirective("{not json", crmChat), null, "broken JSON is not a directive");
+assert(matchDirective(JSON.stringify({ confirm_token: SECRET }), crmChat)?.kind === "confirmation", "any confirm_token JSON is carded, never shown");
+assert(matchDirective(confirm, null)?.kind === "confirmation", "with no descriptor a token-bearing body is still never printed");
 equal(hideIds("done in ctx-abc-123 now"), "done in this workspace now", "ctx ids hidden");
-equal(chatContext("customers", false).label, "Customers", "page chip");
-assert(chatContext("segments", true).label.startsWith("Segment"), "record chip names the open record");
-assert(chatContext("campaigns", false).prompts.length >= 2 && chatContext("campaigns", false).prompts.length <= 3, "2-3 prompts");
+equal(chatContext(crmChat, "customers", false)?.label, "Customers", "page chip");
+assert(chatContext(crmChat, "segments", true)?.label.startsWith("Segment"), "record chip names the open record");
+assert((chatContext(crmChat, "campaigns", false)?.prompts.length ?? 0) >= 2 && (chatContext(crmChat, "campaigns", false)?.prompts.length ?? 9) <= 3, "2-3 prompts");
+equal(chatContext(crmChat, null, false), null, "no screen, no chip");
 
 const crm = { install_id: "install-crm", title: "CRM", name: "crm", version: "0.1.0", digest: "d", catalog_generation: "g", approved: true, storage_kind: "workspace", files: [], capabilities: null, connection_slots: [] };
 const ctxs = { contexts: [{ id: "ctx-a", install_id: "install-crm", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } }] };
@@ -71,6 +79,7 @@ globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
   if (path === "/api/app-installations/install-crm") return json(crm);
   if (path === "/api/app-installations/install-crm/contexts") return json(ctxs);
+  if (path.endsWith("/chat-descriptor")) return json({ descriptor: crmDescriptor, digest: crm.digest, app: "crm" });
   if (path.endsWith("/conversations")) return new Response("{}", { status: 404 });
   if (path.startsWith("/api/threads/master")) return json(thread);
   const url = new URL(path, "http://localhost");
@@ -98,7 +107,7 @@ const grid = () => host.querySelector(".app-shell-grid") as HTMLElement;
 const text = () => pane().textContent ?? "";
 
 // Markdown renders, raw markers do not.
-assert(host.querySelector("[data-chat-md] strong")?.textContent === "VIP customers", "markdown bold renders as <strong>");
+assert(host.querySelector('[data-kind="answer"] strong')?.textContent === "VIP customers", "markdown bold renders as <strong>");
 assert(!text().includes("**"), "no raw ** in the chat");
 // Tool steps fold to one line.
 const steps = host.querySelectorAll("[data-chat-steps]");

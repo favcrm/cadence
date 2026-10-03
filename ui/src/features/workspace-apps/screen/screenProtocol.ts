@@ -48,13 +48,29 @@ export interface ScreenInit {
  *  else closes the port. `state` is the child's opaque draft snapshot
  *  (≤ 32 KiB string), held host-side in memory only. */
 export type ChildToHost =
-  | { v: 1; op: "ready"; accepts?: [typeof PUBLISH_INTENTS_V1] }
+  | { v: 1; op: "ready"; accepts?: [typeof PUBLISH_INTENTS_V1] | [typeof CHAT_DIRECTIVE_V1] }
   | { v: 1; op: "state"; data: string };
 
 /** CAD-1025 — the one optional PUSH extension. A child opts in by sending
  *  `{v:1, op:"ready", accepts:["publish-intents.v1"]}`; a child that sends
  *  the bare `ready` keeps receiving the exact CAD-1006 v1 shape. */
 export const PUBLISH_INTENTS_V1 = "publish-intents.v1";
+/** CAD-1110 — the chat-only opt-in: a screen mounted inline in chat sends
+ *  `{v:1, op:"ready", accepts:["chat-directive.v1"]}` and is pushed ONLY the
+ *  directive (see `ChatDirectivePush`), never the scope projection above. */
+export const CHAT_DIRECTIVE_V1 = "chat-directive.v1";
+
+/** The one push a chat frame receives: the matched kind plus the flat,
+ *  bounded, identity-free payload the host's matcher validated. */
+export interface ChatDirectivePush {
+  v: 1;
+  op: "directive";
+  tag: string;
+  kind: string;
+  data: Record<string, string | number | boolean>;
+}
+/** The whole directive push is at most this many UTF-8 bytes. */
+export const CHAT_PUSH_BYTES_MAX = 4 * 1024;
 /** Every PUSH a child receives is at most this many UTF-8 bytes. */
 export const PUSH_BYTES_MAX = 128 * 1024;
 const LINK_ID_MAX = 128;
@@ -187,6 +203,12 @@ export function parseChild(data: unknown): ChildToHost | null {
     Array.isArray(d.accepts) && d.accepts.length === 1 && d.accepts[0] === PUBLISH_INTENTS_V1
   ) {
     return { v: 1, op: "ready", accepts: [PUBLISH_INTENTS_V1] };
+  }
+  if (
+    Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
+    Array.isArray(d.accepts) && d.accepts.length === 1 && d.accepts[0] === CHAT_DIRECTIVE_V1
+  ) {
+    return { v: 1, op: "ready", accepts: [CHAT_DIRECTIVE_V1] };
   }
   if (
     Object.keys(d).sort().join() === "data,op,v" &&

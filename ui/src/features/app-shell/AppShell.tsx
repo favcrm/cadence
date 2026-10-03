@@ -1,43 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError } from "../../lib/api";
-import { resources } from "../../lib/resources";
-import { streamInto } from "../../lib/sse";
-import { useQuery, useResource } from "../../lib/useResource";
 import { navigate, useHref } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
-import { MASTER } from "../home/master";
-import {
-  addPending,
-  lastSeq,
-  newMessageId,
-  reduceFrame,
-  settlePending,
-  threadItems,
-} from "../home/thread";
 import type { Viewer } from "../projects/work";
 import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
-import ChatCsvImport from "./ChatCsvImport";
-import { ChatRow, chatContext, type ChatPage } from "./chatRender";
+import Conversation from "./chat/Conversation";
+import { useAppChat } from "./chat/descriptorClient";
+import type { ChatBinding, ChatScope } from "./chat/types";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
-import {
-  QUEUED_NOTICE,
-  conversationLabel,
-  conversationThread,
-  conversationStreamUrl,
-  createConversation,
-  idleThread,
-  hasUnansweredOperator,
-  isQueuedBehindOther,
-  parseSlash,
-  selectConversation,
-  useActiveConversation,
-  useChatCollapsed,
-} from "./conversationClient";
+import { useChatCollapsed } from "./conversationClient";
 import "./app-shell.css";
 
 /**
@@ -420,6 +395,30 @@ export default function AppShell({
 
   const title = installation?.title || installation?.name || "App";
   const isSocial = installation !== null && installation.name === "social-content";
+  // The chat's descriptor comes from the installation's own approved package
+  // (served pinned to its digest); with none, the pane is plain shared chat.
+  const verified = installation !== null && installation.install_id === installId;
+  const chatDescriptor = useAppChat(
+    installId,
+    verified ? installation.digest : null,
+    verified ? installation.name : null,
+  );
+  // The shell's own screen ids (D5): the CRM outlet's sections, or the generic
+  // outlet's `list` and `new`; the private-screen app owns its own and has none.
+  const chatScreen = !verified || isSocial ? null : installation.name === "crm" ? crmSection : view;
+  // `open-view` card action: navigate within this installation and context.
+  const openView = useCallback(
+    (target: string) => {
+      if (installation?.name === "crm") {
+        if (target === "customers" || target === "segments" || target === "campaigns") {
+          writeQuery({ crm: target, appview: null, record: null });
+        }
+      } else if (target === "list" || target === "new") {
+        writeQuery({ appview: target === "list" ? null : target, record: null });
+      }
+    },
+    [installation, writeQuery],
+  );
 
   return (
     <div className="app-shell" data-app-shell-outlet={installId}>
@@ -474,16 +473,22 @@ export default function AppShell({
               Close chat
             </button>
           </div>
-          <ChatPane
-            installId={installId}
+          <Conversation
+            mode={{
+              kind: "app",
+              installId,
+              contextId: binding.scope?.context_id ?? "",
+              screen: chatScreen,
+              recordOpen: recordId !== null,
+              contextName: contextLabel(contexts, contextId),
+              descriptor: chatDescriptor,
+            }}
+            density="compact"
             viewer={viewer}
-            contextLabel={isSocial ? null : contextLabel(contexts, contextId)}
             binding={binding}
-            crm={installation !== null && installation.name === "crm"}
-            page={installation !== null && installation.name === "crm" ? crmSection : null}
-            recordOpen={recordId !== null}
             collapsed={chatCollapsed}
             onCollapsed={setChatCollapsed}
+            onOpenView={openView}
           />
         </div>
         <section className="app-shell-outlet" aria-label={`${title} workspace`}>
@@ -648,15 +653,7 @@ export default function AppShell({
   );
 }
 
-export interface ChatScope {
-  install_id: string;
-  context_id: string;
-}
-
-export interface ChatBinding {
-  scope: ChatScope | null;
-  error: string | null;
-}
+export type { ChatBinding, ChatScope };
 
 /** The chat send's App scope: empty wants plain chat, a selected but
  *  inactive context blocks early, otherwise the server proves the
@@ -738,332 +735,4 @@ export function latestScopedChatMessage(
     }
   }
   return null;
-}
-
-/**
- * The install's assistant conversation in compact form (CAD-1098): one
- * thread store per conversation, streamed live from
- * `/api/threads/master/stream?conversation=<id>`. The picker lists General,
- * campaign conversations and + New; the home thread is not shown here.
- * Sends carry the shell's current installation/context; the daemon
- * proves both against its store and stamps the verified binding on
- * the entry — the chip below renders only that read-back stamp, never
- * what was sent.
- */
-function ChatPane({
-  installId,
-  viewer,
-  contextLabel,
-  binding,
-  crm,
-  page,
-  recordOpen,
-  collapsed,
-  onCollapsed,
-}: {
-  installId: string;
-  viewer: Viewer;
-  contextLabel: string | null;
-  binding: ChatBinding;
-  crm?: boolean;
-  page: ChatPage | null;
-  recordOpen: boolean;
-  collapsed: boolean;
-  onCollapsed: (next: boolean) => void;
-}) {
-  // CAD-1098: one conversation per (installation, optional subject); the
-  // thread shown is that conversation's own store, never the home thread
-  // (unless the daemon predates conversations: `legacy`).
-  const active = useActiveConversation(installId);
-  const store = active.store ?? idleThread;
-  const convId = active.state === "ready" ? (active.selected?.id ?? null) : null;
-  const thread = useResource(store);
-  const masterState = useQuery(resources.masterState);
-  const [draft, setDraft] = useState("");
-  const [sendError, setSendError] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
-  const loaded = thread.data !== null;
-  const draftSubject = active.draftSubject;
-  // With no context selected the send still carries the installation, so
-  // it lands in the app's conversation (the context is only a per-turn hint).
-  const sendApp = binding.scope ?? (active.state === "ready" ? { install_id: installId } : undefined);
-  const usable =
-    active.state === "legacy" || (active.state === "ready" && (convId !== null || draftSubject !== null));
-
-  useEffect(() => {
-    if (usable && !loaded) void store.refresh();
-  }, [usable, loaded, store]);
-  useEffect(() => {
-    if (!usable || !loaded || thread.data?.missing === true || draftSubject !== null) return;
-    const sub = streamInto(store, reduceFrame, {
-      url: convId === null ? `/api/threads/${MASTER}/stream` : conversationStreamUrl(convId),
-      events: ["entry"],
-      lastEventId: String(lastSeq(store.get().data) ?? 0),
-      onError: () => undefined,
-    });
-    return () => sub.close();
-  }, [store, usable, convId, loaded, thread.data?.missing, draftSubject]);
-
-  const items = threadItems(thread.data);
-  const tail = items.slice(-8);
-  const canSend = viewer.operator && !viewer.readOnly && usable;
-  const canCreate = viewer.operator && !viewer.readOnly && active.state === "ready";
-  // Waiting dot: the selected conversation grew while the rail was collapsed.
-  const seen = useRef(items.length);
-  if (!collapsed) seen.current = items.length;
-  const waiting = collapsed && items.length > seen.current;
-  const ctx = page === null ? null : chatContext(page, recordOpen);
-  const queued = isQueuedBehindOther(masterState.data?.turn, thread.data?.entries ?? [], thread.data?.pending ?? []);
-  // The notice needs a live turn read while a reply is awaited.
-  const awaiting = queued || (thread.data?.pending ?? []).some((p) => p.state === "sent");
-  // After a reload or navigation the selected conversation may still be
-  // waiting on another conversation's turn: read the master's state once
-  // (the poll below then keeps the notice live while it is queued).
-  const unanswered = hasUnansweredOperator(thread.data?.entries ?? []);
-  useEffect(() => {
-    if (unanswered) void resources.masterState.refresh();
-  }, [unanswered, convId]);
-  useEffect(() => {
-    if (!awaiting) return;
-    const t = setInterval(() => void resources.masterState.refresh(), 6_000);
-    return () => clearInterval(t);
-  }, [awaiting]);
-
-  // "+ New", `/new` and `/clear` are one call: a fresh conversation.
-  const startNew = () => {
-    if (!canCreate || creating) return;
-    setCreating(true);
-    setSendError(null);
-    createConversation(installId, binding.scope?.context_id ?? "")
-      .catch((e: unknown) => setSendError(e instanceof ApiError ? e.message : String(e)))
-      .finally(() => setCreating(false));
-  };
-
-  const send = () => {
-    const body = draft.trim();
-    if (!body || !canSend) return;
-    if (parseSlash(body) === "new") {
-      // A command, never a message: nothing is sent to the assistant.
-      setDraft("");
-      startNew();
-      return;
-    }
-    if (binding.error !== null) {
-      setSendError(binding.error);
-      return;
-    }
-    const message = newMessageId();
-    setSendError(null);
-    // Create-on-first-send: an unsaved campaign conversation is made
-    // (idempotently) right before its first message, then the message
-    // goes to the returned id.
-    const target: Promise<{ id: string | null; store: typeof store }> =
-      draftSubject !== null
-        ? createConversation(installId, binding.scope?.context_id ?? "", draftSubject).then((c) => ({
-            id: c.id,
-            store: conversationThread(c.id),
-          }))
-        : Promise.resolve({ id: convId, store });
-    setDraft("");
-    void target.then(
-      ({ id, store: dest }) => {
-        dest.write((s) => addPending(s, message, body, Date.now()));
-        return api
-          .threadSend(MASTER, body, message, undefined, sendApp, id ?? undefined)
-          .then(() => {
-            dest.write((s) => settlePending(s, message, { ok: true }));
-            void resources.masterState.refresh();
-          })
-          .catch((e: ApiError) => {
-            setSendError(e.message ?? String(e));
-            dest.write((s) => settlePending(s, message, { ok: false, error: e.message ?? String(e) }));
-          });
-      },
-      (e: unknown) => setSendError(e instanceof ApiError ? e.message : String(e)),
-    );
-  };
-
-  return (
-    <div className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
-      <button
-        type="button"
-        className="btn btn-ghost btn-sm app-chat-rail"
-        aria-label="Expand assistant chat"
-        aria-expanded={!collapsed}
-        onClick={() => onCollapsed(false)}
-        data-waiting={waiting || undefined}
-      >
-        {waiting && <span className="app-chat-dot" role="status" aria-label="New reply waiting" />}
-        <span className="app-chat-rail-label text-micro text-ink-400">ASSISTANT</span>
-      </button>
-      <div className="app-chat-head">
-        <p className="text-micro text-ink-500">
-          Assistant{contextLabel ? ` · ${contextLabel}` : ""} — context for this turn, never access proof.
-        </p>
-        <button
-          type="button"
-          className="btn btn-ghost btn-sm app-chat-collapse"
-          aria-label="Collapse assistant chat"
-          aria-expanded={!collapsed}
-          onClick={() => onCollapsed(true)}
-        >
-          ⇤
-        </button>
-      </div>
-      {active.state !== "legacy" && (
-        <div className="app-chat-conv" data-chat-conversations>
-          <select
-            className="app-chat-conv-select text-secondary"
-            aria-label="Conversation"
-            value={convId ?? ""}
-            disabled={active.state !== "ready" || (active.conversations.length === 0 && draftSubject === null)}
-            onChange={(e) => e.target.value !== "" && selectConversation(installId, e.target.value)}
-          >
-            {active.conversations.length === 0 && draftSubject === null && <option value="">General</option>}
-            {draftSubject !== null && <option value="">New campaign conversation (unsaved)</option>}
-            {active.conversations.map((c, i) => (
-              <option key={c.id} value={c.id}>
-                {conversationLabel(c, i)}
-              </option>
-            ))}
-          </select>
-          <button
-            type="button"
-            className="btn btn-secondary btn-sm"
-            data-chat-new
-            disabled={!canCreate || creating}
-            onClick={startNew}
-          >
-            + New
-          </button>
-        </div>
-      )}
-      {active.state === "failed" && (
-        <p className="text-label text-fail" role="alert">
-          The conversations could not be read — {active.error}{" "}
-          <button type="button" className="lnk" onClick={active.retry}>
-            Retry
-          </button>
-        </p>
-      )}
-      {active.state === "ready" && convId === null && (
-        <p className="text-label text-ink-500" data-empty="conversations">
-          No conversation yet. Start one with + New.
-        </p>
-      )}
-      <p className="text-micro text-ink-500">
-        <Link href="/" className="lnk" data-chat-home-link>
-          Earlier history is in Home
-        </Link>
-      </p>
-      {queued && (
-        <p className="text-label text-ink-300" role="status" data-chat-queued>
-          {QUEUED_NOTICE}
-        </p>
-      )}
-      {thread.status === "failed" && (
-        <p className="text-label text-fail" role="alert">
-          The thread could not be read — {thread.error}{" "}
-          <button type="button" className="lnk" onClick={() => void store.refresh()}>
-            Retry
-          </button>
-        </p>
-      )}
-      {usable && !loaded && thread.status !== "failed" && (
-        <p className="text-label text-ink-500" role="status">
-          Reading the thread…
-        </p>
-      )}
-      {usable && loaded && tail.length === 0 && (
-        <p className="text-label text-ink-500" data-empty="chat">
-          Nothing here yet. Send the first message.
-        </p>
-      )}
-      <ol className="app-chat-list" aria-label="Recent master messages">
-        {tail.map((item) => (
-          <li key={item.key} className="text-secondary text-ink-300 break-words" data-chat-item>
-            <ChatRow item={item} />
-          </li>
-        ))}
-      </ol>
-      {sendError && (
-        <p className="text-label text-fail" role="alert">
-          {sendError}
-        </p>
-      )}
-      {crm === true && binding.scope !== null && (
-        <details className="app-chat-import">
-          <summary className="text-label text-ink-300">Import a customer list</summary>
-          <ChatCsvImport
-            // CAD-1016: a context change remounts the import — a pending
-            // plan/preview/choices from the prior scope can never bleed
-            // into the new one.
-            key={`${binding.scope.install_id}:${binding.scope.context_id}`}
-            scope={{ installId: binding.scope.install_id, contextId: binding.scope.context_id }}
-            canWrite={canSend}
-            onSendIntent={async (intent) => {
-              const message = newMessageId();
-              const body = JSON.stringify(intent);
-              try {
-                await api.threadSend(MASTER, body, message, undefined, sendApp, convId ?? undefined);
-                void store.refresh();
-                void resources.masterState.refresh();
-                return null;
-              } catch (e: unknown) {
-                return e instanceof ApiError ? e.message : String(e);
-              }
-            }}
-          />
-        </details>
-      )}
-      <form
-        className="app-chat-form"
-        onSubmit={(e) => {
-          e.preventDefault();
-          send();
-        }}
-      >
-        {ctx !== null && (
-          <div className="app-chat-ctx" data-chat-context>
-            <span className="app-chat-chip text-micro text-ink-300">
-              Context <b className="font-medium text-ink-100">{ctx.label}</b>
-            </span>
-            {ctx.prompts.map((p) => (
-              <button
-                key={p}
-                type="button"
-                className="app-chat-prompt text-micro"
-                disabled={!canSend}
-                onClick={() => setDraft(p)}
-              >
-                {p}
-              </button>
-            ))}
-          </div>
-        )}
-        <label className="sr-only" htmlFor="app-shell-chat-box">
-          Message to the master
-        </label>
-        <textarea
-          id="app-shell-chat-box"
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-              e.preventDefault();
-              send();
-            }
-          }}
-          rows={2}
-          disabled={!canSend}
-          placeholder={canSend ? "Ask Master… (Enter sends)" : "Read-only · Sending is unavailable"}
-          aria-label="Message to the master"
-          className="app-chat-box"
-        />
-        <Button type="submit" variant="primary" size="sm" disabled={!canSend || !draft.trim()}>
-          Send
-        </Button>
-      </form>
-    </div>
-  );
 }

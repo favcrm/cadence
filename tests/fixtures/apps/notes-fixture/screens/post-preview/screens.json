@@ -1,0 +1,19 @@
+{
+  "contract": "app-screens/v1",
+  "app": "notes-fixture",
+  "entry": "client.js",
+  "assets": [
+    {
+      "name": "client.js",
+      "media_type": "text/javascript",
+      "sha256": "sha256:93ef567be87428000e4a60d306d0a74e0c5ed4c6de63c92f577fb5661ff479a8",
+      "size": 1335
+    }
+  ],
+  "provenance": {
+    "source_digest": "sha256:feccc439aca5debd0208adb22aa1df1ab3c43de25dac31033b9f3625f815a68e",
+    "sdk_digest": "sha256:140bedbf9c3f6d56a9846d2ba7088798683f4da0c248231336e6a05679e4fdfe",
+    "toolchain_digest": "sha256:140bedbf9c3f6d56a9846d2ba7088798683f4da0c248231336e6a05679e4fdfe"
+  },
+  "may": []
+}

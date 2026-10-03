@@ -25,7 +25,7 @@ import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
 import PlanCard from "./PlanCard";
-import { ThreadItemView } from "./ThreadView";
+import Conversation from "../app-shell/chat/Conversation";
 import {
   initialFollow,
   motionBehavior,
@@ -339,23 +339,22 @@ const ThreadList = memo(function ThreadList({
           </button>
         </div>
       )}
-      <ol className="space-y-3 min-w-0" aria-label="messages" data-rendered={shown.length}>
-        {shown.map((item) => {
-          // Live items (or the operator's pending ones) enter with the
-          // rise animation; anything at or below the mount seq is history.
-          const live = item.type === "pending" || Number(item.key.slice(1)) > liveAfter;
-          return (
-            <li key={item.key} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
-              <ThreadItemView item={item} readOnly={readOnly} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={discard} />
-              {anchors.has(item.key) && (
-                <div className="ml-8">
-                  <PlanCard epic={anchors.get(item.key)!} readOnly={readOnly} onOpenIssue={onOpenIssue} />
-                </div>
-              )}
-            </li>
-          );
-        })}
-      </ol>
+      <Conversation
+        mode={{ kind: "home" }}
+        items={shown}
+        readOnly={readOnly}
+        liveAfter={liveAfter}
+        onOpenIssue={onOpenIssue}
+        onRetry={onRetry}
+        onDiscard={discard}
+        after={(item) =>
+          anchors.has(item.key) ? (
+            <div className="ml-8">
+              <PlanCard epic={anchors.get(item.key)!} readOnly={readOnly} onOpenIssue={onOpenIssue} />
+            </div>
+          ) : null
+        }
+      />
     </>
   );
 });

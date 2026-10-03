@@ -633,6 +633,10 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
                 manifest = true;
                 add(dir, &name, text.to_string())?;
             }
+            // CAD-1110: the data-only chat descriptor beside app.md.
+            libc::S_IFREG if text == crate::issue::app_chat::FILE => {
+                add(dir, &name, text.to_string())?;
+            }
             libc::S_IFLNK => {
                 return Err(Error::rejected(format!(
                     "bundle entry '{text}' is a symlink — a bundle holds real \
@@ -641,7 +645,7 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
             }
             _ => {
                 return Err(Error::rejected(format!(
-                    "bundle entry '{text}' — the v0 shape is app.md plus flat \
+                    "bundle entry '{text}' — the v0 shape is app.md, app-chat.json plus flat \
                      workflows/, rubrics/, templates/; everything else refuses"
                 )))
             }

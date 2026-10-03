@@ -1,0 +1,45 @@
+{
+  "contract": "app-chat/v1",
+  "app": "crm",
+  "contexts": [
+    {
+      "id": "customers",
+      "label": "Customers",
+      "prompts": ["Who can't be emailed?", "Import a list", "Tag counter sign-ups"],
+      "record": {
+        "label": "Customer",
+        "prompts": ["Summarise this customer", "Draft a follow-up", "Why can't they be emailed?"]
+      }
+    },
+    {
+      "id": "segments",
+      "label": "Segments",
+      "prompts": ["Build a segment for…", "Who can I email today?"],
+      "record": {
+        "label": "Segment",
+        "prompts": ["Refine this segment", "Explain who's excluded"]
+      }
+    },
+    {
+      "id": "campaigns",
+      "label": "Campaigns",
+      "prompts": ["Draft a welcome email", "Plan an October promo"],
+      "record": {
+        "label": "Campaign",
+        "prompts": ["Make it warmer", "Shorter subject", "Translate to Chinese"]
+      }
+    }
+  ],
+  "attachments": [{ "id": "csv-import", "label": "Import a customer list" }],
+  "directives": [
+    {
+      "match": "cadence_csv_import",
+      "card": {
+        "title": "Customer import",
+        "text": "You confirmed the reviewed rows. The assistant applies them."
+      }
+    }
+  ],
+  "subjects": [{ "kind": "campaign", "label": "Campaign" }],
+  "presentation": { "showContext": true }
+}
