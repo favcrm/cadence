@@ -236,6 +236,29 @@ fn object_has(root: &Path, oid: &str) -> bool {
         .unwrap_or(false)
 }
 
+thread_local! {
+    /// A per-thread bound on the daemon probes below. Unset keeps the
+    /// CLI's long default; the daemon's own checkup sets it so a wedged
+    /// self-RPC cannot stall the stall-watch thread (CAD-1021).
+    static PROBE_TIMEOUT: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with every finish daemon probe on this thread bounded by `d`.
+pub(crate) fn with_probe_timeout<T>(d: std::time::Duration, f: impl FnOnce() -> T) -> T {
+    let prev = PROBE_TIMEOUT.with(|t| t.replace(Some(d)));
+    let out = f();
+    PROBE_TIMEOUT.with(|t| t.set(prev));
+    out
+}
+
+fn probe_rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
+    match PROBE_TIMEOUT.with(|t| t.get()) {
+        Some(d) => client::rpc_timeout(state_dir, method, params, d),
+        None => client::rpc(state_dir, method, params),
+    }
+}
+
 /// A resolved finish target: the issue's open worktree/branch refs
 /// plus the repo root the git probes run against. `msg_refs` are the
 /// issue's `message` ref targets — the dispatches recorded against
@@ -413,19 +436,7 @@ fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
     // binding. Unscoped refs (hand-added, pre-CAD-94) bind any target.
     // A closed ref — a dispatch whose send failed — bound nothing and
     // counts for no check.
-    let msg_refs = front
-        .refs
-        .iter()
-        .filter(|r| r.kind == "message" && r.closed != Some(true))
-        .filter(|r| match r.worktree.as_deref() {
-            Some(w) => {
-                wt_name.as_deref() == Some(w)
-                    || wt_dir.as_deref().is_some_and(|d| d.to_string_lossy() == w)
-            }
-            None => true,
-        })
-        .filter_map(|r| r.path.clone())
-        .collect();
+    let msg_refs = bound_msg_refs(&front, wt_name.as_deref(), wt_dir.as_deref());
     Ok(Resolve::Target(Box::new(Target {
         front,
         body,
@@ -437,6 +448,26 @@ fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
         msg_refs,
         cargo_target,
     })))
+}
+
+/// The `message` ref targets bound to this worktree: a ref carrying a
+/// `worktree` field scopes to that pair only; unscoped refs bind any
+/// target; a closed ref (a failed send) binds nothing.
+fn bound_msg_refs(
+    front: &Front,
+    wt_name: Option<&str>,
+    wt_dir: Option<&Path>,
+) -> std::collections::HashSet<String> {
+    front
+        .refs
+        .iter()
+        .filter(|r| r.kind == "message" && r.closed != Some(true))
+        .filter(|r| match r.worktree.as_deref() {
+            Some(w) => wt_name == Some(w) || wt_dir.is_some_and(|d| d.to_string_lossy() == w),
+            None => true,
+        })
+        .filter_map(|r| r.path.clone())
+        .collect()
 }
 
 /// One condition blocking a finish. `reason` names the pid or
@@ -605,7 +636,7 @@ fn message_bound(view: &DaemonView, state_dir: &Path, msg: &Value, t: &Target) -
     }
     // A task no agent listed — ask directly; the error is routed
     // through the same classification, never swallowed.
-    match client::rpc(state_dir, "task_show", json!({"task": task})) {
+    match probe_rpc(state_dir, "task_show", json!({"task": task})) {
         Ok(ts) => {
             if task_worktree_matches(t, ts["task"]["worktree"].as_str()) {
                 Bound::Yes
@@ -648,6 +679,13 @@ pub(crate) struct DaemonView {
 }
 
 impl DaemonView {
+    /// Test: the daemon is up but the agent enumeration failed.
+    #[cfg(test)]
+    pub(crate) fn enumeration_failed(mut self) -> Self {
+        self.enum_unreachable = Some("agent_list timed out".to_string());
+        self
+    }
+
     /// A test view: `up` plus the agent rows `agent_list` would have
     /// returned (each `{"alias", "cwd"}`), so a reclaim/finish guard's
     /// live-agent arm can be driven without a running daemon.
@@ -664,6 +702,32 @@ impl DaemonView {
     }
 }
 
+/// Why the live-use scan (messages, task bindings, panes, processes)
+/// blocks `lane`, or `None` when nothing is bound to it. Reclaim reuses
+/// finish's in-use evaluation; any unresolvable or unknown answer blocks.
+pub(crate) fn lane_in_use(
+    view: &DaemonView,
+    state_dir: &Path,
+    front: &Front,
+    lane: &Path,
+) -> Option<String> {
+    let wt_name = lane.file_name().map(|n| n.to_string_lossy().into_owned());
+    let t = Target {
+        front: front.clone(),
+        body: String::new(),
+        dir: PathBuf::new(),
+        wt_dir: Some(lane.to_path_buf()),
+        msg_refs: bound_msg_refs(front, wt_name.as_deref(), Some(lane)),
+        wt_name,
+        branch: String::new(),
+        root: PathBuf::new(),
+        cargo_target: None,
+    };
+    let (mut blocks, deferred) = in_use_blocks(view, state_dir, &t);
+    blocks.extend(deferred);
+    blocks.first().map(|b| b.reason.clone())
+}
+
 pub(crate) fn daemon_view(state_dir: &Path) -> DaemonView {
     let mut v = DaemonView {
         up: client::socket_path(state_dir).exists(),
@@ -676,7 +740,7 @@ pub(crate) fn daemon_view(state_dir: &Path) -> DaemonView {
     if !v.up {
         return v;
     }
-    match client::rpc(state_dir, "agent_list", json!({})) {
+    match probe_rpc(state_dir, "agent_list", json!({})) {
         Ok(list) => {
             for a in list["agents"].as_array().into_iter().flatten() {
                 v.agents.push(a.clone());
@@ -686,7 +750,7 @@ pub(crate) fn daemon_view(state_dir: &Path) -> DaemonView {
                     .flatten()
                     .filter_map(Value::as_str)
                 {
-                    match client::rpc(state_dir, "task_show", json!({"task": tid})) {
+                    match probe_rpc(state_dir, "task_show", json!({"task": tid})) {
                         Ok(ts) => {
                             if let Some(task) = ts.get("task") {
                                 v.tasks.insert(tid.to_string(), task.clone());
@@ -1048,7 +1112,7 @@ fn classify_probe_error(e: Error, absent_marker: &str) -> ProbeError {
 }
 
 fn agent_lookup(state_dir: &Path, alias: &str) -> AgentLookup {
-    match client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
+    match probe_rpc(state_dir, "agent_show", json!({"alias": alias})) {
         Ok(show) => AgentLookup::Shown(show),
         Err(e) => match classify_probe_error(e, "Unknown managed agent") {
             ProbeError::Absent => AgentLookup::Absent,
@@ -1135,6 +1199,14 @@ pub(crate) fn cwd_holder_aliases(view: &DaemonView, wt_dir: Option<&Path>) -> Ve
 /// answer is inconclusive and blocks with its own wording. The /proc
 /// scans run regardless.
 fn inspect(view: &DaemonView, state_dir: &Path, t: &Target, ev: &Evidence) -> Check {
+    let (blocks, deferred) = in_use_blocks(view, state_dir, t);
+    inspect_rest(blocks, deferred, t, ev)
+}
+
+/// The in-use half of [`inspect`]: live or unknown messages, task
+/// bindings, pane trees and processes bound to this worktree. Returns
+/// the blocks and the deferred enumeration (meta) failures.
+fn in_use_blocks(view: &DaemonView, state_dir: &Path, t: &Target) -> (Vec<Block>, Vec<Block>) {
     let mut blocks = Vec::new();
     let mut pane_pid = None;
     let mut unreachable = false;
@@ -1378,6 +1450,10 @@ fn inspect(view: &DaemonView, state_dir: &Path, t: &Target, ev: &Evidence) -> Ch
             });
         }
     }
+    (blocks, deferred)
+}
+
+fn inspect_rest(mut blocks: Vec<Block>, deferred: Vec<Block>, t: &Target, ev: &Evidence) -> Check {
     // Dirty worktree — `--ignored` marks ignored paths `!!` so a build
     // artifact (like the ui/node_modules symlink) never blocks; only
     // real changes and non-ignored untracked files do. A status that

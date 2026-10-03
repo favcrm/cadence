@@ -622,7 +622,9 @@ impl Shared {
     /// `doing`/`review` issues whose recorded work merged. Runs on the
     /// stall-watch thread at most hourly; the finish sweep stays a CLI
     /// verb because its liveness probes go through `client::rpc`,
-    /// which the daemon must not issue to itself. A tracker write
+    /// which the daemon must not issue to itself unbounded (the CAD-1021
+    /// reclaim pass is the bounded exception: `finish::with_probe_timeout`
+    /// caps every probe it makes). A tracker write
     /// failure is logged, never escalated: the next tick retries.
     pub(super) fn reconcile_tick(&self) {
         let pm = match self.pm() {
