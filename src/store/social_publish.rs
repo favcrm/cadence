@@ -460,7 +460,7 @@ impl Store {
             // id can pin its claim to that exact row — a queue-head move
             // between peek and claim is a no-claim, never a send of an
             // intent the caller never inspected.
-            if !eligible(&tx, &id, &frozen)? {
+            if !eligible(tx, &id, &frozen)? {
                 return Ok(None);
             }
             let changed = tx.execute("UPDATE social_publish_intents SET state='processing',updated=? WHERE intent_id=? AND state='queued'",params![now(),id])?;
