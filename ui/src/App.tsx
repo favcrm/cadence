@@ -4,7 +4,8 @@ import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
 import AppDetail from "./features/apps/AppDetail";
 import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell";
-import { crmAppMenu, type CrmSection } from "./features/app-shell/CrmOutlet";
+import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
+import { workspaceApps } from "./features/workspace-apps/workspaceApps";
 import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
@@ -565,11 +566,11 @@ export default function App() {
   };
   const navProject = route.screen === "projects" ? project : null;
   const projectSlug = project === "all" ? null : project;
-  // Board-level App menu (CAD-784): the shell reports its verified
-  // installation receipt; the board nests that installation's
-  // sections in the shared sidebar/phone menu only while the route
-  // still names the same verified CRM installation. A forged route
-  // or a non-CRM app never produces entries.
+  // Board-level Apps menu (CAD-784, CAD-1116): the installed apps come
+  // from the verified installation list (or the shell's receipt for the
+  // open one), never from the bare route, so a forged installId in the
+  // URL produces no entry. The active or last-used app also lists its
+  // sections, and that stays on every screen.
   const [activeApp, setActiveApp] = useState<ActiveInstallation | null>(null);
   const reportInstallation = useCallback((info: ActiveInstallation | null) => {
     setActiveApp((prev) => {
@@ -583,17 +584,46 @@ export default function App() {
       return info;
     });
   }, []);
-  const activeCrm =
-    route.screen === "workspaceApp" &&
-    activeApp !== null &&
-    activeApp.installId === route.installId &&
-    activeApp.kind === "crm"
-      ? activeApp
-      : null;
-  const crmQuery = new URLSearchParams(search).get("crm");
-  const crmSection: CrmSection =
-    crmQuery === "segments" || crmQuery === "campaigns" ? crmQuery : "customers";
-  const appMenu = activeCrm ? crmAppMenu(href, activeCrm.title, crmSection) : null;
+  const [installed, setInstalled] = useState<VerifiedApp[]>([]);
+  useEffect(() => {
+    const controller = new AbortController();
+    workspaceApps
+      .installations(controller.signal)
+      .then((list) => {
+        if (controller.signal.aborted || !Array.isArray(list)) return;
+        setInstalled(list.map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })));
+      })
+      .catch(() => undefined); // keep the last good list
+    return () => controller.abort();
+  }, [route.screen]);
+  const onAppScreen = route.screen === "workspaceApp";
+  const receipt = onAppScreen && activeApp !== null && activeApp.installId === route.installId ? activeApp : null;
+  const menuApps =
+    receipt !== null && !installed.some((a) => a.installId === receipt.installId)
+      ? [...installed, { installId: receipt.installId, kind: receipt.kind, title: receipt.title }]
+      : installed;
+  const activeId = onAppScreen
+    ? menuApps.find((a) => a.installId === route.installId)?.installId ?? null
+    : null;
+  const [last, setLast] = useState<LastApp | null>(() => readLastApp());
+  const activeSection = activeId === null ? null : sectionFromSearch(menuApps.find((a) => a.installId === activeId)!.kind, search);
+  useEffect(() => {
+    if (activeId === null) return;
+    setLast((prev) => {
+      if (prev !== null && prev.installId === activeId && prev.section === activeSection) return prev;
+      const next = { installId: activeId, section: activeSection };
+      writeLastApp(next);
+      return next;
+    });
+  }, [activeId, activeSection]);
+  const appMenu = buildAppNav({
+    apps: menuApps,
+    onAppScreen,
+    activeId,
+    activeHref: href,
+    last,
+    installHref: (installId) => hrefFor({ screen: "workspaceApp", installId }),
+  });
   // One element for both account menus (sidebar row, header avatar) so they cannot drift.
   const versionLine = (
     <VersionLine
