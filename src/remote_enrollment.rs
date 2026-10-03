@@ -1212,8 +1212,8 @@ pub fn enroll_browser(
     )
 }
 
-/// What `cadence login` learns from the issuer: every field is taken from
-/// the verified grant, never derived locally or supplied by the caller.
+/// A verified login: the operator named the slug, and the issuer's grant
+/// echoed exactly the workspace and audience that were requested.
 pub struct LoginGrant {
     pub organization_id: String,
     pub slug: String,
@@ -1235,10 +1235,11 @@ fn slug(value: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// Accept only an owner grant for exactly the requested workspace, whose
-/// slug is a single DNS label and whose audience is exactly
-/// `https://<slug>.cadencecloud.app`, with only `cli.*` capabilities.
-fn login_grant(value: &Value, org: &str) -> Result<LoginGrant> {
+/// Accept only an owner grant for exactly the requested workspace and
+/// audience (`https://<slug>.cadencecloud.app`), with only `cli.*`
+/// capabilities. The issuer binds slug to workspace itself; the response
+/// carries no slug field.
+fn login_grant(value: &Value, org: &str, slug_value: &str) -> Result<LoginGrant> {
     let at = now()?;
     let (principal, credential) = (&value["principal"], &value["credential"]);
     let caps = value["capabilities"]
@@ -1249,7 +1250,6 @@ fn login_grant(value: &Value, org: &str) -> Result<LoginGrant> {
             c.as_str()
                 .is_some_and(|s| s.starts_with("cli.") && s.len() <= 32)
         });
-    let slug_value = field(value, "organization_slug")?;
     let endpoint = format!("https://{slug_value}{CLOUD_SUFFIX}");
     if field(value, "version")? != VERSION
         || field(value, "organization_id")? != org
@@ -1303,19 +1303,22 @@ impl LoginGrant {
 
 /// `cadence login` (CAD-1019 slice 1b): the hosted-cadence device grant
 /// (PKCE, `hcd_` device code, `hct_` bridge) against the operator-pinned
-/// issuer. The request names only the workspace; the issuer pins the slug
-/// and audience, and the returned grant is verified by `login_grant`.
-/// Nothing is persisted here: the caller records the org, then saves.
+/// issuer. The operator names the workspace and slug; the request carries
+/// audience `https://<slug>.cadencecloud.app`, and `login_grant` accepts
+/// only a grant that echoes both. Nothing is persisted here: the caller
+/// records the org, then saves.
 pub fn login_browser(
     issuer: &str,
     org: &str,
+    slug_value: &str,
     dir: &Path,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<LoginGrant> {
     let issuer = origin(issuer, cfg!(test))?;
-    if !id(org) {
+    if !id(org) || !slug(slug_value) {
         return Err(reject("Invalid hosted login request"));
     }
+    let audience = format!("https://{slug_value}{CLOUD_SUFFIX}");
     private_dir(dir, false)?;
     let _guard = lock(dir, true)?;
     require_trusted_issuer(dir, &issuer)?;
@@ -1329,7 +1332,7 @@ pub fn login_browser(
     let (status, code) = post_public_with_access(
         &issuer,
         "/v1/hosted-cadence/device/code",
-        json!({"version":DEVICE_VERSION,"organization_id":org,
+        json!({"version":DEVICE_VERSION,"organization_id":org,"audience":audience,
             "client_label":"cadence-cli","requested_capabilities":["cli.read","cli.write"],
             "code_challenge":challenge}),
         access.as_ref(),
@@ -1370,7 +1373,7 @@ pub fn login_browser(
             _ => return Err(reject("Hosted browser grant refused; start again")),
         }
     };
-    let grant = login_grant(&grant, org)?;
+    let grant = login_grant(&grant, org, slug_value)?;
     confirm_access_ingress(dir, &issuer, &access)?;
     Ok(grant)
 }
@@ -2840,20 +2843,42 @@ mod tests {
 
     const LOGIN_ENDPOINT: &str = "https://acme.cadencecloud.app";
 
-    /// A well-formed grant: owner principal, `cli.*` caps, issuer-pinned
-    /// slug and the audience that slug implies.
+    /// The AgenticOS device/code request contract (`requestShape` in
+    /// apps/api/src/hosted-cadence/device.ts): exactly these keys, an exact
+    /// HTTPS audience, a 43-char PKCE challenge. Anything else is a 400.
+    fn real_code_request_ok(body: &Value) -> bool {
+        let keys = [
+            "version",
+            "organization_id",
+            "audience",
+            "client_label",
+            "requested_capabilities",
+            "code_challenge",
+        ];
+        body.as_object().is_some_and(|o| {
+            o.len() == keys.len()
+                && keys.iter().all(|k| o.contains_key(*k))
+                && body["version"] == DEVICE_VERSION
+                && body["audience"].as_str().is_some_and(|a| origin(a, false).is_ok())
+                && body["client_label"].as_str().is_some_and(|l| (1..=120).contains(&l.len()))
+                && body["code_challenge"].as_str().is_some_and(|c| c.len() == 43)
+        })
+    }
+
+    /// The real token response (`hostedCadenceExchangeResponseFor`): exactly
+    /// these fields and no `organization_slug`.
     fn login_grant_body() -> Value {
         let at = now().unwrap();
-        json!({"version":VERSION,"organization_id":"ws_real",
-            "organization_slug":"acme","audience":LOGIN_ENDPOINT,
+        json!({"version":VERSION,"organization_id":"ws_real","audience":LOGIN_ENDPOINT,
             "principal":{"kind":"user","subject_id":"user_1","current_role":"owner"},
             "capabilities":["cli.read","cli.write"],
             "credential":{"credential_id":"hcp_credential","access_token":BRIDGE,
                 "token_type":"Bearer","issued_at":at,"expires_at":at+120,"renewal":"reexchange"}})
     }
 
-    /// Drive `login_browser` against a loopback fake issuer that answers the
-    /// device code, any `token_errors` in order, then `grant`.
+    /// Drive `login_browser` for slug `acme` against a loopback fake issuer
+    /// that enforces the real request contract, answers any `token_errors`
+    /// in order, then `grant`.
     fn run_login(
         grant: Value,
         token_errors: Vec<&'static str>,
@@ -2862,15 +2887,14 @@ mod tests {
         let issuer = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             let (mut code, body) = public_request(&listener, "/v1/hosted-cadence/device/code");
-            assert_eq!(body["organization_id"], "ws_real");
-            assert!(
-                body.get("audience").is_none(),
-                "the caller never names a host"
-            );
-            assert_eq!(
-                body["requested_capabilities"],
-                json!(["cli.read", "cli.write"])
-            );
+            if !real_code_request_ok(&body)
+                || body["organization_id"] != "ws_real"
+                || body["audience"] != LOGIN_ENDPOINT
+                || body["requested_capabilities"] != json!(["cli.read", "cli.write"])
+            {
+                respond_error(&mut code, "invalid_request");
+                return;
+            }
             respond(&mut code, &browser_code(60));
             for e in &token_errors {
                 let (mut token, _) = public_request(&listener, "/v1/hosted-cadence/device/token");
@@ -2885,7 +2909,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("e");
         trust(&dir, &issuer);
-        let out = login_browser(&issuer, "ws_real", &dir, |_, _| Ok(()));
+        let out = login_browser(&issuer, "ws_real", "acme", &dir, |_, _| Ok(()));
         server.join().unwrap();
         (out, dir, root)
     }
@@ -2896,15 +2920,25 @@ mod tests {
     }
 
     #[test]
-    fn login_returns_the_issuer_verified_org_and_stores_hct_under_0600() {
+    fn the_fake_issuer_refuses_an_extra_or_missing_request_key() {
+        let ok = json!({"version":DEVICE_VERSION,"organization_id":"ws_real",
+            "audience":LOGIN_ENDPOINT,"client_label":"cadence-cli",
+            "requested_capabilities":["cli.read"],"code_challenge":"A".repeat(43)});
+        assert!(real_code_request_ok(&ok));
+        let mut extra = ok.clone();
+        extra["organization_slug"] = json!("acme");
+        assert!(!real_code_request_ok(&extra));
+        let mut missing = ok.clone();
+        missing.as_object_mut().unwrap().remove("audience");
+        assert!(!real_code_request_ok(&missing));
+    }
+
+    #[test]
+    fn login_sends_the_slug_audience_and_returns_the_verified_org() {
         let (out, dir, _root) = run_login(login_grant_body(), vec![]);
         let grant = out.unwrap();
         assert_eq!(
-            (
-                grant.organization_id.as_str(),
-                grant.slug.as_str(),
-                grant.endpoint.as_str()
-            ),
+            (grant.organization_id.as_str(), grant.slug.as_str(), grant.endpoint.as_str()),
             ("ws_real", "acme", LOGIN_ENDPOINT)
         );
         // Verification persists nothing; the caller records, then saves.
@@ -2942,35 +2976,31 @@ mod tests {
     }
 
     #[test]
-    fn login_rejects_a_forged_or_extra_slug() {
-        // The endpoint is exactly https://<one DNS label>.cadencecloud.app,
-        // and the audience must say the same thing as the slug.
-        let at = |slug: &str, audience: &str| {
-            let mut grant = login_grant_body();
-            grant["organization_slug"] = json!(slug);
-            grant["audience"] = json!(audience);
-            grant
-        };
-        for grant in [
-            at("evil.example", "https://evil.example.cadencecloud.app"),
-            at("acme/x", "https://acme/x.cadencecloud.app"),
-            at("Acme", "https://Acme.cadencecloud.app"),
-            at("-acme", "https://-acme.cadencecloud.app"),
-            at("acme", "https://other.cadencecloud.app"),
-            at("acme", "https://acme.cadencecloud.app.evil.test"),
-            at("acme", "https://acme.cadencecloud.app/"),
-            at("acme", "http://acme.cadencecloud.app"),
-            at("", "https://.cadencecloud.app"),
+    fn login_rejects_a_grant_for_a_different_audience() {
+        // The requested audience must come back byte for byte.
+        for audience in [
+            "https://other.cadencecloud.app",
+            "https://acme.cadencecloud.app.evil.test",
+            "https://acme.cadencecloud.app/",
+            "http://acme.cadencecloud.app",
         ] {
+            let mut grant = login_grant_body();
+            grant["audience"] = json!(audience);
             let (out, dir, _r) = run_login(grant, vec![]);
-            assert!(out.is_err());
+            assert!(out.is_err(), "{audience}");
             assert_nothing_stored(&dir);
         }
-        let mut missing = login_grant_body();
-        missing.as_object_mut().unwrap().remove("organization_slug");
-        let (out, dir, _r) = run_login(missing, vec![]);
-        assert!(out.is_err());
-        assert_nothing_stored(&dir);
+    }
+
+    #[test]
+    fn login_refuses_a_slug_that_is_not_one_dns_label_before_any_request() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        for bad in ["evil.example", "acme/x", "Acme", "-acme", "acme-", "", "a_b", "acme:443"] {
+            // No listener exists: refusal must precede any network call.
+            let out = login_browser("http://127.0.0.1:1", "ws_real", bad, &dir, |_, _| Ok(()));
+            assert!(out.is_err(), "{bad}");
+        }
     }
 
     #[test]

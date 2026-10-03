@@ -10,8 +10,8 @@ pub(crate) enum Commands {
         action: RemoteAction,
     },
     /// Authenticate to an AgenticOS issuer and map the workspace to a remote
-    /// org (CAD-1019). The issuer returns the verified org id and slug; the
-    /// endpoint is `https://<slug>.cadencecloud.app`, never derived locally.
+    /// org (CAD-1019). `--slug` names the board host; the issuer's grant must
+    /// echo exactly the workspace and audience requested.
     Login {
         /// AgenticOS HTTPS issuer origin (no path) — must match the
         /// operator-pinned trusted issuer.
@@ -20,6 +20,10 @@ pub(crate) enum Commands {
         /// Exact AgenticOS workspace ID to authorize.
         #[arg(long)]
         org: String,
+        /// Org slug: the board host is `https://<slug>.cadencecloud.app`.
+        /// Required for org login (not for `--token-stdin`).
+        #[arg(long)]
+        slug: Option<String>,
         /// Select the new org as the saved default. Without it, login records
         /// the org but keeps an existing default.
         #[arg(long = "use")]

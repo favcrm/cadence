@@ -49,6 +49,7 @@ pub(crate) fn run() -> Result<i32> {
         Commands::Login {
             issuer,
             org,
+            slug,
             use_,
             token_stdin,
             no_open,
