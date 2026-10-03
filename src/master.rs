@@ -160,6 +160,30 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     // CAD-615: ask the operator to approve one plain command. The
     // decision verbs are not here — the master cannot approve itself.
     "Bash(cadence master ask-permission *)",
+    // CAD-1014(b): the scoped-chat redeem verbs. Each redeems the
+    // operator's own stamped scoped chat message on the live assigned
+    // turn (`--message`/`--token` are the turn identity); scope comes
+    // from the daemon stamp, never the agent. Bounded CSV import and a
+    // revision-checked segment save — never the operator verbs.
+    "Bash(cadence app record csv-assistant-import *)",
+    "Bash(cadence app audience segment-assistant-save *)",
+    // The scoped-chat reads behind the commits: segment revision/
+    // membership and the CSV preview. Read-only — they never claim the
+    // message. `csv-confirm` is the operator's verb, not the agent's.
+    "Bash(cadence app audience segment-assistant-ls *)",
+    "Bash(cadence app audience segment-assistant-show *)",
+    // Bounded membership preview over a saved segment — the audience
+    // the operator will confirm a campaign against; never a freeze/send.
+    "Bash(cadence app audience segment-assistant-preview *)",
+    "Bash(cadence app record csv-assistant-preview *)",
+    // The composer-free scoped-chat email draft — the turn IS the
+    // request; one turn one inert pending proposal, never a send/
+    // approve/edit. The operator applies or discards it.
+    "Bash(cadence app content assistant-draft *)",
+    // Proposal list/show so the inert draft is discoverable in the
+    // campaign before the operator applies it.
+    "Bash(cadence app content assistant-proposals *)",
+    "Bash(cadence app content assistant-proposal-show *)",
 ];
 
 /// The only built-in tool the master's Claude session has (`--tools`):

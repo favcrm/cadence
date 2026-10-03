@@ -300,7 +300,9 @@ async function mountedFlow() {
   // Direct section route: the Segments list paints server rows, with
   // no customer content and no campaign builder in sight.
   await settle(() => assert(text().includes("VIP"), "segments list paints server rows"));
-  assert(text().includes("Apps") && text().includes("Segments"), "nested breadcrumb renders");
+  assert(host.querySelector("[data-outlet-heading]")?.textContent?.trim() === "Segments", "segments list retains its section heading");
+  assert(host.querySelectorAll('a[href="/apps"]').length === 1, "only the shared shell Apps link renders");
+  assert(!host.querySelector(".crm-crumb"), "segments do not duplicate the shell breadcrumb");
   assert(!host.querySelector('[data-section="campaigns"]'), "campaigns stay unmounted on the segments route");
 
   // New segment: malformed rules refuse before the wire.

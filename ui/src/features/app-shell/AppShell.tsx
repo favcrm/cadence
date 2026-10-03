@@ -6,7 +6,6 @@ import { useQuery } from "../../lib/useResource";
 import { navigate, useHref } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
-import Select from "../../ui/Select";
 import { MASTER } from "../home/master";
 import {
   addPending,
@@ -252,44 +251,74 @@ export default function AppShell({
     const urlRecord = query.get("record");
     const urlView = query.get("appview");
     const urlCrm = query.get("crm");
+    // A rewrite this pass emits is still "external" until adoption has
+    // run against it: marking only the pre-write URL handled and
+    // returning would let the next pass re-enter, and marking the
+    // rewritten URL handled would make the next pass return early and
+    // never adopt the surviving ctx (the cold deep-link defect). So
+    // adoption is fall-through, not early-return: normalize each
+    // param, then act on the still-valid remainder.
     if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView, urlCrm)) return;
     handledQuery.current = queryKey(urlCtx, urlRecord, urlView, urlCrm);
     // An unknown CRM section never renders: strip it back to the
-    // default instead of guessing a section.
-    if (urlCrm !== null && urlCrm !== "segments" && urlCrm !== "campaigns") {
-      writeQuery({ crm: null }, { replace: true });
-      return;
-    }
+    // default instead of guessing a section. The explicit default
+    // (`crm=customers`) is already canonical, so it is not rewritten.
+    const badCrm = urlCrm !== null && urlCrm !== "customers" && urlCrm !== "segments" && urlCrm !== "campaigns";
+    let badRecord = false;
     if (urlRecord !== null) {
       try {
         assertRecordId(urlRecord);
       } catch {
-        writeQuery({ record: null }, { replace: true });
-        return;
+        badRecord = true;
       }
     }
-    if (urlCtx !== null && !activeIds.includes(urlCtx)) {
+    const staleCtx = urlCtx !== null && !activeIds.includes(urlCtx);
+    const scopelessRecord = urlCtx === null && urlRecord !== null && !badRecord;
+    if (staleCtx) {
       setContextId(fallbackContext());
       setLinkNotice(
-        "The linked context is not active in this installation — the selection was cleared.",
+        installation.name === "crm"
+          ? "This link names a scope that is not active in this CRM installation, so nothing was opened. Ask an administrator to review the installation's CRM setup."
+          : "The linked context is not active in this installation — the selection was cleared.",
       );
-      writeQuery({ ctx: null, appview: null, record: null }, { replace: true });
-      return;
-    }
-    if (urlCtx !== null) {
+    } else if (scopelessRecord) {
+      // A record link without scope is ambiguous: refuse it with a
+      // notice rather than guessing which context it names.
+      setLinkNotice(
+        installation.name === "crm"
+          ? "This link does not say which scope the record belongs to, so nothing was opened. Ask an administrator to review the installation's CRM setup."
+          : "The record link names no context — the selection was cleared.",
+      );
+      setContextId(fallbackContext());
+    } else if (urlCtx !== null) {
+      // The URL's ctx+record/appview are adopted verbatim: they were
+      // authored together — a deep link, a scoped-entry link, or a
+      // history entry — never split or cleared here. Stale scope is
+      // prevented at the transition origin (the scoped-entry links
+      // emit a bare `?ctx=` and the section links drop record/appview),
+      // not by guessing which arriving params are intentional.
       setContextId(urlCtx);
       rememberContext(installId, urlCtx);
       setLinkNotice(null);
-      return;
-    }
-    // No linked context: a record link without scope is ambiguous.
-    if (urlRecord !== null) {
-      setLinkNotice("The record link names no context — the selection was cleared.");
+    } else {
       setContextId(fallbackContext());
-      writeQuery({ record: null }, { replace: true });
-      return;
     }
-    setContextId(fallbackContext());
+    // One normalized write emits every strip at once. Marking the
+    // pre-write URL handled (done above) plus this write's own
+    // handled mark leaves the surviving ctx adoptable on the next
+    // pass — but adoption already ran on it above, so no second
+    // effect turn is needed and the URL settles in a single replace.
+    if (badCrm || badRecord || staleCtx || scopelessRecord) {
+      writeQuery(
+        {
+          crm: badCrm ? null : undefined,
+          record: badRecord || staleCtx || scopelessRecord ? null : undefined,
+          ctx: staleCtx ? null : undefined,
+          appview: staleCtx ? null : undefined,
+        },
+        { replace: true },
+      );
+    }
   }, [loading, installation, activeIds, query, installId, writeQuery]);
 
   // The default selection, without persisting an empty choice when
@@ -297,31 +326,45 @@ export default function AppShell({
   const fallbackContext = () =>
     activeIds.length > 0 ? initialContext(installId, activeIds) : "";
 
-  const pickContext = useCallback(
-    (next: string) => {
-      if (next === contextId) return;
-      setContextId(next);
-      rememberContext(installId, next);
-      setLinkNotice(null);
-      // Context switch clears the selected record and returns the
-      // outlet to the list — the outlet remounts on the scope key, so
-      // no unsaved draft survives the switch.
-      writeQuery({ ctx: next === "" ? null : next, appview: null, record: null });
-    },
-    [contextId, installId, writeQuery],
-  );
+  // The context picker is removed (operator review): context follows
+  // the URL, not a selector.
 
   // Narrow drawer focus: opening moves into the pane, closing returns
   // to the trigger. The closed drawer is `visibility: hidden`, so it
   // stays out of the tab order with the draft intact.
+  //
+  // Observed defect (baseline in d379ae54, real Chrome): a synchronous
+  // commit-phase `.focus()` ran before the open activation's own focus
+  // (the toggle is focused on mousedown / Enter) was applied, so the
+  // composer never received focus. A single rAF still fired too early —
+  // before `data-open` propagated. Deferring two frames clears the open
+  // commit in both real and synthesized input; the `data-open` guard
+  // means the callback never focuses a still-hidden pane. Both frame
+  // ids are tracked so cleanup cancels whichever is still pending — a
+  // rapid close can never refocus once the user has moved on. A
+  // disabled (read-only) composer yields to the enabled Close control.
   useEffect(() => {
     if (!chatOpen) return;
-    chatPaneRef.current?.querySelector("textarea")?.focus();
+    let inner = 0;
+    const focusComposer = () => {
+      const pane = chatPaneRef.current;
+      if (!pane || !pane.hasAttribute("data-open")) return;
+      const composer = pane.querySelector<HTMLElement>("textarea");
+      const target = composer && !composer.hasAttribute("disabled")
+        ? composer
+        : pane.querySelector<HTMLElement>(".app-shell-chat-close") ?? composer;
+      target?.focus();
+    };
+    const outer = requestAnimationFrame(() => {
+      inner = requestAnimationFrame(focusComposer);
+    });
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setChatOpen(false);
     };
     addEventListener("keydown", onKey);
     return () => {
+      cancelAnimationFrame(outer);
+      cancelAnimationFrame(inner);
       removeEventListener("keydown", onKey);
       chatOpenRef.current?.focus();
     };
@@ -354,12 +397,9 @@ export default function AppShell({
     <div className="app-shell" data-app-shell-outlet={installId}>
       <div className="app-shell-crumb">
         <Link href="/apps" className="lnk text-label">
-          Apps
+          ← All apps
         </Link>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="truncate text-ink-100" aria-current="page">
+        <span className="truncate text-ink-100 text-cardtitle" aria-current="page">
           {loading ? "Loading…" : title}
         </span>
         <span className="flex-1" />
@@ -447,25 +487,86 @@ export default function AppShell({
                 <p className="num text-micro text-ink-500">
                   {installId} · {installation.version} · context is managed inside the workspace screen
                 </p>
+              ) : installation.name === "crm" ? (
+                // Single-company CRM (CAD-1008): a bound scope shows no
+                // context/scope subtitle at all — the page is the
+                // company's records. Only the exceptional unbound
+                // ambiguous state below names a setup action.
+                contextId === "" && activeIds.length > 1 ? (
+                  <p className="text-micro text-ink-500">CRM setup is required before records open.</p>
+                ) : null
               ) : (
-                <div className="app-shell-context">
-                  <Select
-                    value={contextId}
-                    onChange={pickContext}
-                    options={[
-                      { value: "", label: "No context" },
-                      ...contexts
-                        .filter((c) => c.state === "active")
-                        .map((c) => ({ value: c.id, label: c.config.label })),
-                    ]}
-                    aria-label="App context"
-                    disabled={!viewer.operator || viewer.readOnly}
-                    full
-                  />
-                  <p className="num text-micro text-ink-500" title="Verified installation digest">
-                    {installId} · {installation.version}
+                <p className="num text-micro text-ink-500">
+                  {contexts.find((c) => c.id === contextId)?.config.label ?? "No context"} · {installation.version}
+                </p>
+              )}
+              {/* Scoped entry: a multi-context install with no linked
+                  or remembered scope stays unselected rather than
+                  silently picking a client. Each context is an explicit
+                  `?ctx=` link — a real URL write, deep-linkable, never a
+                  hidden default. The removed header picker stays gone.
+                  The same links stay available after a scope is bound
+                  (chosen, linked or remembered): without them the only
+                  way to reach a second context would be hand-editing
+                  the URL — the regression the header picker's removal
+                  introduced. The bound context keeps its link but
+                  carries `aria-current`, so the current scope is still
+                  announced and never a dead control — and its href is
+                  the current URL itself, so following it is a
+                  `navigate` no-op that keeps the open record, the New
+                  view and any unsaved draft instead of resetting the
+                  outlet. Single-context installs keep the entry hidden
+                  — no link clutter.
+                  CAD-1008: a bound CRM scope shows no switch links at
+                  all — the single-company surface never offers a scope
+                  control. Only the exceptional unbound multi-context
+                  legacy install keeps the explicit entry; Social and
+                  generic Apps are unchanged. */}
+              {!isSocial && activeIds.length > 1 && (installation?.name !== "crm" || contextId === "") && (
+                <nav
+                  className={
+                    contextId === ""
+                      ? "app-shell-scope card px-4 py-4"
+                      : "app-shell-switch"
+                  }
+                  aria-label={contextId === "" ? "Choose a context" : "Switch context"}
+                >
+                  <p
+                    className={
+                      contextId === "" ? "text-label text-ink-300" : "text-label text-ink-500"
+                    }
+                  >
+                    {contextId === ""
+                      ? installation.name === "crm"
+                        ? "This CRM installation is not bound to a scope yet — administrator CRM setup is required before records open."
+                        : `Choose a context to open ${title}'s records.`
+                      : installation.name === "crm"
+                        ? "Scope:"
+                        : "Context:"}
                   </p>
-                </div>
+                  <ul
+                    className={
+                      contextId === ""
+                        ? "app-shell-scope-list"
+                        : "app-shell-scope-list app-shell-switch-list"
+                    }
+                  >
+                    {contexts
+                      .filter((c) => c.state === "active")
+                      .map((c) => (
+                        <li key={c.id}>
+                          <Link
+                            href={scopedEntryHref(href, c.id, contextId)}
+                            className="lnk text-label"
+                            data-scope-link={c.id}
+                            aria-current={c.id === contextId ? "page" : undefined}
+                          >
+                            {c.config.label}
+                          </Link>
+                        </li>
+                      ))}
+                  </ul>
+                </nav>
               )}
               {linkNotice && (
                 <p className="card px-4 py-3 text-label text-warn border-warn/40" role="alert">
@@ -546,6 +647,25 @@ export function chatBinding({ installId, wanted, known, activeIds }: {
 function contextLabel(contexts: AppContext[], contextId: string): string | null {
   if (!contextId) return null;
   return contexts.find((c) => c.id === contextId)?.config.label ?? null;
+}
+
+/** A scoped-entry link: sets `ctx` and clears any carried record /
+ *  new-view / section state so entering a scope never lands on the
+ *  prior scope's drawer or draft. Re-entering the already-bound
+ *  scope keeps the outlet exactly as it is: the link resolves to the
+ *  current URL, so `navigate` no-ops and an open record, the New
+ *  view and unsaved drafts survive — the link stays real (copiable,
+ *  openable in a new tab), never a dead control. Pure — unit-tested
+ *  via the shell. */
+export function scopedEntryHref(href: string, contextId: string, boundId: string): string {
+  if (contextId === boundId) return href;
+  const [path, search] = href.split("?");
+  const q = new URLSearchParams(search ?? "");
+  q.set("ctx", contextId);
+  q.delete("record");
+  q.delete("appview");
+  const s = q.toString();
+  return path + (s ? `?${s}` : "");
 }
 
 /** The daemon-stamped App binding on an entry's payload, if verified. */

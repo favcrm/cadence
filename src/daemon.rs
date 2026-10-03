@@ -27,6 +27,7 @@ mod app_contexts_rpc;
 mod app_effects_rpc;
 mod app_records_rpc;
 mod app_runs_rpc;
+mod app_screens_rpc;
 mod approvals_rpc;
 mod area_rpc;
 mod caller_rule;
@@ -111,6 +112,10 @@ use uuid::Uuid;
 
 /// CAD-339: the daemon methods a master connection may call.
 pub use master_rpc::MASTER_ALLOWED;
+// CAD-1006: the frame-document renderer the board's consume route uses.
+// `pub(crate)` — the UI frame route calls it; unit tests live in the
+// module, not as a public API.
+pub(crate) use app_screens_rpc::render_frame_html;
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
 ///
@@ -478,6 +483,18 @@ pub struct Shared {
     /// `capability_unavailable`. Never set from PM, RPC, or worker input.
     pub(crate) social_media_resolver:
         Option<std::sync::Arc<crate::platform::agenticos_external::media_import::MediaResolver>>,
+    /// CAD-1006: outstanding one-use frame capabilities minted by
+    /// `app_screen_mint` — nonce → ScreenCap. Bounded (≤128 global,
+    /// ≤4/install, ≤8/session), 60 s TTL, atomic burn on consume.
+    /// In-memory: a daemon restart drops every minted mount.
+    screen_caps: Mutex<HashMap<String, app_screens_rpc::ScreenCap>>,
+    /// CAD-1006: the mint RATE bound — per verified session, a rolling
+    /// 60 s window of mint timestamps. Distinct from the outstanding-cap
+    /// count: an attacker who mints-then-consumes forever would otherwise
+    /// spin the expensive digest/approval/package re-proof each call.
+    /// session_id → Vec<Instant> (≤64 per window); the map is bounded
+    /// (≤128 sessions) and swept on each mint.
+    screen_mint_rate: Mutex<HashMap<String, Vec<Instant>>>,
     /// Serializes an app's checked execution claim through bounded Local
     /// commit/readback against binding/context/custody mutations.
     app_release_lock: Mutex<()>,
@@ -688,6 +705,8 @@ impl Shared {
             social_publish_sender: opts.social_publish_sender.clone(),
             social_media_importer: opts.social_media_importer.clone(),
             social_media_resolver: opts.social_media_resolver.clone(),
+            screen_caps: Mutex::new(HashMap::new()),
+            screen_mint_rate: Mutex::new(HashMap::new()),
             app_release_lock: Mutex::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
@@ -2957,7 +2976,31 @@ impl Shared {
             "app_record_update" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_preview" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_import" => self.rpc_app_record(method, params, peer_pid),
+            "app_record_csv_confirm" => self.rpc_app_record(method, params, peer_pid),
             "app_segment_save" => self.rpc_app_audience(method, params, peer_pid),
+            "app_record_csv_assistant_import" => {
+                self.rpc_app_record_csv_assistant_import(params, peer_pid)
+            }
+            "app_segment_assistant_save" => self.rpc_app_segment_assistant_save(params, peer_pid),
+            // Scoped-chat reads — data exposes, never mutations; the
+            // same verified-turn gate, no claim (a read doesn't spend).
+            // One handler routes each to its store call. Each method is
+            // its own `=>` arm on ONE line: the caller-rule method-table
+            // parser scans per-arm lines for the `"name" =>` shape.
+            "app_segment_assistant_list" => self.rpc_app_assistant_read(method, params, peer_pid),
+            "app_segment_assistant_show" => self.rpc_app_assistant_read(method, params, peer_pid),
+            "app_record_csv_assistant_preview" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
+            "app_segment_assistant_preview" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
+            "app_content_assistant_proposals" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
+            "app_content_assistant_proposal_show" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
             "app_segment_show" => self.rpc_app_audience(method, params, peer_pid),
             "app_segment_list" => self.rpc_app_audience(method, params, peer_pid),
             "app_exclusion_save" => self.rpc_app_audience(method, params, peer_pid),
@@ -2981,7 +3024,9 @@ impl Shared {
             "app_content_assistant_propose" => {
                 self.rpc_app_content_assistant_propose(params, peer_pid)
             }
+            "app_content_assistant_draft" => self.rpc_app_content_assistant_draft(params, peer_pid),
             "app_content_proposal_show" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_render" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_list" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_apply" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_discard" => self.rpc_app_content(method, params, peer_pid),
@@ -2997,6 +3042,8 @@ impl Shared {
             "app_workspace_migrate" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_recover" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_migration_recover" => self.rpc_app_workspace(method, params, peer_pid),
+            "app_screen_mint" => self.rpc_app_screen_mint(params, peer_pid),
+            "app_screen_consume" => self.rpc_app_screen_consume(params, peer_pid),
             "app_approve" => self.rpc_app_approve(params, peer_pid),
             "app_revoke" => self.rpc_app_revoke(params, peer_pid),
             "app_set_team" => self.rpc_app_set_team(params, peer_pid),

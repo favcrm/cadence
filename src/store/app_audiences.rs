@@ -971,6 +971,25 @@ impl RecordStore {
         self.preview_json(&conn, context, base, exclusion_list_id, &computed)
     }
 
+    /// CAD-1014 scoped-chat segment preview: a bounded membership read
+    /// over a SAVED segment — base/exclusion/final counts plus the
+    /// bounded `sample`, never the full member list, never a freeze and
+    /// never a send. The base is the named segment resolved host-side
+    /// (the saved predicates, not agent text); no exclusion list. This
+    /// is the metadata the operator confirms a campaign against — the
+    /// assistant's read exposes exactly what the operator's own preview
+    /// shows, no more.
+    pub fn app_segment_preview(&self, context: &str, segment_id: &str) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(segment_id, "segment ID")?;
+        let base = AudienceBase::Segment {
+            segment_id: segment_id.to_string(),
+        };
+        let conn = self.conn();
+        let computed = self.compute_audience(&conn, context, &base, None)?;
+        self.preview_json(&conn, context, &base, None, &computed)
+    }
+
     /// Freeze the computed membership: member IDs, digest,
     /// installation/context and revision pins plus the recipient
     /// ceiling. A reused freeze ID behind identical bytes and ceiling

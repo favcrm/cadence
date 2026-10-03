@@ -36,6 +36,7 @@ pub(super) enum Route<'a> {
     ProposalRequest(&'a str, &'a str),
     ProposalList(&'a str, &'a str),
     ProposalShow(&'a str, &'a str, &'a str),
+    ProposalRender(&'a str, &'a str, &'a str),
     ProposalApply(&'a str, &'a str, &'a str),
     ProposalDiscard(&'a str, &'a str, &'a str),
     BindingSave(&'a str, &'a str),
@@ -88,6 +89,13 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         ("proposal-requests", []) => Some(Route::ProposalRequest(install, context)),
         ("proposals", ["list"]) => Some(Route::ProposalList(install, context)),
         ("proposals", [id]) if segment(id) => Some(Route::ProposalShow(install, context, id)),
+        // CAD-1014: the operator's before-Apply preview — the same
+        // safe render over the stored PENDING proposal. Pure GET read,
+        // no body: sample/binding default host-side; the URL proposal
+        // id is the only selector.
+        ("proposals", [id, "render"]) if segment(id) => {
+            Some(Route::ProposalRender(install, context, id))
+        }
         ("proposals", [id, "apply"]) if segment(id) => {
             Some(Route::ProposalApply(install, context, id))
         }
@@ -109,6 +117,7 @@ impl Route<'_> {
                 | Self::CampaignShow(..)
                 | Self::ProposalList(..)
                 | Self::ProposalShow(..)
+                | Self::ProposalRender(..)
                 | Self::BindingList(..)
                 | Self::BindingShow(..)
         )
@@ -391,6 +400,18 @@ pub(super) fn handle(
             "app_content_proposal_show",
             json!({"install_id": install, "context_id": context, "proposal_id": id}),
         ),
+        // CAD-1014 before-Apply preview: a read, so it carries no
+        // body — a non-empty body refuses like every read route.
+        Route::ProposalRender(install, context, id) if !write => {
+            match read_body(request, BODY_CAP) {
+                Ok(bytes) if bytes.is_empty() => (
+                    "app_content_proposal_render",
+                    json!({"install_id": install, "context_id": context, "proposal_id": id}),
+                ),
+                Ok(_) => return err_response(400, "invalid app content request schema"),
+                Err(response) => return response,
+            }
+        }
         Route::ProposalApply(install, context, id) => {
             let bytes = match read_body(request, BODY_CAP) {
                 Ok(bytes) => bytes,
@@ -501,6 +522,10 @@ mod tests {
             Some(Route::ProposalShow("i", "c", "prop-1"))
         ));
         assert!(matches!(
+            route("/api/app-installations/i/contexts/c/content/proposals/prop-1/render"),
+            Some(Route::ProposalRender("i", "c", "prop-1"))
+        ));
+        assert!(matches!(
             route("/api/app-installations/i/contexts/c/content/proposals/prop-1/apply"),
             Some(Route::ProposalApply("i", "c", "prop-1"))
         ));
@@ -546,6 +571,12 @@ mod tests {
                 .unwrap()
                 .is_read()
         );
+        // The before-Apply proposal render is a read, never a write.
+        assert!(
+            route("/api/app-installations/i/contexts/c/content/proposals/prop-1/render")
+                .unwrap()
+                .is_read()
+        );
         // The request mint is a write like the proposal save.
         assert!(
             !route("/api/app-installations/i/contexts/c/content/proposal-requests")
@@ -569,6 +600,7 @@ mod tests {
             "/api/app-installations/i/contexts/c/content/campaigns/launch-1/extra",
             "/api/app-installations/i/contexts/c/content/campaigns/launch-1/render/extra",
             "/api/app-installations/i/contexts/c/content/proposals/prop-1/extra",
+            "/api/app-installations/i/contexts/c/content/proposals/prop-1/render/extra",
             "/api/app-installations/i/contexts/c/content/proposals/prop-1/apply/extra",
             "/api/app-installations/i/contexts/c/content/sender-bindings/list/extra",
             "/api/app-installations/i/contexts/c/content/sender-bindings/bind-1/extra",

@@ -52,11 +52,11 @@ fn origin_param(params: &Value) -> Result<Origin> {
 }
 
 impl Shared {
-    fn operator_now(&self) -> i64 {
+    pub(super) fn operator_now(&self) -> i64 {
         (self.operator_clock)()
     }
 
-    fn operator_auth(&self) -> std::sync::MutexGuard<'_, auth::Auth> {
+    pub(super) fn operator_auth(&self) -> std::sync::MutexGuard<'_, auth::Auth> {
         self.operator_auth.lock().unwrap_or_else(|e| e.into_inner())
     }
 

@@ -576,7 +576,11 @@ fn render_html(draft: &Draft, sample: Option<&str>, binding: &BindingView) -> St
         out.push_str(&html_escape(&personalize(&draft.preheader, sample)));
         out.push_str("</div>");
     }
-    out.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td align=\"center\"><table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#ffffff;margin:24px auto;\"><tr><td style=\"padding:32px;font-family:Arial,sans-serif;color:#222222;\">");
+    // CAD-1014: the content column must shrink to the preview iframe —
+    // a fixed `width="600"` clips under the narrow-390 CRM preview. Keep
+    // the 600px desktop measure but cap it as a style (never a fixed
+    // attribute) so the column fills the frame at narrower widths.
+    out.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td align=\"center\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#ffffff;max-width:600px;margin:24px auto;\"><tr><td style=\"padding:32px;font-family:Arial,sans-serif;color:#222222;\">");
     for block in &draft.blocks {
         match block {
             Block::Heading { text } => {
@@ -813,6 +817,17 @@ struct ResolvedBinding {
     connection_id: Option<String>,
     preview_only: bool,
     view: BindingView,
+}
+
+/// A stored assistant-draft proposal row read back for idempotent
+/// replay — campaign, source revision, content digest and the
+/// message/agent receipt it was claimed under (CAD-1014).
+struct PriorDraft {
+    campaign_id: String,
+    source_revision: i64,
+    content_digest: String,
+    receipt_message: Option<String>,
+    receipt_agent: Option<String>,
 }
 
 impl RecordStore {
@@ -1484,6 +1499,81 @@ impl RecordStore {
         }}))
     }
 
+    /// CAD-1014: render a STORED proposal (the assistant's inert pending
+    /// draft) through the exact same `render_html`/`render_text` the
+    /// saved-content path uses — the operator's before-Apply preview.
+    /// Pure read: no apply/save/approve/send, no doc write, no freeze.
+    /// `send_ready:false`/`preview_only` always; the render carries the
+    /// proposal id, its state and the source revision it was drafted
+    /// against so the UI labels it as a proposal, never as live content.
+    /// A proposal that is not `pending` refuses — only an unapplied draft
+    /// has a preview to render.
+    pub fn app_content_proposal_render(
+        &self,
+        context: &str,
+        proposal_id: &str,
+        sample_first_name: Option<&str>,
+        binding_id: Option<&str>,
+    ) -> Result<Value> {
+        if let Some(name) = sample_first_name {
+            if !sample_name_valid(name) {
+                return Err(Error::rejected(
+                    "email sample name exceeds its supported shape or bounds",
+                ));
+            }
+        }
+        let conn = self.conn();
+        let row = self.proposal_row(&conn, context, proposal_id)?;
+        if row.state != "pending" {
+            return Err(Error::rejected(
+                "only a pending proposal has a before-apply preview",
+            ));
+        }
+        let raw: Value = serde_json::from_str(&row.blocks).unwrap_or(Value::Null);
+        let blocks = raw
+            .as_array()
+            .cloned()
+            .ok_or_else(|| Error::rejected("email proposal blocks are not an array"))?;
+        let draft = Draft::parse(&row.subject, &row.preheader, &blocks)?;
+        let binding = self.resolve_binding(&conn, context, binding_id)?;
+        let html = render_html(&draft, sample_first_name, &binding.view);
+        let text = render_text(&draft, sample_first_name, &binding.view);
+        let render_digest = material_digest(&json!({
+            "domain": "cadence-app-content-render-v1",
+            "content_digest": row.digest,
+            "binding_digest": binding.digest,
+            "proposal_id": proposal_id,
+            "html": html,
+            "text": text,
+        }));
+        let unsubscribe = unsubscribe_url(&binding.view);
+        Ok(json!({
+            "render": {
+                "proposal_id": proposal_id,
+                "campaign_id": row.campaign,
+                "install_id": self.install(),
+                "context_id": context,
+                "state": row.state,
+                "source_revision": row.source_revision,
+                "content_digest": row.digest,
+                "sample_first_name": sample_first_name,
+                "binding": {
+                    "binding_id": binding.binding_id,
+                    "revision": binding.revision,
+                    "digest": binding.digest,
+                    "preview_only": binding.preview_only,
+                },
+                "preview_only": true,
+                "send_ready": false,
+                "sender": {"name": binding.view.sender_name, "address": binding.view.sender_address},
+                "unsubscribe_url": unsubscribe,
+                "html": html,
+                "text": text,
+                "render_digest": render_digest,
+            },
+        }))
+    }
+
     /// CAD-813: mint a one-time, host-stamped proposal request.
     /// The daemon proved the chat message carries the server-verified
     /// App binding for this installation and context before calling
@@ -1789,6 +1879,107 @@ impl RecordStore {
             if is_claim_conflict(&error) {
                 return Err(Error::rejected(
                     "email proposal message is already claimed",
+                ));
+            }
+            return Err(Error::internal(error.to_string()));
+        }
+        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+        drop(conn);
+        self.app_content_proposal_show(context, proposal_id)
+    }
+
+    /// CAD-1014(b) composer-free scoped-chat draft: an assigned agent
+    /// turn drafts a campaign email with NO manual mint. The host
+    /// derives `source_revision` from the LIVE doc (0 when the campaign
+    /// has none — a first draft), stamps `receipt_request` with the
+    /// message id itself (the verified turn IS the request — there is
+    /// no operator-minted request row to redeem), and claims the
+    /// message via the `app_content_proposal_claim` unique index so one
+    /// turn produces one draft. The proposal stays `pending` /
+    /// `assistant-receipt` — never edits content, approves or sends;
+    /// Apply/Discard are still the operator's. `request_id` in the
+    /// provenance is the message id, honest because no mint exists.
+    pub fn app_content_assistant_draft(
+        &self,
+        context: &str,
+        campaign: &str,
+        proposal_id: &str,
+        draft: &Draft,
+        agent: &str,
+        message: &str,
+    ) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(campaign, "campaign ID")?;
+        crate::proto::identifier(proposal_id, "proposal ID")?;
+        if agent.is_empty()
+            || agent.len() > 80
+            || !agent
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        {
+            return Err(Error::rejected("draft agent identity is malformed"));
+        }
+        if message.is_empty() || message.len() > 128 || message.chars().any(char::is_control) {
+            return Err(Error::rejected("draft message identity is malformed"));
+        }
+        let digest = proposal_digest(self.install(), context, campaign, proposal_id, draft);
+        let blocks_text = serde_json::to_string(&draft.canonical_blocks())
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let conn = self.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| Error::internal(e.to_string()))?;
+        // Host-derived source: the live draft revision, or 0 for a
+        // first draft — never agent text.
+        let source_revision = tx
+            .query_row(
+                "SELECT revision FROM app_content_docs WHERE context_id=? AND campaign_id=?",
+                params![context, campaign],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?
+            .unwrap_or(0);
+        // Idempotent replay of the same proposal id on the same
+        // message+agent+identical bytes returns the stored proposal.
+        let existing: Option<PriorDraft> = tx
+            .query_row(
+                "SELECT campaign_id,source_revision,content_digest,receipt_message,receipt_agent FROM app_content_proposals WHERE context_id=? AND proposal_id=?",
+                params![context, proposal_id],
+                |r| {
+                    Ok(PriorDraft {
+                        campaign_id: r.get(0)?,
+                        source_revision: r.get(1)?,
+                        content_digest: r.get(2)?,
+                        receipt_message: r.get(3)?,
+                        receipt_agent: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if let Some(stored) = existing {
+            if stored.campaign_id == campaign
+                && stored.source_revision == source_revision
+                && stored.content_digest == digest
+                && stored.receipt_message.as_deref() == Some(message)
+                && stored.receipt_agent.as_deref() == Some(agent)
+            {
+                drop(tx);
+                drop(conn);
+                return self.app_content_proposal_show(context, proposal_id);
+            }
+            return Err(Error::rejected("email draft proposal ID is already used"));
+        }
+        // One turn = one draft: the unique claim index on
+        // receipt_message refuses a second proposal for this message.
+        if let Err(error) = tx.execute(
+            "INSERT INTO app_content_proposals(context_id,proposal_id,campaign_id,source_revision,subject,preheader,blocks,content_digest,actor,origin,receipt_message,receipt_agent,receipt_request,state,created,decided) VALUES(?,?,?,?,?,?,?,?,'assistant','assistant-receipt',?,?,?,'pending',?,NULL)",
+            params![context, proposal_id, campaign, source_revision, draft.subject, draft.preheader, blocks_text, digest, message, agent, message, now()],
+        ) {
+            if is_claim_conflict(&error) {
+                return Err(Error::rejected(
+                    "this scoped chat message already produced a draft",
                 ));
             }
             return Err(Error::internal(error.to_string()));
@@ -2266,5 +2457,43 @@ impl Store {
         {
             eprintln!("content audit event skipped: event write refused");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_draft() -> Draft {
+        Draft::parse(
+            "Welcome {{first_name|friend}}",
+            "A note",
+            &[
+                json!({"type": "heading", "text": "Hello {{first_name|friend}}"}),
+                json!({"type": "paragraph", "text": "First line.\nSecond line."}),
+                json!({"type": "button", "label": "Open", "url": "https://example.com/x"}),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// CAD-1014: the email content column is responsive — `width="100%"`
+    /// with a `max-width:600px` style cap — so the narrow-390 CRM preview
+    /// frame shows the whole message instead of clipping a fixed 600px
+    /// table. No `width="600"` attribute ever returns.
+    #[test]
+    fn render_html_content_column_is_responsive() {
+        let html = render_html(&test_draft(), Some("Amina"), &preview_binding_view());
+        assert!(
+            !html.contains("width=\"600\""),
+            "fixed 600px content table clipped the narrow preview: {html}"
+        );
+        assert!(
+            html.contains("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#ffffff;max-width:600px;margin:24px auto;\">"),
+            "responsive content column missing: {html}"
+        );
+        // Content still renders through the new table shape.
+        assert!(html.contains("Hello Amina"), "{html}");
+        assert!(html.contains("https://example.com/x"), "{html}");
     }
 }
