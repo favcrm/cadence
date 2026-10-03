@@ -294,12 +294,27 @@ impl Shared {
         })?;
         let records = RecordStore::open(&self.state_dir, install)?;
         let result = match method {
-            "app_content_save" => records.app_content_save(
-                context,
-                required_str(params, "campaign_id")?,
-                content_expected(params)?,
-                &content_save_draft(params)?,
-            ),
+            "app_content_save" => {
+                let draft = content_save_draft(params)?;
+                if let Some(html) = &draft.html {
+                    // The host's own unsubscribe URL shapes: saved
+                    // bindings, the preview base and the configured
+                    // send origin (`{origin}/unsubscribe/<token>`).
+                    let mut endpoints = records.app_unsubscribe_endpoints(context)?;
+                    if let Ok(origin) = self.crm_send_origin() {
+                        endpoints.extend(crate::store::app_content_html::HostEndpoint::origin(
+                            &origin,
+                        ));
+                    }
+                    crate::store::app_content_html::refuse_host_unsubscribe(html, &endpoints)?;
+                }
+                records.app_content_save(
+                    context,
+                    required_str(params, "campaign_id")?,
+                    content_expected(params)?,
+                    &draft,
+                )
+            }
             "app_content_show" => {
                 records.app_content_show(context, required_str(params, "campaign_id")?)
             }

@@ -226,25 +226,155 @@ pub fn sanitize_html(input: &str) -> Result<String> {
 }
 
 /// The host owns the unsubscribe footer: operator content may not
-/// carry the host footer sentence, a link to an unsubscribe path, or
-/// the host's per-recipient placeholder inside a link.
+/// carry the host footer sentence. Links to the host's own
+/// unsubscribe endpoint are refused by [`refuse_host_unsubscribe`],
+/// which needs the live binding and origin facts.
 fn refuse_footer_spoof(html: &str) -> Result<()> {
-    let lower = html.to_ascii_lowercase();
-    let mut spoof = lower.contains(&FOOTER_NOTE.to_ascii_lowercase());
+    if html
+        .to_ascii_lowercase()
+        .contains(&FOOTER_NOTE.to_ascii_lowercase())
+    {
+        return Err(Error::rejected(SPOOF));
+    }
+    Ok(())
+}
+
+const SPOOF: &str = "email content may not carry its own unsubscribe footer; the host adds it";
+
+/// One host-built unsubscribe URL shape, normalised for comparison.
+#[derive(Clone, Debug)]
+pub struct HostEndpoint {
+    host: String,
+    path: String,
+    /// `true`: every path under `path` is the endpoint (the send-time
+    /// `{origin}/unsubscribe/<token>` family). `false`: only `path`
+    /// itself, and an empty path only counts with a `token` query.
+    under: bool,
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(v) = hex {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_ascii_lowercase()
+}
+
+/// Fully decode (three rounds, so double and triple encoding cannot
+/// hide a path) and lowercase.
+fn decode_all(text: &str) -> String {
+    let mut cur = text.to_string();
+    for _ in 0..3 {
+        let next = percent_decode(&cur);
+        if next == cur.to_ascii_lowercase() {
+            return next;
+        }
+        cur = next;
+    }
+    cur
+}
+
+/// Split an absolute `http(s)` URL into (host, path, query), all
+/// decoded and lowercased; the path loses repeated and trailing
+/// slashes, the host loses a default port.
+fn split_url(url: &str) -> Option<(String, String, String)> {
+    let url = url.trim();
+    let lower = url.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))?;
+    let rest = rest.split('#').next().unwrap_or("");
+    let (head, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (host, path) = head.split_at(head.find('/').unwrap_or(head.len()));
+    let host = decode_all(host.rsplit('@').next().unwrap_or(""));
+    let host = host
+        .strip_suffix(":443")
+        .or_else(|| host.strip_suffix(":80"))
+        .unwrap_or(&host)
+        .to_string();
+    let mut path = decode_all(path).replace('\\', "/");
+    while path.contains("//") {
+        path = path.replace("//", "/");
+    }
+    let path = path.trim_end_matches('/').to_string();
+    Some((host, path, decode_all(query)))
+}
+
+impl HostEndpoint {
+    /// A saved binding (or preview) base: `{base}?token=RECIPIENT`.
+    pub fn binding(base: &str) -> Option<Self> {
+        let (host, path, _) = split_url(base)?;
+        Some(Self {
+            host,
+            path,
+            under: false,
+        })
+    }
+
+    /// The configured send origin: `{origin}/unsubscribe/<token>`.
+    pub fn origin(origin: &str) -> Option<Self> {
+        let (host, path, _) = split_url(origin)?;
+        Some(Self {
+            host,
+            path: format!("{path}/unsubscribe"),
+            under: true,
+        })
+    }
+
+    fn matches(&self, host: &str, path: &str, query: &str) -> bool {
+        if host != self.host {
+            return false;
+        }
+        if self.under {
+            return path == self.path || path.starts_with(&format!("{}/", self.path));
+        }
+        if self.path.is_empty() {
+            return path.is_empty() && query.contains("token=");
+        }
+        path == self.path
+    }
+}
+
+fn entity_decode(href: &str) -> String {
+    href.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Refuse operator links that target the host's own unsubscribe
+/// endpoint (same host, any scheme, case, percent-encoding, trailing
+/// slash or query) or carry the host's per-recipient placeholder.
+/// Ordinary third-party links are untouched.
+pub fn refuse_host_unsubscribe(html: &str, endpoints: &[HostEndpoint]) -> Result<()> {
     let mut rest = html;
     while let Some(at) = rest.find("<a ") {
         let tail = &rest[at..];
         let end = tail.find('>').unwrap_or(tail.len());
         if let Some(href) = attr(&tail[..end], "href") {
-            let href = href.to_ascii_lowercase();
-            spoof |= href.contains("unsubscribe") || href.contains("recipient");
+            if let Some((host, path, query)) = split_url(&entity_decode(href)) {
+                let marker = query.split('&').any(|pair| {
+                    pair.split_once('=')
+                        .is_some_and(|(k, v)| k == "token" && v == "recipient")
+                });
+                if marker || endpoints.iter().any(|e| e.matches(&host, &path, &query)) {
+                    return Err(Error::rejected(SPOOF));
+                }
+            }
         }
         rest = &tail[end..];
-    }
-    if spoof {
-        return Err(Error::rejected(
-            "email content may not carry its own unsubscribe footer; the host adds it",
-        ));
     }
     Ok(())
 }
@@ -430,14 +560,73 @@ mod tests {
     }
 
     #[test]
-    fn footer_spoof_attempts_are_refused() {
-        for spoof in [
-            format!("<p>hi</p><p>{FOOTER_NOTE}</p>"),
-            "<p>hi</p><a href=\"https://e.example/unsubscribe?u=RECIPIENT\">Unsubscribe</a>"
-                .to_string(),
-            "<p>hi</p><a href=\"https://e.example/x?t=recipient\">x</a>".to_string(),
+    fn footer_sentence_is_refused() {
+        assert!(sanitize_html(&format!("<p>hi</p><p>{FOOTER_NOTE}</p>")).is_err());
+        assert!(sanitize_html(&format!("<p>{}</p>", FOOTER_NOTE.to_uppercase())).is_err());
+    }
+
+    fn endpoints() -> Vec<HostEndpoint> {
+        vec![
+            HostEndpoint::binding("https://cadence.invalid/unsubscribe").unwrap(),
+            HostEndpoint::binding("https://example.com/unsub").unwrap(),
+            HostEndpoint::binding("https://bare.example").unwrap(),
+            HostEndpoint::origin("https://send.example.com/base/").unwrap(),
+        ]
+    }
+
+    fn link(href: &str) -> String {
+        clean(&format!("<p><a href=\"{href}\">x</a></p>"))
+    }
+
+    #[test]
+    fn host_unsubscribe_links_are_refused_in_every_shape() {
+        for href in [
+            "https://cadence.invalid/unsubscribe?token=RECIPIENT",
+            "https://cadence.invalid/unsubscribe",
+            "https://cadence.invalid/unsubscribe/",
+            "http://cadence.invalid/unsubscribe",
+            "HTTPS://CADENCE.INVALID/Unsubscribe?x=1&token=abc",
+            "https://cadence.invalid/%75nsubscribe",
+            "https://cadence.invalid/%2575nsubscribe",
+            "https://cadence.invalid//unsubscribe",
+            "https://cadence.invalid:443/unsubscribe",
+            "https://example.com/unsub?token=RECIPIENT&a=1",
+            "http://example.com/unsub/",
+            "https://bare.example?token=RECIPIENT",
+            "https://bare.example/?token=abc",
+            "https://send.example.com/base/unsubscribe/abc123",
+            "http://send.example.com/base/unsubscribe/abc123/",
+            "https://send.example.com/base/%55nsubscribe/abc",
+            // The per-recipient placeholder is host-private anywhere.
+            "https://anywhere.example/x?token=RECIPIENT",
+            "https://anywhere.example/x?a=1&token=%52ecipient",
         ] {
-            assert!(sanitize_html(&spoof).is_err(), "spoof admitted: {spoof}");
+            let out = link(href);
+            assert!(
+                refuse_host_unsubscribe(&out, &endpoints()).is_err(),
+                "{href} admitted -> {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_third_party_links_are_allowed() {
+        for href in [
+            "https://news.example/article?utm=unsubscribe-tips",
+            "https://news.example/unsubscribe-guide",
+            "https://news.example/unsubscribe",
+            "https://news.example/recipient-stories?token=abc",
+            "https://cadence.invalid/blog/unsubscribe-tips",
+            "https://cadence.invalid/",
+            "https://bare.example/pricing",
+            "https://example.com/unsubscribe",
+            "https://send.example.com/base/news",
+            "https://send.example.com/other/unsubscribe/abc",
+            "mailto:help@example.com?subject=unsubscribe",
+        ] {
+            let out = link(href);
+            refuse_host_unsubscribe(&out, &endpoints())
+                .unwrap_or_else(|_| panic!("{href} refused -> {out}"));
         }
     }
 

@@ -213,7 +213,7 @@ impl Shared {
     /// open: `https://` anywhere, or loopback `http://` for the
     /// isolated test rigs. Anything else refuses rather than minting
     /// dead links.
-    fn crm_send_origin(&self) -> Result<String> {
+    pub(super) fn crm_send_origin(&self) -> Result<String> {
         let stored = self.store.crm_setting("unsubscribe_origin")?;
         let origin = stored
             .or_else(|| self.unsubscribe_origin.clone())

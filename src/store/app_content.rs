@@ -1355,6 +1355,32 @@ impl RecordStore {
         Ok(json!({"binding": self.binding_json(context, &record)}))
     }
 
+    /// CAD-1056: the host's own unsubscribe URL shapes for this
+    /// context — the preview base and every saved binding base —
+    /// so operator HTML cannot link to them.
+    pub fn app_unsubscribe_endpoints(
+        &self,
+        context: &str,
+    ) -> Result<Vec<super::app_content_html::HostEndpoint>> {
+        use super::app_content_html::HostEndpoint;
+        crate::proto::identifier(context, "context ID")?;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT unsubscribe_base FROM app_sender_bindings WHERE context_id=?")
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let bases = stmt
+            .query_map(params![context], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let mut out: Vec<HostEndpoint> = HostEndpoint::binding(UNSUBSCRIBE_BASE)
+            .into_iter()
+            .collect();
+        for base in bases {
+            let base = base.map_err(|e| Error::internal(e.to_string()))?;
+            out.extend(HostEndpoint::binding(&base));
+        }
+        Ok(out)
+    }
+
     pub fn app_sender_binding_list(&self, context: &str) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
         let conn = self.conn();

@@ -799,7 +799,7 @@ fn cad1056_http_html_save_matches_rpc_and_is_as_strict() {
         json!({"campaign_id": "launch-h", "subject": "x", "html": "<p>x</p>", "expected_revision": 9}),
         json!({"campaign_id": "launch-h", "subject": "x", "expected_revision": 1}),
         json!({"campaign_id": "launch-h", "subject": "x", "html": "<p>x</p>", "blocks": blocks(), "expected_revision": 1}),
-        json!({"campaign_id": "launch-h", "subject": "x", "html": "<a href=\"https://e.example/unsubscribe\">u</a>", "expected_revision": 1}),
+        json!({"campaign_id": "launch-h", "subject": "x", "html": "<a href=\"https://cadence.invalid/unsubscribe?token=RECIPIENT\">u</a>", "expected_revision": 1}),
         json!({"campaign_id": "launch-h", "subject": "x", "html": "<script>1</script>", "expected_revision": 1}),
     ];
     for body in refusals {

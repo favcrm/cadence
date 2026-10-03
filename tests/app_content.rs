@@ -1027,7 +1027,7 @@ fn cad1056_html_save_refuses_bad_shapes_without_mutation() {
         ),
         (
             "own unsubscribe link",
-            json!({"html": "<a href=\"https://e.example/unsubscribe\">Unsubscribe</a>"}),
+            json!({"html": "<a href=\"https://cadence.invalid/unsubscribe?token=RECIPIENT\">Unsubscribe</a>"}),
         ),
         ("bad token", json!({"html": "<p>{{last_name|x}}</p>"})),
         (
@@ -1226,4 +1226,42 @@ fn cad1056_agent_detached_and_forged_callers_cannot_save_html() {
             json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-evil"})
         )
         .is_err());
+}
+
+#[test]
+fn cad1056_host_unsubscribe_links_refuse_but_third_party_links_pass() {
+    let w = Content::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-content-h5");
+    let context_id = context["id"].as_str().unwrap();
+    // A saved binding adds its own unsubscribe base to the refused set.
+    w.bind(install, context_id, "bind-1");
+    let refused = [
+        "https://example.com/unsub?token=RECIPIENT",
+        "http://example.com/unsub/",
+        "https://EXAMPLE.com/%75nsub",
+        "https://cadence.invalid/unsubscribe",
+        "https://anywhere.example/x?token=RECIPIENT",
+    ];
+    for (i, href) in refused.iter().enumerate() {
+        let html = format!("<p>hi <a href=\"{href}\">here</a></p>");
+        assert!(
+            html_save(&w, install, context_id, &format!("spoof-{i}"), None, &html).is_err(),
+            "{href} admitted"
+        );
+    }
+    assert!(w
+        .daemon
+        .operator_rpc(
+            "app_content_show",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "spoof-0"}),
+        )
+        .is_err());
+    let ok = "<p><a href=\"https://news.example/article?utm=unsubscribe-tips\">read</a> <a href=\"https://example.com/unsubscribe\">other</a></p>";
+    let saved = html_save(&w, install, context_id, "fine-1", None, ok).unwrap();
+    assert!(saved["content"]["html"]
+        .as_str()
+        .unwrap()
+        .contains("unsubscribe-tips"));
 }
