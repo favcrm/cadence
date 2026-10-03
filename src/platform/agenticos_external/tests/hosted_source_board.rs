@@ -51,7 +51,7 @@ fn operator(state: &std::path::Path, method: &str, params: Value) -> Value {
 /// it, Social Content installed with its source slot bound to the builtin
 /// `hosted` account, and a board on 3110-3199. Answers the board's quote
 /// `(status, body)` and the frozen source binding.
-fn board_quote(answer: fn(&str, &str, &Value) -> Reply) -> (u16, Value, Value) {
+fn board_quote(answer: fn(&str, &str, &Value) -> Reply, slot: &str) -> (u16, Value, Value) {
     let mut stop = Stop(Arc::new(AtomicBool::new(false)), Vec::new());
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let base = format!("http://{}", server.server_addr().to_ip().unwrap());
@@ -140,7 +140,7 @@ fn board_quote(answer: fn(&str, &str, &Value) -> Reply) -> (u16, Value, Value) {
     let cookie = set[..set.find(';').unwrap()].to_owned();
     let key: Value = session.into_body().read_json().unwrap();
     let install = install["install_id"].as_str().unwrap();
-    let url = format!("{base}/api/app-installations/{install}/bindings/source/quote");
+    let url = format!("{base}/api/app-installations/{install}/bindings/{slot}/quote");
     let mut response = board(agent.get(&url), &host, &token)
         .header("Cookie", &cookie)
         .header("X-Cadence-Session", key["session_key"].as_str().unwrap())
@@ -167,7 +167,7 @@ fn board<B>(request: ureq::RequestBuilder<B>, host: &str, token: &str) -> ureq::
 /// that binding and quote returns the door's posts.
 #[test]
 fn cad1096_source_quote_and_read_succeed_against_the_generic_tool() {
-    let (status, body, frozen) = board_quote(generic_door);
+    let (status, body, frozen) = board_quote(generic_door, "source");
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["quote"]["total_price_micros"], 2000, "{body}");
     assert!(body["quote_digest"].as_str().is_some_and(|d| !d.is_empty()));
@@ -185,8 +185,18 @@ fn cad1096_source_quote_and_read_succeed_against_the_generic_tool() {
 /// R2: when the door refuses, the operator's board response names the code.
 #[test]
 fn cad1096_board_quote_names_the_door_refusal_code() {
-    let (status, body, _) = board_quote(|_, _, _| refused("not_allowlisted"));
+    let (status, body, _) = board_quote(|_, _, _| refused("not_allowlisted"), "source");
     assert_eq!(status, 409, "{body}");
     let message = "bound capability price discovery refused: not_allowlisted";
     assert_eq!(body["error"], message, "{body}");
+}
+
+/// Forbidden harm: any other daemon refusal (here the unbound image slot's
+/// "capability binding is absent") never reaches the browser verbatim.
+#[test]
+fn cad1096_board_keeps_non_price_refusals_generic() {
+    let (status, body, _) = board_quote(generic_door, "image");
+    assert_eq!(status, 409, "{body}");
+    let generic = "app release management refused or unavailable";
+    assert_eq!(body["error"], generic, "{body}");
 }
