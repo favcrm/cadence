@@ -44,6 +44,8 @@ mod dispatch_rpc;
 mod effect_rpc;
 mod idea_rpc;
 mod identity;
+#[cfg(target_os = "linux")]
+mod installer_client;
 mod installer_enrollment_wire;
 mod jobs_rpc;
 mod lane_rpc;

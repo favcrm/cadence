@@ -1,0 +1,104 @@
+# CAD-1113: fixed private installer client transport (source only)
+
+## Design note
+
+A private Linux client transports one bounded host-stdin capsule to the fixed
+`/run/cadence-supervisor/grant.sock`. There is no CLI, RPC, HTTP route, selectable
+path/command, environment secret, temporary capsule file, signer or launcher.
+The production entry resolves unavailable admission/trust/consume factories
+**before reading stdin**. No source in this batch installs or runs the client.
+
+The concrete socket mechanics are nonblocking connect, bounded send/receive,
+`poll` with a single absolute monotonic deadline (10 seconds), and exact response
+classification. There is one connection and one request; no retry exists.
+Malformed, missing, oversized, truncated, late, or uncorrelated acknowledgements
+are UNKNOWN. A consumed acknowledgement is evidence of a transport reply only,
+not protected-launch success, eligibility, release or physical retirement.
+
+## Private correlated wire profile
+
+The existing grant signature/claim schema is unchanged. Legacy `challenge` and
+`install` keep their existing admission policy. A versioned transport profile
+adds operation and **two separate** generations (installer and recipient):
+
+```text
+challenge-v1 <operation> <installerGeneration> <recipientGeneration>\n
+install-v1 <operation> <installerGeneration> <recipientGeneration> <grant>\n
+```
+
+The operation is a lowercase UUID; generations are 32 lowercase hex bytes.
+There is exactly one space between fields and one newline. No normalization,
+extra fields or negotiated verbs. Host stdin additionally appends a compact
+installer receipt to the install frame, before its newline; the client verifies
+that receipt with the existing receipt consumer against production pinned trust
+and requires its canonical binding bytes to equal the externally enrolled
+prepared binding. The receipt is not a second grant or an enrollment mutation.
+Neither secret envelope is echoed or included in diagnostic errors.
+
+All separators, receipt bytes and the terminating newline count toward the
+32 KiB stdin cap. The framed socket request is independently capped at 32 KiB.
+
+Only after the existing kernel/pins/signature/consume guards does the server
+produce the corresponding response:
+
+```text
+ok challenge-v1 <operation> <installerGeneration> <recipientGeneration> <pid> <starttime>\n
+ok consumed-v1 <operation> <installerGeneration> <recipientGeneration>\n
+```
+
+The connection closes after the single response. Exact byte equality binds the
+operation and both generations; challenge PID/starttime must also equal the
+separately enrolled and measured supervisor. EOF is part of the response frame:
+trailing bytes/frames or an acknowledgement without completed EOF refuse under
+the same deadline. Old, unbound replies are not accepted by the new client.
+Before install consumption, the **existing** grant parser checks the request's
+operation and recipient generation against the grant. No crypto codec or
+second enrollment ledger is introduced.
+
+## Held topology and process custody
+
+The client retains no-follow descriptors for every node: `/` (root:root 0755),
+`run` (root:root 0755), `cadence-supervisor` (21000:21000 0700), and the socket
+(21000:21000 0600). Exact owner/group/type/mode policy refuses writable ancestors,
+symlinks and unexpected topology. Connect addresses the held parent through
+`/proc/self/fd`, not a second unanchored `/run` traversal. Re-open/re-stat checks
+compare device/inode/owner/group/mode/ctime before sending and after receiving;
+parent/leaf replacement refuses. Socket identity is not authority by itself.
+
+The expected supervisor identity is privately enrolled, not extracted from the
+peer response. Actual `SO_PEERCRED` UID/GID/PID, live `/proc` starttime, generation
+binding, and bounded held executable digest must match it. Self-admission checks
+real/effective/saved UID and GID 21000, no supplementary groups, all five actual
+kernel capability sets empty, exact enrolled PID/starttime/generation/executable.
+The executable measurement reuses the existing root-owned, regular,
+non-writable, linked, bounded, stability-checked grant-consumer measurement.
+Root UID alone and caller reports cannot produce an admission.
+
+## Explicit unavailable owner boundary
+
+This is **not** a privileged carrier/drop/observer implementation, durable
+current-owner adapter, retirement adapter, operational trust manifest,
+installation, image attestation, deployment or native eligibility result.
+`production_admission`, receipt trust, durable consume, self-enrollment and live
+listener factories remain unavailable. Receipt verification is format evidence,
+not custody or current authority. Test paths and synthetic enrollment literals
+exist only inside cfg-test mechanics and cannot open any production factory.
+
+In particular, the existing PR688 receiver still requires a UID0 image-pinned
+installer; the accepted future carrier/client proposal drops to UID21000. This
+batch does **not** reconcile that policy mismatch or qualify a UID21000 client
+for the UID0 receiver. A later explicitly reviewed owner must supply real
+root/drop/procfs/enrollment/retirement/trust and compatible mutual admission;
+caller metadata, synthetic digests or root UID cannot substitute. No ptrace
+capability, key, signing principal, live listener or launch authority is added.
+
+## Acceptance and delivery
+
+Ordinary-UID named Unix-socket checks exercise exact framing/correlation,
+fragmented replies/stdin, finite deadlines, backpressure, malformed/truncated/
+oversized/lost replies, held-path replacement/symlink/owner/mode refusal, and real
+kernel admission refusal. They do not claim root custody or launch success.
+The reviewer/ticket-author's independent bad-case acceptance check is mandatory
+before review; implementer-written tests do not replace it. Required CI, two
+independent exact-head reviews and the exact human audit decision precede merge.
+PR686 retains heavy-validation priority. No operational change is authorized.
