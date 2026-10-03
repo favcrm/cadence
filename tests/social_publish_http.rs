@@ -231,7 +231,11 @@ fn cad787_relay_forged_bodies_fail_closed_with_backend_codes() {
         "backend refusal not passed through: {text}"
     );
     // Cancel of a missing intent refuses with the backend message.
-    let (status, text) = b.operator("POST", "/api/social-publishes/nope/cancel", "{}");
+    let (status, text) = b.operator(
+        "POST",
+        "/api/social-publishes/nope/cancel",
+        r#"{"install_id":"install-a"}"#,
+    );
     assert_eq!(status, 400, "cancel of nothing accepted: {text}");
     assert!(
         text.contains("cancelled") || text.contains("does not exist"),

@@ -30,6 +30,9 @@ pub(super) enum Route<'a> {
     /// write transport while the daemon itself writes nothing.
     CsvPreview(&'a str, &'a str),
     CsvImport(&'a str, &'a str),
+    /// POST-only CSV confirm: the operator mints the one-use delegated
+    /// confirm receipt the agent redeems — never a commit itself.
+    CsvConfirm(&'a str, &'a str),
 }
 
 fn segment(id: &str) -> bool {
@@ -61,14 +64,14 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     // and `csv-import` are unaddressable over HTTP (RPC still serves
     // them) so a bulk POST can never create or read a record, and
     // suffixed paths under them never resolve.
-    if matches!(record, "csv-preview" | "csv-import") {
+    if matches!(record, "csv-preview" | "csv-import" | "csv-confirm") {
         if parts.next().is_some() {
             return None;
         }
-        return Some(if record == "csv-preview" {
-            Route::CsvPreview(install, context)
-        } else {
-            Route::CsvImport(install, context)
+        return Some(match record {
+            "csv-preview" => Route::CsvPreview(install, context),
+            "csv-import" => Route::CsvImport(install, context),
+            _ => Route::CsvConfirm(install, context),
         });
     }
     if !segment(record) {
@@ -100,6 +103,8 @@ struct Create {
 struct Update {
     expected_revision: u64,
     profile: Value,
+    #[serde(default)]
+    consent_provenance: Option<Value>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -115,6 +120,23 @@ struct CsvDecision {
     action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_revision: Option<u64>,
+}
+
+/// Operator confirm: binds the exact preview token, request id and
+/// decisions digest the agent will redeem. The URL install/context are
+/// authority; the body carries no identity.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CsvConfirm {
+    request_id: String,
+    preview_token: String,
+    decisions_digest: String,
+    /// The previewed CSV bytes — minted onto the durable plan the
+    /// assistant import resolves by request id + nonce (the bytes never
+    /// ride the text-only chat). Reuses the CSV body cap.
+    csv_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decisions: Option<Vec<CsvDecision>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -258,6 +280,9 @@ pub(super) fn handle(
                 "expected_revision": revision,
             });
             params["profile"] = body.profile;
+            if let Some(provenance) = body.consent_provenance {
+                params["consent_provenance"] = provenance;
+            }
             ("app_record_update", params)
         }
         Route::CsvPreview(install, context) => {
@@ -301,6 +326,40 @@ pub(super) fn handle(
                 params["decisions"] = Value::Array(list);
             }
             ("app_record_csv_import", params)
+        }
+        Route::CsvConfirm(install, context) => {
+            // Carries csv_text — reuse the larger CSV cap.
+            let body: CsvConfirm = match typed_cap(request, CSV_BODY_CAP) {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            let mut params = json!({
+                "install_id": install,
+                "context_id": context,
+                "request_id": body.request_id,
+                "preview_token": body.preview_token,
+                "decisions_digest": body.decisions_digest,
+                "csv_text": body.csv_text,
+            });
+            if let Some(decisions) = body.decisions {
+                let mut list = Vec::with_capacity(decisions.len());
+                for item in &decisions {
+                    let revision: Option<i64> = match item.expected_revision {
+                        None => None,
+                        Some(revision) => match i64::try_from(revision) {
+                            Ok(revision) if revision > 0 => Some(revision),
+                            _ => return err_response(400, "invalid app record request schema"),
+                        },
+                    };
+                    let mut entry = json!({"row": item.row, "action": item.action});
+                    if let Some(revision) = revision {
+                        entry["expected_revision"] = revision.into();
+                    }
+                    list.push(entry);
+                }
+                params["decisions"] = Value::Array(list);
+            }
+            ("app_record_csv_confirm", params)
         }
     };
     match client::rpc(state, method, params) {
@@ -351,6 +410,10 @@ mod tests {
             route("/api/app-installations/install-a/contexts/context-b/records/csv-import"),
             Some(Route::CsvImport("install-a", "context-b"))
         ));
+        assert!(matches!(
+            route("/api/app-installations/install-a/contexts/context-b/records/csv-confirm"),
+            Some(Route::CsvConfirm("install-a", "context-b"))
+        ));
         // The bulk verbs are POST-only transport: never reads.
         assert!(
             !route("/api/app-installations/i/contexts/c/records/csv-preview")
@@ -362,6 +425,12 @@ mod tests {
                 .unwrap()
                 .is_read()
         );
+        // The confirm is an operator write — never a read.
+        assert!(
+            !route("/api/app-installations/i/contexts/c/records/csv-confirm")
+                .unwrap()
+                .is_read()
+        );
         for path in [
             "/api/app-installations/install-a/records",
             "/api/app-installations/install-a/contexts/",
@@ -370,6 +439,7 @@ mod tests {
             "/api/app-installations/install-a/contexts/context-b/records/customer-1/archive",
             "/api/app-installations/install-a/contexts/context-b/records/csv-preview/extra",
             "/api/app-installations/install-a/contexts/context-b/records/csv-import/extra",
+            "/api/app-installations/install-a/contexts/context-b/records/csv-confirm/extra",
             "/api/app-installations/../contexts",
             "/api/app-records",
         ] {
@@ -425,6 +495,33 @@ mod tests {
             r#"{"csv_text":"a","preview_token":"sha256:x","request_id":"req-1","decisions":[{"row":1,"action":"update","expected_revision":2}]}"#
         )
         .is_ok());
+        // The confirm body binds token+request+digest only — no
+        // identity, install or context can ride the body.
+        // The confirm body now carries the CSV bytes (the durable plan
+        // the assistant resolves) plus the bound token/request/digest —
+        // and optionally the normalized decisions array.
+        assert!(serde_json::from_str::<CsvConfirm>(
+            r#"{"request_id":"req-1","preview_token":"sha256:x","decisions_digest":"sha256:y","csv_text":"a,b"}"#
+        )
+        .is_ok());
+        assert!(serde_json::from_str::<CsvConfirm>(
+            r#"{"request_id":"req-1","preview_token":"sha256:x","decisions_digest":"sha256:y","csv_text":"a,b","decisions":[{"row":1,"action":"update"}]}"#
+        )
+        .is_ok());
+        for body in [
+            r#"{"request_id":"req-1","preview_token":"sha256:x","decisions_digest":"sha256:y","csv_text":"a,b","install_id":"other"}"#,
+            r#"{"request_id":"req-1","preview_token":"sha256:x","decisions_digest":"sha256:y","csv_text":"a,b","context_id":"other"}"#,
+            r#"{"request_id":"req-1","preview_token":"sha256:x","decisions_digest":"sha256:y","csv_text":"a,b","actor":"operator"}"#,
+            r#"{"request_id":"req-1","preview_token":"sha256:x","decisions_digest":"sha256:y","csv_text":"a,b","by":"operator"}"#,
+            r#"{"request_id":"req-1","preview_token":"sha256:x","csv_text":"a,b"}"#,
+            r#"{"preview_token":"sha256:x","decisions_digest":"sha256:y","csv_text":"a,b"}"#,
+            r#"{"request_id":"req-1","preview_token":"sha256:x","decisions_digest":"sha256:y"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CsvConfirm>(body).is_err(),
+                "csv confirm admitted {body}"
+            );
+        }
         for body in [
             r#"{"csv_text":"a","preview_token":"sha256:x","request_id":"req-1","install_id":"other"}"#,
             r#"{"csv_text":"a","preview_token":"sha256:x","request_id":"req-1","actor":"operator"}"#,

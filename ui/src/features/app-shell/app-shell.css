@@ -3,9 +3,20 @@
  * One chat node serves both panes: the desktop left column and the
  * narrow left drawer are one element restyled by breakpoint. The
  * closed narrow drawer is `visibility: hidden`, so it leaves the tab
- * order with the draft intact — no second pane, no second stream. */
+ * order with the draft intact — no second pane, no second stream.
+ *
+ * CAD-1007: the shell is a bounded column, not a document-flow block.
+ * Inside `.app-workspace` it already flexes to the pane's height and
+ * scrolls itself (styles.css); here the grid claims the leftover
+ * height (`flex: 1 1 0%; min-height: 0`) and each pane owns its own
+ * overflow — the chat's message list scrolls internally, and the
+ * outlet scrolls long app screens (Settings) inside the pane. On
+ * document-flow mounts the flex/height rules are inert: the grid's
+ * single row still sizes to content, so nothing regresses. */
 
 .app-shell {
+  display: flex;
+  flex-direction: column;
   padding: 1rem 1rem 2.25rem;
   min-width: 0;
 }
@@ -23,14 +34,21 @@
   gap: 0.5rem;
   min-width: 0;
   margin-bottom: 0.75rem;
+  flex-shrink: 0;
 }
 
-/* Two panes on desktop: live master thread left, outlet right. */
+/* Two panes on desktop: live master thread left, outlet right. The
+   grid fills the shell's leftover height (a single bounded row) so a
+   tall pane overflows inside its own scroller instead of stretching
+   the whole shell past the viewport (CAD-1007). */
 .app-shell-grid {
   display: grid;
   gap: 1rem;
   grid-template-columns: minmax(0, 1fr);
-  align-items: start;
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
+  flex: 1 1 0%;
+  min-height: 0;
 }
 
 @media (min-width: 1024px) {
@@ -39,9 +57,14 @@
   }
 }
 
-/* The single chat node: static left column on desktop, fixed left
-   sheet at narrow widths. */
+/* The single chat node: a bounded flex column in the left pane on
+   desktop, a fixed left sheet at narrow widths. The column owns
+   internal scrolling: drawer head and composer never shrink, the
+   message list takes the leftover height and scrolls (CAD-1007). */
 .app-shell-chat {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   position: fixed;
   top: 0;
   bottom: 0;
@@ -64,14 +87,14 @@
 
 @media (min-width: 1024px) {
   .app-shell-chat {
-    position: sticky;
-    top: 4.5rem;
+    position: static;
+    height: 100%;
     width: auto;
     z-index: auto;
     background: transparent;
     border-right: 0;
     padding: 0;
-    overflow-y: visible;
+    overflow: hidden;
     transform: none;
     visibility: visible;
     transition: none;
@@ -92,6 +115,7 @@
   justify-content: space-between;
   gap: 0.75rem;
   margin-bottom: 0.75rem;
+  flex-shrink: 0;
 }
 
 @media (min-width: 1024px) {
@@ -125,9 +149,26 @@
 
 .app-shell-outlet {
   min-width: 0;
+  min-height: 0;
   display: grid;
   gap: 0.75rem;
-  align-content: start;
+  align-content: stretch;
+  /* The outlet is the pane's own scroller: long app screens scroll
+     inside the bounded grid row while the chat column keeps its
+     height (CAD-1007). The shell's outer scroller stays the document
+     fallback on flow mounts. */
+  overflow: auto;
+}
+
+/* An installed-app screen mounts a metadata `<p>` above the
+   `ScreenOutlet` div. In the grid these become two auto rows, so the
+   frame never receives height and renders at its collapsed fallback.
+   Switch just this case to a column: the `<p>` takes natural height,
+   the ScreenOutlet `flex: 1` div fills the remainder (CAD-1006).
+   Native/CRM outlets have no such child and keep the grid. */
+.app-shell-outlet:has(> [aria-label="Installed app screen"]) {
+  display: flex;
+  flex-direction: column;
 }
 
 .app-shell-context {
@@ -135,9 +176,16 @@
   gap: 0.35rem;
 }
 
-/* Compact master thread pane. */
+/* Compact master thread pane. A bounded column: header copy and the
+   composer keep their size, the message list takes the leftover
+   height and scrolls internally. The desktop chat column is
+   overflow:hidden so this inner scroller is the only one (CAD-1007);
+   at narrow widths the fixed drawer keeps its outer scroller too. */
 .app-chat {
-  display: grid;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
   gap: 0.5rem;
   border: 1px solid var(--color-ink-700);
   border-radius: 0.5rem;
@@ -148,7 +196,10 @@
 .app-chat-list {
   display: grid;
   gap: 0.5rem;
-  max-height: 24rem;
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  align-content: start;
   overflow-y: auto;
   list-style: none;
   margin: 0;
@@ -158,6 +209,7 @@
 .app-chat-form {
   display: grid;
   gap: 0.5rem;
+  flex-shrink: 0;
 }
 
 .app-chat-box {
@@ -273,6 +325,14 @@
   gap: 0.75rem;
   flex-wrap: wrap;
   min-width: 0;
+}
+
+/* The lede takes the free width and wraps; the header action stays on
+   the same row, right-aligned, in every CRM section. */
+.crm-toolbar-lede {
+  flex: 1 1 14rem;
+  min-width: 0;
+  margin: 0;
 }
 
 .crm-search {
@@ -648,4 +708,322 @@
 .av-form-foot {
   display: grid;
   gap: 0.4rem;
+}
+
+/* ============================================================
+   CAD-1008 additive layer: CRM-only selectors + shared host
+   primitives (CAD-866), appended after the parent's shared shell.
+   No parent app-shell, app-view or existing CRM rule above is overridden —
+   every block below is a new selector or a CRM-scoped rule. */
+
+/* CAD-1008: the email content form and its saved-version preview sit
+   side by side on wide viewports — the operator writes and sees the
+   rendered email in one glance. Narrow viewports stack them so the
+   preview lands immediately after the content card, before approval. */
+.crm-compose {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  align-items: start;
+}
+
+@media (min-width: 1100px) {
+  .crm-compose {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+/* Diagnostic record metadata (ids, revisions, digests, workspace)
+   collapses behind this details block instead of leading the page. */
+.crm-diag summary {
+  cursor: pointer;
+  list-style: disclosure-closed;
+}
+
+.crm-diag[open] summary {
+  list-style: disclosure-open;
+}
+/* Scoped entry: the unselected multi-context state lists each active
+   context as an explicit `?ctx=` link — a real URL write, never a
+   hidden default. Replaces the removed header picker without
+   silently binding a client. */
+.app-shell-scope {
+  display: grid;
+  gap: 0.6rem;
+  max-width: 28rem;
+}
+
+.app-shell-scope-list {
+  display: grid;
+  gap: 0.35rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.app-shell-scope-list .lnk {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2rem;
+}
+
+/* Bound scope: the same links stay reachable as a compact inline
+   switch — never a second picker, and never a card on every view. */
+.app-shell-switch {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.9rem;
+  min-width: 0;
+}
+
+.app-shell-switch > p {
+  margin: 0;
+}
+
+.app-shell-switch-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.1rem 0.9rem;
+}
+
+/* The bound context stays in the switch list (aria-current) so the
+   current scope is announced without becoming a dead control. */
+.app-shell-scope-list .lnk[aria-current] {
+  color: var(--color-ink-100);
+  font-weight: 600;
+}
+
+/* WCAG 2.5.5 target size at pointer-coarse widths: the 2rem desktop
+   row grows to a 44px target on touch/narrow screens. */
+@media (max-width: 1023.98px) {
+  .app-shell-scope-list .lnk {
+    min-height: 2.75rem;
+  }
+}
+/* CAD-866 shared host primitives. These generic classes carry the same
+   canonical tokens the CRM (`crm-*`) and app-views (`av-*`) shapes used;
+   consumers keep their legacy class as an extra hook for tests/QA while
+   the field/table/detail/state chrome now lives here once. */
+.sfield {
+  display: grid;
+  /* Label/hint/error sit as one unit (8px spacing scale); control
+     heights, rows-driven textareas and required/error/readonly
+     semantics are untouched (CAD-910). */
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.sfield .field,
+.sfield > input:not([type="file"]),
+.sfield > textarea,
+.sfield > select {
+  width: 100%;
+  max-width: 100%;
+}
+
+.sfield-label {
+  /* Mid weight lifts the label above its hint without reaching the
+     semibold reserved for selected tabs/headings (CAD-910). */
+  font-weight: 500;
+}
+
+/* Shared hint typography overrides the compact utilities emitted by Field. */
+p.sfield-hint {
+  margin: 0;
+  font-size: var(--text-label);
+  line-height: 1.5;
+  color: var(--color-ink-400);
+}
+
+.sfield-error {
+  margin: 0;
+}
+
+.stable-wrap {
+  overflow: auto;
+  max-width: 100%;
+  /* Inside a bounded flex column this is the only flex-growing region:
+     it fills the leftover height and scrolls the table internally
+     instead of letting the document grow past the fold. */
+  flex: 1;
+  min-height: 0;
+  contain: layout paint;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-850);
+}
+
+.stable-wrap:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.stable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-table);
+}
+
+.stable th,
+.stable td {
+  text-align: left;
+  /* Same 12px block/inline padding as .crm-table: both owners read
+     identically wherever DataTable or a bare table renders (CAD-910). */
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--color-ink-700);
+  vertical-align: top;
+  /* Long unbreakable tokens wrap; horizontal scrolling stays inside
+     `.stable-wrap`, never the document. */
+  overflow-wrap: anywhere;
+}
+
+.stable thead th {
+  font-size: var(--text-label);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-ink-400);
+  background: var(--color-ink-875);
+}
+
+.stable tbody tr:hover {
+  background: var(--color-ink-875);
+}
+
+.stable tbody tr:last-child td,
+.stable tbody tr:last-child th {
+  border-bottom: 0;
+}
+
+.sdetail {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+}
+
+.sdetail > div {
+  display: grid;
+  grid-template-columns: 8rem minmax(0, 1fr);
+  gap: 0.5rem;
+  align-items: baseline;
+}
+
+.sdetail dt {
+  font-size: var(--text-label);
+  color: var(--color-ink-500);
+}
+
+.sdetail dd {
+  margin: 0;
+  font-size: var(--text-secondary);
+  color: var(--color-ink-200);
+  overflow-wrap: anywhere;
+}
+
+.snotice,
+.sempty,
+.serror {
+  margin: 0;
+}
+
+.sloading {
+  margin: 0;
+}
+/* CAD-1051: collapsible chat rail (desktop). The pane stays on the
+   left; collapsed it is a thin rail with a waiting dot. */
+.app-chat-rail {
+  display: none;
+}
+.app-chat-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.app-chat-collapse {
+  display: none;
+}
+.app-chat-me {
+  justify-self: end;
+  max-width: 90%;
+  background: var(--color-ink-800);
+  border-radius: 0.5rem 0.5rem 0.15rem 0.5rem;
+  padding: 0.4rem 0.6rem;
+}
+.app-chat-ai > :first-child {
+  margin-top: 0;
+}
+.app-chat-ai > :last-child {
+  margin-bottom: 0;
+}
+.app-chat-card {
+  padding: 0.5rem 0.65rem;
+  background: var(--color-ink-850);
+}
+.app-chat-ctx {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+.app-chat-prompt {
+  border: 1px dashed var(--color-ink-600);
+  background: transparent;
+  border-radius: 0.25rem;
+  padding: 0.1rem 0.45rem;
+  color: var(--color-ink-400);
+}
+.app-chat-prompt:hover:not(:disabled) {
+  border-style: solid;
+  color: var(--color-ink-200);
+}
+.app-chat-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--color-warn);
+}
+
+@media (min-width: 1024px) {
+  .app-chat-collapse {
+    display: inline-flex;
+  }
+  .app-shell-grid {
+    transition: grid-template-columns 0.2s ease;
+  }
+  .app-shell-grid[data-chat-collapsed] {
+    grid-template-columns: 2.75rem minmax(0, 1fr);
+  }
+  .app-chat[data-collapsed] {
+    padding: 0.5rem 0;
+    align-items: center;
+  }
+  .app-chat[data-collapsed] > :not(.app-chat-rail) {
+    display: none;
+  }
+  .app-chat[data-collapsed] .app-chat-rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    height: auto;
+  }
+  .app-chat-rail-label {
+    writing-mode: vertical-rl;
+    letter-spacing: 0.08em;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-shell-grid {
+    transition: none;
+  }
+}
+.app-chat-chip {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-items: center;
+  border: 1px solid var(--color-ink-600);
+  border-radius: 0.25rem;
+  padding: 0.1rem 0.4rem;
 }

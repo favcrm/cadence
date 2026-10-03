@@ -18,6 +18,7 @@
 //! 256-bit token is the credential — and reveals nothing but a
 //! constant `{"unsubscribed": true}`.
 
+use super::crm_smtp_rpc::SenderTransport;
 use super::*;
 use crate::store::app_records::RecordStore;
 use crate::store::app_sends::{
@@ -37,6 +38,11 @@ enum Step {
     Suppressed(String),
     /// A submission ran; the row follows its classified outcome.
     Done(crate::platform::smtp::SmtpOutcome),
+    /// CAD-1063: the platform's approval ledger holds this delivery
+    /// for the owner. Nothing was sent; the same bytes under the same
+    /// key (hence the same unsubscribe token) are presented again on
+    /// the next pass.
+    Waiting { message: String, token: String },
     /// The token hash could not be durably recorded — the row was
     /// requeued and is picked up again; nothing was submitted.
     Requeue,
@@ -213,7 +219,7 @@ impl Shared {
     /// open: `https://` anywhere, or loopback `http://` for the
     /// isolated test rigs. Anything else refuses rather than minting
     /// dead links.
-    fn crm_send_origin(&self) -> Result<String> {
+    pub(super) fn crm_send_origin(&self) -> Result<String> {
         let stored = self.store.crm_setting("unsubscribe_origin")?;
         let origin = stored
             .or_else(|| self.unsubscribe_origin.clone())
@@ -721,6 +727,13 @@ impl Shared {
         if send.state != "sending" {
             return Ok(());
         }
+        // CAD-1063: deliveries the platform holds for owner approval.
+        // They keep their token in memory only (raw tokens never reach
+        // a durable row), are skipped for the rest of the pass, and
+        // are re-presented after the poll interval.
+        let mut waiting: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut passed: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
             // test-seam: a fixture budget parks the worker between
             // rows so mid-send mutations are deterministic.
@@ -729,7 +742,15 @@ impl Shared {
                 gate.take();
             }
             let deliveries = records.app_campaign_deliveries(context, send_id)?;
-            let Some(next) = deliveries.iter().find(|d| d.state == "queued") else {
+            let Some(next) = deliveries
+                .iter()
+                .find(|d| d.state == "queued" && !passed.contains(&d.customer_id))
+            else {
+                if deliveries.iter().any(|d| d.state == "queued") {
+                    std::thread::sleep(self.crm_send_pending_poll);
+                    passed.clear();
+                    continue;
+                }
                 break;
             };
             let customer_id = next.customer_id.clone();
@@ -742,7 +763,14 @@ impl Shared {
             // revision, customer still sendable — all inside the
             // custody lock the submission itself holds.
             let step = match self.crm_smtp_scope(install, context, || {
-                self.crm_send_row_step(&records, install, context, &send, &customer_id)
+                self.crm_send_row_step(
+                    &records,
+                    install,
+                    context,
+                    &send,
+                    &customer_id,
+                    waiting.get(&customer_id).cloned(),
+                )
             }) {
                 Ok(step) => step,
                 Err(error) => {
@@ -755,6 +783,22 @@ impl Shared {
             };
             match step {
                 Step::Requeue => {}
+                Step::Waiting { message, token } => {
+                    records.app_campaign_delivery_finish(
+                        context,
+                        send_id,
+                        &customer_id,
+                        "queued",
+                        None,
+                        Some(&message),
+                        Some(crate::platform::hosted_email::WAITING_APPROVAL_REASON),
+                        None,
+                        &["submitting"],
+                    )?;
+                    waiting.insert(customer_id.clone(), token);
+                    passed.insert(customer_id.clone());
+                    continue;
+                }
                 Step::Suppressed(why) => {
                     records.app_campaign_delivery_finish(
                         context,
@@ -768,67 +812,74 @@ impl Shared {
                         &["submitting"],
                     )?;
                 }
-                Step::Done(outcome) => match outcome {
-                    crate::platform::smtp::SmtpOutcome::Accepted { code, message } => {
-                        records.app_campaign_delivery_finish(
-                            context,
-                            send_id,
-                            &customer_id,
-                            "accepted",
-                            Some(i64::from(code)),
-                            Some(&message),
-                            None,
-                            None,
-                            &["submitting"],
-                        )?;
+                Step::Done(outcome) => {
+                    waiting.remove(&customer_id);
+                    match outcome {
+                        crate::platform::smtp::SmtpOutcome::Accepted { code, message } => {
+                            records.app_campaign_delivery_finish(
+                                context,
+                                send_id,
+                                &customer_id,
+                                "accepted",
+                                Some(i64::from(code)),
+                                Some(&message),
+                                None,
+                                None,
+                                &["submitting"],
+                            )?;
+                        }
+                        crate::platform::smtp::SmtpOutcome::Rejected { code, message } => {
+                            records.app_campaign_delivery_finish(
+                                context,
+                                send_id,
+                                &customer_id,
+                                "failed",
+                                Some(i64::from(code)),
+                                Some(&message),
+                                None,
+                                None,
+                                &["submitting"],
+                            )?;
+                        }
+                        crate::platform::smtp::SmtpOutcome::Uncertain { message } => {
+                            records.app_campaign_delivery_finish(
+                                context,
+                                send_id,
+                                &customer_id,
+                                "uncertain",
+                                None,
+                                Some(&message),
+                                None,
+                                None,
+                                &["submitting"],
+                            )?;
+                        }
+                        crate::platform::smtp::SmtpOutcome::Deferred { code, message } => {
+                            self.crm_send_delivery_retry(
+                                &records,
+                                context,
+                                send_id,
+                                &customer_id,
+                                Some(code),
+                                &message,
+                            )?;
+                        }
+                        crate::platform::smtp::SmtpOutcome::NotSubmitted { message } => {
+                            self.crm_send_delivery_retry(
+                                &records,
+                                context,
+                                send_id,
+                                &customer_id,
+                                None,
+                                &message,
+                            )?;
+                        }
+                        // `crm_send_row_step` turns this into `Step::Waiting`.
+                        crate::platform::smtp::SmtpOutcome::PendingApproval { .. } => {
+                            return Err(Error::internal("pending approval escaped the row step"));
+                        }
                     }
-                    crate::platform::smtp::SmtpOutcome::Rejected { code, message } => {
-                        records.app_campaign_delivery_finish(
-                            context,
-                            send_id,
-                            &customer_id,
-                            "failed",
-                            Some(i64::from(code)),
-                            Some(&message),
-                            None,
-                            None,
-                            &["submitting"],
-                        )?;
-                    }
-                    crate::platform::smtp::SmtpOutcome::Uncertain { message } => {
-                        records.app_campaign_delivery_finish(
-                            context,
-                            send_id,
-                            &customer_id,
-                            "uncertain",
-                            None,
-                            Some(&message),
-                            None,
-                            None,
-                            &["submitting"],
-                        )?;
-                    }
-                    crate::platform::smtp::SmtpOutcome::Deferred { code, message } => {
-                        self.crm_send_delivery_retry(
-                            &records,
-                            context,
-                            send_id,
-                            &customer_id,
-                            Some(code),
-                            &message,
-                        )?;
-                    }
-                    crate::platform::smtp::SmtpOutcome::NotSubmitted { message } => {
-                        self.crm_send_delivery_retry(
-                            &records,
-                            context,
-                            send_id,
-                            &customer_id,
-                            None,
-                            &message,
-                        )?;
-                    }
-                },
+                }
             }
             std::thread::sleep(self.crm_send_interval);
         }
@@ -856,6 +907,7 @@ impl Shared {
         context: &str,
         send: &crate::store::app_sends::CampaignSend,
         customer_id: &str,
+        reuse_token: Option<String>,
     ) -> Result<Step> {
         // Mint this attempt's unsubscribe token and land its sha256
         // in the App token table plus the core index BEFORE any
@@ -864,15 +916,17 @@ impl Shared {
         // mints a fresh one. If the hash writes fail, the row goes
         // back to `queued` (attempt already counted by the claim)
         // and is never submitted.
-        let token = mint_unsubscribe_token();
+        let reused = reuse_token.is_some();
+        let token = reuse_token.unwrap_or_else(mint_unsubscribe_token);
         let token_hash = unsubscribe_token_hash(&token);
-        if records
-            .app_unsubscribe_token_record(context, &send.send_id, customer_id, &token_hash)
-            .and_then(|()| {
-                self.store
-                    .crm_unsubscribe_index_add(&token_hash, install, context)
-            })
-            .is_err()
+        if !reused
+            && records
+                .app_unsubscribe_token_record(context, &send.send_id, customer_id, &token_hash)
+                .and_then(|()| {
+                    self.store
+                        .crm_unsubscribe_index_add(&token_hash, install, context)
+                })
+                .is_err()
         {
             let _ = records.app_campaign_delivery_requeue(context, &send.send_id, customer_id);
             let attempts = records
@@ -910,7 +964,7 @@ impl Shared {
         {
             return Err(Error::rejected("SMTP sender binding changed"));
         }
-        let (_, envelope, projection, _) =
+        let (transport, projection) =
             self.crm_smtp_authority(&link.connection_id, link.auth_revision)?;
         let (content_revision, content_digest) =
             records.app_content_approved(context, &send.campaign_id)?;
@@ -933,20 +987,43 @@ impl Shared {
             first_name.as_deref(),
             &unsubscribe_url,
         )?;
-        let message = crate::platform::smtp::SmtpMessage {
-            to: email,
-            subject: rendered["subject"].as_str().unwrap_or_default().to_string(),
-            html: rendered["html"].as_str().unwrap_or_default().to_string(),
-            text: rendered["text"].as_str().unwrap_or_default().to_string(),
-            unsubscribe_url,
-            idempotency_key: Some(delivery.idempotency_key.clone()),
+        let subject = rendered["subject"].as_str().unwrap_or_default().to_string();
+        let html = rendered["html"].as_str().unwrap_or_default().to_string();
+        let text = rendered["text"].as_str().unwrap_or_default().to_string();
+        let outcome = match &transport {
+            SenderTransport::Smtp(envelope) => {
+                let message = crate::platform::smtp::SmtpMessage {
+                    to: email,
+                    subject,
+                    html,
+                    text,
+                    unsubscribe_url,
+                    idempotency_key: Some(delivery.idempotency_key.clone()),
+                };
+                crate::platform::smtp::send_outcome(
+                    envelope,
+                    &message,
+                    &content_digest,
+                    self.smtp_test_ca.as_deref(),
+                )?
+            }
+            SenderTransport::Hosted(hosted) => {
+                let message = crate::platform::hosted_email::HostedMessage {
+                    to: email,
+                    subject,
+                    text,
+                    html,
+                };
+                let key = crate::platform::hosted_email::idempotency_key(
+                    &delivery.idempotency_key,
+                    &crate::platform::hosted_email::content_digest(&message),
+                );
+                hosted.send_outcome(&message, &key)?
+            }
         };
-        let outcome = crate::platform::smtp::send_outcome(
-            &envelope,
-            &message,
-            &content_digest,
-            self.smtp_test_ca.as_deref(),
-        )?;
+        if let crate::platform::smtp::SmtpOutcome::PendingApproval { message } = outcome {
+            return Ok(Step::Waiting { message, token });
+        }
         Ok(Step::Done(outcome))
     }
 

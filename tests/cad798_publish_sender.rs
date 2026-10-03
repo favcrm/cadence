@@ -1292,7 +1292,11 @@ fn daemon_release(door: &FakeDoor) -> (Release, Arc<HttpPublishSender>) {
 fn approved_run(h: &Release, tag: &str) -> (Value, Value, String, String) {
     let context = h.context("Harbour", A, &format!("cad798-{tag}-context"));
     h.bind(&context, &format!("cad798-{tag}-binding"));
-    let run = h.complete(&context, &format!("cad798-{tag}-run"));
+    let mut run = h.complete(&context, &format!("cad798-{tag}-run"));
+    // CAD-1027: freeze proves the effect belongs to this run+artifact, so
+    // every fixture schedules against a real staged app effect.
+    let effect = h.stage(&run, &format!("cad798-{tag}-effect"));
+    run["staged_effect_id"] = effect["effect_id"].clone();
     let bundle_digest = run["snapshot"]["bundle_digest"]
         .as_str()
         .unwrap()
@@ -1314,9 +1318,9 @@ fn freeze_params(
         "context_id": context["id"], "run_id": run["id"],
         "artifact_id": run["artifacts"][0]["id"],
         "bundle_digest": bundle_digest,
-        "slot": "publication", "effect_id": "cad_fx_798_e2e_01",
+        "slot": "publication", "effect_id": run["staged_effect_id"],
         "destination_id": DEST, "toolkit": "facebook",
-        "grant_id": grant, "approval_id": "cad_approval_798_01",
+        "grant_id": grant, "approval_id": approval_for(request),
         "due_epoch": due, "timezone": "Asia/Hong_Kong"})
 }
 
@@ -1545,4 +1549,12 @@ fn cad798_registration_accepts_explicit_config() {
     .expect("explicit config registers");
     assert!(opts.social_publish_sender.is_some());
     clear_env();
+}
+
+/// CAD-1027: a daemon-shaped approval id (`apv-` + 32 lowercase hex),
+/// distinct per seed — one approval authorizes one intent.
+fn approval_for(seed: &str) -> String {
+    use sha2::Digest as _;
+    let hex = format!("{:x}", sha2::Sha256::digest(seed.as_bytes()));
+    format!("apv-{}", &hex[..32])
 }

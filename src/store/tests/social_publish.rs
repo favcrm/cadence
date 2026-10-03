@@ -43,7 +43,9 @@ fn intent(request: &str) -> NewSocialPublish<'_> {
         image_digest: Some(img_digest()),
         media_key: None,
         grant_id: "dpq_synthetic_grant_01",
-        approval_id: "cad_approval_01",
+        // CAD-1027: an approval authorizes exactly one intent, so each
+        // fixture request carries its own approval identity.
+        approval_id: request,
         due_epoch: 1_750_000_000,
         timezone: "Asia/Hong_Kong",
     }
@@ -118,21 +120,77 @@ fn cad771_schedule_refuses_forged_and_mismatched_shapes() {
     );
 }
 
+/// CAD-1027 adversarial: an approval authorizes exactly one intent. The
+/// same-request retry is idempotent; the same approval under any other
+/// request (a replay, a double submit with a fresh request id, a
+/// re-schedule after cancel, another install) refuses and stores nothing.
+#[test]
+fn cad1027_approval_authorizes_exactly_one_intent() {
+    let (_dir, s) = store();
+    let mut first = intent("req-apv-1");
+    first.approval_id = "apv-once";
+    let made = s.social_publish_schedule(&first).unwrap();
+    let id = made["intent"]["intent_id"].as_str().unwrap().to_owned();
+    let retry = s.social_publish_schedule(&first).unwrap();
+    assert_eq!(retry["intent"]["intent_id"], id.as_str());
+    let refuse = |request: &str, install: &str| {
+        let mut replay = intent(request);
+        replay.approval_id = "apv-once";
+        replay.install_id = install;
+        let err = s.social_publish_schedule(&replay).unwrap_err().to_string();
+        assert!(err.contains("approval_replay"), "{request}: {err}");
+    };
+    refuse("req-apv-2", "install-harbour");
+    refuse("req-apv-3", "install-other");
+    s.social_publish_cancel(&id, "install-harbour", None)
+        .unwrap();
+    refuse("req-apv-4", "install-harbour");
+    let rows: i64 = s
+        .conn()
+        .query_row("SELECT count(*) FROM social_publish_intents", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 1, "a replayed approval stored a second intent");
+}
+
 #[test]
 fn cad771_cancel_only_before_dispatch() {
     let (_dir, s) = store();
     let staged = s.social_publish_schedule(&intent("req-cancel")).unwrap();
     let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
-    let cancelled = s.social_publish_cancel(&id).unwrap();
+    let cancelled = s
+        .social_publish_cancel(&id, "install-harbour", None)
+        .unwrap();
     assert_eq!(cancelled["intent"]["state"], "cancelled");
+    // CAD-1027: cancel is scoped — another install or a context the intent
+    // does not carry refuses and leaves it queued.
+    let mut later = intent("req-cancel-scope");
+    later.due_epoch = 1_900_000_000;
+    let staged = s.social_publish_schedule(&later).unwrap();
+    let scoped = staged["intent"]["intent_id"].as_str().unwrap();
+    assert!(s
+        .social_publish_cancel(scoped, "install-other", None)
+        .is_err());
+    assert!(s
+        .social_publish_cancel(scoped, "install-harbour", Some("ctx-a"))
+        .is_err());
+    assert_eq!(
+        s.social_publish_show(scoped).unwrap()["intent"]["state"],
+        "queued"
+    );
     // A cancelled intent cannot be cancelled again or claimed.
-    assert!(s.social_publish_cancel(&id).is_err());
+    assert!(s
+        .social_publish_cancel(&id, "install-harbour", None)
+        .is_err());
     assert!(s
         .social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
         .unwrap()
         .is_none());
     // Unknown intent ids are refused, never created.
-    assert!(s.social_publish_cancel("spub-nope").is_err());
+    assert!(s
+        .social_publish_cancel("spub-nope", "install-harbour", None)
+        .is_err());
     assert!(s.social_publish_show("spub-nope").is_err());
 }
 

@@ -684,13 +684,22 @@ fn cad779_customer_search_pagination_and_extended_profile() {
     w.daemon
         .operator_rpc(
             "app_record_update",
-            json!({"install_id": install, "context_id": context_id, "record_id": "customer-3", "expected_revision": 1, "profile": consent_change}),
+            json!({"install_id": install, "context_id": context_id, "record_id": "customer-3", "expected_revision": 1, "profile": consent_change, "consent_provenance": {"method": "written", "note": "cad779 consent change"}}),
         )
         .unwrap();
     let after = w.show(install, context_id, "customer-3");
     assert!(
         after["record"]["consent_history"].as_array().unwrap().len() > history.len(),
         "consent change left no history: {after}"
+    );
+    assert_eq!(
+        after["record"]["consent_history"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["method"],
+        "written",
+        "grant lost its method: {after}"
     );
 
     // Bad contact fields refuse without echoing the marker.

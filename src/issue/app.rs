@@ -69,8 +69,11 @@ const MANIFEST_KEYS: &[&str] = &["app", "title", "version", "needs", "summary"];
 /// message so a bundle carrying one names the stage, not "unknown key".
 const GATED_KEYS: &[&str] = &["records", "actions", "ui", "settings", "actors"];
 
-/// The only directories an app folder may carry at top level.
-const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates"];
+/// The only directories an app folder may carry at top level. CAD-1006:
+/// `screens/` joins them — it holds one `<tag>/` subdir per screen
+/// package, each carrying a `screens.json` declaration plus flat
+/// `<stem>.<js|css|svg|json>` asset leaves.
+const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "screens"];
 
 /// Largest single file in a bundle — workflows render to plans, so the
 /// plan cap applies; the same bound keeps every other file small.
@@ -552,6 +555,17 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
                     "a symlink — an app folder holds real files only",
                 ));
             }
+            if *top == "screens" {
+                // A screens member is a <tag>/ directory handled by the
+                // nested pass below — never a flat file.
+                if !ft.is_dir() {
+                    return Err(entry_err(
+                        &format!("{top}/{name}"),
+                        "a screen package is a <tag>/ directory",
+                    ));
+                }
+                continue;
+            }
             if ft.is_dir() {
                 return Err(entry_err(
                     &format!("{top}/{name}"),
@@ -571,6 +585,79 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
                 check_name(stem, "workflow name")?;
             }
             files.push((format!("{top}/{name}"), entry.path()));
+        }
+        // screens/<tag>/<leaf> — the one nested level v1 allows: each
+        // `<tag>` is a tag-named subdir holding the declaration and flat
+        // asset leaves. Anything deeper, a non-dir member, or a bad leaf
+        // extension refuses.
+        if top == "screens" {
+            for tag_entry in std::fs::read_dir(dir)?.flatten() {
+                let tag = tag_entry.file_name();
+                let Some(tag) = tag.to_str() else {
+                    return Err(Error::rejected("screens/ carries a non-UTF-8 name"));
+                };
+                if tag.starts_with('.') {
+                    return Err(entry_err(
+                        &format!("screens/{tag}"),
+                        "dotfiles are not app content",
+                    ));
+                }
+                let ft = tag_entry
+                    .file_type()
+                    .map_err(|e| Error::rejected(format!("cannot stat 'screens/{tag}': {e}")))?;
+                if ft.is_symlink() {
+                    return Err(entry_err(
+                        &format!("screens/{tag}"),
+                        "a symlink — an app folder holds real files only",
+                    ));
+                }
+                if !ft.is_dir() {
+                    return Err(entry_err(
+                        &format!("screens/{tag}"),
+                        "a screen package is a <tag>/ directory",
+                    ));
+                }
+                check_name(tag, "screen tag")?;
+                for leaf in std::fs::read_dir(tag_entry.path())?.flatten() {
+                    let leaf_name = leaf.file_name();
+                    let Some(leaf_name) = leaf_name.to_str() else {
+                        return Err(Error::rejected(
+                            "screens/<tag>/ carries a non-UTF-8 leaf name",
+                        ));
+                    };
+                    if leaf_name.starts_with('.') {
+                        return Err(entry_err(
+                            &format!("screens/{tag}/{leaf_name}"),
+                            "dotfiles are not app content",
+                        ));
+                    }
+                    let lft = leaf.file_type().map_err(|e| {
+                        Error::rejected(format!("cannot stat 'screens/{tag}/{leaf_name}': {e}"))
+                    })?;
+                    if lft.is_symlink() {
+                        return Err(entry_err(
+                            &format!("screens/{tag}/{leaf_name}"),
+                            "a symlink — an app folder holds real files only",
+                        ));
+                    }
+                    if !lft.is_file() {
+                        return Err(entry_err(
+                            &format!("screens/{tag}/{leaf_name}"),
+                            "screen assets are flat files — no nested folders",
+                        ));
+                    }
+                    let rel = format!("screens/{tag}/{leaf_name}");
+                    if !crate::issue::app_screen_pkg::leaf_ok(leaf_name) {
+                        return Err(entry_err(
+                            &rel,
+                            "a screen asset is <stem>.<js|css|svg|json>, or screens.json",
+                        ));
+                    }
+                    files.push((rel, leaf.path()));
+                }
+            }
+            // screens/ holds subdirs only — the flat-member loop above
+            // collected none for it; drop the loop's own (empty) result.
         }
     }
     if files.len() > MAX_FILES {

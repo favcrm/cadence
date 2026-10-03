@@ -627,7 +627,11 @@ fn ensure_spa_dist() -> std::path::PathBuf {
 fn approved_run(h: &Release, tag: &str) -> (Value, Value, String, String) {
     let context = h.context("Harbour", A, &format!("cad771-e2e-{tag}-context"));
     h.bind(&context, &format!("cad771-e2e-{tag}-binding"));
-    let run = h.complete(&context, &format!("cad771-e2e-{tag}-run"));
+    let mut run = h.complete(&context, &format!("cad771-e2e-{tag}-run"));
+    // CAD-1027: freeze proves the effect belongs to this run+artifact, so
+    // every fixture schedules against a real staged app effect.
+    let effect = h.stage(&run, &format!("cad771-e2e-{tag}-effect"));
+    run["staged_effect_id"] = effect["effect_id"].clone();
     let bundle_digest = run["snapshot"]["bundle_digest"]
         .as_str()
         .unwrap()
@@ -686,16 +690,17 @@ fn freeze_params(
     bundle_digest: &str,
     install_id: &str,
     request: &str,
-    effect: &str,
     due: i64,
 ) -> Value {
     json!({"request_id": request, "install_id": install_id,
         "context_id": context["id"], "run_id": run["id"],
         "artifact_id": run["artifacts"][0]["id"],
         "bundle_digest": bundle_digest,
-        "slot": "publication", "effect_id": effect,
+        "slot": "publication", "effect_id": run["staged_effect_id"],
         "destination_id": DEST_FB, "toolkit": "facebook",
-        "grant_id": GRANT_FB, "approval_id": "cad_approval_e2e_01",
+        // CAD-1027: one approval authorizes one intent — each request
+        // carries its own approval identity.
+        "grant_id": GRANT_FB, "approval_id": approval_for(request),
         "due_epoch": due, "timezone": "Asia/Hong_Kong"})
 }
 
@@ -720,7 +725,6 @@ fn cad771_e2e_post_now_from_approved_run_with_grant_liveness() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-now",
-                "cad_fx_e2e_01",
                 due,
             ),
         )
@@ -799,7 +803,6 @@ fn cad771_e2e_forged_matching_receipt_fails_closed_without_trusted_evidence() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-forged-receipt",
-                "cad_fx_forged_receipt_01",
                 epoch_now(),
             ),
         )
@@ -898,7 +901,6 @@ fn cad771_e2e_forged_freeze_inputs_fail_closed() {
         &bundle_digest,
         &install_id,
         "cad771-e2e-forged",
-        "cad_fx_forged_01",
         epoch_now(),
     );
     // Forged artifact, bundle, slot, and run each refuse.
@@ -970,7 +972,6 @@ fn cad771_e2e_revoked_grant_holds_for_new_decision_and_exhaustion_refuses() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-revoke-1",
-                "cad_fx_revoke_01",
                 epoch_now(),
             ),
         )
@@ -1005,7 +1006,6 @@ fn cad771_e2e_revoked_grant_holds_for_new_decision_and_exhaustion_refuses() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-revoke-stale",
-                "cad_fx_revoke_stale_01",
                 epoch_now(),
             ),
         )
@@ -1036,7 +1036,6 @@ fn cad771_e2e_revoked_grant_holds_for_new_decision_and_exhaustion_refuses() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-exhaust-2",
-                "cad_fx_exhaust_02",
                 epoch_now(),
             ),
         )
@@ -1074,7 +1073,6 @@ fn cad771_e2e_revoked_grant_holds_for_new_decision_and_exhaustion_refuses() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-exhaust-3",
-                "cad_fx_exhaust_03",
                 epoch_now(),
             ),
         )
@@ -1112,7 +1110,6 @@ fn cad771_e2e_lost_response_reconciles_without_second_send() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-lost",
-                "cad_fx_lost_01",
                 epoch_now(),
             ),
         )
@@ -1194,7 +1191,6 @@ fn cad771_e2e_schedule_cancel_and_native_http_parity() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-cancel",
-                "cad_fx_cancel_01",
                 epoch_now() + 3600,
             ),
         )
@@ -1213,7 +1209,8 @@ fn cad771_e2e_schedule_cancel_and_native_http_parity() {
         .daemon
         .operator_rpc(
             "social_publish_cancel",
-            json!({"intent_id": intent["intent_id"]}),
+            json!({"intent_id": intent["intent_id"], "install_id": install_id,
+                "context_id": context["id"]}),
         )
         .unwrap()["intent"]
         .clone();
@@ -1474,7 +1471,6 @@ fn cad771_e2e_revoked_binding_holds_despite_matching_recheck() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-stale",
-                "cad_fx_stale_01",
                 epoch_now(),
             ),
         )
@@ -1521,7 +1517,6 @@ fn cad771_e2e_missing_upstream_echo_fails_closed_never_filled() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-noecho",
-                "cad_fx_noecho_01",
                 epoch_now(),
             ),
         )
@@ -1567,7 +1562,6 @@ fn cad771_e2e_cross_key_evidence_confusion_fails_closed() {
                 &bundle_a,
                 &install_a,
                 "cad771-e2e-xkey-a",
-                "cad_fx_xkey_a_01",
                 due_a,
             ),
         )
@@ -1583,7 +1577,6 @@ fn cad771_e2e_cross_key_evidence_confusion_fails_closed() {
                 &bundle_b,
                 &install_b,
                 "cad771-e2e-xkey-b",
-                "cad_fx_xkey_b_01",
                 due_b,
             ),
         )
@@ -1650,7 +1643,6 @@ fn cad771_e2e_corrupt_status_binding_fails_closed_at_claim() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-corrupt",
-                "cad_fx_corrupt_01",
                 epoch_now(),
             ),
         )
@@ -1697,7 +1689,6 @@ fn cad771_e2e_hostile_status_binding_fails_closed_at_reconcile() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-hostile",
-                "cad_fx_hostile_01",
                 epoch_now(),
             ),
         )
@@ -1772,7 +1763,6 @@ fn cad771_e2e_sender_forged_status_fails_closed_at_reconcile() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-senderforge",
-                "cad_fx_senderforge_01",
                 epoch_now(),
             ),
         )
@@ -1846,7 +1836,6 @@ fn cad771_e2e_hostile_reconcile_with_no_prior_evidence_stays_null() {
                 &bundle_digest,
                 &install_id,
                 "cad771-e2e-nullup",
-                "cad_fx_nullup_01",
                 epoch_now(),
             ),
         )
@@ -1898,4 +1887,424 @@ fn cad771_e2e_hostile_reconcile_with_no_prior_evidence_stays_null() {
         .clone();
     assert_eq!(shown["state"], "processing");
     assert!(shown["upstream"].is_null());
+}
+
+/// An in-process board on the daemon's own state dir, for HTTP parity.
+struct Board {
+    port: u16,
+    _lease: common::PortLease,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    join: Option<thread::JoinHandle<cadence_agent::Result<()>>>,
+    _pm: tempfile::TempDir,
+}
+impl Board {
+    fn serve(h: &Release) -> Self {
+        let lease = common::test_port();
+        let port = lease.port;
+        let (state, pm) = (h.daemon.state.clone(), tempfile::tempdir().unwrap());
+        let pm_dir = pm.path().to_path_buf();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bstop = stop.clone();
+        let join = thread::spawn(move || {
+            cadence_agent::ui::serve(
+                &state,
+                &pm_dir,
+                &cadence_agent::ui::ServeOpts {
+                    host: "127.0.0.1".into(),
+                    port,
+                    stop: Some(bstop),
+                    startup: Some(tx),
+                    test_seam: true,
+                    ..Default::default()
+                },
+            )
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("board up")
+            .expect("board started");
+        Self {
+            port,
+            _lease: lease,
+            stop,
+            join: Some(join),
+            _pm: pm,
+        }
+    }
+    /// Operator POST; returns `(status, body)`.
+    fn post(&self, h: &Release, path: &str, body: &Value) -> (u16, String) {
+        let session =
+            common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &h.daemon.state, self.port);
+        let (code, _, text) =
+            common::op::raw(self.port, &session.request("POST", path, &body.to_string()));
+        (code, text)
+    }
+}
+impl Drop for Board {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn intent_count(h: &Release, install: &str) -> usize {
+    h.daemon
+        .operator_rpc("social_publish_list", json!({"install_id": install}))
+        .unwrap()["intents"]
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+/// CAD-1027 adversarial (written before the guard): one operator approval
+/// authorizes exactly one intent. Concurrent double submits that share the
+/// approval but carry fresh request ids yield one intent; a replay of the
+/// approval refuses through the RPC and the HTTP relay alike; a forged
+/// (non-`dpq_`) grant refuses through both doors; an agent caller and a
+/// detached unproven peer never reach schedule.
+#[test]
+fn cad1027_one_approval_one_intent_rpc_and_http() {
+    let door = FakeDoor::start();
+    let h = resolver_only_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "apv");
+    let body = |request: &str| {
+        let mut b = freeze_params(
+            &context,
+            &run,
+            &bundle,
+            &install,
+            request,
+            epoch_now() + 3600,
+        );
+        b["approval_id"] = json!(approval_for("cad1027-double"));
+        b
+    };
+    // Four concurrent submits of one approval with distinct request ids.
+    let wins = thread::scope(|scope| {
+        let calls: Vec<_> = (0..4)
+            .map(|i| {
+                let (state, params) = (h.daemon.state.clone(), body(&format!("cad1027-dbl-{i}")));
+                scope.spawn(move || {
+                    cadence_agent::test_seam::scoped(
+                        cadence_agent::test_seam::Asserted::Operator,
+                        || cadence_agent::client::rpc(&state, "social_publish_schedule", params),
+                    )
+                })
+            })
+            .collect();
+        calls
+            .into_iter()
+            .map(|call| call.join().unwrap())
+            .filter(Result::is_ok)
+            .count()
+    });
+    assert_eq!(wins, 1, "a double submit must produce exactly one intent");
+    assert_eq!(intent_count(&h, &install), 1);
+    // RPC replay of the consumed approval under a fresh request refuses.
+    let err = h
+        .daemon
+        .operator_rpc("social_publish_schedule", body("cad1027-replay-rpc"))
+        .unwrap_err();
+    assert!(err.to_string().contains("approval_replay"), "{err}");
+    // An agent caller and an unproven (detached) peer never reach schedule.
+    for err in [
+        h.daemon
+            .agent_rpc("worker-0", "social_publish_schedule", body("cad1027-agent"))
+            .unwrap_err(),
+        h.daemon
+            .unproven_rpc("social_publish_schedule", body("cad1027-unproven"))
+            .unwrap_err(),
+    ] {
+        assert!(err.to_string().contains("operator"), "{err}");
+    }
+    // The HTTP relay is at least as strict: replay and forged grant refuse.
+    let board = Board::serve(&h);
+    let (code, text) = board.post(&h, "/api/social-publishes", &body("cad1027-replay-http"));
+    // The relay maps the store's "already" refusal to 409 Conflict.
+    assert_eq!(code, 409, "HTTP replay: {text}");
+    assert!(text.contains("approval_replay"), "{text}");
+    for grant in ["grant-a", "dpq_short", "DPQ_synthetic_grant_fb"] {
+        let mut forged = freeze_params(
+            &context,
+            &run,
+            &bundle,
+            &install,
+            "cad1027-forged",
+            epoch_now() + 3600,
+        );
+        forged["grant_id"] = json!(grant);
+        let (code, text) = board.post(&h, "/api/social-publishes", &forged);
+        assert_eq!(code, 400, "HTTP forged grant {grant} accepted: {text}");
+        let err = h
+            .daemon
+            .operator_rpc("social_publish_schedule", forged)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("grant is invalid"),
+            "{grant}: {err}"
+        );
+    }
+    assert_eq!(
+        intent_count(&h, &install),
+        1,
+        "a refused call stored an intent"
+    );
+}
+
+/// CAD-1027 (d) adversarial: freeze proves the effect belongs to this
+/// run+artifact and that the request's install/context are the run's own.
+/// A cross-context effect, a forged effect, another context, a dropped
+/// context and another install each refuse through the RPC and the HTTP
+/// relay, storing nothing; the exact scope then freezes.
+#[test]
+fn cad1027_freeze_refuses_foreign_effect_and_scope() {
+    let door = FakeDoor::start();
+    let h = resolver_only_release(&door);
+    let (ctx_a, run_a, bundle_a, install) = approved_run(&h, "scope-a");
+    let (ctx_b, run_b, _bundle_b, _) = approved_run(&h, "scope-b");
+    let base = freeze_params(
+        &ctx_a,
+        &run_a,
+        &bundle_a,
+        &install,
+        "cad1027-scope",
+        epoch_now() + 3600,
+    );
+    let board = Board::serve(&h);
+    let mut cases: Vec<(&str, &str, Value)> = Vec::new();
+    let mut forged = base.clone();
+    forged["effect_id"] = run_b["staged_effect_id"].clone();
+    cases.push(("cross-context effect", "bad_effect", forged));
+    // Another approved run in the SAME context: its effect matches the
+    // scope, so only the run/artifact comparison refuses it.
+    let sibling = h.complete(&ctx_a, "cad1027-scope-sibling-run");
+    let sibling_effect = h.stage(&sibling, "cad1027-scope-sibling-effect");
+    let mut forged = base.clone();
+    forged["effect_id"] = sibling_effect["effect_id"].clone();
+    cases.push(("same-scope other-run effect", "bad_effect", forged));
+    // Same run, different artifact: the effect's authorization names
+    // another artifact of the run (rewritten in place, as a two-step run
+    // would carry), so only the artifact comparison refuses it.
+    let mut rewritten = h.complete(&ctx_a, "cad1027-scope-artifact-run");
+    let effect = h.stage(&rewritten, "cad1027-scope-artifact-effect");
+    rewritten["staged_effect_id"] = effect["effect_id"].clone();
+    rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE app_effect_authorizations SET artifact_id='artifact-cad1027-other' WHERE effect_id=?",
+            [effect["effect_id"].as_str().unwrap()],
+        )
+        .unwrap();
+    let forged = freeze_params(
+        &ctx_a,
+        &rewritten,
+        &bundle_a,
+        &install,
+        "cad1027-scope-artifact",
+        epoch_now() + 3600,
+    );
+    cases.push(("same-run other-artifact effect", "bad_effect", forged));
+    // A declined effect is no longer live authority: it never backs a post.
+    let mut declined = h.complete(&ctx_a, "cad1027-scope-declined-run");
+    let effect = h.stage(&declined, "cad1027-scope-declined-effect");
+    h.daemon
+        .operator_rpc(
+            "app_effect_decide",
+            json!({"effect_id": effect["effect_id"], "digest": effect["digest"], "decision": "decline"}),
+        )
+        .unwrap();
+    declined["staged_effect_id"] = effect["effect_id"].clone();
+    let forged = freeze_params(
+        &ctx_a,
+        &declined,
+        &bundle_a,
+        &install,
+        "cad1027-scope-declined",
+        epoch_now() + 3600,
+    );
+    cases.push(("declined effect", "bad_effect", forged));
+    let mut forged = base.clone();
+    forged["effect_id"] = json!("fx-forged-cad1027");
+    cases.push(("forged effect", "bad_effect", forged));
+    let mut forged = base.clone();
+    forged["context_id"] = ctx_b["id"].clone();
+    cases.push(("other context", "grant_binding_mismatch", forged));
+    let mut forged = base.clone();
+    forged.as_object_mut().unwrap().remove("context_id");
+    cases.push(("dropped context", "grant_binding_mismatch", forged));
+    let mut forged = base.clone();
+    forged["install_id"] = json!("install-forged");
+    cases.push(("other install", "grant_binding_mismatch", forged));
+    // Each case names the guard that must refuse it, so removing either
+    // guard alone fails here (the effect guard would otherwise also catch
+    // the scope cases).
+    for (case, refusal, params) in cases {
+        let err = h
+            .daemon
+            .operator_rpc("social_publish_schedule", params.clone())
+            .expect_err(case)
+            .to_string();
+        assert!(err.contains(refusal), "RPC {case}: {err}");
+        let (code, text) = board.post(&h, "/api/social-publishes", &params);
+        assert!(
+            (400..500).contains(&code),
+            "HTTP froze a {case}: {code} {text}"
+        );
+        assert!(text.contains(refusal), "HTTP {case}: {text}");
+    }
+    assert_eq!(
+        intent_count(&h, &install),
+        0,
+        "a refused freeze stored an intent"
+    );
+    assert_eq!(intent_count(&h, "install-forged"), 0);
+    let intent = h
+        .daemon
+        .operator_rpc("social_publish_schedule", base)
+        .unwrap();
+    assert_eq!(intent["intent"]["state"], "queued");
+}
+
+/// CAD-1027 (d) adversarial: cancel is scoped by install and context. A
+/// cancel naming another install, another context or no context refuses
+/// through the RPC and the HTTP relay and leaves the intent queued; only
+/// the intent's own scope cancels it.
+#[test]
+fn cad1027_cancel_is_scoped_to_install_and_context() {
+    let door = FakeDoor::start();
+    let h = resolver_only_release(&door);
+    let (ctx_a, run_a, bundle_a, install) = approved_run(&h, "cscope-a");
+    let (ctx_b, _run_b, _bundle_b, _) = approved_run(&h, "cscope-b");
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &ctx_a,
+                &run_a,
+                &bundle_a,
+                &install,
+                "cad1027-cscope",
+                epoch_now() + 3600,
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    let id = intent["intent_id"].as_str().unwrap();
+    let board = Board::serve(&h);
+    let path = format!("/api/social-publishes/{id}/cancel");
+    for scope in [
+        json!({"install_id": "install-forged", "context_id": ctx_a["id"]}),
+        json!({"install_id": install, "context_id": ctx_b["id"]}),
+        json!({"install_id": install}),
+    ] {
+        let mut params = scope.clone();
+        params["intent_id"] = json!(id);
+        let err = h
+            .daemon
+            .operator_rpc("social_publish_cancel", params)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("in this install and context"),
+            "{scope}: {err}"
+        );
+        let (code, text) = board.post(&h, &path, &scope);
+        assert!(
+            (400..500).contains(&code),
+            "HTTP cancelled outside scope {scope}: {code} {text}"
+        );
+    }
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(
+        shown["intent"]["state"], "queued",
+        "an out-of-scope cancel changed the intent"
+    );
+    let (code, text) = board.post(
+        &h,
+        &path,
+        &json!({"install_id": install, "context_id": ctx_a["id"]}),
+    );
+    assert_eq!(code, 200, "in-scope cancel refused: {text}");
+    assert!(text.contains("\"cancelled\""), "{text}");
+}
+
+/// CAD-1027: a daemon-shaped approval id (`apv-` + 32 lowercase hex),
+/// distinct per seed — one approval authorizes one intent.
+fn approval_for(seed: &str) -> String {
+    use sha2::Digest as _;
+    let hex = format!("{:x}", sha2::Sha256::digest(seed.as_bytes()));
+    format!("apv-{}", &hex[..32])
+}
+
+/// CAD-1027 adversarial: the daemon accepts only the minted approval shape
+/// (`apv-` + 32 lowercase hex), so a non-UI operator client cannot choose a
+/// guessable approval id. Every other shape refuses `bad_approval` through
+/// the RPC and the HTTP relay and stores nothing.
+#[test]
+fn cad1027_daemon_refuses_unminted_approval_shape() {
+    let door = FakeDoor::start();
+    let h = resolver_only_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "apvshape");
+    let board = Board::serve(&h);
+    let hex = "0123456789abcdef0123456789abcdef";
+    for (i, approval) in [
+        "op-a".to_owned(),
+        "cad_approval_01".to_owned(),
+        format!("apv-{}", hex.to_uppercase()),
+        format!("apv-{}", &hex[..31]),
+        format!("apv-{hex}0"),
+        format!("apv-{}g", &hex[..31]),
+        format!("APV-{hex}"),
+        format!(" apv-{hex}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut params = freeze_params(
+            &context,
+            &run,
+            &bundle,
+            &install,
+            &format!("cad1027-shape-{i}"),
+            epoch_now() + 3600,
+        );
+        params["approval_id"] = json!(approval);
+        let err = h
+            .daemon
+            .operator_rpc("social_publish_schedule", params.clone())
+            .expect_err(&approval)
+            .to_string();
+        assert!(err.contains("bad_approval"), "RPC {approval:?}: {err}");
+        let (code, text) = board.post(&h, "/api/social-publishes", &params);
+        assert!(
+            (400..500).contains(&code),
+            "HTTP accepted {approval:?}: {code} {text}"
+        );
+        assert!(text.contains("bad_approval"), "HTTP {approval:?}: {text}");
+    }
+    assert_eq!(
+        intent_count(&h, &install),
+        0,
+        "an unminted approval stored an intent"
+    );
+    let mut ok = freeze_params(
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1027-shape-ok",
+        epoch_now() + 3600,
+    );
+    ok["approval_id"] = json!(format!("apv-{hex}"));
+    assert_eq!(
+        h.daemon
+            .operator_rpc("social_publish_schedule", ok)
+            .unwrap()["intent"]["state"],
+        "queued"
+    );
 }

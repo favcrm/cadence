@@ -104,9 +104,11 @@ const TIMEOUT_TERM_CODE: i32 = 124;
 const TIMEOUT_KILL_CODE: i32 = 137;
 
 /// The v0 bundle shape — the same allowlist `app.rs` pins privately:
-/// `app.md` plus flat `workflows/`, `rubrics/`, `templates/` dirs.
-/// Kept identical by inspection parity, never expanded here.
-const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates"];
+/// `app.md` plus flat `workflows/`, `rubrics/`, `templates/` dirs, and
+/// CAD-1006's `screens/` (one `<tag>/` subdir per package of flat
+/// `<stem>.<js|css|svg|json>` leaves + `screens.json`). Kept identical
+/// by inspection parity.
+const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "screens"];
 
 /// Most files a bundle may carry — pinned at `app.rs`'s private
 /// `MAX_FILES`.
@@ -664,6 +666,84 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
             ))
         })?;
         for leaf in list_dir(&sub)? {
+            let leaf_text = std::str::from_utf8(&leaf).map_err(|_| {
+                Error::rejected(format!("{top_text}/ carries a name that is not UTF-8"))
+            })?;
+            let rel = format!("{top_text}/{leaf_text}");
+            if leaf_text.starts_with('.') {
+                return Err(Error::rejected(format!(
+                    "bundle entry '{rel}': dotfiles are not app content"
+                )));
+            }
+            // CAD-1006: screens/<tag>/<asset> — the one nested level.
+            if top_text == "screens" {
+                match kind_at(&sub, &leaf)? {
+                    libc::S_IFDIR => {
+                        if !model::valid_tag(leaf_text) {
+                            return Err(Error::rejected(format!(
+                                "bundle entry '{rel}': the screen tag '{leaf_text}' is \
+                                 not tag-shaped"
+                            )));
+                        }
+                        let tagdir = open_dir_at(&sub, &leaf).map_err(|e| {
+                            Error::rejected(format!(
+                                "bundle directory '{rel}' cannot be opened: {e}"
+                            ))
+                        })?;
+                        for asset in list_dir(&tagdir)? {
+                            let asset_text = std::str::from_utf8(&asset).map_err(|_| {
+                                Error::rejected(format!("{rel}/ carries a non-UTF-8 name"))
+                            })?;
+                            let arel = format!("{rel}/{asset_text}");
+                            if asset_text.starts_with('.') {
+                                return Err(Error::rejected(format!(
+                                    "bundle entry '{arel}': dotfiles are not app content"
+                                )));
+                            }
+                            match kind_at(&tagdir, &asset)? {
+                                libc::S_IFREG => {
+                                    if !crate::issue::app_screen_pkg::leaf_ok(asset_text) {
+                                        return Err(Error::rejected(format!(
+                                            "bundle entry '{arel}': a screen asset is \
+                                             <stem>.<js|css|svg|json>, or screens.json"
+                                        )));
+                                    }
+                                    add(&tagdir, &asset, arel)?;
+                                }
+                                libc::S_IFDIR => {
+                                    return Err(Error::rejected(format!(
+                                        "bundle entry '{arel}': screen assets are flat \
+                                         files — no nested folders"
+                                    )))
+                                }
+                                libc::S_IFLNK => {
+                                    return Err(Error::rejected(format!(
+                                        "bundle entry '{arel}' is a symlink — a bundle \
+                                         holds real files only"
+                                    )))
+                                }
+                                _ => {
+                                    return Err(Error::rejected(format!(
+                                        "bundle entry '{arel}' is not a regular file"
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                    libc::S_IFLNK => {
+                        return Err(Error::rejected(format!(
+                            "bundle entry '{rel}' is a symlink — a bundle holds real \
+                             files only"
+                        )))
+                    }
+                    _ => {
+                        return Err(Error::rejected(format!(
+                            "bundle entry '{rel}': a screen package is a <tag>/ directory"
+                        )))
+                    }
+                }
+                continue;
+            }
             let leaf_text = std::str::from_utf8(&leaf).map_err(|_| {
                 Error::rejected(format!("{top_text}/ carries a name that is not UTF-8"))
             })?;

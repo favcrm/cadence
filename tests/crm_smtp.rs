@@ -506,6 +506,177 @@ fn cad785_secret_never_leaves_custody() {
     assert!(!events_text(&app.daemon).contains(OTHER_SECRET));
 }
 
+/// Replace the one custody file and re-record its fingerprint, the
+/// way a corrupted-but-consistent record looks to the daemon.
+fn replace_custody(daemon: &TestDaemon, bytes: &[u8], fingerprint_matches: bool) {
+    let dir = daemon.state.join("custody");
+    let cred = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("cred"))
+        .expect("custody file");
+    std::fs::write(&cred, bytes).unwrap();
+    if fingerprint_matches {
+        let db = rusqlite::Connection::open(daemon.state.join("cadence.sqlite3")).unwrap();
+        db.execute(
+            "UPDATE platform_credentials SET fingerprint=?1",
+            [cadence_agent::secret::fingerprint(bytes)],
+        )
+        .unwrap();
+    }
+}
+
+fn listed(app: &Crm, id: &str) -> Value {
+    app.daemon
+        .operator_rpc("connection_list", json!({}))
+        .unwrap()["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == id)
+        .cloned()
+        .expect("connection listed")
+}
+
+fn smtp_fields(secret: &str) -> Value {
+    json!({"provider": "smtp", "account": "gmail", "shape": "smtp",
+        "host": "localhost", "port": 465, "tls_mode": "implicit",
+        "username": "smtp-user", "secret": secret,
+        "sender": "news@example.com", "sender_name": "CRM News",
+        "scopes": ["email:send"], "accept_same_uid_risk": true})
+}
+
+#[test]
+fn cad1064_unreadable_sender_stays_listed_with_typed_error_and_no_secret() {
+    let app = Crm::new();
+    let id = app.enroll("gmail", SECRET)["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let healthy = listed(&app, &id);
+    assert_eq!(healthy["smtp_sender"], true);
+    assert_eq!(healthy["smtp_error"], Value::Null);
+    assert_eq!(healthy["smtp"]["host"], "localhost");
+    // Non-SMTP rows are never SMTP senders.
+    let all = app
+        .daemon
+        .operator_rpc("connection_list", json!({}))
+        .unwrap();
+    for row in all["connections"].as_array().unwrap() {
+        if row["id"] != id.as_str() {
+            assert_eq!(row["smtp_sender"], false, "{row}");
+            assert_eq!(row["smtp_error"], Value::Null, "{row}");
+        }
+    }
+    // Corrupt custody that still matches its fingerprint.
+    replace_custody(&app.daemon, b"{\"schema\":2}", true);
+    let corrupt = listed(&app, &id);
+    assert_eq!(corrupt["kind"], "enrolled");
+    assert_eq!(corrupt["smtp"], Value::Null);
+    assert_eq!(corrupt["smtp_sender"], true);
+    assert_eq!(corrupt["smtp_error"], "custody_corrupt");
+    // Torn custody (fingerprint no longer matches).
+    replace_custody(&app.daemon, b"torn", false);
+    let torn = listed(&app, &id);
+    assert_eq!(torn["smtp_sender"], true);
+    assert_eq!(torn["smtp_error"], "unavailable");
+    for row in [&corrupt, &torn] {
+        assert!(!row.to_string().contains(SECRET), "{row}");
+    }
+    // A leaky legacy record: secret overlaps the username, written
+    // straight to custody (enrollment refuses to create this).
+    let leaky = format!("zz{}zz", "smtp-user");
+    let bytes = serde_json::to_vec(&json!({"schema": 1, "provider": "smtp",
+        "host": "localhost", "port": 465, "tls_mode": "implicit",
+        "username": "smtp-user", "secret": leaky,
+        "sender": "news@example.com", "sender_name": "CRM News"}))
+    .unwrap();
+    replace_custody(&app.daemon, &bytes, true);
+    let withheld = listed(&app, &id);
+    assert_eq!(withheld["smtp"], Value::Null);
+    assert_eq!(withheld["smtp_sender"], true);
+    assert_eq!(withheld["smtp_error"], "withheld_leak");
+    assert!(!withheld.to_string().contains(&leaky));
+    assert!(!withheld.to_string().contains("zzsmtp"));
+    let shown = app
+        .daemon
+        .operator_rpc("connection_show", json!({"connection_id": id}))
+        .unwrap();
+    assert_eq!(shown["connection"]["smtp_error"], "withheld_leak");
+    // Rotation with only a secret cannot inherit unreadable fields.
+    let error = app
+        .daemon
+        .operator_rpc(
+            "connection_rotate",
+            json!({"connection_id": id, "secret": OTHER_SECRET}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("re-entered"), "{error}");
+    assert!(!error.contains(OTHER_SECRET) && !error.contains(&leaky));
+    // Re-entering every field repairs it.
+    let mut full = smtp_fields(OTHER_SECRET);
+    full["connection_id"] = json!(id);
+    for field in [
+        "provider",
+        "account",
+        "shape",
+        "scopes",
+        "accept_same_uid_risk",
+    ] {
+        full.as_object_mut().unwrap().remove(field);
+    }
+    let rotated = app.daemon.operator_rpc("connection_rotate", full).unwrap();
+    assert_eq!(rotated["connection"]["smtp_error"], Value::Null);
+    assert_eq!(rotated["connection"]["smtp"]["username"], "smtp-user");
+    assert!(!rotated.to_string().contains(OTHER_SECRET));
+}
+
+#[test]
+fn cad1064_enrollment_and_rotation_refuse_overlapping_password_and_strip_spaces() {
+    let app = Crm::new();
+    let overlap = format!("a{}b", "smtp-user");
+    let error = app
+        .daemon
+        .operator_rpc("connection_create", smtp_fields(&overlap))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("different password"), "{error}");
+    assert!(!error.contains(&overlap), "echoed: {error}");
+    let none = app
+        .daemon
+        .operator_rpc("connection_list", json!({}))
+        .unwrap();
+    assert!(
+        none["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["smtp_sender"] == false),
+        "refused enrollment created a record"
+    );
+    // Gmail groups its app passwords with spaces.
+    let grouped = ["qwlz", "xmnb", "vcpo", "iuyt"].join(" ");
+    let created = app
+        .daemon
+        .operator_rpc("connection_create", smtp_fields(&grouped))
+        .unwrap();
+    let id = created["connection"]["id"].as_str().unwrap().to_string();
+    assert_eq!(created["connection"]["smtp_error"], Value::Null);
+    assert_eq!(created["connection"]["smtp"]["sender"], "news@example.com");
+    // Rotation with an overlapping secret is refused, nothing changes.
+    let error = app
+        .daemon
+        .operator_rpc(
+            "connection_rotate",
+            json!({"connection_id": id, "secret": overlap}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("different password"), "{error}");
+    assert_eq!(listed(&app, &id)["revision"], 1);
+}
+
 #[test]
 fn cad785_one_live_link_per_install_context_with_stale_revoke() {
     let app = Crm::new();

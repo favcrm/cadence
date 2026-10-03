@@ -2425,11 +2425,25 @@ impl ProviderAdapter for PiAdapter {
     fn run_turn(
         &self,
         prompt: &str,
+        client_message_id: &str,
+        on_started: &dyn Fn(&str),
+    ) -> Result<TurnResult> {
+        self.run_turn_slotted(prompt, None, client_message_id, on_started)
+    }
+
+    /// CAD-1009: the token is minted here, before the prompt is sent, so
+    /// the scoped-turn line shows exactly the token `on_started` hands
+    /// the daemon.
+    fn run_turn_slotted(
+        &self,
+        prompt: &str,
+        slot: Option<&str>,
         _client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
         let generation = self.shared.generation.lock().unwrap().clone();
         let turn_id = registry::PI_MANAGED_TURN_TOKENS.mint(&generation);
+        let prompt = &super::with_turn_token(prompt, slot, &turn_id);
         *self.shared.interrupt_at.lock().unwrap() = None;
         // A settled-but-unconsumed turn is stale — it belongs to a
         // message the daemon already fenced.

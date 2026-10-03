@@ -764,3 +764,79 @@ fn cad781_http_list_search_and_pagination_through_peer() {
         3
     );
 }
+
+#[test]
+fn cad1053_http_consent_grant_needs_operator_and_a_method() {
+    let b = Board::new();
+    let base = b.base();
+    let created = b.value(
+        "POST",
+        &base,
+        json!({"record_id": "customer-1", "profile": Board::profile(PROFILE_B)}),
+    );
+    let show_path = format!("{base}/customer-1");
+    let update_path = format!("{show_path}/update");
+    let grant = Board::profile(PROFILE_A);
+
+    // Operator, no method: refused, record unchanged.
+    let (code, body) = b.operator(
+        "POST",
+        &update_path,
+        &json!({"expected_revision": 1, "profile": grant}).to_string(),
+    );
+    assert_eq!(code, 409, "{body}");
+    // Forged extra field inside the provenance: refused.
+    let (code, _) = b.operator(
+        "POST",
+        &update_path,
+        &json!({"expected_revision": 1, "profile": grant, "consent_provenance": {"method": "written", "actor": "operator"}}).to_string(),
+    );
+    assert_ne!(code, 200);
+    assert_eq!(
+        b.value("GET", &show_path, json!({}))["record"],
+        created["record"]
+    );
+
+    // An agent (plain and detached) with a valid method is refused at
+    // the operator peer; nothing is written.
+    let mut lane = LaneShell::spawn(b.root.path());
+    plant_member_pane(&b.daemon, "consent-http-worker", "claude", None, lane.pid());
+    let body = json!({"expected_revision": 1, "profile": grant, "consent_provenance": {"method": "in_person"}}).to_string();
+    for prefix in ["", "setsid "] {
+        let stolen = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &b.daemon.state, b.port);
+        let wire = stolen.request_as("POST", &update_path, &body, "");
+        let file = lane.dir.path().join(format!("request-{}.txt", lane.seq));
+        std::fs::write(&file, wire).unwrap();
+        let (rc, response) = lane.run(&format!("{prefix}python3 -c 'import socket,sys;s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {} {}", b.port, file.display()));
+        assert_eq!(rc, 0);
+        assert_eq!(
+            response.split_whitespace().nth(1),
+            Some("403"),
+            "{prefix:?}: {response}"
+        );
+    }
+    assert_eq!(
+        b.value("GET", &show_path, json!({}))["record"],
+        created["record"]
+    );
+
+    // Operator with a method: lands, and the receipt names it.
+    let updated = b.value(
+        "POST",
+        &update_path,
+        json!({"expected_revision": 1, "profile": grant, "consent_provenance": {"method": "web_form", "note": "Footer signup"}}),
+    );
+    let last = updated["record"]["consent_history"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(last["state"], "granted");
+    assert_eq!(last["method"], "web_form");
+    assert_eq!(last["note"], "Footer signup");
+    assert_eq!(
+        b.rpc_show(&b.install, &b.context_id, "customer-1")["record"],
+        updated["record"]
+    );
+}

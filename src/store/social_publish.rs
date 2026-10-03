@@ -11,9 +11,10 @@
 //! Shape validation reuses
 //! [`crate::platform::agenticos_external::publish`], the read-only mirror
 //! of the pinned AOS-94 device-publish v1 contract (PR #214 @ 12953144).
-//! The run/effect cross-check against app runs (proving the frozen caption
-//! and asset are the reviewed ones) lands with the slice-3 E2E wiring; the
-//! store already keeps `run_id`/`effect_id` for that join.
+//! Freeze from an artifact re-proves the reviewed run material (caption and
+//! asset digests derive from it) and, since CAD-1027, that the request's
+//! install/context are the run's own and that `effect_id` is a live app
+//! effect authorized by this run's artifact in that scope.
 
 use super::*;
 use rusqlite::{params, OptionalExtension};
@@ -278,6 +279,23 @@ impl Store {
                 upstream.as_ref(),
             ));
         }
+        // CAD-1027: one operator approval authorizes exactly one intent. The
+        // same-request retry returned above; the same approval under any
+        // other request — a replay, a double submit with a fresh request id,
+        // a re-schedule after cancel, another install — refuses. The check
+        // and the insert share this transaction on the one write connection.
+        let replayed: Option<String> = tx
+            .query_row(
+                "SELECT intent_id FROM social_publish_intents WHERE approval_id=?",
+                [row.approval_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if replayed.is_some() {
+            return Err(Error::rejected(
+                "approval_replay: this approval already authorized another social publish intent",
+            ));
+        }
         let intent_id = format!("spub-{}", uuid::Uuid::new_v4().simple());
         tx.execute("INSERT INTO social_publish_intents(intent_id,request,install_id,context_id,run_id,effect_id,connection_id,destination_id,toolkit,caption_digest,image_digest,media_key,grant_id,approval_id,due_epoch,timezone,state,frozen,frozen_digest,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?,?)",
             params![intent_id,request,row.install_id,row.context_id,row.run_id,row.effect_id,row.connection_id,row.destination_id,row.toolkit,row.caption_digest,row.image_digest,row.media_key,row.grant_id,row.approval_id,row.due_epoch,row.timezone,frozen.to_string(),digest,now(),now()])?;
@@ -292,14 +310,21 @@ impl Store {
         Ok(result)
     }
 
-    /// Operator cancellation before dispatch. Any other state refuses.
-    pub fn social_publish_cancel(&self, intent_id: &str) -> Result<Value> {
+    /// Operator cancellation before dispatch, scoped (CAD-1027): the intent
+    /// must belong to exactly this install and context (null-preserving).
+    /// Any other state or scope refuses and changes nothing.
+    pub fn social_publish_cancel(
+        &self,
+        intent_id: &str,
+        install_id: &str,
+        context_id: Option<&str>,
+    ) -> Result<Value> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
-        let changed = tx.execute("UPDATE social_publish_intents SET state='cancelled',updated=? WHERE intent_id=? AND state='queued'",params![now(),intent_id])?;
+        let changed = tx.execute("UPDATE social_publish_intents SET state='cancelled',updated=? WHERE intent_id=? AND state='queued' AND install_id=? AND context_id IS ?",params![now(),intent_id,install_id,context_id])?;
         if changed != 1 {
             return Err(Error::rejected(
-                "only a queued social publish intent can be cancelled",
+                "only a queued social publish intent in this install and context can be cancelled",
             ));
         }
         Self::event(
@@ -651,6 +676,17 @@ fn bare_digest(prefixed: &str) -> Result<&str> {
     Ok(hex)
 }
 
+/// CAD-1027: the operator approval id the confirmation step mints —
+/// `apv-` then exactly 32 lowercase hex (128 random bits).
+pub fn valid_approval_id(raw: &str) -> bool {
+    raw.strip_prefix("apv-").is_some_and(|hex| {
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 /// Params for freezing an intent from reviewed run material instead of
 /// caller-supplied digests.
 #[allow(clippy::too_many_arguments)]
@@ -662,7 +698,8 @@ pub struct FreezeFromArtifact<'a> {
     pub artifact_id: &'a str,
     pub bundle_digest: &'a str,
     pub slot: &'a str,
-    /// The operator's publish-approval identity (not an app_effect row).
+    /// A live app effect authorized by this run's artifact in this exact
+    /// install/context (CAD-1027): freeze refuses any other id.
     pub effect_id: &'a str,
     pub destination_id: &'a str,
     pub toolkit: &'a str,
@@ -689,12 +726,63 @@ impl Store {
         &self,
         row: &FreezeFromArtifact<'_>,
     ) -> Result<Value> {
+        // CAD-1027: only the minted approval shape freezes, so the
+        // per-confirmation, unguessable approval is not a UI-only property.
+        if !valid_approval_id(row.approval_id) {
+            return Err(Error::rejected(
+                "bad_approval: approval id must be apv- followed by 32 lowercase hex",
+            ));
+        }
         let material = self.app_publication_material(
             row.run_id,
             row.artifact_id,
             row.bundle_digest,
             row.slot,
         )?;
+        // CAD-1027: the request's install/context must be the run's own —
+        // the material proves the run's binding in the run's scope only, so
+        // a request naming another scope would otherwise freeze under it.
+        // context_id is exact and null-preserving (no wildcard).
+        if material["run"]["install_id"].as_str() != Some(row.install_id)
+            || material["run"]["context_id"].as_str() != row.context_id
+        {
+            return Err(Error::rejected(
+                "grant_binding_mismatch: schedule names a different install or context than the run",
+            ));
+        }
+        // CAD-1027: the effect must be an app effect authorized by THIS run's
+        // artifact in this exact scope — never a forged id or another run's.
+        let effect_scope = self
+            .conn()
+            .query_row(
+                // Live authority only: an app-artifact effect still waiting
+                // or accepted. Declined/closed/executed effects never back
+                // a post (the same live set authority changes close).
+                "SELECT a.install_id,a.context_id,a.run_id,a.artifact_id FROM app_effect_authorizations a JOIN platform_effects e ON e.effect_id=a.effect_id WHERE a.effect_id=? AND e.authorization_kind='app_artifact' AND e.state IN ('waiting','decided')",
+                [row.effect_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if effect_scope
+            .as_ref()
+            .is_none_or(|(install, context, run, artifact)| {
+                install != row.install_id
+                    || context.as_deref() != row.context_id
+                    || run != row.run_id
+                    || artifact != row.artifact_id
+            })
+        {
+            return Err(Error::rejected(
+                "bad_effect: effect is not live authority for this run, artifact and scope",
+            ));
+        }
         let caption_digest = bare_digest(
             material["artifact"]["digest"]
                 .as_str()

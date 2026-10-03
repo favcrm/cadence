@@ -367,6 +367,11 @@ pub struct Draft {
     pub subject: String,
     pub preheader: String,
     pub blocks: Vec<Block>,
+    /// CAD-1056: host-sanitised operator HTML body. When set it
+    /// replaces `blocks` (kept empty) at render time.
+    pub html: Option<String>,
+    /// CAD-1056: operator plain-text override; generated when absent.
+    pub text: Option<String>,
 }
 
 impl Draft {
@@ -397,7 +402,50 @@ impl Draft {
             subject: subject.to_string(),
             preheader: preheader.to_string(),
             blocks: parsed,
+            html: None,
+            text: None,
         })
+    }
+
+    /// CAD-1056: an operator draft whose body is pasted HTML. The
+    /// HTML is sanitised here, so a `Draft` never holds raw markup.
+    pub fn parse_html(subject: &str, preheader: &str, html: &str) -> Result<Self> {
+        reject_subject(subject)?;
+        reject_preheader(preheader)?;
+        let clean = super::app_content_html::sanitize_html(html)?;
+        let mut tokens = validate_tokens(subject, 0)?;
+        tokens = validate_tokens(preheader, tokens)?;
+        validate_tokens(&clean, tokens)?;
+        Ok(Self {
+            subject: subject.to_string(),
+            preheader: preheader.to_string(),
+            blocks: Vec::new(),
+            html: Some(clean),
+            text: None,
+        })
+    }
+
+    /// CAD-1056: attach an optional plain-text override. It is bound,
+    /// control-free, token-checked and may not carry the host footer.
+    pub fn with_text(mut self, text: Option<&str>) -> Result<Self> {
+        let Some(text) = text else {
+            return Ok(self);
+        };
+        const BAD: &str = "email plain text exceeds its supported shape or bounds";
+        if text.trim().is_empty()
+            || text.len() > super::app_content_html::TEXT_OVERRIDE_BYTES
+            || text
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+            || text
+                .to_ascii_lowercase()
+                .contains(&FOOTER_NOTE.to_ascii_lowercase())
+        {
+            return Err(Error::rejected(BAD));
+        }
+        validate_tokens(text, 0)?;
+        self.text = Some(text.to_string());
+        Ok(self)
     }
 
     fn canonical_blocks(&self) -> Value {
@@ -576,7 +624,16 @@ fn render_html(draft: &Draft, sample: Option<&str>, binding: &BindingView) -> St
         out.push_str(&html_escape(&personalize(&draft.preheader, sample)));
         out.push_str("</div>");
     }
-    out.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td align=\"center\"><table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#ffffff;margin:24px auto;\"><tr><td style=\"padding:32px;font-family:Arial,sans-serif;color:#222222;\">");
+    // CAD-1014: the content column must shrink to the preview iframe —
+    // a fixed `width="600"` clips under the narrow-390 CRM preview. Keep
+    // the 600px desktop measure but cap it as a style (never a fixed
+    // attribute) so the column fills the frame at narrower widths.
+    out.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td align=\"center\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#ffffff;max-width:600px;margin:24px auto;\"><tr><td style=\"padding:32px;font-family:Arial,sans-serif;color:#222222;\">");
+    if let Some(html) = &draft.html {
+        // Sanitised at save time; the sample name and fallbacks are
+        // alphabetic by grammar, so substitution cannot add markup.
+        out.push_str(&personalize(html, sample));
+    }
     for block in &draft.blocks {
         match block {
             Block::Heading { text } => {
@@ -620,7 +677,19 @@ fn render_text(draft: &Draft, sample: Option<&str>, binding: &BindingView) -> St
         out.push('\n');
     }
     out.push('\n');
+    if let Some(text) = &draft.text {
+        out.push_str(&personalize(text, sample));
+        out.push_str("\n\n");
+    } else if let Some(html) = &draft.html {
+        out.push_str(&super::app_content_html::html_to_text(&personalize(
+            html, sample,
+        )));
+        out.push_str("\n\n");
+    }
     for block in &draft.blocks {
+        if draft.text.is_some() {
+            break;
+        }
         match block {
             Block::Heading { text } => {
                 out.push_str(&personalize(text, sample));
@@ -656,7 +725,7 @@ fn content_digest(
     revision: i64,
     draft: &Draft,
 ) -> String {
-    material_digest(&json!({
+    let mut doc = json!({
         "domain": "cadence-app-content-v1",
         "install_id": install,
         "context_id": context,
@@ -665,7 +734,16 @@ fn content_digest(
         "subject": draft.subject,
         "preheader": draft.preheader,
         "blocks": draft.canonical_blocks(),
-    }))
+    });
+    // CAD-1056: present only when set, so every earlier digest is
+    // unchanged and a body or text change always changes the digest.
+    if let Some(html) = &draft.html {
+        doc["html"] = json!(html);
+    }
+    if let Some(text) = &draft.text {
+        doc["text_override"] = json!(text);
+    }
+    material_digest(&doc)
 }
 
 fn proposal_digest(
@@ -708,6 +786,8 @@ struct ContentRow {
     digest: String,
     approval_revision: Option<i64>,
     approval_digest: Option<String>,
+    html: Option<String>,
+    text: Option<String>,
 }
 
 struct ProposalRow {
@@ -815,6 +895,17 @@ struct ResolvedBinding {
     view: BindingView,
 }
 
+/// A stored assistant-draft proposal row read back for idempotent
+/// replay — campaign, source revision, content digest and the
+/// message/agent receipt it was claimed under (CAD-1014).
+struct PriorDraft {
+    campaign_id: String,
+    source_revision: i64,
+    content_digest: String,
+    receipt_message: Option<String>,
+    receipt_agent: Option<String>,
+}
+
 impl RecordStore {
     fn content_row(
         &self,
@@ -825,7 +916,7 @@ impl RecordStore {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(campaign, "campaign ID")?;
         conn.query_row(
-            "SELECT revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest FROM app_content_docs WHERE context_id=? AND campaign_id=?",
+            "SELECT revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,html,text_override FROM app_content_docs WHERE context_id=? AND campaign_id=?",
             params![context, campaign],
             |r| {
                 let blocks: String = r.get(3)?;
@@ -838,6 +929,8 @@ impl RecordStore {
                     digest: r.get(4)?,
                     approval_revision: r.get(5)?,
                     approval_digest: r.get(6)?,
+                    html: r.get(7)?,
+                    text: r.get(8)?,
                 })
             },
         )
@@ -856,6 +949,9 @@ impl RecordStore {
             "subject": row.subject,
             "preheader": row.preheader,
             "blocks": row.blocks,
+            "mode": if row.html.is_some() { "html" } else { "blocks" },
+            "html": row.html,
+            "text_override": row.text,
             "content_digest": row.digest,
             "approval": {
                 "revision": row.approval_revision,
@@ -920,15 +1016,15 @@ impl RecordStore {
         let digest = content_digest(self.install(), context, campaign, revision, draft);
         if current.is_none() {
             tx.execute(
-                "INSERT INTO app_content_docs(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,actor,created,updated) VALUES(?,?,?,?,?,?,?,NULL,NULL,'operator',?,?)",
-                params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now(), now()],
+                "INSERT INTO app_content_docs(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,actor,created,updated,html,text_override) VALUES(?,?,?,?,?,?,?,NULL,NULL,'operator',?,?,?,?)",
+                params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now(), now(), draft.html, draft.text],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
         } else {
             let changed = tx
                 .execute(
-                    "UPDATE app_content_docs SET revision=?,subject=?,preheader=?,blocks=?,content_digest=?,approval_revision=NULL,approval_digest=NULL,actor='operator',updated=? WHERE context_id=? AND campaign_id=? AND revision=?",
-                    params![revision, draft.subject, draft.preheader, blocks_text, digest, now(), context, campaign, current],
+                    "UPDATE app_content_docs SET revision=?,subject=?,preheader=?,blocks=?,content_digest=?,approval_revision=NULL,approval_digest=NULL,actor='operator',updated=?,html=?,text_override=? WHERE context_id=? AND campaign_id=? AND revision=?",
+                    params![revision, draft.subject, draft.preheader, blocks_text, digest, now(), draft.html, draft.text, context, campaign, current],
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
             if changed != 1 {
@@ -936,8 +1032,8 @@ impl RecordStore {
             }
         }
         tx.execute(
-            "INSERT INTO app_content_revisions(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,actor,origin,proposal_id,at) VALUES(?,?,?,?,?,?,?,'operator','operator',NULL,?)",
-            params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now()],
+            "INSERT INTO app_content_revisions(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,actor,origin,proposal_id,at,html,text_override) VALUES(?,?,?,?,?,?,?,'operator','operator',NULL,?,?,?)",
+            params![context, campaign, revision, draft.subject, draft.preheader, blocks_text, digest, now(), draft.html, draft.text],
         )
         .map_err(|e| Error::internal(e.to_string()))?;
         tx.commit().map_err(|e| Error::internal(e.to_string()))?;
@@ -996,11 +1092,19 @@ impl RecordStore {
             if wanted != row.revision {
                 // Immutable history: fetch the exact requested
                 // revision; anything else is stale, not approximate.
-                let (subject, preheader, blocks, digest): (String, String, String, String) = conn
+                type Hist = (
+                    String,
+                    String,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                );
+                let (subject, preheader, blocks, digest, html, text): Hist = conn
                     .query_row(
-                        "SELECT subject,preheader,blocks,content_digest FROM app_content_revisions WHERE context_id=? AND campaign_id=? AND revision=?",
+                        "SELECT subject,preheader,blocks,content_digest,html,text_override FROM app_content_revisions WHERE context_id=? AND campaign_id=? AND revision=?",
                         params![context, campaign, wanted],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
                     )
                     .optional()
                     .map_err(|e| Error::internal(e.to_string()))?
@@ -1024,6 +1128,8 @@ impl RecordStore {
                     subject,
                     preheader,
                     blocks: parsed,
+                    html,
+                    text,
                 };
                 return Ok((wanted, draft, digest));
             }
@@ -1046,6 +1152,8 @@ impl RecordStore {
                 subject: row.subject,
                 preheader: row.preheader,
                 blocks: parsed,
+                html: row.html,
+                text: row.text,
             },
             row.digest,
         ))
@@ -1245,6 +1353,32 @@ impl RecordStore {
         let conn = self.conn();
         let record = self.binding_record(&conn, context, binding_id)?;
         Ok(json!({"binding": self.binding_json(context, &record)}))
+    }
+
+    /// CAD-1056: the host's own unsubscribe URL shapes for this
+    /// context — the preview base and every saved binding base —
+    /// so operator HTML cannot link to them.
+    pub fn app_unsubscribe_endpoints(
+        &self,
+        context: &str,
+    ) -> Result<Vec<super::app_content_html::HostEndpoint>> {
+        use super::app_content_html::HostEndpoint;
+        crate::proto::identifier(context, "context ID")?;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT unsubscribe_base FROM app_sender_bindings WHERE context_id=?")
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let bases = stmt
+            .query_map(params![context], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let mut out: Vec<HostEndpoint> = HostEndpoint::binding(UNSUBSCRIBE_BASE)
+            .into_iter()
+            .collect();
+        for base in bases {
+            let base = base.map_err(|e| Error::internal(e.to_string()))?;
+            out.extend(HostEndpoint::binding(&base));
+        }
+        Ok(out)
     }
 
     pub fn app_sender_binding_list(&self, context: &str) -> Result<Value> {
@@ -1482,6 +1616,81 @@ impl RecordStore {
             "created": row.created,
             "decided": row.decided,
         }}))
+    }
+
+    /// CAD-1014: render a STORED proposal (the assistant's inert pending
+    /// draft) through the exact same `render_html`/`render_text` the
+    /// saved-content path uses — the operator's before-Apply preview.
+    /// Pure read: no apply/save/approve/send, no doc write, no freeze.
+    /// `send_ready:false`/`preview_only` always; the render carries the
+    /// proposal id, its state and the source revision it was drafted
+    /// against so the UI labels it as a proposal, never as live content.
+    /// A proposal that is not `pending` refuses — only an unapplied draft
+    /// has a preview to render.
+    pub fn app_content_proposal_render(
+        &self,
+        context: &str,
+        proposal_id: &str,
+        sample_first_name: Option<&str>,
+        binding_id: Option<&str>,
+    ) -> Result<Value> {
+        if let Some(name) = sample_first_name {
+            if !sample_name_valid(name) {
+                return Err(Error::rejected(
+                    "email sample name exceeds its supported shape or bounds",
+                ));
+            }
+        }
+        let conn = self.conn();
+        let row = self.proposal_row(&conn, context, proposal_id)?;
+        if row.state != "pending" {
+            return Err(Error::rejected(
+                "only a pending proposal has a before-apply preview",
+            ));
+        }
+        let raw: Value = serde_json::from_str(&row.blocks).unwrap_or(Value::Null);
+        let blocks = raw
+            .as_array()
+            .cloned()
+            .ok_or_else(|| Error::rejected("email proposal blocks are not an array"))?;
+        let draft = Draft::parse(&row.subject, &row.preheader, &blocks)?;
+        let binding = self.resolve_binding(&conn, context, binding_id)?;
+        let html = render_html(&draft, sample_first_name, &binding.view);
+        let text = render_text(&draft, sample_first_name, &binding.view);
+        let render_digest = material_digest(&json!({
+            "domain": "cadence-app-content-render-v1",
+            "content_digest": row.digest,
+            "binding_digest": binding.digest,
+            "proposal_id": proposal_id,
+            "html": html,
+            "text": text,
+        }));
+        let unsubscribe = unsubscribe_url(&binding.view);
+        Ok(json!({
+            "render": {
+                "proposal_id": proposal_id,
+                "campaign_id": row.campaign,
+                "install_id": self.install(),
+                "context_id": context,
+                "state": row.state,
+                "source_revision": row.source_revision,
+                "content_digest": row.digest,
+                "sample_first_name": sample_first_name,
+                "binding": {
+                    "binding_id": binding.binding_id,
+                    "revision": binding.revision,
+                    "digest": binding.digest,
+                    "preview_only": binding.preview_only,
+                },
+                "preview_only": true,
+                "send_ready": false,
+                "sender": {"name": binding.view.sender_name, "address": binding.view.sender_address},
+                "unsubscribe_url": unsubscribe,
+                "html": html,
+                "text": text,
+                "render_digest": render_digest,
+            },
+        }))
     }
 
     /// CAD-813: mint a one-time, host-stamped proposal request.
@@ -1798,6 +2007,107 @@ impl RecordStore {
         self.app_content_proposal_show(context, proposal_id)
     }
 
+    /// CAD-1014(b) composer-free scoped-chat draft: an assigned agent
+    /// turn drafts a campaign email with NO manual mint. The host
+    /// derives `source_revision` from the LIVE doc (0 when the campaign
+    /// has none — a first draft), stamps `receipt_request` with the
+    /// message id itself (the verified turn IS the request — there is
+    /// no operator-minted request row to redeem), and claims the
+    /// message via the `app_content_proposal_claim` unique index so one
+    /// turn produces one draft. The proposal stays `pending` /
+    /// `assistant-receipt` — never edits content, approves or sends;
+    /// Apply/Discard are still the operator's. `request_id` in the
+    /// provenance is the message id, honest because no mint exists.
+    pub fn app_content_assistant_draft(
+        &self,
+        context: &str,
+        campaign: &str,
+        proposal_id: &str,
+        draft: &Draft,
+        agent: &str,
+        message: &str,
+    ) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(campaign, "campaign ID")?;
+        crate::proto::identifier(proposal_id, "proposal ID")?;
+        if agent.is_empty()
+            || agent.len() > 80
+            || !agent
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        {
+            return Err(Error::rejected("draft agent identity is malformed"));
+        }
+        if message.is_empty() || message.len() > 128 || message.chars().any(char::is_control) {
+            return Err(Error::rejected("draft message identity is malformed"));
+        }
+        let digest = proposal_digest(self.install(), context, campaign, proposal_id, draft);
+        let blocks_text = serde_json::to_string(&draft.canonical_blocks())
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let conn = self.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| Error::internal(e.to_string()))?;
+        // Host-derived source: the live draft revision, or 0 for a
+        // first draft — never agent text.
+        let source_revision = tx
+            .query_row(
+                "SELECT revision FROM app_content_docs WHERE context_id=? AND campaign_id=?",
+                params![context, campaign],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?
+            .unwrap_or(0);
+        // Idempotent replay of the same proposal id on the same
+        // message+agent+identical bytes returns the stored proposal.
+        let existing: Option<PriorDraft> = tx
+            .query_row(
+                "SELECT campaign_id,source_revision,content_digest,receipt_message,receipt_agent FROM app_content_proposals WHERE context_id=? AND proposal_id=?",
+                params![context, proposal_id],
+                |r| {
+                    Ok(PriorDraft {
+                        campaign_id: r.get(0)?,
+                        source_revision: r.get(1)?,
+                        content_digest: r.get(2)?,
+                        receipt_message: r.get(3)?,
+                        receipt_agent: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if let Some(stored) = existing {
+            if stored.campaign_id == campaign
+                && stored.source_revision == source_revision
+                && stored.content_digest == digest
+                && stored.receipt_message.as_deref() == Some(message)
+                && stored.receipt_agent.as_deref() == Some(agent)
+            {
+                drop(tx);
+                drop(conn);
+                return self.app_content_proposal_show(context, proposal_id);
+            }
+            return Err(Error::rejected("email draft proposal ID is already used"));
+        }
+        // One turn = one draft: the unique claim index on
+        // receipt_message refuses a second proposal for this message.
+        if let Err(error) = tx.execute(
+            "INSERT INTO app_content_proposals(context_id,proposal_id,campaign_id,source_revision,subject,preheader,blocks,content_digest,actor,origin,receipt_message,receipt_agent,receipt_request,state,created,decided) VALUES(?,?,?,?,?,?,?,?,'assistant','assistant-receipt',?,?,?,'pending',?,NULL)",
+            params![context, proposal_id, campaign, source_revision, draft.subject, draft.preheader, blocks_text, digest, message, agent, message, now()],
+        ) {
+            if is_claim_conflict(&error) {
+                return Err(Error::rejected(
+                    "this scoped chat message already produced a draft",
+                ));
+            }
+            return Err(Error::internal(error.to_string()));
+        }
+        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+        drop(conn);
+        self.app_content_proposal_show(context, proposal_id)
+    }
+
     pub fn app_content_proposal_list(
         &self,
         context: &str,
@@ -1869,6 +2179,8 @@ impl RecordStore {
             subject: proposal.subject.clone(),
             preheader: proposal.preheader.clone(),
             blocks,
+            html: None,
+            text: None,
         };
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
@@ -1920,7 +2232,7 @@ impl RecordStore {
         } else {
             let changed = tx
                 .execute(
-                    "UPDATE app_content_docs SET revision=?,subject=?,preheader=?,blocks=?,content_digest=?,approval_revision=NULL,approval_digest=NULL,actor='operator',updated=? WHERE context_id=? AND campaign_id=? AND revision=?",
+                    "UPDATE app_content_docs SET revision=?,subject=?,preheader=?,blocks=?,content_digest=?,approval_revision=NULL,approval_digest=NULL,actor='operator',updated=?,html=NULL,text_override=NULL WHERE context_id=? AND campaign_id=? AND revision=?",
                     params![revision, draft.subject, draft.preheader, stored, content_digest, now(), context, proposal.campaign, current],
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
@@ -2266,5 +2578,59 @@ impl Store {
         {
             eprintln!("content audit event skipped: event write refused");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_draft() -> Draft {
+        Draft::parse(
+            "Welcome {{first_name|friend}}",
+            "A note",
+            &[
+                json!({"type": "heading", "text": "Hello {{first_name|friend}}"}),
+                json!({"type": "paragraph", "text": "First line.\nSecond line."}),
+                json!({"type": "button", "label": "Open", "url": "https://example.com/x"}),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// CAD-1014: the email content column is responsive — `width="100%"`
+    /// with a `max-width:600px` style cap — so the narrow-390 CRM preview
+    /// frame shows the whole message instead of clipping a fixed 600px
+    /// table. No `width="600"` attribute ever returns.
+    #[test]
+    fn render_html_content_column_is_responsive() {
+        let html = render_html(&test_draft(), Some("Amina"), &preview_binding_view());
+        assert!(
+            !html.contains("width=\"600\""),
+            "fixed 600px content table clipped the narrow preview: {html}"
+        );
+        assert!(
+            html.contains("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#ffffff;max-width:600px;margin:24px auto;\">"),
+            "responsive content column missing: {html}"
+        );
+        // Content still renders through the new table shape.
+        assert!(html.contains("Hello Amina"), "{html}");
+        assert!(html.contains("https://example.com/x"), "{html}");
+    }
+
+    /// CAD-1056: the digest binds the HTML body and the text override,
+    /// so approval can never carry across a changed body.
+    #[test]
+    fn digest_binds_html_and_text_override() {
+        let digest = |draft: &Draft| content_digest("i", "c", "k", 1, draft);
+        let a = Draft::parse_html("Hi", "", "<p>one</p>").unwrap();
+        let b = Draft::parse_html("Hi", "", "<p>two</p>").unwrap();
+        assert_ne!(digest(&a), digest(&b));
+        let with_text = a.clone().with_text(Some("plain")).unwrap();
+        assert_ne!(digest(&a), digest(&with_text));
+        assert_ne!(
+            digest(&with_text),
+            digest(&a.clone().with_text(Some("other")).unwrap())
+        );
     }
 }

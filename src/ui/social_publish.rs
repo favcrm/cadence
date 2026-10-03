@@ -126,9 +126,19 @@ struct MediaImport {
     toolkit: String,
     destination_id: String,
 }
-#[derive(Deserialize)]
+/// CAD-1027: cancel names the intent's own install and exact context; the
+/// daemon refuses any other scope.
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Empty {}
+struct Cancel {
+    install_id: String,
+    #[serde(
+        default,
+        deserialize_with = "present_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    context_id: Option<String>,
+}
 
 fn query(request: &Request) -> Result<Value, HttpResp> {
     let raw = request
@@ -254,10 +264,13 @@ pub(super) fn handle(
                 Ok(bytes) => bytes,
                 Err(response) => return response,
             };
-            if let Err(response) = parse_json::<Empty>(&bytes) {
-                return response;
-            }
-            ("social_publish_cancel", json!({"intent_id": id}))
+            let scope: Cancel = match parse_json(&bytes) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let mut params = serde_json::to_value(scope).expect("typed cancel serializes");
+            params["intent_id"] = json!(id);
+            ("social_publish_cancel", params)
         }
         Route::MediaImport => {
             let bytes = match read_body(request, BODY_CAP) {

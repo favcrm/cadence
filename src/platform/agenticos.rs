@@ -173,6 +173,11 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions, hosted: &crate::lease::Hos
     let Some(base) = resolve_base(lease_is_on(hosted), explicit.as_deref()) else {
         return Ok(());
     };
+    // CAD-1063: only a real hosted lease replaces SMTP egress with the
+    // platform email door; an explicit URL alone never does.
+    if lease_is_on(hosted) && opts.hosted_email.is_none() {
+        opts.hosted_email = super::hosted_email::HostedEmail::from_env(&base)?;
+    }
     register_from_composition(opts, &base, lease_is_on(hosted))
 }
 

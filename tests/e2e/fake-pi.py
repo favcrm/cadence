@@ -301,6 +301,10 @@ def run_prompt(message):
     emit({"type": "turn_start"})
     emit({"type": "message_start", "message": {"role": "assistant"}})
     reply = "fake-pi reply: " + message.strip().splitlines()[-1][:80]
+    if MODE == "echo-all":
+        # CAD-1009: the whole provider prompt, so a test can read what
+        # the daemon actually delivered (envelope lines included).
+        reply = "fake-pi prompt: " + message
     slow = MODE == "slow"  # CAD-551: a visible turn for the working row
     if "run tool" in message:
         emit({

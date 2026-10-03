@@ -961,6 +961,72 @@ impl Auth {
         Ok(gone)
     }
 
+    /// Whether a live session with this display `id` exists right now.
+    /// CAD-1006: the frame-capability consume path proves the consuming
+    /// request's session resolves to the id the mint was bound to — a
+    /// revoked session id fails closed. `now` is the operator clock.
+    pub fn live_session_id(&mut self, id: &str, now: i64) -> Result<bool> {
+        if self.prune(now) {
+            self.persist()?;
+        }
+        Ok(self.sessions.iter().any(|r| r.id() == id))
+    }
+
+    /// Whether a live row carries this FULL credential hash. `crate`-
+    /// private — the cap machinery binds a session by the row's verified
+    /// full `sha256(token)` hash, not its 8-hex display prefix, so a
+    /// prefix collision where a DIFFERENT row survives the original's
+    /// revocation cannot keep a cap live. The hash never leaves the
+    /// daemon (no HTTP/browser/log). Returns false on any error.
+    pub(crate) fn live_hash(&mut self, hash: &str, now: i64) -> Result<bool> {
+        if self.prune(now) {
+            self.persist()?;
+        }
+        Ok(self.sessions.iter().any(|r| r.hash == hash && r.live(now)))
+    }
+
+    /// The verified row's FULL credential hash for `token` (+ `key` on a
+    /// keyed origin), or `None` when no live session matches. `crate`-
+    /// private — mint binds a frame cap to this internal value, never
+    /// the 8-hex display id. The token/key are consumed by `Auth` only.
+    pub(crate) fn session_hash(
+        &mut self,
+        token: &str,
+        key: &str,
+        origin: Origin,
+        now: i64,
+    ) -> Result<Option<String>> {
+        if !well_formed(token) || !well_formed(key) {
+            return Ok(None);
+        }
+        let hash = digest(token);
+        let key_hash = digest(key);
+        Ok(self
+            .sessions
+            .iter()
+            .find(|r| {
+                same_credential(&r.hash, &hash)
+                    && same_credential(&r.key_hash, &key_hash)
+                    && r.origin == origin
+                    && r.live(now)
+            })
+            .map(|r| r.hash.clone()))
+    }
+
+    /// The verified public row's FULL credential hash for `token` — the
+    /// cookie-only public surface has no `key`. `crate`-private.
+    pub(crate) fn public_session_hash(&mut self, token: &str, now: i64) -> Result<Option<String>> {
+        if !well_formed(token) {
+            return Ok(None);
+        }
+        let hash = digest(token);
+        Ok(self
+            .sessions
+            .iter()
+            .find(|r| r.origin == Origin::Public && same_credential(&r.hash, &hash) && r.live(now))
+            .map(|r| r.hash.clone()))
+    }
+
     /// The live sessions, oldest first.
     pub fn list(&mut self, now: i64) -> Result<Vec<SessionView>> {
         if self.prune(now) {
@@ -985,6 +1051,60 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().mode() & 0o777
+    }
+
+    /// CAD-1006 follow-up: the cap binds a session by its row's FULL
+    /// credential hash, not the 8-hex display `id`. Two rows that share
+    /// the same first-8 prefix but differ after: revoking one must NOT
+    /// leave the cap's `live_hash` satisfied by the surviving collider,
+    /// and `live_session_id` (display-prefix) must still behave as before
+    /// for its own callers.
+    #[test]
+    fn cap_binds_full_hash_not_display_prefix() {
+        let s = state();
+        let mut auth = Auth::load(s.path());
+        let now = 1_000i64;
+        // Two rows sharing the 8-hex display prefix, different full hash.
+        let prefix = "abcd1234";
+        let mk = |suffix: &str| Row {
+            hash: format!("{}{}", prefix, suffix),
+            key_hash: "k".repeat(64),
+            origin: Origin::Loopback,
+            created: now,
+            last_used: now,
+            expires_at: now + 10_000,
+            user_agent: String::new(),
+            max_idle_secs: IDLE_SECS,
+            user: None,
+        };
+        let orig = mk(&"1".repeat(56));
+        let collider = mk(&"2".repeat(56));
+        assert_eq!(orig.id(), collider.id(), "fixtures must share prefix");
+        assert_ne!(orig.hash, collider.hash);
+        let orig_hash = orig.hash.clone();
+        let collider_hash = collider.hash.clone();
+        auth.sessions.push(orig);
+        auth.sessions.push(collider);
+
+        // Both live under the prefix and the full hash.
+        assert!(auth.live_session_id(prefix, now).unwrap());
+        assert!(auth.live_hash(&orig_hash, now).unwrap());
+        assert!(auth.live_hash(&collider_hash, now).unwrap());
+
+        // Revoke the ORIGINAL by its display id — `revoke_id` drops every
+        // row under the prefix, so the collider goes too; that is the
+        // honest revoke semantics. Prove instead the sharper property:
+        // a cap bound to `orig_hash` stays live only while THAT row lives.
+        auth.sessions.retain(|r| r.hash != orig_hash);
+        // The collider (same display prefix) still lives — but the cap's
+        // full-hash check for the revoked original must now FAIL.
+        assert!(
+            !auth.live_hash(&orig_hash, now).unwrap(),
+            "colliding row satisfied the revoked cap's full-hash binding"
+        );
+        assert!(auth.live_hash(&collider_hash, now).unwrap());
+        // The display-prefix check still sees the survivor (unchanged).
+        assert!(auth.live_session_id(prefix, now).unwrap());
     }
 
     #[test]

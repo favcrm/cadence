@@ -82,6 +82,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 webpki-roots = { version = "1" }
 # Decode retained CDN bytes before issuing an image asset receipt.
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+ammonia = "4"
 
 [[test]]
 name = "e2e_mvp"

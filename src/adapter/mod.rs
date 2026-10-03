@@ -361,6 +361,27 @@ pub trait ProviderAdapter: Send + Sync {
         client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult>;
+    /// CAD-1009: [`Self::run_turn`] for a prompt that may carry a
+    /// scoped-turn token `slot` (a unique marker the daemon left after
+    /// the App hint). An adapter that mints its turn token inside
+    /// `run_turn` (managed Pi and Claude) replaces every occurrence of
+    /// the slot with the very token it hands `on_started`, so what the model is shown is
+    /// exactly what the redeem gate compares. This default is for
+    /// endpoints that cannot redeem: it drops the slot and runs the
+    /// turn unchanged.
+    fn run_turn_slotted(
+        &self,
+        prompt: &str,
+        slot: Option<&str>,
+        client_message_id: &str,
+        on_started: &dyn Fn(&str),
+    ) -> Result<TurnResult> {
+        let prompt = match slot {
+            Some(slot) => without_turn_slot(prompt, slot),
+            None => prompt.to_string(),
+        };
+        self.run_turn(&prompt, client_message_id, on_started)
+    }
     /// CAD-565: pre-write screening of the stored `body` — distinct
     /// from the check on the paste itself. A pty pane now receives a
     /// bounded notice while the body is pulled, so refusing the body
@@ -586,6 +607,45 @@ pub trait ProviderAdapter: Send + Sync {
             "the '{command}' command is not supported by this provider"
         )))
     }
+}
+
+/// CAD-1009: the opener and closer of the scoped-turn block the daemon
+/// writes into a scoped App prompt (`master::scoped_verb_reference`),
+/// with the one-use `slot` standing where the turn token goes.
+const TURN_BLOCK_OPEN: &str = "[Scoped chat turn";
+const TURN_BLOCK_CLOSE: &str = "[end scoped chat turn]";
+
+/// CAD-1009: `prompt` with every occurrence of `slot` replaced by
+/// `token`. The block around the slot (message id, install/context,
+/// verb reference) is daemon-written; the slot is a random per-turn
+/// value the daemon never stores, so only daemon-placed text can
+/// match and the model sees exactly the token the redeem gate compares.
+pub fn with_turn_token(prompt: &str, slot: Option<&str>, token: &str) -> String {
+    match slot {
+        Some(slot) => prompt.replace(slot, token),
+        None => prompt.to_string(),
+    }
+}
+
+/// CAD-1009: `prompt` without its scoped block — the endpoint cannot
+/// redeem, so the turn carries the hint only. A bare slot line (no
+/// block) is dropped too.
+fn without_turn_slot(prompt: &str, slot: &str) -> String {
+    let Some(at) = prompt.find(slot) else {
+        return prompt.to_string();
+    };
+    let start = prompt[..at]
+        .rfind(&format!("\n{TURN_BLOCK_OPEN}"))
+        .map(|i| i + 1)
+        .or_else(|| prompt[..at].rfind('\n').map(|i| i + 1))
+        .unwrap_or(0);
+    let end = prompt[at..]
+        .find(TURN_BLOCK_CLOSE)
+        .map(|i| at + i + TURN_BLOCK_CLOSE.len())
+        .or_else(|| prompt[at..].find('\n').map(|i| at + i))
+        .unwrap_or(prompt.len());
+    let end = prompt[end..].strip_prefix('\n').map_or(end, |_| end + 1);
+    format!("{}{}", &prompt[..start], &prompt[end..])
 }
 
 /// Build the adapter for an agent's `provider`/`endpoint_kind`.
@@ -857,6 +917,25 @@ mod split_launch_tests {
 
 #[cfg(test)]
 mod tests {
+    /// CAD-1009: the slot stands for the token wherever the daemon's
+    /// block puts it (many places), all filled with the one token; and
+    /// an endpoint that cannot redeem loses the whole block, not just
+    /// the first slot.
+    #[test]
+    fn turn_slot_fills_every_token_position_or_drops_the_block() {
+        let slot = "<<cadence-turn-slot:abc>>";
+        let block =
+            crate::master::scoped_verb_reference("i", "c", "m1", slot, std::path::Path::new("/t"));
+        let prompt = format!("[App context]\n{block}\n\nhello");
+        assert!(prompt.matches(slot).count() >= 2);
+        let filled = with_turn_token(&prompt, Some(slot), "pi-1-ff");
+        assert!(!filled.contains(slot));
+        assert!(filled.matches("pi-1-ff").count() >= 2);
+        assert_eq!(with_turn_token("x", None, "t"), "x");
+        let dropped = without_turn_slot(&prompt, slot);
+        assert_eq!(dropped, "[App context]\n\nhello");
+    }
+
     use std::process::Command;
 
     use super::*;

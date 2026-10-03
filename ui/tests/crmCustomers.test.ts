@@ -1,4 +1,5 @@
 import {
+  buildConsentChange,
   buildCustomerProfile,
   consentEntries,
   friendlyError,
@@ -82,6 +83,25 @@ for (const [fields, why] of [
 equal(parseTags("vip; newsletter  referral"), ["vip", "newsletter", "referral"], "tag separators split");
 await rejected(() => Promise.resolve().then(() => parseTags("a,".repeat(17))), (e) => e instanceof ApiError, "17 tags refused");
 assert(/^[A-Za-z0-9_-]{1,128}$/.test(newCustomerId()), "fresh record ids match the peer grammar");
+
+// CAD-1053 consent change: granting needs a method, withdrawing never does.
+{
+  const was = { schema: 1, display_name: "Ada", tags: [], consent: { email: "unknown" } };
+  await rejected(() => Promise.resolve().then(() => buildConsentChange(was, { email: "granted", sms: "unknown", method: "", note: "" })), (e) => e instanceof ApiError, "grant without method refused client-side");
+  await rejected(() => Promise.resolve().then(() => buildConsentChange(was, { email: "unknown", sms: "unknown", method: "", note: "" })), (e) => e instanceof ApiError, "no-op change refused");
+  await rejected(() => Promise.resolve().then(() => buildConsentChange(was, { email: "granted", sms: "unknown", method: "written", note: "x".repeat(281) })), (e) => e instanceof ApiError, "long note refused");
+  const granted = buildConsentChange(was, { email: "granted", sms: "unknown", method: "written", note: "  by email  " });
+  equal(granted.provenance, { method: "written", note: "by email" }, "provenance trims the note");
+  equal((granted.profile as any).consent, { email: "granted", sms: "unknown" }, "consent replaced");
+  const withdrawn = buildConsentChange({ ...was, consent: { email: "granted" } }, { email: "denied", sms: "unknown", method: "", note: "" });
+  equal(withdrawn.provenance, null, "withdrawal needs no provenance");
+}
+// The client refuses a forged provenance key.
+await rejected(
+  () => Promise.resolve().then(() => hostActions.guards.assertCleanBody({ expected_revision: 1, profile: {}, consent_provenance: {}, actor: "operator" }, ["expected_revision", "profile", "consent_provenance"])),
+  (e) => e instanceof ApiError,
+  "forged actor next to provenance refused",
+);
 
 // Defensive reads never throw and never render raw shapes.
 equal(viewProfile(null).displayName, "—", "null profile falls back");
@@ -194,6 +214,13 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
         return new Response(JSON.stringify({ error: "record revision is stale" }), { status: 409 });
       }
       current.revision += 1;
+      for (const channel of ["email", "sms"] as const) {
+        const was = current.profile.consent?.[channel] ?? "unknown";
+        const now = body.profile.consent?.[channel] ?? "unknown";
+        if (was !== now) {
+          current.consent_history.push({ revision: current.revision, channel, state: now, actor: "operator", at: 1759286400, ...(body.consent_provenance ?? {}) });
+        }
+      }
       current.profile = body.profile;
       current.digest = "sha256:upd";
       current.history.push({ revision: current.revision, digest: "sha256:upd", actor: "operator", at: 1759286400 });
@@ -277,13 +304,49 @@ async function fill(selector: string, value: string) {
   });
   await flush();
 }
+// Textareas ride their own prototype setter — fill() above is inputs only.
+async function fillArea(selector: string, value: string) {
+  const element = host.querySelector(selector) as HTMLTextAreaElement;
+  assert(element, `area exists: ${selector}`);
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(element, value);
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await flush();
+}
 
 await React.act(async () => {
   root.render(React.createElement(Harness, { viewer: { operator: true, readOnly: false } }));
 });
 await settle(() => assert(text().includes("Search Alpha One"), "list paints real server rows"));
-assert(text().includes("Apps") && text().includes("CRM") && text().includes("Customers"), "nested breadcrumb Apps → CRM → Customers");
-assert(text().includes("r1") && text().includes("granted"), "revision and consent cues render");
+assert(host.querySelector("[data-outlet-heading]")?.textContent?.trim() === "Customers", "customers list retains its section heading");
+assert(!host.querySelector(".crm-crumb"), "the CRM outlet does not duplicate the shell breadcrumb");
+assert(!host.querySelector('nav[aria-label="CRM sections"]'), "the outlet leaves navigation to the host sidebar");
+assert(text().includes("Granted"), "consent state renders in the list as a pill");
+// CAD-1053 list: tag chips, a separate Source column, consent pills, filters, selection.
+const listHeaders = Array.from(host.querySelectorAll('section[aria-label="Customers list"] th')).map((th) => th.textContent?.trim());
+assert(listHeaders.includes("Source") && listHeaders.includes("Email consent") && listHeaders.includes("Tags"), "list has Tags, Source and Email consent columns");
+assert(host.querySelector('tr[data-record-id="customer-s2"] td:nth-child(5)')?.textContent === "import", "source has its own column");
+assert(host.querySelector('tr[data-record-id="customer-s1"] button.chip[title="Filter by tag alpha"]'), "tags render as chips");
+assert(host.querySelector('tr[data-record-id="customer-s2"] .chip[title="Email consent"]')?.textContent === "Withdrawn", "denied reads as Withdrawn");
+// Tag chip filters the page; clearing restores it.
+await click(host.querySelector('tr[data-record-id="customer-s1"] button.chip'));
+assert(text().includes("tag: alpha") && !text().includes("Search Beta Two"), "tag chip filters the loaded rows");
+await click(host.querySelector('button[aria-label="Clear tag filter alpha"]'));
+assert(text().includes("Search Beta Two"), "clearing the tag filter restores rows");
+// Bulk select: row and select-all checkboxes drive a selection count; it never opens a drawer.
+await click(host.querySelector('input[aria-label="Select Search Alpha One"]'));
+assert(text().includes("1 selected") && !host.querySelector('[data-drawer="customer"]'), "row checkbox selects without opening");
+await click(host.querySelector('input[aria-label="Select all customers on this page"]'));
+const pageRows = host.querySelectorAll("tr[data-record-id]").length;
+assert(pageRows >= 2 && text().includes(`${pageRows} selected`), "select all counts the page");
+await click(Array.from(host.querySelectorAll("button.lnk")).find((el) => el.textContent === "Clear"));
+assert(!text().includes("selected"), "clear empties the selection");
+// The customers table no longer leads with the diagnostic revision
+// column — record bookkeeping lives under the drawer's collapsed
+// Record diagnostics instead (CAD-1008).
+const custHeaders = Array.from(host.querySelectorAll('section[aria-label="Customers list"] th')).map((th) => th.textContent?.trim());
+assert(!custHeaders.includes("Rev"), "the customers table drops the diagnostic Rev column (CAD-1008)");
 assert(!text().includes("No records yet"), "populated list shows no empty state");
 
 // Search narrows through the peer; the route URL keeps scope only.
@@ -297,42 +360,139 @@ await settle(() => assert(text().includes("Search Alpha One"), "clearing restore
 
 // CAD-784 sections render real server-driven screens: empty states off
 // empty server rows, and the list never contains an inline builder.
-// Moves ride the host-owned submenu links (real anchors), not pane buttons.
-const sectionLink = (label: string) =>
-  Array.from(host.querySelectorAll('nav[aria-label="CRM sections"] a')).find(
-    (el) => (el.textContent ?? "").trim() === label,
-  );
-assert(sectionLink("Segments")?.tagName === "A", "submenu offers real links");
-assert(
-  (sectionLink("Segments") as HTMLAnchorElement).getAttribute("href")?.includes("ctx=ctx-a"),
-  "submenu links keep the selected context",
-);
-await click(sectionLink("Segments"));
-await settle(() => assert(text().includes("No segments yet in this context"), "segments empty state is server-driven"));
+// Route transitions exercise the outlet; sidebar/mobile links are tested in crmAppMenu.
+const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
+const { crmSectionHref } = require("../src/features/app-shell/CrmOutlet") as typeof import("../src/features/app-shell/CrmOutlet");
+async function openPage(section: "customers" | "segments" | "campaigns") {
+  await React.act(async () => { navigate(crmSectionHref(location.pathname + location.search, section)); });
+  await flush();
+}
+await openPage("segments");
+await settle(() => assert(text().includes("No segments yet"), "segments empty state is server-driven"));
 assert(location.search.includes("crm=segments"), "submenu move routes");
-await click(sectionLink("Campaigns"));
-await settle(() => assert(text().includes("No campaigns yet in this context"), "campaigns empty state is server-driven"));
+await openPage("campaigns");
+await settle(() => assert(text().includes("No campaigns yet"), "campaigns empty state is server-driven"));
 assert(!host.querySelector('section[aria-label="Campaigns list"] input'), "campaigns list holds no inline builder");
-await click(sectionLink("Customers"));
+await openPage("customers");
 await settle(() => assert(text().includes("Search Alpha One"), "customers link restores the list"));
 assert(!location.search.includes("crm="), "customers is the default route");
 
 // Drawer: profile, consent trail, keyboard close with focus restoration.
-const openBeta = Array.from(host.querySelectorAll("button.lnk")).find((el) => el.textContent === "Open" && el.closest("tr")?.textContent?.includes("Beta"));
+// Whole-row click opens the drawer (the click lands on the row itself, not a control).
+const openBeta = host.querySelector('tr[data-record-id="customer-s2"] td:nth-child(3)') as HTMLElement;
+(openBeta.closest("tr")!.querySelector("button.lnk") as HTMLElement).focus(); // real browsers focus the pressed control
 await click(openBeta);
-await settle(() => assert(host.querySelector('[data-drawer="customer"]'), "drawer opens"));
+await settle(() => assert(host.querySelector('[data-drawer="customer"]'), "row click opens the drawer"));
 assert(text().includes("beta-two@example.com"), "drawer shows the profile");
-assert(text().includes("Consent history"), "drawer shows the consent trail");
-assert(text().includes("Revision history"), "drawer shows revision history");
-assert(text().includes("chat context only"), "drawer names the selection contract");
+// CAD-1053 status strip, footer and Overview cards.
+assert(host.querySelector('[data-testid="drawer-warning"]')?.textContent?.includes("can't receive campaigns"), "denied customer shows the status warning");
+assert(!host.querySelector('[data-testid="drawer-warning"] button'), "the warning strip holds no controls");
+const foot = host.querySelector(".crm-drawer-foot")!;
+const footLabels = Array.from(foot.querySelectorAll("button")).map((b) => b.textContent?.trim());
+equal(footLabels.filter((l) => ["Add to segment", "Edit", "Record consent"].includes(l ?? "")), ["Add to segment", "Edit", "Record consent"], "footer order: Add to segment, Edit, primary Record consent");
+assert(foot.querySelector("button.btn-primary")?.textContent === "Record consent", "Record consent is the single primary");
+assert((Array.from(foot.querySelectorAll("button")).find((b) => b.textContent === "Add to segment") as HTMLButtonElement).disabled, "Add to segment is disabled until it has a backend");
+await click(foot.querySelector('button[aria-label="More actions"]'));
+const menuItems = Array.from(host.querySelectorAll('[role="menuitem"]')) as HTMLButtonElement[];
+equal(menuItems.map((m) => m.textContent), ["Copy email", "View in Outbox", "Archive customer"], "menu order");
+assert(menuItems[2].classList.contains("danger") && menuItems[2].getAttribute("aria-disabled") === "true" && menuItems[2].title.length > 0, "Archive is red, disabled and explains why");
+await click(foot.querySelector('button[aria-label="More actions"]'));
+assert(host.querySelector('[data-consent="email"]')?.textContent?.includes("Withdrawn"), "Overview consent card shows the email state");
+assert(text().includes("Profile") && text().includes("Segments") && text().includes("Campaigns"), "Overview carries Profile, Segments and Campaigns");
+// Activity is a human timeline; ids stay under Details.
+await click(Array.from(host.querySelectorAll('[role="tab"]')).find((el) => el.textContent === "Activity"));
+assert(text().includes("Email consent withdrawn by the operator") && text().includes("Created · Email consent granted by the operator"), "Activity reads as plain sentences");
+assert(!text().includes("sha256:") && !text().includes("customer-s2"), "Activity shows no ids or digests");
+await click(Array.from(host.querySelectorAll('[role="tab"]')).find((el) => el.textContent === "Details"));
+assert(text().includes("chat context only"), "Details names the selection contract");
+assert(text().includes("customer-s2") && text().includes("revision r"), "Details tab holds the record diagnostics");
+
+// Record consent: Email/SMS status, "How was it given?", optional note.
+async function pick(id: string, label: string) {
+  await React.act(async () => { (host.querySelector(`#${id}`) as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await flush();
+  const option = Array.from(document.querySelector(`#${id}-listbox`)!.querySelectorAll('[role="option"]')).find((el) => (el.textContent ?? "").trim() === label);
+  assert(option, `option ${label} exists`);
+  await click(option);
+}
+posts.length = 0;
+await click(Array.from(host.querySelectorAll(".crm-drawer-foot button")).find((el) => el.textContent === "Record consent"));
+await settle(() => assert(host.querySelector("#crm-customer-consent"), "Record consent opens the form in place"));
+assert(host.querySelector("#crm-rc-email") && host.querySelector("#crm-rc-sms") && host.querySelector("#crm-rc-note"), "form has Email, SMS and Note");
+assert(!host.querySelector("#crm-rc-method"), "no method question until a grant is chosen");
+await pick("crm-rc-email", "Granted");
+assert(host.querySelector("#crm-rc-method"), "choosing Granted asks how it was given");
+await click(host.querySelector('[data-drawer="customer"] button[type="submit"]'));
+await flush();
+assert(posts.length === 0 && text().includes("Say how consent was given"), "a grant without a method never reaches the wire");
+await pick("crm-rc-method", "In person (counter / event)");
+await fill("#crm-rc-note", "Signed at the counter");
+await click(host.querySelector('[data-drawer="customer"] button[type="submit"]'));
+await settle(() => assert(posts.length === 1, "the grant posts once"));
+equal(Object.keys(posts[0].body).sort(), ["consent_provenance", "expected_revision", "profile"], "update body carries only the allowlisted keys");
+equal(posts[0].body.consent_provenance, { method: "in_person", note: "Signed at the counter" }, "provenance carries method and note");
+equal(posts[0].body.profile.consent, { email: "granted", sms: "unknown" }, "only consent changed");
+assert(posts[0].body.profile.display_name === "Search Beta Two" && posts[0].body.profile.source === "import", "other profile fields are preserved");
+await settle(() => assert(!host.querySelector('[data-testid="drawer-warning"]'), "the warning clears once email consent is granted"));
+await click(Array.from(host.querySelectorAll('[role="tab"]')).find((el) => el.textContent === "Activity"));
+assert(text().includes("Email consent granted (in person)") && text().includes("Signed at the counter"), "Activity shows the method and note");
+// Withdrawing needs no method and sends no provenance.
+posts.length = 0;
+await click(Array.from(host.querySelectorAll(".crm-drawer-foot button")).find((el) => el.textContent === "Record consent"));
+await settle(() => assert(host.querySelector("#crm-customer-consent"), "form reopens"));
+await pick("crm-rc-email", "Withdrawn");
+assert(!host.querySelector("#crm-rc-method"), "withdrawing asks no method");
+await click(host.querySelector('[data-drawer="customer"] button[type="submit"]'));
+await settle(() => assert(posts.length === 1, "the withdrawal posts"));
+equal(Object.keys(posts[0].body).sort(), ["expected_revision", "profile"], "withdrawal carries no provenance");
+// Edit hides consent: it can no longer change it behind the provenance rule.
+await click(Array.from(host.querySelectorAll(".crm-drawer-foot button")).find((el) => el.textContent === "Edit"));
+await settle(() => assert(host.querySelector("#crm-customer-edit"), "edit opens"));
+assert(!host.querySelector("#crm-consent-email") && !text().includes("Email consent (explicit)"), "edit has no consent selects");
+await click(Array.from(host.querySelectorAll(".crm-drawer-foot button")).find((el) => el.textContent === "Cancel"));
 assert(location.search.includes("record=customer-s2"), "direct record route deep-links");
 assert(!location.search.includes("beta-two"), "no customer content in the URL");
 await React.act(async () => {
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
 });
-await flush();
-assert(!host.querySelector('[data-drawer="customer"]'), "Escape closes the drawer");
+// CAD-1013: Escape now plays the close transition and unmounts on
+// transitionend, or on the 320ms fallback timer. happy-dom fires no real
+// transitionend, so the unmount only lands after that fallback — wait it
+// out (sleep > 320) inside act, then settle to confirm the drawer is gone.
+await React.act(async () => { await sleep(400); });
+await settle(() => assert(!host.querySelector('[data-drawer="customer"]'), "Escape closes the drawer"));
 assert(!location.search.includes("record="), "closing clears the record scope");
+// CAD-1009: closing returns focus to the row's Open button, not <body>.
+assert(
+  document.activeElement?.tagName === "BUTTON" && document.activeElement.closest("tr")?.textContent?.includes("Beta"),
+  "Escape returns focus to the Open button that opened the drawer",
+);
+
+// CAD-1009: an expired hosted session (the records fetch is redirected
+// cross-origin, so fetch throws; or a 401 whose body is an object) reads
+// as a human sentence with Reload — never "[object Object]".
+{
+  const sessionFetch = globalThis.fetch;
+  for (const failure of [
+    () => { throw new TypeError("Failed to fetch"); },
+    () => new Response(JSON.stringify({ error: { code: "unauthorized" } }), { status: 401 }),
+    () => { throw { type: "opaqueredirect" }; },
+  ]) {
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (new URL(String(input), "http://localhost").pathname.endsWith("/records")) return failure();
+      return sessionFetch(input as RequestInfo | URL, init);
+    }) as typeof fetch;
+    await fill("#crm-customer-search", "expired-" + Math.random().toString(36).slice(2, 7));
+    await React.act(async () => { await sleep(400); });
+    await settle(() => assert(text().includes("session expired"), "an expired session says so: " + text().slice(0, 400)));
+    assert(!text().includes("[object"), "no object is ever stringified into the list error");
+    assert(Array.from(host.querySelectorAll("button")).some((el) => el.textContent === "Reload"), "an expired session offers Reload");
+  }
+  globalThis.fetch = sessionFetch;
+  await fill("#crm-customer-search", "");
+  await React.act(async () => { await sleep(400); });
+  await settle(() => assert(text().includes("Search Alpha One"), "the list recovers"));
+}
 
 // New customer: invalid email blocks before the wire; valid posts exact grammar.
 await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "New customer"));
@@ -352,18 +512,317 @@ equal(posts[0].body.profile.consent, { email: "unknown", sms: "unknown" }, "cons
 await settle(() => assert(host.querySelector('[data-drawer="customer"]'), "created record opens its drawer"));
 
 // Edit with a stale revision surfaces the server refusal and keeps the drawer.
-await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Edit profile"));
+await click(Array.from(host.querySelectorAll(".crm-drawer-foot button")).find((el) => el.textContent === "Edit"));
 await settle(() => assert(host.querySelector("#crm-display-name"), "edit form opens"));
 (recordStore[posts[0].body.record_id] as any).revision = 99;
 await fill("#crm-display-name", "New Person Edited");
 await click(host.querySelector('[data-drawer="customer"] button[type="submit"]'));
 await settle(() => assert(text().includes("stale"), "stale write explains itself with a next step"));
 
+// ---- CAD-865: the CSV import flow — preview, per-row decisions,
+// commit. The fixture answers the two reserved bulk routes with the
+// daemon's shapes; nothing mutates until the import POST lands.
+const csvPosts: { path: string; body: any }[] = [];
+const importedIds: string[] = [];
+const csvText =
+  "record_id,display_name,email,tags,consent_email,expected_revision\n" +
+  "customer-9,Chidi Anagonye,chidi@example.com,newcomer,granted,\n" +
+  "customer-s2,Boris Feld Jr,beta-two@example.com,,denied,\n" +
+  "customer-bad,Bad Row,not-an-email,,granted,\n" +
+  "customer-s1,Search Alpha One,alpha-one@example.com,alpha,granted,\n";
+const priorFetch = globalThis.fetch;
+globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+  const url = new URL(String(input), "http://localhost");
+  if (url.pathname.endsWith("/records/csv-preview")) {
+    const body = JSON.parse(String(init!.body));
+    csvPosts.push({ path: url.pathname, body });
+    return new Response(JSON.stringify({
+      preview_token: "sha256:" + "a".repeat(64),
+      row_count: 4,
+      summary: { create: 1, update: 0, skip: 1, needs_revision: 1, error: 1 },
+      rows: [
+        { row: 1, record_id: "customer-9", decision: "create", expected_revision: null, current_revision: null, profile: { schema: 1, display_name: "Chidi Anagonye", email: "chidi@example.com", tags: ["newcomer"], consent: { email: "granted" } }, errors: [], reason: null },
+        { row: 2, record_id: "customer-s2", decision: "needs_revision", expected_revision: null, current_revision: 2, profile: { schema: 1, display_name: "Boris Feld Jr", email: "beta-two@example.com", tags: [], consent: { email: "denied" } }, errors: [], reason: "missing expected revision" },
+        { row: 3, record_id: "customer-bad", decision: "error", expected_revision: null, current_revision: null, profile: null, errors: ["invalid email"], reason: null },
+        { row: 4, record_id: "customer-s1", decision: "skip", expected_revision: null, current_revision: 1, profile: { schema: 1, display_name: "Search Alpha One", email: "alpha-one@example.com", tags: ["alpha"], consent: { email: "granted" } }, errors: [], reason: "already current" },
+      ],
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+  if (url.pathname.endsWith("/records/csv-import")) {
+    const body = JSON.parse(String(init!.body));
+    csvPosts.push({ path: url.pathname, body });
+    // The fixture refuses a token that does not bind the bytes —
+    // the same guard the daemon enforces on a stale preview.
+    if (body.preview_token !== "sha256:" + "a".repeat(64)) {
+      return new Response(JSON.stringify({ error: "customer CSV preview is stale; preview again" }), { status: 409 });
+    }
+    const decisions: any[] = body.decisions ?? [];
+    for (const decision of decisions) {
+      if (decision.action !== "skip") importedIds.push(`row-${decision.row}`);
+    }
+    return new Response(JSON.stringify({
+      request_id: body.request_id,
+      preview_token: body.preview_token,
+      replayed: false,
+      summary: { applied: 2, skipped: 2, failed: 0 },
+      rows: [
+        { row: 1, record_id: "customer-9", outcome: "created", reason: null },
+        { row: 2, record_id: "customer-s2", outcome: "updated", reason: null },
+        { row: 3, record_id: "customer-bad", outcome: "skipped", reason: "row error" },
+        { row: 4, record_id: "customer-s1", outcome: "skipped", reason: "already current" },
+      ],
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+  return priorFetch(input as RequestInfo | URL, init);
+}) as typeof fetch;
+
+// The list's toolbar carries the import affordance next to New.
+const importButton = Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Import CSV");
+assert(importButton, "the customers list offers Import CSV");
+await click(importButton);
+await settle(() => assert(host.querySelector("#csv-text"), "the import page renders its CSV source"));
+assert(!location.search.includes("csv"), "no CSV bytes or marker enter the URL");
+
+// Paste the CSV and preview: the plan writes nothing and binds the
+// bytes under one token.
+await fillArea("#csv-text", csvText);
+csvPosts.length = 0;
+await click(host.querySelector('form[aria-label="CSV source"] button[type="submit"]'));
+await settle(() => assert(host.querySelector("[data-preview-summary]"), "the preview summary renders"));
+equal(csvPosts.length, 1, "exactly one preview POST left the browser");
+equal(Object.keys(csvPosts[0].body).sort(), ["csv_text"], "preview body is exactly csv_text");
+assert(text().includes("1 create"), "preview counts the planned create");
+assert(text().includes("1 need a revision"), "preview counts needs_revision rows");
+assert(text().includes("1 already current"), "preview counts plan-skip rows");
+assert(text().includes("1 refused"), "preview counts error rows");
+assert(host.querySelector('[data-plan-row="2"] input#csv-revision-2'), "the needs_revision row offers its revision field");
+assert(!host.querySelector('[data-plan-row="3"] input#csv-revision-3'), "the error row carries no revision field");
+assert(!host.querySelector('[data-plan-row="4"] select, [data-plan-row="4"] input'), "the already-current row offers no apply control");
+
+// The count names only the rows that will actually write — plan-skips
+// and refused rows are never counted as approved.
+const applyButton = () => Array.from(host.querySelectorAll("button")).find((el) => (el.textContent ?? "").startsWith("Import "));
+assert(applyButton()?.textContent === "Import 2 approved rows", "the button counts only apply-chosen rows");
+
+// The count tracks the operator's choices live: flipping a row to Skip
+// lowers it, and skipping every writable row disables commit with its
+// reason — an all-skip import is never offered as a write.
+const choiceFor = async (row: number, value: "apply" | "skip") => {
+  const select = host.querySelector(`#csv-choice-${row}`);
+  assert(select, `row ${row} has a choice control`);
+  await React.act(async () => {
+    // The custom Select trigger opens a portaled listbox; click it,
+    // then pick the option by its value. The apply option's label
+    // varies per row ("Create"/"Update with revision"/"Update"), so
+    // match on the option's own value text inside its listbox instead.
+    (select as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  const listbox = document.querySelector(`#csv-choice-${row}-listbox`);
+  assert(listbox, `row ${row} listbox opened`);
+  const options = Array.from(listbox.querySelectorAll('[role="option"]'));
+  const option = options.find((el) =>
+    value === "skip"
+      ? (el.textContent ?? "").trim() === "Skip"
+      : (el.textContent ?? "").trim() !== "Skip",
+  );
+  assert(option, `row ${row} has a ${value} option`);
+  await React.act(async () => { option!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await flush();
+};
+await choiceFor(2, "skip");
+assert(applyButton()?.textContent === "Import 1 approved row", "skipping row 2 drops the count to 1");
+await choiceFor(1, "skip");
+assert(applyButton()?.textContent === "Import 0 approved rows", "skipping row 1 drops the count to 0");
+assert((applyButton() as HTMLButtonElement).disabled, "zero approved rows disables the commit");
+assert((applyButton() as HTMLButtonElement).title.includes("No row is set to write"), "the disabled reason is truthful");
+await choiceFor(1, "apply");
+assert(applyButton()?.textContent === "Import 1 approved row", "re-applying row 1 restores the count");
+await choiceFor(2, "apply");
+assert(applyButton()?.textContent === "Import 2 approved rows", "re-applying row 2 restores both");
+
+// A needs_revision row demands the operator type the observed revision
+// — the field starts empty with the live revision as a hint, never a
+// pre-answered value.
+const revisionInput = host.querySelector("#csv-revision-2") as HTMLInputElement;
+assert(revisionInput.value === "", "the revision field starts empty — no prefill");
+assert((revisionInput.placeholder ?? "").includes("r2"), "the observed revision is a hint");
+assert(applyButton()!.disabled, "import stays gated until the revision is typed");
+await fill("#csv-revision-2", "2");
+assert(applyButton() && !(applyButton() as HTMLButtonElement).disabled, "the typed revision arms commit");
+
+// Commit: the import body carries the exact grammar — same bytes,
+// the bound token, one request id, explicit per-row decisions.
+csvPosts.length = 0;
+await click(applyButton());
+await settle(() => assert(host.querySelector("[data-import-receipt]"), "the import receipt renders"));
+equal(csvPosts.length, 1, "exactly one import POST left the browser");
+equal(
+  Object.keys(csvPosts[0].body).sort(),
+  ["csv_text", "decisions", "preview_token", "request_id"],
+  "import body is exactly the allowlist",
+);
+equal(csvPosts[0].body.preview_token, "sha256:" + "a".repeat(64), "the bound token ships");
+assert(/^csv-[0-9a-f]{24}$/.test(csvPosts[0].body.request_id), "the request id is identifier-safe");
+const sent = csvPosts[0].body.decisions as any[];
+// The error row is omitted — the daemon refuses a decision that
+// targets an error row. The plan-skip row travels as an explicit skip
+// (the operator's reviewed choice), so rows 1, 2 and 4 are decided.
+equal(sent.length, 3, "decided rows travel — the error row alone is omitted");
+equal(
+  sent.find((d) => d.row === 2),
+  { row: 2, action: "update", expected_revision: 2 },
+  "the needs_revision row commits with its confirmed revision",
+);
+equal(sent.find((d) => d.row === 4)?.action, "skip", "the already-current row is an explicit skip");
+assert(sent.every((d) => d.row !== 3), "the error row carries no decision");
+assert(importedIds.includes("row-1") && importedIds.includes("row-2"), "the committed rows report applied");
+assert(text().includes("2 applied"), "the receipt counts applied rows");
+assert(text().includes("row error"), "the skipped row's reason stays visible");
+
+// The receipt stays mounted — the operator chooses to return.
+assert(host.querySelector('[data-outcome-row="3"]'), "the skipped row's outcome stays visible");
+
+// Return to the list and re-read it — the imported record surfaces
+// from the server, not from local state. The record store gains it so
+// the next read paints it.
+recordStore["customer-9"] = { id: "customer-9", install_id: "install-crm", context_id: "ctx-a", kind: "customer", revision: 1, digest: "sha256:imp", profile: { schema: 1, display_name: "Chidi Anagonye", email: "chidi@example.com", tags: ["newcomer"], consent: { email: "granted" } }, history: [], consent_history: [] };
+await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Return to customers"));
+await settle(() => assert(text().includes("Chidi Anagonye"), "the imported row re-reads from the list"));
+
+// A file over the byte bound is refused before it is ever read —
+// `File.text()` must not run, AND a new selection must discard any
+// prior plan: the operator can never commit bytes they no longer have
+// selected. First build a real preview so there is a live plan to lose.
+// The fetch mock answers csv-preview again for this pick.
+globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+  const url = new URL(String(input), "http://localhost");
+  if (url.pathname.endsWith("/records/csv-preview")) {
+    return new Response(JSON.stringify({
+      preview_token: "sha256:" + "d".repeat(64),
+      row_count: 1,
+      summary: { create: 1, update: 0, skip: 0, needs_revision: 0, error: 0 },
+      rows: [{ row: 1, record_id: "customer-9", decision: "create", expected_revision: null, current_revision: null, profile: { schema: 1, display_name: "Chidi Anagonye" }, errors: [], reason: null }],
+    }), { status: 200 });
+  }
+  return priorFetch(input as RequestInfo | URL, init);
+}) as typeof fetch;
+const realText = File.prototype.text;
+let fileReads = 0;
+File.prototype.text = function () {
+  fileReads += 1;
+  return realText.call(this);
+};
+await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Import CSV"));
+await settle(() => assert(host.querySelector("#csv-text"), "import page reopens for the file pick"));
+await fillArea("#csv-text", "record_id,display_name\ncustomer-9,Chidi Anagonye\n");
+await click(host.querySelector('form[aria-label="CSV source"] button[type="submit"]'));
+await settle(() => assert(host.querySelector("[data-preview-summary]"), "a live preview stands before the oversized pick"));
+const applyBefore = Array.from(host.querySelectorAll("button")).find((el) => (el.textContent ?? "").startsWith("Import "));
+assert(applyBefore && !(applyBefore as HTMLButtonElement).disabled, "a live plan is committable before the bad pick");
+const oversized = new File([new Uint8Array(300 * 1024)], "big.csv", { type: "text/csv" });
+const fileInput = host.querySelector("#csv-file") as HTMLInputElement;
+assert(fileInput, "the file input renders");
+await React.act(async () => {
+  Object.defineProperty(fileInput, "files", { value: [oversized], configurable: true });
+  fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+});
+await flush();
+assert(fileReads === 0, "an oversized file is refused without being read");
+assert(text().includes("256 KiB bound"), "the refusal names the bound");
+assert((host.querySelector("#csv-text") as HTMLTextAreaElement).value === "", "no bytes landed in the source");
+assert(!host.querySelector("[data-preview-summary]"), "the rejected pick discards the prior plan");
+assert(!Array.from(host.querySelectorAll("button")).some((el) => (el.textContent ?? "").startsWith("Import ")), "no committable plan survives the rejected pick");
+File.prototype.text = realText;
+
+// A second import with a preview that went stale refuses — the token
+// binds bytes the operator actually saw planned. The fixture refuses
+// any token but the one bound to the bytes above.
+globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+  const url = new URL(String(input), "http://localhost");
+  if (url.pathname.endsWith("/records/csv-preview")) {
+    return new Response(JSON.stringify({
+      preview_token: "sha256:" + "c".repeat(64),
+      row_count: 1,
+      summary: { create: 1, update: 0, skip: 0, needs_revision: 0, error: 0 },
+      rows: [{ row: 1, record_id: "customer-9", decision: "create", expected_revision: null, current_revision: null, profile: { schema: 1, display_name: "Chidi Anagonye" }, errors: [], reason: null }],
+    }), { status: 200 });
+  }
+  if (url.pathname.endsWith("/records/csv-import")) {
+    const body = JSON.parse(String(init!.body));
+    csvPosts.push({ path: url.pathname, body });
+    return new Response(JSON.stringify({ error: "customer CSV preview is stale; preview again" }), { status: 409 });
+  }
+  return priorFetch(input as RequestInfo | URL, init);
+}) as typeof fetch;
+// (the oversized-file case above already reopened and dismissed its
+// refusal) — re-enter cleanly for the stale-preview check.
+await settle(() => assert(host.querySelector("#csv-text"), "import page reopens"));
+await fillArea("#csv-text", "record_id,display_name\ncustomer-9,Chidi Anagonye\n");
+await click(host.querySelector('form[aria-label="CSV source"] button[type="submit"]'));
+await settle(() => assert(host.querySelector("[data-preview-summary]"), "the second preview lands"));
+csvPosts.length = 0;
+await click(Array.from(host.querySelectorAll("button")).find((el) => (el.textContent ?? "").startsWith("Import ")));
+await settle(() => assert(text().includes("stale"), "a stale preview refuses with its next step"));
+assert(host.querySelector("[data-preview-summary]"), "the preview stays mounted under the refusal");
+
+// While an import is in flight the page's own Back link is disabled —
+// a committed import can never be abandoned without its receipt. The
+// import response is held by a deferred promise so pending is provable.
+await click(Array.from(host.querySelectorAll("button.lnk")).find((el) => (el.textContent ?? "").includes("← Customers")));
+await settle(() => assert(!host.querySelector("#csv-text"), "back returns to the list"));
+let releaseImport: (() => void) | null = null;
+globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+  const url = new URL(String(input), "http://localhost");
+  if (url.pathname.endsWith("/records/csv-preview")) {
+    return new Response(JSON.stringify({
+      preview_token: "sha256:" + "e".repeat(64),
+      row_count: 1,
+      summary: { create: 1, update: 0, skip: 0, needs_revision: 0, error: 0 },
+      rows: [{ row: 1, record_id: "customer-9", decision: "create", expected_revision: null, current_revision: null, profile: { schema: 1, display_name: "Chidi Anagonye" }, errors: [], reason: null }],
+    }), { status: 200 });
+  }
+  if (url.pathname.endsWith("/records/csv-import")) {
+    const body = JSON.parse(String(init!.body));
+    await new Promise<void>((resolve) => { releaseImport = resolve; });
+    return new Response(JSON.stringify({
+      request_id: body.request_id,
+      preview_token: body.preview_token,
+      replayed: false,
+      summary: { applied: 1, skipped: 0, failed: 0 },
+      rows: [{ row: 1, record_id: "customer-9", outcome: "created", reason: null }],
+    }), { status: 200 });
+  }
+  return priorFetch(input as RequestInfo | URL, init);
+}) as typeof fetch;
+await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Import CSV"));
+await settle(() => assert(host.querySelector("#csv-text"), "import page reopens for the deferred import"));
+await fillArea("#csv-text", "record_id,display_name\ncustomer-9,Chidi Anagonye\n");
+await click(host.querySelector('form[aria-label="CSV source"] button[type="submit"]'));
+await settle(() => assert(host.querySelector("[data-preview-summary]"), "the deferred-import preview lands"));
+const backLink = () => Array.from(host.querySelectorAll("button.lnk")).find((el) => (el.textContent ?? "").includes("← Customers")) as HTMLButtonElement | undefined;
+assert(backLink() && !backLink()!.disabled, "back is live before the import");
+await click(Array.from(host.querySelectorAll("button")).find((el) => (el.textContent ?? "").startsWith("Import ")));
+await settle(() => assert(backLink()!.disabled === true, "back is disabled while the import is in flight"));
+// A mid-flight Back click is a no-op — the page stays mounted.
+await click(backLink()!);
+await flush();
+assert(host.querySelector("#csv-text") !== null || host.querySelector("[data-preview-summary]"), "the import page survives a mid-flight back click");
+assert(!host.querySelector('#crm-customer-search'), "the list is not mounted under an in-flight import");
+await React.act(async () => { releaseImport!(); });
+await settle(() => assert(host.querySelector("[data-import-receipt]"), "the deferred import lands its receipt"));
+assert(backLink() && backLink()!.disabled !== true, "back re-arms once the receipt holds");
+await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Return to customers"));
+await settle(() => assert(host.querySelector('#crm-customer-search'), "the list re-reads after the deferred import"));
+globalThis.fetch = priorFetch;
+
 // Read-only viewers get truthful states, never forms.
 await React.act(async () => { root.render(React.createElement(Harness, { viewer: { operator: true, readOnly: true } })); });
 await flush(); await flush();
 assert(text().includes("Read-only"), "read-only state is explicit");
 assert(!host.querySelector("#crm-display-name"), "read-only renders no edit form");
+assert(!Array.from(host.querySelectorAll("button")).some((el) => el.textContent === "Import CSV"), "read-only renders no import control");
+assert(!Array.from(host.querySelectorAll("button")).some((el) => el.textContent === "Record consent"), "read-only renders no Record consent");
 
 await React.act(async () => { root.unmount(); });
 console.log("crm customer checks passed");
