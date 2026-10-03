@@ -1212,6 +1212,157 @@ pub fn enroll_browser(
     )
 }
 
+/// The grant a CLI login accepts: the issuer-verified workspace and audience,
+/// an owner principal, and only `cli.*` capabilities — never the agent
+/// `bridge.enroll`/`results.submit` set. `org`/`audience` are what the caller
+/// asked for; the response must echo them byte-for-byte or it is forged.
+fn login_grant(value: &Value, org: &str, audience: &str) -> Result<String> {
+    let at = now()?;
+    let principal = &value["principal"];
+    let credential = &value["credential"];
+    let caps = value["capabilities"]
+        .as_array()
+        .ok_or_else(|| reject("Invalid hosted login capabilities"))?;
+    let every_cli = !caps.is_empty()
+        && caps.iter().all(|c| {
+            c.as_str()
+                .is_some_and(|s| s.starts_with("cli.") && s.len() <= 32)
+        });
+    if field(value, "version")? != VERSION
+        || field(value, "organization_id")? != org
+        || field(value, "audience")? != audience
+        || field(principal, "kind")? != "user"
+        || field(principal, "current_role")? != "owner"
+        || !id(field(principal, "subject_id")?)
+        || !every_cli
+        || field(credential, "token_type")? != "Bearer"
+        || !token(field(credential, "access_token")?, "hct_")
+        || !id(field(credential, "credential_id")?)
+        || timestamp(credential, "issued_at")? > at
+        || timestamp(credential, "expires_at")? <= at
+    {
+        return Err(reject("Issuer grant did not match hosted login consent"));
+    }
+    Ok(field(credential, "access_token")?.to_string())
+}
+
+/// `cadence login` (CAD-1019 slice 1b): the hosted-cadence device grant —
+/// PKCE + `hcd_` device code + `hct_` bridge — against the operator-pinned
+/// issuer. Requests the `cli.*` capability set (read/write verbs); the org
+/// id and audience (`https://<slug>.cadencecloud.app`) come only from the
+/// issuer's verified response, never derived locally. No agent child is
+/// enrolled; the `hct_` is stored as the org's CLI credential (0600).
+///
+/// Returns `(organization_id, audience, expires_at)` — the caller hands the
+/// pair to `org::record_remote`, which is the only writer of `orgs.json`.
+pub fn login_browser(
+    issuer: &str,
+    org: &str,
+    audience: &str,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<(String, String, u64)> {
+    let issuer = origin(issuer, cfg!(test))?;
+    let audience = origin(audience, cfg!(test))?;
+    if !id(org) {
+        return Err(reject("Invalid hosted login request"));
+    }
+    private_dir(dir, false)?;
+    let _guard = lock(dir, true)?;
+    require_trusted_issuer(dir, &issuer)?;
+    let access = read_access_ingress(dir, &issuer)?;
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).map_err(|_| reject("Unable to create PKCE verifier"))?;
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
+    confirm_access_ingress(dir, &issuer, &access)?;
+    let (status, code) = post_public_with_access(
+        &issuer,
+        "/v1/hosted-cadence/device/code",
+        json!({"version":DEVICE_VERSION,"organization_id":org,"audience":audience,
+            "client_label":"cadence-cli","requested_capabilities":["cli.read","cli.write"],
+            "code_challenge":challenge}),
+        access.as_ref(),
+    )?;
+    if status != 200 {
+        return Err(reject("Hosted issuer refused device authorization"));
+    }
+    let (device, user, verification, mut interval) = device_code(&code)?;
+    show_code(verification, user)?;
+    let deadline = Instant::now() + Duration::from_secs(timestamp(&code, "expires_in")?);
+    let grant = loop {
+        if Instant::now() >= deadline {
+            return Err(reject("Hosted browser authorization expired; start again"));
+        }
+        std::thread::sleep(Duration::from_secs(interval));
+        if Instant::now() >= deadline {
+            return Err(reject("Hosted browser authorization expired; start again"));
+        }
+        confirm_access_ingress(dir, &issuer, &access)?;
+        let (status, response) = post_public_with_access(
+            &issuer,
+            "/v1/hosted-cadence/device/token",
+            json!({"device_code":device,"code_verifier":verifier}),
+            access.as_ref(),
+        )?;
+        if Instant::now() >= deadline {
+            return Err(reject("Hosted browser authorization expired; start again"));
+        }
+        if status == 200 {
+            break response;
+        }
+        match (status, response["error"].as_str()) {
+            (400, Some("authorization_pending")) => {}
+            (400, Some("slow_down")) => interval = interval.saturating_add(5).min(30),
+            (400, Some("access_denied")) => return Err(reject("Hosted browser consent denied")),
+            (400, Some("expired_token")) => return Err(reject("Hosted device code expired")),
+            _ => return Err(reject("Hosted browser grant refused; start again")),
+        }
+    };
+    let access_token = login_grant(&grant, org, &audience)?;
+    confirm_access_ingress(dir, &issuer, &access)?;
+    // Persist the hct_ as this org's CLI credential — 0600, separate from
+    // orgs.json (which stays a preference pointer, never a secret store).
+    let expires_at = timestamp(&grant["credential"], "expires_at")?;
+    save_cli_credential(dir, org, &audience, &access_token, expires_at)?;
+    Ok((org.to_string(), audience.clone(), expires_at))
+}
+
+/// Write the CLI credential `cli-<org>.json` under the enrollment dir at
+/// 0600 — `hct_` + the verified audience + expiry, no orgs.json overlap.
+fn save_cli_credential(
+    dir: &Path,
+    org: &str,
+    audience: &str,
+    access_token: &str,
+    expires_at: u64,
+) -> Result<()> {
+    let path = dir.join(format!("cli-{org}.json"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|_| reject("CLI credential path refused"))?;
+    if !file.metadata()?.is_file() {
+        return Err(reject("CLI credential path must be a regular file"));
+    }
+    let body = serde_json::to_vec_pretty(&json!({
+        "version": VERSION,
+        "organization_id": org,
+        "audience": audience,
+        "access_token": access_token,
+        "expires_at": expires_at,
+    }))
+    .map_err(|e| Error::internal(e.to_string()))?;
+    file.write_all(&body)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 /// Bootstrap only against an explicitly trusted issuer origin. The `hcs_` service
 /// token is read by the CLI from protected stdin, never from an argv or outbox row.
 pub fn enroll(
@@ -1372,6 +1523,7 @@ mod tests {
     use crate::remote_result_outbox::{deliver_with, ResultCommand, ResultOutbox};
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
+    use std::path::PathBuf;
     use std::thread;
 
     const SERVICE: &str = "hcs_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -2670,6 +2822,174 @@ mod tests {
             );
             assert!(!dir.join(RECORD).exists());
         }
+    }
+
+    // --- CAD-1019 slice 1b: `cadence login` device grant ---
+
+    /// A grant the issuer returns for the `cli.*` capability set — owner
+    /// principal, `hct_` bridge, verified org + audience echo.
+    fn login_grant_body(org: &str, audience: &str, caps: &[&str]) -> Value {
+        let at = now().unwrap();
+        json!({"version":VERSION,"organization_id":org,
+            "audience":audience,"principal":{"kind":"user","subject_id":"user_1","current_role":"owner"},
+            "capabilities":caps,
+            "credential":{"credential_id":"hcp_credential","access_token":BRIDGE,
+                "token_type":"Bearer","issued_at":at,"expires_at":at+120,"renewal":"reexchange"}})
+    }
+
+    /// Drive one `login_browser` grant: device code → token → grant with the
+    /// supplied caps/body. `org`/`audience` are what the caller asked for
+    /// (`--org`/`--audience`); the fake issuer asserts the code request
+    /// names exactly that workspace, audience and the `cli.*` set.
+    fn run_login(
+        org: &'static str,
+        audience: &'static str,
+        grant: Value,
+        token_errors: Vec<&'static str>,
+    ) -> (Result<(String, String, u64)>, PathBuf) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let dir_is = issuer.clone();
+        let server = thread::spawn(move || {
+            let (mut code, code_body) =
+                public_request(&listener, "/v1/hosted-cadence/device/code");
+            assert_eq!(code_body["version"], DEVICE_VERSION);
+            assert_eq!(code_body["organization_id"], org);
+            assert_eq!(code_body["audience"], audience);
+            assert_eq!(
+                code_body["requested_capabilities"],
+                json!(["cli.read", "cli.write"])
+            );
+            respond(&mut code, &browser_code(60));
+            // terminal errors first (one request each), then the grant.
+            for e in &token_errors {
+                let (mut token, _) = public_request(&listener, "/v1/hosted-cadence/device/token");
+                respond_error(&mut token, e);
+            }
+            let (mut token, _) = public_request(&listener, "/v1/hosted-cadence/device/token");
+            respond(&mut token, &grant);
+        });
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        trust(&dir, &dir_is);
+        let out = login_browser(&issuer, org, audience, &dir, |_, _| Ok(()));
+        server.join().unwrap();
+        (out, dir)
+    }
+
+    #[test]
+    fn login_succeeds_and_stores_hct_under_0600() {
+        let grant = login_grant_body("ws_real", "https://real.board.example.test", &["cli.read", "cli.write"]);
+        let (out, dir) = run_login("ws_real", "https://real.board.example.test", grant, vec![]);
+        let (org_id, audience, _exp) = out.unwrap();
+        assert_eq!(org_id, "ws_real");
+        assert_eq!(audience, "https://real.board.example.test");
+        let cred = dir.join("cli-ws_real.json");
+        let meta = cred.metadata().unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        let body: Value = serde_json::from_slice(&fs::read(&cred).unwrap()).unwrap();
+        assert_eq!(body["access_token"], BRIDGE);
+        // orgs.json never holds the secret.
+        assert!(!dir.join(RECORD).exists());
+    }
+
+    #[test]
+    fn login_denied_is_terminal() {
+        let grant = login_grant_body("ws_real", "https://real.board.example.test", &["cli.read"]);
+        let (out, dir) =
+            run_login("ws_real", "https://real.board.example.test", grant, vec!["access_denied"]);
+        // terminal error → no credential is stored.
+        assert!(out.is_err());
+        assert!(!dir.join("cli-ws_real.json").exists());
+    }
+
+    #[test]
+    fn login_expired_is_terminal() {
+        let grant = login_grant_body("ws_real", "https://real.board.example.test", &["cli.read"]);
+        let (out, dir) =
+            run_login("ws_real", "https://real.board.example.test", grant, vec!["expired_token"]);
+        assert!(out.is_err());
+        assert!(!dir.join("cli-ws_real.json").exists());
+    }
+
+    #[test]
+    fn login_slow_down_is_retried_then_granted() {
+        // slow_down is not terminal: back off, then the grant lands.
+        let grant = login_grant_body("ws_real", "https://real.board.example.test", &["cli.read"]);
+        let (out, dir) =
+            run_login("ws_real", "https://real.board.example.test", grant, vec!["slow_down"]);
+        assert!(out.is_ok(), "{:?}", out.err());
+        assert!(dir.join("cli-ws_real.json").exists());
+    }
+
+    #[test]
+    fn login_workspace_mismatch_with_org_is_rejected() {
+        // The grant echoes a different workspace than `--org` asked for:
+        // forged consent, never stored.
+        let mut grant =
+            login_grant_body("ws_real", "https://real.board.example.test", &["cli.read"]);
+        grant["organization_id"] = json!("ws_other");
+        let (out, dir) = run_login("ws_real", "https://real.board.example.test", grant, vec![]);
+        assert!(out.is_err());
+        assert!(!dir.join("cli-ws_real.json").exists());
+    }
+
+    #[test]
+    fn login_forged_slug_audience_is_rejected() {
+        // The grant binds a different slug/audience than `--audience`:
+        // the endpoint is never taken from an unverified source.
+        let mut grant =
+            login_grant_body("ws_real", "https://real.board.example.test", &["cli.read"]);
+        grant["audience"] = json!("https://evil.example.test");
+        let (out, dir) = run_login("ws_real", "https://real.board.example.test", grant, vec![]);
+        assert!(out.is_err());
+        assert!(!dir.join("cli-ws_real.json").exists());
+    }
+
+    #[test]
+    fn login_agent_capabilities_are_rejected() {
+        // Agent caps (`bridge.enroll`/`results.submit`) are not CLI
+        // consent — only the `cli.*` set grants a login.
+        let mut grant =
+            login_grant_body("ws_real", "https://real.board.example.test", &["cli.read"]);
+        grant["capabilities"] = json!(["bridge.enroll", "results.submit"]);
+        let (out, dir) = run_login("ws_real", "https://real.board.example.test", grant, vec![]);
+        assert!(out.is_err());
+        assert!(!dir.join("cli-ws_real.json").exists());
+    }
+
+    #[test]
+    fn login_non_owner_role_is_rejected() {
+        // Only an owner consent grants a CLI login — a member/admin
+        // grant for the same workspace is refused.
+        let mut grant =
+            login_grant_body("ws_real", "https://real.board.example.test", &["cli.read"]);
+        grant["principal"]["current_role"] = json!("member");
+        let (out, dir) = run_login("ws_real", "https://real.board.example.test", grant, vec![]);
+        assert!(out.is_err());
+        assert!(!dir.join("cli-ws_real.json").exists());
+    }
+
+    #[test]
+    fn login_second_org_records_separately() {
+        // Two workspaces, two issuers' grants — each lands its own
+        // credential file; the second cannot clobber the first.
+        let (o1, d1) = run_login(
+            "ws_alpha",
+            "https://alpha.example.test",
+            login_grant_body("ws_alpha", "https://alpha.example.test", &["cli.read"]),
+            vec![],
+        );
+        assert!(o1.is_ok());
+        assert!(d1.join("cli-ws_alpha.json").exists());
+        let (o2, d2) = run_login(
+            "ws_beta",
+            "https://beta.example.test",
+            login_grant_body("ws_beta", "https://beta.example.test", &["cli.read"]),
+            vec![],
+        );
+        assert!(o2.is_ok());
+        assert!(d2.join("cli-ws_beta.json").exists());
     }
 
     #[test]

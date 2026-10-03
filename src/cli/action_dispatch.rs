@@ -49,12 +49,55 @@ pub(crate) fn run() -> Result<i32> {
         Commands::Login {
             issuer,
             org,
+            audience,
+            use_,
             token_stdin,
             no_open,
             auth_dir,
         } => {
+            // Hosted device grant → verified org id + audience → registry.
+            // `--token-stdin` is the legacy AgenticOS token path, not org login.
+            if *token_stdin {
+                let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
+                return cadence_agent::remote_auth::login(issuer, org, &dir, true, *no_open);
+            }
             let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
-            return cadence_agent::remote_auth::login(issuer, org, &dir, *token_stdin, *no_open);
+            let audience = audience.as_deref().ok_or_else(|| {
+                Error::rejected("login needs --audience https://<slug>.cadencecloud.app")
+            })?;
+            let (org_id, endpoint, _expires) = cadence_agent::remote_enrollment::login_browser(
+                issuer,
+                org,
+                audience,
+                &dir,
+                |url, code| {
+                    eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
+                    if !no_open {
+                        let program = if cfg!(target_os = "macos") {
+                            "open"
+                        } else {
+                            "xdg-open"
+                        };
+                        let mut opener = std::process::Command::new(program);
+                        opener
+                            .arg(url)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null());
+                        let _ = cadence_agent::reaper::spawn(&mut opener);
+                    }
+                    Ok(())
+                },
+            )?;
+            // The issuer verified org id + audience together; record_remote
+            // persists the org's remote connection. `--use` selects it;
+            // without it an existing default is kept.
+            let view = org::record_remote(org, &endpoint, &org_id, *use_)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&view).unwrap_or_default()
+            );
+            return Ok(0);
         }
         Commands::Auth { action } => {
             return match action {

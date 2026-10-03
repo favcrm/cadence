@@ -317,7 +317,7 @@ All commands (one line per path):
     job task fail
     job task reopen
     job task cancel
-  login          Authenticate to an AgenticOS issuer
+  login          Authenticate to an AgenticOS issuer and map the workspace to a remote org (CAD-1019)
   message        Send durable messages to an agent
     message send
     message ask
