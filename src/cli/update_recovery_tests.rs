@@ -227,6 +227,10 @@ impl Drop for OwnedBoard {
 /// argument, if any, is a file it writes once its argv is installed.
 fn board_stand_in(state: &Path, tail: &[&std::ffi::OsStr]) -> OwnedBoard {
     use std::os::unix::process::CommandExt;
+    // python3 sees argv as `-c <script> --state-dir <s> ui run <tail>`,
+    // so sys.argv[-1] is `run` exactly when there is no tail; otherwise
+    // it is the readiness file, written only after exec installed the
+    // argv that ui_run_args reads back.
     let script = "import pathlib, sys, time\n\
                   if sys.argv[-1] != 'run': pathlib.Path(sys.argv[-1]).write_text('ready')\n\
                   time.sleep(60)";
