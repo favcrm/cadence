@@ -81,6 +81,28 @@ export function enrollmentShapes(provider: ConnectionProvider): string[] {
   return shapes.filter((s) => s === "token" || s === "smtp");
 }
 
+/**
+ * Is this connection an SMTP sender? Decided from the daemon's shape
+ * flag; `smtp` presence is only the fallback for an older daemon.
+ */
+export function isSmtpSender(row: Connection): boolean {
+  return row.smtp_sender === true || (row.smtp ?? null) !== null;
+}
+
+/** An SMTP sender whose settings the daemon could not project. */
+export function smtpUnreadable(row: Connection): boolean {
+  return isSmtpSender(row) && (row.smtp ?? null) === null;
+}
+
+/** Plain-language reason and fix for an unreadable SMTP sender. */
+export function smtpErrorMessage(row: Connection): string | null {
+  if (!smtpUnreadable(row)) return null;
+  if (row.smtp_error === "withheld_leak") {
+    return "Settings are hidden: your password shares characters with the host, username or sender. Rotate it and choose a different password or app password.";
+  }
+  return "Settings can't be read. Rotate it to re-enter them.";
+}
+
 /** One enrolled SMTP sender in plain words — transport and verified sender, never the secret. */
 export function smtpSummary(row: Connection): string | null {
   const smtp = row.smtp ?? null;

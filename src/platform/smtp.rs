@@ -132,6 +132,84 @@ impl SmtpProjection {
     }
 }
 
+/// Why a stored SMTP sender cannot be projected for the operator.
+/// Typed and secret-free: the code is all that ever leaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectionFault {
+    /// Custody bytes exist but are not the canonical schema-1 document.
+    CustodyCorrupt,
+    /// The settings would reveal part of the secret (it overlaps the
+    /// host, username or sender), so they are withheld.
+    WithheldLeak,
+    /// Custody could not be read at all (missing, torn, locked).
+    Unavailable,
+}
+
+impl ProjectionFault {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::CustodyCorrupt => "custody_corrupt",
+            Self::WithheldLeak => "withheld_leak",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Decode custody bytes into the operator projection, classifying
+/// every failure. The secret never reaches the caller.
+pub fn project_custody(bytes: &[u8]) -> std::result::Result<SmtpProjection, ProjectionFault> {
+    let (envelope, projection) =
+        custody_decode(bytes).map_err(|_| ProjectionFault::CustodyCorrupt)?;
+    super::refuse_leak(
+        "smtp connection projection",
+        &projection.to_json().to_string(),
+        envelope.secret(),
+    )
+    .map_err(|_| ProjectionFault::WithheldLeak)?;
+    Ok(projection)
+}
+
+/// Refuse, before any custody write, a secret that overlaps the
+/// settings the board shows for the sender: such a connection would
+/// later have its settings withheld. The message names no value.
+fn refuse_secret_overlap(
+    host: &str,
+    port: u16,
+    tls_mode: &str,
+    username: &str,
+    sender: &str,
+    sender_name: &str,
+    secret: &str,
+) -> Result<()> {
+    let shown = SmtpProjection {
+        host: host.to_string(),
+        port,
+        tls_mode: tls_mode.to_string(),
+        username: username.to_string(),
+        sender: sender.to_string(),
+        sender_name: sender_name.to_string(),
+    };
+    super::refuse_leak(
+        "smtp settings",
+        &shown.to_json().to_string(),
+        secret.as_bytes(),
+    )
+    .map_err(|_| {
+        Error::rejected(
+            "SMTP password must not contain 8 or more characters in a row that appear in the host, username, sender or sender name — choose a different password or app password",
+        )
+    })
+}
+
+/// Gmail shows app passwords in groups ("abcd efgh ijkl mnop"):
+/// spaces (and no-break spaces from a paste) are formatting, not
+/// part of the secret.
+fn normalize_secret(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| *ch != ' ' && *ch != '\u{a0}')
+        .collect()
+}
+
 /// Custody bytes are canonical JSON under schema 1. The store keeps
 /// only a fingerprint; this codec is the only reader. The secret is
 /// a field here — these bytes enter custody and never leave it.
@@ -415,8 +493,8 @@ pub fn parse_enrollment(params: &Value) -> Result<SmtpEnrollment> {
     validate_port_tls(&host, port, tls_mode)?;
     let username = required_field(params, "username")?;
     validate_username(username)?;
-    let secret = required_field(params, "secret")?;
-    validate_secret(secret)?;
+    let secret = normalize_secret(required_field(params, "secret")?);
+    validate_secret(&secret)?;
     let sender = required_field(params, "sender")?;
     validate_sender(sender)?;
     let sender_name = match optional_field(params, "sender_name")? {
@@ -426,12 +504,21 @@ pub fn parse_enrollment(params: &Value) -> Result<SmtpEnrollment> {
             name
         }
     };
+    refuse_secret_overlap(
+        &host,
+        port,
+        tls_mode,
+        username,
+        sender,
+        &sender_name,
+        &secret,
+    )?;
     Ok(SmtpEnrollment {
         host,
         port,
         tls_mode: tls_mode.to_string(),
         username: username.to_string(),
-        secret: secret.as_bytes().to_vec(),
+        secret: secret.into_bytes(),
         sender: sender.to_string(),
         sender_name,
     })
@@ -448,8 +535,8 @@ pub fn overlay_rotate(current: &SmtpProjection, params: &Value) -> Result<SmtpEn
             "SMTP rotation carries the fresh secret — no token",
         ));
     }
-    let secret = required_field(params, "secret")?;
-    validate_secret(secret)?;
+    let secret = normalize_secret(required_field(params, "secret")?);
+    validate_secret(&secret)?;
     let host = match optional_field(params, "host")? {
         None => current.host.clone(),
         Some(raw) => validate_host(&raw)?,
@@ -496,12 +583,21 @@ pub fn overlay_rotate(current: &SmtpProjection, params: &Value) -> Result<SmtpEn
             raw
         }
     };
+    refuse_secret_overlap(
+        &host,
+        port,
+        &tls_mode,
+        &username,
+        &sender,
+        &sender_name,
+        &secret,
+    )?;
     Ok(SmtpEnrollment {
         host,
         port,
         tls_mode,
         username,
-        secret: secret.as_bytes().to_vec(),
+        secret: secret.into_bytes(),
         sender,
         sender_name,
     })
@@ -1566,6 +1662,69 @@ mod tests {
         foreign["provider"] = json!("other");
         assert!(custody_decode(&serde_json::to_vec(&foreign).unwrap()).is_err());
         assert!(custody_decode(b"not json").is_err());
+    }
+
+    fn sample_enrollment(secret: String) -> SmtpEnrollment {
+        SmtpEnrollment {
+            host: "mail.example.com".into(),
+            port: 465,
+            tls_mode: "implicit".into(),
+            username: "mailer@example.com".into(),
+            secret: secret.into_bytes(),
+            sender: "news@example.com".into(),
+            sender_name: "News".into(),
+        }
+    }
+
+    #[test]
+    fn cad1064_projection_faults_are_typed_and_secret_free() {
+        let good = custody_bytes(&sample_enrollment("qwlzxmnbvc".into())).unwrap();
+        assert!(project_custody(&good).is_ok());
+        // Corrupt: not JSON, wrong field count, wrong schema.
+        let mut extra: Value = serde_json::from_slice(&good).unwrap();
+        extra["extra"] = json!(1);
+        for bytes in [
+            b"not json".to_vec(),
+            b"{}".to_vec(),
+            serde_json::to_vec(&extra).unwrap(),
+        ] {
+            let fault = project_custody(&bytes).unwrap_err();
+            assert_eq!(fault, ProjectionFault::CustodyCorrupt);
+            assert_eq!(fault.code(), "custody_corrupt");
+        }
+        // Leak: a legacy record whose secret overlaps the username
+        // (custody_bytes does not screen; enrollment does).
+        let leaky = custody_bytes(&sample_enrollment("zzmailer@example.comzz".into())).unwrap();
+        let fault = project_custody(&leaky).unwrap_err();
+        assert_eq!(fault, ProjectionFault::WithheldLeak);
+        assert_eq!(fault.code(), "withheld_leak");
+        assert!(!format!("{fault:?}{}", fault.code()).contains("mailer"));
+    }
+
+    #[test]
+    fn cad1064_enrollment_refuses_overlap_and_strips_spaces() {
+        let params = |secret: &str| {
+            json!({"host": "mail.example.com", "port": 465, "tls_mode": "implicit",
+                "username": "mailer@example.com", "secret": secret,
+                "sender": "news@example.com"})
+        };
+        for overlap in [
+            "xxmailer@example.comxx",
+            "mail.example.com1",
+            "xnews@example.comx",
+        ] {
+            let error = parse_enrollment(&params(overlap)).unwrap_err().to_string();
+            assert!(error.contains("different password"), "{error}");
+            assert!(!error.contains(overlap), "echoed: {error}");
+        }
+        // Grouped app password: spaces are formatting.
+        let grouped = ["qwlz", "xmnb", "vcpo", "iuyt"].join(" ");
+        let parsed = parse_enrollment(&params(&grouped)).unwrap();
+        assert_eq!(parsed.secret, b"qwlzxmnbvcpoiuyt");
+        // A secret that is nothing but spaces is still empty.
+        assert!(parse_enrollment(&params("   ")).is_err());
+        // Tabs and newlines stay refused.
+        assert!(parse_enrollment(&params("qwlz\txmnbvcpo")).is_err());
     }
 
     #[test]

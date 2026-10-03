@@ -336,6 +336,98 @@ async function main() {
   globalThis.fetch = innerFetch2;
   await act(async () => root2.unmount());
 
+  // ---- CAD-1064: an SMTP sender whose settings cannot be read. ----
+  const { ConnectionDetail } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
+  const unreadableRow = (code: string): any => ({
+    ...smtpRow, smtp: null, smtp_sender: true, smtp_error: code,
+  });
+  const host3 = document.createElement("div");
+  document.body.appendChild(host3);
+  const root3 = createRoot(host3);
+
+  // Detail: readable settings show host, port+security, login and sender.
+  act(() => {
+    root3.render(React.createElement(ConnectionDetail, { row: { ...smtpRow, smtp_sender: true, smtp_error: null }, capabilities: null, canWrite: true, onChanged: () => {}, onRevoked: () => {} }));
+  });
+  await settle(() => {
+    const t = host3.textContent ?? "";
+    assert(t.includes("mail.example.com:465") && t.includes("implicit TLS"), "detail shows host, port and security");
+    assert(t.includes("login mailer") && t.includes("news@example.com") && t.includes("News"), "detail shows username, sender and sender name");
+    assert(!host3.querySelector("[data-smtp-error]"), "a readable sender shows no error");
+  });
+
+  // Detail: each typed error gives a human message and the fix.
+  for (const [code, phrase] of [
+    ["custody_corrupt", "Rotate it to re-enter them"],
+    ["unavailable", "Rotate it to re-enter them"],
+    ["withheld_leak", "different password or app password"],
+  ] as const) {
+    act(() => {
+      root3.render(React.createElement(ConnectionDetail, { row: unreadableRow(code), capabilities: null, canWrite: true, onChanged: () => {}, onRevoked: () => {} }));
+    });
+    await settle(() => {
+      const err = host3.querySelector(`[data-smtp-error="${code}"]`);
+      assert(err && (err.textContent ?? "").includes(phrase), `${code}: message carries the fix`);
+    });
+    assert(!(host3.textContent ?? "").includes("null"), `${code}: no raw null leaks into the page`);
+  }
+  await act(async () => root3.unmount());
+
+  // Rotate on an unreadable sender uses the SMTP form (password-first),
+  // never the generic token form, and nothing is inherited.
+  const rotatePosts3: any[] = [];
+  const innerFetch3 = globalThis.fetch;
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    if (init?.method === "POST" && String(input).includes("/rotate")) {
+      rotatePosts3.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({ connection: { id: "c-1", revision: 2 } }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return innerFetch3(input as RequestInfo | URL, init);
+  }) as typeof fetch;
+  const host4 = document.createElement("div");
+  document.body.appendChild(host4);
+  const root4 = createRoot(host4);
+  const field4 = (label: string) => Array.from(host4.querySelectorAll("label")).find((l) => (l.textContent ?? "").includes(label));
+  const set4 = (label: string, value: string, kind: "Input" | "Select" = "Input") => {
+    const el = field4(label)!.parentElement!.querySelector("input,select") as HTMLInputElement;
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor((window as any)[`HTML${kind}Element`].prototype, "value")!.set!;
+      setter.call(el, value);
+      el.dispatchEvent(new Event(kind === "Input" ? "input" : "change", { bubbles: true }));
+    });
+  };
+  act(() => {
+    root4.render(React.createElement(RotateForm, { row: unreadableRow("custody_corrupt"), onDone: () => {}, onClose: () => {} }));
+  });
+  await settle(() => assert(field4("New SMTP password"), "unreadable sender rotates with the SMTP password form"));
+  assert(!field4("New token") && !field4("Scopes"), "no generic token form or scopes box");
+  assert((host4.textContent ?? "").includes("Rotate it to re-enter them"), "rotate repeats why");
+  assert(host4.querySelector("details")?.hasAttribute("open"), "transport fields are open, not collapsed");
+  const keepCurrent = Array.from(host4.querySelectorAll("option")).some((o) => (o.textContent ?? "").includes("Keep current"));
+  assert(!keepCurrent, "there is no 'keep current' choice when nothing is readable");
+  const replace4 = () => Array.from(host4.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Replace credential")) as HTMLButtonElement;
+  // Password alone is refused client-side: all fields are required.
+  set4("New SMTP password", "pw-one-two-three");
+  await act(async () => replace4().click());
+  await settle(() => assert((host4.textContent ?? "").includes("Enter the server host"), "missing fields are named"));
+  assert(rotatePosts3.length === 0, "nothing posts until every field is entered");
+  set4("Server host", "mail.example.com");
+  set4("Port & security", "implicit", "Select");
+  set4("Username", "mailer");
+  set4("Sender address", "news@example.com");
+  set4("New SMTP password", "pw-one-two-three");
+  await act(async () => replace4().click());
+  await settle(() => assert(rotatePosts3.length === 1, "full re-entry posts"));
+  const full = rotatePosts3[0];
+  equal(
+    { host: full.host, port: full.port, tls_mode: full.tls_mode, username: full.username, sender: full.sender, secret: full.secret },
+    { host: "mail.example.com", port: 465, tls_mode: "implicit", username: "mailer", sender: "news@example.com", secret: "pw-one-two-three" },
+    "every transport field travels with the secret",
+  );
+  assert(full.scopes === undefined, "scopes are still never sent");
+  globalThis.fetch = innerFetch3;
+  await act(async () => root4.unmount());
+
   console.log("connections smtp form checks passed");
 }
 

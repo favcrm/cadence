@@ -19,6 +19,9 @@ import {
   scopeHint,
   smtpPortTlsError,
   smtpSummary,
+  isSmtpSender,
+  smtpUnreadable,
+  smtpErrorMessage,
 } from "./connectionsView";
 import { connectionLabel } from "../../lib/connections";
 
@@ -272,7 +275,7 @@ export default function Connections({
 }
 
 /** One connection's detail: metadata, local check, rotate and revoke. */
-function ConnectionDetail({
+export function ConnectionDetail({
   row,
   capabilities,
   canWrite,
@@ -342,6 +345,14 @@ function ConnectionDetail({
           <div className="flex flex-wrap gap-x-2 min-w-0">
             <dt className="text-ink-500">Sender</dt>
             <dd className="text-ink-200 break-words">{smtpSummary(row)}</dd>
+          </div>
+        )}
+        {smtpErrorMessage(row) && (
+          <div className="flex flex-wrap gap-x-2 min-w-0">
+            <dt className="text-ink-500">Sender</dt>
+            <dd className="text-fail break-words" role="alert" data-smtp-error={row.smtp_error ?? "unavailable"}>
+              {smtpErrorMessage(row)}
+            </dd>
           </div>
         )}
         {capabilities && (
@@ -445,7 +456,10 @@ export function RotateForm({
   // a raw, independently-editable tls_mode field. SMTP keeps its live
   // scopes (the rotation never narrows or widens them); token providers
   // still expose their own scopes box.
-  const isSmtp = (row.smtp ?? null) !== null;
+  const isSmtp = isSmtpSender(row);
+  // CAD-1064: when the live settings can't be read there is nothing to
+  // inherit — the operator re-enters every transport field.
+  const unreadable = smtpUnreadable(row);
   // transport: "" = keep the live host/port/tls pairing; otherwise the
   // operator picks a paired submission transport.
   const [smtpTransport, setSmtpTransport] = useState("");
@@ -467,6 +481,15 @@ export function RotateForm({
     const effTls = smtpTransport === "" ? liveTls : smtpTransport;
     const hostChanged = smtp.host.trim() !== "";
     const transportChanged = smtpTransport !== "";
+    if (unreadable) {
+      const missing =
+        smtp.host.trim() === "" ? "server host"
+        : smtpTransport === "" ? "port & security"
+        : smtp.username.trim() === "" ? "username"
+        : smtp.sender.trim() === "" ? "sender address"
+        : null;
+      if (missing) { setError(`Enter the ${missing} — the saved settings can't be read, so none are kept.`); return; }
+    }
     if (isSmtp && (hostChanged || transportChanged)) {
       // Validate the EFFECTIVE inherited host/port/TLS before the request
       // — a changed piece must still form a valid (465 implicit) /
@@ -541,16 +564,23 @@ export function RotateForm({
           disabled={busy}
         />
       </div>
-      {isSmtp && row.smtp && (
-        <details className="space-y-2">
+      {unreadable && smtpErrorMessage(row) && (
+        <p className="text-label text-fail break-words" role="alert">{smtpErrorMessage(row)}</p>
+      )}
+      {isSmtp && (
+        <details className="space-y-2" open={unreadable}>
           <summary className="text-label font-medium text-ink-300 cursor-pointer select-none">
-            Server &amp; sender details <span className="text-ink-500 font-normal">(optional — blank keeps the current values)</span>
+            Server &amp; sender details{" "}
+            <span className="text-ink-500 font-normal">
+              {unreadable ? "(required — enter every field)" : "(optional — blank keeps the current values)"}
+            </span>
           </summary>
           <fieldset className="space-y-2 mt-2">
             <legend className="sr-only">SMTP server and sender</legend>
             <p className="text-micro text-ink-500 break-words">
-              Leave everything blank to keep the live server and sender. Only fill a
-              field you intend to change.
+              {unreadable
+                ? "Nothing is kept from the unreadable settings. Enter the server, port, username and sender address; the sender name is optional."
+                : "Leave everything blank to keep the live server and sender. Only fill a field you intend to change."}
             </p>
             <div>
               <label htmlFor={`${scopesId}-host`} className="text-label text-ink-300">
@@ -563,7 +593,7 @@ export function RotateForm({
                 spellCheck={false}
                 value={smtp.host}
                 onChange={(e) => setSmtp((cur) => ({ ...cur, host: e.target.value }))}
-                placeholder={row.smtp.host}
+                placeholder={row.smtp?.host ?? ""}
                 className="field w-full mt-1"
                 disabled={busy}
               />
@@ -579,7 +609,11 @@ export function RotateForm({
                 className="field w-full mt-1"
                 disabled={busy}
               >
-                <option value="">Keep current — {row.smtp.port} ({row.smtp.tls_mode === "implicit" ? "implicit TLS" : "STARTTLS"})</option>
+                {row.smtp ? (
+                  <option value="">Keep current — {row.smtp.port} ({row.smtp.tls_mode === "implicit" ? "implicit TLS" : "STARTTLS"})</option>
+                ) : (
+                  <option value="">Choose…</option>
+                )}
                 <option value="implicit">465 — implicit TLS</option>
                 <option value="starttls">587 — STARTTLS</option>
               </select>
@@ -595,7 +629,7 @@ export function RotateForm({
                 spellCheck={false}
                 value={smtp.username}
                 onChange={(e) => setSmtp((cur) => ({ ...cur, username: e.target.value }))}
-                placeholder={row.smtp.username}
+                placeholder={row.smtp?.username ?? ""}
                 className="field w-full mt-1"
                 disabled={busy}
               />
@@ -611,7 +645,7 @@ export function RotateForm({
                 spellCheck={false}
                 value={smtp.sender}
                 onChange={(e) => setSmtp((cur) => ({ ...cur, sender: e.target.value }))}
-                placeholder={row.smtp.sender}
+                placeholder={row.smtp?.sender ?? ""}
                 className="field w-full mt-1"
                 disabled={busy}
               />
@@ -627,7 +661,7 @@ export function RotateForm({
                 spellCheck={false}
                 value={smtp.sender_name}
                 onChange={(e) => setSmtp((cur) => ({ ...cur, sender_name: e.target.value }))}
-                placeholder={row.smtp.sender_name}
+                placeholder={row.smtp?.sender_name ?? ""}
                 className="field w-full mt-1"
                 disabled={busy}
               />

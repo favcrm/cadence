@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import type { Connection } from "../../lib/types";
-import { smtpSummary } from "../settings/connectionsView";
+import { isSmtpSender, smtpErrorMessage, smtpSummary } from "../settings/connectionsView";
+import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
@@ -1006,6 +1007,9 @@ function SenderBindPanel({
 }) {
   const canWrite = viewer.operator && !viewer.readOnly;
   const [connections, setConnections] = useState<Connection[]>([]);
+  // CAD-1064: SMTP senders that exist but cannot be bound (unreadable
+  // settings or custody) — named, never reported as "none enrolled".
+  const [unusable, setUnusable] = useState<Connection[]>([]);
   const [connError, setConnError] = useState<string | null>(null);
   const [picked, setPicked] = useState("");
   const [pending, setPending] = useState(false);
@@ -1022,11 +1026,11 @@ function SenderBindPanel({
       .connections()
       .then((value) => {
         if (controller.signal.aborted) return;
-        setConnections(
-          (value.connections ?? []).filter(
-            (row) => (row.smtp ?? null) !== null && row.status.custody_available === true,
-          ),
-        );
+        const senders = (value.connections ?? []).filter(isSmtpSender);
+        const usable = (row: Connection) =>
+          (row.smtp ?? null) !== null && row.status.custody_available === true;
+        setConnections(senders.filter(usable));
+        setUnusable(senders.filter((row) => !usable(row)));
         setConnError(null);
       })
       .catch((e: unknown) => {
@@ -1105,9 +1109,17 @@ function SenderBindPanel({
           {note}
         </p>
       )}
-      {canWrite && connections.length === 0 && connError === null && (
+      {canWrite && connections.length === 0 && connError === null && unusable.length === 0 && (
         <p className="text-label text-ink-500">
           No enrolled SMTP connections — enroll one under Settings → Connections first.
+        </p>
+      )}
+      {canWrite && connections.length === 0 && connError === null && unusable.length > 0 && (
+        <p className="text-label text-fail break-words" role="alert" data-state="sender-unusable">
+          {unusable.length === 1 ? "An SMTP sender is enrolled but" : "SMTP senders are enrolled but"}{" "}
+          can't be used yet.{" "}
+          {smtpErrorMessage(unusable[0]) ?? "Its credential is not available. Rotate it to re-enter its settings."}{" "}
+          <Link href="/settings/connections">Fix it in Settings → Connections</Link>.
         </p>
       )}
       {canWrite && connections.length > 0 && (
