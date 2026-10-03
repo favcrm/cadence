@@ -16,7 +16,7 @@ import { useDrawerClose } from "./useDrawerClose";
  * drawer; focus returns through `useDrawerClose`.
  */
 export type DrawerTab = { id: string; label: string; panel: ReactNode };
-export type DrawerMenuItem = { key: string; label: string; onSelect: () => void; destructive?: boolean };
+export type DrawerMenuItem = { key: string; label: string; onSelect: () => void; destructive?: boolean; disabled?: boolean; title?: string };
 export type DrawerEdit = {
   /** `id` of the `<form>` in `body`; the footer Save submits it. */
   formId: string;
@@ -37,6 +37,9 @@ export interface DrawerShellProps {
   /** Plain warning copy; rendered as a strip with no controls. */
   warning?: ReactNode;
   tabs: DrawerTab[];
+  /** Optional controlled tab (so a body link can switch tabs). */
+  tab?: string;
+  onTab?: (id: string) => void;
   /** Replaces the tabs and body while set; footer becomes Cancel / Save. */
   edit?: DrawerEdit | null;
   /** Loading / error content shown instead of the tabs; the footer hides. */
@@ -106,7 +109,10 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
               type="button"
               role="menuitem"
               className={item.destructive ? "danger" : undefined}
+              aria-disabled={item.disabled || undefined}
+              title={item.title}
               onClick={() => {
+                if (item.disabled) return;
                 setOpen(false);
                 trigger.current?.focus();
                 item.onSelect();
@@ -122,9 +128,14 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
 }
 
 export default function DrawerShell(props: DrawerShellProps) {
-  const { kind, label, title, subtitle, avatar, pills, warning, tabs, edit, state, menu, secondary, primary, note, onClose } = props;
+  const { kind, label, title, subtitle, avatar, pills, warning, tabs, tab: tabProp, onTab, edit, state, menu, secondary, primary, note, onClose } = props;
   const headRef = useRef<HTMLHeadingElement | null>(null);
-  const [tab, setTab] = useState(tabs[0]?.id ?? "");
+  const [tabState, setTabState] = useState(tabs[0]?.id ?? "");
+  const tab = tabProp ?? tabState;
+  const setTab = (id: string) => {
+    setTabState(id);
+    onTab?.(id);
+  };
   const [menuOpen, setMenuOpen] = useState(false);
   const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
   const scrimLeft = useScrimLeft();

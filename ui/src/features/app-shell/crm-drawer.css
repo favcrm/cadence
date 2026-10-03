@@ -245,3 +245,50 @@
     transition: none;
   }
 }
+.crm-drawer-pop button[aria-disabled="true"] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Segment drawer (CAD-1054): rule sentence, eligibility funnel. */
+.chip[data-tone="warn"] {
+  color: var(--color-warn);
+  border-color: color-mix(in srgb, var(--color-warn) 45%, var(--color-ink-700));
+}
+.chip[data-tone="ok"] {
+  color: var(--color-ok);
+}
+.crm-rule-sentence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: var(--text-secondary);
+  color: var(--color-ink-300);
+}
+.crm-funnel {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.crm-funnel li {
+  display: grid;
+  grid-template-columns: 8rem 1fr 3rem;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-300);
+}
+.crm-funnel-bar {
+  height: 0.4rem;
+  border-radius: 0.2rem;
+  background: var(--color-ink-800);
+  overflow: hidden;
+}
+.crm-funnel-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--color-accent);
+}

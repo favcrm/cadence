@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
+import { navigate, useHref } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
@@ -28,6 +29,54 @@ export function describeRule(rule: SegmentPredicate): string {
   const field = SEGMENT_FIELDS.find((f) => f.value === rule.field)?.label ?? rule.field;
   const op = SEGMENT_OPS.find((o) => o.value === rule.op)?.label ?? rule.op;
   return `${field} ${op} ${rule.value}`;
+}
+
+/** Rule as a sentence of tokens: "Customers where [tag] [is] [vip]". */
+function RuleSentence({ rules }: { rules: SegmentPredicate[] }) {
+  return (
+    <p className="crm-rule-sentence" data-testid="rule-sentence">
+      <span>Customers where</span>
+      {rules.map((rule, i) => (
+        <span key={i} className="crm-rule-sentence">
+          {i > 0 && <span>and</span>}
+          <span className="chip">{SEGMENT_FIELDS.find((f) => f.value === rule.field)?.label ?? rule.field}</span>
+          <span className="chip">{SEGMENT_OPS.find((o) => o.value === rule.op)?.label ?? rule.op}</span>
+          <span className="chip">{rule.value}</span>
+        </span>
+      ))}
+    </p>
+  );
+}
+
+export interface FunnelStep {
+  label: string;
+  count: number;
+}
+
+/** Eligibility funnel built only from the host's membership-preview
+ *  counts, plus the one plain-language reason that blocks most people. */
+export function eligibilityFunnel(p: AudiencePreview): { steps: FunnelStep[]; reason: string | null } {
+  const valid = Math.max(p.finalCount, p.baseCount - p.excluded.invalid);
+  const consent = Math.max(p.finalCount, valid - p.excluded.noConsent - p.excluded.unsubscribed);
+  const steps = [
+    { label: "Match the rule", count: p.baseCount },
+    { label: "Valid email", count: valid },
+    { label: "Email consent", count: consent },
+    { label: "Can be emailed", count: p.finalCount },
+  ];
+  const causes: [number, string][] = [
+    [p.excluded.noConsent, "have not agreed to receive email"],
+    [p.excluded.unsubscribed, "have unsubscribed"],
+    [p.excluded.invalid, "have no valid email address"],
+    [p.excluded.suppressed, "are on the suppression list"],
+    [p.exclusionCount, "are on the saved exclusion list"],
+  ];
+  const top = causes.filter(([n]) => n > 0).sort((a, b) => b[0] - a[0])[0];
+  let reason: string | null = null;
+  if (p.baseCount === 0) reason = "No customers match this rule yet.";
+  else if (p.finalCount === 0 && top) reason = `Nobody can be emailed: ${top[0]} ${top[1]}.`;
+  else if (p.finalCount < p.baseCount && top) reason = `${top[0]} ${top[0] === 1 ? "customer" : "customers"} ${top[1]}.`;
+  return { steps, reason };
 }
 
 /**
@@ -182,6 +231,7 @@ export default function CrmSegments({
           viewer={viewer}
           canWrite={viewer.operator && !viewer.readOnly}
           onClose={() => onSelect(null)}
+          onOpen={onSelect}
         />
       )}
     </div>
@@ -204,6 +254,24 @@ function SegmentList({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
+  const [counts, setCounts] = useState<Record<string, AudiencePreview | null>>({});
+
+  // Per-row exact host counts (bounded); a failed row shows an em dash.
+  useEffect(() => {
+    const controller = new AbortController();
+    for (const segment of segments.slice(0, 25)) {
+      audienceClient
+        .preview(scope, { mode: "segment", segmentId: segment.id })
+        .then((value) => {
+          if (!controller.signal.aborted) setCounts((c) => ({ ...c, [segment.id]: parsePreview(value) }));
+        })
+        .catch(() => {
+          if (!controller.signal.aborted) setCounts((c) => ({ ...c, [segment.id]: null }));
+        });
+    }
+    return () => controller.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segments]);
 
   const reloadToken = `${scope.installId}:${scope.contextId}:${retry}`;
   useEffect(() => {
@@ -282,7 +350,9 @@ function SegmentList({
             <thead>
               <tr>
                 <th scope="col">Name</th>
-                <th scope="col">Rules</th>
+                <th scope="col">Rule</th>
+                <th scope="col">Matches</th>
+                <th scope="col">Can be emailed</th>
                 <th scope="col">
                   <span className="sr-only">Open</span>
                 </th>
@@ -295,8 +365,21 @@ function SegmentList({
                     {segment.name}
                     <span className="num text-micro text-ink-500"> · {segment.id}</span>
                   </td>
-                  <td className="num text-ink-300">
-                    {segment.predicates.length} rule{segment.predicates.length === 1 ? "" : "s"}
+                  <td className="text-ink-300">
+                    <span className="chip">{segment.predicates[0] ? describeRule(segment.predicates[0]) : "—"}</span>
+                    {segment.predicates.length > 1 && (
+                      <span className="num text-micro text-ink-500"> +{segment.predicates.length - 1} more</span>
+                    )}
+                  </td>
+                  <td className="num text-ink-300">{counts[segment.id]?.baseCount ?? "—"}</td>
+                  <td>
+                    {counts[segment.id] ? (
+                      <span className="chip" data-tone={counts[segment.id]!.finalCount === 0 ? "warn" : "ok"}>
+                        {counts[segment.id]!.finalCount}
+                      </span>
+                    ) : (
+                      "—"
+                    )}
                   </td>
                   <td>
                     <button type="button" className="lnk" onClick={() => onSelect(segment.id)}>
@@ -604,12 +687,14 @@ function SegmentDrawer({
   viewer,
   canWrite,
   onClose,
+  onOpen,
 }: {
   scope: AudienceScope;
   segmentId: string;
   viewer: Viewer;
   canWrite: boolean;
   onClose: () => void;
+  onOpen: (segmentId: string) => void;
 }) {
   const [segment, setSegment] = useState<SegmentDoc | null>(null);
   const [loading, setLoading] = useState(true);
@@ -620,12 +705,15 @@ function SegmentDrawer({
   const [previewLoading, setPreviewLoading] = useState(true);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewToken, setPreviewToken] = useState(0);
+  const [tab, setTab] = useState("overview");
+  const href = useHref();
   const reloadToken = `${scope.installId}:${scope.contextId}:${segmentId}`;
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
     setError(null);
     setEditing(false);
+    setTab("overview");
     audienceClient
       .segmentShow(scope, segmentId)
       .then((value) => {
@@ -674,6 +762,17 @@ function SegmentDrawer({
   };
   const ready = !loading && error === null && segment !== null;
 
+  const members = preview?.sample ?? [];
+  const funnel = preview ? eligibilityFunnel(preview) : null;
+  const memberList = (rows: { id: string; displayName: string }[]) => (
+    <ul className="crm-history" aria-label="Segment members">
+      {rows.map((m) => (
+        <li key={m.id} className="text-label text-ink-300">
+          {m.displayName || "—"} <span className="chip" data-tone="ok">Can email</span>
+        </li>
+      ))}
+    </ul>
+  );
   const tabs: DrawerTab[] =
     ready && segment !== null
       ? [
@@ -682,29 +781,62 @@ function SegmentDrawer({
             label: "Overview",
             panel: (
               <>
-                <section aria-label="Segment rules">
-                  <h4 className="text-label font-medium text-ink-200">Rules ({segment.predicates.length})</h4>
-                  <ol className="crm-history">
-                    {segment.predicates.map((rule, index) => (
-                      <li key={index} className="text-label text-ink-300">
-                        {describeRule(rule)}
-                      </li>
-                    ))}
-                  </ol>
+                <section aria-label="Segment rule">
+                  <RuleSentence rules={segment.predicates} />
                 </section>
-                <section aria-label="Current matches" className="mt-3">
-                  <h4 className="text-label font-medium text-ink-200">Current matches</h4>
-                  <div className="mt-1">
-                    <PreviewPanel
-                      preview={preview}
-                      loading={previewLoading}
-                      error={previewError}
-                      onRetry={() => setPreviewToken((count) => count + 1)}
-                      label="Current matches"
-                    />
-                  </div>
+                <section aria-label="Who can be emailed" className="mt-3">
+                  <h4 className="text-label font-medium text-ink-200">Who can be emailed</h4>
+                  {previewLoading && (
+                    <p className="text-secondary text-ink-400" role="status">Reading host audience counts…</p>
+                  )}
+                  {previewError !== null && (
+                    <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
+                      {previewError}{" "}
+                      <button type="button" className="lnk" onClick={() => setPreviewToken((n) => n + 1)}>Retry</button>
+                    </p>
+                  )}
+                  {funnel && !previewLoading && previewError === null && (
+                    <>
+                      <ol className="crm-funnel" data-testid="funnel">
+                        {funnel.steps.map((step) => (
+                          <li key={step.label}>
+                            <span>{step.label}</span>
+                            <span className="crm-funnel-bar">
+                              <span style={{ width: `${funnel.steps[0].count === 0 ? 0 : Math.round((step.count / funnel.steps[0].count) * 100)}%` }} />
+                            </span>
+                            <span className="num">{step.count}</span>
+                          </li>
+                        ))}
+                      </ol>
+                      {funnel.reason !== null && (
+                        <p className="text-label text-ink-300 mt-1" data-testid="funnel-reason">{funnel.reason}</p>
+                      )}
+                    </>
+                  )}
+                </section>
+                <section aria-label="Members preview" className="mt-3">
+                  <h4 className="text-label font-medium text-ink-200">Members</h4>
+                  {members.length === 0 && !previewLoading && (
+                    <p className="text-secondary text-ink-400">No one can be emailed from this segment yet.</p>
+                  )}
+                  {memberList(members.slice(0, 10))}
+                  {members.length > 0 && (
+                    <button type="button" className="lnk text-label" onClick={() => setTab("members")}>View all</button>
+                  )}
                 </section>
               </>
+            ),
+          },
+          {
+            id: "members",
+            label: "Members",
+            panel: (
+              <section aria-label="All members">
+                <p className="text-label text-ink-400">
+                  Showing {members.length} of {preview?.finalCount ?? 0} customers who can be emailed.
+                </p>
+                {memberList(members)}
+              </section>
             ),
           },
           {
@@ -717,11 +849,41 @@ function SegmentDrawer({
                   <span className="num">{scope.contextId || "none"}</span> · revision r{segment.revision} · digest{" "}
                   {segment.digest.slice(0, 18)}…
                 </p>
+                <div className="mt-3">
+                  <PreviewPanel
+                    preview={preview}
+                    loading={previewLoading}
+                    error={previewError}
+                    onRetry={() => setPreviewToken((count) => count + 1)}
+                    label="Current matches"
+                  />
+                </div>
               </section>
             ),
           },
         ]
       : [];
+
+  const duplicate = () => {
+    if (segment === null) return;
+    void audienceClient
+      .segmentSave(scope, {
+        segmentId: newAudienceId("seg"),
+        name: `${segment.name} (copy)`.slice(0, 80),
+        predicates: segment.predicates.map((r) => ({ field: r.field, op: r.op, value: r.value })),
+      })
+      .then((value) => onOpen(parseSegment(value).id))
+      .catch((err: unknown) => setError(friendlyAudienceError(err)));
+  };
+  const useInCampaign = () => {
+    const [path, search] = href.split("?");
+    const q = new URLSearchParams(search ?? "");
+    q.set("crm", "campaigns");
+    q.set("appview", "new");
+    q.set("segment", segmentId);
+    q.delete("record");
+    navigate(`${path}?${q.toString()}`);
+  };
 
   return (
     <DrawerShell
@@ -730,7 +892,35 @@ function SegmentDrawer({
       title={loading ? "Segment details" : (segment?.name ?? "Segment details")}
       avatar="◎"
       subtitle={segment ? `${segment.predicates.length} rule${segment.predicates.length === 1 ? "" : "s"}` : undefined}
+      pills={
+        ready && preview ? (
+          <>
+            <span className="chip">{preview.baseCount} match</span>
+            <span className="chip" data-tone={preview.finalCount === 0 ? "warn" : "ok"}>
+              {preview.finalCount} can be emailed
+            </span>
+          </>
+        ) : undefined
+      }
       tabs={tabs}
+      tab={tab}
+      onTab={setTab}
+      menu={
+        ready
+          ? [
+              { key: "duplicate", label: "Duplicate", onSelect: duplicate, disabled: !canWrite, title: canWrite ? undefined : "Operators only" },
+              { key: "export", label: "Export members", onSelect: () => {}, disabled: true, title: "Not available yet: the host has no segment export" },
+              { key: "delete", label: "Delete segment", onSelect: () => {}, disabled: true, destructive: true, title: "Not available yet: the host has no segment delete" },
+            ]
+          : undefined
+      }
+      secondary={
+        ready && canWrite ? (
+          <Button size="sm" onClick={() => setEditing(true)}>
+            Edit rules
+          </Button>
+        ) : undefined
+      }
       state={
         loading ? (
           <p className="text-secondary text-ink-400" role="status">
@@ -769,8 +959,8 @@ function SegmentDrawer({
       }
       primary={
         ready && canWrite ? (
-          <Button size="sm" variant="primary" onClick={() => setEditing(true)}>
-            Edit rules
+          <Button size="sm" variant="primary" onClick={useInCampaign}>
+            Use in campaign
           </Button>
         ) : undefined
       }
