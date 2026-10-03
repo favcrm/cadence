@@ -956,7 +956,7 @@ async function mountedFlow() {
         .map((el) => el.getAttribute("aria-label"));
     };
     const overview = await panelsOf("overview");
-    for (const label of ["Ready to send", "Campaign summary", "Content approval", "SMTP sender", "Test send", "Final send"]) {
+    for (const label of ["Ready to send", "Campaign summary", "Content approval", "Test send", "Final send"]) {
       assert(overview.includes(label), `Overview carries: ${label}`);
     }
     assert(!overview.includes("Frozen audience") && !overview.includes("Email preview"), "Overview mounts no other tab's panels");

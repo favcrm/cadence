@@ -287,8 +287,6 @@ async function mounted(readOnly: boolean) {
     // Fix links go to the owning tab or panel.
     await click(buttonIn(item("approval"), "Approve"));
     assert((document.activeElement as HTMLElement | null)?.id === "cmp-approval-section", "Approve focuses the approval panel");
-    await click(buttonIn(item("sender"), "Fix"));
-    assert((document.activeElement as HTMLElement | null)?.id === "cmp-sender-section", "the sender fix focuses the sender panel");
     await click(buttonIn(item("freeze"), "Fix"));
     await settle(() => assert(tabEl("audience")!.getAttribute("aria-selected") === "true", "the freeze fix opens the Audience tab"));
     assert(host.querySelector('section[aria-label="Frozen audience"]'), "the Audience tab mounts the audience panel");

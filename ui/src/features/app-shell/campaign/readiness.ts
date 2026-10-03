@@ -1,5 +1,6 @@
 import type { ContentDoc } from "../campaignGrammar";
 import type { SmtpBinding, TestSendReceipt } from "../sendClient";
+import { EMAIL_SENDING_HREF } from "../../settings/emailSendingView";
 
 /**
  * The send prerequisites as data (CAD-1055). One list feeds both the
@@ -14,7 +15,8 @@ export type CampaignTab = "overview" | "email" | "audience" | "activity";
 /** Where an unmet item is fixed: another tab, or a panel on Overview. */
 export type FixTarget =
   | { kind: "tab"; tab: CampaignTab; label: string }
-  | { kind: "anchor"; id: string; label: string };
+  | { kind: "anchor"; id: string; label: string }
+  | { kind: "href"; href: string; label: string };
 
 export interface ReadinessItem {
   key: "draft" | "approval" | "freeze" | "sender" | "test";
@@ -35,7 +37,6 @@ export interface ReadinessInput {
   testEvidence: TestSendReceipt | null;
 }
 
-export const SENDER_ANCHOR = "cmp-sender-section";
 export const TEST_ANCHOR = "cmp-test-section";
 export const APPROVAL_ANCHOR = "cmp-approval-section";
 
@@ -92,7 +93,7 @@ export function sendReadiness(input: ReadinessInput): ReadinessItem[] {
       label: "Email sender connected",
       done: senderReason === null,
       reason: senderReason,
-      fix: { kind: "anchor", id: SENDER_ANCHOR, label: "Fix" },
+      fix: { kind: "href", href: EMAIL_SENDING_HREF, label: "Set up sending" },
     },
     {
       key: "test",
