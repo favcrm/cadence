@@ -685,31 +685,39 @@ fn cad1041_claim_id_identity_and_two_handles_one_claim() {
         .as_str()
         .unwrap()
         .to_owned();
-    // Identity pin: claiming while naming a DIFFERENT id is a no-claim.
-    let other = s1
-        .social_publish_schedule(&intent("req-claimid-b"))
-        .unwrap()["intent"]["intent_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert!(s1
-        .social_publish_claim_id(&id, |_, candidate, _| Ok(candidate == other))
-        .unwrap()
-        .is_none());
+    // Scope pin (CAD-1027 cancel predicate): another install, a context
+    // the row does not carry, or an unknown id is a no-claim.
+    s1.social_publish_schedule(&intent("req-claimid-b"))
+        .unwrap();
+    for (want, install, context) in [
+        (id.as_str(), "install-forged", None),
+        (id.as_str(), "install-harbour", Some("ctx-other")),
+        ("sp-never-scheduled", "install-harbour", None),
+    ] {
+        assert!(
+            s1.social_publish_claim_id(want, install, context)
+                .unwrap()
+                .is_none(),
+            "claimed {want} in {install}/{context:?}"
+        );
+    }
     assert_eq!(
         s1.social_publish_show(&id).unwrap()["intent"]["state"],
         "queued"
     );
-    // Named claim wins once.
+    assert!(s1
+        .social_publish_show_scoped(&id, "install-harbour", Some("ctx-other"))
+        .is_err());
+    // The named claim in its own scope wins once.
     let claimed = s1
-        .social_publish_claim_id(&id, |_, _, _| Ok(true))
+        .social_publish_claim_id(&id, "install-harbour", None)
         .unwrap()
         .unwrap();
     assert_eq!(claimed["intent"]["state"], "processing");
     // A second Store handle on the same file cannot re-claim it.
     let s2 = Store::open(&path).unwrap();
     assert!(s2
-        .social_publish_claim_id(&id, |_, _, _| Ok(true))
+        .social_publish_claim_id(&id, "install-harbour", None)
         .unwrap()
         .is_none());
     // A raw second connection replaying the claim UPDATE shape finds

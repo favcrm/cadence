@@ -255,11 +255,13 @@ export default function PublishPanel({
     }
   };
 
-  const sendNow = async (intentId: string) => {
+  // CAD-1041: send-now in the intent's own frozen scope, as cancel.
+  const sendNow = async (intent: PublishIntent) => {
+    const intentId = intent.intent_id;
     setBusy(true);
     setActionError(null);
     try {
-      const reply = await client.sendNow(intentId);
+      const reply = await client.sendNow(intentId, intent.install_id, intent.context_id);
       setConfirmSend(null);
       setNotice(
         reply.intent.state === "posted"
@@ -356,7 +358,7 @@ export default function PublishPanel({
                 size="sm"
                 loading={busy}
                 disabled={!canWrite}
-                onClick={() => void sendNow(intent.intent_id)}
+                onClick={() => void sendNow(intent)}
               >
                 Confirm send now
               </Button>

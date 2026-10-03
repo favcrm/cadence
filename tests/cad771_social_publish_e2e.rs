@@ -2396,6 +2396,11 @@ fn cad1027_daemon_refuses_unminted_approval_shape() {
 /// — never a re-send, never another intent, and only an operator may
 /// invoke it. Each refusal keeps the provider-call count unchanged.
 ///
+/// CAD-1041: send-now params in the intent's own install and context.
+fn send_now_params(id: &str, install: &str, context: &Value) -> Value {
+    json!({"intent_id": id, "install_id": install, "context_id": context["id"]})
+}
+
 /// Schedule one queued intent and return `(intent_id, request_key)`.
 #[allow(clippy::too_many_arguments)]
 fn send_now_fixture(
@@ -2439,7 +2444,10 @@ fn cad1041_send_now_posts_the_named_intent_once() {
     );
     let out = h
         .daemon
-        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
         .unwrap()["intent"]
         .clone();
     assert_eq!(out["state"], "posted", "{out}");
@@ -2453,7 +2461,10 @@ fn cad1041_send_now_posts_the_named_intent_once() {
     // A second send-now on a posted row refuses without a provider call.
     let err = h
         .daemon
-        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
         .unwrap_err()
         .to_string();
     assert!(err.contains("queued"), "{err}");
@@ -2481,7 +2492,7 @@ fn cad1041_agent_and_detached_child_never_send() {
         .agent_rpc(
             "cc13-pw",
             "social_publish_send_now",
-            json!({"intent_id": id}),
+            send_now_params(&id, &install, &context),
         )
         .unwrap_err()
         .to_string();
@@ -2492,7 +2503,10 @@ fn cad1041_agent_and_detached_child_never_send() {
     // Detached setsid child (unproven peer): refused.
     let err = h
         .daemon
-        .unproven_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .unproven_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
         .unwrap_err()
         .to_string();
     assert!(
@@ -2537,15 +2551,21 @@ fn cad1041_forged_id_never_claims_a_different_intent() {
         .daemon
         .operator_rpc(
             "social_publish_send_now",
-            json!({"intent_id": "sp-forged-never-scheduled"}),
+            send_now_params("sp-forged-never-scheduled", &install, &context),
         )
         .unwrap_err()
         .to_string();
-    assert!(err.contains("does not exist"), "{err}");
+    assert!(
+        err.contains("no social publish intent with this id"),
+        "{err}"
+    );
     // Send A by name: A posts on its own request key; B stays queued.
     let out = h
         .daemon
-        .operator_rpc("social_publish_send_now", json!({"intent_id": id_a}))
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id_a, &install, &context),
+        )
         .unwrap()["intent"]
         .clone();
     assert_eq!(out["state"], "posted");
@@ -2563,6 +2583,67 @@ fn cad1041_forged_id_never_claims_a_different_intent() {
         !keys.is_empty() && keys.iter().all(|k| k == &key_a),
         "keys: {keys:?} want only {key_a}"
     );
+}
+
+/// CAD-1041 adversarial (review finding B4): send-now is scoped like the
+/// CAD-1027 cancel. Another install, another context or a dropped context
+/// refuses through the RPC and the board, stages nothing, sends nothing
+/// and leaves the row queued; only the intent's own scope sends it.
+#[test]
+fn cad1041_wrong_scope_never_stages_or_sends() {
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _s) = e2e_release(&door);
+    let (context, run, bundle, install) = approved_run(&h, "snscope-a");
+    let (other, _run_b, _bundle_b, _) = approved_run(&h, "snscope-b");
+    let (id, _key) = send_now_fixture(
+        &h,
+        &context,
+        &run,
+        &bundle,
+        &install,
+        "cad1041-scope",
+        epoch_now(),
+    );
+    let board = Board::serve(&h);
+    let path = format!("/api/social-publishes/{id}/send-now");
+    for scope in [
+        json!({"install_id": "install-forged", "context_id": context["id"]}),
+        json!({"install_id": install, "context_id": other["id"]}),
+        json!({"install_id": install}),
+    ] {
+        let mut params = scope.clone();
+        params["intent_id"] = json!(id);
+        let err = h
+            .daemon
+            .operator_rpc("social_publish_send_now", params)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("in this install and context"),
+            "{scope}: {err}"
+        );
+        let (code, text) = board.post(&h, &path, &scope);
+        assert!(
+            (400..500).contains(&code),
+            "HTTP sent outside scope {scope}: {code} {text}"
+        );
+    }
+    assert_eq!(door.stages(), 0, "an out-of-scope request staged");
+    assert_eq!(
+        *door.calls.lock().unwrap(),
+        0,
+        "an out-of-scope request sent"
+    );
+    let shown = h
+        .daemon
+        .operator_rpc("social_publish_show", json!({"intent_id": id}))
+        .unwrap();
+    assert_eq!(shown["intent"]["state"], "queued");
+    let own = json!({"install_id": install, "context_id": context["id"]});
+    let (code, text) = board.post(&h, &path, &own);
+    assert_eq!(code, 200, "in-scope send-now refused: {text}");
+    assert!(text.contains("\"posted\""), "{text}");
 }
 
 #[test]
@@ -2583,15 +2664,16 @@ fn cad1041_concurrent_double_click_one_provider_call() {
     // Two operator clicks race on the same intent id; the single CAS
     // inside claim_id means only one wins the queued→processing move.
     let state = h.daemon.state.clone();
-    let id2 = id.clone();
+    let params = send_now_params(&id, &install, &context);
     let winner = thread::spawn(move || {
         cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
-            cadence_agent::client::rpc(&state, "social_publish_send_now", json!({"intent_id": id2}))
+            cadence_agent::client::rpc(&state, "social_publish_send_now", params)
         })
     });
-    let second = h
-        .daemon
-        .operator_rpc("social_publish_send_now", json!({"intent_id": id}));
+    let second = h.daemon.operator_rpc(
+        "social_publish_send_now",
+        send_now_params(&id, &install, &context),
+    );
     let first = winner.join().unwrap();
     // Exactly one posts; the other either posts the same claimed row
     // (idempotent claim) or refuses "no longer queued" — never two
@@ -2637,7 +2719,10 @@ fn cad1041_revoked_grant_sends_nothing() {
     door.grants.lock().unwrap().revoke(GRANT_FB);
     let out = h
         .daemon
-        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
         .unwrap()["intent"]
         .clone();
     assert_eq!(out["state"], "refused", "revoked grant: {out}");
@@ -2667,7 +2752,10 @@ fn cad1041_uncertain_staging_leaves_the_row_queued() {
     sender.script_preflight(&key, Some(Staging::Uncertain));
     let err = h
         .daemon
-        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
         .unwrap_err()
         .to_string();
     assert!(err.contains("stays queued"), "{err}");
@@ -2680,7 +2768,10 @@ fn cad1041_uncertain_staging_leaves_the_row_queued() {
     sender.script_preflight(&key, None);
     let out = h
         .daemon
-        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
         .unwrap();
     assert_eq!(out["intent"]["state"], "posted", "{out}");
     assert_eq!(*door.calls.lock().unwrap(), 1);
@@ -2706,7 +2797,10 @@ fn cad1041_refused_staging_reports_refused_without_execute() {
     sender.script_preflight(&key, Some(Staging::Refused("not_publishable")));
     let out = h
         .daemon
-        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
         .unwrap()["intent"]
         .clone();
     assert_eq!(out["state"], "refused", "{out}");
@@ -2736,7 +2830,10 @@ fn cad1041_nothing_sent_holds_the_row() {
     sender.script_execute_refusal(&key, "nothing_sent");
     let out = h
         .daemon
-        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
         .unwrap()["intent"]
         .clone();
     assert_eq!(out["state"], "held", "{out}");
@@ -2762,7 +2859,10 @@ fn cad1041_overdue_intent_refuses_until_rescheduled() {
     );
     let err = h
         .daemon
-        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
         .unwrap_err()
         .to_string();
     assert!(err.contains("overdue"), "{err}");
@@ -2794,7 +2894,7 @@ fn cad1041_send_now_board_route_reaches_the_same_gate() {
     let (code, text) = board.post(
         &h,
         &format!("/api/social-publishes/{id}/send-now"),
-        &json!({}),
+        &json!({"install_id": install, "context_id": context["id"]}),
     );
     assert_eq!(code, 200, "{code} {text}");
     let parsed: Value = serde_json::from_str(&text).unwrap();
@@ -2805,7 +2905,7 @@ fn cad1041_send_now_board_route_reaches_the_same_gate() {
     let (code2, _text2) = board.post(
         &h,
         &format!("/api/social-publishes/{id}/send-now"),
-        &json!({}),
+        &json!({"install_id": install, "context_id": context["id"]}),
     );
     assert!((400..500).contains(&code2), "{code2}");
     assert_eq!(*door.calls.lock().unwrap(), 1);
@@ -2834,7 +2934,10 @@ fn cad1041_crash_after_door_accept_reconciles_never_resends() {
     sender.set_behavior(&key, FakeProviderBehavior::LoseResponseAfterAccept);
     let out = h
         .daemon
-        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
         .unwrap()["intent"]
         .clone();
     assert_eq!(out["state"], "posted", "{out}");
@@ -2844,7 +2947,10 @@ fn cad1041_crash_after_door_accept_reconciles_never_resends() {
     // A send-now on the settled row refuses; no third provider call.
     let err = h
         .daemon
-        .operator_rpc("social_publish_send_now", json!({"intent_id": id}))
+        .operator_rpc(
+            "social_publish_send_now",
+            send_now_params(&id, &install, &context),
+        )
         .unwrap_err()
         .to_string();
     assert!(err.contains("queued"), "{err}");

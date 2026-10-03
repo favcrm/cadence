@@ -59,7 +59,7 @@ impl Shared {
                 "social_publish_show" => &["intent_id"],
                 "social_publish_list" => &["install_id", "context_id"],
                 "social_publish_claim_due" => &["now_epoch", "recheck"],
-                "social_publish_send_now" => &["intent_id"],
+                "social_publish_send_now" => &["intent_id", "install_id", "context_id"],
                 "social_publish_reconcile" => &["intent_id"],
                 "social_publish_report" => &["intent_id", "decision", "receipt"],
                 _ => return Err(Error::rejected("unknown social publish method")),
@@ -418,9 +418,10 @@ impl Shared {
     }
 
     /// CAD-1041: the operator's explicit "send this queued intent now".
-    /// One named row is claimed BY IDENTITY (the candidate-id pin — a
-    /// peek/claim head move can never claim a row the operator did not
-    /// click), prefight-staged before the claim so a door blip leaves it
+    /// One named row is claimed BY IDENTITY in its own install and exact
+    /// context (the CAD-1027 cancel scope — a peek/claim head move or a
+    /// forged scope can never claim a row the operator did not click),
+    /// preflight-staged before the claim so a door blip leaves it
     /// queued, dispatched exactly once through `dispatch_claimed`, then
     /// reconciled once via `status` (never a second provider send).
     /// Refuses a row more than `MAX_LATENESS` overdue — re-schedule it
@@ -430,7 +431,14 @@ impl Shared {
         use crate::platform::agenticos_external::publish::Preflight;
         const MAX_LATENESS_SECS: i64 = 900;
         let id = Self::required_segment(params, "intent_id")?.to_owned();
-        let shown = self.store.social_publish_show(&id)?;
+        // CAD-1027 scope, as cancel: the intent's own install and exact
+        // context. An out-of-scope request refuses here, before staging,
+        // and the claim below re-checks the same predicate in its CAS.
+        let install = Self::required_segment(params, "install_id")?;
+        let context = Self::strict_optional_segment(params, "context_id")?;
+        let shown = self
+            .store
+            .social_publish_show_scoped(&id, install, context)?;
         if shown["intent"]["state"] != "queued" {
             return Err(Error::rejected(
                 "send-now needs a queued intent — this one already left queued",
@@ -466,10 +474,9 @@ impl Shared {
                 )));
             }
             Preflight::Refused(refusal) => {
-                let want = id.clone();
                 if self
                     .store
-                    .social_publish_claim_id(&id, move |_, candidate, _| Ok(candidate == want))?
+                    .social_publish_claim_id(&id, install, context)?
                     .is_some()
                 {
                     return self.store.social_publish_report(
@@ -485,11 +492,7 @@ impl Shared {
         // concurrent send-now or cancel reads state='processing' and
         // gets `claimed: false`; the single CAS inside `claim_id` is
         // what makes a double-click one provider call, not two.
-        let want = id.clone();
-        let Some(claimed) = self
-            .store
-            .social_publish_claim_id(&id, move |_, candidate, _| Ok(candidate == want))?
-        else {
+        let Some(claimed) = self.store.social_publish_claim_id(&id, install, context)? else {
             return Ok(json!({"sent": false, "intent_id": id, "reason": "no longer queued"}));
         };
         if !self.store.social_publish_material_current(&id)? {

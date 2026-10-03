@@ -477,47 +477,53 @@ impl Store {
         Ok(Some(result))
     }
 
-    /// CAD-1041: atomically claim one NAMED queued intent — the
-    /// operator's send-now. Unlike `claim_due` there is no due_epoch
-    /// filter: the operator's explicit click IS the dispatch trigger,
-    /// so an intent not yet due sends all the same (the lateness bound
-    /// runs earlier and refuses only the over-stale). The candidate is
-    /// the named row or nothing — the eligible callback still receives
-    /// (conn, candidate id, frozen) and the same single CAS transition
-    /// guards the claim: exactly one claimant wins, a second click or a
-    /// racing `claim_due` reads `state='processing'` and yields `None`.
-    pub(crate) fn social_publish_claim_id<F>(
+    /// CAD-1041: the operator's view of one intent in a named scope —
+    /// the row only when it belongs to exactly this install and context
+    /// (null-preserving, the CAD-1027 cancel predicate). Send-now reads
+    /// through it so an out-of-scope request refuses before staging.
+    pub(crate) fn social_publish_show_scoped(
         &self,
         intent_id: &str,
-        eligible: F,
-    ) -> Result<Option<Value>>
-    where
-        F: FnOnce(&Connection, &str, &Value) -> Result<bool>,
-    {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let state: Option<String> = tx
+        install_id: &str,
+        context_id: Option<&str>,
+    ) -> Result<Value> {
+        let conn = self.conn();
+        let in_scope: Option<String> = conn
             .query_row(
-                "SELECT state FROM social_publish_intents WHERE intent_id=?",
-                [intent_id],
+                "SELECT intent_id FROM social_publish_intents WHERE intent_id=? AND install_id=? AND context_id IS ?",
+                params![intent_id, install_id, context_id],
                 |r| r.get(0),
             )
             .optional()?;
-        if state.as_deref() != Some("queued") {
-            tx.commit()?;
-            return Ok(None);
+        if in_scope.is_none() {
+            return Err(Error::rejected(
+                "no social publish intent with this id in this install and context",
+            ));
         }
-        let frozen_text: String = tx.query_row(
-            "SELECT frozen FROM social_publish_intents WHERE intent_id=?",
-            [intent_id],
-            |r| r.get(0),
+        read_row(&conn, intent_id)
+    }
+
+    /// CAD-1041: atomically claim one NAMED queued intent in its own
+    /// scope — the operator's send-now. Unlike `claim_due` there is no
+    /// due_epoch filter: the operator's explicit click IS the dispatch
+    /// trigger (the lateness bound runs earlier and refuses only the
+    /// over-stale). The install and exact context are checked against the
+    /// row inside the same compare-and-set as the state, so exactly one
+    /// claimant wins and a wrong scope never claims; a second click, a
+    /// racing `claim_due` or a cancel reads a non-queued row and yields
+    /// `None`.
+    pub(crate) fn social_publish_claim_id(
+        &self,
+        intent_id: &str,
+        install_id: &str,
+        context_id: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE social_publish_intents SET state='processing',updated=? WHERE intent_id=? AND state='queued' AND install_id=? AND context_id IS ?",
+            params![now(), intent_id, install_id, context_id],
         )?;
-        let frozen: Value = serde_json::from_str(&frozen_text)?;
-        if !eligible(&tx, intent_id, &frozen)? {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let changed = tx.execute("UPDATE social_publish_intents SET state='processing',updated=? WHERE intent_id=? AND state='queued'",params![now(),intent_id])?;
         if changed != 1 {
             tx.commit()?;
             return Ok(None);

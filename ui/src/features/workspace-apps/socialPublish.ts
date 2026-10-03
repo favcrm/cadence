@@ -297,9 +297,11 @@ export const socialPublish = {
   /** CAD-1041: the operator's explicit "send this queued intent now".
    *  The daemon claims the named row by identity, stages it, dispatches
    *  once and reconciles through status — one click, one provider call,
-   *  never another intent. A refused call leaves the row for a human. */
-  sendNow: async (intentId: string) => {
-    const reply = await request<{ intent: BackendIntent }>(paths.sendNow(intentId), undefined, {});
+   *  never another intent. A refused call leaves the row for a human.
+   *  Like cancel, it names the intent's own install and exact context. */
+  sendNow: async (intentId: string, installId: string, contextId: string | null) => {
+    const body = { install_id: installId, ...(contextId ? { context_id: contextId } : {}) };
+    const reply = await request<{ intent: BackendIntent }>(paths.sendNow(intentId), undefined, body, CANCEL_KEYS);
     return { intent: toPublishIntent(reply.intent) };
   },
 };
