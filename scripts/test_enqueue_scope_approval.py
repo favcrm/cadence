@@ -53,6 +53,7 @@ class Case:
         self.branch = BRANCH
         self.ticket_body = BODY
         self.refs = [{"kind": "branch", "path": BRANCH}]
+        self.status = "doing"
         self.store = [scope_rec()]
         self.note_text = (f"# Verdict: {ISSUE} Review (standards+spec) — pass\n> Issue: {ISSUE}\n> From: rev\n\n"
                           f"## Verdict\npass — PR #5, head {HEAD}\n\nRisk: human (4, 7) — scripts\n"
@@ -92,7 +93,7 @@ class Case:
                     return 0, (ROOT / f).read_text(), ""
         if argv[:3] == ["cadence", "issue", "show"]:
             return 0, json.dumps({"id": argv[3], "owner": None, "claim": None, "body": self.ticket_body,
-                                  "refs": self.refs,
+                                  "status": self.status, "refs": self.refs,
                                   "comments": [{"body": f"{HEAD} {NOTE}"}]}), ""
         if argv[:3] == ["cadence", "audit", "verdicts"]:
             return 0, json.dumps({"verdicts": [self.note()], "skipped": []}), ""
@@ -179,14 +180,14 @@ class ScopeApproval(unittest.TestCase):
 
     def test_digest_matches_the_daemon_trim_not_pythons(self):
         # Rust's trim() keeps U+001C; Python's str.strip() would drop it.
-        body = "x\u001c"
+        body = BODY.rstrip("\n") + "\u001c"
         self.c.ticket_body = body
         self.c.store = [{**scope_rec(), "digest": hashlib.sha256(body.encode()).hexdigest()}]
         reasons, report = self.c.evaluate()
         self.assertEqual(reasons, [], report)
         # NBSP and trailing newlines ARE trimmed by both.
-        self.c.ticket_body = "x \n"
-        self.c.store = [{**scope_rec(), "digest": hashlib.sha256(b"x").hexdigest()}]
+        self.c.ticket_body = BODY + "\u00a0\n"
+        self.c.store = [{**scope_rec(), "digest": digest(BODY)}]
         reasons, report = self.c.evaluate()
         self.assertEqual(reasons, [], report)
 
@@ -236,6 +237,66 @@ class ScopeApproval(unittest.TestCase):
             with self.subTest(line=line):
                 self.c.note_text = self.c.note_text.replace(f"Scope: in-scope {ISSUE}\n", line)
                 self.refused("does not state")
+
+    def set_risk(self, line):
+        self.c.note_text = self.c.note_text.replace("Risk: human (4, 7) — scripts", line)
+
+    def test_undeclared_path_triggers_need_a_per_head_approval(self):
+        # A trigger-7 (docs) ticket must not cover trigger 4 (supply chain) or 6 (rollout) paths.
+        self.c.ticket_body = "## Goal\ndocs\nRisk: human (7)\n"
+        self.c.store = [scope_rec(body=self.c.ticket_body)]
+        self.set_risk("Risk: human (7) — docs")
+        self.c.paths = ["docs/AUDIT.md"]
+        reasons, report = self.c.evaluate()
+        self.assertEqual(reasons, [], report)  # sanity: in scope when only 7 is hit
+        for paths, why in ((["docs/AUDIT.md", "Cargo.toml"], [4]), (["docs/AUDIT.md", "src/rollout.rs"], [6]),
+                           (["docs/AUDIT.md", ".github/workflows/release.yml", "src/update.rs"], [4, 6]),
+                           (["docs/AUDIT.md", "src/store/schema.rs"], [2])):
+            with self.subTest(paths=paths):
+                self.c.paths = paths
+                self.refused(f"does not declare (declared [7])")
+                self.assertTrue(any(f"hits trigger(s) {why}" in r for r in self.c.evaluate()[1]))
+
+    def test_undeclared_verdict_trigger_needs_a_per_head_approval(self):
+        self.c.ticket_body = "Risk: human (7)\n"
+        self.c.store = [scope_rec(body=self.c.ticket_body)]
+        self.c.paths = ["docs/AUDIT.md"]
+        self.set_risk("Risk: human (7, 6) — x")
+        self.refused("names Risk trigger(s) [6] the ticket does not declare")
+
+    def test_ticket_without_a_parseable_risk_line_has_no_scope(self):
+        for body in ("## Goal\nno risk line\n", "Risk: human\n", "Risk: human (see below)\n", "Risk: auto\n",
+                     "Risk: human (4, 7, 1)\n", "Risk: human (3)\n"):
+            with self.subTest(body=body):
+                self.c.ticket_body = body
+                self.c.store = [scope_rec(body=body)]
+                self.refused()
+
+    def test_human_path_in_no_risk_list_needs_a_per_head_approval(self):
+        for path in ("config/production-baseline.json", "tests/safety_floor.rs", "apps/x/package-lock.json"):
+            with self.subTest(path=path):
+                self.assertTrue(enq.is_human_path(path, ()))
+                self.c.paths = ["scripts/enqueue-reviewed", path]
+                self.refused("in no risk trigger list")
+
+    def test_trigger_1_or_3_anywhere_on_a_risk_line_is_refused(self):
+        for risk in ("human (4, 7) and trigger 1 (identity)", "human (4, 7) (triggers 4 and 3)",
+                     "human (4, 7) — see (3)", "human (4, 7) (identity 1)"):
+            with self.subTest(risk=risk):
+                self.set_risk("Risk: " + risk)
+                self.refused("Risk trigger")
+                self.c.note_text = self.c.note_text.replace("Risk: " + risk, "Risk: human (4, 7) — scripts")
+
+    def test_risk_prose_without_trigger_numbers_is_fine(self):
+        self.set_risk("Risk: human (4, 7) — scripts, 1500 lines (PR #773, CAD-1106)")
+        reasons, report = self.c.evaluate()
+        self.assertEqual(reasons, [], report)
+
+    def test_done_or_cancelled_ticket_has_no_scope(self):
+        for status in ("done", "cancelled", None):
+            with self.subTest(status=status):
+                self.c.status = status
+                self.refused("status is")
 
     def test_unreadable_verdict_note_fails_closed(self):
         self.c.note_text = None
