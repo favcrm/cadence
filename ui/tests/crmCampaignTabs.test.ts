@@ -147,6 +147,13 @@ async function mounted(readOnly: boolean) {
         final_count: 0, sample: [], digest: "aud-digest-1",
       });
     }
+    if (url.pathname.includes("/audience/prepares/")) {
+      return json({ freeze: {
+        freeze_id: "launch-1-freeze-1", install_id: "install-crm", context_id: "ctx-a",
+        base: { mode: "all" }, exclusion_list_id: null, final_count: 0, max_recipients: 50,
+        digest: "audience-digest-frozen-0001", sample: [],
+      }, current_digest: "audience-digest-frozen-0001", current_final_count: 0, valid: true, drift: null });
+    }
     if (path.startsWith("/api/threads/master")) return json({ entries: [], more_before: false });
     if (url.pathname.endsWith("/segments/list")) return json({ segments: [] });
     if (url.pathname.endsWith("/exclusions/list")) return json({ exclusions: [] });
@@ -374,9 +381,45 @@ async function mounted(readOnly: boolean) {
     assert(!host.querySelector('[aria-label="Assistant proposals"] [role="alert"]'), "no stray proposal errors");
   }
 
-  // ---- Activity keeps the sends history.
+  // ---- Audience: picker and funnel up front, the rest under Advanced.
+  await openTab("audience");
+  await settle(() => assert(host.querySelector("[data-funnel]"), "the eligibility funnel renders from the host counts"));
+  const step = (key: string) => host.querySelector(`[data-funnel] [data-step="${key}"]`)?.textContent ?? "";
+  assert(step("match").includes("4"), "funnel shows the matching customers");
+  assert(step("consent").includes("−4"), "funnel shows who lacks email consent");
+  assert(step("final").includes("Can be emailed") && step("final").endsWith("0"), "funnel ends on the host's final count");
+  assert((host.querySelector("[data-blocked]")?.textContent ?? "").includes("All 4 lack email consent"), "a plain-language blocking reason names the biggest drop");
+  assert(host.querySelector('[role="radiogroup"][aria-label="Base audience mode"]'), "the audience picker stays up front");
+  const advanced = host.querySelector("details[data-advanced]") as HTMLDetailsElement | null;
+  assert(advanced && !advanced.open, "Advanced is a closed disclosure");
+  assert(advanced!.querySelector("#aud-exclusion") && advanced!.querySelector('section[aria-label="Suppressions"]'), "exclusions and suppressions live inside Advanced");
+  assert(!Array.from(host.querySelectorAll("#aud-exclusion, section[aria-label=\"Suppressions\"]")).some((el) => !advanced!.contains(el)), "nothing from Advanced leaks onto the main path");
+  assert(!(host.querySelector('section[aria-label="Frozen audience"]')?.textContent ?? "").includes("audience-digest-frozen"), "the freeze digest is hidden until recheck");
+  if (!readOnly) {
+    await click(byText(host, "button", "Recheck freeze"));
+    await settle(() => assert((host.querySelector('[aria-label="Freeze validity"]')?.textContent ?? "").includes("Valid"), "freeze recheck still reports validity"));
+    const freezeDetails = host.querySelector('section[aria-label="Frozen audience"] details') as HTMLDetailsElement;
+    assert(freezeDetails && !freezeDetails.open && (freezeDetails.textContent ?? "").includes("audience-digest-frozen-0001"), "the freeze digest sits behind Technical details");
+  }
+
+  // ---- Activity: a plain timeline; ids and digests behind Technical details.
   await openTab("activity");
   assert(host.querySelector('section[aria-label="Campaign sends"]'), "Activity carries the sends history");
+  const events = Array.from(host.querySelectorAll("[data-timeline] li")).map((li) => li.getAttribute("data-event"));
+  if (readOnly) {
+    equal(events, ["proposal-pending", "proposal-pending", "approval", "revision"], "pending drafts lead the timeline");
+  } else {
+    equal(events, ["approval", "revision", "proposal-applied", "proposal-discarded"], "applied and discarded drafts follow the saved version");
+  }
+  const timeline = host.querySelector("[data-timeline]")!.textContent ?? "";
+  assert(!timeline.includes("content-digest") && !timeline.includes("prop-1") && !timeline.includes("launch-1"), "the timeline carries no ids or digests");
+  const technical = host.querySelector("details[data-technical]") as HTMLDetailsElement | null;
+  assert(technical && !technical.open, "Technical details is a closed disclosure");
+  const tech = technical!.textContent ?? "";
+  for (const needle of ["launch-1", "content-digest-", "prop-1", "Unsubscribe link", "https://unsub.example.invalid/preview", "preview-only"]) {
+    assert(tech.includes(needle), `Technical details carries: ${needle}`);
+  }
+  assert(!Array.from(host.querySelectorAll('[data-panel] > *:not([aria-label="Campaign timeline"]):not([aria-label="Campaign sends"])')).length, "Activity holds only the timeline and the sends");
 
   await React.act(async () => { root.unmount(); });
   globalThis.fetch = realFetch;
