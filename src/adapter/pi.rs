@@ -2732,7 +2732,15 @@ impl ProviderAdapter for PiAdapter {
         }
         *rejected = None;
         drop(rejected);
-        self.checked("new_session", json!({}))?;
+        // A reset that did not happen is no reset: the turn keeps the
+        // provider's own error, and the daemon does not retry.
+        if let Err(e) = self.checked("new_session", json!({})) {
+            self.shared.emit(
+                "cadence/pi_session_reset_failed",
+                &json!({"turn": result.turn_id, "error": e.to_string()}),
+            );
+            return Ok(false);
+        }
         Ok(true)
     }
 

@@ -2653,3 +2653,28 @@ fn a_worker_refused_with_the_gateway_400_is_not_reset() {
     );
     pi.close();
 }
+
+/// CAD-1076: a reset whose `new_session` fails is no reset — the turn
+/// keeps the provider's own 400 as its error (never the reset's), and
+/// the daemon does not retry.
+#[test]
+fn a_failed_reset_keeps_the_gateway_error() {
+    let state = tempfile::tempdir().unwrap();
+    let pi = master_adapter(
+        "gateway-stuck",
+        state.path(),
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    pi.open(&master_agent(state.path(), json!({"unconfined": true})))
+        .unwrap();
+    let refused = pi.run_turn("plain", "m", &|_| {}).unwrap();
+    assert_eq!(refused.status, "failed", "{:?}", refused.error);
+    let reset = pi.reset_rejected_session(&refused);
+    assert!(matches!(reset, Ok(false)), "{reset:?}");
+    assert!(refused
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("invalid_request"));
+    pi.close();
+}

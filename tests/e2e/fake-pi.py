@@ -42,7 +42,8 @@ Modes (argv[1]):
   call over the cap ends the turn with the gateway's exact 400, before
   any work, until `new_session` resets the history. A prompt with
   "run empty tool" runs a tool whose result has no content (the Demo
-  "(no output)" shape). `gateway-always` refuses every model call.
+  "(no output)" shape). `gateway-always` refuses every model call;
+  `gateway-stuck` also refuses `new_session`.
   In any mode, a prompt containing `fake-fail <key>` ends with the
   provider error FAIL_SHAPES[key] (a 429, a 5xx, a credential error, the
   exact gateway 400) — the shapes a session reset must tell apart.
@@ -254,7 +255,7 @@ MODELS = [
      "contextWindow": 200000},
 ]
 usage = {"tokens": 42000, "contextWindow": 200000}
-GATEWAY_CAP = {"gateway-cap": 12, "gateway-always": 0}.get(MODE)
+GATEWAY_CAP = {"gateway-cap": 12, "gateway-always": 0, "gateway-stuck": 0}.get(MODE)
 GATEWAY_400 = ('400 {"message":"Unsupported or malformed text request.",'
                '"type":"invalid_request_error","code":"invalid_request"}')
 history = 1  # the system prompt
@@ -506,6 +507,9 @@ def main():
             respond(rid, "compact", True,
                     data={"compacted": True, "tokensAfter": usage["tokens"]})
         elif rtype == "new_session":
+            if MODE == "gateway-stuck":
+                respond(rid, "new_session", False, error="synthetic new_session failure")
+                continue
             history = 1
             state["sessionId"] = "fakepi-session-{}-{}".format(
                 os.getpid(), int(time.time()))
