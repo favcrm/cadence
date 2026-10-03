@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::mpsc::{channel, Receiver};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -44,6 +46,8 @@ pub use commands::{
     CMD_UPGRADE_LATEST_MAIN,
 };
 use github::{build_repo_match, compute_drift, gh_repo, git_text, GH_TIMEOUT};
+#[cfg(test)]
+use github_cache::github_bounded_notify;
 #[cfg(test)]
 use github_cache::write_cache;
 use github_cache::{cache_file, github, github_bounded, read_cache};
@@ -3313,9 +3317,104 @@ mod tests {
         assert!(rows.is_empty());
     }
 
-    fn slow_gh(_slug: &str) -> Result<Value, String> {
-        std::thread::sleep(Duration::from_secs(3));
-        Ok(json!({"prs": [{"number": 2}], "ci": {"state": "success"}}))
+    /// Controlled dependency delay; each observer owns its refresh lifetime.
+    #[derive(Default)]
+    struct FetchGate {
+        state: Mutex<FetchGateState>,
+        wake: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct FetchGateState {
+        released: bool,
+        attempts: usize,
+        observers: usize,
+    }
+
+    impl FetchGate {
+        fn release(&self) {
+            self.state.lock().unwrap().released = true;
+            self.wake.notify_all();
+        }
+
+        fn attempts(&self) -> usize {
+            self.state.lock().unwrap().attempts
+        }
+
+        fn fetch(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.attempts += 1;
+            while !state.released {
+                state = self.wake.wait(state).unwrap();
+            }
+        }
+    }
+
+    /// Dropped after refresh completion, or immediately if no refresh starts.
+    struct RefreshLease(std::sync::Arc<FetchGate>);
+
+    impl Drop for RefreshLease {
+        fn drop(&mut self) {
+            self.0
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observers -= 1;
+            self.0.wake.notify_all();
+        }
+    }
+
+    #[derive(Default)]
+    struct GateHold(std::sync::Arc<FetchGate>);
+
+    impl GateHold {
+        fn observed(
+            &self,
+            state_dir: &Path,
+            slugs: &[String],
+            wait: Duration,
+            cache_secs: i64,
+        ) -> (HashMap<String, Value>, Value, Receiver<()>) {
+            self.0.state.lock().unwrap().observers += 1;
+            let lease = RefreshLease(self.0.clone());
+            let fetch = self.0.clone();
+            let (done_tx, done_rx) = channel();
+            let out = github_bounded_notify(
+                state_dir,
+                slugs,
+                wait,
+                cache_secs,
+                move |_| {
+                    fetch.fetch();
+                    Ok(json!({"prs": [{"number": 2}], "ci": {"state": "success"}}))
+                },
+                move || {
+                    let _lease = lease;
+                    let _ = done_tx.send(());
+                },
+            );
+            (out.0, out.1, done_rx)
+        }
+    }
+
+    impl Drop for GateHold {
+        fn drop(&mut self) {
+            // Release on panic too; await even workers not yet in the fetch closure.
+            self.0.release();
+            let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (state, _) = self
+                .0
+                .wake
+                .wait_timeout_while(state, Duration::from_secs(15), |state| state.observers != 0)
+                .unwrap_or_else(|e| e.into_inner());
+            if state.observers != 0 {
+                if std::thread::panicking() {
+                    eprintln!("refresh cleanup timed out: {} observers", state.observers);
+                } else {
+                    panic!("refresh cleanup timed out: {} observers", state.observers);
+                }
+            }
+        }
     }
 
     #[test]
@@ -3486,11 +3585,15 @@ mod tests {
 
     /// CAD-249: a gh refresh slower than the caller's wait serves the
     /// last cache as `stale` with its `as_of` inside the bound, and the
-    /// refresh still lands in the cache for the next request.
+    /// refresh still lands in the cache for the next request. CAD-1124:
+    /// the slowness is a parked gate, not a sleep — the refresh provably
+    /// outlives the wait, its completion is observed directly on the
+    /// worker, and a single parked fetch proves single-flight.
     #[test]
     fn slow_gh_serves_stale_cache_within_the_wait() {
         let dir = tempfile::tempdir().unwrap();
         let slugs = vec!["acme/widgets".to_string()];
+        let hold = GateHold::default();
         let old = now_epoch() - 600;
         let mut repos = HashMap::new();
         repos.insert(
@@ -3500,12 +3603,11 @@ mod tests {
         write_cache(&cache_file(dir.path()), &slugs, &repos, old);
 
         let started = Instant::now();
-        let (got, state) = github_bounded(
+        let (got, state, refresh_done) = hold.observed(
             dir.path(),
             &slugs,
             Duration::from_millis(300),
             GH_CACHE_SECS,
-            slow_gh,
         );
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -3520,51 +3622,71 @@ mod tests {
         );
         assert_eq!(got["acme/widgets"]["prs"][0]["number"], 1);
 
-        // A second request while the refresh runs starts no other one.
-        let (_, again) = github_bounded(
+        // A second request while the refresh is parked starts no other
+        // one — single-flight, proven by the fetch count.
+        let (_, again, second_done) = hold.observed(
             dir.path(),
             &slugs,
             Duration::from_millis(100),
             GH_CACHE_SECS,
-            slow_gh,
         );
         assert_eq!(again["state"], "stale", "{again}");
-
-        // The background refresh lands; the next request is a cache hit.
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while read_cache(&cache_file(dir.path())).is_none_or(|c| c.at == old) {
-            assert!(Instant::now() < deadline, "refresh never landed");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let (got, state) = github_bounded(
-            dir.path(),
-            &slugs,
-            Duration::from_millis(1),
-            GH_CACHE_SECS,
-            slow_gh,
+        assert!(
+            matches!(
+                second_done.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "a second refresh was created while the first was parked"
         );
+        assert!(
+            hold.0.attempts() <= 1,
+            "a second fetch attempted while parked"
+        );
+
+        // Admit the fetch; the worker's own completion signal lands
+        // after refresh_github returns and the cache is written.
+        hold.0.release();
+        refresh_done
+            .recv_timeout(Duration::from_secs(15))
+            .expect("refresh worker never completed");
+        assert_eq!(hold.0.attempts(), 1);
+        let (got, state, cache_done) =
+            hold.observed(dir.path(), &slugs, Duration::from_millis(1), GH_CACHE_SECS);
+        assert!(matches!(
+            cache_done.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
         assert_eq!(state["state"], "cached", "{state}");
         assert_eq!(got["acme/widgets"]["prs"][0]["number"], 2);
     }
 
     /// No cache at all and a slow gh: `unavailable` inside the bound,
-    /// never a hang.
+    /// never a hang. CAD-1124: the fetch is parked on a gate, so the
+    /// bounded return cannot race a finishing fixture; the worker's
+    /// completion is awaited before the tempdir drops.
     #[test]
     fn slow_gh_without_cache_is_unavailable_not_blocking() {
         let dir = tempfile::tempdir().unwrap();
         let slugs = vec!["acme/gadgets".to_string()];
+        let hold = GateHold::default();
         let started = Instant::now();
-        let (got, state) = github_bounded(
+        let (got, state, refresh_done) = hold.observed(
             dir.path(),
             &slugs,
             Duration::from_millis(200),
             GH_CACHE_SECS,
-            slow_gh,
         );
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(got.is_empty());
         assert_eq!(state["state"], "unavailable", "{state}");
         assert!(state["as_of"].is_null());
+        // The parked refresh still runs in the background; admit it and
+        // await the worker's completion before the tempdir drops.
+        hold.0.release();
+        refresh_done
+            .recv_timeout(Duration::from_secs(15))
+            .expect("refresh worker never completed");
+        assert_eq!(hold.0.attempts(), 1);
     }
 
     /// A daemon that answers `health`/`agent_list` but never answers

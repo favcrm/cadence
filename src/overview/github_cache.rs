@@ -85,6 +85,24 @@ pub(super) fn github_bounded(
     cache_secs: i64,
     fetch: GhFetch,
 ) -> (HashMap<String, Value>, Value) {
+    github_bounded_notify(state_dir, slugs, wait, cache_secs, fetch, || {})
+}
+
+/// [`github_bounded`] with a refresh-completion observer (CAD-1124).
+/// `done` runs on the refresh worker thread after `refresh_github`
+/// returns — after any cache write and after the file is removed from
+/// `GH_REFRESHING` — exactly when the spawned thread would exit.
+/// Production callers always take [`github_bounded`]'s no-op observer;
+/// the private wrapper only lets tests observe the lifecycle, never
+/// select a different refresh path.
+pub(super) fn github_bounded_notify(
+    state_dir: &Path,
+    slugs: &[String],
+    wait: Duration,
+    cache_secs: i64,
+    fetch: impl Fn(&str) -> Result<Value, String> + Send + Sync + 'static,
+    done: impl FnOnce() + Send + 'static,
+) -> (HashMap<String, Value>, Value) {
     let file = cache_file(state_dir);
     let now = now_epoch();
     let cached = read_cache(&file);
@@ -119,6 +137,7 @@ pub(super) fn github_bounded(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|f| f != &file);
+            done();
             let _ = tx.send(out);
         });
         if let Ok(out) = rx.recv_timeout(wait) {
@@ -171,9 +190,10 @@ fn refresh_github(
     state_dir: &Path,
     slugs: &[String],
     cached: Option<GhCache>,
-    fetch: GhFetch,
+    fetch: impl Fn(&str) -> Result<Value, String> + Sync,
 ) -> (HashMap<String, Value>, Value) {
     let results: Vec<Result<Value, String>> = std::thread::scope(|s| {
+        let fetch = &fetch;
         let handles: Vec<_> = slugs
             .iter()
             .map(|slug| s.spawn(move || fetch(slug)))

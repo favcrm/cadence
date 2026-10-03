@@ -1,0 +1,112 @@
+#!/bin/sh
+# CAD-1124: real release+test-seam compile-exclusion acceptance.
+# Invoke from the repository root under an admitted build slot.
+# Inherit Cargo, toolchain, flags, wrapper and caller identity unchanged.
+# Default-feature binary canary checks remain separate proof.
+
+set -eu
+
+log=$(mktemp "${TMPDIR:-/tmp}/cadence-release-test-seam.XXXXXXXXXX") || {
+    printf '%s\n' 'release test-seam probe: cannot create private log' >&2
+    exit 1
+}
+
+cleanup() {
+    status=$?
+    trap - 0 HUP INT TERM
+    if ! rm -f -- "$log"; then
+        printf '%s\n' 'release test-seam probe: cannot delete own log' >&2
+        if [ "$status" -eq 0 ]; then
+            status=1
+        fi
+    fi
+    exit "$status"
+}
+
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+printf '%s\n' '+ cargo check --release --locked --features test-seam' >&2
+if cargo check --release --locked --features test-seam >"$log" 2>&1; then
+    cargo_status=0
+else
+    cargo_status=$?
+fi
+
+printf 'release test-seam probe: cargo exit %s\n' "$cargo_status" >&2
+if cat "$log" >&2; then
+    :
+else
+    output_status=$?
+    printf '%s\n' 'release test-seam probe: cannot print command log' >&2
+    if [ "$cargo_status" -ne 0 ]; then
+        exit "$cargo_status"
+    fi
+    exit "$output_status"
+fi
+
+if [ "$cargo_status" -eq 0 ]; then
+    printf '%s\n' \
+        'release test-seam probe FAILED: forbidden release check succeeded' >&2
+    exit 1
+fi
+
+# Retain BOTH existing message-specific assertions verbatim.
+if grep -F 'feature `test-seam` arms a caller-identity override that bypasses' "$log" >/dev/null &&
+   grep -F 'must never be compiled into a release build' "$log" >/dev/null; then
+    :
+else
+    printf '%s\n' \
+        'release test-seam probe FAILED: missing guard message; toolchain or unrelated failure is not acceptance' >&2
+    exit "$cargo_status"
+fi
+
+# Require the actual diagnostic from src/test_seam.rs, not merely matching
+# text in a quoted source line. Reject accompanying unrelated error
+# diagnostics. Normalize only a private parser view of ANSI SGR colors;
+# retain the original log above and do not alter Cargo color settings.
+if awk '
+    BEGIN {
+        esc = sprintf("%c", 27)
+        expected = "error: feature `test-seam` arms a caller-identity override that bypasses /proc ancestry proof; it is for test binaries only and must never be compiled into a release build (CAD-482)"
+    }
+    {
+        line = $0
+        gsub(esc "\\[[0-9;]*m", "", line)
+
+        if (line ~ /^error([[][^]]+[]])?:/) {
+            awaiting_location = 0
+            if (line == expected) {
+                guard_errors++
+                awaiting_location = 1
+            } else if (line ~ /^error: could not compile .* due to 1 previous error(;.*)?$/) {
+                summaries++
+            } else {
+                unrelated_error = 1
+            }
+        } else if (awaiting_location && line ~ /^[[:space:]]*-->/) {
+            if (line ~ /^[[:space:]]*--> src\/test_seam[.]rs:[0-9]+:[0-9]+$/) {
+                guard_locations++
+            } else {
+                unrelated_error = 1
+            }
+            awaiting_location = 0
+        }
+    }
+    END {
+        if (guard_errors == 1 && guard_locations == 1 &&
+            summaries == 1 && !unrelated_error) {
+            exit 0
+        }
+        exit 1
+    }
+' "$log"; then
+    printf '%s\n' \
+        'probe ok: release+test-seam refused by its own compile_error; binary canary proof remains independent'
+else
+    printf '%s\n' \
+        'release test-seam probe FAILED: expected only the real seam compile_error and its Cargo failure summary' >&2
+    exit "$cargo_status"
+fi

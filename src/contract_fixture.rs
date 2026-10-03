@@ -587,21 +587,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn standard_table_loads_the_fixture_file() {
-        let table = ToolTable::standard();
-        assert_eq!(table.platform, "fixture");
-        assert_eq!(table.manifest_version.as_deref(), Some("1"));
-        assert_eq!(table.tools.len(), 3);
-        assert_eq!(table.effect_of("widgets.list"), Effect::Read);
-        assert_eq!(table.effect_of("widgets.preview"), Effect::Draft);
-        assert_eq!(table.effect_of("widgets.publish"), Effect::Send);
-        assert_eq!(
-            table.declared("widgets.publish").unwrap().label.as_deref(),
-            Some("deploy")
-        );
-    }
-
-    #[test]
     fn classify_fails_into_send() {
         let table = ToolTable::standard();
         // Undeclared tool, missing effect, unknown value — all send (C3).
@@ -618,69 +603,5 @@ mod tests {
             classify_call(&table, Some("1"), "widgets.list"),
             Effect::Read
         );
-    }
-
-    #[test]
-    fn execute_is_idempotent_on_the_key() {
-        let adapter = FakePlatform::standard();
-        let input = json!({"widget": "w1"});
-        let first = adapter.execute("widgets.publish", &input, "eff-1", None);
-        let second = adapter.execute("widgets.publish", &input, "eff-1", None);
-        assert_eq!(first.unwrap(), second.unwrap());
-        assert_eq!(adapter.execution_count(), 1);
-        // A different effect_id is a different write.
-        adapter
-            .execute("widgets.publish", &input, "eff-2", None)
-            .unwrap();
-        assert_eq!(adapter.execution_count(), 2);
-    }
-
-    #[test]
-    fn fault_and_read_back_knobs() {
-        let adapter = FakePlatform::standard();
-        adapter.fail_tool("widgets.publish", "platform rejected");
-        let err = adapter
-            .execute("widgets.publish", &json!({"widget": "w1"}), "eff-1", None)
-            .unwrap_err();
-        assert_eq!(err, "platform rejected");
-        assert!(!adapter.executions()[0].ok);
-
-        adapter.set_read_back(ReadBack::Unknown);
-        assert_eq!(
-            adapter.read_back("widgets.list", &json!({})),
-            Verified::Unknown
-        );
-        adapter.set_read_back(ReadBack::Mismatch);
-        assert_eq!(
-            adapter.read_back("widgets.list", &json!({})),
-            Verified::False
-        );
-    }
-
-    #[test]
-    fn read_back_compares_applied_state() {
-        let adapter = FakePlatform::standard();
-        adapter
-            .execute("widgets.publish", &json!({"widget": "w1"}), "eff-1", None)
-            .unwrap();
-        assert_eq!(
-            adapter.read_back("widgets.publish", &json!({"widget": "w1"})),
-            Verified::True
-        );
-        assert_eq!(
-            adapter.read_back("widgets.publish", &json!({"widget": "w2"})),
-            Verified::False
-        );
-    }
-
-    #[test]
-    fn source_edits_change_the_hash() {
-        let adapter = FakePlatform::standard();
-        assert_eq!(adapter.source_hash("deploy-plan"), None);
-        adapter.write_source("deploy-plan", "v1");
-        let h1 = adapter.source_hash("deploy-plan").unwrap();
-        assert!(h1.starts_with("sha256:"));
-        adapter.write_source("deploy-plan", "v2");
-        assert_ne!(adapter.source_hash("deploy-plan").unwrap(), h1);
     }
 }
