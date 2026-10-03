@@ -1,0 +1,391 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cadence:contracts:app-chat:v1:descriptor",
+  "title": "App chat descriptor (app-chat/v1)",
+  "description": "A versioned, data-only declaration of how an app package describes its assistant chat to the trusted host Conversation component: context chips with at most 3 quick prompts per screen or record type, host capability attachments by id, directive kinds rendered as a declared text card (at most 2 open-view buttons) or as the app's own sandboxed screen (render: screen:<tag>), subject kinds for the conversation picker, and presentation options. The descriptor is data, never code. The key list under $defs.safeObject is the same list as FORBIDDEN_DESCRIPTOR_KEYS in ui/src/features/app-shell/app-views/contract.ts (a test asserts equality) and the daemon's install validator reads it from this file. Consumers must also enforce what JSON Schema cannot express: unique context ids, unique directive match strings, unique subject kinds, host registry membership of attachment ids and button run ids, a directive carrying exactly one of card or render, fields present iff the card is field-bearing, whole descriptor at most 16 KiB, at most 1024 nodes and nesting depth at most 12 (checked before shape validation).",
+  "type": "object",
+  "required": [
+    "contract",
+    "app"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "$ref": "#/$defs/safeObject"
+    }
+  ],
+  "properties": {
+    "contract": {
+      "const": "app-chat/v1",
+      "description": "The contract tag. A descriptor naming any other version is refused."
+    },
+    "app": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+      "description": "The app kind this descriptor was reviewed with. Provenance only; it must equal the installed app's name."
+    },
+    "contexts": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "$ref": "#/$defs/context"
+      },
+      "description": "Ids unique (consumer-checked). An id is the shell's own screen id (D5)."
+    },
+    "attachments": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {
+        "$ref": "#/$defs/attachment"
+      }
+    },
+    "directives": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/directive"
+      },
+      "description": "match strings unique (consumer-checked)."
+    },
+    "subjects": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/subject"
+      },
+      "description": "kind unique (consumer-checked)."
+    },
+    "presentation": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/safeObject"
+        }
+      ],
+      "type": "object",
+      "required": [],
+      "additionalProperties": false,
+      "properties": {
+        "showContext": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    }
+  },
+  "$defs": {
+    "safeObject": {
+      "type": "object",
+      "propertyNames": {
+        "not": {
+          "enum": [
+            "__proto__",
+            "prototype",
+            "constructor",
+            "script",
+            "scripts",
+            "code",
+            "html",
+            "innerHTML",
+            "css",
+            "style",
+            "javascript",
+            "eval",
+            "import",
+            "module",
+            "url",
+            "uri",
+            "href",
+            "src",
+            "link",
+            "action",
+            "endpoint",
+            "install_id",
+            "installId",
+            "context_id",
+            "contextId",
+            "workspace",
+            "workspace_id",
+            "project",
+            "project_id",
+            "project_link",
+            "actor",
+            "by",
+            "role",
+            "grant",
+            "scope",
+            "scopes",
+            "capability",
+            "capabilities",
+            "secret",
+            "secrets",
+            "credential",
+            "credentials",
+            "token",
+            "password",
+            "sql",
+            "query",
+            "path",
+            "file",
+            "effect",
+            "effects",
+            "verified",
+            "digest",
+            "revision"
+          ]
+        }
+      }
+    },
+    "context": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/safeObject"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "id",
+        "label"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
+        },
+        "prompts": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
+          }
+        },
+        "record": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/safeObject"
+            }
+          ],
+          "type": "object",
+          "required": [
+            "label"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "label": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 40,
+              "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
+            },
+            "prompts": {
+              "type": "array",
+              "maxItems": 3,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80,
+                "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
+              }
+            }
+          }
+        }
+      }
+    },
+    "attachment": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/safeObject"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "enum": [
+            "csv-import"
+          ],
+          "description": "The host capability registry (ui/src/features/app-shell/chat/capabilities.tsx). Adding an id is a host change."
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
+        }
+      },
+      "description": "Registry membership is enforced by this enum, by the TS validator and by the daemon's install validator; a test asserts the three agree."
+    },
+    "subject": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/safeObject"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "kind",
+        "label"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
+        }
+      }
+    },
+    "directive": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/safeObject"
+        },
+        {
+          "oneOf": [
+            {
+              "required": [
+                "card"
+              ]
+            },
+            {
+              "required": [
+                "render"
+              ]
+            }
+          ]
+        }
+      ],
+      "type": "object",
+      "required": [
+        "match"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "match": {
+          "type": "string",
+          "pattern": "^cadence_[a-z][a-z0-9_]{0,47}$"
+        },
+        "card": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/safeObject"
+            }
+          ],
+          "type": "object",
+          "required": [
+            "title"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "title": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80,
+              "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
+            },
+            "text": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 240,
+              "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
+            },
+            "fields": {
+              "type": "array",
+              "maxItems": 4,
+              "items": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/safeObject"
+                  }
+                ],
+                "type": "object",
+                "required": [
+                  "label",
+                  "from"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 40,
+                    "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
+                  },
+                  "from": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                  }
+                }
+              }
+            },
+            "buttons": {
+              "type": "array",
+              "maxItems": 2,
+              "items": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/safeObject"
+                  }
+                ],
+                "type": "object",
+                "required": [
+                  "label",
+                  "run"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 40,
+                    "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$"
+                  },
+                  "run": {
+                    "enum": [
+                      "open-view"
+                    ],
+                    "description": "The host action registry (ui/src/features/app-shell/chat/actions.ts). v1 has open-view only (D3)."
+                  },
+                  "view": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                  }
+                },
+                "description": "view is required exactly when run is open-view (consumer-checked)."
+              }
+            }
+          }
+        },
+        "render": {
+          "type": "string",
+          "pattern": "^screen:[a-z0-9][a-z0-9-]{0,31}$"
+        },
+        "size": {
+          "enum": [
+            "small",
+            "medium",
+            "large"
+          ],
+          "default": "medium"
+        }
+      }
+    }
+  }
+}

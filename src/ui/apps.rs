@@ -257,7 +257,7 @@ fn leaf_ok(seg: &str, need_md_tag: bool) -> bool {
 /// alias the same staged file and defeat duplicate detection; this grammar
 /// refuses them instead. Admitted shapes (the only flat entries the bundle
 /// allows):
-///   `app.md`                          (exactly)
+///   `app.md`, `app-chat.json`         (exactly; CAD-1110)
 ///   `workflows/<tag>.md`              (valid_tag stem — the installer's rule)
 ///   `rubrics/<leaf>` `templates/<leaf>` (any visible flat leaf)
 /// Empty segments (`//`, leading `/`, trailing `/`), `.`/`..`, `\`, `\0` and
@@ -273,7 +273,7 @@ fn upload_path_ok(path: &str) -> bool {
         return false;
     }
     match segs.as_slice() {
-        ["app.md"] => true,
+        ["app.md"] | ["app-chat.json"] => true,
         ["workflows", leaf] => leaf_ok(leaf, true),
         ["rubrics", leaf] | ["templates", leaf] => leaf_ok(leaf, false),
         // CAD-1006: screens/<tag>/<leaf> — the one depth-2 entry: a

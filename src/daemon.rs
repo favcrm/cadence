@@ -22,6 +22,7 @@ mod answer_rpc;
 mod app_audiences_rpc;
 mod app_bindings_rpc;
 mod app_capabilities_rpc;
+mod app_chat_rpc;
 mod app_content_rpc;
 mod app_contexts_rpc;
 mod app_effects_rpc;
@@ -3313,6 +3314,7 @@ impl Shared {
             "app_workspace_migrate" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_recover" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_migration_recover" => self.rpc_app_workspace(method, params, peer_pid),
+            "app_chat_descriptor" => self.rpc_app_chat_descriptor(params, peer_pid),
             "app_screen_mint" => self.rpc_app_screen_mint(params, peer_pid),
             "app_screen_consume" => self.rpc_app_screen_consume(params, peer_pid),
             "app_approve" => self.rpc_app_approve(params, peer_pid),

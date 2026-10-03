@@ -34,6 +34,7 @@ use crate::error::{Error, Result};
 use crate::proc::{self, BoundedError};
 
 mod app_audiences;
+mod app_chat;
 mod app_content;
 mod app_contexts;
 mod app_records;

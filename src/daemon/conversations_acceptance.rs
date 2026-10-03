@@ -1167,6 +1167,19 @@ mod http {
         (board, state, rest)
     }
 
+    impl Board {
+        /// The `Cache-Control` of a GET as `who` (None when absent).
+        pub(super) fn cache_control(&self, who: &str, path: &str) -> Option<String> {
+            let url = format!("{}{path}", self.base);
+            let response = self.decorate(who, self.agent.get(&url)).call().unwrap();
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        }
+    }
+
     pub(super) struct Gx2 {
         pub crm: String,
         pub social: String,
@@ -1529,4 +1542,229 @@ fn the_daemon_never_reads_the_conversation_env() {
         assert!(out.status.success(), "claim {claim}: {text}");
         assert!(text.contains("1 passed"), "child did not run: {text}");
     }
+}
+
+/// CAD-1110: the app-chat descriptor read, at the real daemon guard and on
+/// the board over real HTTP. The descriptor is served only to the operator,
+/// only from the APPROVED digest, install id from the path only, and every
+/// "no descriptor" case is one 404 that names nothing. The agent caller is
+/// refused by the same proof as the sibling app reads (relay parity, I13),
+/// and refused BEFORE existence is decided, so the route is no oracle for
+/// installation ids.
+///
+/// Guards: `Shared::operator_connection` in `rpc_app_chat_descriptor`
+/// (daemon/app_chat_rpc.rs), `admit_operator_read` before
+/// `app_chat::handle` (ui/serve.rs), the closed param set, and the
+/// `app_capability_status == approved` check at the live digest.
+#[test]
+fn chat_descriptor_is_operator_only_pinned_to_the_approved_digest_and_one_404() {
+    let gx = gx_with(true);
+    let read =
+        |who: Asserted, id: &str| gx.call(who, "app_chat_descriptor", json!({"install_id": id}));
+    // Control: the operator reads the CRM's own descriptor and Social's.
+    let crm = read(Asserted::Operator, &gx.crm).unwrap();
+    assert_eq!(crm["app"], json!("crm"), "{crm}");
+    assert_eq!(crm["descriptor"]["contract"], json!("app-chat/v1"));
+    assert!(
+        crm["digest"].as_str().unwrap().starts_with("sha256:"),
+        "{crm}"
+    );
+    let social = read(Asserted::Operator, &gx.social).unwrap();
+    assert_eq!(social["app"], json!("social-content"), "{social}");
+    // An agent, another agent and an unproven peer get the sibling reads'
+    // refusal at the daemon; nothing is read.
+    for who in [
+        Asserted::Agent("master".into()),
+        Asserted::Agent("w1".into()),
+        Asserted::Unproven,
+    ] {
+        let err = err_text(read(who, &gx.crm));
+        // The master's own turn is stopped earlier still, by the app-turn
+        // verb allowlist; everyone else by the operator proof.
+        assert!(
+            err.contains("operator action")
+                || err.contains("not provably the operator")
+                || err.contains("may call only the scoped app verbs"),
+            "{err}"
+        );
+    }
+    // The install id is the only input: any other field refuses.
+    for extra in ["token", "digest", "path", "app"] {
+        let err = err_text(gx.operator(
+            "app_chat_descriptor",
+            json!({"install_id": gx.crm, extra: "x"}),
+        ));
+        assert!(err.contains("admits only an install_id"), "{extra}: {err}");
+    }
+    // A forged or unknown install id is "no descriptor", not an error
+    // that names anything.
+    for forged in ["no-such-install", "install-1", &"a".repeat(64)] {
+        let none = read(Asserted::Operator, forged).unwrap();
+        assert_eq!(none, json!({"found": false}), "{forged}");
+    }
+    // Pinned: once the approval is revoked at the live digest, the bundle
+    // on disk is no longer served.
+    let digest = crm["digest"].clone();
+    gx.operator(
+        "app_local_install_revoke",
+        json!({"install_id": gx.crm, "digest": digest}),
+    )
+    .unwrap();
+    assert_eq!(
+        read(Asserted::Operator, &gx.crm).unwrap(),
+        json!({"found": false}),
+        "an unapproved installation serves no descriptor"
+    );
+    assert!(read(Asserted::Operator, &gx.social).unwrap()["descriptor"].is_object());
+}
+
+/// CAD-1110 relay parity: the board's `GET .../chat-descriptor` refuses an
+/// agent exactly like the daemon verb and like the sibling reads
+/// (`check: operator_only`, 403) even for a forged id, 404s a forged id and
+/// an unapproved installation for the operator with one body, and serves
+/// the approved descriptor `no-store`.
+///
+/// Guard: `operator::admit_operator_read` ahead of `app_chat::handle`
+/// (ui/serve.rs); `app_chat::route` takes the id from the path only.
+#[test]
+fn chat_descriptor_board_route_refuses_agents_and_404s_every_missing_case() {
+    let (board, _state, rest) = http::start(gx_with(true));
+    let crm_path = format!("/api/app-installations/{}/chat-descriptor", rest.crm);
+    let forged = "/api/app-installations/no-such-install/chat-descriptor";
+    for path in [crm_path.as_str(), forged] {
+        let (status, reply) = board.call("agent:w1", "GET", path, None);
+        assert_eq!(status, 403, "{path}: {reply}");
+        assert_eq!(reply["check"], json!("operator_only"), "{path}: {reply}");
+    }
+    let (status, reply) = board.call("operator", "GET", &crm_path, None);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["app"], json!("crm"), "{reply}");
+    assert!(reply["descriptor"]["contexts"].is_array(), "{reply}");
+    assert_eq!(
+        board.cache_control("operator", &crm_path).as_deref(),
+        Some("no-store")
+    );
+    let (status, none) = board.call("operator", "GET", forged, None);
+    assert_eq!(status, 404, "{none}");
+    assert_eq!(none["error"], json!("no chat descriptor"));
+    // The id is never taken from anywhere but the path.
+    let (status, _) = board.call(
+        "operator",
+        "GET",
+        &format!("{forged}?install_id={}", rest.crm),
+        None,
+    );
+    assert_eq!(status, 404);
+    // Another HTTP method is not a read.
+    let (status, _) = board.call("operator", "POST", &crm_path, Some(json!({})));
+    assert_ne!(status, 200);
+}
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&src, &dst);
+        } else {
+            std::fs::copy(&src, &dst).unwrap();
+        }
+    }
+}
+
+/// CAD-1110: the install validator refuses a package whose `app-chat.json`
+/// breaks the grammar, at install time, by the grammar's own reason; and a
+/// symlinked descriptor is refused by the confined resolver. Positive
+/// control: the untouched package installs.
+///
+/// Guards: `app_chat::validate` called from `app::validate_contents`
+/// (issue/app.rs) and the `snapshot` allowlist (app_catalog/workspace.rs).
+#[test]
+fn install_refuses_a_package_with_an_invalid_chat_descriptor() {
+    let dir = tempfile::Builder::new().prefix("c10i").tempdir().unwrap();
+    let pm = dir.path().join("pm");
+    crate::issue::Pm::init(&pm).unwrap();
+    let opts = ServeOptions::default();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    let shared = Shared::new(dir.path(), &opts).unwrap();
+    let operator = |method: &str, params: Value| {
+        scoped(Asserted::Operator, || {
+            shared.dispatch(method, &params, pid())
+        })
+    };
+    let root = tempfile::Builder::new().prefix("c1110").tempdir().unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workspace-apps/crm");
+    let good: Value =
+        serde_json::from_str(&std::fs::read_to_string(source.join("app-chat.json")).unwrap())
+            .unwrap();
+    let install = |name: &str, descriptor: Option<String>, link: bool| {
+        let dir = root.path().join(name);
+        copy_tree(&source, &dir);
+        let file = dir.join("app-chat.json");
+        if link {
+            std::fs::remove_file(&file).unwrap();
+            std::os::unix::fs::symlink("/etc/hostname", &file).unwrap();
+        } else if let Some(text) = descriptor {
+            std::fs::write(&file, text).unwrap();
+        }
+        operator(
+            "app_workspace_install",
+            json!({"source": dir.to_str().unwrap()}),
+        )
+    };
+    let with = |edit: &dyn Fn(&mut Value)| {
+        let mut d = good.clone();
+        edit(&mut d);
+        Some(d.to_string())
+    };
+    let cases: Vec<(&str, Option<String>, &str)> = vec![
+        (
+            "forbidden",
+            with(&|d| d["contexts"][0]["install_id"] = json!("x")),
+            "forbidden descriptor key",
+        ),
+        (
+            "run",
+            with(&|d| {
+                d["directives"][0]["card"]["buttons"] =
+                    json!([{"label": "x", "run": "delete-everything", "view": "a"}])
+            }),
+            "not a host action",
+        ),
+        (
+            "attach",
+            with(&|d| d["attachments"][0]["id"] = json!("shell")),
+            "not a host capability",
+        ),
+        (
+            "app",
+            with(&|d| d["app"] = json!("social-content")),
+            "different app",
+        ),
+        (
+            "tag",
+            with(&|d| d["contract"] = json!("app-chat/v2")),
+            "expected app-chat/v1",
+        ),
+        (
+            "big",
+            Some(format!(
+                "{{\"contract\":\"app-chat/v1\",\"app\":\"crm\",\"pad\":\"{}\"}}",
+                "x".repeat(17_000)
+            )),
+            "exceeds",
+        ),
+    ];
+    for (name, text, reason) in cases {
+        let err = err_text(install(name, text, false));
+        assert!(
+            err.contains("app-chat.json") && err.contains(reason),
+            "{name}: {err}"
+        );
+    }
+    let err = err_text(install("link", None, true));
+    assert!(!err.is_empty(), "a symlinked descriptor must be refused");
+    let ok = install("ok", None, false).unwrap();
+    assert!(ok["install_id"].is_string(), "control: {ok}");
 }
