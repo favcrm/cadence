@@ -9,13 +9,11 @@ on:
       - 'scripts/delivery-candidate.py'
       - 'scripts/staging-rehearsal.py'
       - 'scripts/auto-stage.py'
-      - 'tests/scripts/test_auto_stage.py'
+      - 'scripts/test_reduced_gate_release.py'
+      - 'scripts/test_workflow_cleanup.py'
       - 'config/production-baseline.json'
       - 'scripts/e2e/**'
-      - 'tests/e2e/**'
-      - 'tests/e2e_mvp.rs'
       - 'src/upgrade.rs'
-      - 'tests/upgrade.rs'
   workflow_dispatch:
     inputs:
       ci_run_id:
@@ -215,7 +213,7 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: candidate-source/tests/e2e/pnpm-lock.yaml
+          cache-dependency-path: candidate-source/ui/pnpm-lock.yaml
       - run: control/scripts/ci-rust-toolchain --export --profile minimal
       # CAD-1073: tests/e2e_mvp.rs was retired with the suite. The stage
       # job's residual release gate is the migration/backup rehearsal below

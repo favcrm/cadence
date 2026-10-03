@@ -283,10 +283,13 @@ normal gates return. An agent or PR may not grant that exception to itself.
 - Never skip, ignore or weaken a test or check to get green.
 
 ### Local builds and tests
-- Before every push run `scripts/pre-push` (fmt, split-map sync, clippy,
-  ui typecheck and script contracts for what you changed; add `--tests` for
-  the changed integration binaries). After adding a `#[test]` to an
-  integration binary run `scripts/split-map-sync` to register it.
+- Before every push run `scripts/pre-push` (fmt, live doctor split check,
+  clippy, UI typecheck and active script contracts for what you changed).
+  Use `scripts/pre-push --tests` before requesting review of Rust changes:
+  during CAD-1073 it always runs the safety floor, even when its source is
+  unchanged. It does not replace behavior tests for the changed contract.
+  Integration split manifests are retired; do not run `split-map-sync`
+  until a reviewed inventory restoration establishes its inputs.
 - sccache is the host-wide rustc wrapper (set in `~/.cargo/config.toml`).
   Don't override `RUSTC_WRAPPER`. If a build fails in a strange way, rerun
   it once with `RUSTC_WRAPPER=` to rule sccache out.

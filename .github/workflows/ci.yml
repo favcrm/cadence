@@ -61,8 +61,8 @@ jobs:
   # key and passes `save-if: false`: a queue ref saved ~1.4 GB per run that no
   # other ref could read, and the repo sat at 12.7 GB against a 10 GB limit.
   # release-artifact and release-build keep their own default-keyed caches
-  # (they run on main pushes and tags only). cross-build has no rust-cache. tests/scripts/test_ci_cache_scope.py
-  # pins all of this.
+  # (they run on main pushes and tags only). cross-build has no rust-cache.
+  # The legacy cache-scope fixture was retired in CAD-1073.
   # CAD-409: with the merge queue (CAD-290), GitHub merges a queue entry by
   # moving main to the exact commit its merge_group run tested, so a push
   # run for that sha would re-test identical content. On a push to main
@@ -164,18 +164,15 @@ jobs:
       - run: python3 scripts/check-review-recipe
       - run: python3 scripts/test-review-recipe
       - run: python3 -m unittest scripts/test_reduced_gate_release.py
+      - run: python3 scripts/test_pre_push_plan.py
+      - run: python3 scripts/test_workflow_cleanup.py
       - run: scripts/design-kit --check
       - name: Check contributor documentation paths
         run: python3 scripts/check-doc-links.py
       - name: Test contributor documentation checker
         run: python3 -m unittest discover -s scripts -p 'test_check_doc_links.py'
-      - name: Verify doctor/host split-map consistency
-        run: |
-          if [ -f tests/split-map-doctor.toml ] || [ -f tests/split-map-host.toml ]; then
-            scripts/split-doctor-host --check
-          else
-            echo 'split-doctor-host: manifests retired under CAD-1073; nothing to check.'
-          fi
+      - name: Verify live doctor/host source inventory
+        run: scripts/split-doctor-host --check
 
   clippy:
     needs: [queue-evidence]
@@ -196,51 +193,11 @@ jobs:
       # run — lint the feature-on shape too so it cannot rot.
       - run: cargo clippy --all-targets --locked --features test-seam -- -D warnings
 
-  # CAD-1073 clean-slate transition: the sharded suite is retired.
-  # `test` runs the safety-floor binary once; `test-shard` and the
-  # inventory/assignment machinery return when a real suite exists to
-  # schedule. The required `test` name is preserved by that job.
-  test-shard:
-    needs: [queue-evidence]
-    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Retired — clean-slate transition
-        run: |
-          echo 'test-shard: legacy suite retired under CAD-1073; the safety floor is the test job.'
-          echo 'test-shard: legacy suite retired under CAD-1073; the safety floor is the test job.' >> "$GITHUB_STEP_SUMMARY"
-
-  # CAD-1073: the once-only job is folded into `test`; the seam-refusal
-  # proof it carried lives inside `tests/safety_floor.rs` (the release
-  # build + test-seam combination must fail), so no coverage that matters
-  # during the window is dropped.
-  test-once:
-    needs: [queue-evidence]
-    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: scripts/ci-rust-toolchain --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: gate-test
-          save-if: false
-      # The seam's release refusal is proved in tests/safety_floor.rs and
-      # again by the build job's explicit release+test-seam probe; this job
-      # exists so the required check name stays present without duplicating
-      # the floor's compile cost.
-      - name: Run Rust doctests with locked Cargo
-        env:
-          CARGO_BUILD_JOBS: 4
-        run: cargo test --doc --locked
-
-  # Stable required-check name over the safety floor: branch protection
-  # requires `test`, and downstream gates read `needs.test.result`.
+  # CAD-1088: one runner for the reduced floor and doctests. The old
+  # echo-only shard and separate doctest startup added dependency wait,
+  # not coverage. Preserve the required `test` name and all real commands.
   test:
-    needs: [queue-evidence, test-shard, test-once]
+    needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -251,12 +208,10 @@ jobs:
         with:
           shared-key: gate-test
           save-if: false
-      - name: Aggregate test-shard results
-        run: |
-          echo "test shards: ${{ needs.test-shard.result }}"
-          echo "test-once: ${{ needs.test-once.result }}"
-          [ "${{ needs.test-shard.result }}" = success ]
-          [ "${{ needs.test-once.result }}" = success ]
+      - name: Run Rust doctests with locked Cargo
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: cargo test --doc --locked
       - name: Build and run the safety floor
         env:
           CARGO_BUILD_JOBS: 4
