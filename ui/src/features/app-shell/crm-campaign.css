@@ -221,3 +221,92 @@
 .crm-timeline li[data-accent] .crm-dot {
   background: var(--color-accent);
 }
+
+/* CAD-1057 inline editing in the Email tab. Board tokens only. */
+.crm-env-row {
+  display: grid;
+  grid-template-columns: 5rem minmax(0, 1fr);
+  align-items: center;
+  gap: 0.5rem;
+}
+.crm-canvas {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--color-ink-700);
+  border-bottom: 0;
+  background: var(--color-ink-900);
+}
+.crm-block {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.25rem;
+  border: 1px dashed transparent;
+  border-radius: 0.375rem;
+}
+.crm-block:hover,
+.crm-block:focus-within {
+  border-color: var(--color-ink-600);
+}
+.crm-block-body {
+  flex: 1;
+  min-width: 0;
+}
+.crm-block-heading,
+.crm-block-paragraph,
+.crm-block-button input {
+  width: 100%;
+  background: transparent;
+  color: var(--color-ink-100);
+  border: 0;
+  outline: 0;
+  font: inherit;
+  resize: vertical;
+}
+.crm-block-heading {
+  font-size: var(--text-cardtitle);
+  font-weight: 600;
+}
+.crm-block-button {
+  display: grid;
+  gap: 0.25rem;
+}
+.crm-block-tools {
+  display: inline-flex;
+  gap: 0.4rem;
+  opacity: 0.7;
+}
+.crm-addblock {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  padding-top: 0.25rem;
+}
+.crm-footer-lock {
+  margin: 0;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0 0 0.5rem 0.5rem;
+  background: var(--color-ink-850);
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+}
+.srcedit {
+  font-family: var(--font-mono, monospace);
+  width: 100%;
+}
+.crm-unsaved {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--color-accent);
+  border-radius: 0.5rem;
+  background: var(--color-ink-875);
+}

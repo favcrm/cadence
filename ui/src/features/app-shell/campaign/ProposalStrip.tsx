@@ -25,6 +25,7 @@ export default function ProposalStrip({
   proposal,
   expectedRevision,
   canWrite,
+  replacesHtml,
   viewingDraft,
   onViewDraft,
   onApplied,
@@ -35,6 +36,8 @@ export default function ProposalStrip({
   proposal: ProposalDoc;
   expectedRevision: number;
   canWrite: boolean;
+  /** The saved body is operator HTML; Apply swaps it for blocks. */
+  replacesHtml: boolean;
   viewingDraft: boolean;
   onViewDraft: (view: boolean) => void;
   onApplied: (doc: ContentDoc) => void;
@@ -143,6 +146,11 @@ export default function ProposalStrip({
           </>
         )}
       </div>
+      {replacesHtml && canWrite && (
+        <p className="text-label text-warn" data-state="replaces-html">
+          Apply replaces this email&apos;s HTML body with the assistant&apos;s blocks.
+        </p>
+      )}
       {stale && (
         <p className="text-label text-warn" data-state="stale">
           Needs review (stale) — drafted against r{proposal.sourceRevision}, the saved version is

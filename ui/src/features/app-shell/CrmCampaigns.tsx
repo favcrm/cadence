@@ -12,15 +12,12 @@ import {
   type AudienceScope,
 } from "./audienceClient";
 import {
-  checkCampaignId,
-  checkContent,
   friendlyCampaignError,
   parseContentDoc,
   parseContentList,
   parseProposalList,
   parseProposalRender,
   parseRender,
-  type CampaignBlock,
   type ContentDoc,
   type ContentRender,
   type ProposalDoc,
@@ -51,11 +48,11 @@ import {
 import { PreviewPanel, parsePreview, type AudiencePreview } from "./CrmSegments";
 import { friendlyAudienceError, newAudienceId } from "./segmentGrammar";
 import Field from "./shared/Field";
-import { isGenericRefusal } from "./shared/hostErrors";
 import { ErrorNotice } from "./shared/States";
 import "./crm-campaign.css";
 import CampaignTabs from "./campaign/CampaignTabs";
 import EmailPane from "./campaign/EmailPane";
+import { useEmailDraft } from "./campaign/useEmailDraft";
 import OverviewPane from "./campaign/OverviewPane";
 import EligibilityFunnel from "./campaign/EligibilityFunnel";
 import ActivityPane from "./campaign/ActivityPane";
@@ -1082,34 +1079,6 @@ function AudienceSection({
 /* Visual email editor + host preview + test-send + proposals.         */
 /* ------------------------------------------------------------------ */
 
-interface EditorBlock {
-  key: number;
-  kind: CampaignBlock["type"];
-  text: string;
-  label: string;
-  url: string;
-}
-
-let editorKey = 1;
-
-function blocksFromDoc(doc: ContentDoc | null): EditorBlock[] {
-  if (doc === null) return [{ key: editorKey++, kind: "paragraph", text: "", label: "", url: "" }];
-  return doc.blocks.map((block) => {
-    if (block.type === "button") {
-      return { key: editorKey++, kind: "button" as const, text: "", label: block.label, url: block.url };
-    }
-    return { key: editorKey++, kind: block.type, text: block.text, label: "", url: "" };
-  });
-}
-
-function blocksToGrammar(blocks: EditorBlock[]): CampaignBlock[] {
-  return blocks.map((block) => {
-    if (block.kind === "heading") return { type: "heading", text: block.text };
-    if (block.kind === "paragraph") return { type: "paragraph", text: block.text };
-    return { type: "button", label: block.label, url: block.url };
-  });
-}
-
 /* ------------------------------------------------------------------ */
 /* Send controls (CAD-785 binding + CAD-786 approved bounded send).     */
 /* ------------------------------------------------------------------ */
@@ -2101,19 +2070,7 @@ function CampaignWorkspace({
   onTab?: (tab: CampaignTab) => void;
 }) {
   const canWrite = viewer.operator && !viewer.readOnly;
-  const [subject, setSubject] = useState(doc?.subject ?? "");
-  const [preheader, setPreheader] = useState(doc?.preheader ?? "");
-  const [blocks, setBlocks] = useState<EditorBlock[]>(() => blocksFromDoc(doc));
-  // CAD-1013 pinned inline edit: the revision the operator began editing
-  // against. `save` sends it as expectedRevision so a concurrent agent
-  // Apply/newer draft can never be silently overwritten — a drift is a
-  // conflict, not a merge. `staleEdit` flags that a newer doc landed
-  // while editing so the local text is preserved, not clobbered.
-  const [editSourceRevision, setEditSourceRevision] = useState<number | null>(null);
-  const [staleEdit, setStaleEdit] = useState(false);
-  const [pending, setPending] = useState(false);
-  const [formError, setFormError] = useState<string | null>(null);
-  const [savedNote, setSavedNote] = useState<string | null>(null);
+  const emailDraft = useEmailDraft(scope, campaignId, doc, onDoc);
   const [render, setRender] = useState<ContentRender | null>(null);
   const [renderPending, setRenderPending] = useState(false);
   const [renderError, setRenderError] = useState<string | null>(null);
@@ -2137,24 +2094,11 @@ function CampaignWorkspace({
   const [proposalError, setProposalError] = useState<string | null>(null);
   const [proposalNote, setProposalNote] = useState<string | null>(null);
 
-  // The doc is the saved truth: editor follows a newly saved revision
-  // (create, Apply) but never clobbers typing mid-draft. While editing,
-  // a newer doc marks the edit stale instead — the operator's text stays
-  // put and the save keeps the pinned editSourceRevision, so a conflict
-  // refuses rather than overwriting an agent's newer draft.
+  // A newly saved revision (create, Apply, save) invalidates test-send
+  // evidence; the editor follows it inside `useEmailDraft`.
   const docIdentity = doc === null ? "none" : `${doc.revision}:${doc.contentDigest}`;
   useEffect(() => {
-    if (doc === null) return;
-    if (editing) {
-      // A new saved revision landed mid-edit: keep local text, flag it.
-      setStaleEdit(true);
-      return;
-    }
-    setSubject(doc.subject);
-    setPreheader(doc.preheader);
-    setBlocks(blocksFromDoc(doc));
     setTestReceipt(null);
-    setStaleEdit(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docIdentity]);
 
@@ -2296,77 +2240,7 @@ function CampaignWorkspace({
   // inert `pending` proposal on this campaign. The drafts list below
   // refreshes to surface it; there is no request id to mint or poll.
 
-  const grammarBlocks = (): CampaignBlock[] => blocksToGrammar(blocks);
-
-  const save = (e: React.FormEvent) => {
-    e.preventDefault();
-    setFormError(null);
-    setSavedNote(null);
-    try {
-      checkCampaignId(campaignId);
-      checkContent(subject, preheader, grammarBlocks());
-    } catch (err: unknown) {
-      setFormError(friendlyCampaignError(err));
-      return;
-    }
-    setPending(true);
-    void contentClient
-      .save(scope, {
-        campaignId,
-        subject,
-        preheader,
-        blocks: grammarBlocks(),
-        // CAD-1013 pinned edit: expectedRevision is the revision the
-        // operator began editing against, not whatever doc is current —
-        // a concurrent agent Apply must refuse as a conflict, never be
-        // silently overwritten.
-        ...(editSourceRevision === null || editSourceRevision === 0
-          ? {}
-          : { expectedRevision: editSourceRevision }),
-      })
-      .then((value) => {
-        const next = parseContentDoc(value);
-        onDoc(next);
-        setRender(null);
-        setTestReceipt(null);
-        setEditing(false);
-        setEditSourceRevision(null);
-        setStaleEdit(false);
-        setSavedNote(
-          doc === null
-            ? `Created revision ${next.revision} — earlier content approval does not exist yet.`
-            : `Saved revision ${next.revision} — content approval invalidated.`,
-        );
-      })
-      .catch((err: unknown) => {
-        // expectedRevision conflict: keep the operator's local text edits
-        // open and ask for a reload — never overwrite an agent's newer draft.
-        setFormError(
-          (isGenericRefusal(err) ? "" : friendlyCampaignError(err)) +
-            " The draft moved since you started editing — reload it to retry, or Cancel to keep browsing.",
-        );
-      })
-      .finally(() => setPending(false));
-  };
-
-  // The editor diverged from the saved revision: the preview keeps
-  // naming the last saved bytes instead of implying live content.
-  // Blocks compare semantically — field order over the wire is not
-  // the draft's identity.
-  const blockKey = (block: CampaignBlock) =>
-    block.type === "button" ? `button:${block.label}${block.url}` : `${block.type}:${block.text}`;
-  const savedBlocks = doc?.blocks.map(blockKey) ?? [];
-  const draftBlocks = blocksToGrammar(blocks).map(blockKey);
-  const dirty =
-    doc !== null &&
-    (subject !== doc.subject ||
-      preheader !== doc.preheader ||
-      savedBlocks.length !== draftBlocks.length ||
-      savedBlocks.some((key, index) => key !== draftBlocks[index]));
-
-  const updateBlock = (key: number, patch: Partial<EditorBlock>) => {
-    setBlocks((prev) => prev.map((block) => (block.key === key ? { ...block, ...patch } : block)));
-  };
+  const dirty = emailDraft.dirty;
 
   const previewBody =
     doc === null ? (
@@ -2484,167 +2358,6 @@ function CampaignWorkspace({
     </section>
   );
 
-  // CAD-1013 preview-first: the manual block composer is replaced by a
-  // read-oriented content card. The email is created/refined by the
-  // assistant proposal flow (Proposals section); the only operator edit
-  // here is a bounded inline text correction of saved subject, preheader
-  // and the text of existing blocks — never block structure, URLs or
-  // token tooling. Corrections go through the same revisioned save path
-  // (expectedRevision) so a conflict never overwrites an agent draft.
-  const [editing, setEditing] = useState(false);
-  const startEdit = () => {
-    setSubject(doc?.subject ?? "");
-    setPreheader(doc?.preheader ?? "");
-    setBlocks(blocksFromDoc(doc));
-    setEditSourceRevision(doc === null ? 0 : doc.revision);
-    setStaleEdit(false);
-    setFormError(null);
-    setEditing(true);
-  };
-  const cancelEdit = () => {
-    setBlocks(blocksFromDoc(doc));
-    setSubject(doc?.subject ?? "");
-    setPreheader(doc?.preheader ?? "");
-    setEditSourceRevision(null);
-    setStaleEdit(false);
-    setFormError(null);
-    setEditing(false);
-  };
-  const editForm = (
-          <form className="grid gap-3" aria-label="Correct email text" onSubmit={save}>
-            {staleEdit && (
-              <p className="text-label text-warn" role="status" data-stale-edit>
-                A newer revision was saved while you were editing — your text is kept, but
-                saving now is pinned to revision {editSourceRevision}. If it conflicts, reload
-                the draft or Cancel — your newer text is never overwritten silently.
-              </p>
-            )}
-            <div className="crm-field-row">
-              <Field
-                label="Subject"
-                id="cmp-subject"
-                hint="Plain text"
-                required
-                disabled={!canWrite || pending}
-                className="crm-field"
-              >
-                {(c) => (
-                  <input
-                    {...c}
-                    className="field"
-                    value={subject}
-                    onChange={(e) => setSubject(e.target.value)}
-                    maxLength={150}
-                    autoComplete="off"
-                  />
-                )}
-              </Field>
-              <Field
-                label="Preheader"
-                id="cmp-preheader"
-                hint="Optional, plain text"
-                disabled={!canWrite || pending}
-                className="crm-field"
-              >
-                {(c) => (
-                  <input
-                    {...c}
-                    className="field"
-                    value={preheader}
-                    onChange={(e) => setPreheader(e.target.value)}
-                    maxLength={200}
-                    autoComplete="off"
-                  />
-                )}
-              </Field>
-            </div>
-            <ol className="crm-history" aria-label="Block text">
-              {blocks.map((block, index) => (
-                <li key={block.key} className="card px-3 py-3">
-                  <p className="text-micro text-ink-500">
-                    Block {index + 1} — {block.kind}
-                    {block.kind === "button" ? " (URL unchanged)" : ""}
-                  </p>
-                  {block.kind === "button" ? (
-                    <Field
-                      label="Button label"
-                      id={`cmp-block-label-${block.key}`}
-                      disabled={!canWrite || pending}
-                      className="crm-field mt-2"
-                    >
-                      {(c) => (
-                        <input
-                          {...c}
-                          className="field"
-                          value={block.label}
-                          onChange={(e) => updateBlock(block.key, { label: e.target.value })}
-                          maxLength={60}
-                          autoComplete="off"
-                        />
-                      )}
-                    </Field>
-                  ) : (
-                    <Field
-                      label={block.kind === "heading" ? "Heading text" : "Paragraph text"}
-                      id={`cmp-block-text-${block.key}`}
-                      disabled={!canWrite || pending}
-                      className="crm-field mt-2"
-                    >
-                      {(c) => (
-                        <textarea
-                          {...c}
-                          className="field"
-                          rows={block.kind === "heading" ? 2 : 4}
-                          value={block.text}
-                          onChange={(e) => updateBlock(block.key, { text: e.target.value })}
-                          maxLength={block.kind === "heading" ? 120 : 2000}
-                          autoComplete="off"
-                        />
-                      )}
-                    </Field>
-                  )}
-                </li>
-              ))}
-            </ol>
-            {formError && (
-              <p className="text-label text-fail" role="alert">
-                {formError}
-              </p>
-            )}
-            {savedNote && (
-              <p className="text-label text-ok" role="status">
-                {savedNote}
-              </p>
-            )}
-            <div className="crm-toolbar">
-              <Button type="submit" variant="primary" loading={pending} disabled={pending}>
-                Save text corrections (new revision)
-              </Button>
-              <Button type="button" disabled={pending} onClick={cancelEdit}>
-                Cancel
-              </Button>
-            </div>
-          </form>
-  );
-  const editControls = (
-    <>
-            {canWrite && doc !== null && (
-              <div className="crm-toolbar">
-                <Button type="button" size="sm" onClick={startEdit}>
-                  Edit subject / text
-                </Button>
-                <span className="text-micro text-ink-500">
-                  Text corrections save a new revision and invalidate the current approval.
-                </span>
-              </div>
-            )}
-            {doc !== null && !canWrite && (
-              <p className="text-label text-ink-400" data-state="read-only">
-                Read-only view. A verified operator saves content revisions.
-              </p>
-            )}
-    </>
-  );
   const contentForm = (
       <div className="card px-4 py-4 grid gap-3" aria-label="Email content">
         <h4 className="text-cardtitle font-medium text-ink-100">
@@ -2657,35 +2370,30 @@ function CampaignWorkspace({
             inline editor after a draft exists.
           </p>
         )}
-        {!editing ? (
-          <>
-            {doc !== null && (
-              <dl className="sdetail" data-content-summary>
-                <div>
-                  <dt>Subject</dt>
-                  <dd>{doc.subject}</dd>
-                </div>
-                <div>
-                  <dt>Preheader</dt>
-                  <dd>{doc.preheader === "" ? "—" : doc.preheader}</dd>
-                </div>
-                <div>
-                  <dt>Blocks</dt>
-                  <dd>
-                    {doc.blocks.length} block{doc.blocks.length === 1 ? "" : "s"} ·{" "}
-                    {doc.contentDigest.slice(0, 18)}…
-                  </dd>
-                </div>
-              </dl>
-            )}
-            {editControls}
-          </>
-        ) : (
-          editForm
+        {doc !== null && (
+          <dl className="sdetail" data-content-summary>
+            <div>
+              <dt>Subject</dt>
+              <dd>{doc.subject}</dd>
+            </div>
+            <div>
+              <dt>Preheader</dt>
+              <dd>{doc.preheader === "" ? "—" : doc.preheader}</dd>
+            </div>
+            <div>
+              <dt>Body</dt>
+              <dd>
+                {doc.mode === "html"
+                  ? "HTML body"
+                  : `${doc.blocks.length} block${doc.blocks.length === 1 ? "" : "s"}`}{" "}
+                · {doc.contentDigest.slice(0, 18)}…
+              </dd>
+            </div>
+          </dl>
         )}
-        {!editing && savedNote && (
-          <p className="text-label text-ok" role="status">
-            {savedNote}
+        {doc !== null && (
+          <p className="text-label text-ink-400">
+            Edit the email on the campaign&apos;s Email tab.
           </p>
         )}
       </div>
@@ -3013,20 +2721,6 @@ function CampaignWorkspace({
   });
   const pendingProposals = proposals.filter((row) => row.state === "pending");
   const emailBadge = pendingProposals.length > 0 ? `${pendingProposals.length} draft` : null;
-  const editAction = (
-    <>
-      {!editing && doc !== null && (
-        <div className="grid gap-2">
-          {editControls}
-        </div>
-      )}
-      {!editing && savedNote && (
-        <p className="text-label text-ok" role="status">
-          {savedNote}
-        </p>
-      )}
-    </>
-  );
   return (
     <CampaignTabs
       tabs={[
@@ -3073,8 +2767,7 @@ function CampaignWorkspace({
           onApplied={applyProposal}
           onDiscarded={discardProposal}
           onProposalError={setProposalError}
-          editor={editing ? editForm : null}
-          editAction={editAction}
+          edit={canWrite && doc !== null ? emailDraft : null}
         />
       )}
       {activeTab === "audience" && audienceSlot}

@@ -156,6 +156,11 @@ export interface ContentDoc {
   subject: string;
   preheader: string;
   blocks: CampaignBlock[];
+  /** CAD-1056: `html` when the operator saved a (host-sanitised) HTML body. */
+  mode: "blocks" | "html";
+  html: string | null;
+  /** Operator plain-text override, or null for the generated text. */
+  textOverride: string | null;
   contentDigest: string;
   approval: { revision: number | null; digest: string | null; valid: boolean; scope: string };
 }
@@ -183,6 +188,9 @@ export function parseContentDoc(value: unknown): ContentDoc {
     subject: row.subject,
     preheader: row.preheader,
     blocks: row.blocks as CampaignBlock[],
+    mode: row.mode === "html" && typeof row.html === "string" ? "html" : "blocks",
+    html: typeof row.html === "string" ? row.html : null,
+    textOverride: typeof row.text_override === "string" ? row.text_override : null,
     contentDigest: row.content_digest,
     approval: {
       revision: typeof approval.revision === "number" ? approval.revision : null,

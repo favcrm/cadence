@@ -751,16 +751,20 @@ async function mountedFlow() {
   assert((host.querySelector('pre[data-preview="text"]')?.textContent ?? "").includes("TEXT form"), "text tab shows the host text form");
   assert(text().includes("noreply@cadence.invalid"), "preview-only sender material renders");
 
-  // Bounded inline text correction: Edit subject / text opens the only
-  // operator edit — subject, preheader and existing block text, never
-  // block type, URL, token tooling or add/remove — and saves a new
-  // revision through expectedRevision (a conflict keeps local text).
-  await click(byText("button", "Edit subject / text"));
-  await settle(() => assert(host.querySelector("#cmp-subject"), "inline edit reveals subject"));
-  assert(!host.querySelector('[aria-label="Add block"]'), "no add-block control in inline edit");
+  // CAD-1057 inline editing: the envelope's subject is editable in
+  // place (no separate form), the unsaved bar offers Save as vN+1 and
+  // saves through expectedRevision (a conflict keeps local text).
+  const editorBar = () => host.querySelector("[data-unsaved-bar]");
+  const saveAs = () => Array.from(editorBar()?.querySelectorAll("button") ?? []).find((b) => (b.textContent ?? "").startsWith("Save as v"));
+  assert(!byText("button", "Edit subject / text"), "the separate edit form is gone");
+  await settle(() => assert(host.querySelector("#cmp-subject"), "the envelope subject is editable inline"));
+  await click(byText("button", "Visual"));
+  assert(host.querySelector('[aria-label="Add block"]'), "blocks can be added inline");
+  assert(!editorBar(), "no unsaved bar while nothing changed");
   await fillInput("#cmp-subject", "Assistant draft subject v2");
-  await click(byText("button", "Save text corrections (new revision)"));
-  await settle(() => assert(text().includes("Saved revision 2"), "the text correction saved a new revision"));
+  await settle(() => assert(saveAs(), "an edit raises the unsaved bar"));
+  await click(saveAs());
+  await settle(() => assert(text().includes("Saved v2"), "the correction saved a new revision"));
 
   // Approval is content-only; a proposal Apply invalidates it and a
   // stale-source proposal refuses with Apply disabled.
@@ -773,11 +777,10 @@ async function mountedFlow() {
   landAssistantDraft(openDoc().campaign_id as string, { subject: "Assistant draft subject v2 draft" });
   await click(byText("button", "Refresh drafts"));
   await settle(() => assert(host.querySelectorAll('[data-proposal]').length > 0, "second proposal pends"), 30000);
-  await click(byText("button", "Edit subject / text"));
-  await settle(() => assert(host.querySelector("#cmp-subject"), "inline edit reopens"));
   await fillInput("#cmp-subject", "Assistant draft subject v3");
-  await click(byText("button", "Save text corrections (new revision)"));
-  await settle(() => assert(text().includes("Saved revision 3"), "the correction saved r3"));
+  await settle(() => assert(saveAs(), "the second edit raises the unsaved bar"));
+  await click(saveAs());
+  await settle(() => assert(text().includes("Saved v3"), "the correction saved r3"));
   await settle(() => assert(text().includes("Needs review (stale)"), "the drifted proposal renders stale"));
   // The row's first button is "Preview draft" — the Apply control is a
   // later button in the same row; find it by label, never by position.
@@ -794,8 +797,6 @@ async function mountedFlow() {
   // newer revision. The editor must keep the local text, flag the edit
   // stale and pin the save to the revision it began on — a conflict
   // refuses instead of silently overwriting the agent's newer draft.
-  await click(byText("button", "Edit subject / text"));
-  await settle(() => assert(host.querySelector("#cmp-subject"), "inline edit opens for the pinned test"));
   const pinnedBase = openDoc().revision as number;
   await fillInput("#cmp-subject", "My kept local correction");
   // A concurrent assistant draft lands (scoped chat turn) and applies
@@ -813,10 +814,10 @@ async function mountedFlow() {
   );
   assert(host.querySelector('[data-stale-edit]'), "the stale-edit warning renders");
   // Saving stays pinned to the base revision → the backend conflicts.
-  await click(byText("button", "Save text corrections (new revision)"));
+  await click(saveAs());
   await settle(() =>
     assert(
-      text().includes("revision is stale") || text().includes("moved since you started editing"),
+      text().includes("since you started editing"),
       "the pinned save conflicts instead of overwriting the newer draft",
     ),
   );
@@ -824,7 +825,8 @@ async function mountedFlow() {
     (host.querySelector("#cmp-subject") as HTMLInputElement).value === "My kept local correction",
     "the refused save keeps the local text for a reload decision",
   );
-  await click(byText("button", "Cancel"));
+  await click(Array.from(editorBar()!.querySelectorAll("button")).find((b) => b.textContent === "Discard"));
+  await settle(() => assert(!editorBar(), "Discard drops the unsaved edits"));
 
   // ---- CAD-1016: the verified assistant-draft seam (no manual mint) ----
   // The mint control is gone: an ordinary scoped chat message invokes the
@@ -991,10 +993,9 @@ async function mountedFlow() {
   await settle(() => assert(heldRender !== null, "the refresh render is in flight"));
   const heldRevision = renderDoc().revision;
   // Save a newer revision while the stale render is outstanding.
-  await click(byText("button", "Edit subject / text"));
-  await settle(() => assert(host.querySelector("#cmp-subject"), "inline edit opens for the stale-render save"));
   await fillInput("#cmp-subject", "Assistant draft subject v4");
-  await click(byText("button", "Save text corrections (new revision)"));
+  await settle(() => assert(saveAs(), "the stale-render edit raises the unsaved bar"));
+  await click(saveAs());
   await settle(() => assert(renderDoc().revision === heldRevision + 1, "the newer revision saved while the stale render was in flight"));
   // Release the stale answer now that the saved revision has moved on.
   const release = heldRender!;

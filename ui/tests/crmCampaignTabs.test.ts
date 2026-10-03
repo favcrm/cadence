@@ -308,9 +308,11 @@ async function mounted(readOnly: boolean) {
   await settle(() => assert((host.querySelector('iframe[data-preview="visual"]') as HTMLIFrameElement | null)?.getAttribute("srcdoc")?.includes("HTML form"), "the saved revision renders in the Visual iframe"));
   const envelope = host.querySelector('[aria-label="Email envelope"]');
   assert(envelope, "the envelope header renders");
-  assert((envelope!.textContent ?? "").includes("Welcome aboard") && (envelope!.textContent ?? "").includes("We are glad you are here"), "envelope shows subject and preheader");
+  const envSubject = readOnly ? (envelope!.textContent ?? "") : (host.querySelector("#cmp-subject") as HTMLInputElement).value;
+  const envPre = readOnly ? (envelope!.textContent ?? "") : (host.querySelector("#cmp-preheader") as HTMLInputElement).value;
+  assert(envSubject.includes("Welcome aboard") && envPre.includes("We are glad you are here"), "envelope shows subject and preheader");
   assert((envelope!.textContent ?? "").includes("CRM News <news@example.com>") && (envelope!.textContent ?? "").includes("preview-only"), "envelope shows the host-locked preview sender");
-  assert(!host.querySelector("[contenteditable], textarea.srcedit"), "no inline editing surfaces ship in this lane");
+  assert(!!host.querySelector("#cmp-subject") === !readOnly, "the envelope is editable only for an operator who can write");
   const inbox = () => host.querySelector(".crm-inbox") as HTMLElement;
   equal(inbox().getAttribute("data-device"), "desktop", "desktop width by default");
   await click(byText(host, "button", "Mobile"));
@@ -370,14 +372,13 @@ async function mounted(readOnly: boolean) {
     await settle(() => assert(text().includes("Applied as revision 3") && text().includes("approval invalidated"), "Apply reports the new revision and the approval reset"));
     equal(applyBodies, [{ id: "prop-1", body: { expected_revision: 2 } }], "Apply is pinned to the revision the strip showed");
     await settle(() => assert(!strip1(), "the applied strip leaves"));
-    await settle(() => assert(((host.querySelector('[aria-label="Email envelope"]')?.textContent) ?? "").includes("Draft subject one"), "the saved preview follows the new revision"));
+    await settle(() => assert(((host.querySelector("#cmp-subject") as HTMLInputElement | null)?.value ?? "").includes("Draft subject one"), "the editable envelope follows the new revision"));
     await openTab("overview");
     assert(!item("approval")?.hasAttribute("data-done"), "applying resets the approval row");
     assert(host.querySelector("[data-campaign-status]")?.textContent === "Draft", "the header returns to Draft");
-    // The existing inline correction stays reachable from the Email tab.
+    // Inline editing is reachable straight from the Email tab (CAD-1057).
     await openTab("email");
-    await click(byText(host, "button", "Edit subject / text"));
-    await settle(() => assert(host.querySelector("#cmp-subject"), "inline subject/text correction opens in the Email tab"));
+    await settle(() => assert(host.querySelector("#cmp-subject"), "inline subject editing sits in the Email tab envelope"));
     assert(!host.querySelector('[aria-label="Assistant proposals"] [role="alert"]'), "no stray proposal errors");
   }
 

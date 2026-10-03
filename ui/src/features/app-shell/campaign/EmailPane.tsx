@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import Button from "../../../ui/Button";
 import type { AudienceScope } from "../audienceClient";
 import {
@@ -10,7 +10,9 @@ import {
   type ProposalRenderDoc,
 } from "../campaignGrammar";
 import { contentClient } from "../contentClient";
+import EmailBlocksCanvas from "./EmailBlocksCanvas";
 import ProposalStrip from "./ProposalStrip";
+import type { EmailDraftApi } from "./useEmailDraft";
 
 type Mode = "visual" | "html" | "text";
 type Device = "desktop" | "mobile";
@@ -22,13 +24,15 @@ const MODES: [Mode, string][] = [
 ];
 
 /**
- * Email tab (CAD-1055, view only): pending assistant proposal strip,
- * preview toolbar (Visual/HTML/Text, Desktop/Mobile, sample
- * recipient), an envelope header and the host-rendered stage. The
- * stage only ever shows host-rendered, preview-only bytes — saved
- * revision or the proposal's own inert draft; unsaved editor text is
- * never rendered. `editor` (the existing inline subject/text
- * correction) replaces the stage while open.
+ * Email tab: pending assistant proposal strip, preview toolbar
+ * (Visual/HTML/Text, Desktop/Mobile, sample recipient), an envelope
+ * header and the host-rendered stage. The host render only ever shows
+ * preview-only bytes — saved revision or the proposal's own inert
+ * draft; unsaved editor text is never rendered as the email.
+ * CAD-1057: an operator edits inline — blocks, subject and preheader
+ * (Visual), pasted HTML (HTML), an optional plain-text override
+ * (Text) — and a sticky bar saves a new version. The host footer is
+ * locked. `edit` is null for a read-only viewer.
  */
 export default function EmailPane({
   scope,
@@ -49,8 +53,7 @@ export default function EmailPane({
   onApplied,
   onDiscarded,
   onProposalError,
-  editor,
-  editAction,
+  edit,
 }: {
   scope: AudienceScope;
   canWrite: boolean;
@@ -71,8 +74,7 @@ export default function EmailPane({
   onApplied: (doc: ContentDoc) => void;
   onDiscarded: (proposalId: string) => void;
   onProposalError: (message: string | null) => void;
-  editor: ReactNode | null;
-  editAction: ReactNode;
+  edit: EmailDraftApi | null;
 }) {
   const [mode, setMode] = useState<Mode>("visual");
   const [device, setDevice] = useState<Device>("desktop");
@@ -116,6 +118,9 @@ export default function EmailPane({
   const subject = draft !== null ? draft.subject : (doc?.subject ?? "");
   const preheader = draft !== null ? draft.preheader : (doc?.preheader ?? "");
   const expectedRevision = doc === null ? 0 : doc.revision;
+  // Inline editing is for an operator on a saved email, never while a
+  // proposal draft is on the stage.
+  const editing = edit !== null && doc !== null && draft === null;
 
   const stage = (() => {
     if (draft === null && doc === null) {
@@ -134,14 +139,46 @@ export default function EmailPane({
           {...(draft !== null ? { "data-proposal-body": draft.proposalId } : {})}
         >
           <div className="crm-envelope" aria-label="Email envelope">
-            <p>
-              <span className="text-ink-500">Subject </span>
-              <strong className="text-ink-100">{subject}</strong>
-            </p>
-            <p>
-              <span className="text-ink-500">Preheader </span>
-              {preheader === "" ? "—" : preheader}
-            </p>
+            {editing && edit !== null ? (
+              <>
+                <label className="crm-env-row">
+                  <span className="text-ink-500">Subject</span>
+                  <input
+                    id="cmp-subject"
+                    className="field"
+                    value={edit.draft.subject}
+                    onChange={(e) => edit.patch({ subject: e.target.value })}
+                    maxLength={150}
+                    autoComplete="off"
+                    disabled={edit.saving}
+                  />
+                </label>
+                <label className="crm-env-row">
+                  <span className="text-ink-500">Preheader</span>
+                  <input
+                    id="cmp-preheader"
+                    className="field"
+                    value={edit.draft.preheader}
+                    onChange={(e) => edit.patch({ preheader: e.target.value })}
+                    maxLength={200}
+                    autoComplete="off"
+                    placeholder="Optional preview text"
+                    disabled={edit.saving}
+                  />
+                </label>
+              </>
+            ) : (
+              <>
+                <p>
+                  <span className="text-ink-500">Subject </span>
+                  <strong className="text-ink-100">{subject}</strong>
+                </p>
+                <p>
+                  <span className="text-ink-500">Preheader </span>
+                  {preheader === "" ? "—" : preheader}
+                </p>
+              </>
+            )}
             <p className="text-label text-ink-400">
               From{" "}
               <span className="num">
@@ -153,6 +190,91 @@ export default function EmailPane({
               </span>
             </p>
           </div>
+          {editing && edit !== null && mode === "visual" && (
+            <>
+              {edit.draft.html === null ? (
+                <EmailBlocksCanvas
+                  blocks={edit.draft.blocks}
+                  disabled={edit.saving}
+                  onChange={(blocks) => edit.patch({ blocks })}
+                />
+              ) : (
+                <p className="text-label text-ink-400 mt-2" data-state="html-body">
+                  This email&apos;s body is HTML — edit it in HTML mode. Blocks return only if
+                  you Discard or Apply an assistant draft.
+                </p>
+              )}
+              <p className="crm-footer-lock" data-host-footer>
+                🔒 host footer — the unsubscribe link and sender address are added by the host
+                and cannot be edited.
+              </p>
+            </>
+          )}
+          {editing && edit !== null && mode === "html" && (
+            <div className="grid gap-1 mt-2">
+              <label className="text-label text-ink-300" htmlFor="cmp-html-source">
+                HTML source
+              </label>
+              <textarea
+                id="cmp-html-source"
+                className="field srcedit"
+                rows={12}
+                spellCheck={false}
+                value={edit.draft.html ?? ""}
+                placeholder="Paste or edit the email body HTML"
+                disabled={edit.saving}
+                onChange={(e) =>
+                  edit.patch({
+                    html: e.target.value === "" && doc?.mode !== "html" ? null : e.target.value,
+                  })
+                }
+              />
+              <p className="text-micro text-ink-500" data-html-note>
+                The host sanitises this HTML (scripts, forms, event handlers and tracking pixels
+                are removed) and adds the unsubscribe footer.
+                {edit.draft.html !== null && edit.draft.blocks.length > 0 && doc?.mode !== "html"
+                  ? " Saving it replaces the blocks."
+                  : ""}
+              </p>
+            </div>
+          )}
+          {editing && edit !== null && mode === "text" && (
+            <div className="grid gap-1 mt-2">
+              <label className="text-label text-ink-300">
+                <input
+                  type="checkbox"
+                  checked={edit.draft.ownText}
+                  disabled={edit.saving}
+                  onChange={(e) =>
+                    edit.patch({
+                      ownText: e.target.checked,
+                      text: edit.draft.text === "" ? (render?.text ?? "") : edit.draft.text,
+                    })
+                  }
+                />{" "}
+                Write my own
+              </label>
+              {edit.draft.ownText ? (
+                <textarea
+                  id="cmp-text-override"
+                  className="field"
+                  rows={8}
+                  value={edit.draft.text}
+                  disabled={edit.saving}
+                  onChange={(e) => edit.patch({ text: e.target.value })}
+                />
+              ) : (
+                <p className="text-micro text-ink-500">
+                  The plain-text version is generated from the email body.
+                </p>
+              )}
+            </div>
+          )}
+          {editing && (
+            <p className="text-micro text-ink-500 mt-2">
+              Host render of the saved version{doc !== null ? ` (v${doc.revision})` : ""}:
+            </p>
+          )}
           {shown === null && (draft !== null ? draftPending : renderPending) && (
             <p className="text-label text-ink-500 mt-2" role="status" data-preview="loading">
               {draft !== null ? "Rendering the draft preview…" : "Rendering the saved email…"}
@@ -231,6 +353,7 @@ export default function EmailPane({
             proposal={row}
             expectedRevision={expectedRevision}
             canWrite={canWrite}
+            replacesHtml={doc?.mode === "html"}
             viewingDraft={draftId === row.proposalId}
             onViewDraft={(view) => setDraftId(view ? row.proposalId : null)}
             onApplied={onApplied}
@@ -324,8 +447,55 @@ export default function EmailPane({
             </p>
           )
         )}
-        {editor !== null ? editor : stage}
-        {editor === null && editAction}
+        {stage}
+        {doc !== null && !canWrite && (
+          <p className="text-label text-ink-400" data-state="read-only">
+            Read-only view. A verified operator saves content revisions.
+          </p>
+        )}
+        {editing && edit !== null && (
+          <>
+            {edit.note !== null && !edit.dirty && (
+              <p className="text-label text-ok" role="status" data-saved-note>
+                {edit.note}
+              </p>
+            )}
+            {edit.dirty && (
+              <div className="crm-unsaved" data-unsaved-bar>
+                <div className="grid gap-1">
+                  <span className="text-label text-ink-100">
+                    Unsaved changes to v{edit.source} · Saving creates v{edit.source + 1} and
+                    resets approval
+                  </span>
+                  {edit.stale && (
+                    <span className="text-micro text-warn" role="status" data-stale-edit>
+                      A newer version was saved while you were editing — your text is kept, but
+                      saving is pinned to v{edit.source} and will be refused rather than
+                      overwrite it.
+                    </span>
+                  )}
+                  {edit.error !== null && (
+                    <span className="text-micro text-fail" role="alert">
+                      {edit.error}
+                    </span>
+                  )}
+                </div>
+                <span className="flex-1" />
+                <Button size="sm" variant="ghost" disabled={edit.saving} onClick={edit.discard}>
+                  Discard
+                </Button>
+                <Button size="sm" variant="primary" loading={edit.saving} disabled={edit.saving} onClick={edit.save}>
+                  {`Save as v${edit.source + 1}`}
+                </Button>
+              </div>
+            )}
+            {!edit.dirty && edit.error !== null && (
+              <p className="text-label text-fail" role="alert">
+                {edit.error}
+              </p>
+            )}
+          </>
+        )}
       </section>
     </div>
   );
