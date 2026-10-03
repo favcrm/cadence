@@ -1017,28 +1017,61 @@ pub fn detached_pid(state_dir: &Path) -> Option<i32> {
 /// stranger. Anything else is stale: the file is removed (only if it
 /// still holds what was read, so a concurrent `ui start` keeps its own).
 pub(crate) fn read_pid(state_dir: &Path) -> Option<i32> {
+    read_pid_in(Path::new("/proc"), state_dir)
+}
+
+fn read_pid_in(proc_root: &Path, state_dir: &Path) -> Option<i32> {
     let path = pid_file(state_dir);
     let text = std::fs::read_to_string(&path).ok()?;
     let pid: i32 = text.trim().parse().ok()?;
-    if is_board_process(pid, state_dir) {
-        return Some(pid);
+    match board_identity(proc_root, pid, state_dir) {
+        BoardPid::Board => Some(pid),
+        // Unproven either way: not ours to signal, not ours to delete.
+        BoardPid::Unknown => None,
+        BoardPid::NotBoard => {
+            if std::fs::read_to_string(&path).is_ok_and(|now| now == text) {
+                let _ = std::fs::remove_file(&path);
+            }
+            None
+        }
     }
-    if std::fs::read_to_string(&path).is_ok_and(|now| now == text) {
-        let _ = std::fs::remove_file(&path);
-    }
-    None
 }
 
-/// Is `pid` a live thread-group leader running `cadence … ui run` for
-/// `state_dir`? Mirrors state-bridge.sh `kill_pidfile`: `Tgid` must be
-/// the pid itself (a thread id answers `kill(tid, 0)` too) and not a
-/// zombie, and the argv must be the one `start_inner` spawns.
-pub(crate) fn is_board_process(pid: i32, state_dir: &Path) -> bool {
-    if pid <= 0 {
-        return false;
+/// What `/proc` proves about a pidfile's pid. A failed read proves
+/// nothing: only a missing entry (ENOENT/ESRCH) or a field that
+/// contradicts the board is `NotBoard`; every other error is `Unknown`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BoardPid {
+    Board,
+    NotBoard,
+    Unknown,
+}
+
+fn proc_read(dir: &Path, name: &str) -> std::result::Result<Vec<u8>, BoardPid> {
+    std::fs::read(dir.join(name)).map_err(|e| gone_or_unknown(&e))
+}
+
+fn gone_or_unknown(e: &std::io::Error) -> BoardPid {
+    if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH) {
+        BoardPid::NotBoard
+    } else {
+        BoardPid::Unknown
     }
-    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-        return false;
+}
+
+/// Is `pid` (under `proc_root`, `/proc` outside tests) a live
+/// thread-group leader running `cadence … ui run` for `state_dir`?
+/// Mirrors state-bridge.sh `kill_pidfile`: `Tgid` must be the pid
+/// itself (a thread id answers `kill(tid, 0)` too) and not a zombie,
+/// and the argv must be the one `start_inner` spawns.
+pub(crate) fn board_identity(proc_root: &Path, pid: i32, state_dir: &Path) -> BoardPid {
+    if pid <= 0 {
+        return BoardPid::NotBoard;
+    }
+    let dir = proc_root.join(pid.to_string());
+    let status = match proc_read(&dir, "status") {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(v) => return v,
     };
     let field = |name: &str| {
         status
@@ -1046,20 +1079,26 @@ pub(crate) fn is_board_process(pid: i32, state_dir: &Path) -> bool {
             .find_map(|l| l.strip_prefix(name))
             .map(str::trim)
     };
-    if field("Tgid:") != Some(pid.to_string().as_str())
-        || field("State:").is_none_or(|s| s.starts_with('Z'))
-    {
-        return false;
+    let (Some(tgid), Some(state)) = (field("Tgid:"), field("State:")) else {
+        return BoardPid::Unknown;
+    };
+    if tgid != pid.to_string() || state.starts_with('Z') {
+        return BoardPid::NotBoard;
     }
-    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-        return false;
+    let raw = match proc_read(&dir, "cmdline") {
+        Ok(b) => b,
+        Err(v) => return v,
     };
     let argv: Vec<String> = raw
         .split(|b| *b == 0)
         .filter(|s| !s.is_empty())
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect();
-    board_argv_matches(&argv, state_dir)
+    if board_argv_matches(&argv, state_dir) {
+        BoardPid::Board
+    } else {
+        BoardPid::NotBoard
+    }
 }
 
 /// `argv` is `<…/cadence> [--state-dir <dir>] … ui run …`. A board for
@@ -2403,12 +2442,53 @@ mod tests {
     }
 }
 
-/// CAD-1081: the argv half of the board identity; the live halves
+/// CAD-1081: board identity against a fake proc root; the live cases
 /// (pid 1, another process, a thread id, the real board) run against
 /// the real binary in tests/board_tailnet.rs.
 #[cfg(test)]
 mod pidfile_tests {
-    use super::board_argv_matches;
+    use super::{board_argv_matches, board_identity, pid_file, read_pid_in, BoardPid};
+    use std::path::Path;
+
+    /// A fake `/proc/<pid>` with the given `status` and argv.
+    fn fake_proc(root: &Path, pid: i32, status: &str, argv: &[&str]) {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("status"), status).unwrap();
+        std::fs::write(dir.join("cmdline"), argv.join("\0")).unwrap();
+    }
+
+    #[test]
+    fn unreadable_proc_is_unknown_and_keeps_the_pidfile() {
+        let (root, state) = (
+            tempfile::TempDir::new().unwrap(),
+            tempfile::TempDir::new().unwrap(),
+        );
+        let (root, st) = (root.path(), state.path());
+        let s = st.to_str().unwrap();
+        let board = ["cadence", "--state-dir", s, "ui", "run"];
+        fake_proc(root, 40, "State:\tS\nTgid:\t40\n", &board);
+        assert_eq!(board_identity(root, 40, st), BoardPid::Board);
+        assert_eq!(board_identity(root, 41, st), BoardPid::NotBoard, "no entry");
+        fake_proc(root, 42, "State:\tS\nTgid:\t40\n", &board);
+        assert_eq!(board_identity(root, 42, st), BoardPid::NotBoard, "a thread");
+        fake_proc(root, 43, "State:\tS\n", &board);
+        assert_eq!(
+            board_identity(root, 43, st),
+            BoardPid::Unknown,
+            "no Tgid line"
+        );
+        // A `status` that exists but cannot be read (EISDIR here; EACCES,
+        // EMFILE in the field) proves nothing either way.
+        std::fs::create_dir_all(root.join("44/status")).unwrap();
+        assert_eq!(board_identity(root, 44, st), BoardPid::Unknown);
+        std::fs::write(pid_file(st), "44").unwrap();
+        assert_eq!(read_pid_in(root, st), None);
+        assert!(pid_file(st).exists(), "an unproven pid deleted ui.pid");
+        std::fs::write(pid_file(st), "41").unwrap();
+        assert_eq!(read_pid_in(root, st), None);
+        assert!(!pid_file(st).exists(), "a gone pid kept ui.pid");
+    }
 
     #[test]
     fn board_argv_names_cadence_ui_run_for_this_state_dir() {
