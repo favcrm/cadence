@@ -20,7 +20,7 @@ exact tuple:
   "providers": [{
     "provider": "agenticos_external",
     "origin": "http://api.internal",
-    "manifest_pin": "agenticos-external-provider-tools@2",
+    "manifest_pin": "agenticos-external-provider-tools@3",
     "transport": "hosted-media-lease@1"
   }]
 }

@@ -168,7 +168,7 @@ pub(super) fn normalize_posts(handle: &str, result: &Value) -> Result<Value, Str
         "schema": 1,
         "kind": "social.source.posts",
         "provider": "agenticos_external",
-        "source_tool": "scrapecreators.instagram.user.posts",
+        "source_tool": super::POSTS_TOOL,
         "handle": handle,
         "profile_verified": profile_verified,
         "empty_reason": if posts.is_empty() { Some("no_public_posts_or_unavailable") } else { None },
