@@ -58,11 +58,16 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   security or ticket-requirement gap. Everything else (wording, docs,
   comments, style, extra tests) is a note: the reviewer PASSes with notes,
   and the author fixes them in a follow-up PR, not in the reviewed PR,
-  because a new head voids every verdict.
-  The path list is a floor, not a complete map: a single reviewer who sees
-  auth, identity, credential, signature, secret, confinement or gate logic
-  in a one-review PR returns REVISE asking for a second (Spec/security)
-  reviewer, and states the trigger in `Risk:`. When unsure, two. The PR
+  because a new head voids every verdict. A gate or daemon-enforced rule
+  change without its acceptance check ("Gates and security work") is a
+  REVISE, not a note.
+- **The path list is a floor.** A single reviewer who sees auth, identity,
+  credential, signature, secret or confinement logic (triggers 1 and 3) in
+  a one-review PR returns REVISE asking for a second (Spec/security)
+  reviewer, and states the trigger in `Risk:`. When unsure, two. Gate,
+  CI and rules logic stays one review: the operator's approval (enforced
+  from `docs/roles/risk-paths.toml` by `scripts/enqueue-reviewed`) is its
+  second check. The PR
   then follows the two-review path: the same reviewer refiles as the
   Standards review on the head, and a different reviewer files Spec/security. A single
   reviewer of a PR that changes or deletes a check states that no gate check

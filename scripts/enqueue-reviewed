@@ -53,9 +53,15 @@ ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
 # check, so this list must catch every trigger 4/6/7 path mechanically rather
 # than rely on a single reviewer's `Risk:` line.
 HUMAN_PREFIXES = (".github/", "scripts/", "docs/roles/", ".config/", ".cargo/",
-                  "src/audit/", "src/delegation/", "tests/common/")
+                  "src/audit/", "src/delegation/", "tests/common/", "config/")
+# Every [schema]/[trigger4]/[trigger6]/[trigger7] glob in this file, read at the
+# PR's base, is human too (CAD-1104). Unreadable means human (fail closed).
+RISK_PATHS_FILE = "docs/roles/risk-paths.toml"
+RISK_HUMAN_TABLES = ("schema", "trigger4", "trigger6", "trigger7")
 HUMAN_LINES = 1500  # risk-classes trigger 5
-HUMAN_BASENAMES = {"Cargo.toml", "Cargo.lock", "package.json", "pnpm-lock.yaml"}
+HUMAN_BASENAMES = {"Cargo.toml", "Cargo.lock", "package.json", "pnpm-lock.yaml",
+                   "package-lock.json", ".npmrc", "yarn.lock", "bun.lockb",
+                   "build.rs", "rust-toolchain.toml"}
 HUMAN_EXACT = {
     "Cargo.toml", "Cargo.lock", "ui/package.json", "cadence-review.toml",
     "src/review.rs", "docs/TEAM.md", "docs/CHARTER.md", "AGENTS.md",
@@ -193,10 +199,24 @@ def pr_changes(pr, head, base, base_oid):
     return parse_raw_diff(out), lines
 
 
-def is_human_path(path):
+def risk_globs(toml_text):
+    """The human-class globs of risk-paths.toml, or None if unreadable."""
+    if toml_text is None:
+        return None
+    try:
+        doc = tomllib.loads(toml_text)
+        globs = [g for t in RISK_HUMAN_TABLES for g in doc[t]["paths"]]
+    except (tomllib.TOMLDecodeError, KeyError, TypeError):
+        return None
+    return globs if all(isinstance(g, str) for g in globs) else None
+
+
+def is_human_path(path, risk=()):
     base = path.rsplit("/", 1)[-1]
+    segs = path.split("/")[:-1]
     return (path in HUMAN_EXACT or path.startswith(HUMAN_PREFIXES)
-            or base in HUMAN_BASENAMES)
+            or base in HUMAN_BASENAMES or ".github" in segs or ".cargo" in segs
+            or any(glob_match(g, path) for g in risk))
 
 
 # ---- required checks --------------------------------------------------------
@@ -453,7 +473,11 @@ def evaluate(args, repo):
         reasons += check_comment(ticket.get("comments"), head, counted)
 
     # Human class: paths, size, or any head-pinned note whose Risk is not exactly `auto`.
-    why = [p for p in paths if is_human_path(p)][:5]
+    rc, risk_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                            f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={base_oid}"])
+    risk = risk_globs(risk_text if rc == 0 and base_oid else None)
+    why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the base (fail closed)"]
+    why += [p for p in paths if is_human_path(p, risk or ())][:5]
     if lines > HUMAN_LINES:
         why.append(f"{lines} changed lines")
     not_auto = [v for v in verdicts if v["risk"] != "auto"]

@@ -25,8 +25,9 @@ observations, not a controlled performance comparison.
 | Tracker contention | Shared PM writer was busy | Treat exit 75 as bounded retry; do not invent an approval/comment or bypass the lock |
 
 The author owns these mistakes. Deleting reviews or approvals would hide the
-failure, not fix it. One correctly bound scope approval, two independent
-exact-head verdicts, one correctly bound merge approval and a queue enqueue
+failure, not fix it. One correctly bound scope approval, the exact-head
+verdicts AGENTS.md "Review" requires (one by default, two for triggers 1/3),
+one correctly bound merge approval and a queue enqueue
 should be the normal path—not repeated requests for the same decision.
 
 ## Change-dependent PR feedback

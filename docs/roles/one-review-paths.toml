@@ -19,8 +19,7 @@
 # A disqualified PR keeps two reviews. `human` triggers apply on top.
 #
 # CAD-965 (operator decision 2026-10-01) put top-level integration tests on
-# this list; CAD-1099 below supersedes it with a wider list. `tests/common/**`
-# (harness and isolation code) stays two-review via the exclude list.
+# this list; CAD-1099 and CAD-1104 below supersede it with a wider list.
 #
 # CAD-1099 / CAD-1104 (operator decisions 2026-10-03, "simplify and make the
 # dev cycle more smooth and fast"): ONE independent review is the default for
