@@ -499,3 +499,68 @@
         // hold the queue.
         assert!(!s.has_unknown("w1").unwrap());
     }
+
+    #[test]
+    fn native_nudge_writers_refuse_after_closure_or_lease_loss() {
+        for sealed in [false, true] {
+            let (dir, s) = store();
+            let agent = live_agent(&s, "w1", &dir.path().join("w"), "turn-1");
+            s.begin_native_nudge(
+                &agent,
+                "before barrier",
+                "n1",
+                &Sender::Unattributed,
+                &caller_steer(),
+            )
+            .unwrap();
+            if sealed {
+                let database = dir.path().join("t.sqlite3").canonicalize().unwrap();
+                let permit = super::seal::OwnerMaintenancePermit::synthetic(
+                    &database.to_string_lossy(),
+                    super::seal::OwnerOp::Close,
+                    b"nudge-close",
+                    "attempt-1",
+                    "",
+                    1,
+                    now() as i64 + 3_600,
+                );
+                s.propose_close(&permit, "nudge barrier test").unwrap();
+            } else {
+                s.install_write_fence(std::sync::Arc::new(crate::lease::Fence::default()));
+                s.fence_writes("nudge lease lost");
+            }
+            let events_before: i64 = s
+                .conn()
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .unwrap();
+            let before = s.message("n1").unwrap().unwrap();
+            let errors = [
+                s.begin_native_nudge(
+                    &agent,
+                    "after barrier",
+                    "n2",
+                    &Sender::Unattributed,
+                    &caller_steer(),
+                )
+                .unwrap_err(),
+                s.finish_native_nudge("n1", "queued", None).unwrap_err(),
+                s.orphan_submitting_nudges("crash").unwrap_err(),
+            ];
+            for error in errors {
+                assert_eq!(error.is_fenced(), !sealed, "{error}");
+            }
+            assert!(s.message("n2").unwrap().is_none());
+            let after = s.message("n1").unwrap().unwrap();
+            assert_eq!(after.state, before.state);
+            assert_eq!(after.result, before.result);
+            assert_eq!(after.turn_id, before.turn_id);
+            let conn = s.conn();
+            assert!(conn.is_autocommit());
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                events_before,
+                "refused nudge writers must not append events"
+            );
+        }
+    }

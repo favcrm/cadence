@@ -306,37 +306,37 @@ impl Store {
     /// never left non-terminal. Unlike `cancel_nudges_for` this is not
     /// alias-scoped: a crashed daemon's orphan could name any agent.
     pub fn orphan_submitting_nudges(&self, reason: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.write_conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let stale: Vec<(String, String)> = tx
-            .prepare(
-                "SELECT id, alias FROM messages
-                 WHERE source='nudge' AND state='submitting'",
-            )?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut closed = Vec::new();
-        for (id, alias) in stale {
-            let result = json!({"status": "unknown", "via": format!("{reason}_unconfirmed"),
-                                "reason": format!("{reason} — a nudge is never replayed")});
-            let n = tx.execute(
-                "UPDATE messages SET state='unknown',result=?,completed=?
-                 WHERE id=? AND state='submitting' AND source='nudge'",
-                params![result.to_string(), now(), id],
-            )?;
-            if n == 1 {
-                Self::event(
-                    &tx,
-                    &alias,
-                    "nudge_cancelled",
-                    json!({"message": id, "was": "submitting", "state": "unknown",
-                           "reason": reason}),
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let stale: Vec<(String, String)> = tx
+                .prepare(
+                    "SELECT id, alias FROM messages
+                     WHERE source='nudge' AND state='submitting'",
+                )?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut closed = Vec::new();
+            for (id, alias) in stale {
+                let result = json!({"status": "unknown", "via": format!("{reason}_unconfirmed"),
+                                    "reason": format!("{reason} — a nudge is never replayed")});
+                let n = tx.execute(
+                    "UPDATE messages SET state='unknown',result=?,completed=?
+                     WHERE id=? AND state='submitting' AND source='nudge'",
+                    params![result.to_string(), now(), id],
                 )?;
-                closed.push((id, alias));
+                if n == 1 {
+                    Self::event(
+                        &tx,
+                        &alias,
+                        "nudge_cancelled",
+                        json!({"message": id, "was": "submitting", "state": "unknown",
+                               "reason": reason}),
+                    )?;
+                    closed.push((id, alias));
+                }
             }
-        }
-        tx.commit()?;
-        Ok(closed)
+            Ok(closed)
+        })
     }
 
     /// CAD-250: finish a turn from its worker's `message result` — only

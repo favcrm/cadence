@@ -110,7 +110,7 @@ pub(crate) fn now() -> f64 {
 pub struct Store {
     conn: Mutex<Connection>,
     /// CAD-538: the hosted-lease write fence — installed by the daemon
-    /// when it runs under `hosted.lease`. `write_conn` refuses once it
+    /// when it runs under `hosted.lease`. `write_tx` refuses once it
     /// trips; reads stay up so a fenced daemon can still be diagnosed.
     write_fence: std::sync::OnceLock<Arc<crate::lease::Fence>>,
     /// Adoption candidates that survived `recover()`'s store-level
@@ -334,7 +334,7 @@ impl Store {
     }
 
     /// Trip the fence, then wait out the writer in flight — after this
-    /// returns, every [`Self::write_conn`] observes the trip before its
+    /// returns, every [`Self::write_tx`] observes the trip before its
     /// write begins.
     pub fn fence_writes(&self, reason: impl Into<String>) {
         if let Some(fence) = self.write_fence.get() {
