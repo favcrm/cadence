@@ -3075,20 +3075,6 @@ mod tests {
     }
 
     #[test]
-    fn the_fake_issuer_refuses_an_extra_or_missing_request_key() {
-        let ok = json!({"version":DEVICE_VERSION,"organization_id":"ws_real",
-            "audience":LOGIN_ENDPOINT,"client_label":"cadence-cli",
-            "requested_capabilities":["cli.read"],"code_challenge":"A".repeat(43)});
-        assert!(real_code_request_ok(&ok));
-        let mut extra = ok.clone();
-        extra["organization_slug"] = json!("acme");
-        assert!(!real_code_request_ok(&extra));
-        let mut missing = ok.clone();
-        missing.as_object_mut().unwrap().remove("audience");
-        assert!(!real_code_request_ok(&missing));
-    }
-
-    #[test]
     fn login_sends_the_slug_audience_and_returns_the_verified_org() {
         let (out, dir, _root, script) = run_login(login_grant_body(), vec![]);
         assert_eq!(

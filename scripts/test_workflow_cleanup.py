@@ -39,7 +39,38 @@ class CleanupTests(unittest.TestCase):
                 category = "ui" if name == "ui" else "rust"
                 self.assertIn(f"needs.change-scope.outputs.{category} != 'false'", step)
         test = job(ci, "test")
-        self.assertIn("cargo test --doc --locked", test)
+        # CAD-1124: retiring the empty doctest invocation must retain BOTH
+        # default-feature compilation gates, not just feature-on tests.
+        rust_scope = "        if: ${{ needs.change-scope.outputs.rust != 'false' }}"
+        for name, command in (
+            ("clippy", "cargo clippy --all-targets --locked -- -D warnings"),
+            ("build", "cargo build --profile ci --locked"),
+        ):
+            steps = re.split(r"(?=^      - )", job(ci, name), flags=re.M)
+            matching = [step for step in steps if re.search(
+                rf"^      (?:- |  )run: {re.escape(command)}$", step, re.M)]
+            self.assertEqual(len(matching), 1, (name, command))
+            self.assertIn(rust_scope, matching[0])
+            self.assertNotIn("continue-on-error:", matching[0])
+        build_steps = re.split(r"(?=^      - )", job(ci, "build"), flags=re.M)
+        for name in ("Assert the test seam refuses a release build",
+                     "Assert the ci-profile gate binary carries no test seam"):
+            matching = [step for step in build_steps
+                        if step.startswith(f"      - name: {name}\n")]
+            self.assertEqual(len(matching), 1, name)
+            step = matching[0]
+            self.assertIn(rust_scope, step)
+            self.assertNotIn("continue-on-error:", step)
+            if name == "Assert the test seam refuses a release build":
+                self.assertRegex(step, r"(?m)^        run: sh scripts/check-release-test-seam$")
+            else:
+                self.assertRegex(
+                    step,
+                    r"(?m)^        run: \|\n"
+                    r"          if grep -aq 'cadence-test-seam-v1' target/ci/cadence; then\n"
+                    r"            echo [^\n]+\n"
+                    r"            exit 1\n"
+                    r"          fi$")
         # CAD-1090: every tests/*.rs target, via the shared selection script.
         self.assertIn("scripts/run-result-tests", test)
         runner = (ROOT / "scripts/run-result-tests").read_text()

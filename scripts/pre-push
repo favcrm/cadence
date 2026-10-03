@@ -13,6 +13,7 @@ Steps run in order and stop at the first failure:
      doctor split scripts/split-doctor-host --check          (live source inventory)
   3. clippy       cargo clippy --all-targets --locked -- -D warnings, and again with
                   --features test-seam                       (Rust changed)
+     release seam sh scripts/check-release-test-seam          (Rust/check changed or --tests)
   4. ui typecheck pnpm --dir ui run typecheck                (ui/ changed)
   5. contracts    active Python test commands in CI's fmt job
                                                               (scripts/, .github/ or tests/scripts/ changed)
@@ -134,6 +135,9 @@ def plan(root, changed, with_tests):
     steps.append(("clippy", ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"], why))
     steps.append(("clippy test-seam", ["cargo", "clippy", "--all-targets", "--locked",
                                       "--features", "test-seam", "--", "-D", "warnings"], why))
+    need_seam = rs or with_tests or touched(changed, "scripts/check-release-test-seam")
+    steps.append(("release seam", ["sh", "scripts/check-release-test-seam"],
+                  None if need_seam else "no Rust or seam-check changes; --tests not requested"))
     ui = touched(changed, "ui/")
     steps.append(("ui typecheck", ["pnpm", "--dir", "ui", "run", "typecheck"],
                   None if ui else "ui/ unchanged"))

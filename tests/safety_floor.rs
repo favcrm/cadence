@@ -121,24 +121,8 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
-#[test]
-fn safety_floor_test_seam_refuses_release_build() {
-    // The release binary must never carry the test seam. This assertion is
-    // checked by the CI build job's "Assert the release binary carries no
-    // test seam" step; we mirror the check here so the floor itself can fail.
-    let mut cmd = Command::new("cargo");
-    cmd.args(["check", "--release", "--locked", "--features", "test-seam"]);
-    let out = reaper::output(&mut cmd).expect("cargo check failed");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !out.status.success(),
-        "test-seam release build must fail: {stderr}"
-    );
-    assert!(
-        stderr.contains("feature `test-seam` arms a caller-identity override that bypasses"),
-        "expected test-seam compile_error, not a toolchain/dependency failure: {stderr}"
-    );
-}
+// CAD-1124: the native release-exclusion proof lives in
+// scripts/check-release-test-seam, run once by CI build and local pre-push.
 
 #[test]
 fn safety_floor_suite_lock_serializes_review() {

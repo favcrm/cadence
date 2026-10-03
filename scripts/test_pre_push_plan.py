@@ -26,6 +26,20 @@ class PlanTests(unittest.TestCase):
         runner = (ROOT / "scripts/run-result-tests").read_text()
         self.assertIn("cargo test --locked --features test-seam --lib --no-fail-fast", runner)
 
+    def test_release_seam_proof_runs_for_rust_or_explicit_tests(self):
+        for changed, with_tests in (
+            ({"src/review.rs"}, False), ({"tests/safety_floor.rs"}, False),
+            ({"Cargo.toml"}, False), ({"Cargo.lock"}, False),
+            ({"rust-toolchain.toml"}, False),
+            ({"scripts/check-release-test-seam"}, False), (None, False),
+            ({"docs/START-HERE.md"}, True), (set(), True), (None, True),
+        ):
+            with self.subTest(changed=changed, with_tests=with_tests):
+                steps = pre_push.plan(str(ROOT), changed, with_tests)
+                seam = [(name, argv) for name, argv, skip in steps if argv and not skip
+                        and argv == ["sh", "scripts/check-release-test-seam"]]
+                self.assertEqual(seam, [("release seam", ["sh", "scripts/check-release-test-seam"])])
+
     def test_active_script_contracts_are_in_local_plan(self):
         steps = pre_push.plan(str(ROOT), {".github/workflows/ci.yml"}, False)
         commands = [argv for _, argv, skip in steps if argv and not skip]

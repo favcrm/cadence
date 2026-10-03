@@ -270,11 +270,8 @@ jobs:
         with:
           shared-key: gate-test
           save-if: false
-      - name: Run Rust doctests with locked Cargo
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        env:
-          CARGO_BUILD_JOBS: 4
-        run: cargo test --doc --locked
+      # CAD-1124: no doctests exist; mandatory default-feature clippy and
+      # build retain compilation coverage without a zero-test rebuild.
       # CAD-1090: every cargo test target (scripts/result-test-args), with
       # the test seam on and a 0-test target treated as a failure.
       # CAD-1105: then the lib unit tests, with PATH cut to the toolchain.
@@ -348,18 +345,7 @@ jobs:
       # dep, a syntax error — must not count, so grep the message).
       - name: Assert the test seam refuses a release build
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        run: |
-          log="${{ runner.temp }}/seam-release-check.log"
-          if cargo check --release --locked --features test-seam >"$log" 2>&1; then
-            echo "::error::'cargo check --release --features test-seam' succeeded — the seam's release exclusion was removed" >&2
-            exit 1
-          fi
-          cat "$log"
-          if ! grep -q 'must never be compiled into a release build' "$log"; then
-            echo "::error::release+test-seam failed, but not with the seam's compile_error — the probe must name the guard it tests" >&2
-            exit 1
-          fi
-          echo "probe ok: --release --features test-seam is refused by the seam's own compile_error"
+        run: sh scripts/check-release-test-seam
       - name: sccache statistics
         if: ${{ !cancelled() && needs.change-scope.outputs.rust != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
