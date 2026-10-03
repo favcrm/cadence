@@ -27,8 +27,13 @@ works() {
 cmd_enable() {
     [ -n "${GITHUB_ENV:-}" ] || { note "disabled: no GITHUB_ENV"; return 0; }
     if ! command -v mold >/dev/null 2>&1 && ! command -v ld.lld >/dev/null 2>&1; then
-        sudo apt-get install -y --no-install-recommends mold >/dev/null 2>&1 \
-            || note "mold install failed"
+        # Installing packages is only ever allowed on a GitHub-hosted runner.
+        if [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then
+            err=$(sudo -n apt-get install -y --no-install-recommends mold 2>&1 >/dev/null) \
+                || { note "mold install failed"; printf '%s\n' "$err" >&2; }
+        else
+            note "not a GitHub-hosted runner: refusing to install anything"
+        fi
     fi
     for linker in mold lld; do
         bin=$linker

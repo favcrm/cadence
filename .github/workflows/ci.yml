@@ -213,6 +213,7 @@ jobs:
       - run: python3 scripts/test_pre_push_plan.py
       - run: python3 scripts/test_workflow_cleanup.py
       - run: python3 scripts/test_ci_change_scope.py
+      - run: python3 scripts/test_ci_fast_linker.py
       - run: python3 -m unittest scripts/test_enqueue_human_paths.py
       - run: scripts/design-kit --check
       - name: Check contributor documentation paths
@@ -330,7 +331,7 @@ jobs:
       # shipped default-feature binary proves its bytes carry none of
       # the seam. The step below is the guard's own tripwire: it builds
       # the forbidden combination and asserts the compile_error fires.
-      - name: Assert the release binary carries no test seam
+      - name: Assert the ci-profile gate binary carries no test seam
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         run: |
           if grep -aq 'cadence-test-seam-v1' target/ci/cadence; then
