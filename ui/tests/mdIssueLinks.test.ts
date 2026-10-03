@@ -57,4 +57,48 @@ const url = render("open https://example.com/CAD-12 and [x](https://e.com/CAD-12
 equal(url.includes('href="https://example.com/CAD-12"'), true, "autolinked URL keeps its path");
 equal(linked(url), false, "ids in URLs are not issue links");
 
+// A reference-style link keeps its text: the id inside is not an issue link.
+const ref = render("[see CAD-1][r]\n\n[r]: https://example.com");
+equal(linked(ref), false, "reference-link text is not an issue link");
+equal(ref.includes('href="https://example.com"'), true, "reference link keeps its target");
+equal(ref.includes("issue:"), false, "no issue: target in a reference link");
+
+// The `a` component only opens well-formed ids (CAD-1070).
+type El = { type: unknown; props: Record<string, any> };
+function anchor(href: string, onOpen: (id: string) => void): El | null {
+  const el = Md({ text: "x", onOpen }) as unknown as El;
+  return el.props.components.a({ href, children: "x" });
+}
+const opened: string[] = [];
+const good = anchor("issue:CAD-12", (id) => opened.push(id)) as El;
+equal(good.type, "button", "valid id renders a button");
+good.props.onClick();
+equal(opened, ["CAD-12"], "valid id reaches onOpen");
+for (const bad of ["issue:javascript:alert(1)", "issue:", "issue:cad-12", "issue:CAD-12/../x", "issue:CAD-12 ", "issue:A-1", "issue:../CAD-12", "issue:xCAD-12", "issue:CAD-1234567890"]) {
+  const el = anchor(bad, (id) => opened.push(id)) as El;
+  equal(el.type === "button" || el.type === "a", false, `${bad}: no button or anchor`);
+  equal(el.props.children, "x", `${bad}: link text kept as plain text`);
+}
+equal(opened, ["CAD-12"], "hostile ids never call onOpen");
+// End to end: a hostile target renders no button and no anchor.
+const hostile = render("[x](issue:javascript:alert(1)) and [y](issue:cad-12)");
+equal(/<button|<a /.test(hostile), false, "hostile issue: links render as text");
+equal(hostile.includes("javascript"), false, "hostile target does not leak into markup");
+
+// Ids are capped at 9 digits: a 10-digit run is neither linked in prose nor opened.
+const long = render("see CAD-1234567890 now");
+equal(linked(long), false, "10-digit id is not linkified in prose");
+const nine = render("see CAD-123456789 now");
+equal(linked(nine), true, "9-digit id is still linkified");
+
+// An unsafe target is blanked by react-markdown; render text, not `<a href="">`.
+for (const md of ["[x](javascript:alert(1))", "[x](ISSUE:CAD-1)"]) {
+  const html = render(md);
+  equal(/<a |<button/.test(html), false, `${md}: no anchor or button`);
+  equal(html.includes(">x<") || html.includes("x</p>"), true, `${md}: text kept`);
+}
+// A valid external link still renders as an anchor.
+const ext = render("[x](https://example.com/p)");
+equal(ext.includes('<a class="lnk" href="https://example.com/p" target="_blank" rel="noreferrer">x</a>'), true, "external link unchanged");
+
 console.log("md issue link checks passed");
