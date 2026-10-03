@@ -115,6 +115,24 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   an operator connection (not an agent pane or endpoint):
   `cadence audit approve --pr <n> --head <full-sha> --source "<who decided, where>"`.
   A note or ticket comment is not approval evidence (`docs/AUDIT.md`).
+  **Approve once per ticket (CAD-1106):** instead of a per-head approval the
+  operator may run `cadence audit approve --issue <ID> --action scope` once;
+  `scripts/enqueue-reviewed` then accepts it for every in-scope PR of that
+  ticket when: the PR title names the ticket, its branch is an open lane
+  branch recorded on it, the approval is operator-connection, unrevoked and
+  its digest equals the sha256 of the ticket body as it reads now, every
+  head-pinned verdict's `Risk:` line is `auto` or `human (<numbers>)` without
+  trigger 1 or 3, and each counted verdict carries `Scope: in-scope <ID>`.
+  The ticket body declares its triggers (`Risk: human (4, 7)`; missing or
+  unparseable means no scope approval) and the approval covers only those:
+  the triggers of the changed paths (risk-paths `[schema]`/`[trigger4]`/
+  `[trigger6]`/`[trigger7]`) and of every verdict must be declared, and a
+  human-class path in no trigger list needs the per-head approval. A diff
+  touching a risk-paths trigger 1/3 path or a two-review path always needs
+  the per-head approval, and so does a ticket not in ready, doing or review (backlog, done, dropped). A
+  ticket body or verdict with more than one `Risk:` line (fenced code in the
+  body is skipped) gives no scope approval. Editing the ticket body voids the scope
+  approval (the digest changes); `cadence audit revoke <id>` withdraws it.
 - **Delegated approval** (CAD-918) when the reviewers class the PR
   `delegated` (`docs/roles/risk-classes.md`): the agent designated for
   the project runs, from its own pane,
