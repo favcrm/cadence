@@ -28,6 +28,7 @@ mod app_contexts_rpc;
 mod app_effects_rpc;
 mod app_records_rpc;
 mod app_runs_rpc;
+mod app_teams_rpc;
 mod app_screens_rpc;
 mod approvals_rpc;
 mod area_rpc;
@@ -3218,6 +3219,9 @@ impl Shared {
             "app_local_install_approve" => self.rpc_app_local(method, params, peer_pid),
             "app_local_install_revoke" => self.rpc_app_local(method, params, peer_pid),
             "app_run_create" => self.rpc_app_local(method, params, peer_pid),
+            "app_run_start" => self.rpc_app_local(method, params, peer_pid),
+            "app_install_team_set" => self.rpc_app_team(method, params, peer_pid),
+            "app_install_team_show" => self.rpc_app_team(method, params, peer_pid),
             "app_run_approve" => self.rpc_app_local(method, params, peer_pid),
             "app_run_cancel" => self.rpc_app_local(method, params, peer_pid),
             "app_run_dispatch" => self.rpc_app_local(method, params, peer_pid),

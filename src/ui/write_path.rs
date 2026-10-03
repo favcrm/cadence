@@ -1054,7 +1054,7 @@ pub(crate) fn write_route(
         return;
     }
     if let Some(route) = app_runs::route(path) {
-        let writable = matches!(route, app_runs::Route::List) || !route.is_read();
+        let writable = matches!(route, app_runs::Route::List | app_runs::Route::Team(_)) || !route.is_read();
         if *method != Method::Post || !writable {
             send(request, err_response(405, "method not allowed"));
             return;

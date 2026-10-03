@@ -95,135 +95,68 @@ pub(super) fn local_execution_contract(
     Ok(manifest)
 }
 
+
 impl Shared {
-    /// CAD-1119: an operator install or update is the consent for exactly
-    /// the installed digest. Called only from the operator-gated catalog
-    /// RPC after the bundle is committed; never from an agent path. The
-    /// runtime snapshot re-proves the digest, so a concurrent update
-    /// cannot receive consent meant for another version. A bundle that
-    /// fails the approval checks is installed but not approved, and the
-    /// result says why.
-    pub(super) fn record_install_consent(
-        &self,
-        pm: &crate::issue::Pm,
-        install: &str,
-        digest: &str,
-        via: &str,
-    ) -> Value {
-        let outcome = workspace::with_runtime_snapshot(pm, install, |row, files| {
-            let _release = self
-                .app_release_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if row["digest"].as_str() != Some(digest) {
-                return Err(Error::rejected(
-                    "installation changed before its consent was recorded",
-                ));
-            }
-            let manifest = local_execution_contract(files)?;
-            let capabilities = serde_json::to_value(&manifest.capabilities)
-                .map_err(|e| Error::internal(e.to_string()))?;
-            self.store
-                .app_install_consent(install, digest, via, &capabilities)
-        });
-        match outcome {
-            Ok(_) => json!({"recorded": true, "via": via, "digest": digest}),
-            Err(error) => json!({"recorded": false, "via": via, "digest": digest,
-                "reason": error.to_string()}),
+    /// CAD-1123 HP2: create, approve and dispatch in one operator call. The
+    /// operator proof was taken by the caller. The approval is the daemon's
+    /// own: it binds exactly the snapshot digest this call just created.
+    fn start_app_run(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let install = required_str(params, "install_id")?;
+        let team = super::app_teams_rpc::team_of(&self.state_dir, install)?
+            .ok_or_else(|| Error::rejected("installation has no default team; set one in Settings"))?;
+        let expected = params
+            .get("expected_quotes")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| Error::rejected("expected_quotes is required"))?;
+        if params.get("inputs").is_some_and(|inputs| {
+            inputs.as_object().is_none_or(|map| map.values().any(|v| !v.is_string()))
+        }) {
+            return Err(Error::rejected("inputs must be a string map"));
         }
+        let created = self.create_app_run(params, Some(&team), Some(expected))?;
+        let id = created["id"]
+            .as_str()
+            .ok_or_else(|| Error::internal("created run has no id"))?
+            .to_string();
+        let mut run = created;
+        if run["state"] == "awaiting_approval" {
+            let digest = required_str(&run, "snapshot_digest")?.to_string();
+            let approved = self.with_app_run_current(&id, |bundle| {
+                self.store.app_run_decide(&id, Some(&digest), false, Some(bundle))
+            });
+            // A concurrent start of the same request may have approved first.
+            run = match approved {
+                Ok(value) => value,
+                Err(error) => {
+                    let shown = self.store.app_run_show(&id)?;
+                    if !matches!(shown["state"].as_str(), Some("approved" | "running")) {
+                        return Err(error);
+                    }
+                    shown
+                }
+            };
+        }
+        if matches!(run["state"].as_str(), Some("approved" | "running")) {
+            run = self.dispatch_app_run(&id)?;
+            self.auto_resume_tick();
+        }
+        Ok(run)
     }
 
-    pub(super) fn rpc_app_local(
-        self: &Arc<Self>,
-        method: &str,
+    /// The one run-creation path: `app_run_create` (owner and workers named by
+    /// the caller) and `app_run_start` (owner and workers from the install's
+    /// default team, quotes checked against `expected`). Operator proof is the
+    /// caller's job.
+    pub(super) fn create_app_run(
+        &self,
         params: &Value,
-        peer_pid: u32,
+        team: Option<&super::app_teams_rpc::Team>,
+        expected: Option<&Value>,
     ) -> Result<Value> {
-        let allowed: &[&str] = match method {
-            "app_local_install_approve" | "app_local_install_revoke" => &["install_id", "digest"],
-            "app_run_create" => &[
-                "install_id",
-                "workflow",
-                "inputs",
-                "request_id",
-                "owner_pm",
-                "project_link",
-                "context_id",
-                "source_receipt_id",
-                "selected_post_id",
-            ],
-            "app_run_approve" => &["run_id", "digest"],
-            "app_run_cancel" | "app_run_dispatch" | "app_run_show" => &["run_id"],
-            "app_run_list" => &["install_id", "context_id"],
-            "app_run_artifact" => &["artifact_id", "message", "token"],
-            _ => return Err(Error::rejected("unknown app lifecycle method")),
-        };
-        let fields = params
-            .as_object()
-            .ok_or_else(|| Error::rejected("app lifecycle payload must be an object"))?;
-        if fields.keys().any(|k| !allowed.contains(&k.as_str())) {
-            return Err(Error::rejected(
-                "app lifecycle payload has unsupported fields",
-            ));
-        }
-        for field in [
-            "project_link",
-            "install_id",
-            "context_id",
-            "source_receipt_id",
-            "selected_post_id",
-        ] {
-            if fields.get(field).is_some_and(|value| !value.is_string()) {
-                return Err(Error::rejected(
-                    "optional app references must be strings when present",
-                ));
-            }
-        }
-        if method == "app_run_artifact" && fields.contains_key("message") {
-            let caller = self.agent_caller(peer_pid, "app dependency artifact")?;
-            let AgentCaller::Agent(alias) = caller else {
-                return Err(Error::rejected(
-                    "dependency artifact requires its assigned worker",
-                ));
-            };
-            let message = required_str(params, "message")?;
-            let token = required_str(params, "token")?;
-            if self.store.message(message)?.map(|m| m.alias) != Some(alias) {
-                return Err(Error::rejected("artifact turn belongs to another worker"));
-            }
-            return self.app_artifact_current(
-                required_str(params, "artifact_id")?,
-                Some((message, token)),
-            );
-        }
-        self.operator_connection("app local lifecycle", params, peer_pid)?;
-        match method {
-            "app_local_install_approve" | "app_local_install_revoke" => {
-                let pm = self.pm_at(&self.pm_dir()?)?;
-                workspace::with_runtime_snapshot(
-                    &pm,
-                    required_str(params, "install_id")?,
-                    |row, files| {
-                        let _release = self
-                            .app_release_lock
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let digest = required_str(params, "digest")?;
-                        if row["digest"].as_str() != Some(digest) {
-                            return Err(Error::rejected("installation digest is stale"));
-                        }
-                        if method == "app_local_install_approve" {
-                            local_execution_contract(files)?;
-                        }
-                        self.store.app_capability_decide(
-                            required_str(params, "install_id")?,
-                            digest,
-                            method == "app_local_install_approve",
-                        )
-                    },
-                )
-            }
-            "app_run_create" => {
+                let owner_pm = match team {
+                    Some(team) => team.owner_pm.clone(),
+                    None => required_str(params, "owner_pm")?.to_string(),
+                };
                 if params.get("source_receipt_id").is_some()
                     != params.get("selected_post_id").is_some()
                 {
@@ -278,6 +211,21 @@ impl Shared {
                     }
                     let template = crate::issue::workflow::parse_template(text)
                         .map_err(|_| Error::rejected("installed workflow declarations refused"))?;
+                    if let Some(team) = team {
+                        // The team is the only source of worker aliases: a
+                        // caller-supplied value for a team role is a forgery.
+                        for (role, alias) in &team.roles {
+                            if !template.inputs.contains_key(role) {
+                                continue;
+                            }
+                            if inputs.contains_key(role) {
+                                return Err(Error::rejected(
+                                    "team roles come from the installation team, not the request",
+                                ));
+                            }
+                            inputs.insert(role.clone(), alias.clone());
+                        }
+                    }
                     let context = optional_str(params, "context_id")
                         .map(|context| self.store.app_context_proof(id, context))
                         .transpose()?;
@@ -393,6 +341,17 @@ impl Shared {
                             self.app_capability_quote(capabilities.get(slot).unwrap())?,
                         );
                     }
+                    if let Some(expected) = expected {
+                        // The quote the host fetched when it drew the slot must
+                        // be exactly the quote this run freezes (no slot, no
+                        // extra slot, no different price or revision).
+                        let frozen = json!(quotes);
+                        if *expected != frozen {
+                            return Err(Error::rejected(
+                                "price_changed: capability price changed since the host quoted it",
+                            ));
+                        }
+                    }
                     self.store.app_run_create_with_capabilities(
                         LocalRunRequest {
                             install_id: id,
@@ -400,7 +359,7 @@ impl Shared {
                             workflow: &workflow,
                             inputs: &inputs,
                             request_id: required_str(params, "request_id")?,
-                            owner_pm: required_str(params, "owner_pm")?,
+                            owner_pm: owner_pm.as_str(),
                             project_link: optional_str(params, "project_link"),
                         },
                         context.as_ref().map(|(_, proof)| proof),
@@ -414,7 +373,149 @@ impl Shared {
                         },
                     )
                 })
+    }
+}
+
+impl Shared {
+    /// CAD-1119: an operator install or update is the consent for exactly
+    /// the installed digest. Called only from the operator-gated catalog
+    /// RPC after the bundle is committed; never from an agent path. The
+    /// runtime snapshot re-proves the digest, so a concurrent update
+    /// cannot receive consent meant for another version. A bundle that
+    /// fails the approval checks is installed but not approved, and the
+    /// result says why.
+    pub(super) fn record_install_consent(
+        &self,
+        pm: &crate::issue::Pm,
+        install: &str,
+        digest: &str,
+        via: &str,
+    ) -> Value {
+        let outcome = workspace::with_runtime_snapshot(pm, install, |row, files| {
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if row["digest"].as_str() != Some(digest) {
+                return Err(Error::rejected(
+                    "installation changed before its consent was recorded",
+                ));
             }
+            let manifest = local_execution_contract(files)?;
+            let capabilities = serde_json::to_value(&manifest.capabilities)
+                .map_err(|e| Error::internal(e.to_string()))?;
+            self.store
+                .app_install_consent(install, digest, via, &capabilities)
+        });
+        match outcome {
+            Ok(_) => json!({"recorded": true, "via": via, "digest": digest}),
+            Err(error) => json!({"recorded": false, "via": via, "digest": digest,
+                "reason": error.to_string()}),
+        }
+    }
+
+    pub(super) fn rpc_app_local(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let allowed: &[&str] = match method {
+            "app_local_install_approve" | "app_local_install_revoke" => &["install_id", "digest"],
+            "app_run_create" => &[
+                "install_id",
+                "workflow",
+                "inputs",
+                "request_id",
+                "owner_pm",
+                "project_link",
+                "context_id",
+                "source_receipt_id",
+                "selected_post_id",
+            ],
+            "app_run_start" => &[
+                "install_id",
+                "workflow",
+                "inputs",
+                "request_id",
+                "context_id",
+                "source_receipt_id",
+                "selected_post_id",
+                "expected_quotes",
+            ],
+            "app_run_approve" => &["run_id", "digest"],
+            "app_run_cancel" | "app_run_dispatch" | "app_run_show" => &["run_id"],
+            "app_run_list" => &["install_id", "context_id"],
+            "app_run_artifact" => &["artifact_id", "message", "token"],
+            _ => return Err(Error::rejected("unknown app lifecycle method")),
+        };
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("app lifecycle payload must be an object"))?;
+        if fields.keys().any(|k| !allowed.contains(&k.as_str())) {
+            return Err(Error::rejected(
+                "app lifecycle payload has unsupported fields",
+            ));
+        }
+        for field in [
+            "project_link",
+            "install_id",
+            "context_id",
+            "source_receipt_id",
+            "selected_post_id",
+        ] {
+            if fields.get(field).is_some_and(|value| !value.is_string()) {
+                return Err(Error::rejected(
+                    "optional app references must be strings when present",
+                ));
+            }
+        }
+        if method == "app_run_artifact" && fields.contains_key("message") {
+            let caller = self.agent_caller(peer_pid, "app dependency artifact")?;
+            let AgentCaller::Agent(alias) = caller else {
+                return Err(Error::rejected(
+                    "dependency artifact requires its assigned worker",
+                ));
+            };
+            let message = required_str(params, "message")?;
+            let token = required_str(params, "token")?;
+            if self.store.message(message)?.map(|m| m.alias) != Some(alias) {
+                return Err(Error::rejected("artifact turn belongs to another worker"));
+            }
+            return self.app_artifact_current(
+                required_str(params, "artifact_id")?,
+                Some((message, token)),
+            );
+        }
+        self.operator_connection("app local lifecycle", params, peer_pid)?;
+        match method {
+            "app_local_install_approve" | "app_local_install_revoke" => {
+                let pm = self.pm_at(&self.pm_dir()?)?;
+                workspace::with_runtime_snapshot(
+                    &pm,
+                    required_str(params, "install_id")?,
+                    |row, files| {
+                        let _release = self
+                            .app_release_lock
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let digest = required_str(params, "digest")?;
+                        if row["digest"].as_str() != Some(digest) {
+                            return Err(Error::rejected("installation digest is stale"));
+                        }
+                        if method == "app_local_install_approve" {
+                            local_execution_contract(files)?;
+                        }
+                        self.store.app_capability_decide(
+                            required_str(params, "install_id")?,
+                            digest,
+                            method == "app_local_install_approve",
+                        )
+                    },
+                )
+            }
+            "app_run_create" => self.create_app_run(params, None, None),
+            "app_run_start" => self.start_app_run(params),
             "app_run_approve" => {
                 let id = required_str(params, "run_id")?;
                 self.with_app_run_current(id, |current_bundle| {
@@ -629,6 +730,8 @@ impl Shared {
 
 #[cfg(test)]
 mod cad1120_tests;
+#[cfg(test)]
+mod cad1123_tests;
 
 #[cfg(test)]
 mod cad742_tests {

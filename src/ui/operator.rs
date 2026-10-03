@@ -163,6 +163,13 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/app-runs", RouteClass::OperatorOnly),
+    // CAD-1123: one operator gesture creates, approves and dispatches.
+    route("POST", "/api/app-runs/start", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/app-installations/*/team",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/app-runs/*/approve", RouteClass::OperatorOnly),
     route("POST", "/api/app-runs/*/cancel", RouteClass::OperatorOnly),
     route("POST", "/api/app-runs/*/dispatch", RouteClass::OperatorOnly),
