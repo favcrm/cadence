@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { ApiError } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import {
   EMAIL_SENDING_HREF,
   WAITING_APPROVAL_TEXT,
+  hostedSenderFrom,
   sendingFrom,
   waitingApproval,
+  type HostedSender,
 } from "../settings/emailSendingView";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
@@ -1648,6 +1650,21 @@ function CampaignWorkspace({
   // The live sender binding: `null` is the host's none-bound answer,
   // `undefined` is still-loading so dependent panels can wait.
   const [binding, setBinding] = useState<SmtpBinding | null | undefined>(undefined);
+  // CAD-1121: the daemon's word on hosted + the platform sender.
+  const [hostedSender, setHostedSender] = useState<HostedSender | null>(null);
+  useEffect(() => {
+    if (!viewer.operator) return;
+    let live = true;
+    api.connections().then(
+      (list) => {
+        if (live) setHostedSender(hostedSenderFrom(list));
+      },
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [viewer.operator]);
   const [bindingError, setBindingError] = useState<string | null>(null);
   const [bindingToken, setBindingToken] = useState(0);
   const [proposals, setProposals] = useState<ProposalDoc[]>([]);
@@ -2305,6 +2322,7 @@ function CampaignWorkspace({
             items={readiness}
             doc={doc}
             binding={binding}
+            hostedSender={hostedSender}
             audienceLabel={audienceLabel ?? "—"}
             onTab={setTab}
           />

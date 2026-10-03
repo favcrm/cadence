@@ -3,6 +3,9 @@ use super::*;
 use crate::platform;
 use crate::store::CredentialRecord;
 
+/// CAD-1121: the stable code of the hosted raw-SMTP refusal.
+pub(crate) const HOSTED_SMTP_CODE: &str = "hosted_smtp_unsupported";
+
 impl Shared {
     pub(super) fn connection_descriptor(
         &self,
@@ -77,8 +80,12 @@ impl Shared {
             ),
             _ => (None, None),
         };
+        // CAD-1121: on a hosted daemon a raw-SMTP row is never a usable
+        // CRM sender; it stays listed (Connections) with a typed reason.
+        let sender_unusable =
+            (smtp_sender && !hosted_sender && self.is_hosted()).then_some(HOSTED_SMTP_CODE);
         Ok(
-            json!({"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"smtp":smtp,"smtp_sender":smtp_sender,"smtp_error":smtp_error,"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
+            json!({"sender_unusable":sender_unusable,"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"smtp":smtp,"smtp_sender":smtp_sender,"smtp_error":smtp_error,"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
         )
     }
     /// The id of a built-in (credential-less) connection row.
@@ -95,6 +102,32 @@ impl Shared {
             )
             .simple()
         ))
+    }
+
+    /// CAD-1121: is this a hosted daemon? Decided from the lease the
+    /// daemon holds (or the hosted email door it was composed with),
+    /// never from a request field. A `test-seam` build lets a fixture
+    /// override it.
+    pub(super) fn is_hosted(&self) -> bool {
+        #[cfg(feature = "test-seam")]
+        if let Some(flag) = &self.hosted_override {
+            return flag.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        self.hosted_lease || self.hosted_email.is_some()
+    }
+
+    /// CAD-1121: the typed refusal for any raw-SMTP sender on a hosted
+    /// daemon. Its code is `hosted_smtp_unsupported`; the message also
+    /// names the platform-not-ready case.
+    pub(super) fn hosted_smtp_refusal(&self) -> Error {
+        Error::gate_coded(
+            HOSTED_SMTP_CODE,
+            if self.hosted_email.is_some() {
+                "Hosted workspaces send through the platform email door; SMTP is for self-hosted Cadence"
+            } else {
+                "Hosted workspaces send through the platform email door, which is not set up for this workspace yet; SMTP is for self-hosted Cadence"
+            },
+        )
     }
 
     /// CAD-1063: `Some` when `connection_id` names the hosted platform
@@ -234,7 +267,20 @@ impl Shared {
                     .unwrap_or_else(|e| e.into_inner());
                 let rows = self.connection_list_locked()?;
                 if method == "connection_list" {
-                    return Ok(json!({"connections":rows}));
+                    // CAD-1121: whether this is a hosted daemon and
+                    // whether its platform sender exists, so the board
+                    // can offer only the platform sender and say plainly
+                    // when it is not set up yet.
+                    return Ok(json!({
+                        "connections":rows,
+                        "hosted":self.is_hosted(),
+                        "platform_sender":{
+                            "available":self.hosted_email.is_some(),
+                            "missing":if self.is_hosted() && self.hosted_email.is_none() {
+                                Some(platform::hosted_email::FROM_ADDRESS_ENV)
+                            } else { None },
+                        },
+                    }));
                 }
                 let id = connection_id(params)?;
                 let row = rows

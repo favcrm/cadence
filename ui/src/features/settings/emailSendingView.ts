@@ -33,7 +33,34 @@ export interface SenderChoices {
   unusable: { row: Connection; reason: string }[];
 }
 
-export function senderChoices(rows: Connection[]): SenderChoices {
+/** What the daemon says about the hosted platform sender (CAD-1121). */
+export interface HostedSender {
+  hosted: boolean;
+  available: boolean;
+  missing: string | null;
+}
+
+export function hostedSenderFrom(payload: {
+  hosted?: boolean;
+  platform_sender?: { available: boolean; missing: string | null };
+}): HostedSender {
+  return {
+    hosted: payload.hosted === true,
+    available: payload.platform_sender?.available === true,
+    missing: payload.platform_sender?.missing ?? null,
+  };
+}
+
+/** Plain copy when a hosted workspace has no platform sender yet. */
+export const PLATFORM_EMAIL_WAITING = "Platform email isn't set up for this workspace yet";
+export const PLATFORM_EMAIL_WAITING_NOTE =
+  "This is waiting on the platform, not something to fix in the CRM.";
+/** The one line shown beside raw-SMTP connections on a hosted workspace. */
+export const HOSTED_SMTP_NOTE = "Hosted workspaces send through the platform; SMTP is for self-hosted Cadence.";
+
+export function senderChoices(rows: Connection[], hosted = false): SenderChoices {
+  // CAD-1121: on a hosted daemon the platform sender is the only choice.
+  if (hosted) return { usable: rows.filter((r) => isHostedSender(r)), unusable: [] };
   const senders = rows.filter(isSmtpSender);
   const usable: Connection[] = [];
   const unusable: SenderChoices["unusable"] = [];
@@ -52,9 +79,9 @@ export function senderChoices(rows: Connection[]): SenderChoices {
 
 /** "Sending from <address>" for a live binding; null otherwise. */
 export function sendingFrom(
-  binding: { state: string; sender: { address: string } } | null | undefined,
+  binding: { state: string; usable?: boolean; sender: { address: string } } | null | undefined,
 ): string | null {
-  return binding && binding.state === "live" ? binding.sender.address : null;
+  return binding && binding.state === "live" && binding.usable !== false ? binding.sender.address : null;
 }
 
 /** Where campaigns send the operator to choose a sender. */

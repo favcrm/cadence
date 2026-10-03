@@ -1424,6 +1424,8 @@ export interface Connection {
   smtp_sender?: boolean;
   /** Why `smtp` is null on an SMTP sender — a typed, secret-free code. */
   smtp_error?: "custody_corrupt" | "withheld_leak" | "unavailable" | null;
+  /** CAD-1121: why this raw-SMTP row can't be a CRM sender on a hosted daemon. */
+  sender_unusable?: "hosted_smtp_unsupported" | null;
   status: {
     adapter_registered: boolean;
     descriptor_available: boolean;
@@ -1438,6 +1440,10 @@ export interface Connection {
 
 export interface ConnectionsPayload {
   connections: Connection[];
+  /** CAD-1121: this daemon holds a hosted lease (decided by the daemon). */
+  hosted?: boolean;
+  /** CAD-1121: whether the platform sender exists and what is missing. */
+  platform_sender?: { available: boolean; missing: string | null };
 }
 
 export interface ConnectionPayload {

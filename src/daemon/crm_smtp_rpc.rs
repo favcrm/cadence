@@ -25,6 +25,7 @@
 //! over mandatory authenticated TLS, and a receipt recording SMTP
 //! acceptance/refusal only — never delivery, never reads. No bulk
 //! path exists in this ticket.
+use super::connections_rpc::HOSTED_SMTP_CODE;
 use super::*;
 use crate::issue::app_catalog::workspace;
 use crate::store::app_records::{email_shape_valid, RecordStore};
@@ -133,6 +134,12 @@ impl Shared {
             }
             return Ok((SenderTransport::Hosted(hosted.clone()), hosted.projection()));
         }
+        // CAD-1121 guard: a hosted daemon never opens SMTP. Every bind,
+        // rebind, show, prepare, send and test send passes here, so an
+        // existing raw-SMTP binding fails closed with the typed reason.
+        if self.is_hosted() {
+            return Err(self.hosted_smtp_refusal());
+        }
         let record = self
             .store
             .connection_credential(connection_id)?
@@ -193,6 +200,11 @@ impl Shared {
     fn crm_sender_revision(&self, connection: &str) -> Result<i64> {
         if self.hosted_sender(connection)?.is_some() {
             return Ok(crate::platform::hosted_email::AUTH_REVISION);
+        }
+        // CAD-1121 guard: refuse a raw-SMTP bind/rebind before reading
+        // custody, so the refusal is typed and reveals nothing.
+        if self.is_hosted() {
+            return Err(self.hosted_smtp_refusal());
         }
         let record = self
             .store
@@ -328,13 +340,33 @@ impl Shared {
                         "SMTP sender binding is revoked; bind it again instead",
                     ));
                 }
-                let (transport, projection) =
-                    self.crm_smtp_authority(&link.connection_id, link.auth_revision)?;
                 let row = self
                     .connection_list_locked()?
                     .into_iter()
                     .find(|row| row["id"] == link.connection_id)
                     .unwrap_or(Value::Null);
+                // CAD-1121: an existing raw-SMTP binding on a hosted
+                // daemon is reported, never used. It stays `live` so the
+                // operator can rebind it to the platform sender.
+                let (kind, sender, transport, usable) =
+                    match self.crm_smtp_authority(&link.connection_id, link.auth_revision) {
+                        Ok((transport, projection)) => (
+                            transport.kind(),
+                            json!({"name": projection.sender_name, "address": projection.sender}),
+                            json!({"host": projection.host, "port": projection.port, "tls_mode": projection.tls_mode, "username": projection.username}),
+                            true,
+                        ),
+                        Err(error) if error.code() == Some(HOSTED_SMTP_CODE) => {
+                            let smtp = &row["smtp"];
+                            (
+                                "smtp",
+                                json!({"name": smtp["sender_name"].as_str().unwrap_or(""), "address": smtp["sender"].as_str().unwrap_or("")}),
+                                json!({"host": smtp["host"].as_str().unwrap_or(""), "port": smtp["port"].as_u64().unwrap_or(0), "tls_mode": smtp["tls_mode"].as_str().unwrap_or(""), "username": smtp["username"].as_str().unwrap_or("")}),
+                                false,
+                            )
+                        }
+                        Err(error) => return Err(error),
+                    };
                 Ok(json!({
                     "binding": {
                         "install_id": install,
@@ -344,9 +376,11 @@ impl Shared {
                         "link_revision": link.link_revision,
                         "state": link.state,
                         "digest": link.digest,
-                        "sender": {"name": projection.sender_name, "address": projection.sender},
-                        "transport": {"host": projection.host, "port": projection.port, "tls_mode": projection.tls_mode, "username": projection.username},
-                        "transport_kind": transport.kind(),
+                        "sender": sender,
+                        "transport": transport,
+                        "transport_kind": kind,
+                        "usable": usable,
+                        "unusable_reason": if usable { Value::Null } else { json!(HOSTED_SMTP_CODE) },
                         "connection": row,
                     },
                 }))

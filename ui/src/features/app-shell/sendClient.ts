@@ -136,6 +136,8 @@ export interface SmtpBinding {
   transport: { host: string; port: number; tlsMode: string; username: string };
   /** CAD-1063: "agenticos" when the platform sends, else "smtp". */
   transportKind: string;
+  /** CAD-1121: false when the daemon reports the binding unusable (raw SMTP on a hosted daemon). */
+  usable: boolean;
 }
 
 /** `null` where the host reports no live binding (its refusal is
@@ -176,6 +178,7 @@ export function parseSmtpBinding(value: unknown): SmtpBinding {
       username: typeof transport.username === "string" ? transport.username : "",
     },
     transportKind: typeof row.transport_kind === "string" ? row.transport_kind : "smtp",
+    usable: row.usable !== false,
   };
 }
 

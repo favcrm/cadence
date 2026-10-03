@@ -23,6 +23,7 @@ import {
   smtpUnreadable,
   smtpErrorMessage,
 } from "./connectionsView";
+import { HOSTED_SMTP_NOTE } from "./emailSendingView";
 import { connectionLabel } from "../../lib/connections";
 
 /**
@@ -347,7 +348,15 @@ export function ConnectionDetail({
             <dd className="text-ink-200 break-words">{smtpSummary(row)}</dd>
           </div>
         )}
-        {smtpErrorMessage(row) && (
+        {row.sender_unusable === "hosted_smtp_unsupported" && (
+          <div className="flex flex-wrap gap-x-2 min-w-0">
+            <dt className="text-ink-500">Sender</dt>
+            <dd className="text-ink-300 break-words" data-hosted-smtp>
+              {HOSTED_SMTP_NOTE}
+            </dd>
+          </div>
+        )}
+        {!row.sender_unusable && smtpErrorMessage(row) && (
           <div className="flex flex-wrap gap-x-2 min-w-0">
             <dt className="text-ink-500">Sender</dt>
             <dd className="text-fail break-words" role="alert" data-smtp-error={row.smtp_error ?? "unavailable"}>
