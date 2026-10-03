@@ -255,7 +255,10 @@ normal gates return. An agent or PR may not grant that exception to itself.
 - During the window, an approved PR may remove the named legacy tests and merge
   through only the approved reduced gate. The exception does not delete
   production effects, authorization or enforcement code; it changes which
-  retained tests and required checks may be suspended for the named scope.
+  retained tests and required checks may be suspended for the named scope. A
+  documentation-only/non-logic diff may use the declared reduced gate instead
+  of the heavy compile/test pipeline where that gate has been explicitly
+  approved and wired; this section by itself does not alter required CI.
 - Changes merged under the transition must not produce release or production
   artifacts, and cleanup cannot depend on unverified state. A check that still
   protects a residual control remains mandatory; unknown or uncontrollable
