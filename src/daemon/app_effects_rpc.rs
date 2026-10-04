@@ -111,7 +111,7 @@ impl Shared {
         }
     }
 
-    fn stage_app_artifact(&self, params: &Value) -> Result<Value> {
+    pub(super) fn stage_app_artifact(&self, params: &Value) -> Result<Value> {
         let run_id = required_str(params, "run_id")?;
         let run = self.store.app_run_show(run_id)?;
         let install = required_str(&run, "install_id")?;

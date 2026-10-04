@@ -1,4 +1,5 @@
 //! Provider-neutral publication configuration. Configuration is not authority.
+use super::social_publish_start::carry_publish;
 use super::*;
 use crate::issue::{app, app_catalog::workspace};
 use crate::store::app_bindings::{binding_drift, BindingDrift, BindingProof};
@@ -27,6 +28,17 @@ impl Shared {
                 "connection_id",
             ],
             "app_binding_revoke" => &["install_id", "binding_id", "expected_revision"],
+            // CAD-1123 HP4: the operator records the publish destination once.
+            "app_binding_publish_set" => &[
+                "install_id",
+                "binding_id",
+                "expected_revision",
+                "destination_id",
+                "destination_label",
+                "toolkit",
+                "timezone",
+                "grant_id",
+            ],
             "app_binding_show" => &["install_id", "binding_id"],
             "app_binding_list" => &["install_id", "context_id"],
             _ => return Err(Error::rejected("unknown app binding method")),
@@ -44,6 +56,20 @@ impl Shared {
             }
         };
         match method {
+            "app_binding_publish_set" => {
+                let pm = self.pm_at(&self.pm_dir()?)?;
+                workspace::with_runtime_snapshot(&pm, install, |_, _| {
+                    let _custody = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    self.set_binding_publish(install, params)
+                })
+            }
             "app_binding_show" => self
                 .store
                 .app_binding_show(install, required_str(params, "binding_id")?),
@@ -126,7 +152,7 @@ impl Shared {
                                 "binding_id"
                             },
                         )?);
-                    let config = self.app_binding_config(
+                    let mut config = self.app_binding_config(
                         install,
                         context,
                         slot,
@@ -134,6 +160,9 @@ impl Shared {
                         bundle,
                         files,
                     )?;
+                    if let Some(old) = &existing {
+                        config = carry_publish(config, &old["config"]);
+                    }
                     if method == "app_binding_create" {
                         self.store.app_binding_create(
                             install,
@@ -275,7 +304,10 @@ impl Shared {
         let connection = proof.config["connection_id"]
             .as_str()
             .ok_or_else(|| Error::rejected("binding connection receipt is missing"))?;
-        let fresh = self.app_binding_config(install, context, slot, connection, bundle, files)?;
+        let fresh = carry_publish(
+            self.app_binding_config(install, context, slot, connection, bundle, files)?,
+            &proof.config,
+        );
         match binding_drift(&proof.config, &fresh) {
             BindingDrift::Same => Ok(Some(proof)),
             BindingDrift::Compatible(_) => self
@@ -318,6 +350,7 @@ impl Shared {
                     bundle,
                     files,
                 )
+                .map(|fresh| carry_publish(fresh, &row["config"]))
             });
         match fresh.map(|fresh| binding_drift(&row["config"], &fresh)) {
             Ok(BindingDrift::Same) => json!({"state": "current", "changes": []}),
@@ -353,16 +386,19 @@ impl Shared {
                 "publication binding revision or incarnation changed",
             ));
         }
-        let configured = self.app_binding_config(
-            install,
-            context,
-            slot,
-            proof.config["connection_id"]
-                .as_str()
-                .ok_or_else(|| Error::rejected("binding connection receipt is missing"))?,
-            bundle,
-            files,
-        )?;
+        let configured = carry_publish(
+            self.app_binding_config(
+                install,
+                context,
+                slot,
+                proof.config["connection_id"]
+                    .as_str()
+                    .ok_or_else(|| Error::rejected("binding connection receipt is missing"))?,
+                bundle,
+                files,
+            )?,
+            &proof.config,
+        );
         if configured != proof.config {
             return Err(Error::rejected(
                 "publication binding installation/context/connection receipt is stale",

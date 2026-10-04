@@ -667,3 +667,87 @@ fn cad1020_lease_lost_after_claim_sends_nothing() {
     assert!(door.sent().is_empty(), "nothing was published");
     assert_eq!(daemon.state(&intent), "processing", "claimed, never sent");
 }
+
+fn run_of(intent: &Value) -> String {
+    intent["frozen"]["run_id"].as_str().unwrap().to_owned()
+}
+
+/// CAD-1123 HP4: a double tap of the same publish start is one provider
+/// call (the retry resumes the frozen intent and both race for the one
+/// claim); a request id reused for another run, a bad mode and a time on a
+/// now publish are refused and send nothing.
+#[test]
+fn cad1123_publish_start_double_tap_is_one_send_and_forged_reuse_refuses() {
+    let (dir, door, clock) = rig();
+    *door.meet.0.lock().unwrap() = (2, 0);
+    let daemon = Daemon::start(dir.path(), &door, &clock);
+    let now = clock.load(Ordering::SeqCst);
+    let intent = approved_intent(&daemon.shared.store, "tap", now + 600);
+    let other = approved_intent(&daemon.shared.store, "tap2", now + 600);
+    let (request, run) = ("publish-tap", run_of(&intent));
+    let tap = |shared: Arc<Shared>, run: String| {
+        std::thread::spawn(move || {
+            shared.start_social_publish(
+                &json!({"request_id":"publish-tap","run_id":run,"mode":"now"}),
+            )
+        })
+    };
+    let taps = [
+        tap(daemon.shared.clone(), run.clone()),
+        tap(daemon.shared.clone(), run.clone()),
+    ];
+    let replies: Vec<_> = taps.into_iter().map(|t| t.join().unwrap()).collect();
+    assert!(replies.iter().any(Result::is_ok), "{replies:?}");
+    daemon.wait_state(&intent, "posted");
+    daemon.ticks(2);
+    assert_eq!(door.sent(), vec![key(&intent)], "exactly one provider call");
+    for params in [
+        json!({"request_id":request,"run_id":run_of(&other),"mode":"now"}),
+        json!({"request_id":"publish-tap2","run_id":run,"mode":"sideways"}),
+        json!({"request_id":"publish-tap2","run_id":run,"mode":"now","due_epoch":now + 90}),
+        json!({"request_id":"publish-tap2","run_id":run,"mode":"schedule"}),
+        json!({"request_id":"publish-tap2","run_id":run,"mode":"schedule","due_epoch":now - 5}),
+    ] {
+        assert!(
+            daemon.shared.start_social_publish(&params).is_err(),
+            "{params}"
+        );
+    }
+    assert_eq!(daemon.state(&other), "queued", "another run is untouched");
+    assert_eq!(door.sent().len(), 1);
+}
+
+/// CAD-1123 HP4: reschedule moves a queued intent with no duplicate: the
+/// driver does not send at the old time, sends once at the new one; a
+/// stale expected time and a past time are refused and change nothing.
+#[test]
+fn cad1123_reschedule_moves_the_send_with_no_duplicate() {
+    let (dir, door, clock) = rig();
+    let daemon = Daemon::start(dir.path(), &door, &clock);
+    let now = clock.load(Ordering::SeqCst);
+    let intent = approved_intent(&daemon.shared.store, "resched", now + 600);
+    let move_to = |expected: i64, due: i64| {
+        daemon.shared.reschedule_social_publish(&json!({
+            "intent_id": id(&intent), "install_id": INSTALL,
+            "context_id": null, "expected_due_epoch": expected, "due_epoch": due,
+        }))
+    };
+    assert!(move_to(now + 599, wall() + 3600).is_err(), "stale time");
+    assert!(move_to(now + 600, wall() - 1).is_err(), "past time");
+    let moved = move_to(now + 600, wall() + 3600).unwrap();
+    assert_eq!(moved["intent"]["state"], "queued");
+    assert!(move_to(now + 600, wall() + 7200).is_err(), "old time again");
+    // Past the OLD time, before the new one: nothing is sent.
+    clock.store(now + 700, Ordering::SeqCst);
+    daemon.ticks(3);
+    assert!(door.sent().is_empty());
+    clock.store(wall() + 3700, Ordering::SeqCst);
+    daemon.wait_state(&intent, "posted");
+    daemon.ticks(2);
+    assert_eq!(
+        door.sent(),
+        vec![key(&intent)],
+        "sent once, at the new time"
+    );
+    assert!(move_to(wall() + 3600, wall() + 7200).is_err(), "posted row");
+}

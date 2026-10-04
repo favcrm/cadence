@@ -71,6 +71,7 @@ mod serve;
 mod slots_rpc;
 mod social_publish_driver;
 mod social_publish_rpc;
+mod social_publish_start;
 mod supervisor_grant;
 mod test_queue_rpc;
 mod threads_rpc;
@@ -3234,6 +3235,7 @@ impl Shared {
             "app_binding_revoke" => self.rpc_app_binding(method, params, peer_pid),
             "app_binding_show" => self.rpc_app_binding(method, params, peer_pid),
             "app_binding_list" => self.rpc_app_binding(method, params, peer_pid),
+            "app_binding_publish_set" => self.rpc_app_binding(method, params, peer_pid),
             "app_effect_stage" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_show" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_list" => self.rpc_app_effect(method, params, peer_pid),
@@ -3248,6 +3250,8 @@ impl Shared {
             "social_publish_send_now" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_reconcile" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_report" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_start" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_reschedule" => self.rpc_social_publish(method, params, peer_pid),
             "app_context_create" => self.rpc_app_context(method, params, peer_pid),
             "app_context_list" => self.rpc_app_context(method, params, peer_pid),
             "app_context_show" => self.rpc_app_context(method, params, peer_pid),

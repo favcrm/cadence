@@ -66,6 +66,16 @@ impl Shared {
                 "social_publish_send_now" => &["intent_id", "install_id", "context_id"],
                 "social_publish_reconcile" => &["intent_id"],
                 "social_publish_report" => &["intent_id", "decision", "receipt"],
+                // CAD-1123 HP4: the request names a run and a mode; scope,
+                // artifact, destination, grant and approval all derive.
+                "social_publish_start" => &["request_id", "run_id", "mode", "due_epoch"],
+                "social_publish_reschedule" => &[
+                    "intent_id",
+                    "install_id",
+                    "context_id",
+                    "expected_due_epoch",
+                    "due_epoch",
+                ],
                 _ => return Err(Error::rejected("unknown social publish method")),
             },
         )?;
@@ -102,6 +112,8 @@ impl Shared {
             }
             "social_publish_claim_due" => self.claim_social_publish(params),
             "social_publish_send_now" => self.send_now_social_publish(params),
+            "social_publish_start" => self.start_social_publish(params),
+            "social_publish_reschedule" => self.reschedule_social_publish(params),
             "social_publish_reconcile" => self.reconcile_social_publish(params),
             "social_publish_report" => self.store.social_publish_report(
                 required_str(params, "intent_id")?,
@@ -115,7 +127,7 @@ impl Shared {
     }
 
     /// Segment-shaped required param: a nonempty, ≤128-byte ASCII id.
-    fn required_segment<'a>(params: &'a Value, field: &str) -> Result<&'a str> {
+    pub(super) fn required_segment<'a>(params: &'a Value, field: &str) -> Result<&'a str> {
         let value = required_str(params, field)?;
         if value.is_empty()
             || value.len() > 128
@@ -131,7 +143,10 @@ impl Shared {
     /// Strict optional param: absent/null → None; a valid nonempty
     /// segment string → Some; any other JSON type or an empty/oversize
     /// string is a rejection, never a silent None.
-    fn strict_optional_segment<'a>(params: &'a Value, field: &str) -> Result<Option<&'a str>> {
+    pub(super) fn strict_optional_segment<'a>(
+        params: &'a Value,
+        field: &str,
+    ) -> Result<Option<&'a str>> {
         match params.get(field) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(s)) => {
@@ -154,7 +169,7 @@ impl Shared {
     /// by receipt custody, uploads them to the device media door and returns
     /// the validated `media_key`/`image_digest` for the operator to schedule.
     /// No grant minted, no send, no persisted row — freeze owns durability.
-    fn import_social_media(&self, params: &Value) -> Result<Value> {
+    pub(super) fn import_social_media(&self, params: &Value) -> Result<Value> {
         // Required request_id: a nonempty, bounded, segment-shaped string,
         // validated BEFORE any custody read or provider call. import writes
         // no durable row, so this is an idempotency/receipt shape bound, not
@@ -250,7 +265,7 @@ impl Shared {
     /// caller-frozen digests are refused — no caller-string trust at
     /// either point). Post now is `due_epoch` at now; Schedule is a
     /// future `due_epoch` with an explicit timezone.
-    fn schedule_social_publish(&self, params: &Value) -> Result<Value> {
+    pub(super) fn schedule_social_publish(&self, params: &Value) -> Result<Value> {
         use crate::store::social_publish::FreezeFromArtifact;
         let due = params
             .get("due_epoch")
@@ -446,7 +461,7 @@ impl Shared {
     /// operator clock — re-schedule it
     /// first. There is no background loop: the operator's click is the
     /// only trigger.
-    fn send_now_social_publish(&self, params: &Value) -> Result<Value> {
+    pub(super) fn send_now_social_publish(&self, params: &Value) -> Result<Value> {
         use crate::platform::agenticos_external::publish::Preflight;
         let id = Self::required_segment(params, "intent_id")?.to_owned();
         // CAD-1027 scope, as cancel: the intent's own install and exact

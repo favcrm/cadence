@@ -660,6 +660,24 @@ pub(crate) enum BindingAction {
         #[arg(long)]
         connection_id: String,
     },
+    /// CAD-1123: record where this binding publishes (destination, label,
+    /// toolkit, timezone and send grant) once, at the expected revision.
+    Publish {
+        install_id: String,
+        binding_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        destination_id: String,
+        #[arg(long)]
+        destination_label: String,
+        #[arg(long)]
+        toolkit: String,
+        #[arg(long)]
+        timezone: String,
+        #[arg(long)]
+        grant_id: String,
+    },
     /// Revoke a binding at its expected revision.
     Revoke {
         install_id: String,
@@ -1216,6 +1234,21 @@ fn binding_params(action: &BindingAction) -> (&'static str, serde_json::Value) {
         } => (
             "app_binding_update",
             json!({"install_id":install_id,"binding_id":binding_id,"expected_revision":expected_revision,"connection_id":connection_id}),
+        ),
+        BindingAction::Publish {
+            install_id,
+            binding_id,
+            expected_revision,
+            destination_id,
+            destination_label,
+            toolkit,
+            timezone,
+            grant_id,
+        } => (
+            "app_binding_publish_set",
+            json!({"install_id":install_id,"binding_id":binding_id,"expected_revision":expected_revision,
+            "destination_id":destination_id,"destination_label":destination_label,"toolkit":toolkit,
+            "timezone":timezone,"grant_id":grant_id}),
         ),
         BindingAction::Revoke {
             install_id,
