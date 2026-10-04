@@ -69,11 +69,11 @@ pub(crate) const EXEC_PINS: &[ExecPin] = &[
         sha256: None,
     },
     ExecPin {
-        canon: "/opt/cadence/pi/node",
+        canon: crate::protected_pi_profile::NODE_PATH,
         owner: 0,
         group: None,
         mode: 0o755,
-        sha256: None,
+        sha256: crate::protected_pi_profile::NODE_DIGEST,
     },
 ];
 
@@ -323,6 +323,14 @@ pub(crate) struct PreparedExec {
     envp_p: Vec<*const libc::c_char>,
 }
 
+/// Materialized strings without executable custody: cannot attach or spawn.
+pub(crate) struct ExecDraft {
+    argv_c: Box<[CString]>,
+    envp_c: Box<[CString]>,
+    argv_p: Vec<*const libc::c_char>,
+    envp_p: Vec<*const libc::c_char>,
+}
+
 /// A `Send`/`Sync`-able carrier for the whole spawn plan handed to `pre_exec`.
 /// It owns the `OwnedFd` and both `Box<[CString]>` backings, so the raw
 /// pointers in `argv_p`/`envp_p` and the fd stay valid for the life of the
@@ -372,15 +380,18 @@ static EMPTY_PATH_NUL: u8 = 0;
 
 impl PreparedExec {
     /// Materialize the argv/envp for `execveat(helper_fd, …)`.
-    /// `provider_argv` is appended verbatim after the fixed helper profile
-    /// tokens; `env` is the guest envp vector (already `KEY=VAL` strings).
+    /// The strict shared routing suffix follows the fixed profile tokens;
+    /// production sends an empty helper env, never a caller-selected guest env.
     pub(crate) fn assemble(
         segs: &super::Segments,
         provider_argv: &[String],
         env: Vec<CString>,
-    ) -> Result<Self> {
-        // Fixed argv: the helper's own profile selection + bounded segments,
-        // then `--` then the provider argv verbatim.
+    ) -> Result<ExecDraft> {
+        // Same strict suffix grammar as the helper; NEVER prepend a provider program.
+        let tokens: Vec<std::ffi::OsString> = provider_argv.iter().map(Into::into).collect();
+        crate::protected_pi_profile::Routing::parse(&tokens).map_err(Error::rejected)?;
+        // Fixed profile + bounded segments, then validated routing only.
+        // Node, CLI, session path and all protected env/cwd are helper-owned.
         let mut argv: Vec<CString> = Vec::new();
         let push = |argv: &mut Vec<CString>, s: &str| -> Result<()> {
             argv.push(
@@ -418,23 +429,13 @@ impl PreparedExec {
             .map(|c| c.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
             .collect();
-        // The plan has no fd yet — `with_bound` moves the BoundExec's OwnedFd
-        // in. A plan must never be built without one; keep a sentinel owner.
-        Ok(Self {
-            helper_fd: empty_helper_fd()?,
+        // A draft has no attach method and cannot masquerade as executable custody.
+        Ok(ExecDraft {
             argv_c,
             envp_c,
             argv_p,
             envp_p,
         })
-    }
-
-    /// Bind the verified `BoundExec` into the plan, taking ownership of its
-    /// `OwnedFd` — so the descriptor lives exactly as long as the plan and
-    /// the closure it is moved into.
-    pub(crate) fn with_bound(mut self, bound: BoundExec) -> Self {
-        self.helper_fd = bound.fd;
-        self
     }
 
     /// Attach the async-signal-safe `pre_exec` to `cmd`, consuming the plan.
@@ -516,13 +517,17 @@ impl PreparedExec {
     }
 }
 
-/// A placeholder fd for `assemble` before `with_bound` installs the real one —
-/// an `OwnedFd` over `/dev/null`, never a real exec target, replaced before
-/// `attach` ever runs.
-fn empty_helper_fd() -> Result<OwnedFd> {
-    std::fs::File::open("/dev/null")
-        .map(|f| f.into())
-        .map_err(|e| Error::internal(format!("open /dev/null sentinel: {e}")))
+impl ExecDraft {
+    /// Only moving an owned binding creates the attachable transport plan.
+    pub(crate) fn with_bound(self, bound: BoundExec) -> PreparedExec {
+        PreparedExec {
+            helper_fd: bound.fd,
+            argv_c: self.argv_c,
+            envp_c: self.envp_c,
+            argv_p: self.argv_p,
+            envp_p: self.envp_p,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -552,13 +557,9 @@ mod tests {
         let path = dir.path().join("h");
         std::fs::write(&path, b"x").unwrap();
         let env = vec![CString::new("HOME=/x").unwrap()];
-        let plan = PreparedExec::assemble(
-            &segs(),
-            &["pi".to_string(), "--mode".to_string(), "rpc".to_string()],
-            env,
-        )
-        .unwrap()
-        .with_bound(bound(&path));
+        let plan = PreparedExec::assemble(&segs(), &["--mode".to_string(), "rpc".to_string()], env)
+            .unwrap()
+            .with_bound(bound(&path));
         let argv = plan.argv_strings();
         assert_eq!(argv[0], "cadence-agent-exec");
         assert_eq!(argv[1], "exec");
@@ -569,7 +570,7 @@ mod tests {
         assert!(argv[5].starts_with("--generation="));
         assert_eq!(argv[5].len(), "--generation=".len() + 32);
         assert_eq!(argv[6], "--");
-        assert_eq!(&argv[7..], &["pi", "--mode", "rpc"]);
+        assert_eq!(&argv[7..], &["--mode", "rpc"]);
         assert!(plan.helper_fd() > 0);
     }
 
@@ -602,7 +603,7 @@ mod tests {
             CString::new("HOME=/x").unwrap(),
             CString::new("CADENCE_ALIAS=w").unwrap(),
         ];
-        let plan = PreparedExec::assemble(&segs(), &["pi".to_string()], env)
+        let plan = PreparedExec::assemble(&segs(), &["--mode".to_string(), "rpc".to_string()], env)
             .unwrap()
             .with_bound(bound(&path));
         assert_plan_pointers_resolve(&plan.argv_c, &plan.argv_p);
@@ -622,7 +623,7 @@ mod tests {
         let path = dir.path().join("h");
         std::fs::write(&path, b"x").unwrap();
         let env = vec![CString::new("K=V").unwrap()];
-        let plan = PreparedExec::assemble(&segs(), &["pi".to_string()], env)
+        let plan = PreparedExec::assemble(&segs(), &["--mode".to_string(), "rpc".to_string()], env)
             .unwrap()
             .with_bound(bound(&path));
         // Consume the plan into the same owned carrier `attach` uses — every
@@ -648,7 +649,7 @@ mod tests {
         let path = dir.path().join("h");
         std::fs::write(&path, b"x").unwrap();
         let env = vec![CString::new("A=B").unwrap()];
-        let plan = PreparedExec::assemble(&segs(), &["pi".to_string()], env)
+        let plan = PreparedExec::assemble(&segs(), &["--mode".to_string(), "rpc".to_string()], env)
             .unwrap()
             .with_bound(bound(&path));
         for (i, c) in plan.argv_c.iter().enumerate() {
@@ -706,9 +707,10 @@ mod tests {
         std::fs::write(&path, b"x").unwrap();
         let bound = bound(&path);
         let bound_raw = bound.fd.as_raw_fd();
-        let plan = PreparedExec::assemble(&segs(), &["pi".to_string()], vec![])
-            .unwrap()
-            .with_bound(bound);
+        let plan =
+            PreparedExec::assemble(&segs(), &["--mode".to_string(), "rpc".to_string()], vec![])
+                .unwrap()
+                .with_bound(bound);
         assert_eq!(plan.helper_fd(), bound_raw, "plan holds the bound fd");
         drop(plan);
         // After the plan drops, that fd number is closed — an fcntl on it
@@ -727,12 +729,14 @@ mod tests {
         let (a, b) = (dir.path().join("a"), dir.path().join("b"));
         std::fs::write(&a, b"a").unwrap();
         std::fs::write(&b, b"b").unwrap();
-        let pa = PreparedExec::assemble(&segs(), &["pi".to_string()], vec![])
-            .unwrap()
-            .with_bound(bound(&a));
-        let pb = PreparedExec::assemble(&segs(), &["pi".to_string()], vec![])
-            .unwrap()
-            .with_bound(bound(&b));
+        let pa =
+            PreparedExec::assemble(&segs(), &["--mode".to_string(), "rpc".to_string()], vec![])
+                .unwrap()
+                .with_bound(bound(&a));
+        let pb =
+            PreparedExec::assemble(&segs(), &["--mode".to_string(), "rpc".to_string()], vec![])
+                .unwrap()
+                .with_bound(bound(&b));
         assert_ne!(
             pa.helper_fd(),
             pb.helper_fd(),

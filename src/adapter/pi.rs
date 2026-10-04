@@ -2152,12 +2152,23 @@ impl ProviderAdapter for PiAdapter {
         // namespace policy, pre-start restore lineage — are unavailable this
         // batch, so this refuses closed before any spawn is constructed. No
         // guest boolean, restored marker, or refreshed flag satisfies it.
+        #[cfg(not(all(unix, target_os = "linux")))]
         if self.agent_uid.is_some() {
             super::pi_guest::protected_prereqs_satisfied()?;
-            // Construction continues only when the gate above ever passes;
-            // today it never does. The unreachable seam is exercised by the
-            // module's own tests.
+            return Err(Error::rejected("protected managed-Pi launch is Linux-only"));
         }
+        #[cfg(all(unix, target_os = "linux"))]
+        let protected = if let Some(uid) = self.agent_uid {
+            let generation = Uuid::new_v4().simple().to_string();
+            Some(super::pi_guest::GuestCtx::establish(
+                agent,
+                &self.env,
+                uid,
+                &generation,
+            )?)
+        } else {
+            None
+        }; // No caller flag/marker/command can construct this context.
         let master = crate::master::is_master(&agent.alias);
         let params = agent.params.clone().unwrap_or(Value::Null);
         // CAD-559: pi launches only on an explicit model the operator
@@ -2187,7 +2198,7 @@ impl ProviderAdapter for PiAdapter {
             want,
         )?;
         self.shared.master.store(master, Ordering::SeqCst);
-        if master {
+        if master && self.agent_uid.is_none() {
             let agenticos_reads = agenticos_read_extension(&self.env)?.is_some();
             write_pi_guard(
                 &self.state_dir,
@@ -2196,132 +2207,153 @@ impl ProviderAdapter for PiAdapter {
             )?;
         }
         self.shared.guard_ready.store(false, Ordering::SeqCst);
-        let guard_path = write_pi_turn_guard(&self.state_dir, &agent.alias)?.canonicalize()?;
-        let (command, confinement) = launch_command(&self.env, &self.state_dir, agent)?;
+        let guard_path = if self.agent_uid.is_none() {
+            Some(write_pi_turn_guard(&self.state_dir, &agent.alias)?.canonicalize()?)
+        } else {
+            None
+        }; // Immutable protected guard/graph policy is not elected here.
+        let (command, confinement) = if self.agent_uid.is_none() {
+            launch_command(&self.env, &self.state_dir, agent)?
+        } else {
+            (vec!["cadence-protected-fd-exec-only".into()], None)
+        };
         if let Some(policy) = &confinement {
             let role = if master { "master" } else { "worker" };
             self.log_confinement(role, policy)?;
         }
+        #[cfg(all(unix, target_os = "linux"))]
+        let generation = protected
+            .as_ref()
+            .map(|ctx| ctx.segments().generation_hex())
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string()[..12].to_string());
+        #[cfg(not(all(unix, target_os = "linux")))]
         let generation = Uuid::new_v4().simple().to_string()[..12].to_string();
         *self.shared.generation.lock().unwrap() = generation.clone();
         self.shared.dead.store(false, Ordering::SeqCst);
-        let mut env = vec![
-            ("CADENCE_ALIAS".to_string(), agent.alias.clone()),
-            (
-                "CADENCE_STATE_DIR".to_string(),
-                self.state_dir.to_string_lossy().to_string(),
-            ),
-        ];
-        env.extend(super::daemon_context_env(&self.env));
-        if master {
-            let pm = self
-                .env
-                .var("CADENCE_PM_DIR")
-                .filter(|v| !v.is_empty())
-                .is_none()
-                .then(crate::issue::default_dir)
-                .and_then(Result::ok);
-            env.extend(crate::master::env_overrides(
-                "pi",
-                &self.state_dir,
-                pm.as_deref(),
-                master_confined(&self.env, agent),
-            ));
-            if *self.profile.lock().unwrap() == crate::master::Profile::App {
-                env.push((
-                    crate::master::CONVERSATION_ENV.to_string(),
-                    "app".to_string(),
+        let mut env = if self.agent_uid.is_none() {
+            let mut env = vec![
+                ("CADENCE_ALIAS".to_string(), agent.alias.clone()),
+                (
+                    "CADENCE_STATE_DIR".to_string(),
+                    self.state_dir.to_string_lossy().to_string(),
+                ),
+            ];
+            env.extend(super::daemon_context_env(&self.env));
+            if master {
+                let pm = self
+                    .env
+                    .var("CADENCE_PM_DIR")
+                    .filter(|v| !v.is_empty())
+                    .is_none()
+                    .then(crate::issue::default_dir)
+                    .and_then(Result::ok);
+                env.extend(crate::master::env_overrides(
+                    "pi",
+                    &self.state_dir,
+                    pm.as_deref(),
+                    master_confined(&self.env, agent),
                 ));
+                if *self.profile.lock().unwrap() == crate::master::Profile::App {
+                    env.push((
+                        crate::master::CONVERSATION_ENV.to_string(),
+                        "app".to_string(),
+                    ));
+                }
             }
-        }
-        // CAD-570: every pi agent gets its own XDG_CACHE_HOME inside
-        // its private dir, created 0700 — pi-devin's model catalog
-        // lives at `$XDG_CACHE_HOME/pi-devin/models.json`, and under
-        // Landlock the operator's `~/.cache` is denied outright (the
-        // smoke host's confined master EACCES'd it every open). The
-        // dir is inside the already-granted provider/worker dir, so
-        // confinement needs nothing new; unconfined, the explicit
-        // value keeps a worker off the shared `~/.cache` its env
-        // allowlist would otherwise inherit — two agents never share
-        // one catalog file. Push order is deliberate: the worker's
-        // env keep-list re-inherits the operator's XDG_CACHE_HOME and
-        // `env_overrides` sets none, so this pair always wins.
-        let cache_dir = pi_cache_dir(&self.state_dir, &agent.alias)?;
-        ensure_private_dir(&cache_dir)?;
-        env.push((
-            "XDG_CACHE_HOME".to_string(),
-            cache_dir.to_string_lossy().to_string(),
-        ));
-        if !master && want.starts_with("devin/") {
-            let source_root = self
-                .env
-                .var("XDG_CACHE_HOME")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| {
-                    self.env
-                        .var("HOME")
-                        .filter(|v| !v.is_empty())
-                        .map(|v| PathBuf::from(v).join(".cache"))
-                })
-                .ok_or_else(|| Error::rejected("Offline Devin catalog source is unavailable"))?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| Error::rejected("Offline Devin catalog clock is unavailable"))?
-                .as_millis();
-            let now = u64::try_from(now)
-                .map_err(|_| Error::rejected("Offline Devin catalog clock is unavailable"))?;
-            devin_catalog::seed(
-                &cache_dir,
-                &source_root.join("pi-devin/models.json"),
-                want,
-                now,
-            )?;
-        }
-        if !master {
-            // CAD-544 worker: a private `PI_CODING_AGENT_DIR` under the
-            // state dir — auth arrives as the scoped file copy, never
-            // via env or argv; `~/.pi` is never inherited. An
-            // unattended worker must not stall on a git credential
-            // prompt, so GIT_TERMINAL_PROMPT=0.
-            let config = pi_worker_config_dir(&self.state_dir, &agent.alias)?;
-            let operator = crate::master::operator_provider_config(
-                "pi",
-                self.env.var("PI_CODING_AGENT_DIR"),
-                self.env.var("HOME"),
-            );
-            if want.starts_with("agenticos/") {
-                agenticos::seed(&config, &pi_config_dir(&self.state_dir), want)?;
-            } else if let Some(operator) = operator.as_deref() {
-                copy_pi_auth(&config, operator)?;
-            } else {
-                ensure_private_dir(&config)?;
-            }
+            // CAD-570: every pi agent gets its own XDG_CACHE_HOME inside
+            // its private dir, created 0700 — pi-devin's model catalog
+            // lives at `$XDG_CACHE_HOME/pi-devin/models.json`, and under
+            // Landlock the operator's `~/.cache` is denied outright (the
+            // smoke host's confined master EACCES'd it every open). The
+            // dir is inside the already-granted provider/worker dir, so
+            // confinement needs nothing new; unconfined, the explicit
+            // value keeps a worker off the shared `~/.cache` its env
+            // allowlist would otherwise inherit — two agents never share
+            // one catalog file. Push order is deliberate: the worker's
+            // env keep-list re-inherits the operator's XDG_CACHE_HOME and
+            // `env_overrides` sets none, so this pair always wins.
+            let cache_dir = pi_cache_dir(&self.state_dir, &agent.alias)?;
+            ensure_private_dir(&cache_dir)?;
             env.push((
-                "PI_CODING_AGENT_DIR".to_string(),
-                config.to_string_lossy().to_string(),
+                "XDG_CACHE_HOME".to_string(),
+                cache_dir.to_string_lossy().to_string(),
             ));
-            env.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
-            if confinement.is_some() {
-                // CAD-556: under Landlock the daemon's TMPDIR may be a
-                // shared root — the worker gets its own so `mktemp`
-                // and friends stay inside the policy. And git reads
-                // `~/.gitconfig` fatally on EACCES: point the global
-                // config at the worker's file (seeded with the
-                // operator's identity — repo-local `user.*` still
-                // outranks it, empty is fine).
-                let dir = pi_worker_dir(&self.state_dir, &agent.alias)?;
-                let tmp = dir.join("tmp");
-                ensure_private_dir(&tmp)?;
-                seed_worker_gitconfig(&dir, &self.env)?;
-                env.push(("TMPDIR".to_string(), tmp.to_string_lossy().to_string()));
-                env.push((
-                    "GIT_CONFIG_GLOBAL".to_string(),
-                    dir.join("gitconfig").to_string_lossy().to_string(),
-                ));
+            if !master && want.starts_with("devin/") {
+                let source_root = self
+                    .env
+                    .var("XDG_CACHE_HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        self.env
+                            .var("HOME")
+                            .filter(|v| !v.is_empty())
+                            .map(|v| PathBuf::from(v).join(".cache"))
+                    })
+                    .ok_or_else(|| {
+                        Error::rejected("Offline Devin catalog source is unavailable")
+                    })?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| Error::rejected("Offline Devin catalog clock is unavailable"))?
+                    .as_millis();
+                let now = u64::try_from(now)
+                    .map_err(|_| Error::rejected("Offline Devin catalog clock is unavailable"))?;
+                devin_catalog::seed(
+                    &cache_dir,
+                    &source_root.join("pi-devin/models.json"),
+                    want,
+                    now,
+                )?;
             }
-        }
-        // No update checks or telemetry on any managed startup path.
+            if !master {
+                // CAD-544 worker: a private `PI_CODING_AGENT_DIR` under the
+                // state dir — auth arrives as the scoped file copy, never
+                // via env or argv; `~/.pi` is never inherited. An
+                // unattended worker must not stall on a git credential
+                // prompt, so GIT_TERMINAL_PROMPT=0.
+                let config = pi_worker_config_dir(&self.state_dir, &agent.alias)?;
+                let operator = crate::master::operator_provider_config(
+                    "pi",
+                    self.env.var("PI_CODING_AGENT_DIR"),
+                    self.env.var("HOME"),
+                );
+                if want.starts_with("agenticos/") {
+                    agenticos::seed(&config, &pi_config_dir(&self.state_dir), want)?;
+                } else if let Some(operator) = operator.as_deref() {
+                    copy_pi_auth(&config, operator)?;
+                } else {
+                    ensure_private_dir(&config)?;
+                }
+                env.push((
+                    "PI_CODING_AGENT_DIR".to_string(),
+                    config.to_string_lossy().to_string(),
+                ));
+                env.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
+                if confinement.is_some() {
+                    // CAD-556: under Landlock the daemon's TMPDIR may be a
+                    // shared root — the worker gets its own so `mktemp`
+                    // and friends stay inside the policy. And git reads
+                    // `~/.gitconfig` fatally on EACCES: point the global
+                    // config at the worker's file (seeded with the
+                    // operator's identity — repo-local `user.*` still
+                    // outranks it, empty is fine).
+                    let dir = pi_worker_dir(&self.state_dir, &agent.alias)?;
+                    let tmp = dir.join("tmp");
+                    ensure_private_dir(&tmp)?;
+                    seed_worker_gitconfig(&dir, &self.env)?;
+                    env.push(("TMPDIR".to_string(), tmp.to_string_lossy().to_string()));
+                    env.push((
+                        "GIT_CONFIG_GLOBAL".to_string(),
+                        dir.join("gitconfig").to_string_lossy().to_string(),
+                    ));
+                }
+            }
+            env
+        } else {
+            Vec::new()
+        }; // Helper privately derives protected HOME/env/cwd.
+           // No update checks or telemetry on any managed startup path.
         env.push(("PI_OFFLINE".to_string(), "1".to_string()));
         let idle_secs = params
             .get("turn_idle_secs")
@@ -2343,6 +2375,16 @@ impl ProviderAdapter for PiAdapter {
         // Keep all fallible post-launch work inside one cleanup boundary.
         *self.transport.write().unwrap() = Arc::clone(&transport);
         let initialized = (|| {
+            #[cfg(all(unix, target_os = "linux"))]
+            let pid = match protected {
+                Some(ctx) => {
+                    let routing = crate::protected_pi_profile::Routing::for_agent(master, want)
+                        .map_err(Error::rejected)?;
+                    transport.launch_protected(ctx, &routing, &self.log_path)?
+                }
+                None => transport.launch(&agent.cwd, &self.log_path, &env)?,
+            };
+            #[cfg(not(all(unix, target_os = "linux")))]
             let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
             // Effort: validate against the model's real levels, then verify
             // what stuck — Pi answers success even on a silent fallback.
@@ -2377,32 +2419,35 @@ impl ProviderAdapter for PiAdapter {
             }
             // An old/mocked runtime may not support the extension commands.
             // Ordinary queued turns remain compatible; native input is disabled.
-            let guard_ready = self
-                .checked("get_commands", json!({}))
-                .ok()
-                .is_some_and(|data| {
-                    data.get("commands")
-                        .and_then(Value::as_array)
-                        .is_some_and(|commands| {
-                            [
-                                "cadence-bind-turn",
-                                "cadence-steer-turn",
-                                "cadence-abandon-turn",
-                            ]
-                            .iter()
-                            .all(|name| {
-                                commands.iter().any(|command| {
-                                    command.get("name").and_then(Value::as_str) == Some(*name)
-                                        && command.get("source").and_then(Value::as_str)
-                                            == Some("extension")
-                                        && command
-                                            .pointer("/sourceInfo/path")
-                                            .and_then(Value::as_str)
-                                            == guard_path.to_str()
+            let guard_ready = guard_path.is_some()
+                && self
+                    .checked("get_commands", json!({}))
+                    .ok()
+                    .is_some_and(|data| {
+                        data.get("commands")
+                            .and_then(Value::as_array)
+                            .is_some_and(|commands| {
+                                [
+                                    "cadence-bind-turn",
+                                    "cadence-steer-turn",
+                                    "cadence-abandon-turn",
+                                ]
+                                .iter()
+                                .all(|name| {
+                                    commands.iter().any(|command| {
+                                        command.get("name").and_then(Value::as_str) == Some(*name)
+                                            && command.get("source").and_then(Value::as_str)
+                                                == Some("extension")
+                                            && command
+                                                .pointer("/sourceInfo/path")
+                                                .and_then(Value::as_str)
+                                                == guard_path
+                                                    .as_ref()
+                                                    .and_then(|path| path.to_str())
+                                    })
                                 })
                             })
-                        })
-                });
+                    });
             self.shared.guard_ready.store(guard_ready, Ordering::SeqCst);
             let state = self.request("get_state", json!({}))?;
             if state.get("success").and_then(Value::as_bool) != Some(true) {

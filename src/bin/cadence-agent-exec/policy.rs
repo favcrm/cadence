@@ -91,6 +91,8 @@ const ENV_NEVER_PREFIX: &[&str] = &["CADENCE_DEVIN_", "LD_", "PYTHON", "MALLOC_"
 /// `main.rs` executes it after the drop.
 #[derive(Debug)]
 pub enum Request {
+    /// Fixed protected profile, never arbitrary provider argv or --env.
+    PiGuest(crate::protected_pi_profile::Profile),
     /// `exec [--env K=V]… -- <argv…>` — spawn as the agent uid.
     Exec {
         env: Vec<(OsString, OsString)>,
@@ -119,6 +121,9 @@ pub fn parse(args: &[OsString]) -> Result<Request, String> {
         return Err(format!("an argument exceeds {MAX_ARG_BYTES} bytes"));
     }
     match args.first().map(|a| a.as_bytes()) {
+        Some(b"exec") if args.get(1).is_some_and(|a| a == "--profile") => {
+            crate::protected_pi_profile::Profile::parse(&args[1..]).map(Request::PiGuest)
+        }
         Some(b"exec") => parse_exec(&args[1..]),
         Some(b"kill") => parse_kill(&args[1..]),
         Some(b"inspect") => parse_inspect(&args[1..]),
