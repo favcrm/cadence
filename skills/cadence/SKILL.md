@@ -181,13 +181,15 @@ Verbs that wrap another program (`cadence test`, `build-slot`, attach) pass
 that program's own exit code through. `--help` and `--version` exit 0.
 
 A first `cadence login` against a hosted org creates the private
-`$XDG_CONFIG_HOME/cadence/remote-auth` directory itself (0700), then refuses
-with exit 3 until the operator pins the issuer: the refusal names the exact
-file and commands (`printf '%s\n' '<issuer>' > <auth-dir>/trusted-issuer &&
-chmod 600 …`). The pin is the operator's own trust decision — never create
-it for them, and never retry a pin refusal expecting it to pass. Bare
-`cadence login` records the remote org without moving the saved default;
-`--use` is what makes a remote org the default. Full steps:
+`${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth` directory itself
+(0700), then refuses with exit 3 until the operator pins the issuer: the
+refusal names the exact file and commands (`printf '%s\n' '<issuer>' >
+<auth-dir>/trusted-issuer && chmod 600 …`, values shell-quoted). The pin is
+the operator's own trust decision — never create it for them, and never
+retry a pin refusal expecting it to pass. A pin that exists but cannot be
+opened (symlink, permissions) refuses differently and prints no write
+command. Bare `cadence login` records the remote org without moving the
+saved default; `--use` is what makes a remote org the default. Full steps:
 `docs/REMOTE-AUTH.md` "First login on a fresh machine".
 
 ## Rules

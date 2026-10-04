@@ -47,6 +47,12 @@ fn is_service_source(source: &EnrollmentSource) -> bool {
 fn reject(message: &str) -> Error {
     Error::rejected(message)
 }
+/// Single-quote a value for a shell command the CLI only ever *prints*
+/// (the trusted-issuer remedy). `'` becomes `'\''` so a crafted
+/// `--auth-dir` or issuer cannot break out of the quotes.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
 fn now() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -607,21 +613,38 @@ fn private_dir(dir: &Path, create: bool) -> Result<()> {
 /// credential is ever transmitted. Enrollment never creates it.
 fn require_trusted_issuer(dir: &Path, issuer: &str) -> Result<()> {
     private_dir(dir, false)?;
-    let file = OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(dir.join(TRUSTED_ISSUER))
-        .map_err(|_| {
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // The pin is the operator's independent trust decision — the CLI
-            // never creates it. Name the exact file and the exact commands.
+            // never creates it. Name the exact file and the exact commands,
+            // every interpolated value shell-quoted so a crafted --auth-dir
+            // cannot break out of the printed command.
             let file = dir.join(TRUSTED_ISSUER);
-            Error::rejected(format!(
+            let file = file.display().to_string();
+            return Err(Error::rejected(format!(
                 "Trusted issuer pin is missing. Create it yourself, then retry: \
-                 printf '%s\\n' '{issuer}' > '{}' && chmod 600 '{}'",
-                file.display(),
-                file.display()
-            ))
-        })?;
+                 printf '%s\\n' {} > {} && chmod 600 {}",
+                shell_quote(issuer),
+                shell_quote(&file),
+                shell_quote(&file)
+            )));
+        }
+        // Anything else (a symlink the O_NOFOLLOW refused, EACCES, a dangling
+        // path component) is a refusal, not "missing": never print a write
+        // command against a path that may resolve somewhere else.
+        Err(error) => {
+            return Err(Error::rejected(format!(
+                "Trusted issuer pin at '{}' cannot be opened ({error}) — it must \
+                 be a regular file you own, mode 0600, not a symlink",
+                dir.join(TRUSTED_ISSUER).display()
+            )));
+        }
+    };
     let meta = file.metadata()?;
     if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
         return Err(reject("Trusted issuer pin must be a private owned file"));
@@ -3189,6 +3212,93 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    // --- CAD-1125: first-run pin refusals (review acceptance checks) ---
+
+    #[test]
+    fn missing_pin_refusal_names_the_shell_quoted_file_and_commands() {
+        // Fresh auth dir: login creates it, then the NotFound refusal
+        // carries the printf/chmod remedy against the exact pin path.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        let err = login_browser(
+            "http://127.0.0.1:1",
+            "ws_real",
+            "acme",
+            &dir,
+            |_, _| Ok(()),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        let file = dir.join(TRUSTED_ISSUER).display().to_string();
+        let quoted = shell_quote(&file);
+        assert!(err.contains("Trusted issuer pin is missing"), "{err}");
+        assert!(
+            err.contains(&format!("printf '%s\\n' 'http://127.0.0.1:1' > {quoted}")),
+            "{err}"
+        );
+        assert!(err.contains(&format!("chmod 600 {quoted}")), "{err}");
+        // The CLI created the private dir but must never create the pin.
+        assert!(dir.is_dir());
+        assert_eq!(dir.metadata().unwrap().mode() & 0o777, 0o700);
+        assert!(!dir.join(TRUSTED_ISSUER).exists());
+    }
+
+    #[test]
+    fn symlinked_pin_refuses_without_a_write_command() {
+        // ELOOP from O_NOFOLLOW is not "missing": the refusal must not print
+        // `printf > <pin>` — that command would clobber the symlink target.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let victim = root.path().join("victim");
+        fs::write(&victim, "keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join(TRUSTED_ISSUER)).unwrap();
+        let err = login_browser(
+            "http://127.0.0.1:1",
+            "ws_real",
+            "acme",
+            &dir,
+            |_, _| Ok(()),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("cannot be opened"), "{err}");
+        assert!(!err.contains("printf"), "{err}");
+        assert!(!err.contains("chmod"), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn auth_dir_with_a_quote_cannot_break_the_printed_command() {
+        // A crafted --auth-dir containing ' must not escape the single
+        // quotes in the printed remedy.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("it's");
+        let err = login_browser(
+            "http://127.0.0.1:1",
+            "ws_real",
+            "acme",
+            &dir,
+            |_, _| Ok(()),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        let file = dir.join(TRUSTED_ISSUER).display().to_string();
+        // The raw, unescaped path (with a bare ') never appears.
+        assert!(!err.contains(&format!(">{file}")), "{err}");
+        assert!(!err.contains(&format!("> '{file}'")), "{err}");
+        // The shell-quoted form does.
+        assert!(
+            err.contains(&format!("> {}", shell_quote(&file))),
+            "{err}"
+        );
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
     #[test]

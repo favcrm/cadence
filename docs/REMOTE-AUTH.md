@@ -95,8 +95,11 @@ trust decision:
 ```sh
 cadence login --issuer https://your-agenticos-api.example --org ws_company --slug company
 # → refused: "Trusted issuer pin is missing. Create it yourself, then retry: …"
-printf '%s\n' 'https://your-agenticos-api.example' > ~/.config/cadence/remote-auth/trusted-issuer
-chmod 600 ~/.config/cadence/remote-auth/trusted-issuer
+#   (the refusal prints the exact pin path — on this host it is
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth/trusted-issuer,
+#   or the --auth-dir you passed)
+printf '%s\n' 'https://your-agenticos-api.example' > "${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth/trusted-issuer"
+chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth/trusted-issuer"
 cadence login --issuer https://your-agenticos-api.example --org ws_company --slug company
 # → device code prompt; approve in the browser
 ```
