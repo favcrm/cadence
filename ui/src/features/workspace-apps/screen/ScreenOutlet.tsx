@@ -113,13 +113,32 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
   }, [scope]);
   useEffect(() => { channel.current?.update(projection); }, [projection]);
   return <>
-    <div aria-label="Installed app screen" style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "fallback" ? "none" : "block" }}>
+    <div aria-label="Installed app screen" style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
       <div ref={container} style={{ position: "absolute", inset: 0 }} />
       <ScreenSlotLayer view={slot} link={link} onDismissLink={() => setLink(null)}
         onTap={(token, trusted, at) => { channel.current?.tapSlot(token, trusted, at); }}
         onCancel={token => channel.current?.cancelSlot(token)} />
     </div>
-    {state === "loading" && <p role="status">Loading installed app…</p>}
+    {/* CAD-1137: a quiet first-mount skeleton, with the blank frame hidden until handshake readiness. */}
+    {state === "loading" && (
+      <div className="wa-skeleton" role="status" aria-label="Loading installed app" style={{ padding: "0.5rem 0.25rem" }}>
+        <span className="sr-only">Loading installed app…</span>
+        <div className="wa-skel-tabs">
+          {[3, 3.5, 4.5, 3.5].map((w, i) => (
+            <span key={i} className="wa-skel wa-skel-pulse" style={{ width: `${w}rem`, height: "0.85rem" }} />
+          ))}
+        </div>
+        <div className="wa-skel-board">
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} className="wa-skel-lane">
+              <span className="wa-skel wa-skel-pulse" style={{ width: "45%", height: "0.8rem" }} />
+              <span className="wa-skel wa-skel-pulse" style={{ width: "100%", height: "4.5rem" }} />
+              <span className="wa-skel wa-skel-pulse" style={{ width: "100%", height: "4.5rem" }} />
+            </div>
+          ))}
+        </div>
+      </div>
+    )}
     {state === "fallback" && fallback}
   </>;
 }
