@@ -17,37 +17,59 @@ paths = ["src/issue/blocked.rs", "src/issue/cli.rs", "src/issue/context.rs",
   "src/issue/summary.rs", "src/issue/sync.rs", "src/issue/time.rs", "src/issue/write.rs",
   "src/cli/issue.rs", "src/cli/milestone.rs", "src/cli/project.rs", "src/cli/status.rs",
   "src/cli/overview.rs", "src/cli/events.rs", "src/cli/help.rs",
-  "tests/board_issue.rs", "tests/tracker_issue.rs", "tests/issue_kickoff.rs",
-  "tests/fixtures/cli/**", "docs/**"]
+  "docs/**"]
 
-# Trigger 1: trust boundary and identity. Never delegable.
+# Trigger 1: trust boundary and identity. Never delegable. The
+# remote-CLI, board-auth and agent-exec modules are named too (they sit
+# under one-review-paths' src/daemon/**, src/bin/** and src/platform/**
+# excludes, so they already keep two reviews; naming them also keeps a
+# scope approval from covering them, CAD-1100).
 [trigger1]
 paths = ["src/peer.rs", "src/daemon.rs", "src/daemon/identity.rs",
   "src/daemon/caller_rule.rs", "src/daemon/slots_rpc.rs", "src/adapter/pty/**",
   "src/ui.rs", "src/ui/**", "ui/**", "src/operator_auth.rs", "src/tailnet_proof.rs",
-  "src/test_seam.rs", "src/master_perm.rs", "src/agent_uid.rs", "src/cli/agent_uid.rs"]
+  "src/test_seam.rs", "src/master_perm.rs", "src/agent_uid/**", "src/cli/agent_uid.rs",
+  "src/daemon/operator_rpc.rs", "src/daemon/supervisor_grant.rs",
+  "src/daemon/installer_enrollment_wire.rs", "src/platform/custody.rs",
+  "src/cli/platform.rs", "src/bin/cadence-agent-exec/**", "src/cli_actor.rs",
+  "src/board_identity.rs", "src/device_login.rs",
+  "src/remote_auth.rs", "src/remote_cli.rs", "src/remote_enrollment.rs"]
 
 # Trigger 2, schema and store version. Pre-approvable at ticket time.
 [schema]
 paths = ["src/store/schema.rs", "src/remote_result_outbox.rs"]
 
 # Trigger 3: secret handling, credentials, redaction. Never delegable.
+# The named modules are the redaction code outside src/secret/** (the
+# token/token-span scrubbers, CAD-1100); they sit outside
+# one-review-paths' excluded trees, so naming them is what keeps them on
+# the two-review path.
 [trigger3]
-paths = ["src/secret/**", "src/cli/secret.rs", "src/cli/connection.rs"]
+paths = ["src/secret/**", "src/cli/secret.rs", "src/cli/connection.rs",
+  "src/session.rs", "src/backup/mod.rs", "src/continuity.rs",
+  "src/doctor/host/util.rs", "src/issue/report.rs", "src/issue/areas.rs"]
 
-# Trigger 4: supply chain and CI. Never delegable.
+# Trigger 4: supply chain and CI. Never delegable. Build inputs are
+# covered at every depth (a package manifest, lockfile or toolchain pin
+# in any tree is supply chain), and so are nested CI/vcs config dirs
+# and config/** (CAD-1100).
 [trigger4]
 paths = ["Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml", ".cargo/**",
-  ".config/**", "**/package.json", "**/pnpm-lock.yaml", ".github/**", "scripts/**"]
+  ".config/**", "**/package.json", "**/pnpm-lock.yaml", ".github/**", "scripts/**",
+  "**/.github/**", "**/.cargo/**", "config/**",
+  "**/package-lock.json", "**/yarn.lock", "**/bun.lockb", "**/.npmrc",
+  "**/build.rs", "**/rust-toolchain.toml", "**/Cargo.toml", "**/Cargo.lock"]
 
 # Trigger 6: outward or fleet actions, installs and rollouts. Never delegable.
 [trigger6]
 paths = ["src/rollout.rs", "src/update.rs", "src/upgrade.rs", "src/cli/rollout.rs",
   "src/cli/daemon.rs", "src/cli/update.rs", "src/cli/upgrade.rs"]
 
-# Trigger 7: the rules, the gates, their inputs and their proofs. Never delegable.
+# Trigger 7: the rules, the gates, their inputs and their proofs. Never
+# delegable. tests/** is here because the safety floor proves the gates
+# themselves; the CAD-1073-retired test names were dropped (CAD-1100).
 [trigger7]
-paths = ["docs/roles/**", "docs/TEAM.md", "docs/CHARTER.md", "docs/AUDIT.md",
+paths = ["docs/roles/**", "docs/CHARTER.md", "docs/AUDIT.md",
   "docs/design/**", "docs/cadence/**", "docs/START-HERE.md",
   "docs/ARCHITECTURE.md", "docs/BOARD.md",
   "AGENTS.md", "cadence-review.toml", "clippy.toml", "src/review.rs", "src/review/**",
@@ -55,10 +77,7 @@ paths = ["docs/roles/**", "docs/TEAM.md", "docs/CHARTER.md", "docs/AUDIT.md",
   "src/daemon/approvals_rpc.rs", "src/store/events.rs", "src/overview.rs",
   "src/delivery.rs", "src/issue/delivery_policy.rs", "src/issue/model.rs",
   "src/issue/board.rs", "src/issue/parse.rs", "src/cli/audit.rs", "src/cli/mod.rs",
-  "scripts/**", "tests/scripts/**", "tests/common/**", "tests/split-map*.toml",
-  "tests/split_map_inventory.rs", "tests/ci_test_plan.rs", "tests/test_seam.rs",
-  "tests/audit_review.rs", "tests/delegated_approval.rs", "tests/fixtures/delegated-gh.py",
-  "tests/operator_lineage.rs", "tests/master_permission.rs", "tests/build_identity.rs"]
+  "scripts/**", "tests/**"]
 
 # Exactly the "Script allowlist (auto-eligible)" of risk-classes.md:
 # auto-eligible, never delegable.
