@@ -121,6 +121,25 @@ fn ordinary_descriptor_probe() {
         );
         return;
     }
+    // Seat the high descriptor even when the inherited soft limit is low.
+    // A host whose hard limit cannot support this evidence must fail explicitly,
+    // rather than reporting a sweep of a descriptor that was never opened.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    assert!(
+        limit.rlim_max > 70000,
+        "high-FD custody evidence unavailable: hard RLIMIT_NOFILE cannot seat fd 70000"
+    );
+    if limit.rlim_cur <= 70000 {
+        limit.rlim_cur = 70001;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    }
     let unrelated = File::open(root.join("node")).unwrap();
     assert_eq!(
         unsafe { libc::fcntl(unrelated.as_raw_fd(), libc::F_DUPFD, 70000) },
