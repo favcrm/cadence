@@ -113,6 +113,11 @@ export function useEmailDraft(
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  /** CAD-1146: undo history for structural block ops (add/move/delete).
+   *  Keystroke text edits never push — they ride `patch` directly — so
+   *  Undo restores the last block add/move/delete exactly. The history
+   *  is UI-local: saves, discards and clean doc syncs reset it. */
+  const blockHistory = useRef<EditorBlock[][]>([]);
 
   const dirty = doc !== null && !sameDraft(draft, baseline);
   const live = useRef({ dirty, doc });
@@ -130,10 +135,25 @@ export function useEmailDraft(
     setBaseline(next);
     setSource(doc.revision);
     setStale(false);
+    blockHistory.current = [];
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [identity]);
 
   const patch = (change: Partial<EmailDraft>) => setDraft((prev) => ({ ...prev, ...change }));
+
+  /** Structural block change (add/move/delete): undoable. */
+  const setBlocks = (blocks: EditorBlock[]) => {
+    blockHistory.current = [...blockHistory.current.slice(-29), draft.blocks];
+    patch({ blocks });
+  };
+
+  /** Restore the blocks from before the last structural change. */
+  const undoBlocks = () => {
+    const prev = blockHistory.current.pop();
+    if (prev !== undefined) patch({ blocks: prev });
+  };
+
+  const canUndo = blockHistory.current.length > 0;
 
   const discard = () => {
     const next = draftFromDoc(doc);
@@ -142,6 +162,7 @@ export function useEmailDraft(
     setSource(doc?.revision ?? 0);
     setStale(false);
     setError(null);
+    blockHistory.current = [];
   };
 
   const save = () => {
@@ -188,6 +209,7 @@ export function useEmailDraft(
         setBaseline(synced);
         setSource(next.revision);
         setStale(false);
+        blockHistory.current = [];
         onDoc(next);
         setNote(`Saved v${next.revision} — approval reset. The preview below is the host render.`);
       })
@@ -202,7 +224,7 @@ export function useEmailDraft(
       .finally(() => setSaving(false));
   };
 
-  return { draft, patch, dirty, stale, source, saving, error, note, save, discard };
+  return { draft, patch, setBlocks, undoBlocks, canUndo, dirty, stale, source, saving, error, note, save, discard };
 }
 
 export type EmailDraftApi = ReturnType<typeof useEmailDraft>;

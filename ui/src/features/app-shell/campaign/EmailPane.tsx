@@ -10,7 +10,7 @@ import {
   type ProposalRenderDoc,
 } from "../campaignGrammar";
 import { contentClient } from "../contentClient";
-import EmailBlocksCanvas from "./EmailBlocksCanvas";
+import EmailBlocksCanvas, { AddBlockTools, MAX_BLOCKS } from "./EmailBlocksCanvas";
 import ProposalStrip from "./ProposalStrip";
 import type { EmailDraftApi } from "./useEmailDraft";
 
@@ -33,6 +33,10 @@ const MODES: [Mode, string][] = [
  * (Visual), pasted HTML (HTML), an optional plain-text override
  * (Text) — and a sticky bar saves a new version. The host footer is
  * locked. `edit` is null for a read-only viewer.
+ * CAD-1146: Visual mode is the approved direct-visual canvas — the
+ * supported blocks are edited directly on the email with inline
+ * move/delete menus and undo; the preheader starts collapsed and the
+ * host render below stays the saved truth.
  */
 export default function EmailPane({
   scope,
@@ -121,6 +125,16 @@ export default function EmailPane({
   // Inline editing is for an operator on a saved email, never while a
   // proposal draft is on the stage.
   const editing = edit !== null && doc !== null && draft === null;
+  // CAD-1146: the optional preheader starts collapsed; hiding it never
+  // discards its value and never makes it required. A saved preheader
+  // opens the row on load so its value is never hidden silently.
+  const [preheaderOpen, setPreheaderOpen] = useState((doc?.preheader ?? "") !== "");
+  useEffect(() => {
+    if ((doc?.preheader ?? "") !== "") setPreheaderOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doc?.campaignId, doc?.revision]);
+  const editingBlocks =
+    editing && edit !== null && mode === "visual" && edit.draft.html === null;
 
   const stage = (() => {
     if (draft === null && doc === null) {
@@ -145,7 +159,7 @@ export default function EmailPane({
                   <span className="text-ink-500">Subject</span>
                   <input
                     id="cmp-subject"
-                    className="field"
+                    className="field crm-subject-direct"
                     value={edit.draft.subject}
                     onChange={(e) => edit.patch({ subject: e.target.value })}
                     maxLength={150}
@@ -153,19 +167,33 @@ export default function EmailPane({
                     disabled={edit.saving}
                   />
                 </label>
-                <label className="crm-env-row">
-                  <span className="text-ink-500">Preheader</span>
-                  <input
-                    id="cmp-preheader"
-                    className="field"
-                    value={edit.draft.preheader}
-                    onChange={(e) => edit.patch({ preheader: e.target.value })}
-                    maxLength={200}
-                    autoComplete="off"
-                    placeholder="Optional preview text"
-                    disabled={edit.saving}
-                  />
-                </label>
+                {preheaderOpen ? (
+                  <label className="crm-env-row">
+                    <span className="text-ink-500">Preheader</span>
+                    <input
+                      id="cmp-preheader"
+                      className="field crm-preheader-direct"
+                      value={edit.draft.preheader}
+                      onChange={(e) => edit.patch({ preheader: e.target.value })}
+                      maxLength={200}
+                      autoComplete="off"
+                      placeholder="Optional inbox preview text"
+                      disabled={edit.saving}
+                    />
+                  </label>
+                ) : null}
+                <button
+                  type="button"
+                  id="cmp-preheader-toggle"
+                  className="lnk crm-preheader-toggle"
+                  aria-expanded={preheaderOpen}
+                  aria-controls="cmp-preheader"
+                  disabled={edit.saving}
+                  onClick={() => setPreheaderOpen((open) => !open)}
+                >
+                  {preheaderOpen ? "− Hide preheader" : "+ Add preheader"}{" "}
+                  <span className="text-ink-500">(optional)</span>
+                </button>
               </>
             ) : (
               <>
@@ -190,25 +218,37 @@ export default function EmailPane({
               </span>
             </p>
           </div>
-          {editing && edit !== null && mode === "visual" && (
+          {editingBlocks && edit !== null && (
             <>
-              {edit.draft.html === null ? (
-                <EmailBlocksCanvas
-                  blocks={edit.draft.blocks}
-                  disabled={edit.saving}
-                  onChange={(blocks) => edit.patch({ blocks })}
-                />
-              ) : (
-                <p className="text-label text-ink-400 mt-2" data-state="html-body">
-                  This email&apos;s body is HTML — edit it in HTML mode. Blocks return only if
-                  you Discard or Apply an assistant draft.
-                </p>
-              )}
+              <EmailBlocksCanvas
+                blocks={edit.draft.blocks}
+                disabled={edit.saving}
+                brandName={shown !== null ? shown.sender.name : "Email"}
+                device={device}
+                canUndo={edit.canUndo}
+                onUndo={edit.undoBlocks}
+                onStructure={(blocks) => {
+                  if (blocks.length <= MAX_BLOCKS) edit.setBlocks(blocks);
+                }}
+                onText={(key, change) =>
+                  edit.patch({
+                    blocks: edit.draft.blocks.map((block) =>
+                      block.key === key ? { ...block, ...change } : block,
+                    ),
+                  })
+                }
+              />
               <p className="crm-footer-lock" data-host-footer>
                 🔒 host footer — the unsubscribe link and sender address are added by the host
                 and cannot be edited.
               </p>
             </>
+          )}
+          {editing && edit !== null && mode === "visual" && edit.draft.html !== null && (
+            <p className="text-label text-ink-400 mt-2" data-state="html-body">
+              This email&apos;s body is HTML — edit it in HTML mode. Blocks return only if
+              you Discard or Apply an assistant draft.
+            </p>
           )}
           {editing && edit !== null && mode === "html" && (
             <div className="grid gap-1 mt-2">
@@ -395,6 +435,17 @@ export default function EmailPane({
               </button>
             ))}
           </span>
+          {editingBlocks && edit !== null && (
+            <AddBlockTools
+              disabled={edit.saving || edit.draft.blocks.length >= MAX_BLOCKS}
+              full
+              onAdd={(block) => {
+                if (edit.draft.blocks.length < MAX_BLOCKS) {
+                  edit.setBlocks([...edit.draft.blocks, block]);
+                }
+              }}
+            />
+          )}
           <span className="crm-seg" role="group" aria-label="Preview width">
             {(["desktop", "mobile"] as Device[]).map((key) => (
               <button key={key} type="button" aria-pressed={device === key} data-device={key} onClick={() => setDevice(key)}>

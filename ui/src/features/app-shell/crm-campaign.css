@@ -311,6 +311,213 @@
   background: var(--color-ink-875);
 }
 
+/* CAD-1146 direct-visual email canvas (approved charcoal/teal
+   reference, board tokens for chrome). The email itself is a light
+   content surface — plain-text blocks only, never user HTML. */
+.crm-vcanvas {
+  display: grid;
+  gap: 0.5rem;
+}
+.crm-vemail {
+  color-scheme: light;
+  background: #fff;
+  color: #26332e;
+  width: 100%;
+  max-width: 40rem;
+  margin: 0 auto;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.25rem;
+  transition: max-width 0.2s;
+}
+.crm-vemail[data-device="mobile"] {
+  max-width: 23.5rem;
+}
+.crm-vbrand {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: #456457;
+  padding: 1.6rem 2rem 0;
+  overflow-wrap: anywhere;
+}
+.crm-vbody {
+  padding: 1.25rem 2rem 1rem;
+}
+.crm-vblock {
+  position: relative;
+}
+.crm-vedit {
+  outline: 0;
+  border-radius: 2px;
+  overflow-wrap: anywhere;
+}
+.crm-vedit:hover {
+  background: #f6f9f7;
+  box-shadow: 0 0 0 6px #f6f9f7;
+}
+.crm-vedit:focus {
+  background: #f3f9f6;
+  box-shadow: 0 0 0 6px #f3f9f6;
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.crm-vedit[data-placeholder]::before {
+  content: attr(data-placeholder);
+  color: #85988d;
+}
+.crm-vheading {
+  font-size: 1.6rem;
+  line-height: 1.3;
+  font-weight: 600;
+  color: #173b2b;
+  margin: 0 0 1rem;
+  min-height: 1.4em;
+}
+.crm-vparagraph {
+  font-size: 0.875rem;
+  line-height: 1.8;
+  margin: 0 0 1rem;
+  min-height: 1.5em;
+}
+.crm-vbutton-wrap {
+  display: grid;
+  gap: 0.1rem;
+  justify-items: start;
+  margin: 0 0 1rem;
+}
+.crm-vcta {
+  display: inline-block;
+  background: #234e3b;
+  color: #fff;
+  font-size: 0.75rem;
+  border-radius: 4px;
+  padding: 0.6rem 1.1rem;
+  min-width: 6rem;
+}
+.crm-vcta[data-placeholder]::before {
+  color: #cfe3d6;
+}
+.crm-vurl {
+  display: block;
+  width: 100%;
+  max-width: 24rem;
+  font-size: 0.75rem;
+  color: #365443;
+  background: #f1f7f3;
+  border: 1px solid #cddcd3;
+  border-radius: 4px;
+  padding: 0.3rem 0.5rem;
+  margin-top: 0.35rem;
+}
+.crm-vtools {
+  position: absolute;
+  top: 0.1rem;
+  right: 0.1rem;
+  z-index: 2;
+  display: flex;
+  gap: 0.2rem;
+  padding: 0.15rem;
+  background: #fff;
+  border: 1px solid #d2ded7;
+  border-radius: 0.375rem;
+  box-shadow: 0 4px 14px rgb(23 59 43 / 0.12);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.crm-vblock:hover .crm-vtools,
+.crm-vblock:focus-within .crm-vtools {
+  opacity: 1;
+}
+.crm-vtools button {
+  min-width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 0.25rem;
+  color: #527461;
+  font-size: 0.8rem;
+  line-height: 1;
+}
+.crm-vtools button:hover:not(:disabled) {
+  background: #e2efe7;
+}
+.crm-vtools button:disabled {
+  opacity: 0.35;
+}
+.crm-vtools button:focus-visible,
+.crm-vurl:focus-visible,
+.crm-addtools button:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.crm-vempty {
+  margin: 0;
+  padding: 1.5rem 0;
+  text-align: center;
+  font-size: 0.8rem;
+  color: #85988d;
+}
+.crm-vfoot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  max-width: 40rem;
+  margin: 0 auto;
+  width: 100%;
+}
+.crm-vhint {
+  margin: 0;
+  font-size: var(--text-micro);
+  color: var(--color-ink-400);
+}
+.crm-addtools {
+  display: inline-flex;
+  gap: 0.15rem;
+}
+.crm-addtools button {
+  height: 1.75rem;
+  padding: 0 0.6rem;
+  font-size: var(--text-micro);
+  color: var(--color-ink-300);
+  border-radius: 0.25rem;
+}
+.crm-addtools button:hover:not(:disabled) {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+.crm-addtools button:disabled {
+  opacity: 0.4;
+}
+.crm-subject-direct {
+  font-weight: 600;
+}
+.crm-preheader-toggle {
+  justify-self: start;
+  font-size: var(--text-micro);
+}
+@media (pointer: coarse) {
+  .crm-vtools {
+    opacity: 1;
+  }
+}
+@media (max-width: 52rem) {
+  .crm-vbrand {
+    padding: 1.25rem 1.25rem 0;
+  }
+  .crm-vbody {
+    padding: 1rem 1.25rem 0.75rem;
+  }
+  .crm-vheading {
+    font-size: 1.4rem;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .crm-vemail,
+  .crm-vtools {
+    transition: none;
+  }
+}
+
 /* Draft strip: view toggle and actions stay on one row at desktop; the
    technical-details disclosure sits inside the strip (CAD-1097). */
 .crm-strip-actions {
