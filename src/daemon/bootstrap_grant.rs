@@ -65,9 +65,11 @@ use crate::error::{Error, Result};
 // would be a claim a codec cannot back.
 
 /// The reviewed, image-pinned Ed25519 verifying keys for bootstrap grants —
-/// `"<kid>:<base64url-x>"` pairs, the ONLY trust root a grant signature may
-/// resolve against. Compiled in, bound to the protected-image build; a caller
-/// may never supply or override it. Empty this batch → no envelope verifies.
+/// raw 32-byte public keys, the ONLY trust root a grant signature may
+/// resolve against. Compiled in, bound to the protected-image build; a
+/// caller may never supply or override it. Empty this batch → no envelope
+/// verifies. (Raw bytes, not `kid:base64url` strings — the value feeds
+/// `ring`'s `ED25519` verifier directly.)
 const BOOTSTRAP_KEYRING: &[&[u8]] = &[];
 
 /// The signature domain — prepended to the signed body so a bootstrap grant
@@ -103,11 +105,13 @@ impl BootstrapOp {
 // ────────────────────── non-forgeable authority types ─────────────────────
 
 /// The fields a signed bootstrap grant covers — the body the signature
-/// proves. Private fields; produced only by the verification path, never a
-/// caller literal. The `peer_*`/`db_digest`/`incarnation` fields record what
-/// the supervisor certified; carrying them in a verified signature does NOT
-/// prove any process was measured or any file was hashed — those are future
-/// authority-path requirements, not facts this codec establishes.
+/// proves. Private fields; there is no caller literal and no caller-side
+/// setter. Note the scope precisely: a [`VerifiedBootstrap`] produced by
+/// `verify_grant_signature` proves ONLY that some keyring key signed these
+/// bytes — the `peer_*`/`db_digest`/`incarnation`/`deadline` fields are
+/// *claims the signature covers*, not evidence that any process was
+/// measured, any file was hashed at open, or any ledger/frontier advanced.
+/// No field here is validated against the live system by this module.
 #[derive(Clone, Debug)]
 pub(crate) struct BootstrapChallenge {
     /// The finite operation this grant is FOR — inside the signature, so a
@@ -255,7 +259,9 @@ pub(crate) fn canonical_challenge_bytes(c: &BootstrapChallenge) -> Result<Vec<u8
 /// handler that needs a `Commit` compares the verified `op()` against
 /// `BootstrapOp::Commit` and refuses otherwise — the signature already bound
 /// the operation, so the comparison can only ever *reject*, never grant.
-#[cfg(target_os = "linux")]
+///
+/// Portable: pure `ring` Ed25519 + this module's own encoding — no
+/// Linux-only API — so the function and its tests compile on every target.
 fn verify_grant_signature(
     challenge: &BootstrapChallenge,
     signature: &[u8],
@@ -282,8 +288,7 @@ fn verify_grant_signature(
 
 /// A caller-side operation check on an already-verified grant: the verified
 /// `op` must equal `expected`, else refuse. Reads the signed fact; never
-/// mutates it.
-#[cfg(target_os = "linux")]
+/// mutates it. Portable — a comparison, no OS call.
 fn require_op(verified: &VerifiedBootstrap, expected: BootstrapOp) -> Result<()> {
     if verified.op() != expected {
         return Err(Error::rejected(format!(
@@ -321,11 +326,14 @@ mod tests {
         )]
     }
 
-    /// The fail-closed contract this batch: with no provisioned supervisor
-    /// principal, ledger dir or launcher, every production factory and the
-    /// empty keyring refuse. `OpenMode::Protected` is unchanged — admission
-    /// cannot be conjured from this module. The guard is the *absence* of a
-    /// reachable authority, and it must hold until the real baseline exists.
+    /// The narrow fail-closed facts this batch actually covers: the two
+    /// production factories return `Err`, and a verify call with an EMPTY
+    /// keyring argument refuses even a correctly-formed signature. This does
+    /// NOT prove pin immutability, the compiled `BOOTSTRAP_KEYRING` wiring
+    /// (the test passes `&[]` explicitly, so populating the constant would
+    /// not turn it red) or the `store::seal` `Protected` preflight — those
+    /// are covered elsewhere or remain future work. It is a codec-level
+    /// empty-argument/factory refusal witness only.
     #[test]
     fn production_factories_and_empty_keyring_refuse() {
         assert!(production_bootstrap_keyring().is_err());
@@ -397,31 +405,85 @@ mod tests {
         assert!(verify_grant_signature(&c, forged.as_ref(), &keyring).is_err());
     }
 
+    /// The published canonical format, asserted against a *literal*
+    /// byte vector — independently specified, NOT computed by
+    /// `canonical_challenge_bytes`. Layout: `BOOTSTRAP_DOMAIN` bytes, the
+    /// op tag, `u32`-BE nonce length + nonce, `u32`-BE peer_pid, `u64`-BE
+    /// peer_starttime, the 32-byte exe digest, the 32-byte db digest,
+    /// `i64`-BE schema, `u32`-BE incarnation length + incarnation, `i64`-BE
+    /// deadline. This proves ONE specified vector — a witness that the
+    /// encoder emits exactly these bytes — not an exhaustive injectivity
+    /// proof over all inputs.
     #[test]
-    fn canonical_encoding_is_injective() {
-        // Two challenges differing in ANY field must encode to different
-        // bytes — length-prefixing means a field boundary can never be
-        // absorbed into a variable string. Check each field independently.
-        let base = challenge_for(BootstrapOp::Prepare);
-        let base_bytes = canonical_challenge_bytes(&base).unwrap();
-        // op inside the signature: a Commit differs at the op tag.
-        assert_ne!(
-            base_bytes,
-            canonical_challenge_bytes(&challenge_for(BootstrapOp::Commit)).unwrap()
+    fn canonical_challenge_matches_literal_wire_vector() {
+        let expected: &[u8] = &[
+            // "cadence.bootstrap-admission.v1"
+            0x63, 0x61, 0x64, 0x65, 0x6e, 0x63, 0x65, 0x2e, 0x62, 0x6f, 0x6f, 0x74, 0x73, 0x74,
+            0x72, 0x61, 0x70, 0x2d, 0x61, 0x64, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x2e,
+            0x76, 0x31, // op tag 1 = Prepare
+            0x01, // u32-BE nonce len 2 + "n1"
+            0x00, 0x00, 0x00, 0x02, 0x6e, 0x31, // u32-BE peer_pid 4242
+            0x00, 0x00, 0x10, 0x92, // u64-BE peer_starttime 7777
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1e, 0x61, // peer_exe_digest = [0xAB;32]
+            0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+            0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+            0xab, 0xab, 0xab, 0xab, // db_digest = [0xCD;32]
+            0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
+            0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
+            0xcd, 0xcd, 0xcd, 0xcd, // i64-BE schema 32
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x20, // u32-BE incarnation len 5 + "inc-1"
+            0x00, 0x00, 0x00, 0x05, 0x69, 0x6e, 0x63, 0x2d,
+            0x31, // i64-BE deadline 1800000000
+            0x00, 0x00, 0x00, 0x00, 0x6b, 0x49, 0xd2, 0x00,
+        ];
+        assert_eq!(
+            canonical_challenge_bytes(&challenge_for(BootstrapOp::Prepare)).unwrap(),
+            expected,
+            "the canonical encoding must equal the independently specified literal bytes"
         );
-        // nonce / incarnation / digests / deadline each change the bytes.
-        let mut v = base.clone();
-        v.nonce = "n2".into();
-        assert_ne!(base_bytes, canonical_challenge_bytes(&v).unwrap());
-        let mut v = base.clone();
-        v.incarnation = "inc-9".into();
-        assert_ne!(base_bytes, canonical_challenge_bytes(&v).unwrap());
-        let mut v = base.clone();
-        v.db_digest = [0xEE; 32];
-        assert_ne!(base_bytes, canonical_challenge_bytes(&v).unwrap());
-        let mut v = base.clone();
-        v.deadline_unix += 1;
-        assert_ne!(base_bytes, canonical_challenge_bytes(&v).unwrap());
+    }
+
+    /// Every field participates in the signed body: for EACH field, mutating
+    /// only that field changes the encoding. Unlike a same-encoder
+    /// comparison, each case here perturbs one field to a distinct literal
+    /// and asserts divergence — a witness that the byte for that field is
+    /// inside the digest domain, for every named field including the
+    /// peer/digest/schema fields the first matrix omitted.
+    #[test]
+    fn every_signed_field_changes_the_encoding() {
+        let base_bytes = canonical_challenge_bytes(&challenge_for(BootstrapOp::Prepare)).unwrap();
+        let differs = |mut c: BootstrapChallenge, f: &mut dyn FnMut(&mut BootstrapChallenge)| {
+            f(&mut c);
+            canonical_challenge_bytes(&c).unwrap() != base_bytes
+        };
+        assert!(differs(challenge_for(BootstrapOp::Prepare), &mut |c| c
+            .op =
+            BootstrapOp::Commit));
+        assert!(differs(challenge_for(BootstrapOp::Prepare), &mut |c| c
+            .nonce =
+            "n2".into()));
+        assert!(differs(challenge_for(BootstrapOp::Prepare), &mut |c| c
+            .peer_pid +=
+            1));
+        assert!(differs(challenge_for(BootstrapOp::Prepare), &mut |c| c
+            .peer_starttime +=
+            1));
+        assert!(differs(challenge_for(BootstrapOp::Prepare), &mut |c| c
+            .peer_exe_digest =
+            [0xEE; 32]));
+        assert!(differs(challenge_for(BootstrapOp::Prepare), &mut |c| c
+            .db_digest =
+            [0xEE; 32]));
+        assert!(differs(challenge_for(BootstrapOp::Prepare), &mut |c| c
+            .schema +=
+            1));
+        assert!(differs(challenge_for(BootstrapOp::Prepare), &mut |c| c
+            .incarnation =
+            "inc-9".into()));
+        assert!(differs(challenge_for(BootstrapOp::Prepare), &mut |c| c
+            .deadline_unix +=
+            1));
     }
 
     #[test]
