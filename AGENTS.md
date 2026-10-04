@@ -301,8 +301,35 @@ normal gates return. An agent or PR may not grant that exception to itself.
   is loaded, rerun that test alone before treating the failure as real.
 
 ### Pi agents and models (CAD-559)
-- Workers and reviewers run on `pi` with **devin** models — never
-  OpenRouter. Cost tiers per `devin models list` (the source of truth):
+- Workers and reviewers run on `pi` with **Devin** (`devin/*`) or the
+  configured **OpenCode Go subscription** (`opencode-go/*`) — never
+  OpenRouter. Honor an explicitly requested provider and model; do not
+  silently substitute another provider. If the requested model or its
+  authentication is unavailable, stop and report it. This provider choice
+  does not waive independent review, head-pinned verdicts, Browser QA,
+  operator approval or production-safety rules.
+- **OpenCode Go subscription:** the current Muse 1.3 id is
+  `opencode-go/muse-spark-1.3-contributor`; for example:
+  `cadence join <pm> pi --model opencode-go/muse-spark-1.3-contributor --effort xhigh`.
+  Confirm the exact id with `pi --list-models opencode-go`, then verify it
+  is permitted by the operator-owned `[pi].models` role allowlist and
+  available in the provider configuration the worker launcher loads.
+  Catalog visibility is not proof of authentication or a successful launch.
+  Report launch failures without substituting another provider. Use the
+  existing subscription; never read, print or copy its credentials into a
+  prompt, note or command. Subscription limits and usage apply; do not
+  describe OpenCode Go as free.
+- **Cursor through Pi remains blocked (CAD-603):** `cursor/*` model ids
+  may appear in Pi's catalog, but `src/pi_policy.rs::require_safe_transport`
+  rejects their unsafe argv prompt transport (process-argument exposure
+  and E2BIG). A subscription, model allowlist entry or this documentation
+  does not override that refusal. Do not remove or bypass the guard to
+  dispatch. Enabling Pi + Cursor requires a separately reviewed safe
+  transport implementation and its independent refusal acceptance check.
+  The native `cursor` adapter is a different route, not a silent substitute
+  for a Pi request; use it only when the operator explicitly requests it.
+- **Devin default when no provider is requested:** cost tiers per
+  `devin models list` (the source of truth for Devin):
   `swe-2-{high,medium,max}` are **Free**; `deepseek-v4-1-flash-*` is
   low cost ($0.22/1M in, $0.66/1M out), not free. The default worker
   model is `devin/swe-2-high` with `--effort max` (the SWE-2 Max
