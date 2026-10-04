@@ -96,6 +96,287 @@ pub(super) fn local_execution_contract(
 }
 
 impl Shared {
+    /// CAD-1123 HP2: create, approve and dispatch in one operator call. The
+    /// operator proof was taken by the caller. The approval is the daemon's
+    /// own: it binds exactly the snapshot digest this call just created.
+    fn start_app_run(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let install = required_str(params, "install_id")?;
+        let team = super::app_teams_rpc::team_of(&self.state_dir, install)?.ok_or_else(|| {
+            Error::rejected("installation has no default team; set one in Settings")
+        })?;
+        let expected = params
+            .get("expected_quotes")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| Error::rejected("expected_quotes is required"))?;
+        if params.get("inputs").is_some_and(|inputs| {
+            inputs
+                .as_object()
+                .is_none_or(|map| map.values().any(|v| !v.is_string()))
+        }) {
+            return Err(Error::rejected("inputs must be a string map"));
+        }
+        let created = self.create_app_run(params, Some(&team), Some(expected))?;
+        let id = created["id"]
+            .as_str()
+            .ok_or_else(|| Error::internal("created run has no id"))?
+            .to_string();
+        let mut run = created;
+        if run["state"] == "awaiting_approval" {
+            let digest = required_str(&run, "snapshot_digest")?.to_string();
+            let approved = self.with_app_run_current(&id, |bundle| {
+                self.store
+                    .app_run_decide(&id, Some(&digest), false, Some(bundle))
+            });
+            // A concurrent start of the same request may have approved first.
+            run = match approved {
+                Ok(value) => value,
+                Err(error) => {
+                    let shown = self.store.app_run_show(&id)?;
+                    if !matches!(shown["state"].as_str(), Some("approved" | "running")) {
+                        return Err(error);
+                    }
+                    shown
+                }
+            };
+        }
+        if matches!(run["state"].as_str(), Some("approved" | "running")) {
+            run = self.dispatch_app_run(&id)?;
+            self.auto_resume_tick();
+        }
+        Ok(run)
+    }
+
+    /// The one run-creation path: `app_run_create` (owner and workers named by
+    /// the caller) and `app_run_start` (owner and workers from the install's
+    /// default team, quotes checked against `expected`). Operator proof is the
+    /// caller's job.
+    pub(super) fn create_app_run(
+        &self,
+        params: &Value,
+        team: Option<&super::app_teams_rpc::Team>,
+        expected: Option<&Value>,
+    ) -> Result<Value> {
+        let owner_pm = match team {
+            Some(team) => team.owner_pm.clone(),
+            None => required_str(params, "owner_pm")?.to_string(),
+        };
+        if params.get("source_receipt_id").is_some() != params.get("selected_post_id").is_some() {
+            return Err(Error::rejected(
+                "source receipt and selected post must be supplied together",
+            ));
+        }
+        let id = required_str(params, "install_id")?;
+        let name = required_str(params, "workflow")?;
+        if !crate::issue::model::valid_tag(name) {
+            return Err(Error::rejected("invalid installed workflow name"));
+        }
+        let mut inputs: BTreeMap<String, String> =
+            serde_json::from_value(params.get("inputs").cloned().unwrap_or(json!({})))
+                .map_err(|_| Error::rejected("inputs must be a string map"))?;
+        let supplied_source = inputs.get("source").cloned();
+        if serde_json::to_vec(&inputs)
+            .map_err(|e| Error::internal(e.to_string()))?
+            .len()
+            > 32 * 1024
+        {
+            return Err(Error::rejected("inputs exceed encoded byte limit"));
+        }
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_runtime_snapshot(&pm, id, |row, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let text = files
+                .get(&format!("workflows/{name}.md"))
+                .ok_or_else(|| Error::rejected("workflow is not in this installed bundle"))?;
+            let manifest = crate::issue::app::parse_manifest(
+                files
+                    .get("app.md")
+                    .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
+            )?;
+            if manifest.app == "social-content" {
+                if name == "image-instagram" && params.get("source_receipt_id").is_none() {
+                    return Err(Error::rejected(
+                        "Instagram image run needs a selected source receipt",
+                    ));
+                }
+                if name == "image-manual" && params.get("source_receipt_id").is_some() {
+                    return Err(Error::rejected(
+                        "manual image run takes operator-pasted facts, not a receipt",
+                    ));
+                }
+            }
+            let template = crate::issue::workflow::parse_template(text)
+                .map_err(|_| Error::rejected("installed workflow declarations refused"))?;
+            if let Some(team) = team {
+                // The team is the only source of worker aliases: a
+                // caller-supplied value for a team role is a forgery.
+                for (role, alias) in &team.roles {
+                    if !template.inputs.contains_key(role) {
+                        continue;
+                    }
+                    if inputs.contains_key(role) {
+                        return Err(Error::rejected(
+                            "team roles come from the installation team, not the request",
+                        ));
+                    }
+                    inputs.insert(role.clone(), alias.clone());
+                }
+            }
+            let context = optional_str(params, "context_id")
+                .map(|context| self.store.app_context_proof(id, context))
+                .transpose()?;
+            if let Some((config, _)) = &context {
+                super::app_contexts_rpc::validate_defaults(files, &config.input_defaults)?;
+                let defaults: BTreeMap<_, _> = config
+                    .input_defaults
+                    .iter()
+                    .filter(|(key, _)| template.inputs.contains_key(*key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                crate::issue::workflow::check_context_defaults(text, &defaults)?;
+            }
+            let (resolved_inputs, input_origins) = freeze_content_inputs(
+                &template,
+                inputs,
+                context.as_ref().map(|(config, _)| config),
+            );
+            inputs = resolved_inputs;
+            if serde_json::to_vec(&inputs)
+                .map_err(|e| Error::internal(e.to_string()))?
+                .len()
+                > 32 * 1024
+            {
+                return Err(Error::rejected(
+                    "effective inputs exceed encoded byte limit",
+                ));
+            }
+            if let (Some(receipt), Some(post)) = (
+                optional_str(params, "source_receipt_id"),
+                optional_str(params, "selected_post_id"),
+            ) {
+                let line = self.store.app_selected_source_input(
+                    id,
+                    context.as_ref().map(|(_, proof)| proof.id.as_str()),
+                    receipt,
+                    post,
+                )?;
+                if supplied_source.as_ref().is_some_and(|value| value != &line) {
+                    return Err(Error::rejected(
+                        "supplied source differs from selected provider post",
+                    ));
+                }
+                inputs.insert("source".into(), line);
+            }
+            if manifest.app == "social-content"
+                && matches!(name, "image-instagram" | "image-manual")
+            {
+                crate::platform::agenticos_external::image_plan_preflight(
+                    &inputs,
+                    name == "image-manual",
+                )
+                .map_err(Error::rejected)?;
+            }
+            let workflow = LocalWorkflow::parse(text, &inputs).map_err(|error| {
+                if context.is_some() {
+                    Error::rejected("contextual workflow inputs refused")
+                } else {
+                    error
+                }
+            })?;
+            let binding = workflow
+                .publication_slot
+                .as_deref()
+                .map(|slot| {
+                    let manifest =
+                        crate::issue::app::parse_manifest(files.get("app.md").ok_or_else(
+                            || Error::rejected("installation manifest unavailable"),
+                        )?)?;
+                    if !manifest.capabilities.contains_key(slot) {
+                        return Err(Error::rejected(
+                            "workflow publication slot is not declared by this app",
+                        ));
+                    }
+                    self.app_binding_live(
+                        id,
+                        context.as_ref().map(|(_, proof)| proof.id.as_str()),
+                        slot,
+                        row,
+                        files,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            let mut capabilities = BTreeMap::new();
+            let mut quotes = BTreeMap::new();
+            for slot in &workflow.capability_slots {
+                let manifest = crate::issue::app::parse_manifest(
+                    files
+                        .get("app.md")
+                        .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
+                )?;
+                let declared = manifest.capabilities.get(slot).ok_or_else(|| {
+                    Error::rejected("run capability slot is not declared by installation")
+                })?;
+                if !matches!(declared.effect.as_str(), "read" | "draft") {
+                    return Err(Error::rejected("run capability slot must be read or draft"));
+                }
+                let proof = self
+                    .app_binding_live(
+                        id,
+                        context.as_ref().map(|(_, proof)| proof.id.as_str()),
+                        slot,
+                        row,
+                        files,
+                    )?
+                    .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
+                capabilities.insert(slot.clone(), proof);
+                quotes.insert(
+                    slot.clone(),
+                    self.app_capability_quote(capabilities.get(slot).unwrap())?,
+                );
+            }
+            if let Some(expected) = expected {
+                // The quote the host fetched when it drew the slot must
+                // be exactly the quote this run freezes (no slot, no
+                // extra slot, no different price or revision).
+                let frozen = json!(quotes);
+                if *expected != frozen {
+                    return Err(Error::rejected(
+                        "price_changed: capability price changed since the host quoted it",
+                    ));
+                }
+            }
+            self.store.app_run_create_with_capabilities(
+                LocalRunRequest {
+                    install_id: id,
+                    bundle_digest: row["digest"].as_str().unwrap(),
+                    workflow: &workflow,
+                    inputs: &inputs,
+                    request_id: required_str(params, "request_id")?,
+                    owner_pm: owner_pm.as_str(),
+                    project_link: optional_str(params, "project_link"),
+                },
+                context.as_ref().map(|(_, proof)| proof),
+                binding.as_ref(),
+                &capabilities,
+                &quotes,
+                LocalRunProvenance {
+                    selected_source: optional_str(params, "source_receipt_id")
+                        .zip(optional_str(params, "selected_post_id")),
+                    input_origins: &input_origins,
+                },
+            )
+        })
+    }
+}
+
+impl Shared {
     /// CAD-1119: an operator install or update is the consent for exactly
     /// the installed digest. Called only from the operator-gated catalog
     /// RPC after the bundle is committed; never from an agent path. The
@@ -151,6 +432,16 @@ impl Shared {
                 "context_id",
                 "source_receipt_id",
                 "selected_post_id",
+            ],
+            "app_run_start" => &[
+                "install_id",
+                "workflow",
+                "inputs",
+                "request_id",
+                "context_id",
+                "source_receipt_id",
+                "selected_post_id",
+                "expected_quotes",
             ],
             "app_run_approve" => &["run_id", "digest"],
             "app_run_cancel" | "app_run_dispatch" | "app_run_show" => &["run_id"],
@@ -223,198 +514,8 @@ impl Shared {
                     },
                 )
             }
-            "app_run_create" => {
-                if params.get("source_receipt_id").is_some()
-                    != params.get("selected_post_id").is_some()
-                {
-                    return Err(Error::rejected(
-                        "source receipt and selected post must be supplied together",
-                    ));
-                }
-                let id = required_str(params, "install_id")?;
-                let name = required_str(params, "workflow")?;
-                if !crate::issue::model::valid_tag(name) {
-                    return Err(Error::rejected("invalid installed workflow name"));
-                }
-                let mut inputs: BTreeMap<String, String> =
-                    serde_json::from_value(params.get("inputs").cloned().unwrap_or(json!({})))
-                        .map_err(|_| Error::rejected("inputs must be a string map"))?;
-                let supplied_source = inputs.get("source").cloned();
-                if serde_json::to_vec(&inputs)
-                    .map_err(|e| Error::internal(e.to_string()))?
-                    .len()
-                    > 32 * 1024
-                {
-                    return Err(Error::rejected("inputs exceed encoded byte limit"));
-                }
-                let pm = self.pm_at(&self.pm_dir()?)?;
-                workspace::with_runtime_snapshot(&pm, id, |row, files| {
-                    let _custody = self
-                        .platform_custody_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let _release = self
-                        .app_release_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let text = files.get(&format!("workflows/{name}.md")).ok_or_else(|| {
-                        Error::rejected("workflow is not in this installed bundle")
-                    })?;
-                    let manifest =
-                        crate::issue::app::parse_manifest(files.get("app.md").ok_or_else(
-                            || Error::rejected("installation manifest unavailable"),
-                        )?)?;
-                    if manifest.app == "social-content" {
-                        if name == "image-instagram" && params.get("source_receipt_id").is_none() {
-                            return Err(Error::rejected(
-                                "Instagram image run needs a selected source receipt",
-                            ));
-                        }
-                        if name == "image-manual" && params.get("source_receipt_id").is_some() {
-                            return Err(Error::rejected(
-                                "manual image run takes operator-pasted facts, not a receipt",
-                            ));
-                        }
-                    }
-                    let template = crate::issue::workflow::parse_template(text)
-                        .map_err(|_| Error::rejected("installed workflow declarations refused"))?;
-                    let context = optional_str(params, "context_id")
-                        .map(|context| self.store.app_context_proof(id, context))
-                        .transpose()?;
-                    if let Some((config, _)) = &context {
-                        super::app_contexts_rpc::validate_defaults(files, &config.input_defaults)?;
-                        let defaults: BTreeMap<_, _> = config
-                            .input_defaults
-                            .iter()
-                            .filter(|(key, _)| template.inputs.contains_key(*key))
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect();
-                        crate::issue::workflow::check_context_defaults(text, &defaults)?;
-                    }
-                    let (resolved_inputs, input_origins) = freeze_content_inputs(
-                        &template,
-                        inputs,
-                        context.as_ref().map(|(config, _)| config),
-                    );
-                    inputs = resolved_inputs;
-                    if serde_json::to_vec(&inputs)
-                        .map_err(|e| Error::internal(e.to_string()))?
-                        .len()
-                        > 32 * 1024
-                    {
-                        return Err(Error::rejected(
-                            "effective inputs exceed encoded byte limit",
-                        ));
-                    }
-                    if let (Some(receipt), Some(post)) = (
-                        optional_str(params, "source_receipt_id"),
-                        optional_str(params, "selected_post_id"),
-                    ) {
-                        let line = self.store.app_selected_source_input(
-                            id,
-                            context.as_ref().map(|(_, proof)| proof.id.as_str()),
-                            receipt,
-                            post,
-                        )?;
-                        if supplied_source.as_ref().is_some_and(|value| value != &line) {
-                            return Err(Error::rejected(
-                                "supplied source differs from selected provider post",
-                            ));
-                        }
-                        inputs.insert("source".into(), line);
-                    }
-                    if manifest.app == "social-content"
-                        && matches!(name, "image-instagram" | "image-manual")
-                    {
-                        crate::platform::agenticos_external::image_plan_preflight(
-                            &inputs,
-                            name == "image-manual",
-                        )
-                        .map_err(Error::rejected)?;
-                    }
-                    let workflow = LocalWorkflow::parse(text, &inputs).map_err(|error| {
-                        if context.is_some() {
-                            Error::rejected("contextual workflow inputs refused")
-                        } else {
-                            error
-                        }
-                    })?;
-                    let binding = workflow
-                        .publication_slot
-                        .as_deref()
-                        .map(|slot| {
-                            let manifest = crate::issue::app::parse_manifest(
-                                files.get("app.md").ok_or_else(|| {
-                                    Error::rejected("installation manifest unavailable")
-                                })?,
-                            )?;
-                            if !manifest.capabilities.contains_key(slot) {
-                                return Err(Error::rejected(
-                                    "workflow publication slot is not declared by this app",
-                                ));
-                            }
-                            self.app_binding_live(
-                                id,
-                                context.as_ref().map(|(_, proof)| proof.id.as_str()),
-                                slot,
-                                row,
-                                files,
-                            )
-                        })
-                        .transpose()?
-                        .flatten();
-                    let mut capabilities = BTreeMap::new();
-                    let mut quotes = BTreeMap::new();
-                    for slot in &workflow.capability_slots {
-                        let manifest =
-                            crate::issue::app::parse_manifest(files.get("app.md").ok_or_else(
-                                || Error::rejected("installation manifest unavailable"),
-                            )?)?;
-                        let declared = manifest.capabilities.get(slot).ok_or_else(|| {
-                            Error::rejected("run capability slot is not declared by installation")
-                        })?;
-                        if !matches!(declared.effect.as_str(), "read" | "draft") {
-                            return Err(Error::rejected(
-                                "run capability slot must be read or draft",
-                            ));
-                        }
-                        let proof = self
-                            .app_binding_live(
-                                id,
-                                context.as_ref().map(|(_, proof)| proof.id.as_str()),
-                                slot,
-                                row,
-                                files,
-                            )?
-                            .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
-                        capabilities.insert(slot.clone(), proof);
-                        quotes.insert(
-                            slot.clone(),
-                            self.app_capability_quote(capabilities.get(slot).unwrap())?,
-                        );
-                    }
-                    self.store.app_run_create_with_capabilities(
-                        LocalRunRequest {
-                            install_id: id,
-                            bundle_digest: row["digest"].as_str().unwrap(),
-                            workflow: &workflow,
-                            inputs: &inputs,
-                            request_id: required_str(params, "request_id")?,
-                            owner_pm: required_str(params, "owner_pm")?,
-                            project_link: optional_str(params, "project_link"),
-                        },
-                        context.as_ref().map(|(_, proof)| proof),
-                        binding.as_ref(),
-                        &capabilities,
-                        &quotes,
-                        LocalRunProvenance {
-                            selected_source: optional_str(params, "source_receipt_id")
-                                .zip(optional_str(params, "selected_post_id")),
-                            input_origins: &input_origins,
-                        },
-                    )
-                })
-            }
+            "app_run_create" => self.create_app_run(params, None, None),
+            "app_run_start" => self.start_app_run(params),
             "app_run_approve" => {
                 let id = required_str(params, "run_id")?;
                 self.with_app_run_current(id, |current_bundle| {
@@ -629,6 +730,10 @@ impl Shared {
 
 #[cfg(test)]
 mod cad1120_tests;
+#[cfg(test)]
+mod cad1123_acceptance;
+#[cfg(test)]
+mod cad1123_tests;
 
 #[cfg(test)]
 mod cad742_tests {

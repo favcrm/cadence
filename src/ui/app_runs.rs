@@ -14,6 +14,10 @@ const ARTIFACT_CAP: usize = 256 * 1024;
 #[derive(Clone, Copy)]
 pub(super) enum Route<'a> {
     Create,
+    /// CAD-1123: create + approve + dispatch from the install team.
+    Start,
+    /// CAD-1123: the install's default team (GET shows, POST sets).
+    Team(&'a str),
     List,
     Show(&'a str),
     Artifact(&'a str),
@@ -46,6 +50,9 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         }
         return segment(tail).then_some(Route::CapabilityResult(tail));
     }
+    if path == "/api/app-runs/start" {
+        return Some(Route::Start);
+    }
     if let Some(tail) = path.strip_prefix("/api/app-runs/") {
         if let Some((id, verb)) = tail.split_once('/') {
             if !segment(id) {
@@ -69,6 +76,7 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     match verb {
         "approve" => Some(Route::InstallDecision(id, true)),
         "revoke" => Some(Route::InstallDecision(id, false)),
+        "team" => Some(Route::Team(id)),
         _ => None,
     }
 }
@@ -82,6 +90,7 @@ impl Route<'_> {
                 | Self::CapabilityResults(_)
                 | Self::CapabilityResult(_)
                 | Self::CapabilityAsset(_)
+                | Self::Team(_)
         )
     }
 }
@@ -105,6 +114,32 @@ struct Create {
     source_receipt_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     selected_post_id: Option<String>,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Start {
+    install_id: String,
+    workflow: String,
+    inputs: BTreeMap<String, String>,
+    request_id: String,
+    expected_quotes: serde_json::Map<String, Value>,
+    #[serde(
+        default,
+        deserialize_with = "present_context",
+        skip_serializing_if = "Option::is_none"
+    )]
+    context_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_receipt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_post_id: Option<String>,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TeamSet {
+    owner_pm: String,
+    roles: BTreeMap<String, String>,
+    expected_revision: u64,
 }
 fn present_context<'de, D>(de: D) -> Result<Option<String>, D::Error>
 where
@@ -166,6 +201,7 @@ pub(super) fn handle(
     } else {
         route
     };
+
     let params = match query(request, matches!(route, Route::List)) {
         Ok(value) => value,
         Err(response) => return response,
@@ -190,6 +226,34 @@ pub(super) fn handle(
                 "app_run_create",
                 serde_json::to_value(value).expect("typed create serializes"),
             )
+        }
+        Route::Start => {
+            let bytes = match read_body(request, BODY_CAP) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            let value: Start = match parse_json(&bytes) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            (
+                "app_run_start",
+                serde_json::to_value(value).expect("typed start serializes"),
+            )
+        }
+        Route::Team(id) if !write => ("app_install_team_show", json!({"install_id":id})),
+        Route::Team(id) => {
+            let bytes = match read_body(request, BODY_CAP) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            let value: TeamSet = match parse_json(&bytes) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let mut params = serde_json::to_value(value).expect("typed team serializes");
+            params["install_id"] = json!(id);
+            ("app_install_team_set", params)
         }
         Route::InstallDecision(id, _) | Route::RunDecision(id) => {
             let bytes = match read_body(request, BODY_CAP) {
@@ -304,6 +368,39 @@ mod tests {
         ] {
             assert!(route(path).is_none(), "route admitted {path}");
         }
+    }
+
+    #[test]
+    fn start_and_team_routes_are_exact_and_start_is_write_only() {
+        assert!(matches!(route("/api/app-runs/start"), Some(Route::Start)));
+        assert!(!route("/api/app-runs/start").unwrap().is_read());
+        assert!(matches!(
+            route("/api/app-installations/install-a/team"),
+            Some(Route::Team("install-a"))
+        ));
+        for path in [
+            "/api/app-runs/start/x",
+            "/api/app-installations/install-a/team/x",
+            "/api/app-installations//team",
+        ] {
+            assert!(route(path).is_none(), "route admitted {path}");
+        }
+        // The frame-facing request carries no owner, project or role fields.
+        for body in [
+            r#"{"install_id":"i","workflow":"w","inputs":{},"request_id":"r","expected_quotes":{},"owner_pm":"p"}"#,
+            r#"{"install_id":"i","workflow":"w","inputs":{},"request_id":"r","expected_quotes":{},"project_link":"x"}"#,
+            r#"{"install_id":"i","workflow":"w","inputs":{},"request_id":"r"}"#,
+        ] {
+            assert!(serde_json::from_str::<Start>(body).is_err(), "{body}");
+        }
+        assert!(serde_json::from_str::<Start>(
+            r#"{"install_id":"i","workflow":"w","inputs":{},"request_id":"r","expected_quotes":{}}"#
+        )
+        .is_ok());
+        assert!(serde_json::from_str::<TeamSet>(
+            r#"{"owner_pm":"p","roles":{},"expected_revision":0,"install_id":"other"}"#
+        )
+        .is_err());
     }
 
     #[test]

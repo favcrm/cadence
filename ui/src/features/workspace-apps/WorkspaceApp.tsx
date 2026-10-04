@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Agent } from "../../lib/types";
 import type { Viewer } from "../projects/work";
 import { ApiError } from "../../lib/api";
@@ -21,6 +21,7 @@ import { ImageReceiptPanel, imageSubject, type VerifiedImage } from "./ImageRece
 import { plainTitle, runLane, statusText, statusTone } from "./presentation";
 import { SlotBindings } from "./SlotBindings";
 import { ReadinessPanel } from "./ReadinessPanel";
+import { TeamSettings } from "./TeamSettings";
 import { declaredSlots } from "./bindingChoices";
 import {
   workspaceApps,
@@ -41,6 +42,7 @@ import { forgetContext, initialContext, rememberedContext, rememberContext } fro
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
 import ScreenHost from "./screen/ScreenHost";
+import { makePlanner, runCall, type ActionContext } from "./screen/screenActions";
 import { useScreenExtras } from "./screen/useScreenExtras";
 import { screenTag, screenProjection, settleIntentRead, type IntentRead } from "./screen/screenProjection";
 import { socialPublish } from "./socialPublish";
@@ -316,6 +318,21 @@ export default function WorkspaceApp({
     runs: data?.runs ?? [], bindings: data?.bindings ?? [], workers: data ? workers.length : null,
     onDenied: clearPrivate,
   });
+  // CAD-1123 HP3: the verbs a mounted screen may use, only for the operator's
+  // writable view. The context is read when a verb runs, so it is never stale;
+  // a scope change remounts the frame and retires any live slot.
+  const actionCtx = useRef<ActionContext | null>(null);
+  actionCtx.current = data && data.installation.install_id === installId && !accessDenied
+    ? { installation: data.installation, installId, contextId, runs: data.runs, onChanged: () => { void refresh(); } } : null;
+  const screenActions = useMemo(() => viewer.operator && !viewer.readOnly ? {
+    call: (verb: Parameters<typeof runCall>[1], args: Record<string, unknown>, ui: Parameters<typeof runCall>[3]) =>
+      actionCtx.current ? runCall(actionCtx.current, verb, args, ui)
+        : Promise.resolve({ ok: false as const, refusal: { code: "denied", text: "Only the operator can do that." } }),
+    planner: makePlanner(() => {
+      if (!actionCtx.current) throw new Error("no scope");
+      return actionCtx.current;
+    }),
+  } : undefined, [viewer.operator, viewer.readOnly]);
   const managers = agents.filter(
     (agent) => agent.role === "pm" && !agent.dead && !agent.fenced,
   );
@@ -561,7 +578,7 @@ export default function WorkspaceApp({
     catch { /* Oversized/unavailable scope retains the existing native outlet. */ }
   }
   const screen = (fallback: React.ReactNode) => projection
-    ? <ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} /> : fallback;
+    ? <ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} actions={screenActions} /> : fallback;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
@@ -864,6 +881,14 @@ export default function WorkspaceApp({
                       });
                     })
                   }
+                />
+                <TeamSettings
+                  installation={data.installation}
+                  managers={managers}
+                  workers={workers}
+                  canWrite={canWrite}
+                  busy={busy}
+                  mutate={mutate}
                 />
                 <SlotBindings
                   installId={installId}

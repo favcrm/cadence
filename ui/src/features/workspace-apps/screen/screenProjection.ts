@@ -1,6 +1,6 @@
-import type { Installation, AppContext, WorkspaceRun, AppEffect, AppBinding, CapabilityQuote, SourceReceipt } from "../workspaceApps";
+import type { Installation, AppContext, WorkspaceRun, AppEffect, AppBinding, SourceReceipt } from "../workspaceApps";
 import { PUBLISH_LIST_CAP, type PublishIntent } from "../socialPublish";
-import { shapeFor, type ScreenDefaults, type ScreenIntent, type ScreenIntents, type ScreenPrice, type ScreenPush,
+import { ACTION_VERBS, shapeFor, type ScreenDefaults, type ScreenIntent, type ScreenIntents, type ScreenPush,
   type ScreenRefusal, type ScreenRunV2, type ScreenSourcePost, type ScreenSources } from "./screenProtocol";
 
 /** The verified `socialPublish.list` read, tagged with the scope it was
@@ -103,8 +103,6 @@ export interface ScreenExtras {
   bindings: AppBinding[];
   /** Registered enabled workers; `null` while unknown. */
   workers: number | null;
-  /** Current quotes by slot for this scope. */
-  quotes: Record<string, CapabilityQuote["quote"]>;
   /** The newest finished read-slot run's results; `undefined` while loading,
    *  `null` when the read failed. */
   source?: { runId: string; receipts: SourceReceipt[] } | null;
@@ -116,7 +114,6 @@ const RATIONALE_MAX = 280;
 const POSTS_MAX = 24;
 const STEPS_MAX = 16;
 const KEYS_MAX = 16;
-const SLOTS_MAX = 8;
 /** The wire grammars the package adapter (screen-v2.mjs) checks. */
 const CODE = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
 const KEY = /^[a-z_][a-z0-9_]{0,63}$/;
@@ -147,29 +144,8 @@ export const instagramLink = (value: string | null | undefined) =>
 /** A source thumbnail: https on the Instagram CDN hosts the frame CSP can admit. */
 export const instagramThumb = (value: string | null | undefined) =>
   httpsOn(value, host => host.endsWith(".cdninstagram.com") || host.endsWith(".fbcdn.net"));
-/** Integer micros → the shortest exact decimal string ("60000" → "0.06"). */
-function decimal(micros: number): string {
-  const whole = Math.floor(micros / 1_000_000);
-  const frac = String(micros % 1_000_000).padStart(6, "0").replace(/0+$/, "");
-  return frac ? `${whole}.${frac}` : String(whole);
-}
-function priceOf(quote: CapabilityQuote["quote"] | undefined): ScreenPrice | null {
-  if (!quote || quote.schema !== 1 || typeof quote.currency !== "string" || !/^[A-Z]{3}$/.test(quote.currency) ||
-      !Number.isSafeInteger(quote.total_price_micros) || quote.total_price_micros < 0 ||
-      quote.total_price_micros >= 1e15) return null;
-  return { amount: decimal(quote.total_price_micros), currency: quote.currency };
-}
-function prices(quotes: Record<string, CapabilityQuote["quote"]> | undefined, slots?: Set<string>): Record<string, ScreenPrice> {
-  const out: Record<string, ScreenPrice> = {};
-  for (const [slot, quote] of Object.entries(quotes ?? {})) {
-    if (Object.keys(out).length >= SLOTS_MAX || !SLOT.test(slot) || (slots && !slots.has(slot))) continue;
-    const price = priceOf(quote);
-    if (price) out[slot] = price;
-  }
-  return out;
-}
 /** The input names an installed workflow marks `context_default`. */
-function contextDefaultKeys(installation: Installation, workflow?: string): Map<string, string | null> {
+export function contextDefaultKeys(installation: Installation, workflow?: string): Map<string, string | null> {
   const keys = new Map<string, string | null>();
   for (const flow of installation.workflows ?? []) {
     if (workflow !== undefined && flow.name !== workflow) continue;
@@ -221,7 +197,6 @@ function runV2(run: WorkspaceRun, installation: Installation, extras: ScreenExtr
     ? (lastReview?.decision === "revise" ? refusalOf("review_revise", lastReview.rationale) : null) ??
       { code: "step_failed", text: failedStep ? `Step ${text(failedStep.step_id, 32)} (${text(kinds.get(failedStep.step_id) ?? "step", 64)}) did not finish.` : "The run did not finish." }
     : run.state === "cancelled" ? { code: "cancelled", text: "The run was cancelled." } : null;
-  const runPrice = prices(run.snapshot.quotes);
   const postId = run.snapshot.source?.post?.id;
   const workflow = present({ name: flow && SLOT.test(flow.name) ? flow.name : null,
     kind: slots.length > 0 && effects.every(effect => effect === "read") ? "read" : "draft" });
@@ -235,7 +210,6 @@ function runV2(run: WorkspaceRun, installation: Installation, extras: ScreenExtr
     caption_excerpt: typeof excerpt === "string" ? text(excerpt, EXCERPT_MAX) : null,
     artifact_id: artifact && isId(artifact.id) ? artifact.id : null,
     review: lastReview ? { decision: text(lastReview.decision, 32), rationale: text(lastReview.rationale, RATIONALE_MAX) } : null,
-    price: Object.keys(runPrice).length ? runPrice : null,
     approved: run.approval && typeof run.approval.by === "string" && epoch(run.approval.at) !== null
       ? { by_display: run.approval.by === "operator" ? "Operator" : text(run.approval.by, 64), at: run.approval.at } : null,
     source_post_id: typeof postId === "string" && isId(postId) ? postId : null,
@@ -329,10 +303,10 @@ export function screenProjection(installation: Installation, tag: string, contex
       new Map(scopedRuns.map(r => [r.id, r.context_id ?? ""])), true),
     ...present({ sources: sourcesOf(installation, scopedRuns, scoped) }),
     defaults: defaultsOf(installation, active.find(c => c.id === contextId)),
-    prices: prices(scoped?.quotes, new Set(Object.entries(installation.capabilities ?? {})
-      .filter(([, slot]) => slot.effect === "read" || slot.effect === "draft").map(([name]) => name))),
     readiness: readinessOf(installation, contextId, scoped),
-    actions: [],
+    // Verbs only a viewer with the operator's board reads may use; the daemon
+    // re-proves the operator on every spend. No price is ever pushed.
+    actions: scoped ? [...ACTION_VERBS] : [],
     now: Math.floor(Date.now() / 1000),
   };
   // The base CAD-1006 shape must fit; each child's own shape is re-checked at send.

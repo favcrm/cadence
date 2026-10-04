@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "../../../lib/api";
-import { workspaceApps, type AppBinding, type CapabilityQuote, type Installation, type WorkspaceRun } from "../workspaceApps";
+import { workspaceApps, type AppBinding, type Installation, type WorkspaceRun } from "../workspaceApps";
 import { latestSourceRun, type ScreenExtras } from "./screenProjection";
 import { downscaleToDataUrl } from "./screenAssets";
 import type { AssetLoader } from "./screenLifecycle";
@@ -9,8 +9,8 @@ import type { AssetLoader } from "./screenLifecycle";
 const EXCERPT_RUNS = 32;
 
 /**
- * CAD-1123 HP1 — the board-held reads behind the screen.v2 projection:
- * current quotes for the bound read/draft slots, the newest finished
+  * CAD-1123 HP1 — the board-held reads behind the screen.v2 projection:
+ * the newest finished
  * read-slot run's results, and reviewer-approved caption text. Each read
  * is operator-only on the board and tagged with the scope it served; the
  * projection ignores a read for any other scope. Also the image loader
@@ -29,30 +29,7 @@ export function useScreenExtras(args: {
   const scopedRuns = useMemo(() => runs.filter(run => run.install_id === installId &&
     (!contextId || run.context_id === contextId)), [runs, installId, contextId]);
 
-  // Quotes for the bound read and draft slots of this scope.
-  const priced = useMemo(() => installation ? Object.entries(installation.capabilities ?? {})
-    .filter(([slot, decl]) => (decl.effect === "read" || decl.effect === "draft") && bindings.some(b =>
-      b.slot === slot && (b.context_id ?? "") === contextId && b.state === "configured" &&
-      b.config.bundle_digest === installation.digest))
-    .map(([slot]) => slot).sort() : [], [installation, bindings, contextId]);
-  const pricedKey = priced.join(",");
-  const [quotes, setQuotes] = useState<{ scope: string; quotes: Record<string, CapabilityQuote["quote"]> }>({ scope: "", quotes: {} });
   const scope = JSON.stringify([installId, contextId]);
-  useEffect(() => {
-    if (!enabled || !pricedKey) return;
-    const controller = new AbortController();
-    const read = () => {
-      void Promise.all(pricedKey.split(",").map(slot => workspaceApps.bindingQuote(installId, slot, contextId || undefined, controller.signal)
-        .then(reply => [slot, reply.quote] as const).catch((error: unknown) => { refuse(error); return null; })))
-        .then(rows => {
-          if (controller.signal.aborted) return;
-          setQuotes({ scope, quotes: Object.fromEntries(rows.filter((row): row is readonly [string, CapabilityQuote["quote"]] => !!row)) });
-        });
-    };
-    read();
-    const timer = window.setInterval(() => { if (document.visibilityState !== "hidden") read(); }, 60000);
-    return () => { controller.abort(); window.clearInterval(timer); };
-  }, [enabled, installId, contextId, pricedKey, scope]);
 
   // The newest finished read-slot run's results; immutable once succeeded.
   const sourceRun = installation ? latestSourceRun(installation, scopedRuns)?.id ?? null : null;
@@ -94,10 +71,9 @@ export function useScreenExtras(args: {
 
   const extras = useMemo<ScreenExtras | undefined>(() => enabled ? {
     installId, contextId, bindings, workers,
-    quotes: quotes.scope === scope ? quotes.quotes : {},
     source: sourceRun ? (source.scope === scope && (source.value === null || source.value?.runId === sourceRun) ? source.value : undefined) : null,
     texts: new Map(texts.current),
-  } : undefined, [enabled, installId, contextId, bindings, workers, quotes, source, sourceRun, scope, textVersion]);
+  } : undefined, [enabled, installId, contextId, bindings, workers, source, sourceRun, scope, textVersion]);
 
   // The pushed ref names a run; only a run in this exact scope with a
   // reviewer-pinned image resolves. The channel already refused any ref

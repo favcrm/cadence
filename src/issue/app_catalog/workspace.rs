@@ -1001,14 +1001,25 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
                 .map(|name| (name, text))
         })
         .map(|(name, text)| {
-            let inputs = workflow::parse_template(text)
-                .ok()
-                .map(|template| workflow::inputs_json(&template));
+            let template = workflow::parse_template(text).ok();
+            let inputs = template.as_ref().map(workflow::inputs_json);
+            // CAD-1123 HP2/HP3: what a host-drawn approval slot needs, all
+            // from the installed bundle: the workflow's own label and the
+            // capability slots a run of it freezes quotes for.
+            let label = template.as_ref().and_then(|t| t.label.clone());
+            let distinct = template
+                .as_ref()
+                .map(|t| t.distinct.clone())
+                .unwrap_or_default();
+            let capability_slots = template
+                .as_ref()
+                .map(|t| t.capability_slots.clone())
+                .unwrap_or_default();
             // CAD-1123: the digest a run snapshot records as its
             // workflow `source_digest`, so a reader can name the run's
             // workflow without the snapshot carrying the file name.
             let source_digest = crate::store::app_runs::artifact_digest(text.as_bytes());
-            json!({"name":name,"inputs":inputs,"source_digest":source_digest})
+            json!({"name":name,"inputs":inputs,"source_digest":source_digest,"label":label,"capability_slots":capability_slots,"distinct":distinct})
         })
         .collect::<Vec<_>>();
     Ok(

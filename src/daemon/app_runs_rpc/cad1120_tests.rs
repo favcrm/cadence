@@ -22,22 +22,22 @@ use crate::test_seam::{scoped, Asserted};
 
 const REFUSED_TEAM: &str = "local team needs an enabled registered managed local worker";
 
-fn pid() -> u32 {
+pub(super) fn pid() -> u32 {
     std::process::id()
 }
 
 /// A daemon with an owner PM `lead`, two fake workers in its group, the
 /// CRM bundle installed and approved, and an idle timer on a clock the
 /// test moves.
-struct Fx {
+pub(super) struct Fx {
     _dir: tempfile::TempDir,
-    shared: Arc<Shared>,
-    install: String,
+    pub(super) shared: Arc<Shared>,
+    pub(super) install: String,
     clock: Arc<AtomicU64>,
 }
 
 impl Fx {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let dir = tempfile::Builder::new().prefix("c1120").tempdir().unwrap();
         let pm = dir.path().join("pm");
         crate::issue::Pm::init(&pm).unwrap();
@@ -97,23 +97,29 @@ impl Fx {
         fx
     }
 
-    fn call(&self, who: Asserted, method: &str, params: Value) -> Result<Value> {
+    pub(super) fn call(&self, who: Asserted, method: &str, params: Value) -> Result<Value> {
         scoped(who, || self.shared.dispatch(method, &params, pid()))
     }
 
-    fn operator(&self, method: &str, params: Value) -> Result<Value> {
+    pub(super) fn operator(&self, method: &str, params: Value) -> Result<Value> {
         self.call(Asserted::Operator, method, params)
     }
 
-    fn agent(&self, alias: &str) -> crate::store::Agent {
+    pub(super) fn agent(&self, alias: &str) -> crate::store::Agent {
         self.shared.store.agent(alias).unwrap()
     }
 
-    fn owned(&self, alias: &str) -> bool {
+    /// The fixture's daemon state dir (for sibling check files that open
+    /// the store or run a socket daemon over it).
+    pub(super) fn state(&self) -> std::path::PathBuf {
+        self._dir.path().to_path_buf()
+    }
+
+    pub(super) fn owned(&self, alias: &str) -> bool {
         self.shared.lifecycle.lock().unwrap().owned(alias)
     }
 
-    fn wait(&self, what: &str, mut done: impl FnMut() -> bool) {
+    pub(super) fn wait(&self, what: &str, mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !done() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -123,7 +129,7 @@ impl Fx {
 
     /// Open both workers through the daemon and wait until each is idle
     /// with its native session recorded.
-    fn start_team(&self) {
+    pub(super) fn start_team(&self) {
         for alias in ["writer", "reviewer"] {
             self.shared.launch_actor(alias).unwrap();
         }
@@ -136,7 +142,7 @@ impl Fx {
     }
 
     /// Two hours pass and the real idle timer stops both workers.
-    fn idle_out(&self) {
+    pub(super) fn idle_out(&self) {
         self.clock.fetch_add(2 * 3600, Ordering::SeqCst);
         self.shared.auto_stop_tick();
         self.wait("auto-stop", || {
@@ -152,7 +158,7 @@ impl Fx {
         }
     }
 
-    fn marker(&self, alias: &str) -> String {
+    pub(super) fn marker(&self, alias: &str) -> String {
         self.shared
             .store
             .last_event_of(alias, AUTO_STOP_MARKER_KINDS)
@@ -161,7 +167,7 @@ impl Fx {
             .unwrap_or_default()
     }
 
-    fn create_params(&self, request: &str) -> Value {
+    pub(super) fn create_params(&self, request: &str) -> Value {
         json!({
             "install_id": self.install,
             "workflow": "email-brief",
@@ -177,17 +183,17 @@ impl Fx {
         })
     }
 
-    fn create(&self, request: &str) -> Result<Value> {
+    pub(super) fn create(&self, request: &str) -> Result<Value> {
         self.operator("app_run_create", self.create_params(request))
     }
 
-    fn approve(&self, run: &Value) {
+    pub(super) fn approve(&self, run: &Value) {
         let params = json!({"run_id": run["id"], "digest": run["snapshot_digest"]});
         self.operator("app_run_approve", params).unwrap();
     }
 
     /// The writer step's kickoff message, once one is dispatched.
-    fn kickoff(&self, run: &Value) -> Option<String> {
+    pub(super) fn kickoff(&self, run: &Value) -> Option<String> {
         let shown = self
             .shared
             .store
@@ -207,7 +213,7 @@ impl Drop for Fx {
     }
 }
 
-fn refusal(result: Result<Value>) -> String {
+pub(super) fn refusal(result: Result<Value>) -> String {
     result.expect_err("expected a refusal").to_string()
 }
 
