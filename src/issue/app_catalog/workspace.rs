@@ -11,7 +11,7 @@ const UPGRADE_PENDING: &str = ".apps/upgrade-pending.yaml";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct UpgradeJournal {
+pub(crate) struct UpgradeJournal {
     schema: u32,
     id: InstallationId,
     request_id: String,
@@ -24,14 +24,59 @@ struct UpgradeJournal {
     before_record: String,
     after_record: String,
     files: BTreeMap<String, String>,
+    /// CAD-1140: for every configured binding whose slot declaration is
+    /// byte-identical between the old and new bundles, the exact receipt
+    /// (`binding id -> config`) the preflight read, each pinned to the
+    /// replaced bundle digest. Apply re-verifies that pin and the delivery
+    /// callback rewrites only `bundle_digest`, under CAS, in the upgrade's
+    /// one store transaction. `default` so a retained journal staged before
+    /// this field existed still decodes — it carries nothing.
+    #[serde(default)]
+    pub(crate) bindings: BTreeMap<String, Value>,
     diff: Value,
     compatibility: Value,
+}
+
+impl UpgradeJournal {
+    /// The digest the upgrade published — the target every journaled
+    /// carry receipt is re-pinned to. Accessor: the journal is opaque
+    /// outside this module.
+    pub(crate) fn new_digest(&self) -> &str {
+        &self.expected_new_digest
+    }
 }
 
 fn upgrade_journal_path(id: &InstallationId, request: &str) -> PathBuf {
     Path::new(".apps/upgrade-journals")
         .join(&**id)
         .join(format!("{request}.yaml"))
+}
+
+/// CAD-1140: every journaled carry receipt is an object still pinned to
+/// the bundle the upgrade replaces. The daemon preflight already proved
+/// the slot declarations identical; this check is the journal's own
+/// invariant so a forged or tampered journal cannot smuggle a receipt
+/// bound to anything but the old digest. The store-side carry then
+/// re-proves each row under CAS and rewrites only `bundle_digest`.
+fn upgrade_bindings_valid(bindings: &BTreeMap<String, Value>, old_digest: &str) -> bool {
+    bindings
+        .values()
+        .all(|config| config["bundle_digest"].as_str() == Some(old_digest))
+}
+
+/// The journaled carry set is consistent: each receipt is an object whose
+/// `install_id` and `context.install_id` (when scoped) name this
+/// installation, and whose `workspace_id` is the workspace the new record
+/// keeps. Called from both the fresh-upgrade path and recovery so a
+/// tampered journal fails the same way.
+fn deliverable_bindings(journal: &UpgradeJournal, install: &InstallationId) -> bool {
+    journal.bindings.values().all(|config| {
+        config.is_object()
+            && config["install_id"].as_str() == Some(&**install)
+            && config
+                .get("context")
+                .is_none_or(|c| c.is_null() || c["install_id"].as_str() == Some(&**install))
+    })
 }
 
 fn structural_diff(old: &BTreeMap<String, String>, new: &BTreeMap<String, String>) -> Value {
@@ -106,10 +151,30 @@ fn committed_upgrade_repeat(
         .installations
         .get(id)
         .ok_or_else(|| Error::rejected("retained upgrade journal lacks the new installation"))?;
+    let old_record = record(&journal.before_record, &old_entry.app)?;
+    let new_record = record(&journal.after_record, &new_entry.app)?;
+    if journal.schema != 1
+        || journal.files.is_empty()
+        || journal.files.len() > 128
+        || old_record.install_id != **id
+        || new_record.install_id != **id
+        || old_record.bindings != new_record.bindings
+        || old_record.team != new_record.team
+        || old_record.installed_at != new_record.installed_at
+        || old_record.installed_by != new_record.installed_by
+        || !upgrade_bindings_valid(&journal.bindings, &journal.expected_digest)
+        || !journal
+            .bindings
+            .keys()
+            .all(|id| crate::proto::identifier(id, "binding id").is_ok())
+    {
+        return Err(Error::rejected(
+            "retained upgrade journal changes installation authority",
+        ));
+    }
     let mut changed = before.clone();
     changed.installations.insert(id.clone(), new_entry.clone());
-    if journal.schema != 1
-        || changed != after
+    if changed != after
         || hash(&yaml(&before)?) != journal.expected_generation
         || old_entry.app != new_entry.app
         || old_entry.storage != Storage::Workspace
@@ -816,10 +881,20 @@ pub(crate) fn upgrade_check(
 
 /// The daemon owns the operator proof. `preflight` runs under the PM lock,
 /// which is also the run-creation lock, before any upgrade journal is staged.
+/// It returns the compatibility report plus, per configured binding whose
+/// slot declaration is byte-identical between the old and new bundles, the
+/// receipt to carry (CAD-1140). `deliver` runs inside `apply_upgrade`, after
+/// every journal check and under the same lock, and writes those carries in
+/// the upgrade's one store transaction — a binding that changed since
+/// preflight loses its CAS and refuses the whole delivery.
 pub(crate) fn upgrade(
     pm: &Pm,
     request: &UpgradeRequest<'_>,
-    preflight: impl FnOnce(&BTreeMap<String, String>, &app::Manifest) -> Result<Value>,
+    preflight: impl FnOnce(
+        &BTreeMap<String, String>,
+        &app::Manifest,
+    ) -> Result<(Value, BTreeMap<String, Value>)>,
+    deliver: impl FnOnce(&UpgradeJournal) -> Result<Vec<String>>,
 ) -> Result<Value> {
     let id = InstallationId::parse(request.id)?;
     let source = request.source;
@@ -891,7 +966,7 @@ pub(crate) fn upgrade(
     if new_digest == expected_digest {
         return Err(Error::rejected("upgrade bundle is unchanged"));
     }
-    let compatibility = preflight(&files, &validated.manifest)?;
+    let (compatibility, carried) = preflight(&files, &validated.manifest)?;
     let before_record = required(&root, &record_path, RECORD_CAP)?;
     let mut next_record = record(&before_record, &entry.app)?;
     if next_record.install_id != *id {
@@ -916,6 +991,7 @@ pub(crate) fn upgrade(
         after_catalog: yaml(&catalog)?,
         before_record,
         after_record: yaml(&next_record)?,
+        bindings: carried.into_iter().collect(),
         diff: structural_diff(&old_files, &files),
         compatibility,
         files,
@@ -935,7 +1011,7 @@ pub(crate) fn upgrade(
     ).map_err(|error| {
         Error::internal(format!("workspace upgrade marker incomplete ({}); retained journal can be resumed with `cadence app catalog upgrade-recover {} --request-id {}`", error.kind(), &*id, request_id))
     })?;
-    let foreign = apply_upgrade(pm, &root, &journal).map_err(|error| {
+    let foreign = apply_upgrade(pm, &root, &journal, Some(deliver)).map_err(|error| {
         Error::internal(format!("workspace upgrade delivery incomplete ({}); recover with `cadence app catalog upgrade-recover {} --request-id {}`", error.kind(), &*id, request_id))
     })?;
     let mut row = describe(&root, &catalog, &id)?;
@@ -946,7 +1022,12 @@ pub(crate) fn upgrade(
     Ok(row)
 }
 
-fn apply_upgrade(pm: &Pm, root: &Root, journal: &UpgradeJournal) -> Result<Vec<String>> {
+fn apply_upgrade<F: FnOnce(&UpgradeJournal) -> Result<Vec<String>>>(
+    pm: &Pm,
+    root: &Root,
+    journal: &UpgradeJournal,
+    deliver: Option<F>,
+) -> Result<Vec<String>> {
     if journal.schema != 1 || journal.files.is_empty() || journal.files.len() > 128 {
         return Err(Error::rejected("unsupported workspace upgrade journal"));
     }
@@ -1005,6 +1086,22 @@ fn apply_upgrade(pm: &Pm, root: &Root, journal: &UpgradeJournal) -> Result<Vec<S
     {
         return Err(Error::rejected(
             "upgrade journal changes installation authority or identity",
+        ));
+    }
+    // CAD-1140: the carry set the journal stages is the one apply
+    // delivers — every receipt still pinned to the replaced digest, each
+    // `install_id`/`context.install_id` naming this installation. A
+    // widened or missing declaration never reaches here: preflight already
+    // dropped it from the carry set.
+    if !upgrade_bindings_valid(&journal.bindings, &journal.expected_digest)
+        || journal
+            .bindings
+            .keys()
+            .any(|id| !crate::proto::identifier(id, "binding id").is_ok())
+        || !deliverable_bindings(journal, &journal.id)
+    {
+        return Err(Error::rejected(
+            "upgrade journal carries a receipt outside the replaced bundle",
         ));
     }
     let (old_bundle, record_path) = old_entry.paths(&journal.id);
@@ -1091,6 +1188,14 @@ fn apply_upgrade(pm: &Pm, root: &Root, journal: &UpgradeJournal) -> Result<Vec<S
         &[],
         "operator",
     )?;
+    // CAD-1140: with the new bundle committed, carry the journaled
+    // bindings onto its digest in one store transaction — still under
+    // the PM lock, so the receipts land with the publication they pin.
+    // A binding that moved since preflight fails its CAS and the whole
+    // upgrade fails; the retained journal re-runs delivery.
+    if let Some(deliver) = deliver {
+        deliver(journal)?;
+    }
     root.remove(Path::new(UPGRADE_PENDING))?;
     Ok(foreign
         .into_iter()
@@ -1098,7 +1203,15 @@ fn apply_upgrade(pm: &Pm, root: &Root, journal: &UpgradeJournal) -> Result<Vec<S
         .collect())
 }
 
-pub(crate) fn upgrade_recover(pm: &Pm, id: &str, request_id: &str) -> Result<Value> {
+/// `deliver` is the same binding carry the original `upgrade` staged: a
+/// recovery replays the retained journal's checked receipts verbatim,
+/// still under the PM lock and still under each binding's CAS.
+pub(crate) fn upgrade_recover(
+    pm: &Pm,
+    id: &str,
+    request_id: &str,
+    deliver: impl FnOnce(&UpgradeJournal) -> Result<Vec<String>>,
+) -> Result<Value> {
     let id = InstallationId::parse(id)?;
     crate::proto::identifier(request_id, "upgrade request ID")?;
     let _lock = pm.lock()?;
@@ -1140,7 +1253,7 @@ pub(crate) fn upgrade_recover(pm: &Pm, id: &str, request_id: &str) -> Result<Val
             &yaml(&json!({"install_id":&*id,"request_id":request_id}))?,
         )?;
     }
-    let foreign = apply_upgrade(pm, &root, &journal)?;
+    let foreign = apply_upgrade(pm, &root, &journal, Some(deliver))?;
     let catalog = Catalog::load(&pm.dir)?;
     let mut row = describe(&root, &catalog, &id)?;
     row["committed"] = json!(true);
@@ -2231,7 +2344,8 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
                 expected_new_digest: &new_digest,
                 request_id: "fixture-upgrade",
             },
-            |_, _| Ok(json!({})),
+            |_, _| Ok((json!({}), BTreeMap::new())),
+            |_| Ok(Vec::new()),
         )
         .unwrap();
         let after = show(&pm, &id).unwrap();
