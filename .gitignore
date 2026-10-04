@@ -28,6 +28,7 @@ docs/guides/*
 !docs/ARCHITECTURE.md
 !docs/AUDIT.md
 !docs/BOARD.md
+!docs/AGENT-MODELS.md
 !docs/CHARTER.md
 !docs/EXTERNAL-TEST-RECIPE.md
 !docs/START-HERE.md
