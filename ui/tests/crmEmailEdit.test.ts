@@ -1,11 +1,14 @@
 export {};
 /**
- * CAD-1057: inline editing in the campaign Email tab. Mounted against
- * a stateful fake host: Visual block edits, pasted HTML and the plain
- * text override each save through `app_content_save` with exactly one
- * body kind, pinned to the revision the edits began on; a CAS
- * conflict keeps the local edits; read-only viewers get no editor;
- * the host footer is never editable.
+ * CAD-1146: direct-visual editing in the campaign Email tab. Mounted
+ * against a stateful fake host: operators edit supported blocks
+ * directly on the visual email (plain-text only, never user HTML),
+ * reorder/delete blocks with inline menus and undo, collapse the
+ * optional preheader without losing its value, paste raw HTML, and
+ * save through `app_content_save` with exactly one body kind, pinned
+ * to the revision the edits began on; a CAS conflict keeps the local
+ * edits; read-only viewers get no editor; the host footer is never
+ * editable.
  */
 declare function require(name: string): any;
 
@@ -43,7 +46,7 @@ async function clientXor() {
   assert(refused && refusedNeither && sent === 0, "blocks XOR html is enforced client-side before any request");
 }
 
-async function mount(readOnly: boolean, htmlDoc: boolean) {
+async function mount(readOnly: boolean, htmlDoc: boolean, preheader: string) {
   const { Window } = require("happy-dom");
   const win = new Window({ url: "http://localhost/app-installations/install-crm?ctx=ctx-a" });
   for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "HTMLSelectElement", "HTMLIFrameElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
@@ -75,7 +78,7 @@ async function mount(readOnly: boolean, htmlDoc: boolean) {
   };
   const doc: any = {
     campaign_id: "launch-1", install_id: "install-crm", context_id: "ctx-a", revision: 2,
-    subject: "Welcome aboard", preheader: "We are glad you are here",
+    subject: "Welcome aboard", preheader,
     blocks: htmlDoc ? [] : [{ type: "heading", text: "Hello" }, { type: "paragraph", text: "Hi there" }],
     mode: htmlDoc ? "html" : "blocks", html: htmlDoc ? "<p>Original html body</p>" : null, text_override: null,
     content_digest: "content-digest-2",
@@ -186,9 +189,20 @@ async function mount(readOnly: boolean, htmlDoc: boolean) {
     });
     await flush();
   }
+  /** Keystroke into a direct-visual block (contenteditable plain text). */
+  async function typeVisual(element: Element | null, value: string) {
+    assert(element, "visual edit target exists");
+    await React.act(async () => {
+      element.textContent = value;
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await flush();
+  }
   const q = (selector: string) => host.querySelector(selector);
   const byText = (scope: ParentNode, tag: string, label: string) =>
     Array.from(scope.querySelectorAll(tag)).find((el) => (el.textContent ?? "").trim() === label) ?? null;
+  const visualOrder = () =>
+    Array.from(host.querySelectorAll("[data-visual-text]")).map((el) => el.getAttribute("data-visual-text"));
   const bar = () => q("[data-unsaved-bar]");
   const barButton = (label: string) => Array.from(bar()?.querySelectorAll("button") ?? []).find((b) => (b.textContent ?? "").trim() === label) ?? null;
   const text = () => host.textContent ?? "";
@@ -207,12 +221,12 @@ async function mount(readOnly: boolean, htmlDoc: boolean) {
     loader.prototype.require = originalRequire;
     host.remove();
   };
-  return { React, doc, saves, renders, settle, click, type, q, byText, bar, barButton, text, flush, finish, host };
+  return { React, doc, saves, renders, settle, click, type, typeVisual, q, byText, visualOrder, bar, barButton, text, flush, finish, host };
 }
 
 async function operator(kind: "blocks" | "html") {
-  const t = await mount(false, kind === "html");
-  const { doc, saves, renders, settle, click, type, q, byText, bar, barButton, text } = t;
+  const t = await mount(false, kind === "html", kind === "html" ? "" : "We are glad you are here");
+  const { doc, saves, renders, settle, click, type, typeVisual, q, byText, visualOrder, bar, barButton, text } = t;
   const bodyKinds = () => saves.map((s) => [("blocks" in s), ("html" in s)]);
 
   // The host footer is locked: shown, never an input.
@@ -223,14 +237,42 @@ async function operator(kind: "blocks" | "html") {
   }
 
   if (kind === "blocks") {
-    // Visual: edit text inline, add a block; the bar names the versions.
+    // A saved preheader opens its row; hiding and re-showing keeps it.
+    const pre = q("#cmp-preheader") as HTMLInputElement;
+    assert(pre && pre.value === "We are glad you are here", "a saved preheader opens its row on load");
+    await click(q("#cmp-preheader-toggle"));
+    await settle(() => assert(!q("#cmp-preheader"), "hiding the preheader removes its row"));
+    await click(q("#cmp-preheader-toggle"));
+    await settle(() => assert((q("#cmp-preheader") as HTMLInputElement).value === "We are glad you are here", "re-showing keeps the preheader value"));
+
+    // Visual: edit text directly on the email; the bar names versions.
     assert(!bar(), "no unsaved bar before an edit");
-    await type(q('textarea[aria-label="Paragraph, block 2"]'), "Hi there, edited");
-    await settle(() => assert(bar(), "an inline edit raises the unsaved bar"));
+    equal(visualOrder(), ["Email heading, block 1", "Email paragraph, block 2"], "blocks render directly on the visual email");
+    await typeVisual(q('[data-visual-text="Email paragraph, block 2"]'), "Hi there, edited");
+    await settle(() => assert(bar(), "a direct edit raises the unsaved bar"));
     const copy = bar()!.textContent ?? "";
     assert(copy.includes("Unsaved changes to v2") && copy.includes("Saving creates v3") && copy.includes("resets approval"), "the bar names vN, vN+1 and the approval reset");
+
+    // Inline menus: move down, then undo restores the order.
+    await click(q('[aria-label="Move block 1 down"]'));
+    await settle(() => equal(visualOrder(), ["Email paragraph, block 1", "Email heading, block 2"], "move down reorders the visual blocks"));
+    assert(byText(t.host, "button", "Undo last block change"), "a reorder offers undo");
+    await click(byText(t.host, "button", "Undo last block change"));
+    await settle(() => equal(visualOrder(), ["Email heading, block 1", "Email paragraph, block 2"], "undo restores the block order"));
+
+    // Inline menus: delete, then undo restores the block (with its text).
+    await click(q('[aria-label="Remove block 2"]'));
+    await settle(() => equal(visualOrder(), ["Email heading, block 1"], "delete removes the visual block"));
+    await click(byText(t.host, "button", "Undo last block change"));
+    await settle(() => {
+      equal(visualOrder(), ["Email heading, block 1", "Email paragraph, block 2"], "undo restores the deleted block");
+      equal(q('[data-visual-text="Email paragraph, block 2"]')?.textContent, "Hi there, edited", "undo keeps the edited text");
+    });
+
+    // Add a button from the toolbar and fill it in on the canvas.
     await click(byText(q('[aria-label="Add block"]')!, "button", "Button"));
-    await type(q('input[aria-label="Button label, block 3"]'), "Join");
+    await settle(() => equal(visualOrder(), ["Email heading, block 1", "Email paragraph, block 2", "Button label, block 3"], "adding appends a button block"));
+    await typeVisual(q('[data-visual-text="Button label, block 3"]'), "Join");
     await type(q('input[aria-label="Button link, block 3"]'), "https://example.com/join");
     await type(q("#cmp-subject"), "New subject");
     const rendersBefore = renders.length;
@@ -239,10 +281,11 @@ async function operator(kind: "blocks" | "html") {
     const body = saves[0];
     equal(body.blocks, [{ type: "heading", text: "Hello" }, { type: "paragraph", text: "Hi there, edited" }, { type: "button", label: "Join", url: "https://example.com/join" }], "a visual edit saves blocks");
     assert(!("html" in body) && !("text" in body), "a blocks save carries no html and no text override");
-    equal([body.subject, body.expected_revision], ["New subject", 2], "the save is pinned to the revision the edit began on");
+    equal([body.subject, body.preheader, body.expected_revision], ["New subject", "We are glad you are here", 2], "hiding/showing the preheader never discards it; the save is pinned to the revision the edit began on");
     await settle(() => assert(renders.length > rendersBefore && ((q('iframe[data-preview="visual"]') as HTMLIFrameElement).getAttribute("srcdoc") ?? "").includes("HOSTRENDER v3 New subject"), "the host preview re-renders the new version after save"));
     await settle(() => assert(!bar() && text().includes("Saved v3") && text().includes("approval reset"), "the approval-reset message shows after save"));
     equal(doc.approval.valid, false, "the save reset approval on the host");
+    assert(!byText(t.host, "button", "Undo last block change"), "a save clears undo history");
 
     // HTML paste: html body only, blocks dropped from the body.
     await click(byText(t.host, "button", "HTML"));
@@ -259,7 +302,7 @@ async function operator(kind: "blocks" | "html") {
     await settle(() => assert(text().includes("Saved v4"), "html save lands"));
     // After saving an HTML body, Visual explains instead of faking blocks.
     await click(byText(t.host, "button", "Visual"));
-    assert(q('[data-state="html-body"]') && !q('[aria-label="Email body blocks"]'), "an HTML body is not editable as blocks");
+    assert(q('[data-state="html-body"]') && !q("[data-visual-text]"), "an HTML body is not editable as blocks");
 
     // Text override: generated by default, Write my own enables it.
     await click(byText(t.host, "button", "Text"));
@@ -291,22 +334,28 @@ async function operator(kind: "blocks" | "html") {
   } else {
     // An HTML-bodied email: Visual is read-only text, HTML is the editor,
     // and Apply warns that it replaces the HTML body.
-    assert(q('[data-state="html-body"]') && !q('[aria-label="Email body blocks"]'), "Visual does not pretend an HTML body is blocks");
+    assert(q('[data-state="html-body"]') && !q("[data-visual-text]"), "Visual does not pretend an HTML body is blocks");
     assert((q('[data-proposal="prop-1"] [data-state="replaces-html"]')?.textContent ?? "").includes("replaces this email's HTML body"), "Apply warns it replaces an HTML body with blocks");
+    // An empty preheader starts collapsed and can be shown without loss.
+    assert(!q("#cmp-preheader") && (q("#cmp-preheader-toggle")?.textContent ?? "").includes("+ Add preheader"), "an empty preheader starts collapsed");
+    await click(q("#cmp-preheader-toggle"));
+    await settle(() => assert(q("#cmp-preheader"), "the toggle shows the preheader row"));
     await click(byText(t.host, "button", "HTML"));
     equal((q("#cmp-html-source") as HTMLTextAreaElement).value, "<p>Original html body</p>", "the saved HTML opens in the source editor");
     await type(q("#cmp-html-source"), "<p>Edited html</p>");
+    await type(q("#cmp-preheader"), "Teaser");
     await click(barButton("Save as v3"));
     await settle(() => assert(saves.length === 1 && saves[0].html === "<p>Edited html</p>" && !("blocks" in saves[0]), "an HTML edit saves html only"));
+    equal(saves[0].preheader, "Teaser", "the shown preheader saves with the HTML");
   }
   await t.finish();
 }
 
 async function readOnlyViewer() {
-  const t = await mount(true, false);
+  const t = await mount(true, false, "We are glad you are here");
   const { q, text, host } = t;
   assert(!q("#cmp-subject") && !q("#cmp-preheader"), "a read-only viewer gets no subject editor");
-  assert(!q('[aria-label="Add block"]') && !q('[aria-label="Email body blocks"]') && !q('section[aria-label="Email preview"] textarea'), "a read-only viewer gets no block, source or text editor");
+  assert(!q('[aria-label="Add block"]') && !q('[aria-label="Email canvas — edit directly"]') && !q('section[aria-label="Email preview"] textarea'), "a read-only viewer gets no block, canvas or text editor");
   assert(!q("[data-unsaved-bar]"), "a read-only viewer never sees the save bar");
   assert(text().includes("Read-only view"), "a read-only viewer is told so");
   assert((q('[aria-label="Email envelope"]')?.textContent ?? "").includes("Welcome aboard"), "the envelope still shows the subject");
