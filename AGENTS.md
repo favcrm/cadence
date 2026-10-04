@@ -301,8 +301,26 @@ normal gates return. An agent or PR may not grant that exception to itself.
   is loaded, rerun that test alone before treating the failure as real.
 
 ### Pi agents and models (CAD-559)
-- Workers and reviewers run on `pi` with **devin** models — never
-  OpenRouter. Cost tiers per `devin models list` (the source of truth):
+- Workers and reviewers run on `pi` with either **Cursor subscription**
+  (`cursor/*`) or **Devin** (`devin/*`) models — never OpenRouter. Honor
+  an explicitly requested provider and model: a Cursor request must not
+  silently fall back to Devin, OpenRouter or another provider. If the
+  requested model or its authentication is unavailable, stop and report it.
+  This provider choice does not waive independent review, head-pinned
+  verdicts, Browser QA, operator approval or production-safety rules.
+- **Cursor subscription:** use Pi's configured `cursor` provider, not the
+  native Cursor CLI or a Devin/OpenRouter route to the same model. Confirm
+  the exact model with `pi --list-models cursor` using the provider
+  configuration the worker launcher will load. The current Grok 4.7 ids
+  include `cursor/grok-4.7-high` and `cursor/grok-4.7-xhigh`; for example:
+  `cadence join <pm> pi --model cursor/grok-4.7-high --effort high`.
+  Catalog visibility is not proof of authentication or a successful launch:
+  verify provider readiness before dispatch, and report launch failures
+  without substituting another provider. Use the existing subscription;
+  never read, print or copy its credentials into a prompt, note or command.
+  Subscription limits and usage apply; do not describe Cursor as free.
+- **Devin default when no provider is requested:** cost tiers per
+  `devin models list` (the source of truth for Devin):
   `swe-2-{high,medium,max}` are **Free**; `deepseek-v4-1-flash-*` is
   low cost ($0.22/1M in, $0.66/1M out), not free. The default worker
   model is `devin/swe-2-high` with `--effort max` (the SWE-2 Max
