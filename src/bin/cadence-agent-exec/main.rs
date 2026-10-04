@@ -32,6 +32,7 @@ mod protected;
 mod protected_pi_profile;
 #[cfg(all(target_os = "linux", test))]
 #[path = "tests/protected_profile_refusal_acceptance.rs"]
+#[allow(clippy::single_match)] // Preserve the independently authored assertions verbatim.
 mod protected_profile_refusal_acceptance;
 
 #[cfg(target_os = "linux")]

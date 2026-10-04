@@ -215,7 +215,13 @@ pub(super) fn prepare(profile: Profile) -> io::Result<OwnedLaunch> {
     let view = private_view(&profile)?;
     super::protected_effect(); // Actual privately-owned Node-open attempt site.
     let node = open_node()?;
-    let mut argv = vec![NODE_PATH.to_owned(), cli.to_owned()];
+    // Disable writable/config-discovered extensions. Any future approved
+    // immutable extension set is private graph policy, never caller -e paths.
+    let mut argv = vec![
+        NODE_PATH.to_owned(),
+        cli.to_owned(),
+        "--no-extensions".into(),
+    ];
     argv.extend(profile.routing().tokens());
     // Workers' session paths are private policy-derived, never caller argv.
     if !profile.routing().no_session() {

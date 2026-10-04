@@ -38,7 +38,6 @@ mod envp;
 pub(crate) mod execfd;
 pub(crate) mod topology;
 
-pub(crate) use envp::guest_envp;
 use execfd::{PreparedExec, EXEC_PINS};
 use topology::ProtectedTopology;
 
