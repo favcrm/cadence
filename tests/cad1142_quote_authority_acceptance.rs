@@ -58,7 +58,7 @@ const TOOL: &str = "read_probe_listing";
 /// refused like any error; `Priced` is a healthy door reporting a
 /// *different* live price than the frozen one — the real `Rejected`
 /// drift path (authority intact, price moved), which still invalidates.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Posture {
     Up,
     Down,
