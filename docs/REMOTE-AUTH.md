@@ -75,12 +75,38 @@ runs the hosted-cadence owner-consent device grant (PKCE, `hcd_` device
 code, `hct_` bridge credential) and records an org whose connection is
 `Remote { endpoint: https://<slug>.cadencecloud.app, org_id }` — slug,
 endpoint and org id all come from the issuer's verified grant, never
-derived from each other. A first login selects the org as the default;
-a second workspace adds its org without moving the default unless
-`--use` is passed. The `hct_` is stored at
+derived from each other. Login never moves the saved default: without
+`--use` the org is recorded but the existing destination (ambient local
+on a fresh machine) stays selected; pass `--use` to make the remote org
+the default. The `hct_` is stored at
 `$XDG_CONFIG_HOME/cadence/remote-auth/cli-<slug>.json` (0600) and is
 bound to the org id and endpoint it was issued for — it is never sent
 to another host.
+
+### First login on a fresh machine
+
+The credential directory is created by login itself (0700, owner-only).
+The operator then establishes the independent issuer pin before any
+request goes out: login refuses with an actionable message until the
+exact issuer origin sits in a 0600 `trusted-issuer` file inside that
+directory. The CLI never creates the pin — it is the operator's own
+trust decision:
+
+```sh
+cadence login --issuer https://your-agenticos-api.example --org ws_company --slug company
+# → refused: "Trusted issuer pin is missing. Create it yourself, then retry: …"
+#   (the refusal prints the exact pin path — on this host it is
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth/trusted-issuer,
+#   or the --auth-dir you passed)
+printf '%s\n' 'https://your-agenticos-api.example' > "${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth/trusted-issuer"
+chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth/trusted-issuer"
+cadence login --issuer https://your-agenticos-api.example --org ws_company --slug company
+# → device code prompt; approve in the browser
+```
+
+The pinned origin must byte-match `--issuer` (one optional trailing
+newline). A wrong-issuer pin, a symlink, or loose permissions refuse
+the same way.
 
 When the resolved org is remote (`--org` > `CADENCE_ORG` > saved
 default), an allowlisted command runs against the remote daemon instead
