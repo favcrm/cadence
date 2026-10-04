@@ -468,8 +468,9 @@ export function readWorkspaceAppSnapshot(installId: string): WorkspaceAppSnapsho
 }
 
 /** Record the snapshot a successful read produced. */
-export function writeWorkspaceAppSnapshot(installId: string, data: WorkspaceAppSnapshot): void {
-  snapshots.set(installId, { at: Date.now(), session: sessionKey(), data });
+export function writeWorkspaceAppSnapshot(installId: string, data: WorkspaceAppSnapshot, session = sessionKey()): void {
+  if (session !== sessionKey()) return;
+  snapshots.set(installId, { at: Date.now(), session, data });
 }
 
 /** Forget one installation's snapshot (access refusal, removal). */
@@ -478,19 +479,53 @@ export function dropWorkspaceAppSnapshot(installId: string): void {
 }
 
 /** The app page's reads, fired in parallel and stored as one snapshot. */
-export async function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortSignal): Promise<WorkspaceAppSnapshot> {
-  const [installation, contexts, bindings, connections, agents, runs, effects] = await Promise.all([
-    workspaceApps.detail(installId, signal),
-    workspaceApps.contexts(installId, signal),
-    workspaceApps.bindings(installId, undefined, signal),
-    workspaceApps.connections(signal),
-    workspaceApps.agents(signal),
-    workspaceApps.runs(installId, undefined, signal),
-    workspaceApps.effects(installId, undefined, signal),
-  ]);
-  const data = { installation, contexts, bindings, connections, agents, runs, effects };
-  writeWorkspaceAppSnapshot(installId, data);
-  return data;
+type SnapshotRead = { controller: AbortController; subscribers: number; settled: boolean; promise: Promise<WorkspaceAppSnapshot> };
+const snapshotReads = new Map<string, SnapshotRead>();
+export function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortSignal): Promise<WorkspaceAppSnapshot> {
+  if (signal?.aborted) return Promise.reject(new DOMException("The operation was aborted", "AbortError"));
+  const requestSession = sessionKey();
+  const key = JSON.stringify([installId, requestSession]);
+  let flight = snapshotReads.get(key);
+  if (!flight) {
+    const controller = new AbortController();
+    const created: SnapshotRead = { controller, subscribers: 0, settled: false, promise: Promise.resolve(null as never) };
+    created.promise = (async () => {
+      const [installation, contexts, bindings, connections, agents, runs, effects] = await Promise.all([
+        workspaceApps.detail(installId, controller.signal),
+        workspaceApps.contexts(installId, controller.signal),
+        workspaceApps.bindings(installId, undefined, controller.signal),
+        workspaceApps.connections(controller.signal),
+        workspaceApps.agents(controller.signal),
+        workspaceApps.runs(installId, undefined, controller.signal),
+        workspaceApps.effects(installId, undefined, controller.signal),
+      ]);
+      if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
+      if (requestSession !== sessionKey()) throw new ApiError("The session changed while loading this app", 401);
+      const data = { installation, contexts, bindings, connections, agents, runs, effects };
+      writeWorkspaceAppSnapshot(installId, data, requestSession);
+      return data;
+    })().finally(() => {
+      created.settled = true;
+      if (snapshotReads.get(key) === created) snapshotReads.delete(key);
+    });
+    flight = created;
+    snapshotReads.set(key, flight);
+  }
+  const shared = flight;
+  shared.subscribers += 1;
+  return new Promise((resolve, reject) => {
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      signal?.removeEventListener("abort", abort);
+      shared.subscribers -= 1;
+      if (shared.subscribers === 0 && !shared.settled) shared.controller.abort();
+    };
+    const abort = () => { release(); reject(new DOMException("The operation was aborted", "AbortError")); };
+    signal?.addEventListener("abort", abort, { once: true });
+    shared.promise.then(value => { if (!released) { release(); resolve(value); } }, error => { if (!released) { release(); reject(error); } });
+  });
 }
 
 /**
@@ -506,4 +541,28 @@ export function prefetchWorkspaceApp(installId: string): void {
     .catch(() => null)
     .finally(() => { prefetching.delete(installId); });
   prefetching.set(installId, task);
+}
+
+/** The `/api/app-installations` list, held the same way: the Apps
+ *  screen paints the last read at once and refetches behind it. */
+let installationsSnapshot: { at: number; session: string | null; rows: Installation[] } | null = null;
+
+export function readInstallationsSnapshot(): Installation[] | null {
+  if (!installationsSnapshot || installationsSnapshot.session !== sessionKey() ||
+      Date.now() - installationsSnapshot.at > SNAPSHOT_TTL_MS) return null;
+  return installationsSnapshot.rows;
+}
+
+/** Fresh read of the installations list; stores the snapshot. */
+export async function readInstallationsFresh(signal?: AbortSignal): Promise<Installation[]> {
+  const requestSession = sessionKey();
+  const rows = await workspaceApps.installations(signal);
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  if (requestSession !== sessionKey()) throw new ApiError("The session changed while loading apps", 401);
+  installationsSnapshot = { at: Date.now(), session: requestSession, rows };
+  return rows;
+}
+
+export function dropInstallationsSnapshot(): void {
+  installationsSnapshot = null;
 }

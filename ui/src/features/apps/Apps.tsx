@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
 import { ApiError } from "../../lib/api";
-import { prefetchWorkspaceApp, type Installation } from "../workspace-apps/workspaceApps";
+import { prefetchWorkspaceApp, readInstallationsFresh, readInstallationsSnapshot, dropInstallationsSnapshot, type Installation } from "../workspace-apps/workspaceApps";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import { homeNeeds, type HomeNeed } from "../home/needs";
@@ -370,18 +370,27 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
 
 /** Workspace installations remain visible independently of the legacy project filter. */
 function WorkspaceCatalog() {
-  const [rows, setRows] = useState<Installation[] | null>(null);
+  // CAD-1137: a revisit paints this session's last list at once and
+  // refetches behind it; only the very first read shows the load line.
+  const [rows, setRows] = useState<Installation[] | null>(() => readInstallationsSnapshot());
   const [error, setError] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
+    const cached = readInstallationsSnapshot();
+    setRows(cached);
     setError(null);
-    void workspaceApps.installations(controller.signal).then(value => {
+    void readInstallationsFresh(controller.signal).then(value => {
       if (!controller.signal.aborted) setRows(value.filter(row => row.storage_kind === "workspace"));
     }).catch((cause: unknown) => {
       if (controller.signal.aborted) return;
-      if (cause instanceof ApiError && [401, 403].includes(cause.status)) setRows(null);
-      setError(cause instanceof Error ? cause.message : "Could not load workspace apps");
+      if (cause instanceof ApiError && [401, 403].includes(cause.status)) {
+        dropInstallationsSnapshot();
+        setRows(null);
+      }
+      if (cached === null || (cause instanceof ApiError && [401, 403].includes(cause.status))) {
+        setError(cause instanceof Error ? cause.message : "Could not load workspace apps");
+      }
     });
     return () => controller.abort();
   }, [revision]);
