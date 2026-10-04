@@ -217,7 +217,44 @@ impl StdioAdapter {
                 Ok(())
             });
         }
-        let mut child = crate::reaper::spawn(&mut command)?;
+        self.adopt_child(crate::reaper::spawn(&mut command)?)
+    }
+
+    /// Typed protected transport. No command/env/cwd from agent params enters
+    /// this path; only the owned context can yield a bound helper exec plan.
+    pub(crate) fn launch_protected(
+        self: &Arc<Self>,
+        context: super::pi_guest::GuestCtx,
+        routing: &crate::protected_pi_profile::Routing,
+        stderr_log: &std::path::Path,
+    ) -> Result<u32> {
+        let plan = context.spawn_plan(routing)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (plan, stderr_log);
+            Err(Error::rejected("protected launch is Linux-only"))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(stderr_log)?;
+            // Not a pathname fallback: pre_exec must consume the verified fd.
+            // This deliberately nonexistent target refuses if fd-exec cannot run.
+            let mut command = Command::new("/cadence-protected-fd-exec-only");
+            command
+                .env_clear()
+                .current_dir("/")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::from(log));
+            plan.attach(&mut command);
+            self.adopt_child(crate::reaper::spawn(&mut command)?)
+        }
+    }
+
+    fn adopt_child(self: &Arc<Self>, mut child: std::process::Child) -> Result<u32> {
         let pid = child.id();
         let stdin = child
             .stdin

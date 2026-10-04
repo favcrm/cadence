@@ -8,16 +8,13 @@
 //! restore-lineage, sealed-helper and namespace-policy pins exist, so a
 //! production launch can never pass through here yet.
 //!
-//! Custody model (r5 contract, root direction): the helper ELF and the Node
-//! interpreter are the two *exec'd* binaries and are bound **by fd** —
-//! `execveat(fd, "", AT_EMPTY_PATH)` runs the verified inode, so a path swap
-//! after verification cannot substitute bytes. The Pi module graph
-//! (`cli.js` → `cli-runtime.js` → `chunks/*` → `node_modules/`) is a *tree*
-//! `node` reads by canonical path; it is verified as an immutable root-owned
-//! non-writable tree, never fd-pinned (a tree cannot ride one fd), and never
-//! executed through `/proc/self/fd` (which breaks `import.meta.url` sibling
-//! resolution). The *actual* denial of out-of-tree reads is the external
-//! protected FS policy — not claimed here.
+//! Custody: the daemon binds only the helper ELF. The helper first closes
+//! every inherited descriptor, then privately opens/verifies Node and owns it
+//! through the identity/capability seal and `execveat(AT_EMPTY_PATH)`. A parent
+//! Node fd is neither transferred nor claimed as execution custody.
+//! The reviewed immutable Pi graph/CLI and out-of-tree filesystem policy are
+//! unavailable. No obsolete cli-runtime layout or local candidate observation
+//! elects them; scripts remain canonical immutable paths, never fd-exec targets.
 //!
 //! No guest caller boolean, restored marker, refreshed local flag, or `params`
 //! field is ever an eligibility input: the only inputs are `agent_uid`, the
@@ -32,7 +29,6 @@
 #![allow(dead_code)]
 
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
 
 use super::ProviderEnv;
 use crate::error::{Error, Result};
@@ -153,9 +149,8 @@ pub(crate) struct GuestCtx {
     /// The agent's routing alias — carried verbatim to `CADENCE_ALIAS` (it is
     /// routing text, never a path segment or a principal proof).
     alias: String,
-    /// Bound exec fds: the setuid helper and the node ELF.
+    /// Daemon owns only the helper; Node is reopened privately AFTER close_fds.
     helper: execfd::BoundExec,
-    node: execfd::BoundExec,
 }
 
 /// The mandatory fail-closed gate for production eligibility. The external
@@ -187,6 +182,7 @@ impl GuestCtx {
         agent_uid: u32,
         generation: &str,
     ) -> Result<Self> {
+        protected_prereqs_satisfied()?;
         // The split gate already proved agent_uid.is_some() upstream; assert
         // the resolved uid is the guest account, never 0 or the supervisor.
         let segs = Segments::new(&agent.alias, generation)?;
@@ -195,16 +191,14 @@ impl GuestCtx {
         // Verify the durable + generation slot dirs exist and are exactly the
         // pre-provisioned shape; a missing slot refuses (never creates).
         topo.verify_view(&segs, role)?;
-        // Bind the two exec'd binaries by fd against the compiled pins.
+        // Bind only the helper here. No parent Node fd survives helper close_fds.
         let helper = execfd::open_bound(&EXEC_PINS[0])?;
-        let node = execfd::open_bound(&EXEC_PINS[1])?;
         Ok(Self {
             topo,
             segs,
             role,
             alias: agent.alias.clone(),
             helper,
-            node,
         })
     }
 
@@ -215,29 +209,24 @@ impl GuestCtx {
     }
 
     /// Build the spawn plan handed to `StdioAdapter::launch`: the materialized
-    /// argv/envp for `pre_exec`+`execveat`. The provider argv is appended
-    /// verbatim after the fixed helper profile tokens. The plan takes
+    /// argv/envp for `pre_exec`+`execveat`. Only the shared finite routing grammar
+    /// follows the profile tokens; the helper derives Node/CLI/env/cwd itself.
+    /// The plan takes
     /// ownership of the bound helper fd's `OwnedFd` — custody moves with the
     /// spawn, so no closed/reused descriptor can be exec'd in the child.
     ///
     /// This consumes the helper binding: a `GuestCtx` produces at most one
     /// spawn plan, which is correct — one open, one launch, one fd.
-    pub(crate) fn spawn_plan(mut self, provider_argv: &[String]) -> Result<PreparedExec> {
-        // Take the bound helper fd out of the ctx so the plan owns it.
-        let helper = std::mem::replace(
-            &mut self.helper,
-            execfd::BoundExec {
-                fd: std::fs::File::open("/dev/null")
-                    .map_err(|e| Error::internal(format!("sentinel fd: {e}")))?
-                    .into(),
-                digest: [0u8; 32],
-                canon: PathBuf::new(),
-            },
-        );
-        Ok(
-            PreparedExec::assemble(&self.segs, provider_argv, guest_envp(&self))?
-                .with_bound(helper),
-        )
+    pub(crate) fn spawn_plan(
+        self,
+        routing: &crate::protected_pi_profile::Routing,
+    ) -> Result<PreparedExec> {
+        // Recheck the actual unavailable private prerequisites at transport handoff;
+        // construction and routing text never substitute for current authority.
+        protected_prereqs_satisfied()?;
+        self.topo.verify_view(&self.segs, self.role)?;
+        let draft = PreparedExec::assemble(&self.segs, &routing.tokens(), Vec::new())?;
+        Ok(draft.with_bound(self.helper))
     }
 
     /// The verified per-launch view dirfd for `layer`.

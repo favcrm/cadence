@@ -50,6 +50,8 @@ pub mod peer;
 pub mod pi_policy;
 pub mod platform;
 pub mod proc;
+#[allow(dead_code)] // Shared helper grammar; production prerequisites remain unavailable.
+pub(crate) mod protected_pi_profile;
 pub mod proto;
 pub mod reaper;
 pub mod remote_auth;
