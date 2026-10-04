@@ -6,25 +6,33 @@
 //!
 //! - A transient provider quote/transport outage is NOT silently
 //!   reclassified as authority loss: a `running` run must survive
-//!   monitor ticks that cannot reach the quote door, and a
-//!   queued-but-approved run must not be invalidated by a dead probe.
+//!   monitor ticks that cannot reach the quote door, and an approved
+//!   run's first dispatch must not be refused by a dead probe.
 //! - Dispatch/admission still re-proves the binding revision, the
 //!   capability allowance and the content at the real call, so a
-//!   genuinely stale binding, a revocation or a wrong-scope change
-//!   STILL refuses and invalidates — carrying the actual plain-words
-//!   reason onto the failed step.
-//! - An auth denial or a corrupt price schema from the provider is an
-//!   unknown refusal, never a permissive skip; the spend ceiling is
-//!   still enforced at the call, not merely at quote time.
+//!   genuinely stale or revoked binding STILL refuses and invalidates —
+//!   carrying the actual plain-words reason onto the failed step.
+//! - A provider quote error (unreachable, auth-denied) or a corrupt
+//!   price schema is an unknown probe verdict — it must not mint or
+//!   destroy authority by itself.
 //! - The operator rule holds: agent and unproven callers, and a forged
 //!   field, are refused on every app-lifecycle route that runs the
 //!   binding/authority checks — with nothing written.
 //!
-//! Every check drives a real in-process seam daemon (the 1s monitor tick
+//! Every check drives a real in-process seam daemon (the monitor tick
 //! that re-runs `advance_app_runs`, exactly like Demo) plus a probe
-//! provider whose quote door can be toggled to fail the way the hosted
-//! AgenticOS quote read did. Temp HOME/XDG/TMP/PM/state are explicit; no
-//! live provider or real agent launch.
+//! provider whose quote door can be toggled between postures. Temp
+//! HOME/XDG/TMP/PM/state are explicit; no live provider or real agent
+//! launch.
+//!
+//! Honest coverage boundary: this fixture cannot mint a real managed
+//! endpoint or a verified `/proc` ancestry, so the strict-caller
+//! `app_run_capability_call` gate (worker-claim re-proof, the
+//! call-time `max_charge_minor` spend ceiling, detached-child refusal)
+//! is NOT exercised here and stays BLOCKED pending a sanctioned runner
+//! with a real peer. These rows assert only the public daemon/seam
+//! surface — dispatch, monitor re-validation, operator lifecycle and
+//! binding receipt checks.
 #![cfg(feature = "test-seam")]
 
 use cadence_agent::contract_fixture::{ToolTable, Verified};
@@ -35,7 +43,7 @@ use cadence_agent::platform::{AppCapabilityQuote, PlatformAdapter};
 use cadence_agent::test_seam::{scoped, Asserted, Seam};
 use cadence_agent::{client, daemon, store::Store};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,11 +53,11 @@ const TOOL: &str = "read_probe_listing";
 /// The five quote postures this provider can be told to serve. `Up`
 /// returns the reviewed quote; `Down` models Demo's unreachable door;
 /// `Denied` is an auth/permission refusal; `Corrupt` is a well-formed
-/// transport carrying a price schema that fails `valid()` — the
-/// "unknown auth-denial / corrupt response" the boundary must not skip.
-/// `Priced` is a healthy door reporting a *different* live price than
-/// the frozen one — the real `Rejected` drift path (authority intact,
-/// price moved), which still invalidates.
+/// transport carrying a price schema that fails `valid()` — a corrupt
+/// price response, which is not a probe-liveness miss and must be
+/// refused like any error; `Priced` is a healthy door reporting a
+/// *different* live price than the frozen one — the real `Rejected`
+/// drift path (authority intact, price moved), which still invalidates.
 #[derive(Clone, Copy)]
 enum Posture {
     Up,
@@ -59,8 +67,19 @@ enum Posture {
     Priced,
 }
 
+/// A probe provider whose quote door's *actually observed* posture is
+/// witnessed by a per-posture counter incremented inside
+/// `quote_app_capability` — after the posture is read, so a count can
+/// never be attributed to the wrong mode. The counters let a test prove
+/// the monitor really re-quoted during a failure window (a positive
+/// witness), instead of asserting an absence over a blind sleep.
 struct Probe {
     posture: Mutex<Posture>,
+    quotes_up: AtomicU64,
+    quotes_down: AtomicU64,
+    quotes_denied: AtomicU64,
+    quotes_corrupt: AtomicU64,
+    quotes_priced: AtomicU64,
     table: Mutex<&'static ToolTable>,
 }
 
@@ -72,11 +91,27 @@ impl Probe {
         .unwrap();
         Arc::new(Self {
             posture: Mutex::new(Posture::Up),
+            quotes_up: AtomicU64::new(0),
+            quotes_down: AtomicU64::new(0),
+            quotes_denied: AtomicU64::new(0),
+            quotes_corrupt: AtomicU64::new(0),
+            quotes_priced: AtomicU64::new(0),
             table: Mutex::new(Box::leak(Box::new(table))),
         })
     }
     fn set_posture(&self, posture: Posture) {
         *self.posture.lock().unwrap() = posture;
+    }
+    /// How many times `quote_app_capability` actually served `posture`.
+    fn quotes(&self, posture: Posture) -> u64 {
+        match posture {
+            Posture::Up => &self.quotes_up,
+            Posture::Down => &self.quotes_down,
+            Posture::Denied => &self.quotes_denied,
+            Posture::Corrupt => &self.quotes_corrupt,
+            Posture::Priced => &self.quotes_priced,
+        }
+        .load(SeqCst)
     }
     /// The exact quote a healthy door serves for this binding.
     fn reviewed_quote() -> AppCapabilityQuote {
@@ -135,39 +170,52 @@ impl PlatformAdapter for Probe {
         _credential: &[u8],
         binding: &Value,
     ) -> Result<AppCapabilityQuote, String> {
+        // Witness the *observed* posture, not the request's start: the
+        // counter is incremented inside the matched arm, after the
+        // posture is read under the lock, so a flip mid-call is never
+        // mis-attributed.
         match *self.posture.lock().unwrap() {
             // Demo's AgenticOS quote door: unreachable → refusal.
             Posture::Down => {
+                self.quotes_down.fetch_add(1, SeqCst);
                 Err("bound capability price discovery refused: door_unreachable".into())
             }
             // An auth/permission denial is not a price; it must surface
             // as a refusal the run cannot mistake for authority loss or
             // silently skip.
             Posture::Denied => {
+                self.quotes_denied.fetch_add(1, SeqCst);
                 Err("bound capability price discovery refused: auth_denied".into())
             }
             // A corrupt schema: units out of range → `valid()` is false.
-            Posture::Corrupt => Ok(AppCapabilityQuote {
-                schema: 1,
-                currency: "USD".into(),
-                unit_price_micros: 2000,
-                units: 0,
-                total_price_micros: 0,
-                price_revision: String::new(),
-            }),
+            Posture::Corrupt => {
+                self.quotes_corrupt.fetch_add(1, SeqCst);
+                Ok(AppCapabilityQuote {
+                    schema: 1,
+                    currency: "USD".into(),
+                    unit_price_micros: 2000,
+                    units: 0,
+                    total_price_micros: 0,
+                    price_revision: String::new(),
+                })
+            }
             // A live quote that moved since approval: a well-formed,
             // valid quote whose total/revision differ from the frozen
             // one. The run's drift comparison must reject — a genuine
             // `Rejected`, not a probe miss — so the run invalidates.
-            Posture::Priced => Ok(AppCapabilityQuote {
-                schema: 1,
-                currency: "USD".into(),
-                unit_price_micros: 9000,
-                units: 1,
-                total_price_micros: 9000,
-                price_revision: "probe-price/2".into(),
-            }),
+            Posture::Priced => {
+                self.quotes_priced.fetch_add(1, SeqCst);
+                Ok(AppCapabilityQuote {
+                    schema: 1,
+                    currency: "USD".into(),
+                    unit_price_micros: 9000,
+                    units: 1,
+                    total_price_micros: 9000,
+                    price_revision: "probe-price/2".into(),
+                })
+            }
             Posture::Up => {
+                self.quotes_up.fetch_add(1, SeqCst);
                 if binding["config"]["mapping"]["tool"] != TOOL {
                     return Err("not_allowlisted".into());
                 }
@@ -369,6 +417,30 @@ impl Fx {
     fn run_list(&self, install: &str) -> Value {
         self.op("app_run_list", json!({"install_id": install}))
     }
+    fn binding_show(&self, install: &str, binding_id: &str) -> Value {
+        self.op(
+            "app_binding_show",
+            json!({"install_id": install, "binding_id": binding_id}),
+        )["binding"]
+            .clone()
+    }
+    fn binding_list(&self, install: &str) -> Value {
+        self.op("app_binding_list", json!({"install_id": install}))
+    }
+    /// The worker's durable queue via the public `agent_inbox` peek — a
+    /// read that consumes nothing. Returns `(message_ids, unread)`.
+    fn inbox_peek(&self, alias: &str) -> (Vec<String>, i64) {
+        let reply = self.op("agent_inbox", json!({"alias": alias, "peek": true}));
+        let ids = reply["messages"]
+            .as_array()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|row| row["id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (ids, reply["unread"].as_i64().unwrap_or(0))
+    }
     fn wait_state(&self, id: &str, want: &str, what: &str) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -384,10 +456,38 @@ impl Fx {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    /// Install → bind → create → approve → first dispatch, returning
-    /// `(install_id, binding_id, run_id)`. The same operator RPC chain the
-    /// Demo host ran before s1 dispatched.
-    fn live_run(&self, tag: &str) -> (String, String, String) {
+    /// Wait until the monitor has made at least `min` NEW quote calls
+    /// while the door is in `posture` — a positive witness that the
+    /// re-validation loop actually ran inside the failure window. This
+    /// never manufactures a call; it only observes the provider's own
+    /// counter the daemon's real `app_capability_quote` drove. Times
+    /// out (and fails) if the monitor never ticks or stops listing the
+    /// run, so a stalled loop can't pass the row.
+    fn wait_quote_attempts(&self, posture: Posture, baseline: u64, min: u64, what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let observed = self.provider.quotes(posture);
+            assert!(
+                observed >= baseline,
+                "{what}: {posture:?} counter went backwards ({observed} < {baseline})"
+            );
+            if observed >= baseline + min {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: only {} new {posture:?} quote attempts after \
+                 30s — the monitor never re-quoted inside the window",
+                observed - baseline
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    /// Install → bind → create → approve, returning
+    /// `(install_id, binding_id, run_id)` with the run `approved` but
+    /// NOT yet dispatched. The same operator RPC chain the Demo host
+    /// ran before s1 dispatched.
+    fn approved_run(&self, tag: &str) -> (String, String, String) {
         let installed = self.op("app_workspace_install", json!({"source": self.source()}));
         let install = installed["install_id"].as_str().unwrap().to_string();
         let rows = self.op("connection_list", json!({}))["connections"].clone();
@@ -406,6 +506,14 @@ impl Fx {
                 "connection_id": connection, "request_id": format!("bind-{tag}")}),
         )["binding"]
             .clone();
+        let run_id = self.create_and_approve(&install, tag);
+        (install, bound["id"].as_str().unwrap().to_string(), run_id)
+    }
+    /// Create + approve one run on an already-bound installation,
+    /// returning the run id `approved` but undispatched. A second run
+    /// reuses the slot's existing configured binding — a fresh
+    /// `app_binding_create` would collide on the live slot.
+    fn create_and_approve(&self, install: &str, tag: &str) -> String {
         let run = self
             .rpc(
                 Asserted::Operator,
@@ -420,11 +528,7 @@ impl Fx {
             "app_run_approve",
             json!({"run_id": id, "digest": run["snapshot_digest"]}),
         );
-        (
-            install,
-            bound["id"].as_str().unwrap().to_string(),
-            id,
-        )
+        id
     }
     /// Dispatch the first step, asserting the kickoff was queued.
     fn dispatch_first(&self, run_id: &str) -> Value {
@@ -446,24 +550,36 @@ fn step_reason(shown: &Value, idx: usize) -> String {
 
 // --------------------------------------------------------------------
 // The boundary CAD-1142 draws, from the ticket.
+//
+// Red/green is UNPROVEN until a sanctioned runner executes these on both
+// baselines; the rows are written so the assertions that name the Demo
+// symptom intend to fail on pre-fix code (any probe error invalidated a
+// `running` run) and to pass on the candidate. Nothing here claims a
+// pass, a compile or readiness.
 // --------------------------------------------------------------------
 
 /// A transient quote outage on the monitor's re-validation ticks must not
-/// reclassify as authority loss: a running run stays `running` through a
-/// dead door, then still invalidates — with the real reason — once the
-/// binding is genuinely revoked. The step never loses its message_id, and
-/// no second run replaces the killed one.
+/// reclassify as authority loss: a running run survives *observed* dead-
+/// door re-quotes, then still invalidates — with the real reason — once
+/// the binding is genuinely revoked.
+///
+/// The `Down` counter is the positive witness: we only assert the run
+/// survived after the daemon's own quote path demonstrably re-quoted at
+/// least twice in the outage window, so a stalled or emptied monitor
+/// loop cannot make this row pass vacuously.
 #[test]
 fn transient_outage_survives_then_stale_binding_invalidates_with_reason() {
     let fx = Fx::start();
-    let (install, binding_id, run_id) = fx.live_run("survive");
+    let (install, binding_id, run_id) = fx.approved_run("survive");
     fx.dispatch_first(&run_id);
 
-    // The provider door goes down. Successive monitor ticks re-quote;
-    // the run must stay running, the step dispatched, the message
-    // queued — not failed before the worker's first turn.
+    // The provider door goes down. Record the baseline, then require the
+    // monitor's own `app_capability_quote` to attempt >=2 more quotes in
+    // the Down window before we assert survival — the window must really
+    // have run, not merely elapsed.
+    let baseline = fx.provider.quotes(Posture::Down);
     fx.provider.set_posture(Posture::Down);
-    std::thread::sleep(Duration::from_secs(4));
+    fx.wait_quote_attempts(Posture::Down, baseline, 2, "outage survival");
     let shown = fx.show(&run_id);
     assert_eq!(shown["state"], "running", "{shown}");
     assert_eq!(shown["steps"][0]["state"], "dispatched", "{shown}");
@@ -497,18 +613,27 @@ fn transient_outage_survives_then_stale_binding_invalidates_with_reason() {
 
 /// An approved run whose first kickoff has not yet been dispatched is
 /// also not authority-loss prey to a transient quote outage: the
-/// dispatch-time re-proof (which *does* re-quote, like Demo's first
-/// tick) must treat a dead door as a probe miss and still dispatch the
-/// step, not reject the run. Once the door recovers the run proceeds.
+/// dispatch path's own binding/quote re-proof treats a dead door as a
+/// probe miss and dispatches the step, not a refusal.
+///
+/// Intended to fail on pre-fix code (where the operator `app_run_dispatch`
+/// call itself returns the `Rejected` the probe raised — an error return,
+/// not a monitor invalidation), to pass on the candidate. UNPROVEN.
 #[test]
 fn outage_at_first_dispatch_still_dispatches() {
     let fx = Fx::start();
-    let (install, _binding_id, run_id) = fx.live_run("queued");
-    // Approved, first kickoff pending, door down: the dispatch path's
-    // own binding/quote re-proof must treat the dead door as a probe
-    // miss — dispatch the step anyway, not fail the run.
+    let (install, _binding_id, run_id) = fx.approved_run("queued");
+    // Approved, first kickoff pending, door down. Baseline + require the
+    // dispatch path's own quote attempt to have run before asserting.
+    let baseline = fx.provider.quotes(Posture::Down);
     fx.provider.set_posture(Posture::Down);
     let dispatched = fx.op("app_run_dispatch", json!({"run_id": run_id}));
+    // The operator call itself drives a quote attempt (dispatch re-proves
+    // the binding and quotes); prove it happened in the Down window.
+    assert!(
+        fx.provider.quotes(Posture::Down) > baseline,
+        "the dispatch path never re-quoted inside the outage"
+    );
     assert_eq!(
         dispatched["state"], "running",
         "a transient outage refused the dispatch: {dispatched}"
@@ -526,60 +651,89 @@ fn outage_at_first_dispatch_still_dispatches() {
     );
 }
 
-/// An auth denial or a corrupt price schema is an unknown refusal — the
-/// run is not killed (it is not authority loss), but the refusal is NOT
-/// a permissive skip either: the run stays exactly as it was, and a
-/// later stale binding still invalidates. This is the boundary between
-/// "transient probe miss" and "don't pretend the quote was fine".
+/// A provider quote error — auth-denied or a corrupt price schema — is an
+/// unknown probe verdict: it does not mint or destroy authority by
+/// itself. The run stays running (witnessed by the error posture's own
+/// counter across monitor re-quotes), and a *separately real* binding
+/// revoke still invalidates it with a binding reason.
+///
+/// This proves only quote-error-vs-revoke behavior on the daemon's public
+/// re-validation path. It does NOT assert a broker-spend refusal or a
+/// distinct recorded verdict — the worker-claim/call path needs the real
+/// strict-caller peer this fixture cannot mint (see file header).
 #[test]
-fn denied_and_corrupt_quotes_neither_kill_nor_skip() {
+fn quote_errors_do_not_kill_the_run_but_binding_revoke_does() {
     for posture in [Posture::Denied, Posture::Corrupt] {
         let fx = Fx::start();
-        let (install, binding_id, run_id) = fx.live_run(match posture {
+        let (install, binding_id, run_id) = fx.approved_run(match posture {
             Posture::Denied => "denied",
             _ => "corrupt",
         });
         fx.dispatch_first(&run_id);
-        let before = fx.show(&run_id);
+        let baseline = fx.provider.quotes(posture);
         fx.provider.set_posture(posture);
-        std::thread::sleep(Duration::from_secs(4));
+        fx.wait_quote_attempts(posture, baseline, 2, "quote-error survival");
         let shown = fx.show(&run_id);
-        // Still running — not invalidated — and unchanged.
         assert_eq!(
             shown["state"], "running",
             "{posture:?} was reclassified as authority loss: {shown}"
         );
         assert_eq!(shown["steps"][0]["state"], "dispatched", "{shown}");
-        // Not silently skipped either: once the door serves a good
-        // quote again, then the binding is revoked, the stale state
-        // still invalidates with its reason.
+
+        // A genuinely revoked binding — a real authority change — still
+        // invalidates, so the probe-error window did not mask real
+        // refusals either.
         fx.provider.set_posture(Posture::Up);
         fx.op(
             "app_binding_revoke",
             json!({"install_id": install, "binding_id": binding_id,
                 "expected_revision": 1}),
         );
-        fx.wait_state(&run_id, "failed", "stale binding still invalidates");
+        fx.wait_state(&run_id, "failed", "revoke after quote-error window");
         let shown = fx.show(&run_id);
         let reason = step_reason(&shown, 0);
         assert!(
             !reason.trim().is_empty() && reason.contains("binding"),
-            "post-{posture:?} invalidation lost its reason: {shown} (was {before})"
+            "post-{posture:?} invalidation lost its binding reason: {shown}"
         );
     }
 }
 
 /// The operator rule is exercised at every route that runs the
-/// binding/authority checks — an agent caller, an unproven caller and a
-/// forged field are all refused, and nothing is written.
+/// binding/authority checks — agent and unproven callers and forged
+/// fields are refused, and nothing is written.
+///
+/// Zero-mutation is checked on real protected state, not a blanket
+/// "no events": refusal audit events may legitimately append. We pin
+/// the binding's `revision`/`state`/`config`/`digest`, the target run's
+/// `state`/`approved_digest`/`snapshot_digest`/steps, the run count, the
+/// worker's queued-message set, and explicitly assert the forged
+/// request-ids produced no run/binding/message rows. A seeded
+/// non-dispatched sibling run is inspected for invalidation
+/// side-effects.
 #[test]
 fn agent_unproven_and_forged_fields_are_refused_and_write_nothing() {
     let fx = Fx::start();
-    let (install, _binding_id, run_id) = fx.live_run("gate");
-    let before_runs = fx.run_list(&install)["runs"].as_array().unwrap().len();
+    let (install, binding_id, run_id) = fx.approved_run("gate");
+    // A sibling approved-but-undispatched run on the same installation
+    // (reusing the bound slot), to observe whether a refused call's
+    // side-effects touch other runs.
+    let sibling_run = fx.create_and_approve(&install, "gate-sib");
+
+    // Baseline protected state.
+    let binding_before = fx.binding_show(&install, &binding_id);
+    let target_before = fx.show(&run_id);
+    let sibling_before = fx.show(&sibling_run);
+    let (msgs_before, unread_before) = fx.inbox_peek("writer");
+    let runs_before = fx.run_list(&install)["runs"].as_array().unwrap().len();
+    let bindings_before = fx.binding_list(&install)["bindings"]
+        .as_array()
+        .unwrap()
+        .len();
 
     // Non-operator callers are refused on each lifecycle verb that
-    // reaches the run/binding proof.
+    // reaches the run/binding proof. Each call is refused at the gate —
+    // asserted by the error AND by nothing changing below.
     for who in [Asserted::Agent("writer".into()), Asserted::Unproven] {
         for (method, params) in [
             ("app_run_create", json!({"install_id": install, "workflow": "read",
@@ -589,7 +743,7 @@ fn agent_unproven_and_forged_fields_are_refused_and_write_nothing() {
             ("app_run_dispatch", json!({"run_id": run_id})),
             ("app_run_cancel", json!({"run_id": run_id})),
             ("app_binding_revoke", json!({"install_id": install,
-                "binding_id": "forged-binding", "expected_revision": 1})),
+                "binding_id": binding_id, "expected_revision": 1})),
             ("app_binding_create", json!({"install_id": install, "slot": "source",
                 "connection_id": "forged-conn", "request_id": "forge-bind"})),
         ] {
@@ -600,18 +754,14 @@ fn agent_unproven_and_forged_fields_are_refused_and_write_nothing() {
         }
     }
 
-    // A forged identity/authority field inside an operator verb is
-    // refused, never read: an unknown field, a forged digest and a
-    // forged run id all reject before any write.
+    // Forged identity/authority fields inside an operator verb are
+    // refused, never read: unknown field, forged digest, forged run id.
     for params in [
-        // Forged field the allowlist refuses.
         json!({"install_id": install, "workflow": "read",
             "inputs": {"handle":"probe","writer":"writer"},
             "request_id":"forge-field", "owner_pm":"lead",
             "as_alias":"lead", "approval_id":"apv-forged"}),
-        // Forged approval digest.
         json!({"run_id": run_id, "digest": "sha256:forged-digest"}),
-        // A run id that does not exist at all.
         json!({"run_id": "run-nonexistent", "digest": "sha256:x"}),
     ] {
         let method = if params.get("request_id").is_some() {
@@ -625,71 +775,143 @@ fn agent_unproven_and_forged_fields_are_refused_and_write_nothing() {
         );
     }
 
-    // Nothing was written: same run count, same binding, the target run
-    // still awaits its real approval (not approved/cancelled/failed).
-    let shown = fx.show(&run_id);
+    // ---- zero mutation on protected business state ----
+    // The binding is untouched: same revision, still configured, same
+    // config and digest.
+    let binding_after = fx.binding_show(&install, &binding_id);
     assert_eq!(
-        shown["state"], "awaiting_approval",
-        "a refused call moved the run: {shown}"
+        binding_after["revision"], binding_before["revision"],
+        "a refused call bumped the binding revision: {binding_after}"
     );
+    assert_eq!(
+        binding_after["state"], binding_before["state"],
+        "a refused call changed the binding state: {binding_after}"
+    );
+    assert_eq!(
+        binding_after["config"], binding_before["config"],
+        "a refused call rewrote the binding config: {binding_after}"
+    );
+    assert_eq!(
+        binding_after["digest"], binding_before["digest"],
+        "a refused call moved the binding digest: {binding_after}"
+    );
+    // No forged `forge-bind` binding row appeared.
+    assert_eq!(
+        fx.binding_list(&install)["bindings"].as_array().unwrap().len(),
+        bindings_before,
+        "a refused call wrote a binding"
+    );
+    // The target run is unchanged: same approval state, same
+    // approved_digest/snapshot_digest, same step set.
+    let target_after = fx.show(&run_id);
+    assert_eq!(
+        target_after["state"], target_before["state"],
+        "a refused call moved the target run: {target_after}"
+    );
+    assert_eq!(
+        target_after["approved_digest"], target_before["approved_digest"],
+        "a refused approve wrote approved_digest: {target_after}"
+    );
+    assert_eq!(
+        target_after["snapshot_digest"], target_before["snapshot_digest"],
+        "a refused call rewrote the snapshot: {target_after}"
+    );
+    assert_eq!(
+        target_after["steps"], target_before["steps"],
+        "a refused call altered the steps: {target_after}"
+    );
+    // The sibling run is untouched (no invalidation side-effects).
+    let sibling_after = fx.show(&sibling_run);
+    assert_eq!(
+        sibling_after["state"], sibling_before["state"],
+        "a refused call touched the sibling run: {sibling_after}"
+    );
+    assert_eq!(
+        sibling_after["approved_digest"], sibling_before["approved_digest"],
+        "a refused call touched the sibling approval: {sibling_after}"
+    );
+    // No forged run or message was written: run count unchanged, the
+    // worker's queued set identical, no `forge-create`/`forge-field` row.
     assert_eq!(
         fx.run_list(&install)["runs"].as_array().unwrap().len(),
-        before_runs,
+        runs_before,
         "a refused call wrote a run"
     );
-    // The operator's real approval still lands.
+    let (msgs_after, unread_after) = fx.inbox_peek("writer");
+    assert_eq!(msgs_after, msgs_before, "a refused call queued a message");
+    assert_eq!(
+        unread_after, unread_before,
+        "a refused call changed the queued count"
+    );
+    // The operator's real approval still lands (gate admits, not a
+    // blanket refuse).
     fx.op(
         "app_run_approve",
-        json!({"run_id": run_id, "digest": shown["snapshot_digest"]}),
+        json!({"run_id": run_id, "digest": target_after["snapshot_digest"]}),
     );
     assert_eq!(fx.show(&run_id)["state"], "approved");
 }
 
-/// A stale binding refuses the worker's own claim path — not just the
-/// monitor's. Revoking the binding while the kickoff sits queued makes
-/// the admission re-proof refuse, the step fail, and the run
-/// invalidate with the authority reason, never silently admitting.
+/// A stale binding refuses the run on the daemon's own re-validation —
+/// not just an operator call. Revoking the binding while the kickoff
+/// sits queued makes the monitor's next `dispatch_app_run` re-proof
+/// refuse (`Rejected`) and `app_run_invalidate` fail the run, the step
+/// carrying the authority reason.
+///
+/// Boundary: this is the monitor/dispatch re-proof of a queued run, the
+/// same `app_run_binding_current` the worker-claim path calls. The
+/// actual worker `app_run_capability_call` strict-caller admission and
+/// call-time spend ceiling are NOT exercised — they need a real managed
+/// endpoint/peer this fixture cannot mint (see file header).
 #[test]
-fn stale_binding_at_claim_refuses_and_invalidates() {
+fn stale_binding_revoked_while_queued_invalidates_with_reason() {
     let fx = Fx::start();
-    let (install, binding_id, run_id) = fx.live_run("claim");
+    let (install, binding_id, run_id) = fx.approved_run("claim");
     fx.dispatch_first(&run_id);
-    // The kickoff is queued but not yet claimed by a worker turn.
+    // The kickoff is queued but unclaimed. A binding revoke — a real
+    // authority change — must invalidate via the daemon's re-proof.
     fx.op(
         "app_binding_revoke",
         json!({"install_id": install, "binding_id": binding_id,
             "expected_revision": 1}),
     );
-    // The monitor's next tick — or the first worker claim — re-proves
-    // the binding and finds it stale. The run invalidates.
-    fx.wait_state(&run_id, "failed", "stale binding at claim");
+    fx.wait_state(&run_id, "failed", "revoked binding invalidates a queued run");
     let shown = fx.show(&run_id);
     assert_eq!(shown["steps"][0]["state"], "failed", "{shown}");
     let reason = step_reason(&shown, 0);
     assert!(
         reason.contains("binding") || reason.contains("authorization"),
-        "claim-time refusal carries the authority reason: {reason} / {shown}"
+        "revoke invalidation carries the authority reason: {reason} / {shown}"
     );
     assert_eq!(
         fx.run_list(&install)["runs"].as_array().unwrap().len(),
         1,
-        "claim refusal spawned a replacement run"
+        "revoke invalidation spawned a replacement run"
     );
 }
 
 /// A healthy door reporting a *moved* price is not a probe miss — it is
 /// the real `Rejected` drift verdict: authority intact, price changed.
 /// The monitor tick re-validates a live `running` run; a drifted quote
-/// still invalidates it, naming the price change, while a *transient*
+/// still invalidates it, naming the price/capability, while a *transient*
 /// outage (asserted above) does not. This is the mirror image of the
 /// Demo bug: the probe's answer is read, not its liveness.
+///
+/// Intended to fail on pre-fix code is moot here — this drift already
+/// invalidated before; the row pins that the *fixed* path still
+/// distinguishes a real `Rejected` verdict from a liveness miss.
+/// UNPROVEN.
 #[test]
 fn a_moved_live_price_still_invalidates() {
     let fx = Fx::start();
-    let (install, _binding_id, run_id) = fx.live_run("drift");
+    let (install, _binding_id, run_id) = fx.approved_run("drift");
     fx.dispatch_first(&run_id);
     // The binding is untouched and the door is up — but the price moved.
+    let baseline = fx.provider.quotes(Posture::Priced);
     fx.provider.set_posture(Posture::Priced);
+    // Wait for the drift verdict's own quote attempt (positive witness
+    // that the monitor re-quoted the moved price) then the invalidation.
+    fx.wait_quote_attempts(Posture::Priced, baseline, 1, "price drift re-quote");
     fx.wait_state(&run_id, "failed", "a moved price invalidates");
     let shown = fx.show(&run_id);
     assert_eq!(shown["steps"][0]["state"], "failed", "{shown}");
