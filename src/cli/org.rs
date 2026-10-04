@@ -346,7 +346,9 @@ fn ensure_local(state_dir: &Path, tracker_dir: &Path) -> Result<()> {
 /// without the registry file. `org_name` is the issuer-verified slug and
 /// `endpoint`/`org_id` come only from the verified grant. A stored remote is
 /// never re-pointed, a `local` row is never overwritten, and the new org is
-/// selected only when there is no default or `use_default`.
+/// selected only when `use_default` (`--use`) is passed — a bare first
+/// login leaves `selected` unset so ambient local stays the default
+/// (CAD-1125).
 fn apply_record_remote(
     registry: &mut Registry,
     org_name: &str,
@@ -391,7 +393,11 @@ fn apply_record_remote(
             destination: destination.clone(),
         });
     }
-    let selected = if use_default || registry.selected.is_none() {
+    // CAD-1125: only `--use` moves the saved default. A first login on a
+    // registry with no selection leaves `selected` unset — ambient local
+    // stays the default; a bare remote login must not silently retarget
+    // unmanaged commands at the cloud.
+    let selected = if use_default {
         registry.selected = Some(selection.clone());
         true
     } else {

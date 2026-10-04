@@ -611,7 +611,17 @@ fn require_trusted_issuer(dir: &Path, issuer: &str) -> Result<()> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(dir.join(TRUSTED_ISSUER))
-        .map_err(|_| reject("Trusted issuer pin is missing"))?;
+        .map_err(|_| {
+            // The pin is the operator's independent trust decision — the CLI
+            // never creates it. Name the exact file and the exact commands.
+            let file = dir.join(TRUSTED_ISSUER);
+            Error::rejected(format!(
+                "Trusted issuer pin is missing. Create it yourself, then retry: \
+                 printf '%s\\n' '{issuer}' > '{}' && chmod 600 '{}'",
+                file.display(),
+                file.display()
+            ))
+        })?;
     let meta = file.metadata()?;
     if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
         return Err(reject("Trusted issuer pin must be a private owned file"));
@@ -1346,7 +1356,9 @@ impl LoginRuntime for RealLoginRuntime {
 /// issuer. The operator names the workspace and slug; the request carries
 /// audience `https://<slug>.cadencecloud.app`, and `login_grant` accepts
 /// only a grant that echoes both. Nothing is persisted here: the caller
-/// records the org, then saves.
+/// records the org, then saves. On a fresh HOME the login creates the
+/// credential directory (0700) itself, then stops at the operator's
+/// trusted-issuer pin — the pin is never created automatically.
 pub fn login_browser(
     issuer: &str,
     org: &str,
@@ -1377,7 +1389,10 @@ fn login_browser_with(
         return Err(reject("Invalid hosted login request"));
     }
     let audience = format!("https://{slug_value}{CLOUD_SUFFIX}");
-    private_dir(dir, false)?;
+    // CAD-1125: first login creates the credential dir (0700, owner check
+    // kept) before the pin is read — a fresh HOME gets the actionable pin
+    // refusal, never a raw ENOENT.
+    private_dir(dir, true)?;
     let _guard = lock(dir, true)?;
     require_trusted_issuer(dir, &issuer)?;
     let access = read_access_ingress(dir, &issuer)?;
