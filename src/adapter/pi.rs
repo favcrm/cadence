@@ -2152,6 +2152,12 @@ impl ProviderAdapter for PiAdapter {
         // namespace policy, pre-start restore lineage — are unavailable this
         // batch, so this refuses closed before any spawn is constructed. No
         // guest boolean, restored marker, or refreshed flag satisfies it.
+        #[cfg(not(all(unix, target_os = "linux")))]
+        if self.agent_uid.is_some() {
+            super::pi_guest::protected_prereqs_satisfied()?;
+            return Err(Error::rejected("protected managed-Pi launch is Linux-only"));
+        }
+        #[cfg(all(unix, target_os = "linux"))]
         let protected = if let Some(uid) = self.agent_uid {
             let generation = Uuid::new_v4().simple().to_string();
             Some(super::pi_guest::GuestCtx::establish(
@@ -2192,7 +2198,7 @@ impl ProviderAdapter for PiAdapter {
             want,
         )?;
         self.shared.master.store(master, Ordering::SeqCst);
-        if master && protected.is_none() {
+        if master && self.agent_uid.is_none() {
             let agenticos_reads = agenticos_read_extension(&self.env)?.is_some();
             write_pi_guard(
                 &self.state_dir,
@@ -2201,12 +2207,12 @@ impl ProviderAdapter for PiAdapter {
             )?;
         }
         self.shared.guard_ready.store(false, Ordering::SeqCst);
-        let guard_path = if protected.is_none() {
+        let guard_path = if self.agent_uid.is_none() {
             Some(write_pi_turn_guard(&self.state_dir, &agent.alias)?.canonicalize()?)
         } else {
             None
         }; // Immutable protected guard/graph policy is not elected here.
-        let (command, confinement) = if protected.is_none() {
+        let (command, confinement) = if self.agent_uid.is_none() {
             launch_command(&self.env, &self.state_dir, agent)?
         } else {
             (vec!["cadence-protected-fd-exec-only".into()], None)
@@ -2215,13 +2221,16 @@ impl ProviderAdapter for PiAdapter {
             let role = if master { "master" } else { "worker" };
             self.log_confinement(role, policy)?;
         }
+        #[cfg(all(unix, target_os = "linux"))]
         let generation = protected
             .as_ref()
             .map(|ctx| ctx.segments().generation_hex())
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string()[..12].to_string());
+        #[cfg(not(all(unix, target_os = "linux")))]
+        let generation = Uuid::new_v4().simple().to_string()[..12].to_string();
         *self.shared.generation.lock().unwrap() = generation.clone();
         self.shared.dead.store(false, Ordering::SeqCst);
-        let mut env = if protected.is_none() {
+        let mut env = if self.agent_uid.is_none() {
             let mut env = vec![
                 ("CADENCE_ALIAS".to_string(), agent.alias.clone()),
                 (
@@ -2366,6 +2375,7 @@ impl ProviderAdapter for PiAdapter {
         // Keep all fallible post-launch work inside one cleanup boundary.
         *self.transport.write().unwrap() = Arc::clone(&transport);
         let initialized = (|| {
+            #[cfg(all(unix, target_os = "linux"))]
             let pid = match protected {
                 Some(ctx) => {
                     let routing = crate::protected_pi_profile::Routing::for_agent(master, want)
@@ -2374,6 +2384,8 @@ impl ProviderAdapter for PiAdapter {
                 }
                 None => transport.launch(&agent.cwd, &self.log_path, &env)?,
             };
+            #[cfg(not(all(unix, target_os = "linux")))]
+            let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
             // Effort: validate against the model's real levels, then verify
             // what stuck — Pi answers success even on a silent fallback.
             if let Some(effort) = params.get("effort").and_then(Value::as_str) {

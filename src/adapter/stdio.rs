@@ -222,6 +222,7 @@ impl StdioAdapter {
 
     /// Typed protected transport. No command/env/cwd from agent params enters
     /// this path; only the owned context can yield a bound helper exec plan.
+    #[cfg(all(unix, target_os = "linux"))]
     pub(crate) fn launch_protected(
         self: &Arc<Self>,
         context: super::pi_guest::GuestCtx,
@@ -229,12 +230,6 @@ impl StdioAdapter {
         stderr_log: &std::path::Path,
     ) -> Result<u32> {
         let plan = context.spawn_plan(routing)?;
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (plan, stderr_log);
-            Err(Error::rejected("protected launch is Linux-only"))
-        }
-        #[cfg(target_os = "linux")]
         {
             let log = std::fs::OpenOptions::new()
                 .create(true)
