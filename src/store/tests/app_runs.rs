@@ -699,8 +699,8 @@ fn cad631_authority_loss_invalidates_once_and_keeps_material_receipts() {
     )
     .unwrap();
     s.app_run_dispatch(id, "sha256:bundle").unwrap();
-    s.app_run_invalidate(id).unwrap();
-    s.app_run_invalidate(id).unwrap();
+    s.app_run_invalidate(id, "test authority loss").unwrap();
+    s.app_run_invalidate(id, "test authority loss").unwrap();
     assert_eq!(s.app_run_show(id).unwrap()["state"], "failed");
     assert!(s.app_run_pending().unwrap().is_empty());
     assert!(s.app_run_dispatch(id, "sha256:bundle").is_err());

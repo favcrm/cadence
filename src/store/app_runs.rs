@@ -767,7 +767,11 @@ impl Store {
         {
             value["failure"] = json!({"kind":kind,"reason":reason,"step_id":step_id});
         }
-        value["steps"]=Value::Array(conn.query_vec("SELECT step_id,task_id,state,message_id FROM app_run_steps WHERE run_id=? ORDER BY step_id",[id],|r|Ok(json!({"step_id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"message_id":r.get::<_,Option<String>>(3)?})))?);
+        // CAD-1142: surface the step's failure reason. `app_step_failed_in`
+        // records the cause on the bound task's `error`; project it onto the
+        // step so the board and screen show *why* a step failed instead of a
+        // bare `state: failed` (Demo s1 runs failed with no reason anywhere).
+        value["steps"]=Value::Array(conn.query_vec("SELECT s.step_id,s.task_id,s.state,s.message_id,t.error FROM app_run_steps s LEFT JOIN tasks t ON t.id=s.task_id WHERE s.run_id=? ORDER BY s.step_id",[id],|r|{let mut step=json!({"step_id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"message_id":r.get::<_,Option<String>>(3)?});if let Some(reason)=r.get::<_,Option<String>>(4)?.filter(|reason|!reason.trim().is_empty()){step["reason"]=json!(reason);}Ok(step)})?);
         value["artifacts"]=Value::Array(conn.query_vec("SELECT id,step_id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? ORDER BY step_id",[id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"step_id":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"media_type":r.get::<_,String>(3)?,"size":r.get::<_,i64>(4)?})))?);
         value["reviews"]=Value::Array(conn.query_vec("SELECT step_id,artifact_digest,reviewer,decision,rationale,asset_receipt_id,asset_digest FROM app_run_reviews WHERE run_id=?",[id],|r|{
             let mut review=json!({"step_id":r.get::<_,String>(0)?,"artifact_digest":r.get::<_,String>(1)?,"reviewer":r.get::<_,String>(2)?,"decision":r.get::<_,String>(3)?,"rationale":r.get::<_,String>(4)?});
@@ -1386,15 +1390,22 @@ impl Store {
         })
     }
     /// Authority loss is terminal; existing artifacts and turn receipts remain
-    /// immutable. This never retries uncertain provider work.
-    pub fn app_run_invalidate(&self, id: &str) -> Result<()> {
+    /// immutable. This never retries uncertain provider work. `reason` names
+    /// the actual cause (the dispatch/binding rejection that proved the loss)
+    /// so failed steps persist a plain-words cause instead of a bare state.
+    pub fn app_run_invalidate(&self, id: &str, reason: &str) -> Result<()> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
-            self.app_run_invalidate_in(&tx, id)?;
+            self.app_run_invalidate_in(&tx, id, reason)?;
             Ok(())
         })
     }
-    pub(super) fn app_run_invalidate_in(&self, tx: &impl super::StoreConn, id: &str) -> Result<()> {
+    pub(super) fn app_run_invalidate_in(
+        &self,
+        tx: &impl super::StoreConn,
+        id: &str,
+        reason: &str,
+    ) -> Result<()> {
         let changed = tx.execute("UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state IN ('awaiting_approval','approved','running')", params![now(), id])?;
         if changed != 0 {
             tx.execute(
@@ -1406,7 +1417,7 @@ impl Store {
             // already closes material/dispatch authority; erasing the step
             // association would roll back the transport's terminal receipt.
             tx.execute("UPDATE app_run_steps SET state='failed' WHERE run_id=? AND state IN ('pending','dispatched') AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.id=app_run_steps.message_id AND m.state='running')", [id])?;
-            tx.execute("UPDATE tasks SET state='failed',error='app authority or assignment is no longer current',updated=? WHERE id IN (SELECT task_id FROM app_run_steps WHERE run_id=? AND state='failed')", params![now(), id])?;
+            tx.execute("UPDATE tasks SET state='failed',error=?,updated=? WHERE id IN (SELECT task_id FROM app_run_steps WHERE run_id=? AND state='failed')", params![reason, now(), id])?;
             tx.execute("UPDATE messages SET state='failed',error='app submission authorization changed',completed=? WHERE source='app_run_dispatch' AND state IN ('queued','submitting') AND id IN (SELECT message_id FROM app_run_steps WHERE run_id=?)",params![now(),id])?;
             Self::event(
                 tx,
@@ -1694,14 +1705,30 @@ impl Store {
         let worker = self.agent_in(tx, &message.alias)?;
         let task = self.task_in(tx, task_id)?;
         if status != "completed" {
+            // CAD-1142: the step's reason names what actually ended the
+            // worker's turn (provider error, interruption, unknown outcome),
+            // not a bare "failed". The message's own `error`/`result.error`
+            // carries the provider's words; fold it in so the board shows a
+            // plain-words cause instead of a state with no reason.
+            let detail = message
+                .error
+                .clone()
+                .filter(|e| !e.trim().is_empty())
+                .or_else(|| {
+                    result
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .filter(|e| !e.trim().is_empty())
+                        .map(str::to_string)
+                });
+            let reason = match detail {
+                Some(detail) => format!("the assigned worker's turn ended {status}: {detail}"),
+                None => {
+                    format!("the assigned worker's turn ended {status} without producing material")
+                }
+            };
             return self
-                .app_step_failed_in(
-                    tx,
-                    &run_id,
-                    &step_id,
-                    task_id,
-                    "app turn did not produce successful material",
-                )
+                .app_step_failed_in(tx, &run_id, &step_id, task_id, &reason)
                 .map(|_| true);
         }
         let AppCompletionProof::ActiveEndpoint { turn_id } = proof else {
