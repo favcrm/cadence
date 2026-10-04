@@ -3222,16 +3222,10 @@ mod tests {
         // carries the printf/chmod remedy against the exact pin path.
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("e");
-        let err = login_browser(
-            "http://127.0.0.1:1",
-            "ws_real",
-            "acme",
-            &dir,
-            |_, _| Ok(()),
-        )
-        .err()
-        .unwrap()
-        .to_string();
+        let err = login_browser("http://127.0.0.1:1", "ws_real", "acme", &dir, |_, _| Ok(()))
+            .err()
+            .unwrap()
+            .to_string();
         let file = dir.join(TRUSTED_ISSUER).display().to_string();
         let quoted = shell_quote(&file);
         assert!(err.contains("Trusted issuer pin is missing"), "{err}");
@@ -3257,16 +3251,10 @@ mod tests {
         let victim = root.path().join("victim");
         fs::write(&victim, "keep me").unwrap();
         std::os::unix::fs::symlink(&victim, dir.join(TRUSTED_ISSUER)).unwrap();
-        let err = login_browser(
-            "http://127.0.0.1:1",
-            "ws_real",
-            "acme",
-            &dir,
-            |_, _| Ok(()),
-        )
-        .err()
-        .unwrap()
-        .to_string();
+        let err = login_browser("http://127.0.0.1:1", "ws_real", "acme", &dir, |_, _| Ok(()))
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("cannot be opened"), "{err}");
         assert!(!err.contains("printf"), "{err}");
         assert!(!err.contains("chmod"), "{err}");
@@ -3279,25 +3267,16 @@ mod tests {
         // quotes in the printed remedy.
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("it's");
-        let err = login_browser(
-            "http://127.0.0.1:1",
-            "ws_real",
-            "acme",
-            &dir,
-            |_, _| Ok(()),
-        )
-        .err()
-        .unwrap()
-        .to_string();
+        let err = login_browser("http://127.0.0.1:1", "ws_real", "acme", &dir, |_, _| Ok(()))
+            .err()
+            .unwrap()
+            .to_string();
         let file = dir.join(TRUSTED_ISSUER).display().to_string();
         // The raw, unescaped path (with a bare ') never appears.
         assert!(!err.contains(&format!(">{file}")), "{err}");
         assert!(!err.contains(&format!("> '{file}'")), "{err}");
         // The shell-quoted form does.
-        assert!(
-            err.contains(&format!("> {}", shell_quote(&file))),
-            "{err}"
-        );
+        assert!(err.contains(&format!("> {}", shell_quote(&file))), "{err}");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
