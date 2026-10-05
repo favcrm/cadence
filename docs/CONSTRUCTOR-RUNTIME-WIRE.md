@@ -34,8 +34,11 @@ This new source/artifact requires new root qualification; none is inherited.
 Each request carries version1, original operation/barrierNonce and positive
 JS-safe monotonic sequence, plus its exact selected fields:
 - `runtime-current`
+- `store-startup`: NO caller-selected binding/purpose/attempt; actual owner elects facts
 - `store-acquire`: purpose init|restore|open|close|witness, attempt32hex
 - `store-consume` / `store-current`: opaque reference
+- `store-database-current`: original consumed opening reference; separate live DB
+  authority, never an activation deadline renewal
 - `pi-acquire`: typed OperationScope from pi_guest/owner.rs
 - `pi-consume` / `pi-current`: reference32hex and same exact OperationScope
 
@@ -89,15 +92,31 @@ authority. Return ONLY fixed Pi stdin/stdout/stderr streams to the supervisor;
 helper connects fixed endpoint AFTER close_fds and retains same channel through
 postseal consume. No helper authority argv/env/arbitrary inherited descriptors.
 
-## Remaining source integration (NOT complete)
+## Current source integration and remaining qualification
 
-Runtime signature/current/finite relay, fixed RW mount custody and root-owned
-helper API are source implemented. The private21000 proxy/dispatcher, actual
-enrolled daemon registration, stdio adoption and lifecycle/capture orchestration
-remain necessary. Protected daemon path requests authenticated startup and calls
-Store::open_owned before SQL, retaining migration authorization and refusing
-Legacy fallback; absent genuine service still refuses. This is not a serving
-implementation yet. Independently owned bad-case checks must exercise actual
-production authority/current/peer fences, not cold endpoints or shape-only
-checks. Required gates, final two noncontributor native reviews, exact-head human
-approval and root-owned actual image/kernel/provider/key qualification remain.
+Runtime signature/current/finite relay, fixed RW mount custody, private21000
+proxy/dispatcher, actual own-created daemon registration, Root-owned helper,
+stdio adoption and physical listener handoff are source implemented. Protected
+daemon requests authentic no-argument startup and calls Store::open_owned before
+SQL, retaining migration authorization and refusing Legacy fallback. Root admits
+actual accepted sockets against retained kernel custody, not claimed PIDs/UIDs.
+Serving requires retained listener/process/path objects and original consumed
+DB/current; terminal stop cannot rearm. See CONSTRUCTOR-PRIVATE-RUNTIME.md for
+same-runtime task generations and actual family plus worker-quiescence fences.
+
+The finite enrollment ACK is still not runtime/Store/Pi/serving authority. Host
+retains the SAME carrier only after separate purpose-authenticated runtime
+release within the original bootstrap budget, then retains exact Company/Global
+owner capabilities for bounded current/readbacks. Loss/expiry is UNKNOWN. A
+successful release does not renew Store activation: business writes require the
+distinct original consumed DB-current, not an expired permit or another acquire.
+The first pilot permits only fresh Init with absent DB and all sidecars. Durable
+close/witness/standalone capture source is partial second-milestone work, NOT
+immutable artifact acceptance, restore-ready or FINAL.
+
+These are source contracts, not observed native serving outcomes. Independently
+owned bad-case checks must exercise actual production authority/current/peer
+fences from a genuine baseline, not cold endpoints or shape-only checks. Required
+coherent-head floor/CI, two noncontributor native reviews, exact-head operator
+approval and Root-owned NEW image/kernel/provider/Pi/tool qualification remain.
+No previous artifact qualifies changed constructor images; native stays disabled.
