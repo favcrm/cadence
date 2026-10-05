@@ -34,9 +34,19 @@ pub(super) fn try_entry() -> Option<Result<()>> {
 }
 fn entry() -> Result<()> {
     fixed_arguments()?;
+    let shared = crate::adapter::pi_guest::topology::resolve_gid_pub(
+        crate::adapter::pi_guest::acct::SHARED_GROUP,
+    )?;
+    let mut group = 0u32;
+    if shared == 0
+        || shared == 21000
+        || unsafe { libc::getgroups(1, &mut group) } != 1
+        || group != shared
+    {
+        return Err(refused());
+    }
     if std::env::vars_os().next().is_some()
         || carrier::ids()? != [21000; 6]
-        || unsafe { libc::getgroups(0, std::ptr::null_mut()) } != 0
         || unsafe { libc::prctl(libc::PR_GET_SECUREBITS, 0, 0, 0, 0) } != 239
         || unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1
         || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 2
@@ -137,12 +147,6 @@ fn entry() -> Result<()> {
                 Err(_) => unsafe { libc::_exit(125) },
             }
         });
-    }
-    let shared = crate::adapter::pi_guest::topology::resolve_gid_pub(
-        crate::adapter::pi_guest::acct::SHARED_GROUP,
-    )?;
-    if shared == 0 {
-        return Err(refused());
     }
     let provider_env = crate::adapter::ProviderEnv::default();
     // Fixed application data routing, never an identity/authority selector.

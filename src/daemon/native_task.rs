@@ -87,43 +87,56 @@ impl Task {
         let running = adapter.clone();
         let task = id.clone();
         let worker = thread::spawn(move || -> Result<()> {
-            let identity = running.open(&agent)?;
-            if identity.model.as_deref() != Some(model.as_str()) {
-                running.close();
-                return Err(Error::unknown(
-                    "native Pi model readback differs from election",
-                ));
-            }
-            emit(
-                &control,
-                &task,
-                &part,
-                &json!({"type":"opened","model":identity.model,"pidObservation":identity.pid}),
-            )?;
-            let started_control = control.clone();
-            let started_task = task.clone();
-            let started_part = part.clone();
-            let result = running.run_turn(&prompt, &task, &move |turn| {
-                if emit(
-                    &started_control,
-                    &started_task,
-                    &started_part,
-                    &json!({"type":"turn-started","turn":turn}),
-                )
-                .is_err()
-                {
-                    unsafe { libc::_exit(125) }
+            let outcome = (|| -> Result<()> {
+                let identity = running.open(&agent)?;
+                if identity.model.as_deref() != Some(model.as_str()) {
+                    running.close();
+                    return Err(Error::unknown(
+                        "native Pi model readback differs from election",
+                    ));
                 }
-            })?;
-            emit(
-                &control,
-                &task,
-                &part,
-                &json!({"type":"result","turn":result.turn_id,"status":result.status,"text":result.text,"error":result.error,"stopReason":result.stop_reason}),
-            )?;
-            // Retain the actual adapter/control after completion. A result or
-            // EOF does NOT certify owned retirement or discharge host UNKNOWN.
-            Ok(())
+                emit(
+                    &control,
+                    &task,
+                    &part,
+                    &json!({"type":"opened","model":identity.model,"pidObservation":identity.pid}),
+                )?;
+                let started_control = control.clone();
+                let started_task = task.clone();
+                let started_part = part.clone();
+                let result = running.run_turn(&prompt, &task, &move |turn| {
+                    if emit(
+                        &started_control,
+                        &started_task,
+                        &started_part,
+                        &json!({"type":"turn-started","turn":turn}),
+                    )
+                    .is_err()
+                    {
+                        unsafe { libc::_exit(125) }
+                    }
+                })?;
+                emit(
+                    &control,
+                    &task,
+                    &part,
+                    &json!({"type":"result","turn":result.turn_id,"status":result.status,"text":result.text,"error":result.error,"stopReason":result.stop_reason}),
+                )?;
+                // Retain the actual adapter/control after completion. A result or
+                // EOF does NOT certify owned retirement or discharge host UNKNOWN.
+                Ok(())
+            })();
+            if let Err(error) = &outcome {
+                // Failure is explicit task DATA, never successful EOF/retire.
+                // Keep actual control for Root's independent physical cleanup.
+                emit(
+                    &control,
+                    &task,
+                    &part,
+                    &json!({"type":"failed","error":error.to_string()}),
+                )?;
+            }
+            outcome
         });
         Ok(Self {
             id,

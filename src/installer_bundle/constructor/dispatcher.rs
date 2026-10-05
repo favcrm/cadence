@@ -833,6 +833,14 @@ pub(super) fn run(layout: Layout) -> Result<()> {
         let r = registry()?;
         r.check(until)?;
         r.daemon.drain_logs()?;
+        // Service real tracer signal stops even when no Status RPC arrives.
+        // Exact retained Node/caller/seal/ns is rechecked before forwarding;
+        // unexpected exec/event/trap aborts this runtime rather than releasing.
+        for session in &pi {
+            if let Some(run) = &session.running {
+                run.helper.exited(until)?;
+            }
+        }
         if heartbeat.elapsed() >= Duration::from_secs(1) {
             lifecycle::runtime_current(until)?;
             heartbeat = Instant::now();

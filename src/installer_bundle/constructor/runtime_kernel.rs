@@ -163,6 +163,9 @@ fn filter() -> Vec<libc::sock_filter> {
         libc::SYS_rename,
         libc::SYS_renameat,
         libc::SYS_renameat2,
+        libc::SYS_chown,
+        libc::SYS_fchown,
+        libc::SYS_fchownat,
         libc::SYS_fchmod,
         libc::SYS_fchmodat,
         libc::SYS_chmod,
@@ -234,6 +237,7 @@ pub(crate) struct OwnedDaemon {
     pidfd: File,
     executable: files::HeldArtifact,
     namespaces: Vec<File>,
+    shared_gid: u32,
     pub(super) control: UnixDatagram,
     logs: [File; 2],
     detached: bool,
@@ -252,6 +256,14 @@ impl OwnedDaemon {
             return Err(refused());
         }
         executable.recheck(deadline)?;
+        // Elected fixed image NSS group, resolved in the single-thread parent.
+        // This enables only the shared views/socket DAC, not private Store/root.
+        let shared_gid = crate::adapter::pi_guest::topology::resolve_gid_pub(
+            crate::adapter::pi_guest::acct::SHARED_GROUP,
+        )?;
+        if shared_gid == 0 || shared_gid == 21000 {
+            return Err(refused());
+        }
         let (control, child) = UnixDatagram::pair().map_err(|_| refused())?;
         control.set_nonblocking(true).map_err(|_| refused())?;
         let (stdin, input) = pipe()?;
@@ -304,7 +316,7 @@ impl OwnedDaemon {
                 }
                 let mut kernel = seal::Linux;
                 let last = kernel.prepare()?;
-                if unsafe { libc::setgroups(0, std::ptr::null()) } != 0
+                if unsafe { libc::setgroups(1, &shared_gid) } != 0
                     || unsafe { libc::setresgid(21000, 21000, 21000) } != 0
                     || unsafe { libc::setresuid(21000, 21000, 21000) } != 0
                     || unsafe { libc::chdir(c"/".as_ptr()) } != 0
@@ -368,6 +380,7 @@ impl OwnedDaemon {
             pidfd: unsafe { File::from_raw_fd(p) },
             executable,
             namespaces: Vec::new(),
+            shared_gid,
             control,
             logs: [stdout, stderr],
             detached: false,
@@ -468,7 +481,6 @@ impl OwnedDaemon {
         for (key, value) in [
             ("Uid:", "21000\t21000\t21000\t21000"),
             ("Gid:", "21000\t21000\t21000\t21000"),
-            ("Groups:", ""),
             ("NoNewPrivs:", "1"),
             ("Seccomp:", "2"),
             ("CapInh:", "0000000000000000"),
@@ -480,6 +492,13 @@ impl OwnedDaemon {
             if custody::field(&status, key)?.trim() != value {
                 return Err(refused());
             }
+        }
+        let groups = custody::field(&status, "Groups:")?
+            .split_ascii_whitespace()
+            .map(|s| s.parse::<u32>().map_err(|_| refused()))
+            .collect::<Result<Vec<_>>>()?;
+        if groups != [self.shared_gid] {
+            return Err(refused());
         }
         let tracer = if self.detached { 0 } else { std::process::id() };
         if custody::field(&status, "TracerPid:")? != tracer.to_string() {

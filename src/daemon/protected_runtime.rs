@@ -8,6 +8,20 @@ use crate::installer_bundle::constructor::{
 };
 use std::sync::mpsc;
 struct Quiesced;
+struct Failed {
+    shared: Arc<Shared>,
+    control: Arc<std::os::unix::net::UnixDatagram>,
+}
+impl Drop for Failed {
+    fn drop(&mut self) {
+        // This worker normally remains serving. Error/panic never leaves a
+        // healthy-looking daemon with a silently lost native control reader.
+        self.shared.begin_closing();
+        if private_wire::send_child(&self.control, &Packet::Failed { version: 1 }).is_err() {
+            unsafe { libc::_exit(125) }
+        }
+    }
+}
 pub(super) struct Maintenance {
     completed: mpsc::SyncSender<Quiesced>,
     worker: thread::JoinHandle<Result<()>>,
@@ -18,6 +32,10 @@ impl Maintenance {
         let shared = shared.clone();
         let (tx, rx) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || -> Result<()> {
+            let _failure = Failed {
+                shared: shared.clone(),
+                control: control.clone(),
+            };
             let mut closed = false;
             let mut task = None::<super::native_task::Task>;
             let mut task_spent = false;

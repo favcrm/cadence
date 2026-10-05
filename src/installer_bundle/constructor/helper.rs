@@ -392,21 +392,15 @@ impl OwnedHelper {
             return Err(refused());
         }
         let text = custody::status(self.child.id())?;
-        let uid = format!(
-            "{} {} {} {}",
-            self.guest, self.guest, self.guest, self.guest
-        );
-        let gid = format!(
-            "{} {} {} {}",
-            self.guest_gid, self.guest_gid, self.guest_gid, self.guest_gid
-        );
-        let actual_groups = custody::field(&text, "Groups:")?
-            .split_whitespace()
-            .map(|s| s.parse::<u32>().map_err(|_| refused()))
-            .collect::<Result<Vec<_>>>()?;
-        if custody::field(&text, "Uid:")? != uid
-            || custody::field(&text, "Gid:")? != gid
-            || actual_groups != self.sealed_groups
+        let ids = |key: &str| -> Result<Vec<u32>> {
+            custody::field(&text, key)?
+                .split_ascii_whitespace()
+                .map(|s| s.parse::<u32>().map_err(|_| refused()))
+                .collect()
+        };
+        if ids("Uid:")? != [self.guest; 4]
+            || ids("Gid:")? != [self.guest_gid; 4]
+            || ids("Groups:")? != self.sealed_groups
         {
             return Err(refused());
         }
@@ -467,8 +461,33 @@ impl OwnedHelper {
                 libc::WNOHANG | libc::__WALL,
             )
         };
-        if rc > 0 && !libc::WIFEXITED(status) && !libc::WIFSIGNALED(status) {
-            return Err(refused());
+        if rc > 0 {
+            if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                lifecycle::runtime_proof(until)?.recheck(until)?;
+                return Ok(true); // actual retained-child kernel exit only
+            }
+            // SEIZE keeps normal POSIX signal-delivery stops, including tool
+            // SIGCHLD and owned SIGINT. Never suppress them or leave Node stuck.
+            // A later exec/event/trap/group-stop is NOT a release permission.
+            if !libc::WIFSTOPPED(status)
+                || status >> 16 != 0
+                || matches!(libc::WSTOPSIG(status), libc::SIGTRAP | libc::SIGSTOP)
+            {
+                return Err(refused());
+            }
+            self.node_current()?;
+            lifecycle::runtime_proof(until)?.recheck(until)?;
+            if unsafe {
+                libc::ptrace(
+                    libc::PTRACE_CONT,
+                    self.child.id() as i32,
+                    0usize,
+                    libc::WSTOPSIG(status) as usize,
+                )
+            } != 0
+            {
+                return Err(refused());
+            }
         }
         if rc < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ECHILD) {
             return Err(refused());

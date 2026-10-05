@@ -4973,7 +4973,16 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     crate::device_login::migrate(state_dir);
     let shared_socket = if opts.agent_uid.is_some() {
         let (path, gid, fixture) = match &opts.shared_socket {
-            Some((path, gid)) => (path.clone(), *gid, true),
+            Some((path, gid)) => {
+                // The actual fixed runtime entry never uses the fixture's
+                // relaxed parent-group/mode check for its shared socket.
+                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                let fixture =
+                    crate::installer_bundle::constructor::runtime_child::control().is_none();
+                #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+                let fixture = true;
+                (path.clone(), *gid, fixture)
+            }
             None => (
                 crate::agent_uid::config::shared_socket_path().to_path_buf(),
                 crate::agent_uid::config::shared_gid()?,
