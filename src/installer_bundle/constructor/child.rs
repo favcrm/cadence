@@ -118,6 +118,24 @@ fn filter() -> Vec<libc::sock_filter> {
         out.push(equal(nr as u32, 0, 1));
         out.push(statement(0x06, ALLOW));
     }
+    // Fixed readback/duplex setup only, never credential/securebits mutation.
+    out.extend([
+        equal(libc::SYS_prctl as u32, 0, 9),
+        statement(0x20, 16), // args[0]
+        equal(libc::PR_GET_SECUREBITS as u32, 5, 0),
+        equal(libc::PR_GET_KEEPCAPS as u32, 4, 0),
+        equal(libc::PR_GET_NO_NEW_PRIVS as u32, 3, 0),
+        equal(libc::PR_GET_SECCOMP as u32, 2, 0),
+        statement(0x06, DENY),
+        statement(0x06, DENY),
+        statement(0x06, ALLOW),
+        statement(0x06, DENY),
+        statement(0x20, 0),
+    ]);
+    for nr in [libc::SYS_fcntl, libc::SYS_getsockopt] {
+        out.push(equal(nr as u32, 0, 1));
+        out.push(statement(0x06, ALLOW));
+    }
     out.extend([
         equal(libc::SYS_openat as u32, 0, 4),
         statement(0x20, 32), // args[2] low word: flags
@@ -217,6 +235,13 @@ impl HeldChild {
     pub(super) fn owner(&self) -> &UnixStream {
         &self.owner
     }
+    pub(super) fn resume(&mut self, deadline: Deadline) -> Result<()> {
+        if !self.exec_completed {
+            return Err(refused());
+        }
+        self.corroborate(deadline)?;
+        trace(libc::PTRACE_CONT, self.pid, 0)
+    }
 
     /// Root remains the held tracer. An unexpected signal, exit or later exec
     /// can never become successful construction or consumption evidence.
@@ -232,6 +257,13 @@ impl HeldChild {
         }
         if rc < 0 || !self.exec_completed {
             return Err(refused());
+        }
+        for pipe in [&self.output, &self.errors] {
+            let mut byte = [0u8; 1];
+            let n = unsafe { libc::read(pipe.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+            if n >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN) {
+                return Err(refused()); // stdout/diagnostics never authorize custody
+            }
         }
         self.corroborate(deadline)
     }
@@ -279,7 +311,7 @@ impl HeldChild {
         }
         deadline.check()
     }
-    fn cleanup(&mut self) {
+    pub(super) fn cleanup(&mut self) {
         if self.reaped {
             return;
         }

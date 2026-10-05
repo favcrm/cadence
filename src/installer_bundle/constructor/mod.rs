@@ -3,11 +3,23 @@
 //! Child construction is private and happens ONLY after this authentication.
 mod channel;
 mod child;
+mod children;
+mod context;
+mod custody;
+mod runtime;
+mod wire;
+
 use super::{fixed_arguments, refused, Deadline, Result};
 use crate::daemon::supervisor_grant as grant;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+pub(crate) use children::recipient_entry;
+pub(crate) use context::{
+    acknowledge_children, binding_json, custody_recheck, enrollment, grant_keys, image,
+    install_once, installer, owner_request, proof, receipt_keys, require_self, Proof,
+};
 use serde::{Deserialize, Serialize};
 use std::os::fd::AsRawFd;
+pub(crate) use wire::{Kind, OwnerResponse};
 
 const DOMAIN: &[u8] = b"cadence.native-image-qualification.v1\0";
 const MAX_SAFE: u64 = 9007199254740991;
@@ -23,7 +35,7 @@ struct ImageAuthorityKey {
 }
 const IMAGE_AUTHORITY_KEYS: &[ImageAuthorityKey] = &[];
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Configure {
     version: u8,
@@ -63,9 +75,9 @@ struct LaunchWire {
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct LineageWire {
-    reference: String,
-    database_epoch: u64,
+pub(crate) struct LineageWire {
+    pub(crate) reference: String,
+    pub(crate) database_epoch: u64,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -114,13 +126,14 @@ pub(super) struct Manifest {
 
 /// Non-exported, non-Clone production token. Only authenticated bootstrap can
 /// create one. It is not a process construction proof or a launch capability.
-pub(super) struct QualifiedBootstrap {
+pub(crate) struct QualifiedBootstrap {
     manifest: Manifest,
     launch: grant::LaunchBinding,
     lineage: grant::Lineage,
     operation: String,
     barrier_nonce: String,
     expires_at_ms: u64,
+    authenticated_at_ms: u64,
 }
 fn hex(s: &str, count: usize) -> bool {
     s.len() == count
@@ -282,12 +295,12 @@ pub(super) fn authenticate_bootstrap(bytes: &[u8], now_ms: u64) -> Result<Qualif
         operation: input.operation,
         barrier_nonce: input.barrier_nonce,
         expires_at_ms: input.expires_at_ms,
+        authenticated_at_ms: now_ms,
     })
 }
 
-/// Bootstrap-only entry while this coherent draft is being completed. Keep
-/// activation closed until factory integration AND root-owned qualification;
-/// no CLI/env/caller boolean can enable it. This is not delivery completion.
+/// Fixed production root entry. Missing independently elected image roots
+/// refuse before root effects; positive state is constructed, never asserted.
 pub(super) fn entry() -> Result<()> {
     fixed_arguments()?;
     let deadline = Deadline::new();
@@ -307,10 +320,50 @@ pub(super) fn entry() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| refused())?
         .as_millis();
-    let _qualified = authenticate_bootstrap(&frame.0, u64::try_from(now).map_err(|_| refused())?)?;
-    // The same real production authenticator above precedes ALL root effects.
-    // No success/constructed/PREPARED/ACK is emitted by this draft entry.
-    Err(crate::Error::rejected("root constructor activation unavailable — factory integration and operational qualification incomplete"))
+    let qualified = authenticate_bootstrap(&frame.0, u64::try_from(now).map_err(|_| refused())?)?;
+    runtime::run(qualified, &frame.0, wire, deadline)
+}
+
+pub(crate) fn client_entry() -> Result<()> {
+    children::client_entry()
+}
+
+pub(crate) type ReceiptKeyRecord = (String, String, u64, [u8; 32]);
+impl QualifiedBootstrap {
+    pub(crate) fn receipt_records(&self) -> Result<Vec<ReceiptKeyRecord>> {
+        self.manifest
+            .receipt_trust
+            .iter()
+            .map(|k| {
+                Ok((
+                    k.issuer.clone(),
+                    k.kid.clone(),
+                    k.key_version,
+                    decode(&k.public_key, 32)?
+                        .try_into()
+                        .map_err(|_| refused())?,
+                ))
+            })
+            .collect()
+    }
+    fn grant_public_keys(&self) -> Result<Vec<[u8; 32]>> {
+        self.manifest
+            .grant_trust
+            .iter()
+            .map(|k| decode(&k.public_key, 32)?.try_into().map_err(|_| refused()))
+            .collect()
+    }
+}
+
+fn pin(value: &str) -> Result<[u8; 32]> {
+    if !hex(value, 64) {
+        return Err(refused());
+    }
+    let mut out = [0; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).map_err(|_| refused())?;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

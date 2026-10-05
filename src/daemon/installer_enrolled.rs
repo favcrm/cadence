@@ -257,11 +257,86 @@ trait CombinedConsume {
         until: Instant,
     ) -> Result<OwnerSnapshot>;
 }
+struct ConstructedOwner;
+fn owner_snapshot(
+    response: crate::installer_bundle::constructor::OwnerResponse,
+) -> Result<OwnerSnapshot> {
+    let current = response.current.ok_or_else(unknown)?;
+    Ok(OwnerSnapshot {
+        binding_json: current.binding_json.into_bytes(),
+        phase: match current.phase.as_str() {
+            "prepared" => Phase::Prepared,
+            "consumed" => Phase::Consumed,
+            _ => return Err(unknown()),
+        },
+        stamp: OwnerStamp {
+            global: current.global.into_bytes(),
+            company: current.company.into_bytes(),
+            epoch: current.epoch,
+            lineage: grant::Lineage {
+                reference: current.lineage.reference,
+                database_epoch: current.lineage.database_epoch,
+            },
+            closure: if current.closure == "open" {
+                Closure::Open
+            } else {
+                return Err(unknown());
+            },
+        },
+    })
+}
+impl CombinedConsume for ConstructedOwner {
+    fn observe_prepared(
+        &self,
+        verified: &VerifiedInstaller,
+        until: Instant,
+    ) -> Result<OwnerSnapshot> {
+        owner_snapshot(installer_bundle::constructor::owner_request(
+            installer_bundle::constructor::Kind::Prepared,
+            verified.receipt.binding_json(),
+            until,
+        )?)
+    }
+    fn consume_once(
+        &self,
+        prepared: &PreparedInstaller<'_>,
+        until: Instant,
+    ) -> Result<grant::ConsumeOutcome> {
+        let current = owner_snapshot(installer_bundle::constructor::owner_request(
+            installer_bundle::constructor::Kind::Consume,
+            prepared.verified.receipt.binding_json(),
+            until,
+        )?)?;
+        current.validate(prepared.verified, Phase::Consumed)?;
+        if current.stamp != prepared.stamp {
+            return Err(unknown());
+        }
+        Ok(grant::ConsumeOutcome::Consumed)
+    }
+    fn observe_consumed_current(
+        &self,
+        prepared: &PreparedInstaller<'_>,
+        until: Instant,
+    ) -> Result<OwnerSnapshot> {
+        owner_snapshot(installer_bundle::constructor::owner_request(
+            installer_bundle::constructor::Kind::ConsumedCurrent,
+            prepared.verified.receipt.binding_json(),
+            until,
+        )?)
+    }
+}
 fn production_owner_port() -> Result<Box<dyn CombinedConsume>> {
-    Err(unknown())
+    installer_bundle::constructor::custody_recheck(Instant::now() + BUDGET)?;
+    Ok(Box::new(ConstructedOwner))
 }
 fn production_recipient_enrollment() -> Result<transport::Enrollment> {
-    Err(unknown())
+    let (pid, starttime, generation, digest) = installer_bundle::constructor::enrollment()?;
+    Ok(transport::Enrollment {
+        pid,
+        starttime,
+        generation,
+        digest,
+    })
 }
 struct ReleaseAuthority {
     custody: ClosedCarrierCustody,
@@ -584,6 +659,85 @@ impl<'a> ReleasedInstaller<'a> {
         classify_ack(self.verified.binding(), &response)
     }
 }
+/// Same signature/canonical binding checks used by the constructed root and its
+/// fixed child transport. Format result is not construction/consume authority.
+pub(crate) fn verify_constructor_format(
+    frame: &[u8],
+    receipt_keys: &[receipt::TrustedKey],
+    grant_keys: &[&[u8]],
+    expected_binding: &[u8],
+    until: Instant,
+) -> Result<Vec<u8>> {
+    let mut clock = RequestClock::new(until)?;
+    let verified =
+        VerifiedInstaller::verify(&Frame::parse(frame)?, receipt_keys, grant_keys, &mut clock)?;
+    if verified.receipt.binding_json() != expected_binding {
+        return Err(unknown());
+    }
+    Ok(acknowledgement(verified.binding()))
+}
+
+/// Real production transaction. Custody and recipient enrollment are derived
+/// from OWNED root construction, never caller fields/remote prctl diagnostics.
+/// PREPARED is checked before the withheld child handoff; the same existing
+/// consume core enforces ABA/current/expiry and ACK loss stays UNKNOWN.
+pub(crate) fn consume_constructor_frame(frame: &[u8], until: Instant) -> Result<()> {
+    let mut clock = RequestClock::new(until)?;
+    let authority = production_release_authority()?;
+    authority.custody.require_local_principal(until)?;
+    let verified = VerifiedInstaller::verify(
+        &Frame::parse(frame)?,
+        authority.receipt_keys,
+        authority.grant_keys,
+        &mut clock,
+    )?;
+    if verified.receipt.binding_json() != installer_bundle::constructor::binding_json()?.as_bytes()
+    {
+        return Err(unknown());
+    }
+    recipient_matches(&verified, &authority.supervisor)?;
+    let seen = authority
+        .custody
+        .observe_record(&verified.binding().installer, until)?;
+    let prepared = prepared(&verified, authority.owner.as_ref(), &mut clock)?;
+    recheck_prepared(&prepared, authority.owner.as_ref(), &mut clock)?;
+    authority.custody.recheck(&seen, until)?;
+    clock.valid(&verified)?;
+    installer_bundle::constructor::install_once(frame, until, || {
+        clock.valid(&verified)?;
+        recheck_prepared(&prepared, authority.owner.as_ref(), &mut clock)?;
+        authority.custody.recheck(&seen, until)
+    })?;
+    clock.valid(&verified)?;
+    authority.custody.recheck(&seen, until)?;
+    let stamp = prepared.stamp.clone();
+    let _consumption_only =
+        consume_prepared(prepared, authority.owner.as_ref(), &mut clock, || {
+            authority.custody.require_local_principal(until)?;
+            authority.custody.recheck(&seen, until)
+        })?;
+    clock.valid(&verified)?;
+    let ack = acknowledgement(verified.binding());
+    let pending = PreparedInstaller {
+        verified: &verified,
+        stamp,
+    };
+    installer_bundle::constructor::acknowledge_children(&ack, until, || {
+        clock.valid(&verified)?;
+        authority.custody.recheck(&seen, until)?;
+        effect(Effect::Observe);
+        let view = authority.owner.observe_consumed_current(&pending, until)?;
+        clock.valid(&verified)?;
+        view.validate(&verified, Phase::Consumed)?;
+        if view.stamp != pending.stamp {
+            return Err(unknown());
+        }
+        authority.custody.recheck(&seen, until)
+    })?;
+    clock.valid(&verified)?;
+    authority.custody.recheck(&seen, until)
+}
+
 /// Actual private production release path, usable by independent guard without
 /// argv. Missing closed custody refuses before parser/owner/connect/consume.
 pub(crate) fn release_host_frame(frame: &[u8]) -> Result<()> {

@@ -125,12 +125,34 @@ impl TrustedKey {
 /// operator approves a public-key manifest, an initial trusted version and a
 /// rotation/revocation policy. No live caller may supply trust.
 pub(crate) fn production_trust_set() -> Result<&'static [TrustedKey]> {
-    let _ = PRODUCTION_TRUST_KEYS; // empty — nothing immutable to pin
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        crate::installer_bundle::constructor::receipt_keys()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     Err(Error::rejected(
-        "production installer-enrollment trust unavailable — no approved \
-         public-key manifest, trusted keyVersion or rotation policy; a \
-         receipt can never mint launch eligibility (UNKNOWN, stays refused)",
+        "qualified constructor receipt trust unavailable",
     ))
+}
+
+/// Only the signature-authenticated private bootstrap token can supply public
+/// receipt pins. No raw key/caller/JWKS factory is exposed.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn keys_from_qualified(
+    bootstrap: &crate::installer_bundle::constructor::QualifiedBootstrap,
+) -> Result<Vec<TrustedKey>> {
+    bootstrap
+        .receipt_records()?
+        .into_iter()
+        .map(|(issuer, kid, key_version, public_key)| {
+            Ok(TrustedKey {
+                issuer,
+                kid,
+                key_version,
+                public_key,
+            })
+        })
+        .collect()
 }
 
 // ─────────────────────── typed receipt evidence shapes ────────────────────

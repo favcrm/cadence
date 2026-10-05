@@ -134,6 +134,8 @@ pub(super) enum Artifact {
     Client,
     Carrier,
     Observer,
+    Constructor,
+    Recipient,
 }
 impl Artifact {
     fn path(self) -> &'static str {
@@ -141,6 +143,8 @@ impl Artifact {
             Self::Client => CLIENT,
             Self::Carrier => CARRIER,
             Self::Observer => OBSERVER,
+            Self::Constructor => "/opt/protected/bin/cadence-root-constructor",
+            Self::Recipient => "/opt/protected/bin/cadence-enrolled-recipient",
         }
     }
 }

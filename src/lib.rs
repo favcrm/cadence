@@ -92,6 +92,18 @@ pub fn root_constructor_entry() -> Result<()> {
     }
 }
 
+/// Fixed sealed recipient transport; root-owned custody alone may consume.
+pub fn enrolled_recipient_entry() -> Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        installer_bundle::constructor::recipient_entry()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        Err(Error::rejected("enrolled recipient requires Linux x86_64"))
+    }
+}
+
 /// Fixed no-argument non-setuid carrier entry, never a configurable exec API.
 pub fn installer_carrier_entry() -> Result<()> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

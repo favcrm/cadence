@@ -40,6 +40,10 @@ path = "src/bin/cadence-installer-observer/main.rs"
 name = "cadence-root-constructor"
 path = "src/bin/cadence-root-constructor/main.rs"
 
+[[bin]]
+name = "cadence-enrolled-recipient"
+path = "src/bin/cadence-enrolled-recipient/main.rs"
+
 [features]
 # Embed the built `ui/` SPA into the binary. Requires `pnpm build` inside
 # `ui/` first; without the feature `cadence ui run --dist <dir>` serves

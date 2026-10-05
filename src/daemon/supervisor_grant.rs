@@ -984,8 +984,14 @@ impl VerifiedEnvelope {
     }
 }
 pub(super) fn production_grant_keyring() -> Result<&'static [&'static [u8]]> {
-    let _ = SUPERVISOR_KEYRING;
-    Err(Error::unknown("grant keyring unavailable"))
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        crate::installer_bundle::constructor::grant_keys()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    Err(Error::unknown(
+        "qualified constructor grant keyring unavailable",
+    ))
 }
 /// Reuses BOTH existing parsers. The receipt binding bytes are already verified
 /// canonical; parsing its challenge preserves optional imageLane presence.
