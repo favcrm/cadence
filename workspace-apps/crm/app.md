@@ -5,17 +5,26 @@ version: '0.1.0'
 summary: Draft one independently reviewed email brief from pasted facts; customer records, campaign content, SMTP custody and sending stay operator-run host actions.
 needs:
   connections: []
+  views:
+    contract: app-views/v1
+  bindings:
+    contract: app-bindings/v1
+  actions:
+    contract: app-actions/v2
 ---
 
 # CRM — reviewed email briefs
 
-This bundle installs the `crm` app the host-compiled CRM screens key on:
-Customers, Segments, Campaigns, content review and bounded send controls
-are daemon/UI features for an installation whose app is named `crm`.
-They are not granted or described by this bundle — this package is
-metadata plus one local-only workflow, not the CRM UI or domain code.
-The bundle's only runnable content is `email-brief`, which turns pasted
-facts into a single reviewed email brief text artifact.
+This bundle installs the `crm` app the host-compiled CRM screens key on.
+It declares live customer list/detail views, their closed `CustomerProfile`
+projection, and the `app-actions/v2` customer create/edit slice. The generic
+host UI renders these declarations; the package contains no custom UI or
+executable action code. The host supplies installation/context/record identity
+and revision pins, limits mutations to supported customer fields, creates new
+records with unknown consent, and preserves consent on updates. Segments,
+campaigns, content review and bounded send controls remain separate host
+features. The bundle's only runnable content is `email-brief`, which turns
+pasted facts into a single reviewed email brief text artifact.
 
 An approved brief is text for a person to read. It is not campaign
 content: applying content to a campaign, approving it, freezing an
@@ -51,8 +60,22 @@ cadence app context create INSTALL_ID --label "Default voice" --defaults ./conte
 ```
 
 Context defaults resolve per run like other workspace apps; the frozen
-snapshot pins the effective values before approval. A context is
-optional.
+snapshot pins the effective values before approval. A context is optional for
+`email-brief`; customer list, detail, create and edit operations require a live
+context owned by this installation, and customer records are isolated by that
+context.
+
+## Customer records
+
+The host renders the declared `customers` table and `customer-detail` view from
+its typed `CustomerProfile` store. The host-generated record ID is the row
+identity; package inputs cannot choose it. Create/edit forms are inert previews
+unless the paired `app-actions/v2` declaration is present. In this bundle,
+`customer.create` and `customer.update` expose only display name, email, phone,
+source and tags. Consent, record identity and revision are host-owned: create
+starts with unknown consent, and update uses a current-revision compare-and-set
+while preserving existing consent. These actions do not edit campaigns, send
+mail, or grant a worker capability.
 
 ## New email brief
 

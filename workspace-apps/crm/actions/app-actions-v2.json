@@ -1,0 +1,40 @@
+{
+  "contract": "app-actions/v2",
+  "app": "crm",
+  "title": "CRM customer actions",
+  "summary": "Pinned create and update controls for customer records.",
+  "actions": [
+    {
+      "id": "customer.create",
+      "title": "Create customer",
+      "operation": "record.create",
+      "record": "customer",
+      "form_view": "customer-create-form",
+      "input": {
+        "fields": [
+          { "id": "display_name", "label": "Display name", "type": "text", "required": true, "maxLength": 120 },
+          { "id": "email", "label": "Email", "type": "text", "required": false, "nullable": true, "maxLength": 254 },
+          { "id": "phone", "label": "Phone", "type": "text", "required": false, "nullable": true, "maxLength": 24 },
+          { "id": "source", "label": "Source", "type": "text", "required": false, "nullable": true, "maxLength": 40 },
+          { "id": "tags", "label": "Tags", "type": "tags", "required": false, "maxItems": 16 }
+        ]
+      }
+    },
+    {
+      "id": "customer.update",
+      "title": "Edit customer",
+      "operation": "record.update",
+      "record": "customer",
+      "form_view": "customer-edit-form",
+      "input": {
+        "fields": [
+          { "id": "display_name", "label": "Display name", "type": "text", "required": true, "maxLength": 120 },
+          { "id": "email", "label": "Email", "type": "text", "required": false, "nullable": true, "maxLength": 254 },
+          { "id": "phone", "label": "Phone", "type": "text", "required": false, "nullable": true, "maxLength": 24 },
+          { "id": "source", "label": "Source", "type": "text", "required": false, "nullable": true, "maxLength": 40 },
+          { "id": "tags", "label": "Tags", "type": "tags", "required": false, "maxItems": 16 }
+        ]
+      }
+    }
+  ]
+}

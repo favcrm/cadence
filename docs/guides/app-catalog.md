@@ -50,22 +50,29 @@ cadence app catalog show <install-id>
 ```
 
 The source must be an A1 bundle: `app.md`, checked workflow Markdown under
-`workflows/`, and supported optional `rubrics/`, `templates/`, `views/` and
-`bindings/` files. `views/` may carry exactly one file —
+`workflows/`, and supported optional `rubrics/`, `templates/`, `views/`,
+`bindings/` and `actions/` files. `views/` may carry exactly one file —
 `views/app-views-v1.json`, a data-only
 [app-views/v1](../../contracts/app-views/v1/README.md) descriptor — only when
 `app.md` declares `needs.views.contract: app-views/v1`. `bindings/` may carry
 exactly `bindings/app-bindings-v1.json`, the data-only
 [app-bindings/v1](../../contracts/app-bindings/v1/README.md) companion, only
 when `app.md` declares `needs.bindings.contract: app-bindings/v1` and the bundle
-also declares and ships its app-views/v1 descriptor. Declarations and files
-pair up; the manifest, descriptor and binding app names must match. Descriptor
-only packages remain supported. Descriptor and companion bytes contribute to
-the bundle digest; receipts expose `view_descriptor` with its digest and, when
-present, `view_binding` with its digest, both reparsed from the same verified
-snapshot. These declarations do not execute package code or carry actions. See
-the existing [Blog post bundle](../../apps/blog-post/app.md) and [Social
-Content bundle](../../apps/social-content/app.md).
+also declares and ships its app-views/v1 descriptor. `actions/` may carry
+exactly `actions/app-actions-v2.json`, the data-only
+[app-actions/v2](../../contracts/app-actions/v2/README.md) companion, only when
+`app.md` declares `needs.actions.contract: app-actions/v2` and also declares
+and ships both its views descriptor and bindings companion. Declarations and
+files pair up; the manifest and all companions must name the same app. Descriptor
+only and descriptor-plus-binding packages remain supported. Companion bytes
+contribute to the bundle digest; receipts expose the validated `view_descriptor`
+and `view_binding` with their digests, plus `action_descriptor` when present,
+all reparsed from the same verified snapshot. Declarations are data, never
+package code or authority grants. A v2 declaration exposes only a host-supported,
+closed action adapter; the catalog install itself does not execute it, and the
+host revalidates the caller, context, record and digest pins before a live write.
+See the existing [Blog post bundle](../../apps/blog-post/app.md), [Social
+Content bundle](../../apps/social-content/app.md), and [CRM bundle](../../workspace-apps/crm/app.md).
 
 The React fixture preview at `app-previews/social-content` is **not** an
 installation bundle. Its independent development harness is documented in
@@ -116,6 +123,7 @@ objects. Useful fields include:
 | `approval.state`, `approved`, `executable` | New workspace rows are `unapproved`, `false`, and `false`. Legacy catalog rows report approval `unknown` and `approved: null`; consult the existing legacy surface for approval verification. |
 | `view_descriptor`, `view_descriptor_digest` | Validated descriptor and pin, or both `null` for descriptor-free packages. |
 | `view_binding`, `view_binding_digest` | Validated companion and pin, or both `null` when absent; reparsed with the descriptor from one verified bundle snapshot. |
+| `action_descriptor` | Validated app-actions/v2 declaration, or `null` when absent; reparsed with the descriptor and binding from one verified snapshot. Its bytes are covered by the bundle digest. |
 | `guide`, `record`, `files` | Manifest guide, retained installation record, and bundle inventory. |
 
 Successful install/recover responses also report `committed: true` and

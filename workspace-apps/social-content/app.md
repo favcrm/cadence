@@ -27,6 +27,10 @@ needs:
       action: publish
       resource_kind: connection_account
       effect: send
+  views:
+    contract: app-views/v1
+  bindings:
+    contract: app-bindings/v1
 ---
 
 # Social Content — reviewed captions
@@ -38,6 +42,12 @@ bundle needs no project. The channel is a writing brief; releasing a
 caption delivers it to Local, not that social network. An image-enabled
 caption run can retain one generated asset from a selected source.
 Scheduling and external posting remain unavailable in this version.
+
+The package also declares a host-owned caption-run table and detail view. Its
+binding exposes only the host run ID, state, workflow title, snapshot digest
+and optional subject from the run snapshot. Caption/artifact content and Social
+write actions are not part of this view contract; the existing chat and
+capability declarations above are unchanged.
 
 ## Set up once
 
