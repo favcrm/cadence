@@ -59,6 +59,15 @@ fn enclave_refused<T>(result: crate::error::Result<T>) {
     }
 }
 
+fn alias_refused<T>(result: crate::error::Result<T>) {
+    match result {
+        Err(crate::Error::Rejected(message)) => {
+            assert_eq!(message, "unresolved raw/legacy writer alias refused");
+        }
+        _ => panic!("unresolved alias did not reach the real fail-closed guard"),
+    }
+}
+
 fn database_files(path: &Path) -> Vec<Option<Vec<u8>>> {
     ["", "-wal", "-shm", "-journal"]
         .into_iter()
@@ -244,6 +253,45 @@ fn store_owner_wrong_or_replaced_incarnation_refuses_without_mutation() {
         );
         assert_eq!(database_files(&path), identity_files);
         assert_eq!(database_files(&legacy_path), legacy_files);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let healthy_alias = dir.path().join("healthy-alias.sqlite3");
+        symlink(&path, &healthy_alias).unwrap();
+        let before_healthy_alias = sql_opens.count();
+        super::preflight_writer_guard(&healthy_alias).unwrap();
+        assert!(
+            sql_opens.count() > before_healthy_alias,
+            "supported healthy alias did not reach real SQLite"
+        );
+
+        // A dangling leaf or chain must not elect a fresh database. Every
+        // symlink and target lives in our temp directory, never the enclave.
+        let dangling_alias = dir.path().join("dangling-alias.sqlite3");
+        let chained_alias = dir.path().join("chained-alias.sqlite3");
+        symlink(&absent_path, &dangling_alias).unwrap();
+        symlink(&dangling_alias, &chained_alias).unwrap();
+        let absent_files = database_files(&absent_path);
+        assert!(absent_files.iter().all(Option::is_none));
+        for requested in [&dangling_alias, &chained_alias] {
+            let link_before = std::fs::read_link(requested).unwrap();
+            let candidate_files = database_files(requested);
+            let before_refusal = sql_opens.count();
+            alias_refused(super::preflight_writer_guard(requested));
+            assert_eq!(sql_opens.count(), before_refusal);
+            alias_refused(super::Store::open(requested));
+            assert_eq!(
+                sql_opens.count(),
+                before_refusal,
+                "unresolved alias reached SQLite before refusal"
+            );
+            assert_eq!(std::fs::read_link(requested).unwrap(), link_before);
+            assert_eq!(database_files(requested), candidate_files);
+            assert_eq!(database_files(&absent_path), absent_files);
+            assert_eq!(database_files(&path), identity_files);
+            assert_eq!(database_files(&legacy_path), legacy_files);
+        }
     }
     drop(sql_opens);
 
