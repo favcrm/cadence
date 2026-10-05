@@ -29,6 +29,10 @@ pub(crate) struct OwnedHelper {
     guest: u32,
     guest_gid: u32,
     parent: u32,
+    launch_gid: u32,
+    sealed_groups: Vec<u32>,
+    namespaces: Vec<File>,
+    node: std::sync::OnceLock<File>,
 }
 impl OwnedHelper {
     pub(crate) fn spawn(permit: &LaunchPermit, until: Instant) -> Result<(Self, HelperStdio)> {
@@ -69,6 +73,13 @@ impl OwnedHelper {
             .collect();
         let fd = artifact.fd();
         let parent = std::process::id();
+        let launch_gid = crate::adapter::pi_guest::topology::resolve_gid_pub("cadence-launch")?;
+        if launch_gid == 0 {
+            return Err(refused());
+        }
+        let mut sealed_groups = vec![selected.guest_gid, selected.shared_gid];
+        sealed_groups.sort_unstable();
+        sealed_groups.dedup();
         // pre_exec owns all backing strings AND parent-materialized pointer
         // arrays. No allocation occurs after fork; never caller memory.
         let mut command = Command::new("/opt/protected/bin/cadence-agent-exec");
@@ -82,7 +93,7 @@ impl OwnedHelper {
             command.pre_exec(move || {
                 let fail = || std::io::Error::last_os_error();
                 if libc::setsid() < 0
-                    || libc::setgroups(0, std::ptr::null()) != 0
+                    || libc::setgroups(1, &launch_gid) != 0
                     || libc::setresgid(21000, 0, 0) != 0
                     || libc::setresuid(21000, 0, 0) != 0
                     || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
@@ -136,15 +147,19 @@ impl OwnedHelper {
             artifact.live_correspondence(pid, deadline)?;
             lifecycle::runtime_proof(until)?.recheck(until)?;
             permit.recheck()?;
+            let namespaces = ["user", "pid", "mnt"]
+                .iter()
+                .map(|name| File::open(format!("/proc/{pid}/ns/{name}")).map_err(|_| refused()))
+                .collect::<Result<Vec<_>>>()?;
             let stdio = HelperStdio {
                 stdin: child.stdin.take().ok_or_else(refused)?,
                 stdout: child.stdout.take().ok_or_else(refused)?,
                 stderr: child.stderr.take().ok_or_else(refused)?,
             };
-            Ok((pidfd, birth, stdio))
+            Ok((pidfd, birth, stdio, namespaces))
         })();
         match setup {
-            Ok((pidfd, birth, stdio)) => Ok((
+            Ok((pidfd, birth, stdio, namespaces)) => Ok((
                 Self {
                     child,
                     pidfd,
@@ -153,6 +168,10 @@ impl OwnedHelper {
                     guest: selected.guest,
                     guest_gid: selected.guest_gid,
                     parent,
+                    launch_gid,
+                    sealed_groups,
+                    namespaces,
+                    node: std::sync::OnceLock::new(),
                 },
                 stdio,
             )),
@@ -232,6 +251,9 @@ impl OwnedHelper {
             }
             permit.recheck()?;
             lifecycle::runtime_proof(until)?.recheck(until)?;
+            super::dispatcher::launch_live(until)?;
+            self.namespaces_current()?;
+            self.node.set(live).map_err(|_| refused())?;
             if unsafe {
                 libc::ptrace(
                     libc::PTRACE_CONT,
@@ -254,6 +276,7 @@ impl OwnedHelper {
     ) -> Result<()> {
         let deadline = Deadline(until);
         lifecycle::runtime_proof(until)?.recheck(until)?;
+        self.namespaces_current()?;
         let mut ready = libc::pollfd {
             fd: self.pidfd.as_raw_fd(),
             events: libc::POLLIN,
@@ -300,7 +323,10 @@ impl OwnedHelper {
         }
         match phase {
             HelperPhase::Privileged => {
-                if ids("Uid:")? != [21000, 0, 0, 0] || ids("Gid:")? != [21000, 0, 0, 0] {
+                if ids("Uid:")? != [21000, 0, 0, 0]
+                    || ids("Gid:")? != [21000, 0, 0, 0]
+                    || ids("Groups:")? != [self.launch_gid]
+                {
                     return Err(refused());
                 }
             }
@@ -308,6 +334,7 @@ impl OwnedHelper {
                 if ids("Uid:")? != [self.guest; 4]
                     || ids("Gid:")? != [self.guest_gid; 4]
                     || custody::field(&text, "NoNewPrivs:")? != "1"
+                    || ids("Groups:")? != self.sealed_groups
                 {
                     return Err(refused());
                 }
@@ -319,6 +346,145 @@ impl OwnedHelper {
             }
         }
         deadline.check()
+    }
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+    pub(crate) fn interrupt(&self, until: Instant) -> Result<()> {
+        self.signal(libc::SIGINT, until)
+    }
+    fn namespaces_current(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        for (name, held) in ["user", "pid", "mnt"].iter().zip(&self.namespaces) {
+            let a = held.metadata().map_err(|_| refused())?;
+            let b = File::open(format!("/proc/{}/ns/{name}", self.child.id()))
+                .map_err(|_| refused())?
+                .metadata()
+                .map_err(|_| refused())?;
+            let parent = File::open(format!("/proc/self/ns/{name}"))
+                .map_err(|_| refused())?
+                .metadata()
+                .map_err(|_| refused())?;
+            if (a.dev(), a.ino()) != (b.dev(), b.ino())
+                || (a.dev(), a.ino()) != (parent.dev(), parent.ino())
+            {
+                return Err(refused());
+            }
+        }
+        Ok(())
+    }
+    fn node_current(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        self.namespaces_current()?;
+        let a = self
+            .node
+            .get()
+            .ok_or_else(refused)?
+            .metadata()
+            .map_err(|_| refused())?;
+        let b = File::open(format!("/proc/{}/exe", self.child.id()))
+            .map_err(|_| refused())?
+            .metadata()
+            .map_err(|_| refused())?;
+        if (a.dev(), a.ino(), a.size(), a.ctime(), a.ctime_nsec())
+            != (b.dev(), b.ino(), b.size(), b.ctime(), b.ctime_nsec())
+        {
+            return Err(refused());
+        }
+        let text = custody::status(self.child.id())?;
+        let uid = format!(
+            "{} {} {} {}",
+            self.guest, self.guest, self.guest, self.guest
+        );
+        let gid = format!(
+            "{} {} {} {}",
+            self.guest_gid, self.guest_gid, self.guest_gid, self.guest_gid
+        );
+        let actual_groups = custody::field(&text, "Groups:")?
+            .split_whitespace()
+            .map(|s| s.parse::<u32>().map_err(|_| refused()))
+            .collect::<Result<Vec<_>>>()?;
+        if custody::field(&text, "Uid:")? != uid
+            || custody::field(&text, "Gid:")? != gid
+            || actual_groups != self.sealed_groups
+        {
+            return Err(refused());
+        }
+        if custody::field(&text, "TracerPid:")? != self.parent.to_string()
+            || custody::field(&text, "NoNewPrivs:")? != "1"
+        {
+            return Err(refused());
+        }
+        for cap in ["CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:"] {
+            if custody::field(&text, cap)? != "0000000000000000" {
+                return Err(refused());
+            }
+        }
+        Ok(())
+    }
+    fn signal(&self, signal: i32, until: Instant) -> Result<()> {
+        lifecycle::runtime_proof(until)?.recheck(until)?;
+        self.node_current()?;
+        if crate::peer::proc_starttime(self.child.id()) != Some(self.birth) {
+            return Err(refused());
+        }
+        if unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            )
+        } != 0
+        {
+            return Err(refused());
+        }
+        lifecycle::runtime_proof(until)?.recheck(until)
+    }
+    pub(crate) fn exited(&self, until: Instant) -> Result<bool> {
+        lifecycle::runtime_proof(until)?.recheck(until)?;
+        let mut ready = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let n = unsafe { libc::poll(&mut ready, 1, 0) };
+        if n < 0 {
+            return Err(refused());
+        }
+        if n == 0 {
+            if crate::peer::proc_starttime(self.child.id()) != Some(self.birth) {
+                return Err(refused());
+            }
+            self.node_current()?;
+        }
+        let mut status = 0;
+        let rc = unsafe {
+            libc::waitpid(
+                self.child.id() as i32,
+                &mut status,
+                libc::WNOHANG | libc::__WALL,
+            )
+        };
+        if rc > 0 && !libc::WIFEXITED(status) && !libc::WIFSIGNALED(status) {
+            return Err(refused());
+        }
+        if rc < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ECHILD) {
+            return Err(refused());
+        }
+        lifecycle::runtime_proof(until)?.recheck(until)?;
+        Ok(n > 0 && ready.revents & libc::POLLIN != 0)
+    }
+    pub(crate) fn retire(&self, until: Instant) -> Result<()> {
+        if !self.exited(until)? {
+            self.signal(libc::SIGKILL, until)?;
+        }
+        while !self.exited(until)? {
+            Deadline(until).check()?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(()) // physical result ONLY; not external durable retirement
     }
 }
 impl Drop for OwnedHelper {

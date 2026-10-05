@@ -148,6 +148,9 @@ impl Transport {
     }
 }
 pub(super) fn client_entry() -> Result<()> {
+    if let Some(result) = super::runtime_child::try_entry() {
+        return result;
+    }
     let mut t = Transport::open("installer")?;
     let frame = match t.receive()? {
         wire::ChildReply::Release { frame } => frame,

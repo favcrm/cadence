@@ -108,6 +108,7 @@ struct Runtime {
     nonce: String,
     binding: String,
     state: Mutex<State>,
+    commands: Mutex<Vec<Command>>,
 }
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 fn active() -> Result<&'static Runtime> {
@@ -201,7 +202,36 @@ pub(crate) enum StorePurpose {
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 enum Request<'a> {
     RuntimeCurrent,
+    TaskEvent {
+        task: &'a str,
+        part: u64,
+        bytes: &'a str,
+    },
+    RuntimeDaemonReady {
+        reference: &'a str,
+    },
     StoreStartup,
+    StoreDatabaseCurrent {
+        reference: &'a str,
+    },
+    StoreWitnessReadback {
+        witness: &'a serde_json::Value,
+    },
+    StoreCaptureBegin {
+        attempt: &'a str,
+        witness: &'a serde_json::Value,
+        size: u64,
+        sha256: String,
+    },
+    StoreCaptureChunk {
+        attempt: &'a str,
+        offset: u64,
+        bytes: String,
+    },
+    StoreCaptureCommit {
+        attempt: &'a str,
+        sha256: String,
+    },
     PiAcquire {
         scope: &'a crate::adapter::pi_guest::owner::OperationScope,
     },
@@ -225,6 +255,58 @@ enum Request<'a> {
     },
 }
 #[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub(super) enum Command {
+    Task {
+        task: String,
+        alias: String,
+        model: String,
+        prompt: String,
+    },
+    Cancel {
+        task: String,
+    },
+    Retire {
+        task: String,
+    },
+    Close {
+        binding: crate::store::Binding,
+    },
+    Witness {
+        binding: crate::store::Binding,
+    },
+    Capture {
+        attempt: String,
+    },
+}
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+enum Query {
+    Current,
+    Opening,
+    DatabaseCurrent {
+        reference: String,
+    },
+    Maintenance {
+        purpose: StorePurpose,
+        attempt: String,
+    },
+    Witness {
+        attempt: String,
+    },
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Readback {
+    version: u8,
+    #[serde(rename = "type")]
+    kind: String,
+    operation: String,
+    barrier_nonce: String,
+    sequence: u64,
+    query: Query,
+}
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Response {
     version: u8,
@@ -237,6 +319,8 @@ struct Response {
     current: wire::OwnerCurrent,
     store: Option<serde_json::Value>,
     pi: Option<serde_json::Value>,
+    #[serde(default)]
+    commands: Vec<Command>,
 }
 fn exchange(request: Request<'_>, until: Instant) -> Result<Response> {
     let r = active()?;
@@ -262,7 +346,28 @@ fn exchange(request: Request<'_>, until: Instant) -> Result<Response> {
     let frame = context::runtime_wire(|channel| {
         channel.begin_operation(Deadline(until))?;
         channel.send(&wire::json(&value)?)?;
-        channel.receive()
+        loop {
+            let frame = channel.receive()?;
+            let kind: serde_json::Value =
+                serde_json::from_slice(&frame.0).map_err(|_| refused())?;
+            if kind.get("type").and_then(serde_json::Value::as_str) != Some("runtime-readback") {
+                break Ok(frame);
+            }
+            let query: Readback = serde_json::from_slice(&frame.0).map_err(|_| refused())?;
+            if query.version != 1
+                || query.kind != "runtime-readback"
+                || query.operation != r.operation
+                || query.barrier_nonce != r.nonce
+                || query.sequence != sequence
+            {
+                return Err(refused());
+            }
+            let data = super::dispatcher::readback(
+                &serde_json::to_value(query.query).map_err(|_| refused())?,
+                until,
+            )?;
+            channel.send(&wire::json(&serde_json::json!({"version":1,"type":"runtime-readback-result","operation":r.operation,"barrierNonce":r.nonce,"sequence":sequence,"data":data}))?)?;
+        }
     })?;
     r.check(until)?;
     let reply: Response = serde_json::from_slice(&frame.0).map_err(|_| refused())?;
@@ -287,7 +392,47 @@ fn exchange(request: Request<'_>, until: Instant) -> Result<Response> {
     {
         return Err(refused());
     }
-    Ok(reply)
+    if reply.commands.len() > 8 {
+        return Err(refused());
+    }
+    if !reply.commands.is_empty() {
+        let mut pending = r.commands.lock().map_err(|_| refused())?;
+        if pending.len() + reply.commands.len() > 8 {
+            return Err(refused());
+        }
+        // Refusal state is sampled BEFORE a pending launch can release Node,
+        // even if cancellation arrived inside an Arm/Consume owner await.
+        super::dispatcher::note_commands(&reply.commands)?;
+        // Correlation/intent only. Commands never replace actual owned caller
+        // admission or genuine one-use Store grants before SQL effects.
+        pending.extend(reply.commands);
+    }
+    Ok(Response {
+        commands: Vec::new(),
+        ..reply
+    })
+}
+pub(super) fn take_commands() -> Result<Vec<Command>> {
+    Ok(std::mem::take(
+        &mut *active()?.commands.lock().map_err(|_| refused())?,
+    ))
+}
+pub(super) fn task_event(task: &str, part: u64, bytes: &str, until: Instant) -> Result<()> {
+    if !super::hex(task, 32) || part > MAX_SAFE || super::decode(bytes, 16384)?.is_empty() {
+        return Err(refused());
+    }
+    let reply = exchange(Request::TaskEvent { task, part, bytes }, until)?;
+    if reply.store.is_some() || reply.pi.is_some() {
+        return Err(refused());
+    }
+    Ok(())
+}
+pub(super) fn daemon_ready(reference: &str, until: Instant) -> Result<()> {
+    let reply = exchange(Request::RuntimeDaemonReady { reference }, until)?;
+    if reply.store.is_some() || reply.pi.is_some() {
+        return Err(refused());
+    }
+    Ok(())
 }
 pub(crate) fn runtime_current(until: Instant) -> Result<wire::OwnerCurrent> {
     let reply = exchange(Request::RuntimeCurrent, until)?;
@@ -322,6 +467,73 @@ fn store_reply(reply: Response, expected_phase: Option<&str>) -> Result<serde_js
 }
 pub(crate) fn store_startup(until: Instant) -> Result<serde_json::Value> {
     store_reply(exchange(Request::StoreStartup, until)?, Some("issued"))
+}
+pub(crate) fn store_database_current(reference: &str, until: Instant) -> Result<serde_json::Value> {
+    if !identifier(reference) {
+        return Err(refused());
+    }
+    store_reply(
+        exchange(Request::StoreDatabaseCurrent { reference }, until)?,
+        Some("consumed"),
+    )
+}
+pub(super) fn store_witness_readback(witness: &serde_json::Value, until: Instant) -> Result<()> {
+    let reply = exchange(Request::StoreWitnessReadback { witness }, until)?;
+    if reply.store.is_some() || reply.pi.is_some() {
+        return Err(refused());
+    }
+    Ok(())
+}
+fn capture_reply(reply: Response) -> Result<()> {
+    if reply.store.is_some() || reply.pi.is_some() {
+        return Err(refused());
+    }
+    Ok(())
+}
+pub(super) fn store_capture_begin(
+    attempt: &str,
+    witness: &serde_json::Value,
+    size: u64,
+    sha: &[u8; 32],
+    until: Instant,
+) -> Result<()> {
+    capture_reply(exchange(
+        Request::StoreCaptureBegin {
+            attempt,
+            witness,
+            size,
+            sha256: sha.iter().map(|b| format!("{b:02x}")).collect(),
+        },
+        until,
+    )?)
+}
+pub(super) fn store_capture_chunk(
+    attempt: &str,
+    offset: u64,
+    bytes: &[u8],
+    until: Instant,
+) -> Result<()> {
+    use base64::Engine;
+    if bytes.is_empty() || bytes.len() > 16384 {
+        return Err(refused());
+    }
+    capture_reply(exchange(
+        Request::StoreCaptureChunk {
+            attempt,
+            offset,
+            bytes: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
+        },
+        until,
+    )?)
+}
+pub(super) fn store_capture_commit(attempt: &str, sha: &[u8; 32], until: Instant) -> Result<()> {
+    capture_reply(exchange(
+        Request::StoreCaptureCommit {
+            attempt,
+            sha256: sha.iter().map(|b| format!("{b:02x}")).collect(),
+        },
+        until,
+    )?)
 }
 pub(crate) fn store_acquire(
     purpose: StorePurpose,
@@ -424,6 +636,7 @@ pub(super) fn enter(deadline: Deadline) -> Result<()> {
                 sequence: 0,
                 last_wall: now,
             }),
+            commands: Mutex::new(Vec::new()),
         })
         .map_err(|_| refused())?;
     // First fresh owner readback is required before creating writable mounts,
@@ -431,14 +644,5 @@ pub(super) fn enter(deadline: Deadline) -> Result<()> {
     runtime_current(Instant::now() + Duration::from_secs(10))?;
     let layout =
         super::layout::Layout::acquire(Deadline(Instant::now() + Duration::from_secs(10)))?;
-    // Keep actual root custody and the independently admitted owner carrier
-    // alive. No readiness/launch/Store permission is inferred from this pump.
-    // The private dispatcher uses the same RuntimeProof and finite exchanges.
-    loop {
-        let until = Instant::now() + Duration::from_secs(10);
-        active()?.check(until)?;
-        layout.recheck(Deadline(until))?;
-        runtime_current(until)?;
-        std::thread::sleep(Duration::from_secs(1));
-    }
+    super::dispatcher::run(layout)
 }

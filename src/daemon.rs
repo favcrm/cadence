@@ -49,6 +49,10 @@ mod identity;
 mod installer_client;
 pub(crate) mod installer_enrollment_wire;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod native_task;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod protected_runtime;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_enrolled;
@@ -4951,6 +4955,8 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease));
     let hot = hot_restart_begin(state_dir);
     let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam)?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let protected = protected_runtime::Maintenance::start(&shared);
     if let Some(heartbeat) = &lease_heartbeat {
         heartbeat.attach(&shared);
     }
@@ -5244,7 +5250,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // now is it stopped and joined, so there is never a window with
     // zero posters (heartbeat dead, flush still running) or two (a
     // late renew racing the release and rewriting a removed lease).
-    release_lease_tail(
+    let _flushed = release_lease_tail(
         &shared,
         &hosted,
         &opts,
@@ -5252,6 +5258,12 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         &socket_path,
         shared_socket,
     );
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if serve_error.is_none() && _flushed {
+        if let Some(protected) = protected {
+            protected.quiesced()?;
+        }
+    }
     match serve_error {
         Some(error) => Err(error),
         None => Ok(()),
@@ -5282,7 +5294,7 @@ fn release_lease_tail(
     mut heartbeat: Option<serve::LeaseHeartbeat>,
     socket_path: &Path,
     shared_socket: Option<serve::SharedSocket>,
-) {
+) -> bool {
     let flushed = lease_flush(
         shared,
         opts.flush_budget_for_test
@@ -5308,6 +5320,7 @@ fn release_lease_tail(
     }
     let _ = std::fs::remove_file(socket_path);
     drop(shared_socket);
+    flushed
 }
 
 /// Fallback detail when an unknown fence has no provider account.

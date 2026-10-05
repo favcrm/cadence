@@ -1,16 +1,24 @@
 //! CAD-1159 owned root constructor. Public bootstrap material cannot elect its
 //! own verifier. Image-authority pins are independent immutable build inputs.
 //! Child construction is private and happens ONLY after this authentication.
+mod capture;
 mod channel;
 mod child;
 mod children;
 mod context;
 mod custody;
+mod dispatcher;
 mod helper;
+mod helper_trust;
 mod layout;
 mod lifecycle;
+pub(crate) mod private_wire;
 mod runtime;
+pub(crate) mod runtime_child;
+mod runtime_kernel;
 mod wire;
+pub use helper_trust::{helper_image_trust, HelperImageTrust};
+pub(crate) use runtime_kernel::OwnedDaemon;
 
 use super::{fixed_arguments, refused, Deadline, Result};
 use crate::daemon::supervisor_grant as grant;
@@ -145,6 +153,7 @@ pub(super) struct Manifest {
 /// create one. It is not a process construction proof or a launch capability.
 pub(crate) struct QualifiedBootstrap {
     manifest: Manifest,
+    image_attestation: String,
     launch: grant::LaunchBinding,
     lineage: grant::Lineage,
     operation: String,
@@ -250,7 +259,34 @@ pub(super) fn authenticate_bootstrap(bytes: &[u8], now_ms: u64) -> Result<Qualif
     if launch.request.challenge != input.operation {
         return Err(refused());
     }
-    let parts: Vec<_> = input.image_attestation.split('.').collect();
+    let manifest = authenticate_image_attestation(
+        &input.image_attestation,
+        now_ms,
+        Some(&launch.request.image),
+        input.expires_at_ms,
+    )?;
+    Ok(QualifiedBootstrap {
+        manifest,
+        image_attestation: input.image_attestation,
+        launch,
+        lineage,
+        operation: input.operation,
+        barrier_nonce: input.barrier_nonce,
+        expires_at_ms: input.expires_at_ms,
+        authenticated_at_ms: now_ms,
+    })
+}
+
+fn authenticate_image_attestation(
+    attestation: &str,
+    now_ms: u64,
+    expected_image: Option<&str>,
+    expires_bound: u64,
+) -> Result<Manifest> {
+    if attestation.len() > 32768 || now_ms > MAX_SAFE {
+        return Err(refused());
+    }
+    let parts: Vec<_> = attestation.split('.').collect();
     if parts.len() != 3 {
         return Err(refused());
     }
@@ -266,12 +302,15 @@ pub(super) fn authenticate_bootstrap(bytes: &[u8], now_ms: u64) -> Result<Qualif
         || header.key_version == 0
         || header.key_version > MAX_KEY_VERSION
         || manifest.version != 1
-        || manifest.image != launch.request.image
+        || expected_image.is_some_and(|image| manifest.image != image)
+        || manifest.image.is_empty()
+        || manifest.image.len() > 256
+        || manifest.expires_at_ms <= now_ms
         || !hex(&manifest.source, 40)
         || manifest.not_before_ms > now_ms
         || manifest.not_before_ms >= manifest.expires_at_ms
         || manifest.expires_at_ms > MAX_SAFE
-        || input.expires_at_ms > manifest.expires_at_ms
+        || expires_bound > manifest.expires_at_ms
     {
         return Err(refused());
     }
@@ -311,15 +350,7 @@ pub(super) fn authenticate_bootstrap(bytes: &[u8], now_ms: u64) -> Result<Qualif
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key.public_key)
         .verify(&signed, &signature)
         .map_err(|_| refused())?;
-    Ok(QualifiedBootstrap {
-        manifest,
-        launch,
-        lineage,
-        operation: input.operation,
-        barrier_nonce: input.barrier_nonce,
-        expires_at_ms: input.expires_at_ms,
-        authenticated_at_ms: now_ms,
-    })
+    Ok(manifest)
 }
 
 /// Fixed production root entry. Missing independently elected image roots

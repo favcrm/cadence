@@ -85,7 +85,7 @@ mod schema;
 mod seal;
 pub(crate) use schema::open_read_only;
 pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
-pub(crate) use seal::owner::StoreOwnerGrant;
+pub(crate) use seal::owner::{Binding, Purpose, StoreOwnerGrant};
 pub use seal::OpenMode;
 // `WriteTxn` is `pub` so the `ShutdownEntriesHook` test seam (a `pub`
 // `ServeOptions` field) can name it — it is an opaque facade to external
