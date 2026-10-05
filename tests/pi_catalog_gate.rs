@@ -23,7 +23,9 @@ use serde_json::{json, Value};
 use tempfile::Builder;
 
 fn run(mode: &str) -> (Option<Value>, Vec<Value>, String) {
-    let root = Builder::new().prefix("p601-").tempdir_in("/tmp").unwrap();
+    // Under the seam's temp root ($TMPDIR in CI), not a hardcoded /tmp:
+    // arm() refuses a state dir outside std::env::temp_dir().
+    let root = Builder::new().prefix("p601-").tempdir().unwrap();
     let [state, pm, home] = ["s", "pm", "h"].map(|d| root.path().join(d));
     let mut init = Command::new(env!("CARGO_BIN_EXE_cadence"));
     init.args(["issue", "init"])
