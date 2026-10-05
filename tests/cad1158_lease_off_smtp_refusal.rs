@@ -1,11 +1,19 @@
-//! CAD-1158 acceptance check v2 — independently authored by
-//! `cad1158-acceptance-author`. This file SUPERSEDES v1
-//! (`/var/www/agent-notes/artifacts/cad1158_lease_off_smtp_refusal.rs`,
-//! sha256 bd8c8f94b13c86669af93fac9d3429d65a6428041f6e8113074c0c67ba09de02),
-//! which left two forward arms commented with an implementer-uncomment
-//! instruction — that violated the frozen-bytes rule. v2 activates both
-//! arms. The implementer copies these bytes UNCHANGED; they may not edit,
-//! uncomment, weaken or replace them.
+//! CAD-1158 acceptance check v3 — independently authored by
+//! `cad1158-acceptance-successor` (the original v1/v2 author's ephemeral
+//! agent `cad1158-acceptance-author` cannot be resumed; this is a NEW
+//! independent author identity, not the implementer and not a resumption).
+//! This file SUPERSEDES v2
+//! (`/var/www/agent-notes/artifacts/cad1158_lease_off_smtp_refusal_v2.rs`,
+//! sha256 65e7e20da8e2513ff5a7842e71809e21850a34752953722d68686372d3e8284d),
+//! which failed the repo's own hooks on two mechanical grounds: rustfmt
+//! wanted the `both_forged` case tuple wrapped, and clippy
+//! `disallowed_methods` (clippy.toml, CAD-308) refuses
+//! `std::process::Command::output` — the subprocess runner must go through
+//! `cadence_agent::reaper::output`, as every retained test does. v3 makes
+//! ONLY those two changes (formatter style + the policy-compliant
+//! equivalent runner); every assertion, control, env isolation and active
+//! forward arm is unchanged in behavior. The implementer copies these
+//! bytes UNCHANGED; they may not edit, uncomment, weaken or replace them.
 //!
 //! Ticket: `src/platform/agenticos.rs::attach` must compose the trusted
 //! `smtp.internal` relay independently of the Cadence lifecycle lease, but
@@ -111,7 +119,7 @@ fn relaunch(test: &str, extra_env: &[(&str, &str)]) {
     for (name, value) in extra_env {
         cmd.env(name, value);
     }
-    let out = cmd.output().unwrap();
+    let out = cadence_agent::reaper::output(&mut cmd).unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -152,7 +160,11 @@ fn attach_once(hosted: &Hosted, metadata: Option<&str>) -> ServeOptions {
 fn cad1158_lease_off_forged_urls_do_not_install_smtp_relay() {
     if std::env::var_os(ISOLATED).is_none() {
         for (case, a_url, s_url) in [
-            ("both_forged", "http://127.0.0.1:3110", "http://127.0.0.1:3111"),
+            (
+                "both_forged",
+                "http://127.0.0.1:3110",
+                "http://127.0.0.1:3111",
+            ),
             ("smtp_url_alone", "", "http://127.0.0.1:3111"),
             ("agenticos_url_alone", "http://127.0.0.1:3110", ""),
         ] {
