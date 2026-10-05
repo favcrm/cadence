@@ -3,9 +3,13 @@
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 
-// Existing unresolved release slot, NOT the locally captured candidate election.
+/// Fixed image topology. Digests/entrypoints come only from the authenticated
+/// private image owner, never a candidate capture or a helper caller.
+pub(crate) const IMAGE_ROOT: &str = "/opt/cadence/pi";
 pub(crate) const NODE_PATH: &str = "/opt/cadence/pi/node";
-pub(crate) const NODE_DIGEST: Option<[u8; 32]> = None;
+pub(crate) const NODE_DIGEST: Option<[u8; 32]> = None; // Legacy unelected pin table only.
+#[path = "adapter/pi_guest/authority.rs"]
+pub(crate) mod authority;
 
 #[derive(Debug)]
 pub(crate) struct Profile {
@@ -59,6 +63,24 @@ impl Profile {
     }
     pub(crate) fn routing(&self) -> &Routing {
         &self.routing
+    }
+    pub(crate) fn selection(&self) -> Result<authority::Selection, String> {
+        let selection = authority::Selection {
+            alias_sha256: self.alias_sha256.clone(),
+            generation: self.generation.clone(),
+            role: if self.routing.no_session {
+                authority::Role::Master
+            } else {
+                authority::Role::Worker
+            },
+            model: self
+                .routing
+                .model
+                .clone()
+                .ok_or("protected owner requires explicit model")?,
+        };
+        selection.validate().map_err(|e| e.to_string())?;
+        Ok(selection)
     }
 }
 impl Routing {

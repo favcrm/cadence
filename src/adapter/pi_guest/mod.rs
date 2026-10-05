@@ -1,30 +1,10 @@
-//! CAD-1012 — the protected managed-Pi launch seam (verify-only first batch).
-//!
-//! This module implements the *construction and refusal* half of a split
-//! (`agent_uid.is_some()`) managed-Pi launch: the verified FD-exec spawn plan,
-//! the openat2 verify-only walk of the pre-provisioned protected topology, and
-//! the post-drop guest environment vector. **It enables nothing on its own** —
-//! [`protected_prereqs_satisfied`] returns `Err(UNKNOWN)` until the external
-//! restore-lineage, sealed-helper and namespace-policy pins exist, so a
-//! production launch can never pass through here yet.
-//!
-//! Custody: the daemon binds only the helper ELF. The helper first closes
-//! every inherited descriptor, then privately opens/verifies Node and owns it
-//! through the identity/capability seal and `execveat(AT_EMPTY_PATH)`. A parent
-//! Node fd is neither transferred nor claimed as execution custody.
-//! The reviewed immutable Pi graph/CLI and out-of-tree filesystem policy are
-//! unavailable. No obsolete cli-runtime layout or local candidate observation
-//! elects them; scripts remain canonical immutable paths, never fd-exec targets.
-//!
-//! No guest caller boolean, restored marker, refreshed local flag, or `params`
-//! field is ever an eligibility input: the only inputs are `agent_uid`, the
-//! verified topology, and the source-owned [`EXEC_PINS`].
-//!
-//! First-batch note: the launch path is gated by `protected_prereqs_satisfied`
-//! which is always `Err` until external authority exists, so `establish` and
-//! the spawn plan are exercised only by this module's tests. The items are
-//! real, not dead — the lint is held pending the enablement that the external
-//! prerequisites gate.
+//! Owner-authorized protected managed-Pi launch. The fixed private supervisor
+//! service provisions one fresh generation before verify-only topology access.
+//! Its authenticated image profile binds the helper; the helper independently
+//! arms the exact operation after close_fds, verifies Node/full Pi graph and
+//! consumes current authority immediately before FD exec. No authority survives
+//! in argv/env or arbitrary inherited descriptors. Absent service/custody/image
+//! authorization remains UNKNOWN, not a guest-selected enablement flag.
 
 #![allow(dead_code)]
 
@@ -36,9 +16,11 @@ use crate::store::Agent;
 
 mod envp;
 pub(crate) mod execfd;
+pub(crate) mod owner;
 pub(crate) mod topology;
 
-use execfd::{PreparedExec, EXEC_PINS};
+use crate::protected_pi_profile::authority;
+use execfd::PreparedExec;
 use topology::ProtectedTopology;
 
 /// The four image-local accounts/groups the protected layout is built on —
@@ -148,18 +130,14 @@ pub(crate) struct GuestCtx {
     /// The agent's routing alias — carried verbatim to `CADENCE_ALIAS` (it is
     /// routing text, never a path segment or a principal proof).
     alias: String,
+    selection: authority::Selection,
     /// Daemon owns only the helper; Node is reopened privately AFTER close_fds.
     helper: execfd::BoundExec,
 }
 
-/// The mandatory fail-closed gate for production eligibility. The external
-/// prerequisite factory — sealed-helper pin record, namespace policy and the
-/// pre-start restore-lineage pin — is external authority this source does not
-/// mint. Until it is supplied and verified, this is `Err`, permanently UNKNOWN:
-/// no guest boolean, restored marker or refreshed flag can satisfy it.
-///
-/// This batch ships the constructor and refusal path only; the real factory
-/// arrives with the external provisioning work.
+/// Legacy unbound/unsupported-host probe. No operation/alias/model means no
+/// authority can be returned. Linux production uses authenticated provisioning
+/// in `establish`, never this context-free gate.
 pub(crate) fn protected_prereqs_satisfied() -> Result<()> {
     Err(Error::rejected(
         "protected managed-Pi prerequisites unavailable — external \
@@ -173,30 +151,68 @@ impl GuestCtx {
     /// closed on any missing pre-requisite, any mis-owned or symlinked
     /// topology component, or any exec digest that does not match the
     /// compiled pin. Returns the context only when construction — not
-    /// enablement — is sound. `protected_prereqs_satisfied` is consulted
-    /// by the caller before any spawn; it stays `Err` this batch.
+    /// selector parsing — is sound. The owner provisions a fresh generation
+    /// only after authenticating supervisor custody and current launch policy.
     pub(crate) fn establish(
         agent: &Agent,
         _env: &ProviderEnv,
         agent_uid: u32,
         generation: &str,
     ) -> Result<Self> {
-        protected_prereqs_satisfied()?;
-        // The split gate already proved agent_uid.is_some() upstream; assert
-        // the resolved uid is the guest account, never 0 or the supervisor.
         let segs = Segments::new(&agent.alias, generation)?;
-        let topo = ProtectedTopology::verify(agent_uid)?;
         let role = Role::of(agent);
+        let model = agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::rejected("protected Pi requires explicit model"))?;
+        let selection = authority::Selection {
+            alias_sha256: segs.alias_hex(),
+            generation: segs.generation_hex(),
+            role: if role == Role::Master {
+                authority::Role::Master
+            } else {
+                authority::Role::Worker
+            },
+            model: model.to_owned(),
+        };
+        selection.validate()?;
+        if agent_uid != authority::GUEST_UID
+            || unsafe { libc::geteuid() } != authority::SUPERVISOR_UID
+        {
+            return Err(Error::rejected(
+                "protected Pi must be provisioned by the fixed supervisor",
+            ));
+        }
+        // Provision is authenticated by the service against retained supervisor
+        // custody and current owner policy before it creates ANY generation leaf.
+        let launch = authority::Channel::connect()?.authorize(
+            &authority::Request::Provision {
+                version: 1,
+                selection: selection.clone(),
+                alias: agent.alias.clone(),
+            },
+            &selection,
+        )?;
+        let topo = ProtectedTopology::verify(agent_uid)?;
         // Verify the durable + generation slot dirs exist and are exactly the
         // pre-provisioned shape; a missing slot refuses (never creates).
         topo.verify_view(&segs, role)?;
         // Bind only the helper here. No parent Node fd survives helper close_fds.
-        let helper = execfd::open_bound(&EXEC_PINS[0])?;
+        let helper = execfd::open_bound(&execfd::ExecPin {
+            canon: "/opt/cadence/libexec/cadence-agent-exec",
+            owner: 0,
+            group: Some(acct::LAUNCH_GROUP),
+            mode: 0o4750,
+            sha256: Some(launch.image.helper_sha256),
+        })?;
         Ok(Self {
             topo,
             segs,
             role,
             alias: agent.alias.clone(),
+            selection,
             helper,
         })
     }
@@ -220,9 +236,15 @@ impl GuestCtx {
         self,
         routing: &crate::protected_pi_profile::Routing,
     ) -> Result<PreparedExec> {
-        // Recheck the actual unavailable private prerequisites at transport handoff;
-        // construction and routing text never substitute for current authority.
-        protected_prereqs_satisfied()?;
+        // Routing must exactly echo the provisioned selectors. Only the helper's
+        // separately authenticated arm/consume may authorize actual Node exec.
+        if routing.model() != Some(self.selection.model.as_str())
+            || routing.no_session() != (self.selection.role == authority::Role::Master)
+        {
+            return Err(Error::rejected(
+                "protected Pi routing differs from owner provisioning",
+            ));
+        }
         self.topo.verify_view(&self.segs, self.role)?;
         let draft = PreparedExec::assemble(&self.segs, &routing.tokens(), Vec::new())?;
         Ok(draft.with_bound(self.helper))

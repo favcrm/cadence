@@ -678,7 +678,7 @@ fn resolve_gid(name: &str) -> Result<u32> {
     Ok(unsafe { (*gr).gr_gid })
 }
 
-fn resolve_primary_gid(user: &str) -> Result<u32> {
+pub(crate) fn resolve_primary_gid(user: &str) -> Result<u32> {
     let c = CString::new(user).map_err(|_| Error::rejected("account name NUL"))?;
     let pw = unsafe { libc::getpwnam(c.as_ptr()) };
     if pw.is_null() {
