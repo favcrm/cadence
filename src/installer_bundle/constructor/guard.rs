@@ -90,13 +90,29 @@ fn caller_selected_build_key_pid_and_perfect_diagnostics_cannot_elect_authority(
         "lineage": { "reference": "cad1159-untrusted-lineage", "databaseEpoch": 1 }
     });
 
+    // Validate the actual production types/parsers, not merely JSON syntax.
+    // The schema comes from platform 6b5502e85d40174c1f5de313c10ccda24dee7bce.
+    let parsed: super::Configure = serde_json::from_value(bootstrap.clone()).unwrap();
+    super::grant::parse_launch(&parsed.launch).unwrap();
+    super::grant::parse_lineage(&parsed.lineage).unwrap();
+    let _: super::Header = super::canonical(canonical(&header).as_bytes()).unwrap();
+    let _: super::Manifest = super::canonical(canonical(&payload).as_bytes()).unwrap();
+
     let mut embedded_key = bootstrap.clone();
     embedded_key["imageTrust"] = json!([{ "issuer": "agenticos-native-image-owner",
         "kid": "cad1159-attacker", "keyVersion": 1, "publicKey": public_key }]);
 
     let mut selected_process = bootstrap.clone();
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let starttime = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_ascii_whitespace()
+        .nth(19)
+        .unwrap();
     selected_process["installer"] = json!({
-        "pid": std::process::id(), "starttime": "1", "uid": 21000, "gid": 21000
+        "pid": std::process::id(), "starttime": starttime, "uid": 21000, "gid": 21000
     });
     selected_process["diagnostic"] = json!({
         "pid": std::process::id(), "securebits": 239, "keepcaps": 0,
@@ -132,8 +148,21 @@ fn caller_selected_build_key_pid_and_perfect_diagnostics_cannot_elect_authority(
             bytes.len() < 32768,
             "guard must reach bounded authentication"
         );
+        let result = super::authenticate_bootstrap(&bytes, NOW);
+        if case == "well-formed self-signed untrusted build" {
+            // This must reach the REAL immutable-key lookup, not a syntax,
+            // timeout, geteuid or child-construction refusal. No test key is
+            // inserted into that lookup and no positive authority is mocked.
+            match &result {
+                Err(crate::Error::Rejected(message)) => assert_eq!(
+                    message, "constructor image authority unconfigured or untrusted",
+                    "baseline did not reach independent trust refusal"
+                ),
+                _ => panic!("baseline did not reach independent trust refusal"),
+            }
+        }
         assert!(
-            super::authenticate_bootstrap(&bytes, NOW).is_err(),
+            result.is_err(),
             "{case} produced authenticated construction input"
         );
         assert_eq!(
