@@ -23,8 +23,9 @@
 //!   evaluation, `finish::lane_in_use`). A daemon that is up but could not
 //!   enumerate its agents blocks (that evaluation's deferred failure). The idle window
 //!   is an mtime walk over the lane's source (`target/` is skipped — its
-//!   own writes are covered by the fd/cwd scan); a walk that hits its
-//!   entry cap counts the lane as recent, never idle.
+//!   own writes are covered by the shared finish fd/cwd scan); a truncated or
+//!   unreadable source walk counts as unknown, never idle. Incomplete process
+//!   enumeration is also a refusal, never an empty holder list.
 //! - I-B: exactly one path is ever deleted: `<canonical lane>/target`,
 //!   re-derived at delete time. The lane must be a linked worktree (git
 //!   dir != common dir), not the repo root, and sit under
@@ -74,42 +75,6 @@ pub(crate) fn idle_secs(pm_dir: &Path) -> u64 {
         .unwrap_or(RECLAIM_IDLE_SECS)
 }
 
-/// Pids holding an open file descriptor under `dir` — a build in
-/// flight keeps `target/` open even when its cwd sits elsewhere. A
-/// vanished pid or a denied read just doesn't report; the cadence
-/// process itself is excluded. /proc races are benign: a pid that goes
-/// away mid-scan is simply not held.
-fn pids_fd_under(dir: &Path) -> Vec<u32> {
-    let mut out = Vec::new();
-    let Ok(dir) = dir.canonicalize() else {
-        return out;
-    };
-    let me = std::process::id();
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return out;
-    };
-    for entry in procs.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        if pid == me {
-            continue;
-        }
-        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-            continue;
-        };
-        for fd in fds.flatten() {
-            if let Ok(target) = std::fs::read_link(fd.path()) {
-                if target.starts_with(&dir) {
-                    out.push(pid);
-                    break;
-                }
-            }
-        }
-    }
-    out
-}
-
 /// What the idle walk over a lane's source saw.
 #[derive(Debug, PartialEq)]
 enum Walk {
@@ -119,6 +84,8 @@ enum Walk {
     Recent(Duration),
     /// The entry cap was hit first — the rest is unknown, so not idle.
     Truncated,
+    /// A directory or entry could not be inspected completely.
+    Unknown(String),
 }
 
 /// The most recent write under the lane's source within `window`. The
@@ -132,10 +99,15 @@ fn walk_writes(lane: &Path, window: Duration, cap: usize) -> Walk {
     let mut stack = vec![lane.to_path_buf()];
     let mut visited = 0usize;
     while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
+        let entries = match std::fs::read_dir(&d) {
+            Ok(entries) => entries,
+            Err(e) => return Walk::Unknown(format!("cannot enumerate {}: {e}", d.display())),
         };
-        for ent in entries.flatten() {
+        for ent in entries {
+            let ent = match ent {
+                Ok(ent) => ent,
+                Err(e) => return Walk::Unknown(format!("cannot enumerate {}: {e}", d.display())),
+            };
             if d == lane && ent.file_name() == "target" {
                 continue;
             }
@@ -143,17 +115,27 @@ fn walk_writes(lane: &Path, window: Duration, cap: usize) -> Walk {
             if visited > cap {
                 return Walk::Truncated;
             }
-            let Ok(meta) = ent.metadata() else {
-                continue;
+            let meta = match ent.metadata() {
+                Ok(meta) => meta,
+                Err(e) => {
+                    return Walk::Unknown(format!("cannot inspect {}: {e}", ent.path().display()))
+                }
             };
             if meta.is_dir() {
                 stack.push(ent.path());
             }
-            if let Ok(m) = meta.modified() {
-                let age = now.duration_since(m).unwrap_or(Duration::ZERO);
-                if age < window && newest.is_none_or(|a| age < a) {
-                    newest = Some(age);
+            let modified = match meta.modified() {
+                Ok(modified) => modified,
+                Err(e) => {
+                    return Walk::Unknown(format!(
+                        "cannot inspect modification time for {}: {e}",
+                        ent.path().display()
+                    ))
                 }
+            };
+            let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+            if age < window && newest.is_none_or(|a| age < a) {
+                newest = Some(age);
             }
         }
     }
@@ -267,22 +249,31 @@ fn live_reason(
     front: &crate::issue::model::Front,
     lane: &Path,
 ) -> Option<String> {
-    if let Some(pid) = finish::pids_cwd_under(lane).first() {
+    if view.up && !finish::cwd_holder_aliases(view, Some(lane)).is_empty() {
+        return Some("a registered agent's cwd is on the lane".to_string());
+    }
+    if let Some(reason) = finish::lane_in_use(view, state_dir, front, lane) {
+        return Some(reason);
+    }
+    let process_use = match finish::process_use_under(lane) {
+        Ok(process_use) => process_use,
+        Err(e) => return Some(format!("cannot enumerate process cwd/open-fd use: {e}")),
+    };
+    if let Some(pid) = process_use.cwd.first() {
         return Some(format!(
             "process {pid} ({}) cwd inside",
             finish::comm_of(*pid)
         ));
     }
-    if let Some(pid) = pids_fd_under(lane).first() {
+    if let Some(pid) = process_use.fd.first() {
         return Some(format!(
             "process {pid} ({}) holds an open fd inside",
             finish::comm_of(*pid)
         ));
     }
-    if view.up && !finish::cwd_holder_aliases(view, Some(lane)).is_empty() {
-        return Some("a registered agent's cwd is on the lane".to_string());
-    }
-    finish::lane_in_use(view, state_dir, front, lane)
+    process_use
+        .enumeration_error
+        .map(|error| format!("Cannot fully enumerate process cwd/open-fd use: {error}"))
 }
 
 /// The reason a lane's `target/` is NOT reclaimable, or `None` when the
@@ -305,6 +296,7 @@ fn blocked_reason(
             idle.as_secs() / 3600
         )),
         Walk::Truncated => Some("idle walk truncated — treating as recent".to_string()),
+        Walk::Unknown(reason) => Some(format!("idle walk incomplete — {reason}")),
     }
 }
 
@@ -420,6 +412,20 @@ fn lane_repo(lane: &Path) -> Option<PathBuf> {
         .or_else(|| crate::worktree::layout::assumed_root(lane))
 }
 
+fn declared_lane_root(pm: &Pm, issue: &board::Issue, lane: &Path) -> Result<PathBuf> {
+    let project = crate::issue::project::load(&pm.dir.join(&issue.project).join("project.yaml"))?;
+    let root = crate::worktree::main_root(lane)?.canonicalize()?;
+    if !crate::issue::start::declared_repos(&project).contains(&root) {
+        return Err(Error::rejected(format!(
+            "lane {} has foreign ownership: repo {} is not declared by project {}",
+            lane.display(),
+            root.display(),
+            project.key
+        )));
+    }
+    Ok(root)
+}
+
 fn plan_bounded(pm: &Pm, state_dir: &Path, idle_secs: u64) -> Result<Value> {
     let merged = finish::sweep(pm, None, false, true, "", state_dir)?;
     let view = finish::daemon_view(state_dir);
@@ -428,7 +434,7 @@ fn plan_bounded(pm: &Pm, state_dir: &Path, idle_secs: u64) -> Result<Value> {
     let mut resources = Vec::new();
     for issue in &issues {
         for lane in crate::issue::start::open_worktrees(&issue.front) {
-            resources.push(target_plan(&view, state_dir, issue, &lane, idle));
+            resources.push(target_plan(pm, &view, state_dir, issue, &lane, idle));
         }
     }
     Ok(json!({
@@ -441,6 +447,7 @@ fn plan_bounded(pm: &Pm, state_dir: &Path, idle_secs: u64) -> Result<Value> {
 }
 
 fn target_plan(
+    pm: &Pm,
     view: &finish::DaemonView,
     state_dir: &Path,
     issue: &board::Issue,
@@ -454,6 +461,10 @@ fn target_plan(
     if !lane.is_dir() {
         return json!({"resource": base, "status": "missing", "reason_code": "checkout-missing",
             "reason": "checkout is missing; branch and tracker refs are preserved", "reclaimable_bytes": 0});
+    }
+    if let Err(e) = declared_lane_root(pm, issue, lane) {
+        return json!({"resource": base, "status": "refused",
+            "reason_code": "foreign-or-undeclared-project-repo", "reason": e.to_string(), "reclaimable_bytes": null});
     }
     let cargo_target = issue
         .front
@@ -537,6 +548,7 @@ fn reclaim_lane_detailed(
     if !lane.is_dir() {
         return Ok(ReclaimAttempt::Absent);
     }
+    declared_lane_root(pm, issue, lane)?;
     // The recorded cargo_target for this lane's open ref, if any — only
     // ever compared against the derived path, never deleted.
     let cargo_target = issue
@@ -691,10 +703,30 @@ mod tests {
             .status();
     }
 
-    fn pm_stub(tmp: &Tmp) -> Pm {
+    fn pm_stub(tmp: &Tmp, repo: &Path) -> Pm {
         let pm_dir = tmp.0.join("pm");
-        std::fs::create_dir_all(&pm_dir).unwrap();
+        let project_dir = pm_dir.join("demo");
+        std::fs::create_dir_all(&project_dir).unwrap();
         std::fs::write(pm_dir.join("pm.yaml"), "schema: 1\n").unwrap();
+        let project = crate::issue::project::Project {
+            key: "demo".to_string(),
+            prefix: "D".to_string(),
+            repos: vec![crate::issue::project::Repo {
+                path: Some(repo.display().to_string()),
+                remote: None,
+            }],
+            components: Vec::new(),
+            tags: Vec::new(),
+            default_owner: None,
+            build: None,
+            memory: None,
+            intake: None,
+        };
+        std::fs::write(
+            project_dir.join("project.yaml"),
+            serde_yaml::to_string(&project).unwrap(),
+        )
+        .unwrap();
         Pm::at(&pm_dir).unwrap()
     }
 
@@ -721,10 +753,11 @@ mod tests {
     }
 
     fn reclaim(tmp: &Tmp, lane: &Path, cargo_target: Option<&str>) -> Result<Option<u64>> {
+        let repo = crate::worktree::main_root(lane).unwrap();
         reclaim_lane(
             &down_view(),
             &no_daemon(),
-            &pm_stub(tmp),
+            &pm_stub(tmp, &repo),
             &issue_with(lane, cargo_target),
             lane,
             Duration::from_secs(6 * 3600),
@@ -736,6 +769,8 @@ mod tests {
         static PLANT: std::cell::RefCell<Option<std::process::Child>> =
             const { std::cell::RefCell::new(None) };
         static PLANT_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static PLANT_PROC_ROOT: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// Test seam called by `reclaim_lane` between the idleness check and
@@ -751,6 +786,11 @@ mod tests {
             .spawn()
             .expect("plant a build");
         let want = dir.canonicalize().unwrap();
+        if let Some(proc_root) = PLANT_PROC_ROOT.with(|root| root.borrow().clone()) {
+            let fake_proc = proc_root.join(child.id().to_string());
+            std::fs::create_dir_all(fake_proc.join("fd")).unwrap();
+            std::os::unix::fs::symlink(&want, fake_proc.join("cwd")).unwrap();
+        }
         let link = format!("/proc/{}/cwd", child.id());
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline
@@ -868,6 +908,26 @@ mod tests {
                 "unexpected blocker: {reason}"
             );
         }
+    }
+
+    /// An unreadable process entry is unknown live use, never an empty
+    /// holder list, and the real target-delete path must retain the cache.
+    #[test]
+    fn incomplete_process_enumeration_blocks_target_deletion() {
+        let tmp = Tmp::new("proc-unknown");
+        let (_repo, lane) = repo_with_lane(&tmp);
+        let target = lane_target(&lane);
+        age(&lane, 7 * 3600);
+        let proc_root = tmp.0.join("proc");
+        std::fs::create_dir_all(proc_root.join("4294967294")).unwrap();
+        let _proc_root = finish::use_process_proc_root_for_test(proc_root);
+        let front = issue_with(&lane, None).front;
+        let idle = Duration::from_secs(6 * 3600);
+        let reason = blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, WALK_CAP)
+            .expect("incomplete process enumeration blocks");
+        assert!(process_enumeration_uncertain(&reason), "{reason}");
+        assert_eq!(reclaim(&tmp, &lane, None).unwrap(), None);
+        assert!(target.is_dir(), "unknown process use must retain target");
     }
 
     /// Important 4: a daemon that is up but could not enumerate agents
@@ -989,9 +1049,14 @@ mod tests {
         let (_repo, lane) = repo_with_lane(&tmp);
         let target = lane_target(&lane);
         age(&lane, 7 * 3600);
+        let proc_root = tmp.0.join("proc");
+        std::fs::create_dir_all(&proc_root).unwrap();
+        let _proc_root = finish::use_process_proc_root_for_test(proc_root.clone());
+        PLANT_PROC_ROOT.with(|root| *root.borrow_mut() = Some(proc_root));
         PLANT_ARMED.with(|a| a.set(true));
         let bytes = reclaim(&tmp, &lane, None);
         PLANT_ARMED.with(|a| a.set(false));
+        PLANT_PROC_ROOT.with(|root| *root.borrow_mut() = None);
         if let Some(mut c) = PLANT.with(|p| p.borrow_mut().take()) {
             let _ = c.kill();
             let _ = c.wait();

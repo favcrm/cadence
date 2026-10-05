@@ -820,14 +820,72 @@ pub fn declare_artifacts(
     write_ledger(&dir, &ledger)
 }
 
-/// Whether a lifecycle record exists for this path (read-only).
-pub fn contains(repo: &Path, path: &Path) -> Result<bool> {
+/// Return the unique ownership record for a checkout path, if one exists.
+pub fn managed_record(repo: &Path, path: &Path) -> Result<Option<Checkout>> {
     let root = canonical_root(repo)?;
     let key = path_key(path);
-    Ok(read_ledger(&root)?
+    let mut matches = read_ledger(&root)?
         .records
-        .iter()
-        .any(|record| record.path == key))
+        .into_iter()
+        .filter(|record| record.path == key);
+    let Some(record) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(Error::rejected(format!(
+            "multiple lifecycle ownership records name {}; refusing cleanup",
+            path.display()
+        )));
+    }
+    validate_record(&root, &record)?;
+    Ok(Some(record))
+}
+
+/// Atomically authorize a release before destructive cleanup starts.
+pub fn begin_release(
+    repo: &Path,
+    path: &Path,
+    issue: &str,
+    branch: Option<&str>,
+    reason: &str,
+) -> Result<()> {
+    if reason.trim().is_empty() {
+        return Err(Error::rejected("checkout release requires a reason"));
+    }
+    let root = canonical_root(repo)?;
+    let key = path_key(path);
+    let (dir, _lock) = LedgerLock::acquire(&root)?;
+    let mut ledger = read_ledger(&root)?;
+    let record = ledger
+        .records
+        .iter_mut()
+        .find(|record| record.path == key)
+        .ok_or_else(|| {
+            Error::rejected(format!(
+                "{} has no managed ownership record; refusing deletion",
+                path.display()
+            ))
+        })?;
+    validate_record(&root, record)?;
+    if record.purpose != "development"
+        || record.issue.as_deref() != Some(issue)
+        || branch.is_some_and(|branch| record.branch.as_deref() != Some(branch))
+        || record.state != "active"
+    {
+        return Err(Error::rejected(format!(
+            "checkout ownership for {} changed before release of issue {issue}; refusing deletion",
+            path.display()
+        )));
+    }
+    record.state = "releasing".into();
+    record.release_reason = Some(reason.to_string());
+    record.updated_at = time::now_epoch();
+    write_ledger(&dir, &ledger)
+}
+
+/// Whether a lifecycle record exists for this path (read-only).
+pub fn contains(repo: &Path, path: &Path) -> Result<bool> {
+    Ok(managed_record(repo, path)?.is_some())
 }
 
 /// Find a matching interrupted or active checkout that its creating tool may
@@ -853,7 +911,7 @@ pub fn recoverable_record(
             && record.issue.as_deref() == issue
             && matches!(
                 record.state.as_str(),
-                "preparing" | "setup-failed" | "active"
+                "preparing" | "setup-failed" | "cleanup-failed" | "active"
             )
     });
     if let Some(record) = &record {

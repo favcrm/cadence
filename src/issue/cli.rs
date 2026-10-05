@@ -371,7 +371,10 @@ pub enum IssueAction {
     /// while the worktree is dirty, while the branch has not started
     /// (no commits beyond where it was cut) or while it is neither
     /// merged nor pushed — `--force` records ordinary overrides, never failed
-    /// safety enumeration. Then `git worktree remove`, delete the branch
+    /// safety enumeration. Before deletion, require issue-bound declared-repo
+    /// ownership and an exact registered worktree; present lifecycle metadata
+    /// must match. `--force` cannot bypass these checks.
+    /// Then `git worktree remove`, delete the branch
     /// (`--keep-branch` keeps it, `--remote` deletes the remote one
     /// too) and mark both refs `closed: true` in one commit. The
     /// issue's status is untouched. `--merged` instead sweeps every

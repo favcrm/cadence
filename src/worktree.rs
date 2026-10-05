@@ -231,11 +231,6 @@ pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
     if let Err(e) =
         setup_development(&dir, &root, true).and_then(|_| lifecycle::activate(&root, record))
     {
-        let _ = git(
-            &root,
-            &["worktree", "remove", "--force", &dir.to_string_lossy()],
-        );
-        let _ = git(&root, &["branch", "-D", &branch]);
         let _ = lifecycle::transition(&root, &dir, "setup-failed", Some(&e.to_string()));
         return Err(e);
     }

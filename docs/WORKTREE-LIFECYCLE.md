@@ -1,9 +1,11 @@
 # Managed checkout lifecycle (CAD-848)
 
 Cadence-created development, review and validation checkouts use the repo's
-`.cadence/` ledger at `.cadence/managed-checkouts.json`. Issue refs remain the
-authority for development lanes; the ledger records setup/release state and
-tool ownership. It is not a deletion permit.
+`.cadence/` ledger at `.cadence/managed-checkouts.json`. Issue refs bind a
+development lane to its ticket. Cleanup also checks the project-declared repo,
+managed layout and canonical Git worktree registration. If lifecycle metadata is
+present, it must match the active development issue/branch and moves to
+`releasing` before deletion; legacy issue refs remain authoritative.
 
 ## Create and recover
 
@@ -14,9 +16,10 @@ tool ownership. It is not a deletion permit.
   the durable issue binding.
 - A same-issue restart reuses only its recorded repo/path/branch and does not
   reset dirty source. A different repo or checked-out branch refuses. Setup
-  failures are recorded as `setup-failed`; retry `issue start` after correcting
-  the cause. `preparing` after interruption means inspect the path and branch,
-  then retry to heal; it never authorizes removal.
+  failures preserve the checkout and branch and are recorded as `setup-failed`;
+  retry `issue start` after correcting the cause. `preparing` after interruption
+  means inspect the path and branch, then retry to heal; it never authorizes
+  removal.
 - `cadence review` records its tool, owner and exact PR SHA before creating a
   detached tree. Normal completion records `released`; `--keep` records
   `retained`. Its Markdown/JSON receipts are declared outside the disposable
@@ -41,7 +44,9 @@ means unknown. Inventory does not modify Git, the tracker or the ledger, and
 sends no notifications. Unregistered existing trees—including trees outside
 `.cadence/wt`—remain inventory-only. Adoption requires explicit repo, path,
 purpose, tool, owner and exact current SHA; it verifies the Git common dir and
-branch rather than trusting path names or timestamps.
+branch rather than trusting path names or timestamps. Development lanes remain
+bound by their issue refs and must be in a project-declared repo and registered
+at the canonical managed path before finish can remove them.
 
 ## Cleanup policy
 
@@ -50,9 +55,11 @@ merged-lane finish plan and idle `target/` cache plan using the same checks as
 the scheduled daemon pass. `cadence issue reclaim --apply` opts into the
 existing policy: merged checkout finish and bounded lane-local target cache
 reclamation. It revalidates before deletion. Cache reclamation never removes
-source or a branch. Exact-tip merge evidence remains the only authorization to
-delete a branch; squash merges use the existing SHA-pinned ancestry,
-patch-equivalence or merged-PR evidence.
+source or a branch. Branch deletion requires the issue-bound, project-declared
+checkout and exact-tip merge/push evidence; any present lifecycle record must
+also match and be active. Squash merges use the existing SHA-pinned ancestry,
+patch-equivalence or merged-PR evidence. Unmanaged or foreign checkouts remain
+inventory-only until explicitly adopted.
 
 New review/validation checkout deletion has **no automatic cleanup policy**;
 inventory is report-only. Age, name prefix, `/tmp` location, ticket status and

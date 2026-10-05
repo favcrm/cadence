@@ -695,11 +695,6 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         cargo_target = match setup {
             Ok(target) => target,
             Err(e) => {
-                let _ = git(
-                    &root,
-                    &["worktree", "remove", "--force", &wt_dir.to_string_lossy()],
-                );
-                let _ = git(&root, &["branch", "-D", &branch]);
                 let _ = worktree::lifecycle::transition(
                     &root,
                     &wt_dir,
@@ -710,11 +705,6 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             }
         };
         if let Err(e) = worktree::lifecycle::activate(&root, checkout_record()) {
-            let _ = git(
-                &root,
-                &["worktree", "remove", "--force", &wt_dir.to_string_lossy()],
-            );
-            let _ = git(&root, &["branch", "-D", &branch]);
             let _ = worktree::lifecycle::transition(
                 &root,
                 &wt_dir,
@@ -744,9 +734,8 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         if new_front.claim.is_none() || checked.warning.is_some() {
             new_front.claim = Some(claim::new_claim(&requester, None));
         }
-        // The worktree, the branch and the tracker commit stand or
-        // fall together: a refused commit (hook lint, disk error)
-        // rolls the file and the git side back so a retry is clean.
+        // A refused tracker commit restores the frontmatter but keeps the
+        // managed checkout in setup-failed state for an explicit retry.
         let committed = write::save_front(&dir, &new_front, &body).and_then(|_| {
             // `Actor:` is the requester (the dispatching PM), so the
             // lane's advisory code-area PM is bound to this record and
@@ -762,11 +751,6 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         });
         if let Err(e) = committed {
             let _ = write::save_front(&dir, &front, &body);
-            let _ = git(
-                &root,
-                &["worktree", "remove", "--force", &wt_dir.to_string_lossy()],
-            );
-            let _ = git(&root, &["branch", "-D", &branch]);
             let _ = worktree::lifecycle::transition(
                 &root,
                 &wt_dir,
