@@ -109,11 +109,39 @@ pub(crate) struct Authorized {
     pub shared_gid: u32,
     pub image: ImageProfile,
 }
+/// Public scope descriptor, NOT a caller capability or owned-process proof.
+/// Shared unchanged with the root carrier and purpose signature payload.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperationScope {
+    pub(crate) version: u32,
+    pub(crate) binding_json: String,
+    pub(crate) global: String,
+    pub(crate) company: String,
+    pub(crate) epoch: u64,
+    pub(crate) lineage: String,
+    pub(crate) database_epoch: u64,
+    pub(crate) alias: String,
+    pub(crate) selection: Selection,
+    pub(crate) helper_sha256: [u8; 32],
+    pub(crate) node_sha256: [u8; 32],
+    pub(crate) profile_sha256: [u8; 32],
+    pub(crate) policy_sha256: [u8; 32],
+}
+/// Original externally signed public operation, never echoed public TRUST.
+/// Only LaunchPermit projects this from its retained authenticated origin.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SignedOperation {
+    pub(crate) authorization: String,
+    pub(crate) scope: OperationScope,
+}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Response {
     Authorized {
         launch: Authorized,
+        signed: Box<SignedOperation>,
     },
     Consumed {
         version: u32,
@@ -378,6 +406,10 @@ impl Channel {
     pub(crate) fn connect() -> io::Result<Self> {
         Err(refused())
     }
+    pub(crate) fn bound_until(&mut self, until: Instant) -> io::Result<()> {
+        self.until = self.until.min(until);
+        self.timeout()
+    }
     fn timeout(&self) -> io::Result<()> {
         let remaining = self
             .until
@@ -439,10 +471,28 @@ impl Channel {
         request: &Request,
         selection: &Selection,
     ) -> io::Result<Authorized> {
+        self.authorize_signed(request, selection)
+            .map(|(launch, _)| launch)
+    }
+    /// Helper MUST additionally authenticate signed against independently
+    /// qualified fixed-media trust BEFORE any view/graph/Node effects.
+    pub(crate) fn authorize_signed(
+        &mut self,
+        request: &Request,
+        selection: &Selection,
+    ) -> io::Result<(Authorized, SignedOperation)> {
         match self.exchange(request)? {
-            Response::Authorized { launch } => {
+            Response::Authorized { launch, signed } => {
                 launch.validate(selection)?;
-                Ok(launch)
+                if signed.authorization.is_empty()
+                    || signed.authorization.len() > 32768
+                    || signed.scope.version != 1
+                    || signed.scope.selection != *selection
+                    || signed.scope.alias != launch.alias
+                {
+                    return Err(refused());
+                }
+                Ok((launch, *signed))
             }
             _ => Err(refused()),
         }

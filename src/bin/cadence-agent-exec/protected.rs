@@ -1,6 +1,9 @@
 //! Helper-private protected profile: all inherited FDs have already been closed.
 //! Only this module opens Node, and only its owned descriptor crosses the seal.
 use crate::protected_pi_profile::{authority, Profile, IMAGE_ROOT, NODE_PATH};
+use cadence_agent::{helper_image_trust, HelperImageTrust};
+#[path = "../../adapter/pi_guest/helper_authentication.rs"]
+mod authentication;
 #[path = "../../adapter/pi_guest/graph.rs"]
 mod graph;
 #[path = "../../adapter/pi_guest/namespace.rs"]
@@ -18,22 +21,31 @@ struct PrivateView {
     env: Vec<CString>,
     session: Option<String>,
 }
-fn private_authority(profile: &Profile) -> io::Result<(authority::Channel, authority::Authorized)> {
+fn private_authority(
+    profile: &Profile,
+) -> io::Result<(
+    authority::Channel,
+    authority::Authorized,
+    authentication::HelperAuthorization,
+)> {
     let selection = profile.selection().map_err(|_| authority::refused())?;
     // Kernel caller identity is necessary, not sufficient: the service also
     // authenticates retained child custody, never a submitted pid/uid/hash.
     if unsafe { libc::getuid() } != authority::SUPERVISOR_UID || unsafe { libc::geteuid() } != 0 {
         return Err(authority::refused());
     }
+    let qualified = authentication::QualifiedImage::load()?;
     let mut channel = authority::Channel::connect()?;
-    let authorized = channel.authorize(
+    let (authorized, signed) = channel.authorize_signed(
         &authority::Request::Arm {
             version: 1,
             selection: selection.clone(),
         },
         &selection,
     )?;
-    Ok((channel, authorized))
+    let proof = qualified.authenticate(&authorized, &signed)?;
+    channel.bound_until(proof.deadline())?;
+    Ok((channel, authorized, proof))
 }
 fn private_view(profile: &Profile, authority: &authority::Authorized) -> io::Result<PrivateView> {
     if profile.routing().no_session() != (authority.selection.role == authority::Role::Master)
@@ -213,8 +225,10 @@ fn open_view_dir(path: &str, policy: &[(String, u32, u32, u32)]) -> io::Result<O
 /// Real production preparation used by run, also called by the independent check.
 /// There is no test override, marker, signer, boolean or caller-chosen pin port.
 pub(super) fn prepare(profile: Profile) -> io::Result<OwnedLaunch> {
-    let (channel, authorized) = private_authority(&profile)?;
+    let (channel, authorized, proof) = private_authority(&profile)?;
+    proof.recheck()?;
     let view = private_view(&profile, &authorized)?;
+    proof.recheck()?;
     super::protected_effect(); // Actual privately-owned graph/Node-open site.
     let graph = graph::Graph::open(&authorized.image)?;
     let node = verify_file(graph.node()?, 0, 0o755, authorized.image.node_sha256)?;
@@ -248,8 +262,14 @@ pub(super) fn prepare(profile: Profile) -> io::Result<OwnedLaunch> {
                 .clone(),
         ]);
     }
+    proof.recheck()?;
     let mut launch = OwnedLaunch::new(profile, node, view.cwd, argv, view.env)?;
-    launch.authorization = Some(Box::new((channel, authorized, graph)));
+    launch.authorization = Some(Box::new(PrivateAuthorization {
+        channel,
+        authorized,
+        graph,
+        proof,
+    }));
     Ok(launch)
 }
 #[repr(C)]
@@ -371,6 +391,12 @@ fn verify_file(file: File, owner: u32, mode: u32, expected: [u8; 32]) -> io::Res
     }
     Ok(file)
 }
+struct PrivateAuthorization {
+    channel: authority::Channel,
+    authorized: authority::Authorized,
+    graph: graph::Graph,
+    proof: authentication::HelperAuthorization,
+}
 /// Owning all CString backing/pointers and private fds, built before the seal.
 /// Never an arbitrary descriptor supplied through the helper CLI.
 pub(super) struct OwnedLaunch {
@@ -381,7 +407,7 @@ pub(super) struct OwnedLaunch {
     env: Box<[CString]>,
     argv_p: Vec<*const libc::c_char>,
     env_p: Vec<*const libc::c_char>,
-    authorization: Option<Box<(authority::Channel, authority::Authorized, graph::Graph)>>,
+    authorization: Option<Box<PrivateAuthorization>>,
 }
 impl OwnedLaunch {
     fn new(
@@ -422,16 +448,23 @@ impl OwnedLaunch {
     /// The CLOEXEC Node fd stays open until execveat consumes the inode; no
     /// broad inherited fd survives. Error captures errno before RAII cleanup.
     pub(super) fn exec(mut self) -> io::Result<()> {
-        let (channel, authorized, graph) =
-            *self.authorization.take().ok_or_else(authority::refused)?;
+        let PrivateAuthorization {
+            channel,
+            authorized,
+            graph,
+            proof,
+        } = *self.authorization.take().ok_or_else(authority::refused)?;
         authorized.validate(&self.profile.selection().map_err(|_| authority::refused())?)?;
+        proof.recheck()?;
         // Empty caps + NNP alone do not prevent namespace cap reacquisition.
         namespace::install()?;
         graph.recheck()?;
+        proof.recheck()?;
         // SAME privately opened CLOEXEC channel, not a reconnect after sealing.
         // Owner verifies current and burns one-use operation before its ACK.
         // ACK loss is UNKNOWN. Final authority boundary immediately before exec.
         channel.consume(&authorized)?;
+        proof.recheck()?;
         self.exec_inode()
     }
     fn exec_inode(self) -> io::Result<()> {

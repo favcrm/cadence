@@ -5,7 +5,10 @@
 //! against the actual retained child remains the constructor dispatcher's job.
 use crate::error::{Error, Result};
 use crate::installer_bundle::constructor::{self, RuntimeProof};
-use crate::protected_pi_profile::authority::{self, Authorized, ImageProfile, Role, Selection};
+use crate::protected_pi_profile::authority::{
+    self, Authorized, ImageProfile, Role, Selection, SignedOperation,
+};
+pub(crate) use authority::OperationScope;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
@@ -140,26 +143,6 @@ fn read_elected<T: for<'a> Deserialize<'a> + Serialize>(
         return Err(refuse());
     }
     Ok(typed)
-}
-/// Finite Pi acquire/consume/current selector schema for the constructor's
-/// retained authenticated carrier. These public bytes NEVER mint a permit.
-/// Kernel-owned caller admission is separate and remains constructor-owned.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct OperationScope {
-    pub(crate) version: u32,
-    pub(crate) binding_json: String,
-    pub(crate) global: String,
-    pub(crate) company: String,
-    pub(crate) epoch: u64,
-    pub(crate) lineage: String,
-    pub(crate) database_epoch: u64,
-    pub(crate) alias: String,
-    pub(crate) selection: Selection,
-    pub(crate) helper_sha256: [u8; 32],
-    pub(crate) node_sha256: [u8; 32],
-    pub(crate) profile_sha256: [u8; 32],
-    pub(crate) policy_sha256: [u8; 32],
 }
 #[derive(Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -421,6 +404,18 @@ pub(crate) fn require_binding(
 impl LaunchPermit {
     pub(crate) fn describe(&self) -> &Authorized {
         &self.launch
+    }
+    /// Forward only the retained ORIGINAL signature/scope. A description never
+    /// constructs this permit; helper elects its trust independently from media.
+    pub(crate) fn signed_operation(&self) -> Result<Box<SignedOperation>> {
+        if self.unknown.get() || Instant::now() >= self.until {
+            return Err(refuse());
+        }
+        self.authorization.recheck(authentication::now_ms()?)?;
+        Ok(Box::new(SignedOperation {
+            authorization: self.authorization.original().to_owned(),
+            scope: self.scope.clone(),
+        }))
     }
     fn request(&self, consume: bool) -> Result<()> {
         if self.unknown.get() {

@@ -5,7 +5,9 @@
 use super::owner::LaunchPermit;
 use crate::error::{Error, Result};
 use crate::installer_bundle::constructor::{HelperPhase, HelperStdio, OwnedHelper};
-use crate::protected_pi_profile::authority::{self, Authorized, Request, Response};
+use crate::protected_pi_profile::authority::{
+    self, Authorized, Request, Response, SignedOperation,
+};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -35,6 +37,9 @@ impl PendingLaunch {
     pub(crate) fn describe(&self) -> &Authorized {
         self.permit.describe()
     }
+    pub(crate) fn signed_operation(&self) -> Result<Box<SignedOperation>> {
+        self.permit.signed_operation()
+    }
     /// Production guard, BEFORE Arm changes state or authorizes graph/Node open.
     /// A same-UID peer, copied PID or self-selected Authorized cannot satisfy it.
     pub(crate) fn arm(
@@ -59,6 +64,7 @@ impl PendingLaunch {
         self.permit.recheck()?;
         Ok(Response::Authorized {
             launch: self.permit.describe().clone(),
+            signed: self.signed_operation()?,
         })
     }
     /// Production guard on the SAME retained connection after capability seal.

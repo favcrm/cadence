@@ -11,7 +11,10 @@
 use super::ProviderEnv;
 use crate::error::{Error, Result};
 use crate::store::Agent;
+use crate::{helper_image_trust, HelperImageTrust};
 
+#[path = "helper_authentication.rs"]
+mod authentication;
 mod envp;
 pub(crate) mod execfd;
 pub(crate) mod owner;
@@ -133,6 +136,7 @@ pub(crate) struct GuestCtx {
     /// retains the helper. Daemon receives stdio only, never executable custody.
     channel: authority::Channel,
     launch: authority::Authorized,
+    proof: authentication::HelperAuthorization,
 }
 
 /// Legacy unbound/unsupported-host probe. No operation/alias/model means no
@@ -187,8 +191,9 @@ impl GuestCtx {
         }
         // Provision is authenticated by the service against retained supervisor
         // custody and current owner policy before it creates ANY generation leaf.
+        let qualified = authentication::QualifiedImage::load()?;
         let mut channel = authority::Channel::connect()?;
-        let launch = channel.authorize(
+        let (launch, signed) = channel.authorize_signed(
             &authority::Request::Provision {
                 version: 1,
                 selection: selection.clone(),
@@ -196,10 +201,14 @@ impl GuestCtx {
             },
             &selection,
         )?;
+        let proof = qualified.authenticate(&launch, &signed)?;
+        channel.bound_until(proof.deadline())?;
+        proof.recheck()?;
         let topo = ProtectedTopology::verify(agent_uid)?;
         // Verify the durable + generation slot dirs exist and are exactly the
         // pre-provisioned shape; a missing slot refuses (never creates).
         topo.verify_view(&segs, role)?;
+        proof.recheck()?;
         // No local setuid exec: NNP/NOSUID cannot regain root. The constructor
         // selects the measured helper for this retained owner operation and
         // creates it realUID21000/effective0, retaining actual kernel custody.
@@ -211,6 +220,7 @@ impl GuestCtx {
             selection,
             channel,
             launch,
+            proof,
         })
     }
 
@@ -230,8 +240,11 @@ impl GuestCtx {
                 "protected Pi routing differs from owner provisioning",
             ));
         }
+        self.proof.recheck()?;
         self.topo.verify_view(&self.segs, self.role)?;
-        Ok(self.channel.launch(&self.launch)?)
+        let launched = self.channel.launch(&self.launch)?;
+        self.proof.recheck()?;
+        Ok(launched)
     }
 
     /// The verified per-launch view dirfd for `layer`.

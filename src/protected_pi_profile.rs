@@ -12,6 +12,8 @@ pub(crate) const HELPER_PATH: &str = "/opt/protected/bin/cadence-agent-exec";
 pub(crate) const NODE_DIGEST: Option<[u8; 32]> = None; // Legacy unelected pin table only.
 #[path = "adapter/pi_guest/authority.rs"]
 pub(crate) mod authority;
+#[path = "adapter/pi_guest/purpose.rs"]
+pub(crate) mod purpose;
 
 #[derive(Debug)]
 pub(crate) struct Profile {
