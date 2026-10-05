@@ -348,7 +348,12 @@ pub(super) fn runtime_parts() -> Result<(
 pub(super) fn runtime_wire<T>(f: impl FnOnce(&mut channel::Duplex) -> Result<T>) -> Result<T> {
     f(&mut context()?.provider.lock().map_err(|_| refused())?.channel)
 }
-pub(super) fn finish() -> Result<()> {
+pub(super) fn finish(
+    consumed: crate::daemon::installer_enrolled::ConstructorConsumption,
+) -> Result<()> {
+    // A burned attempt flag or echoed child ACK is not consumption authority.
+    // Consume the opaque successful-core result and recheck its actual handles.
+    consumed.recheck()?;
     let c = context()?;
     c.check(c.deadline)?;
     if !c.handoff.lock().map_err(|_| refused())?.completed {

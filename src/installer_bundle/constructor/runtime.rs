@@ -155,6 +155,7 @@ pub(super) fn run(
         recipient_channel,
         deadline,
     })?;
-    crate::daemon::installer_enrolled::consume_constructor_frame(&frame, deadline.0)?;
-    context::finish()
+    let consumed =
+        crate::daemon::installer_enrolled::consume_constructor_frame(&frame, deadline.0)?;
+    context::finish(consumed)
 }

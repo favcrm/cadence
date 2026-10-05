@@ -287,15 +287,29 @@ pub(crate) fn store_current(reference: &str, until: Instant) -> Result<serde_jso
         .store
         .ok_or_else(refused)
 }
+fn pi_reply(
+    reply: Response,
+    scope: &crate::adapter::pi_guest::owner::OperationScope,
+) -> Result<serde_json::Value> {
+    // The authenticated operation reply and its actual owner-current wrapper
+    // must corroborate the SAME captured scope, not two unrelated fresh reads.
+    if reply.store.is_some()
+        || reply.current.binding_json != scope.binding_json
+        || reply.current.global != scope.global
+        || reply.current.company != scope.company
+        || reply.current.epoch != scope.epoch
+        || reply.current.lineage.reference != scope.lineage
+        || reply.current.lineage.database_epoch != scope.database_epoch
+    {
+        return Err(refused());
+    }
+    reply.pi.ok_or_else(refused)
+}
 pub(crate) fn pi_acquire(
     scope: &crate::adapter::pi_guest::owner::OperationScope,
     until: Instant,
 ) -> Result<serde_json::Value> {
-    let reply = exchange(Request::PiAcquire { scope }, until)?;
-    if reply.store.is_some() {
-        return Err(refused());
-    }
-    reply.pi.ok_or_else(refused)
+    pi_reply(exchange(Request::PiAcquire { scope }, until)?, scope)
 }
 pub(crate) fn pi_consume(
     reference: &str,
@@ -305,11 +319,10 @@ pub(crate) fn pi_consume(
     if !super::hex(reference, 32) {
         return Err(refused());
     }
-    let reply = exchange(Request::PiConsume { reference, scope }, until)?;
-    if reply.store.is_some() {
-        return Err(refused());
-    }
-    reply.pi.ok_or_else(refused)
+    pi_reply(
+        exchange(Request::PiConsume { reference, scope }, until)?,
+        scope,
+    )
 }
 pub(crate) fn pi_current(
     reference: &str,
@@ -319,11 +332,10 @@ pub(crate) fn pi_current(
     if !super::hex(reference, 32) {
         return Err(refused());
     }
-    let reply = exchange(Request::PiCurrent { reference, scope }, until)?;
-    if reply.store.is_some() {
-        return Err(refused());
-    }
-    reply.pi.ok_or_else(refused)
+    pi_reply(
+        exchange(Request::PiCurrent { reference, scope }, until)?,
+        scope,
+    )
 }
 pub(super) fn enter(deadline: Deadline) -> Result<()> {
     let frame = context::runtime_wire(|channel| channel.receive())?;

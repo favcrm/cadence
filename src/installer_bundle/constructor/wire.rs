@@ -76,8 +76,6 @@ impl Release {
     deny_unknown_fields
 )]
 pub(super) enum ChildRequest {
-    Custody,
-    OwnerRequest { kind: Kind, binding_json: String },
     Install { frame: String },
     Ack { frame: String },
     Ready,
@@ -86,7 +84,6 @@ pub(super) enum ChildRequest {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub(super) enum ChildReply {
-    CustodyCurrent,
     Release { frame: String },
     Install { frame: String },
     Installed { frame: String },

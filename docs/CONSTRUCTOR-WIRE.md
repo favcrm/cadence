@@ -44,6 +44,8 @@ UID0 parent's executable through cross-UID procfs; no such access or forged
 parent JSON is assumed. Their FD3 peer credentials authenticate transport only,
 not executable custody. Children independently verify the signed format and
 full binding, but cannot consume, enroll, sign, launch Pi or mint authority.
+The child request enum has only Install/Ack/Ready/Complete; no child custody or
+owner-RPC selector is accepted.
 
 ## Framing and bounds
 
@@ -134,6 +136,11 @@ checks PREPARED before releasing the child transport barrier, checks current
 and held-process custody before/after each child handoff, consumes once, checks
 fresh consumed-current, and then completes both finite child ACK handoffs with
 fresh current rechecks. The expected owner stamp cannot change across awaits.
+The successful actual core returns a non-Clone, privately constructed
+`ConstructorConsumption` retaining its real root/child proof. Root's ACK writer
+consumes and rechecks this opaque result; neither an attempted-consume flag nor
+an echoed child ACK can call that writer or manufacture the result. This token
+is not runtime, Pi, Store or retirement authority.
 Only then it emits
 `{version:1,type:"ack",operation,barrierNonce,recipientGeneration}`. The platform
 also requires consumed-current after ACK. This is consumption-only evidence,

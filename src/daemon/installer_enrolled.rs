@@ -681,7 +681,23 @@ pub(crate) fn verify_constructor_format(
 /// from OWNED root construction, never caller fields/remote prctl diagnostics.
 /// PREPARED is checked before the withheld child handoff; the same existing
 /// consume core enforces ABA/current/expiry and ACK loss stays UNKNOWN.
-pub(crate) fn consume_constructor_frame(frame: &[u8], until: Instant) -> Result<()> {
+/// Non-Clone completion of the actual root operation. Only the real core
+/// below creates it, AFTER authentic consume/current and child handoffs. It
+/// cannot be reconstructed from an ACK, child JSON, UID or peer PID; it grants
+/// neither runtime lifetime nor Pi/Store authority nor physical retirement.
+pub(crate) struct ConstructorConsumption {
+    proof: installer_bundle::constructor::Proof,
+    until: Instant,
+}
+impl ConstructorConsumption {
+    pub(crate) fn recheck(self) -> Result<()> {
+        self.proof.recheck(self.until)
+    }
+}
+pub(crate) fn consume_constructor_frame(
+    frame: &[u8],
+    until: Instant,
+) -> Result<ConstructorConsumption> {
     let mut clock = RequestClock::new(until)?;
     let authority = production_release_authority()?;
     authority.custody.require_local_principal(until)?;
@@ -735,7 +751,10 @@ pub(crate) fn consume_constructor_frame(frame: &[u8], until: Instant) -> Result<
         authority.custody.recheck(&seen, until)
     })?;
     clock.valid(&verified)?;
-    authority.custody.recheck(&seen, until)
+    authority.custody.recheck(&seen, until)?;
+    let proof = installer_bundle::constructor::proof()?;
+    proof.recheck(until)?;
+    Ok(ConstructorConsumption { proof, until })
 }
 
 /// Actual private production release path, usable by independent guard without
