@@ -135,8 +135,41 @@ impl Workspace {
         }
     }
 
+    /// The bundle as the board's `{files}` wire map — every source file
+    /// as a `{path: utf8-text}` entry, the exact shape
+    /// `workspace_upload` stages and `UpgradeWire`'s `FilesMap` decodes
+    /// (duplicate-rejecting, before one byte touches the filesystem).
+    fn files_body(&self) -> Value {
+        let source = self.source();
+        let mut files = serde_json::Map::new();
+        for name in [
+            "app.md",
+            "workflows/blog-post.md",
+            "rubrics/blog.md",
+            "templates/brief.md",
+            "templates/post.md",
+            "views/app-views-v1.json",
+        ] {
+            if let Ok(text) = std::fs::read_to_string(source.join(name)) {
+                files.insert(name.to_string(), json!(text));
+            }
+        }
+        json!({"files": Value::Object(files)})
+    }
+
+    /// `files_body` with the descriptor entry re-keyed to `bad` — the
+    /// map a refused upload carries.
+    fn files_body_rekeyed(&self, bad: &str) -> Value {
+        let mut files = self.files_body()["files"].as_object().unwrap().clone();
+        let text = files
+            .remove("views/app-views-v1.json")
+            .expect("descriptor entry in the files map");
+        files.insert(bad.to_string(), text);
+        json!({"files": Value::Object(files)})
+    }
+
     /// `needs.views.contract: app-views/v1` declared on the bundle's
-    /// `app.md` — the manifest edit every declared-descriptor case makes.
+    /// `app.md` — the manifest edit every declared-descriptor case makes.,
     fn declare_views(&self) {
         let manifest = self.source().join("app.md");
         let text = std::fs::read_to_string(&manifest).unwrap();
@@ -367,6 +400,34 @@ fn get_as(
     let request = format!(
         "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
          Origin: http://{host}\r\nSec-Fetch-Site: same-origin\r\n{seam}{session_headers}\r\n"
+    );
+    raw(port, &request)
+}
+
+/// A POST on `path` over the board on `port`, asserted as `who` through
+/// the seam headers and carrying a JSON body plus an optional operator
+/// `(cookie, key)` session. Answers `(status, head, body)`.
+fn post_as(
+    state: &std::path::Path,
+    port: u16,
+    who: &str,
+    session: Option<(&str, &str)>,
+    path: &str,
+    body: &Value,
+) -> (u16, String, String) {
+    let host = format!("cadence-{port}.localhost:{port}");
+    let token = Seam::token_at(state).unwrap();
+    let session_headers = match session {
+        Some((cookie, key)) => format!("Cookie: {cookie}\r\nX-Cadence-Session: {key}\r\n"),
+        None => String::new(),
+    };
+    let body_text = body.to_string();
+    let request = format!(
+        "POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+         X-Cadence-Board: 1\r\nOrigin: http://{host}\r\nSec-Fetch-Site: same-origin\r\n\
+         {AS_HEADER}: {who}\r\n{TOKEN_HEADER}: {token}\r\n{session_headers}\
+         Content-Length: {}\r\n\r\n{body_text}",
+        body_text.len()
     );
     raw(port, &request)
 }
@@ -750,4 +811,140 @@ fn cad864_descriptor_read_stays_operator_only_and_installation_bound() {
         &format!("/api/app-installations/{fake}"),
     );
     assert!(code >= 400, "unknown installation read served: {code}");
+}
+
+/// The board's `{files}` transports carry the descriptor over the SAME
+/// bundle the CLI path-source install admits: `POST
+/// /api/app-installations/upload` (CAD-996) and files-mode `POST
+/// /api/app-installations/<id>/upgrade` (CAD-1006) both run every
+/// bundle path through the one `upload_path_ok` grammar before a byte
+/// is staged, so `views/app-views-v1.json` — the exact entry
+/// `app_view::FILE` names — must be on it. A `views/` entry under any
+/// other leaf, a nested dir, or a traversal key refuses at that gate
+/// before staging: 400, HEAD unmoved, no `.apps/` and no install
+/// mutation. Independent of the CLI acceptance: this drives the real
+/// HTTP routes, not `app_workspace_install` with a path source.
+#[test]
+fn cad864_board_files_transports_admit_the_descriptor() {
+    let w = Workspace::new();
+    w.write_descriptor(&Workspace::descriptor_text(), true);
+    let lease = test_port();
+    let port = lease.port;
+    let stop = Arc::new(AtomicBool::new(false));
+    let board = board_on(&w.state, &w.pm.dir, port, &stop);
+    struct Cleanup(
+        Arc<AtomicBool>,
+        Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
+    );
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.store(true, SeqCst);
+            if let Some(board) = self.1.take() {
+                let _ = board.join();
+            }
+        }
+    }
+    let _cleanup = Cleanup(stop, Some(board));
+    let (cookie, key) = sign_in(&w.state, port);
+    let session = Some((cookie.as_str(), key.as_str()));
+
+    // Bad cases first, on a clean tracker: a `views/` entry under a
+    // wrong leaf, a traversal key and a nested dir refuse at the path
+    // grammar — before staging, so no install mutation of any kind.
+    let head = w.head();
+    for (label, bad) in [
+        ("wrong views leaf", "views/app-views-v2.json"),
+        ("traversal under views/", "views/../app.md"),
+        ("nested views dir", "views/sub/app-views-v1.json"),
+    ] {
+        let (status, _, body) = post_as(
+            &w.state,
+            port,
+            "operator",
+            session,
+            "/api/app-installations/upload",
+            &w.files_body_rekeyed(bad),
+        );
+        assert_eq!(status, 400, "{label} upload admitted: {body}");
+        assert_eq!(w.head(), head, "{label} upload moved HEAD");
+        assert!(
+            !w.pm.dir.join(".apps").exists(),
+            "{label} upload published install state"
+        );
+    }
+
+    // The good bundle: the descriptor at its exact path installs through
+    // the board upload, and the verified receipt serves it.
+    let (status, _, body) = post_as(
+        &w.state,
+        port,
+        "operator",
+        session,
+        "/api/app-installations/upload",
+        &w.files_body(),
+    );
+    assert_eq!(status, 200, "descriptor bundle upload: {body}");
+    let receipt: Value = serde_json::from_str(&body).unwrap();
+    let install_id = receipt["install_id"].as_str().unwrap().to_string();
+    let old_digest = receipt["digest"].as_str().unwrap().to_string();
+    let generation = receipt["catalog_generation"].as_str().unwrap().to_string();
+    let shown = w.show(&install_id);
+    assert_eq!(shown["view_descriptor"]["contract"], json!("app-views/v1"));
+    assert_eq!(shown["view_descriptor"]["app"], json!("blog-post"));
+    assert!(shown["files"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("views/app-views-v1.json")));
+
+    // Files-mode upgrade: one descriptor byte and the manifest version
+    // move the digest; `upgrade_check` (path source, already exact)
+    // names the proposal the files-mode upgrade must land.
+    let descriptor = w.source().join("views/app-views-v1.json");
+    let text = std::fs::read_to_string(&descriptor).unwrap();
+    std::fs::write(&descriptor, text.replace("\"Customers\"", "\"Clients\"")).unwrap();
+    let manifest = w.source().join("app.md");
+    let mtext = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(&manifest, mtext.replace("version: 0.1.0", "version: 0.2.0")).unwrap();
+    let proposed = w.upgrade_check(&receipt);
+    let new_digest = proposed["digest"].as_str().unwrap().to_string();
+    assert_ne!(new_digest, old_digest);
+
+    let upgrade_path = format!("/api/app-installations/{install_id}/upgrade");
+    // A files-mode upgrade carrying a path the grammar refuses — wrong
+    // views leaf, traversal — is refused before staging, and the
+    // installed digest does not move.
+    for (label, bad) in [
+        ("wrong views leaf", "views/app-views-v2.json"),
+        ("traversal under views/", "views/../app.md"),
+    ] {
+        let mut fields = w.files_body_rekeyed(bad);
+        fields["expected_digest"] = json!(old_digest);
+        fields["expected_generation"] = json!(generation);
+        fields["expected_new_digest"] = json!(new_digest);
+        fields["request_id"] = json!(format!("files-upgrade-bad-{label}"));
+        let (status, _, body) =
+            post_as(&w.state, port, "operator", session, &upgrade_path, &fields);
+        assert_eq!(status, 400, "{label} files-upgrade admitted: {body}");
+        assert_eq!(
+            w.show(&install_id)["digest"],
+            json!(old_digest),
+            "{label} files-upgrade moved the install"
+        );
+    }
+
+    // The good bundle upgrades over `{files}` — the staged descriptor
+    // passes the board grammar and the daemon's own re-validation.
+    let mut fields = w.files_body();
+    fields["expected_digest"] = json!(old_digest);
+    fields["expected_generation"] = json!(generation);
+    fields["expected_new_digest"] = json!(new_digest);
+    fields["request_id"] = json!("files-upgrade");
+    let (status, _, body) = post_as(&w.state, port, "operator", session, &upgrade_path, &fields);
+    assert_eq!(status, 200, "files-mode descriptor upgrade: {body}");
+    let upgraded: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(upgraded["digest"], json!(new_digest));
+    assert_eq!(
+        w.show(&install_id)["view_descriptor"]["views"][0]["title"],
+        json!("Clients")
+    );
 }
