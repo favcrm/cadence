@@ -45,6 +45,8 @@ for line in sys.stdin:
     if kind == "get_state":
         reply["data"] = {"sessionId": "s%d" % session, "thinkingLevel": "medium",
                          "model": {"provider": provider, "id": model_id}}
+    elif kind == "get_available_models":
+        reply["data"] = {"models": [{"provider": provider, "id": model_id}]}
     elif kind == "new_session":
         session += 1
         reply["data"] = {"sessionId": "s%d" % session}
