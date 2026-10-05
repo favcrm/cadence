@@ -351,7 +351,7 @@ fn rpc_create_params(installed: &Value, context: &str, input: Value) -> Value {
     json!({
         "install_id": installed["install_id"],
         "context_id": context,
-        "view_id": "customer-form",
+        "view_id": "customer-create-form",
         "action_id": "customer.create",
         "digest": installed["digest"],
         "view_descriptor_digest": installed["view_descriptor_digest"],
@@ -370,7 +370,7 @@ fn rpc_update_params(
     json!({
         "install_id": installed["install_id"],
         "context_id": context,
-        "view_id": "customer-form",
+        "view_id": "customer-edit-form",
         "action_id": "customer.update",
         "digest": installed["digest"],
         "view_descriptor_digest": installed["view_descriptor_digest"],
@@ -432,7 +432,7 @@ fn cad867_customer_actions_are_operator_only_pinned_and_cas_bound_on_both_peers(
     let context = w.context(install);
     w.plant_agent(AGENT);
     let create_path = format!(
-        "/api/app-installations/{install}/contexts/{context}/views/customer-form/actions/customer.create"
+        "/api/app-installations/{install}/contexts/{context}/views/customer-create-form/actions/customer.create"
     );
     let rpc_params = rpc_create_params(&installed, &context, create_input("RPC customer"));
 
@@ -552,7 +552,7 @@ fn cad867_customer_actions_are_operator_only_pinned_and_cas_bound_on_both_peers(
     );
 
     let update_path = format!(
-        "/api/app-installations/{install}/contexts/{context}/views/customer-form/actions/customer.update/records/{http_id}"
+        "/api/app-installations/{install}/contexts/{context}/views/customer-edit-form/actions/customer.update/records/{http_id}"
     );
     let update_body = http_body(&installed, json!({"display_name":"HTTP updated"}), Some(1));
     let (status, _, body) = post_as(

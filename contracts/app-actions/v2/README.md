@@ -8,12 +8,12 @@ adapter is deliberately closed to CRM customer create/update; it is not a
 generic action engine. V1 action metadata remains inert.
 
 An installed v2 action bundle must also declare and carry
-`app-views/v1` and `app-bindings/v1`. The action's `form_view` must select a
-form in that same descriptor, and its input fields must match the form's
-`previewOf` fields one-for-one (id, label, format, list kind and enum values).
-The v1 form preview itself remains disabled: the host draws a separate
-controller from the validated v2 action fields and never submits through the
-preview component.
+`app-views/v1` and `app-bindings/v1`. Each action's `form_view` must resolve to a form in that same descriptor,
+and its input fields must match that form's `previewOf` fields one-for-one
+(id, label, format, list kind and enum values).
+The v1 form previews remain disabled: the host draws a separate controller
+from the validated v2 action fields and never submits through either preview
+component.
 
 ## Files
 
@@ -26,11 +26,13 @@ preview component.
 
 The descriptor must contain exactly these actions:
 
-- `customer.create` / `record.create` / `customer-form`
-- `customer.update` / `record.update` / `customer-form`
+- `customer.create` / `record.create` / a declared form view
+- `customer.update` / `record.update` / a declared form view
 
-Both declarations intentionally pair with the same inert v1 preview; the
-host draws separate create and edit forms from the explicit action id.
+The CRM example pairs create and update with separate inert v1 previews.
+The reference is descriptor-declared, not restricted to fixed form IDs; the
+host draws its create/edit controller only after validating that exact form's
+field shape against the action.
 
 Both use these host-owned customer fields, in order:
 
@@ -54,7 +56,7 @@ values, 64 KiB serialized JSON, 4096 nodes, nesting depth 24) and adds only
 `form_view` and `nullable`. `nullable: true` is valid only on an optional text
 field. `maxLength` is supported only on text/tags; `maxItems` only on tags.
 The installed CRM adapter further rejects unsupported action IDs, records,
-forms, field shapes and mismatched preview fields.
+undeclared or non-form references, field shapes and mismatched preview fields.
 
 ## Trusted write wire
 
@@ -69,7 +71,7 @@ RPC method: `app_view_action`.
 Create:
 
 ```http
-POST /api/app-installations/{install}/contexts/{context}/views/customer-form/actions/customer.create
+POST /api/app-installations/{install}/contexts/{context}/views/customer-create-form/actions/customer.create
 Content-Type: application/json
 
 {"digest":"sha256:<bundle>","descriptor":"sha256:<view>","binding":"sha256:<binding>","input":{"display_name":"Ada"}}
@@ -78,7 +80,7 @@ Content-Type: application/json
 Update:
 
 ```http
-POST /api/app-installations/{install}/contexts/{context}/views/customer-form/actions/customer.update/records/{record}
+POST /api/app-installations/{install}/contexts/{context}/views/customer-edit-form/actions/customer.update/records/{record}
 Content-Type: application/json
 
 {"digest":"sha256:<bundle>","descriptor":"sha256:<view>","binding":"sha256:<binding>","expected_revision":7,"input":{"display_name":"Ada","email":null,"tags":[]}}

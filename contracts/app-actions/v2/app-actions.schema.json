@@ -125,7 +125,7 @@
         "form_view": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9_-]{0,63}$",
-          "description": "An app-views/v1 form preview id from the same bundle; selecting it never activates the preview renderer."
+          "description": "The ID of any form view declared by the paired app-views/v1 descriptor; no host form-name allowlist applies, and selecting the preview never activates its renderer."
         },
         "input": { "$ref": "#/$defs/input" }
       }

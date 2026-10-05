@@ -42,6 +42,15 @@ fn segment(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
+fn view_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && matches!(value.as_bytes().first(), Some(first) if first.is_ascii_lowercase())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
 fn action_id(value: &str) -> bool {
     let mut segments = value.split('.');
     let mut count = 0usize;
@@ -70,7 +79,7 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         || contexts != "contexts"
         || !segment(context)
         || views != "views"
-        || view != "customer-form"
+        || !view_id(view)
         || actions != "actions"
         || !action_id(action)
     {
@@ -235,15 +244,19 @@ mod tests {
     #[test]
     fn action_routes_are_exact_and_dotted_ids_are_bounded() {
         assert!(matches!(
-            route("/api/app-installations/install-a/contexts/context-a/views/customer-form/actions/customer.create"),
-            Some(Route::Create { install: "install-a", context: "context-a", view: "customer-form", action: "customer.create" })
+            route("/api/app-installations/install-a/contexts/context-a/views/customer-create-form/actions/customer.create"),
+            Some(Route::Create { install: "install-a", context: "context-a", view: "customer-create-form", action: "customer.create" })
         ));
         assert!(matches!(
-            route("/api/app-installations/install-a/contexts/context-a/views/customer-form/actions/customer.update/records/cust-0123456789abcdef0123456789abcdef"),
+            route("/api/app-installations/install-a/contexts/context-a/views/customer-edit-form/actions/customer.update/records/cust-0123456789abcdef0123456789abcdef"),
             Some(Route::Update { action: "customer.update", record: "cust-0123456789abcdef0123456789abcdef", .. })
         ));
         assert!(route("/api/app-installations/install-a/contexts/context-a/views/form/actions/customer.create/records/id/extra").is_none());
-        assert!(route("/api/app-installations/install-a/contexts/context-a/views/customer-create-form/actions/customer.create").is_none());
+        assert!(matches!(
+            route("/api/app-installations/install-a/contexts/context-a/views/custom_form/actions/customer.create"),
+            Some(Route::Create { view: "custom_form", .. })
+        ));
+        assert!(route("/api/app-installations/install-a/contexts/context-a/views/Customer-form/actions/customer.create").is_none());
         assert!(route("/api/app-installations/install-a/contexts/context-a/views/customer-form/actions/customer.delete").is_none());
         assert!(route("/api/app-installations/install-a/contexts/context-a/views/customer-form/actions/customer.create/records/cust-a").is_none());
         assert!(route("/api/app-installations/install-a/contexts/context-a/views/customer-form/actions/customer.update").is_none());

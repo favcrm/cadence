@@ -60,7 +60,7 @@ async function main() {
     "the explicit action companion parses only with its paired installed view receipt");
   const create = resolveLiveAction(receipt, "customer.create", null);
   assert(create.ok && create.route.operation === "create", "customer.create resolves to a host create route");
-  equal(create.route.action.form_view, "customer-form", "create selects its paired inert preview");
+  equal(create.route.action.form_view, "customer-create-form", "create selects its paired inert preview");
   const update = resolveLiveAction(receipt, "customer.update", "cust-0123456789abcdef0123456789abcdef");
   assert(update.ok && update.route.operation === "update" && update.route.detailRoute !== null,
     "customer.update resolves through the unique bound customer detail");
@@ -70,7 +70,7 @@ async function main() {
     "unknown action ids refuse");
   assert(!resolveLiveAction(receipt, "customer.create", null, true).ok,
     "an action selector cannot override a simultaneous live view selector");
-  assert(!resolveLiveView(receipt, "customer-form", null).ok,
+  assert(!resolveLiveView(receipt, "customer-create-form", null).ok,
     "v1 form previews remain inert after the v2 companion is installed");
   const missingActionFile = installedViewReceipt(makeInstallation({ files: [
     "views/app-views-v1.json", "bindings/app-bindings-v1.json",
@@ -80,6 +80,22 @@ async function main() {
     action_descriptor: { ...actionRaw, app: "social-content" },
   }));
   assert(wrongActionApp?.error !== null, "action app identity must match the paired view and binding");
+  const customFormDescriptor = JSON.parse(JSON.stringify(appViewExamples.crm.descriptor)) as {
+    views: { id: string }[];
+  };
+  customFormDescriptor.views[2].id = "signup_form";
+  customFormDescriptor.views[3].id = "profile_editor";
+  const customFormActions = structuredClone(actionRaw) as {
+    actions: { form_view: string }[];
+  };
+  customFormActions.actions[0].form_view = "signup_form";
+  customFormActions.actions[1].form_view = "profile_editor";
+  const descriptorDeclaredForms = installedViewReceipt(makeInstallation({
+    view_descriptor: customFormDescriptor,
+    action_descriptor: customFormActions,
+  }));
+  assert(descriptorDeclaredForms?.error === null,
+    "action form references resolve by descriptor ID rather than a host form-name allowlist");
 
   const { Window } = require("happy-dom");
   const win = new Window({ url: "http://localhost/app-installations/install-1?ctx=context-1&action=customer.create" });
@@ -169,7 +185,7 @@ async function main() {
   const createRequest = requests[0];
   equal(createRequest.method, "POST", "create uses a write request");
   equal(createRequest.url.pathname,
-    "/api/app-installations/install-1/contexts/context-1/views/customer-form/actions/customer.create",
+    "/api/app-installations/install-1/contexts/context-1/views/customer-create-form/actions/customer.create",
     "create URL carries the verified installation/context/form/action route");
   assert(createRequest.body !== null, "create has a JSON body");
   equal(Object.keys(createRequest.body!).sort(), ["binding", "descriptor", "digest", "input"],
@@ -205,7 +221,7 @@ async function main() {
   const updateRequest = requests[2];
   equal(updateRequest.method, "POST", "edit uses a write request");
   equal(updateRequest.url.pathname,
-    `/api/app-installations/install-1/contexts/context-1/views/customer-form/actions/customer.update/records/${recordId}`,
+    `/api/app-installations/install-1/contexts/context-1/views/customer-edit-form/actions/customer.update/records/${recordId}`,
     "update URL carries the record identity only in the route");
   equal(Object.keys(updateRequest.body!).sort(), ["binding", "descriptor", "digest", "expected_revision", "input"],
     "update adds only the host-owned expected revision to the create body shape");

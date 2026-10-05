@@ -118,7 +118,8 @@ async function main() {
   const detailResult = resolveLiveView(receipt, "customer-detail", "customer-1");
   assert(detailResult.ok, "a safe customer detail route resolves");
   equal(detailResult.route.op, "show", "detail route derives the show op");
-  assert(!resolveLiveView(receipt, "customer-form", null).ok, "forms never resolve to live reads");
+  assert(!resolveLiveView(receipt, "customer-create-form", null).ok, "forms never resolve to live reads");
+  assert(!resolveLiveView(receipt, "customer-edit-form", null).ok, "edit previews remain inert live-read routes");
   assert(!resolveLiveView(receipt, "undeclared-view", null).ok, "unknown route ids refuse");
   assert(!resolveLiveView(receipt, "customer-detail", "not/a/record").ok, "unsafe detail ids refuse");
   assert(!resolveLiveView(descriptorOnly, "customers", null).ok, "a descriptor without a binding cannot read live data");

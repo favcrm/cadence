@@ -17,7 +17,7 @@ receipt; full package/UI/actions acceptance remains open.
 | File | What it is |
 |---|---|
 | `app-view.schema.json` | JSON Schema (draft 2020-12) for one descriptor: `{contract, app, title, summary?, views[]}`. `contract` is exactly `"app-views/v1"`. |
-| `examples/crm.json` | The CRM worked example — customers table, customer detail, disabled customer-form preview. Mirrors `ui/.../app-views/examples.ts`. |
+| `examples/crm.json` | The CRM worked example — customers table/detail and separate disabled create/edit form previews. Mirrors `ui/.../app-views/examples.ts`. |
 | `examples/social-content.json` | The Social Content worked example — metadata table/detail plus a disabled caption-form preview. Synthetic preview fixtures may include extra fields; the live binding exposes only its closed metadata projection. |
 
 ## What a descriptor is

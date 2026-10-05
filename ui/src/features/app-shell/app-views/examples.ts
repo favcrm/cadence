@@ -8,7 +8,7 @@ const crmDescriptorJson = {
   contract: "app-views/v1",
   app: "crm",
   title: "CRM — customers overview",
-  summary: "Data-only customers table, customer detail, and disabled customer-form preview.",
+  summary: "Data-only customers table/detail plus disabled create and edit form previews.",
   views: [
     {
       id: "customers",
@@ -52,8 +52,20 @@ const crmDescriptorJson = {
       ],
     },
     {
-      id: "customer-form",
-      title: "Customer form (preview)",
+      id: "customer-create-form",
+      title: "New customer (preview)",
+      kind: "form",
+      previewOf: [
+        { id: "display_name", label: "Display name", format: "text" },
+        { id: "email", label: "Email", format: "text" },
+        { id: "phone", label: "Phone", format: "text" },
+        { id: "source", label: "Source", format: "text" },
+        { id: "tags", label: "Tags", format: "tags", kind: "list" },
+      ],
+    },
+    {
+      id: "customer-edit-form",
+      title: "Edit customer (preview)",
       kind: "form",
       previewOf: [
         { id: "display_name", label: "Display name", format: "text" },

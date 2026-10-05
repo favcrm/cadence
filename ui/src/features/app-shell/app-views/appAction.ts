@@ -205,16 +205,16 @@ function validateAdapter(descriptor: AppActionDescriptorV2, views: AppViewDescri
     fail("$.app", "the first live adapter requires a paired crm action/view/binding receipt");
   }
   if (descriptor.actions.length !== 2) fail("$.actions", "the CRM adapter requires exactly customer.create and customer.update");
-  const expected = new Map<string, { operation: AppActionV2["operation"]; form: string }>([
-    ["customer.create", { operation: "record.create", form: "customer-form" }],
-    ["customer.update", { operation: "record.update", form: "customer-form" }],
+  const expected = new Map<string, AppActionV2["operation"]>([
+    ["customer.create", "record.create"],
+    ["customer.update", "record.update"],
   ]);
   const actions = new Set<string>();
   let pair: ReturnType<typeof customerBindingPair> | null = null;
   for (const action of descriptor.actions) {
-    const required = expected.get(action.id);
-    if (!required || action.operation !== required.operation || action.record !== "customer" || action.form_view !== required.form) {
-      fail("$.actions", `unsupported CRM action/form pairing: ${action.id}`);
+    const requiredOperation = expected.get(action.id);
+    if (!requiredOperation || action.operation !== requiredOperation || action.record !== "customer") {
+      fail("$.actions", `unsupported CRM action or record: ${action.id}`);
     }
     if (actions.has(action.id)) fail("$.actions", "duplicate action id");
     actions.add(action.id);

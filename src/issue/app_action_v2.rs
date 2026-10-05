@@ -409,8 +409,8 @@ fn preview_shape(field: &Field) -> (&str, &str) {
 }
 
 /// Validate the action, view and binding documents together. Only the two
-/// CRM customer actions, their shared inert customer-form preview, and the
-/// matching customers table/detail pair can use the first host adapter.
+/// CRM customer actions, their descriptor-declared inert form previews, and
+/// the matching customers table/detail pair can use the first host adapter.
 pub fn validate_against(
     descriptor: &Descriptor,
     manifest: &Manifest,
@@ -460,9 +460,9 @@ pub fn validate_against(
         if !action_ids.insert(action.id.as_str()) {
             return Err(fail("$.actions", "duplicate action id"));
         }
-        let (operation, form_id) = match action.id.as_str() {
-            "customer.create" => (app_action::Operation::RecordCreate, "customer-form"),
-            "customer.update" => (app_action::Operation::RecordUpdate, "customer-form"),
+        let operation = match action.id.as_str() {
+            "customer.create" => app_action::Operation::RecordCreate,
+            "customer.update" => app_action::Operation::RecordUpdate,
             _ => {
                 return Err(fail(
                     "$.actions",
@@ -470,13 +470,10 @@ pub fn validate_against(
                 ))
             }
         };
-        if action.operation != operation
-            || action.record != "customer"
-            || action.form_view != form_id
-        {
+        if action.operation != operation || action.record != "customer" {
             return Err(fail(
                 "$.actions",
-                format!("{} has an unsupported operation, record or form", action.id),
+                format!("{} has an unsupported operation or record", action.id),
             ));
         }
         if action.input.fields.len() != CUSTOMER_FIELDS.len()
@@ -678,12 +675,37 @@ mod tests {
         validate_against(&actions, &manifest, Some(&views), Some(&binding)).unwrap();
         assert_eq!(
             action(&actions, "customer.create").unwrap().form_view,
-            "customer-form"
+            "customer-create-form"
         );
         assert_eq!(
             action(&actions, "customer.update").unwrap().form_view,
-            "customer-form"
+            "customer-edit-form"
         );
+    }
+
+    #[test]
+    fn form_views_are_resolved_from_the_descriptor_not_a_host_name_allowlist() {
+        let mut actions_raw: Value = serde_json::from_str(include_str!(
+            "../../contracts/app-actions/v2/examples/crm.json"
+        ))
+        .unwrap();
+        actions_raw["actions"][0]["form_view"] = Value::String("signup_form".into());
+        actions_raw["actions"][1]["form_view"] = Value::String("profile_editor".into());
+        let actions = parse(&actions_raw).unwrap();
+
+        let mut views_raw: Value = serde_json::from_str(include_str!(
+            "../../contracts/app-views/v1/examples/crm.json"
+        ))
+        .unwrap();
+        views_raw["views"][2]["id"] = Value::String("signup_form".into());
+        views_raw["views"][3]["id"] = Value::String("profile_editor".into());
+        let views_text = serde_json::to_string(&views_raw).unwrap();
+        let views = app_view::parse_descriptor(&views_text).unwrap();
+        let binding = app_binding::parse_binding(include_str!(
+            "../../contracts/app-bindings/v1/examples/crm.json"
+        ))
+        .unwrap();
+        validate_against(&actions, &manifest(), Some(&views), Some(&binding)).unwrap();
     }
 
     #[test]
