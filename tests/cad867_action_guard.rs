@@ -49,6 +49,17 @@ struct Fixture {
     daemon: Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
 }
 
+struct CustomerSeed<'a> {
+    install: &'a str,
+    context: &'a str,
+    record_id: &'a str,
+    name: &'a str,
+    email: &'a str,
+    email_consent: &'a str,
+    sms_consent: Option<&'a str>,
+    provenance: Option<Value>,
+}
+
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::Builder::new()
@@ -140,36 +151,26 @@ impl Fixture {
             .to_string()
     }
 
-    fn create_customer(
-        &self,
-        install: &str,
-        context: &str,
-        record_id: &str,
-        name: &str,
-        email: &str,
-        email_consent: &str,
-        sms_consent: Option<&str>,
-        provenance: Option<Value>,
-    ) -> Value {
-        let mut consent = json!({"email": email_consent});
-        if let Some(sms) = sms_consent {
+    fn create_customer(&self, seed: CustomerSeed<'_>) -> Value {
+        let mut consent = json!({"email": seed.email_consent});
+        if let Some(sms) = seed.sms_consent {
             consent["sms"] = json!(sms);
         }
         let mut params = json!({
-            "install_id": install,
-            "context_id": context,
-            "record_id": record_id,
+            "install_id": seed.install,
+            "context_id": seed.context,
+            "record_id": seed.record_id,
             "profile": {
                 "schema": 1,
-                "display_name": name,
-                "email": email,
+                "display_name": seed.name,
+                "email": seed.email,
                 "phone": "+1 555 0134",
                 "tags": ["acceptance", "customer"],
                 "source": "acceptance",
                 "consent": consent
             }
         });
-        if let Some(provenance) = provenance {
+        if let Some(provenance) = seed.provenance {
             params["consent_provenance"] = provenance;
         }
         self.op("app_record_create", params)
@@ -632,28 +633,39 @@ fn assert_rpc_refused(
     );
 }
 
-fn assert_http_refused(
-    fixture: &Fixture,
+struct HttpRefusal<'a> {
     port: u16,
-    asserted: &str,
-    session: Option<&OperatorSession>,
-    path: &str,
-    body: &Value,
+    asserted: &'a str,
+    session: Option<&'a OperatorSession>,
+    path: &'a str,
+    body: &'a Value,
     expected_status: u16,
-    expected_body: &str,
-    scopes: &[(&str, &str)],
-    before: &Value,
-) {
-    let (status, _, response) = post_as(&fixture.state, port, asserted, session, path, body);
-    assert_eq!(status, expected_status, "HTTP refusal response: {response}");
+    expected_body: &'a str,
+    scopes: &'a [(&'a str, &'a str)],
+    before: &'a Value,
+}
+
+fn assert_http_refused(fixture: &Fixture, refusal: HttpRefusal<'_>) {
+    let (status, _, response) = post_as(
+        &fixture.state,
+        refusal.port,
+        refusal.asserted,
+        refusal.session,
+        refusal.path,
+        refusal.body,
+    );
+    assert_eq!(
+        status, refusal.expected_status,
+        "HTTP refusal response: {response}"
+    );
     assert!(
-        response.contains(expected_body),
+        response.contains(refusal.expected_body),
         "HTTP refused for an unexpected reason: {response}"
     );
     assert_no_private_markers(&response);
     assert_eq!(
-        snapshot(fixture, scopes),
-        *before,
+        snapshot(fixture, refusal.scopes),
+        *refusal.before,
         "refused HTTP action changed a record, revision, history or consent provenance"
     );
 }
@@ -786,16 +798,16 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
 
     // Seed a real customer with positive and negative consent plus its
     // method/note provenance; action updates must carry this profile forward.
-    let seeded = fixture.create_customer(
-        &install_a,
-        &context_a,
-        "cust-action-consent-seed",
-        CUSTOMER_CANARY,
-        CUSTOMER_EMAIL,
-        "granted",
-        Some("denied"),
-        Some(json!({"method":"web_form","note":"CAD867 consent seed"})),
-    );
+    let seeded = fixture.create_customer(CustomerSeed {
+        install: &install_a,
+        context: &context_a,
+        record_id: "cust-action-consent-seed",
+        name: CUSTOMER_CANARY,
+        email: CUSTOMER_EMAIL,
+        email_consent: "granted",
+        sms_consent: Some("denied"),
+        provenance: Some(json!({"method":"web_form","note":"CAD867 consent seed"})),
+    });
     let seed_id = seeded["record"]["id"].as_str().unwrap().to_string();
     let initial_record = seeded["record"].clone();
     assert_eq!(initial_record["profile"]["consent"]["email"], "granted");
@@ -806,30 +818,30 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
         .iter()
         .any(|entry| { entry["method"] == "web_form" && entry["note"] == "CAD867 consent seed" }));
 
-    let other_context_record = fixture.create_customer(
-        &install_a,
-        &context_a_other,
-        "cust-other-context",
-        "CAD867_OTHER_CONTEXT_CUSTOMER",
-        "cad867-other-context@example.invalid",
-        "unknown",
-        None,
-        None,
-    );
+    let other_context_record = fixture.create_customer(CustomerSeed {
+        install: &install_a,
+        context: &context_a_other,
+        record_id: "cust-other-context",
+        name: "CAD867_OTHER_CONTEXT_CUSTOMER",
+        email: "cad867-other-context@example.invalid",
+        email_consent: "unknown",
+        sms_consent: None,
+        provenance: None,
+    });
     let other_context_id = other_context_record["record"]["id"]
         .as_str()
         .unwrap()
         .to_string();
-    let foreign_b = fixture.create_customer(
-        &install_b,
-        &context_b,
-        "cust-foreign-install",
-        FOREIGN_CANARY,
-        FOREIGN_EMAIL,
-        "unknown",
-        None,
-        None,
-    );
+    let foreign_b = fixture.create_customer(CustomerSeed {
+        install: &install_b,
+        context: &context_b,
+        record_id: "cust-foreign-install",
+        name: FOREIGN_CANARY,
+        email: FOREIGN_EMAIL,
+        email_consent: "unknown",
+        sms_consent: None,
+        provenance: None,
+    });
     let foreign_b_id = foreign_b["record"]["id"].as_str().unwrap().to_string();
 
     let current_a = fixture.show(&install_a);
@@ -1186,19 +1198,21 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
     // its role comes from the fixture-only identity header, not the kernel.
     assert_http_refused(
         &fixture,
-        port,
-        &format!("agent:{AGENT}"),
-        None,
-        &update_path(&current_a, &context_a, &seed_id),
-        &action_http_body(
-            &current_a,
-            json!({"display_name":LEAK_ATTEMPT}),
-            Some(current_revision),
-        ),
-        403,
-        "operator_only",
-        &scopes,
-        &before_refusals,
+        HttpRefusal {
+            port,
+            asserted: &format!("agent:{AGENT}"),
+            session: None,
+            path: &update_path(&current_a, &context_a, &seed_id),
+            body: &action_http_body(
+                &current_a,
+                json!({"display_name":LEAK_ATTEMPT}),
+                Some(current_revision),
+            ),
+            expected_status: 403,
+            expected_body: "operator_only",
+            scopes: &scopes,
+            before: &before_refusals,
+        },
     );
     let mut detached_http = Command::new(std::env::current_exe().unwrap());
     detached_http
@@ -1259,15 +1273,17 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
         body[http_key] = old_a[pin].clone();
         assert_http_refused(
             &fixture,
-            port,
-            "operator",
-            Some(&session),
-            &crm_create_path,
-            &body,
-            400,
-            "app view action refused or unavailable",
-            &scopes,
-            &before_refusals,
+            HttpRefusal {
+                port,
+                asserted: "operator",
+                session: Some(&session),
+                path: &crm_create_path,
+                body: &body,
+                expected_status: 400,
+                expected_body: "app view action refused or unavailable",
+                scopes: &scopes,
+                before: &before_refusals,
+            },
         );
     }
 
@@ -1283,15 +1299,17 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
     );
     assert_http_refused(
         &fixture,
-        port,
-        "operator",
-        Some(&session),
-        &create_path(&current_b, &context_b),
-        &action_http_body(&current_b, create_input(LEAK_ATTEMPT), None),
-        400,
-        "app view action refused or unavailable",
-        &scopes,
-        &before_refusals,
+        HttpRefusal {
+            port,
+            asserted: "operator",
+            session: Some(&session),
+            path: &create_path(&current_b, &context_b),
+            body: &action_http_body(&current_b, create_input(LEAK_ATTEMPT), None),
+            expected_status: 400,
+            expected_body: "app view action refused or unavailable",
+            scopes: &scopes,
+            before: &before_refusals,
+        },
     );
 
     // Replay B's authentic three pins against A, and A's against B. The
@@ -1326,15 +1344,17 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
     b_receipt_http_on_a["binding"] = current_b["view_binding_digest"].clone();
     assert_http_refused(
         &fixture,
-        port,
-        "operator",
-        Some(&session),
-        &crm_create_path,
-        &b_receipt_http_on_a,
-        400,
-        "app view action refused or unavailable",
-        &scopes,
-        &before_refusals,
+        HttpRefusal {
+            port,
+            asserted: "operator",
+            session: Some(&session),
+            path: &crm_create_path,
+            body: &b_receipt_http_on_a,
+            expected_status: 400,
+            expected_body: "app view action refused or unavailable",
+            scopes: &scopes,
+            before: &before_refusals,
+        },
     );
     let mut a_receipt_http_on_b = action_http_body(&current_b, create_input(LEAK_ATTEMPT), None);
     a_receipt_http_on_b["digest"] = current_a["digest"].clone();
@@ -1342,15 +1362,17 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
     a_receipt_http_on_b["binding"] = current_a["view_binding_digest"].clone();
     assert_http_refused(
         &fixture,
-        port,
-        "operator",
-        Some(&session),
-        &create_path(&current_b, &context_b),
-        &a_receipt_http_on_b,
-        400,
-        "app view action refused or unavailable",
-        &scopes,
-        &before_refusals,
+        HttpRefusal {
+            port,
+            asserted: "operator",
+            session: Some(&session),
+            path: &create_path(&current_b, &context_b),
+            body: &a_receipt_http_on_b,
+            expected_status: 400,
+            expected_body: "app view action refused or unavailable",
+            scopes: &scopes,
+            before: &before_refusals,
+        },
     );
 
     // A real B context under A's install is not an A context. A's current
@@ -1369,15 +1391,17 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
     let foreign_context_http_path = create_path(&current_a, &context_b);
     assert_http_refused(
         &fixture,
-        port,
-        "operator",
-        Some(&session),
-        &foreign_context_http_path,
-        &action_http_body(&current_a, create_input(LEAK_ATTEMPT), None),
-        400,
-        "app view action refused or unavailable",
-        &scopes,
-        &before_refusals,
+        HttpRefusal {
+            port,
+            asserted: "operator",
+            session: Some(&session),
+            path: &foreign_context_http_path,
+            body: &action_http_body(&current_a, create_input(LEAK_ATTEMPT), None),
+            expected_status: 400,
+            expected_body: "app view action refused or unavailable",
+            scopes: &scopes,
+            before: &before_refusals,
+        },
     );
 
     // Both a record in A's other real context and B's actual customer are
@@ -1399,15 +1423,17 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
         );
         assert_http_refused(
             &fixture,
-            port,
-            "operator",
-            Some(&session),
-            &update_path(&current_a, &context_a, foreign_record),
-            &action_http_body(&current_a, json!({"display_name":LEAK_ATTEMPT}), Some(1)),
-            400,
-            "app view action refused or unavailable",
-            &scopes,
-            &before_refusals,
+            HttpRefusal {
+                port,
+                asserted: "operator",
+                session: Some(&session),
+                path: &update_path(&current_a, &context_a, foreign_record),
+                body: &action_http_body(&current_a, json!({"display_name":LEAK_ATTEMPT}), Some(1)),
+                expected_status: 400,
+                expected_body: "app view action refused or unavailable",
+                scopes: &scopes,
+                before: &before_refusals,
+            },
         );
     }
 
@@ -1437,15 +1463,17 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
     );
     assert_http_refused(
         &fixture,
-        port,
-        "operator",
-        Some(&session),
-        &wrong_form_http_path,
-        &action_http_body(&current_a, create_input(LEAK_ATTEMPT), None),
-        400,
-        "app view action refused or unavailable",
-        &scopes,
-        &before_refusals,
+        HttpRefusal {
+            port,
+            asserted: "operator",
+            session: Some(&session),
+            path: &wrong_form_http_path,
+            body: &action_http_body(&current_a, create_input(LEAK_ATTEMPT), None),
+            expected_status: 400,
+            expected_body: "app view action refused or unavailable",
+            scopes: &scopes,
+            before: &before_refusals,
+        },
     );
     for (key, value) in [
         ("actor", json!("operator")),
@@ -1476,15 +1504,17 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
         body[key] = value;
         assert_http_refused(
             &fixture,
-            port,
-            "operator",
-            Some(&session),
-            &crm_create_path,
-            &body,
-            400,
-            "invalid app view action schema",
-            &scopes,
-            &before_refusals,
+            HttpRefusal {
+                port,
+                asserted: "operator",
+                session: Some(&session),
+                path: &crm_create_path,
+                body: &body,
+                expected_status: 400,
+                expected_body: "invalid app view action schema",
+                scopes: &scopes,
+                before: &before_refusals,
+            },
         );
     }
 
@@ -1509,15 +1539,17 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
         body["input"][key] = value;
         assert_http_refused(
             &fixture,
-            port,
-            "operator",
-            Some(&session),
-            &crm_create_path,
-            &body,
-            400,
-            "app view action refused or unavailable",
-            &scopes,
-            &before_refusals,
+            HttpRefusal {
+                port,
+                asserted: "operator",
+                session: Some(&session),
+                path: &crm_create_path,
+                body: &body,
+                expected_status: 400,
+                expected_body: "app view action refused or unavailable",
+                scopes: &scopes,
+                before: &before_refusals,
+            },
         );
     }
 
@@ -1540,19 +1572,21 @@ fn cad867_pinned_customer_actions_refuse_without_mutation_on_rpc_and_http() {
     );
     assert_http_refused(
         &fixture,
-        port,
-        "operator",
-        Some(&session),
-        &update_path(&current_a, &context_a, &seed_id),
-        &action_http_body(
-            &current_a,
-            json!({"display_name":LEAK_ATTEMPT}),
-            Some(stale_revision),
-        ),
-        400,
-        "app view action refused or unavailable",
-        &scopes,
-        &before_refusals,
+        HttpRefusal {
+            port,
+            asserted: "operator",
+            session: Some(&session),
+            path: &update_path(&current_a, &context_a, &seed_id),
+            body: &action_http_body(
+                &current_a,
+                json!({"display_name":LEAK_ATTEMPT}),
+                Some(stale_revision),
+            ),
+            expected_status: 400,
+            expected_body: "app view action refused or unavailable",
+            scopes: &scopes,
+            before: &before_refusals,
+        },
     );
 
     // Same host revision, one real RPC and one real HTTP request released by
