@@ -294,9 +294,56 @@ impl ProtectedTopology {
     fn verify_skeleton(&self) -> Result<()> {
         let nodes = self.node_table();
         for n in &nodes {
-            self.check_node(n)?;
+            if n.path == "/workspace/company/pm" {
+                // PM is mutable workspace DATA, never a protected executable,
+                // view ancestor or authority carrier. Keep its existing exact
+                // metadata check, relative to a verified held workspace leaf.
+                self.check_workspace_pm()?;
+            } else {
+                self.check_node(n)?;
+            }
         }
         Ok(())
+    }
+
+    fn check_workspace_pm(&self) -> Result<OwnedFd> {
+        let company = self.check_with(
+            "/workspace/company",
+            self.guest,
+            self.shared,
+            0o770,
+            true,
+            &self.skeleton_policy(),
+        )?;
+        #[cfg(target_os = "linux")]
+        {
+            let name = CString::new("pm").unwrap();
+            let fd = sys_openat2(
+                company.as_raw_fd(),
+                &name,
+                &OpenHow {
+                    flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                        as u64,
+                    mode: 0,
+                    resolve: RESOLVE | libc::RESOLVE_NO_XDEV,
+                },
+            )?;
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let meta = fd_metadata(&fd)?;
+            if !meta.is_dir()
+                || meta.uid() != self.guest
+                || meta.gid() != self.shared
+                || meta.mode() & 0o7777 != 0o770
+            {
+                return Err(Error::rejected("mutable PM data leaf metadata refused"));
+            }
+            Ok(fd)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = company;
+            Err(Error::rejected("protected managed-Pi launch is Linux-only"))
+        }
     }
 
     /// The static node table — every protected ancestor is listed so the
@@ -571,6 +618,19 @@ impl ProtectedTopology {
                 "protected managed-Pi launch is Linux-only (openat2 unavailable)",
             ))
         }
+    }
+
+    /// Root provisioner anchor. Exact protected metadata and every immutable
+    /// ancestor are still verified; this does not accept a caller-selected path.
+    pub(crate) fn view_anchor(&self) -> Result<OwnedFd> {
+        self.check_with(
+            "/srv/cadence/guest-views",
+            self.supervisor,
+            self.shared,
+            0o750,
+            true,
+            &self.skeleton_policy(),
+        )
     }
 
     /// Open the per-launch view dirfd for `layer` — verified, not created.

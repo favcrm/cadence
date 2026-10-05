@@ -1,8 +1,10 @@
 //! Private root-owner launch permits. Neither `Authorized` wire JSON nor a
-//! VerifiedGrant can construct this object. Origin is the real constructor's
-//! retained kernel custody plus its authenticated current-owner relay.
+//! VerifiedGrant can construct this object. Origin is the constructor's physical
+//! root custody, separately signed runtime lifetime and authentic external
+//! one-use Pi operation. This is NOT an owned-helper proof: kernel admission
+//! against the actual retained child remains the constructor dispatcher's job.
 use crate::error::{Error, Result};
-use crate::installer_bundle::constructor::{self, Proof};
+use crate::installer_bundle::constructor::{self, RuntimeProof};
 use crate::protected_pi_profile::authority::{self, Authorized, ImageProfile, Role, Selection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,6 +17,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 static PROFILE_MINTED: AtomicBool = AtomicBool::new(false);
+
+// Independently authored ticket acceptance; implementers own registration only.
+#[cfg(test)]
+mod acceptance;
+mod provision;
 
 const PROFILE: &str = "/opt/cadence/pi-profile.json";
 const POLICY: &str = "/opt/cadence/pi-policy.json";
@@ -42,16 +49,11 @@ struct Epoch {
     lineage: String,
     database_epoch: u64,
 }
-fn current(proof: &Proof, until: Instant) -> Result<Epoch> {
+fn current(proof: &RuntimeProof, until: Instant) -> Result<Epoch> {
     proof.recheck(until)?;
-    let response = constructor::owner_request(
-        constructor::Kind::ConsumedCurrent,
-        constructor::binding_json()?.as_bytes(),
-        until,
-    )?;
-    // owner_request validates exact parent operation, binding, lineage, phase,
-    // sequence and closure through the retained provider channel, never a file.
-    let current = response.current.ok_or_else(refuse)?;
+    // Runtime authority has its OWN signed lifetime. An enrollment receipt,
+    // completed construction or a fresh-looking local epoch cannot renew it.
+    let current = constructor::runtime_current(until)?;
     proof.recheck(until)?;
     Ok(Epoch {
         global: current.global,
@@ -138,14 +140,87 @@ fn read_elected<T: for<'a> Deserialize<'a> + Serialize>(
     }
     Ok(typed)
 }
+/// Finite Pi acquire/consume/current selector schema for the constructor's
+/// retained authenticated carrier. These public bytes NEVER mint a permit.
+/// Kernel-owned caller admission is separate and remains constructor-owned.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperationScope {
+    pub(crate) version: u32,
+    pub(crate) binding_json: String,
+    pub(crate) global: String,
+    pub(crate) company: String,
+    pub(crate) epoch: u64,
+    pub(crate) lineage: String,
+    pub(crate) database_epoch: u64,
+    pub(crate) alias: String,
+    pub(crate) selection: Selection,
+    pub(crate) helper_sha256: [u8; 32],
+    pub(crate) node_sha256: [u8; 32],
+    pub(crate) profile_sha256: [u8; 32],
+    pub(crate) policy_sha256: [u8; 32],
+}
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Outcome {
+    Issued,
+    Consumed,
+    Current,
+    Unknown,
+}
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OperationPhase {
+    Issued,
+    Consumed,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationReply {
+    version: u32,
+    reference: String,
+    scope: OperationScope,
+    outcome: Outcome,
+    phase: OperationPhase,
+}
+impl OperationReply {
+    fn read(value: serde_json::Value) -> Result<Self> {
+        serde_json::from_value(value).map_err(|_| refuse())
+    }
+    fn require(
+        &self,
+        scope: &OperationScope,
+        reference: Option<&str>,
+        outcome: Outcome,
+        phase: OperationPhase,
+    ) -> Result<()> {
+        if self.version != 1
+            || &self.scope != scope
+            || self.outcome != outcome
+            || self.phase != phase
+            || self.reference.len() != 32
+            || !self
+                .reference
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || !self.reference.bytes().any(|b| b != b'0')
+            || reference.is_some_and(|r| r != self.reference)
+        {
+            return Err(refuse());
+        }
+        Ok(())
+    }
+}
+
 /// Root-only factory input with independently authenticated image/policy and
-/// actual retained constructor proof. No caller supplies pins, a key, paths,
+/// separately authenticated runtime proof. No caller supplies pins, a key, paths,
 /// permit booleans, claimed process identity or owner snapshots to this factory.
 pub(crate) struct OwnerProfile {
-    proof: Proof,
+    proof: RuntimeProof,
     image: ImageProfile,
     policy: Policy,
-    until: Instant,
+    profile_sha256: [u8; 32],
+    policy_sha256: [u8; 32],
     generations: RefCell<std::collections::BTreeSet<(String, String)>>,
 }
 impl OwnerProfile {
@@ -154,7 +229,7 @@ impl OwnerProfile {
             return Err(refuse());
         }
         let until = until.min(Instant::now() + Duration::from_secs(authority::DEADLINE_SECS));
-        let proof = constructor::proof()?;
+        let proof = constructor::runtime_proof(until)?;
         proof.recheck(until)?;
         let binding: serde_json::Value =
             serde_json::from_str(constructor::binding_json()?).map_err(|_| refuse())?;
@@ -162,13 +237,15 @@ impl OwnerProfile {
             .get("challenge")
             .and_then(|v| v.get("pins"))
             .ok_or_else(refuse)?;
+        let profile_sha256 = pin(pins, "piGraph")?;
+        let policy_sha256 = pin(pins, "policy")?;
         let image: ImageProfile =
-            read_elected(PROFILE, pin(pins, "piGraph")?, authority::MAX_FRAME as u64)?;
+            read_elected(PROFILE, profile_sha256, authority::MAX_FRAME as u64)?;
         image.validate()?;
         if image.helper_sha256 != pin(pins, "helper")? || image.node_sha256 != pin(pins, "node")? {
             return Err(refuse());
         }
-        let policy: Policy = read_elected(POLICY, pin(pins, "policy")?, 65536)?;
+        let policy: Policy = read_elected(POLICY, policy_sha256, 65536)?;
         if policy.version != 1 || policy.routes.is_empty() || policy.routes.len() > 128 {
             return Err(refuse());
         }
@@ -204,7 +281,8 @@ impl OwnerProfile {
             proof,
             image,
             policy,
-            until,
+            profile_sha256,
+            policy_sha256,
             generations: RefCell::new(std::collections::BTreeSet::new()),
         })
     }
@@ -216,57 +294,97 @@ impl OwnerProfile {
             .iter()
             .find(|r| r.alias == alias)
             .ok_or_else(refuse)?;
-        if route.role != selection.role || !route.models.contains(&selection.model) {
+        if route.role != selection.role
+            || !route.models.contains(&selection.model)
+            || super::Segments::new(alias, &selection.generation)?.alias_hex()
+                != selection.alias_sha256
+        {
             return Err(refuse());
         }
-        let epoch = current(&self.proof, self.until)?;
-        let launch = Authorized {
+        let guest_gid = super::topology::resolve_primary_gid(super::acct::GUEST)?;
+        let shared_gid = super::topology::resolve_gid_pub(super::acct::SHARED_GROUP)?;
+        if guest_gid == 0 || shared_gid == 0 {
+            return Err(refuse());
+        }
+        // The issuer can outlive a launch's IO budget, but NOT the independently
+        // authenticated RuntimeProof. Each operation gets a fresh bounded IO
+        // window; this does not renew or extend external owner authority.
+        let until = Instant::now() + Duration::from_secs(authority::DEADLINE_SECS);
+        let epoch = current(&self.proof, until)?;
+        let scope = OperationScope {
             version: 1,
-            selection,
+            binding_json: constructor::binding_json()?.to_owned(),
+            global: epoch.global.clone(),
+            company: epoch.company.clone(),
+            epoch: epoch.epoch,
+            lineage: epoch.lineage.clone(),
+            database_epoch: epoch.database_epoch,
             alias: alias.to_owned(),
-            operation: uuid::Uuid::new_v4().simple().to_string(),
-            supervisor: authority::SUPERVISOR_UID,
-            guest: authority::GUEST_UID,
-            guest_gid: super::topology::resolve_primary_gid(super::acct::GUEST)?,
-            shared_gid: super::topology::resolve_gid_pub(super::acct::SHARED_GROUP)?,
-            image: self.image.clone(),
+            selection: selection.clone(),
+            helper_sha256: self.image.helper_sha256,
+            node_sha256: self.image.node_sha256,
+            profile_sha256: self.profile_sha256,
+            policy_sha256: self.policy_sha256,
         };
-        launch.validate(&launch.selection)?;
         // The factory enforces ONE OwnerProfile per constructor process.
         // Retired generations are never evicted: reopening an already issued
         // alias/generation is a replay, not fresh. Exhaustion refuses closed.
         let mut generations = self.generations.try_borrow_mut().map_err(|_| refuse())?;
         if generations.len() >= 4096
-            || !generations.insert((
-                launch.selection.alias_sha256.clone(),
-                launch.selection.generation.clone(),
-            ))
+            || !generations.insert((selection.alias_sha256.clone(), selection.generation.clone()))
         {
             return Err(refuse());
         }
+        drop(generations);
+        // Never retry this generation after a partial request or lost ACK.
+        // Only the actual external owner's durable one-use operation can issue
+        // the reference; local UUIDs/phase bits/current readbacks are not grants.
+        let response = constructor::pi_acquire(&scope, until)?;
+        let reply = OperationReply::read(response)?;
+        reply.require(&scope, None, Outcome::Issued, OperationPhase::Issued)?;
+        if current(&self.proof, until)? != epoch {
+            return Err(refuse());
+        }
+        let launch = Authorized {
+            version: 1,
+            selection,
+            alias: alias.to_owned(),
+            operation: reply.reference,
+            supervisor: authority::SUPERVISOR_UID,
+            guest: authority::GUEST_UID,
+            guest_gid,
+            shared_gid,
+            image: self.image.clone(),
+        };
+        launch.validate(&launch.selection)?;
         Ok(LaunchPermit {
             proof: self.proof.clone(),
             launch,
             epoch,
-            until: self.until,
+            scope,
+            until,
             phase: Cell::new(Phase::Prepared),
+            unknown: Cell::new(false),
         })
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Prepared,
+    Provisioned,
     Armed,
     Burned,
 }
 /// Non-Clone, private-origin, exact-scope, one-use permit. Serial root dispatch
 /// owns this object; JSON output is a description, not a reconstruction API.
 pub(crate) struct LaunchPermit {
-    proof: Proof,
+    proof: RuntimeProof,
     launch: Authorized,
     epoch: Epoch,
+    scope: OperationScope,
     until: Instant,
     phase: Cell<Phase>,
+    unknown: Cell<bool>,
 }
 /// Same production binding guard used by arm/consume. Expected values are the
 /// retained owner's permit, not echoed caller fields. Exposed within crate for
@@ -286,17 +404,67 @@ impl LaunchPermit {
     pub(crate) fn describe(&self) -> &Authorized {
         &self.launch
     }
-    pub(crate) fn recheck(&self) -> Result<()> {
-        if Instant::now() >= self.until || current(&self.proof, self.until)? != self.epoch {
+    fn request(&self, consume: bool) -> Result<()> {
+        if self.unknown.get() {
             return Err(refuse());
         }
-        Ok(())
+        let result = (|| {
+            if Instant::now() >= self.until || current(&self.proof, self.until)? != self.epoch {
+                return Err(refuse());
+            }
+            let response = if consume {
+                constructor::pi_consume(&self.launch.operation, &self.scope, self.until)?
+            } else {
+                constructor::pi_current(&self.launch.operation, &self.scope, self.until)?
+            };
+            let reply = OperationReply::read(response)?;
+            reply.require(
+                &self.scope,
+                Some(&self.launch.operation),
+                if consume {
+                    Outcome::Consumed
+                } else {
+                    Outcome::Current
+                },
+                if self.phase.get() == Phase::Burned {
+                    OperationPhase::Consumed
+                } else {
+                    OperationPhase::Issued
+                },
+            )?;
+            if current(&self.proof, self.until)? != self.epoch {
+                return Err(refuse());
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.unknown.set(true);
+        }
+        result
+    }
+    pub(crate) fn recheck(&self) -> Result<()> {
+        self.request(false)
+    }
+    /// Root dispatcher admits its OWN supervisor before issuing/provisioning.
+    /// Partial filesystem/current failures remain UNKNOWN, never repaired or
+    /// deleted here. The guest receives a description only after this succeeds.
+    pub(crate) fn provision(&self) -> Result<()> {
+        if self.phase.get() != Phase::Prepared || self.unknown.get() {
+            return Err(refuse());
+        }
+        let result = provision::create(self);
+        if result.is_err() {
+            self.unknown.set(true);
+        } else {
+            self.phase.set(Phase::Provisioned);
+        }
+        result
     }
     /// Root dispatcher must independently match the kernel caller against the
     /// retained own-created helper handle BEFORE invoking this scope transition.
     pub(crate) fn arm(&self, selection: &Selection) -> Result<()> {
         require_binding(&self.launch, selection, None)?;
-        if self.phase.get() != Phase::Prepared {
+        if self.phase.get() != Phase::Provisioned {
             return Err(refuse());
         }
         self.recheck()?;
@@ -310,6 +478,8 @@ impl LaunchPermit {
         if self.phase.replace(Phase::Burned) != Phase::Armed {
             return Err(refuse());
         }
-        self.recheck()
+        // Burned phase is only local replay protection, NEVER authority.
+        // Actual durable external consume/current must acknowledge this scope.
+        self.request(true)
     }
 }
