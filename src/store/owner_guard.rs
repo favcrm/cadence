@@ -7,7 +7,57 @@
 //! remain to be exercised once the constructor's real relay contract exists.
 use super::owner;
 use rusqlite::{params, Connection, TransactionBehavior};
+use std::cell::Cell;
 use std::path::Path;
+
+thread_local! {
+    static SQLITE_OPENS: Cell<u64> = const { Cell::new(0) };
+}
+
+// Observe real SQLite opens, never replace/deny them or inject Store authority.
+// Per-thread counts exclude unrelated CI tests. The real entrypoints below are
+// synchronous; no product hook, trusted boolean or caller signature is added.
+unsafe extern "C" fn observe_sqlite_open(
+    _db: *mut rusqlite::ffi::sqlite3,
+    _error: *mut *mut std::ffi::c_char,
+    _api: *const rusqlite::ffi::sqlite3_api_routines,
+) -> i32 {
+    let _ = SQLITE_OPENS.try_with(|count| count.set(count.get().saturating_add(1)));
+    rusqlite::ffi::SQLITE_OK
+}
+
+struct SqliteOpenProbe;
+impl SqliteOpenProbe {
+    fn new() -> Self {
+        // SAFETY: static C-ABI function, no borrowed callback state or pointer
+        // dereferences. It only observes; SQLITE_OK preserves normal opening.
+        assert_eq!(
+            unsafe { rusqlite::ffi::sqlite3_auto_extension(Some(observe_sqlite_open)) },
+            rusqlite::ffi::SQLITE_OK
+        );
+        Self
+    }
+    fn count(&self) -> u64 {
+        SQLITE_OPENS.with(Cell::get)
+    }
+}
+impl Drop for SqliteOpenProbe {
+    fn drop(&mut self) {
+        // SAFETY: unregister ONLY our static callback, even on assertion panic;
+        // never reset/delete somebody else's registered SQLite extensions.
+        unsafe { rusqlite::ffi::sqlite3_cancel_auto_extension(Some(observe_sqlite_open)) };
+    }
+}
+
+fn enclave_refused<T>(result: crate::error::Result<T>) {
+    match result {
+        Err(crate::Error::Rejected(message)) => assert_eq!(
+            message,
+            "raw/legacy writer refused in the protected Store enclave"
+        ),
+        _ => panic!("raw/Legacy opening did not reach the real enclave refusal"),
+    }
+}
 
 fn database_files(path: &Path) -> Vec<Option<Vec<u8>>> {
     ["", "-wal", "-shm", "-journal"]
@@ -152,6 +202,50 @@ fn store_owner_wrong_or_replaced_incarnation_refuses_without_mutation() {
         159,
         "path refusal changed business state"
     );
+
+    // Establish a real allowed outside-enclave baseline, including the public
+    // Legacy constructor, so unconditional refusal cannot masquerade as PASS.
+    // The observer must see actual SQLite opens before we trust its zero count.
+    let sql_opens = SqliteOpenProbe::new();
+    let before_raw_baseline = sql_opens.count();
+    super::preflight_writer_guard(&path).unwrap();
+    assert!(sql_opens.count() > before_raw_baseline);
+    let legacy_path = dir.path().join("allowed-legacy.sqlite3");
+    let before_legacy_baseline = sql_opens.count();
+    let legacy = super::Store::open(&legacy_path).unwrap();
+    assert!(sql_opens.count() > before_legacy_baseline);
+    drop(legacy);
+    let identity_files = database_files(&path);
+    let legacy_files = database_files(&legacy_path);
+
+    // These are reserved path SELECTORS, not seeded/live enclave fixtures.
+    // Never read/create an artifact in the real enclave. Actual raw preflight
+    // and public Store::open must return their specific policy refusal without
+    // opening SQLite, including the shadow cadence.sqlite3 spelling and child.
+    let fixed = Path::new(owner::DATABASE_PATH);
+    let enclave = fixed.parent().unwrap();
+    for requested in [
+        fixed.to_path_buf(),
+        enclave.join("cadence.sqlite3"),
+        enclave.join("unprovisioned").join("shadow.sqlite3"),
+    ] {
+        let before_refusal = sql_opens.count();
+        enclave_refused(super::preflight_writer_guard(&requested));
+        assert_eq!(
+            sql_opens.count(),
+            before_refusal,
+            "raw preflight opened SQLite before refusing the enclave"
+        );
+        enclave_refused(super::Store::open(&requested));
+        assert_eq!(
+            sql_opens.count(),
+            before_refusal,
+            "Legacy Store::open opened SQLite before refusing the enclave"
+        );
+        assert_eq!(database_files(&path), identity_files);
+        assert_eq!(database_files(&legacy_path), legacy_files);
+    }
+    drop(sql_opens);
 
     let mut wrong_database = binding.clone();
     wrong_database.database_id = "different-database".into();
