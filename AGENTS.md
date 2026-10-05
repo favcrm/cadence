@@ -21,7 +21,10 @@ that meets them, then stop. Refactors, new abstractions, adjacent fixes and
 nice-to-haves you notice go into a follow-up ticket, not this PR. Polish
 progressively: get the essential path working and reviewed first, improve
 it in later PRs. When two approaches both meet the ticket, pick the smaller
-one and say why in the PR.
+one and say why in the PR. Plan the same way: one ticket per feature, its
+acceptance covering the feature end to end. Split into more tickets only for
+another repository or an outcome the operator can use on its own, never a
+ticket per step.
 
 ### Before you start, and before every push
 - Run `git fetch origin`. Then run
@@ -408,6 +411,18 @@ mapping, process owner, permitted operations and rollback artifact.
 - A board or HTTP path must be at least as strict as the daemon RPC it
   relays, so run the same operator proof on the HTTP peer.
 - Restrict actors with allowlists, not denylists.
+
+### Finish: clean up as soon as the PR merges
+- Run `cadence issue reconcile --project <key>`. It marks the ticket done
+  from the merge evidence; if it reports the tracker write lock, run it
+  again.
+- Run `cadence issue finish <ID> --remote` to remove the worktree and both
+  branches. It refuses a worktree touched in the last 30 minutes; wait,
+  don't `--force`.
+- Delete your own scratch files by name and stop the servers and processes
+  you started.
+- A PR you abandon or replace: close it with a link to what replaces it and
+  say so on the ticket. Don't leave a conflicted PR idle.
 
 ### Reporting
 - Every lane ends with a six-field reflection (expected, evidence, cause,

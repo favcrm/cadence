@@ -113,8 +113,10 @@ What the ticket is about.
 ```
 
 Every ticket needs at least one acceptance item and should name its
-`agent:`. Keep tickets to one PR each. Tell the operator the epic id and
-ask for approval.
+`agent:`. Make one ticket per feature: its acceptance covers the feature
+end to end and it ships in one PR. Add tickets only for another
+repository or an outcome the operator can use on its own, never one per
+step. Tell the operator the epic id and ask for approval.
 
 Dispatch a ticket of an **approved** plan:
 
