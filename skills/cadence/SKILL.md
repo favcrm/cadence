@@ -394,7 +394,9 @@ Before dispatch or resuming changed scope:
   versions before using accepted lessons. Proposed, stale or contradicted
   lessons are hypotheses, not instructions. Record missing or conflicting
   evidence without borrowing another project's memory implicitly.
-- **Plan:** record the smallest useful increment, dependencies, touched areas,
+- **Plan:** record the feature's acceptance end to end as one increment (one
+  ticket, one PR; split only per repository or independently usable
+  outcome), dependencies, touched areas,
   one writer per area, reviewer/result route and proportionate validation.
   Include rollout/recovery and cleanup ownership when they are in scope. Link
   existing plans instead of copying them; revise the brief when scope changes.
@@ -432,6 +434,13 @@ During implementation and handoff:
   reviewed, merged, installed and operationally verified distinct. A moving
   head or changed integration tree needs evidence revalidation; passing CI
   does not itself authorize a merge, deployment, cleanup or message replay.
+
+When the increment merges, clean up before anything else: mark the ticket
+done with `cadence issue reconcile --project <key>` (say on the ticket why
+if it holds it), delete your scratch and stop the processes you started,
+and close any PR you abandoned with a link. Leave the worktree to a later
+reconcile sweep, which removes it once nothing stands in it; never
+`--force` `issue finish`.
 
 At a completed increment, QA revision, incident or repeated blocker, append a
 compact reflection to the existing task: **expected outcome; observed evidence;

@@ -8,6 +8,8 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    leaves main half-built.
    Essentials first: the simplest change that meets the acceptance items,
    extras to a follow-up ticket, polish in later PRs.
+   One ticket per feature too; when the PR merges the lane reconciles the
+   ticket and cleans up its scratch and processes.
 2. Put the design note in the PR description, not in a separate document.
 3. Run `scripts/pre-push` before every push (`--tests` before asking for
    review of Rust changes).
