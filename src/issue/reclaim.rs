@@ -191,9 +191,19 @@ fn git_path(dir: &Path, flag: &str) -> Option<PathBuf> {
 /// path — the recorded string is never trusted as a delete target.
 fn reclaim_target(lane: &Path, cargo_target: Option<&str>) -> Result<Option<PathBuf>> {
     let refuse = |why: String| Err(Error::rejected(format!("{}: {why}", lane.display())));
+    match std::fs::symlink_metadata(lane) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+        Ok(_) => return refuse("lane path is not a real directory".into()),
+        Err(e) => return refuse(format!("cannot inspect lane path ({e})")),
+    }
     let lane_c = lane
         .canonicalize()
         .map_err(|e| Error::rejected(format!("{}: cannot resolve ({e})", lane.display())))?;
+    if finish::lexical_path(lane) != lane_c {
+        return refuse(
+            "lane path traverses a symlink or differs from its canonical identity".into(),
+        );
+    }
     let root = crate::worktree::main_root(&lane_c)
         .map_err(|e| Error::rejected(format!("{}: no main root ({e})", lane.display())))?;
     let root_c = root.canonicalize().unwrap_or(root);
@@ -209,6 +219,18 @@ fn reclaim_target(lane: &Path, cargo_target: Option<&str>) -> Result<Option<Path
     let wt_parent = crate::worktree::layout::worktrees_dir(&root_c);
     if lane_c == wt_parent || !lane_c.starts_with(&wt_parent) {
         return refuse(format!("not under {}", wt_parent.display()));
+    }
+    let registered = finish::git(&root_c, &["worktree", "list", "--porcelain"]).map_err(|e| {
+        Error::rejected(format!(
+            "{}: cannot enumerate registered checkouts ({e})",
+            lane.display()
+        ))
+    })?;
+    if !registered
+        .lines()
+        .any(|line| line == format!("worktree {}", lane_c.display()))
+    {
+        return refuse("path is not a registered worktree of its claimed repo".into());
     }
     let target = lane_c.join("target");
     if let Some(ct) = cargo_target {
@@ -312,7 +334,18 @@ fn run_bounded(pm: &Pm, state_dir: &Path, actor: &str, idle_secs: u64) -> Result
     // `finish` guards; a candidate that fails them is `skipped`/`refused`,
     // never removed.
     match finish::sweep(pm, None, false, false, actor, state_dir) {
-        Ok(s) => out["swept"] = json!(s["rows"].as_array().map(|r| r.len()).unwrap_or(0)),
+        Ok(s) => {
+            let rows = s["rows"].as_array().cloned().unwrap_or_default();
+            out["swept"] = json!(rows.len());
+            for row in rows.into_iter().filter(|row| row["outcome"] == "refused") {
+                out["skipped"].as_array_mut().unwrap().push(json!({
+                    "issue": row["issue"],
+                    "lane": row["path"],
+                    "reason_code": "merged-checkout-refused",
+                    "reason": row["reason"],
+                }));
+            }
+        }
         Err(e) => {
             tracing::warn!(event = "reclaim_sweep_failed", error = e.to_string());
         }
@@ -326,25 +359,155 @@ fn run_bounded(pm: &Pm, state_dir: &Path, actor: &str, idle_secs: u64) -> Result
     for issue in issues {
         let id = issue.front.id.clone();
         for lane in crate::issue::start::open_worktrees(&issue.front) {
-            let res = reclaim_lane(&view, state_dir, pm, &issue, &lane, idle, actor);
+            let res = reclaim_lane_detailed(&view, state_dir, pm, &issue, &lane, idle, actor);
             match res {
-                Ok(Some(bytes)) => out["reclaimed"]
+                Ok(ReclaimAttempt::Reclaimed(bytes)) => out["reclaimed"]
                     .as_array_mut()
                     .unwrap()
                     .push(json!({"issue": id, "lane": lane, "bytes_freed": bytes})),
-                Ok(None) => {}
+                Ok(ReclaimAttempt::Absent) => {}
+                Ok(ReclaimAttempt::Skipped(reason)) => out["skipped"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"issue": id, "lane": lane, "reason_code": "retained-by-safety-policy", "reason": reason})),
                 Err(e) => out["skipped"]
                     .as_array_mut()
                     .unwrap()
-                    .push(json!({"issue": id, "lane": lane, "reason": e.to_string()})),
+                    .push(json!({"issue": id, "lane": lane, "reason_code": "cleanup-check-failed", "reason": e.to_string()})),
             }
         }
     }
     Ok(out)
 }
 
-/// One lane's reclaim decision + delete. `Ok(Some(bytes))` reclaimed,
-/// `Ok(None)` eligible-but-absent or in use, `Err` refused.
+/// Read-only manual plan. The same `reclaim_target` confinement and
+/// `blocked_reason` policy is used by the scheduled actor below; dry-run does
+/// not delete, write tracker comments or notify owners.
+pub fn plan(pm: &Pm, state_dir: &Path, idle_secs: u64) -> Result<Value> {
+    finish::with_probe_timeout(PROBE_TIMEOUT, || plan_bounded(pm, state_dir, idle_secs))
+}
+
+pub fn plan_for_repo(pm: &Pm, state_dir: &Path, idle_secs: u64, repo: &Path) -> Result<Value> {
+    let root = crate::worktree::main_root(repo)?.canonicalize()?;
+    let mut plan = plan(pm, state_dir, idle_secs)?;
+    if let Some(rows) = plan["merged_checkouts"].as_array_mut() {
+        rows.retain(|row| {
+            row["worktree"]
+                .as_str()
+                .and_then(|path| lane_repo(Path::new(path)))
+                .as_deref()
+                == Some(root.as_path())
+        });
+    }
+    if let Some(rows) = plan["cache_resources"].as_array_mut() {
+        rows.retain(|row| {
+            row["resource"]["path"]
+                .as_str()
+                .and_then(|path| lane_repo(Path::new(path)))
+                .as_deref()
+                == Some(root.as_path())
+        });
+    }
+    plan["repo"] = json!(root);
+    plan["scope"] = json!("repository");
+    Ok(plan)
+}
+
+fn lane_repo(lane: &Path) -> Option<PathBuf> {
+    crate::worktree::main_root(lane)
+        .ok()
+        .and_then(|root| root.canonicalize().ok())
+        .or_else(|| crate::worktree::layout::assumed_root(lane))
+}
+
+fn plan_bounded(pm: &Pm, state_dir: &Path, idle_secs: u64) -> Result<Value> {
+    let merged = finish::sweep(pm, None, false, true, "", state_dir)?;
+    let view = finish::daemon_view(state_dir);
+    let idle = Duration::from_secs(idle_secs);
+    let issues = board::load_all(&pm.dir, None)?;
+    let mut resources = Vec::new();
+    for issue in &issues {
+        for lane in crate::issue::start::open_worktrees(&issue.front) {
+            resources.push(target_plan(&view, state_dir, issue, &lane, idle));
+        }
+    }
+    Ok(json!({
+        "schema": "cadence.reclaim-plan/1",
+        "dry_run": true,
+        "cleanup_mode": "report-only-for-checkout-removal",
+        "merged_checkouts": merged["rows"],
+        "cache_resources": resources,
+    }))
+}
+
+fn target_plan(
+    view: &finish::DaemonView,
+    state_dir: &Path,
+    issue: &board::Issue,
+    lane: &Path,
+    idle: Duration,
+) -> Value {
+    let branch = lane
+        .file_name()
+        .map(|name| crate::worktree::layout::branch(&name.to_string_lossy()));
+    let base = json!({"issue": issue.front.id, "path": lane, "branch": branch.clone()});
+    if !lane.is_dir() {
+        return json!({"resource": base, "status": "missing", "reason_code": "checkout-missing",
+            "reason": "checkout is missing; branch and tracker refs are preserved", "reclaimable_bytes": 0});
+    }
+    let cargo_target = issue
+        .front
+        .refs
+        .iter()
+        .filter(|r| r.kind == "worktree" && r.closed != Some(true))
+        .filter(|r| finish::same_path(Path::new(r.path.as_deref().unwrap_or_default()), lane))
+        .find_map(|r| r.cargo_target.clone());
+    let target = match reclaim_target(lane, cargo_target.as_deref()) {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            return json!({"resource": base, "status": "retained",
+            "reason_code": "target-not-lane-local", "reason": "recorded cargo target is not the lane-local target; no deletion", "reclaimable_bytes": null})
+        }
+        Err(e) => {
+            return json!({"resource": base, "status": "refused",
+            "reason_code": "path-confinement-or-symlink-refused", "reason": e.to_string(), "reclaimable_bytes": null})
+        }
+    };
+    if let Some(reason) = blocked_reason(view, state_dir, &issue.front, lane, idle, WALK_CAP) {
+        let code = if reason.contains("written within") {
+            "source-recent"
+        } else if reason.contains("truncated")
+            || reason.contains("cannot")
+            || reason.contains("enumerat")
+        {
+            "live-use-or-idle-probe-unknown"
+        } else {
+            "live-use-blocked"
+        };
+        return json!({"resource": base, "status": "retained", "target": target,
+            "reason_code": code, "reason": reason, "reclaimable_bytes": null});
+    }
+    let (size, truncated) = crate::doctor::host::dir_size(&target);
+    json!({
+        "resource": base,
+        "status": "reclaimable-cache-only",
+        "target": target,
+        "reason_code": if truncated { "size-estimate-unknown" } else { "idle-target-cache" },
+        "reason": "only the confined lane-local target cache may be reclaimed; source and branch are retained",
+        "reclaimable_bytes": if truncated { Value::Null } else { json!(size) },
+        "retained_branch": branch,
+        "retained_artifacts": [],
+    })
+}
+
+enum ReclaimAttempt {
+    Reclaimed(u64),
+    Absent,
+    Skipped(String),
+}
+
+/// Compatibility wrapper used by focused guard checks.
+#[cfg(test)]
 fn reclaim_lane(
     view: &finish::DaemonView,
     state_dir: &Path,
@@ -354,8 +517,25 @@ fn reclaim_lane(
     idle: Duration,
     actor: &str,
 ) -> Result<Option<u64>> {
+    match reclaim_lane_detailed(view, state_dir, pm, issue, lane, idle, actor)? {
+        ReclaimAttempt::Reclaimed(bytes) => Ok(Some(bytes)),
+        ReclaimAttempt::Absent | ReclaimAttempt::Skipped(_) => Ok(None),
+    }
+}
+
+/// One lane's shared reclaim decision + delete. Refusals are returned to the
+/// scheduled report rather than silently disappearing.
+fn reclaim_lane_detailed(
+    view: &finish::DaemonView,
+    state_dir: &Path,
+    pm: &Pm,
+    issue: &board::Issue,
+    lane: &Path,
+    idle: Duration,
+    actor: &str,
+) -> Result<ReclaimAttempt> {
     if !lane.is_dir() {
-        return Ok(None);
+        return Ok(ReclaimAttempt::Absent);
     }
     // The recorded cargo_target for this lane's open ref, if any — only
     // ever compared against the derived path, never deleted.
@@ -367,11 +547,10 @@ fn reclaim_lane(
         .filter(|r| finish::same_path(Path::new(r.path.as_deref().unwrap_or_default()), lane))
         .find_map(|r| r.cargo_target.clone());
     let Some(target) = reclaim_target(lane, cargo_target.as_deref())? else {
-        return Ok(None);
+        return Ok(ReclaimAttempt::Absent);
     };
-    if blocked_reason(view, state_dir, &issue.front, lane, idle, WALK_CAP).is_some() {
-        // Eligible lane but currently in use — skip silently.
-        return Ok(None);
+    if let Some(reason) = blocked_reason(view, state_dir, &issue.front, lane, idle, WALK_CAP) {
+        return Ok(ReclaimAttempt::Skipped(reason));
     }
     // Measure before the re-scan so nothing slow sits between the
     // re-scan and the delete.
@@ -388,13 +567,13 @@ fn reclaim_lane(
             lane = %lane.display(),
             reason = %appeared
         );
-        return Ok(None);
+        return Ok(ReclaimAttempt::Skipped(appeared));
     }
     // Re-derive the one deletable path and re-verify it is still a real
     // dir immediately before the delete — a swap to a symlink must never
     // be followed.
     let Some(target) = reclaim_target(lane, cargo_target.as_deref())? else {
-        return Ok(None);
+        return Ok(ReclaimAttempt::Absent);
     };
     std::fs::remove_dir_all(&target)?;
     // Log the freed bytes on the issue — a reclaim is recorded, never
@@ -414,7 +593,7 @@ fn reclaim_lane(
         None,
         actor,
     );
-    Ok(Some(bytes))
+    Ok(ReclaimAttempt::Reclaimed(bytes))
 }
 
 #[cfg(test)]
@@ -492,6 +671,10 @@ mod tests {
 
     fn down_view() -> finish::DaemonView {
         finish::daemon_view(&no_daemon())
+    }
+
+    fn process_enumeration_uncertain(reason: &str) -> bool {
+        reason.contains("Cannot fully enumerate process cwd/open-fd use")
     }
 
     fn age(dir: &Path, secs: u64) {
@@ -580,7 +763,7 @@ mod tests {
 
     /// Critical 1: a recorded `cargo_target` that is the lane itself, or a
     /// path inside it, is never deleted — and refuses the lane's real
-    /// `target/` too (control: with no recorded path it is reclaimed).
+    /// `target/` too (control: reclaimed when the live-use scan completes).
     #[test]
     fn a_forged_cargo_target_deletes_nothing() {
         let tmp = Tmp::new("forged");
@@ -595,8 +778,26 @@ mod tests {
             assert!(lane.join("src/keep.rs").is_file(), "source deleted");
             assert!(target.is_dir(), "forged {} was accepted", forged.display());
         }
-        assert!(reclaim(&tmp, &lane, None).unwrap().is_some(), "control");
-        assert!(lane.join("src/keep.rs").is_file() && !target.exists());
+        match blocked_reason(
+            &down_view(),
+            &no_daemon(),
+            &issue_with(&lane, None).front,
+            &lane,
+            Duration::from_secs(6 * 3600),
+            WALK_CAP,
+        ) {
+            Some(reason) => {
+                assert!(
+                    process_enumeration_uncertain(&reason),
+                    "unexpected blocker: {reason}"
+                );
+                assert!(target.is_dir(), "uncertain enumeration must retain target");
+            }
+            None => {
+                assert!(reclaim(&tmp, &lane, None).unwrap().is_some(), "control");
+                assert!(lane.join("src/keep.rs").is_file() && !target.exists());
+            }
+        }
     }
 
     /// Important 2: the main checkout, and a linked worktree outside
@@ -660,7 +861,13 @@ mod tests {
         assert_eq!(walk_writes(&lane, idle, 3), Walk::Truncated);
         let front = issue_with(&lane, None).front;
         assert!(blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, 3).is_some());
-        assert!(blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, 1000).is_none());
+        if let Some(reason) = blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, 1000)
+        {
+            assert!(
+                process_enumeration_uncertain(&reason),
+                "unexpected blocker: {reason}"
+            );
+        }
     }
 
     /// Important 4: a daemon that is up but could not enumerate agents
@@ -749,10 +956,14 @@ mod tests {
         age(&lane, 7 * 3600);
         let idle = Duration::from_secs(6 * 3600);
         let front = issue_with(&lane, None).front;
-        assert!(
-            blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, WALK_CAP).is_none(),
-            "control: a down daemon leaves the aged lane free"
-        );
+        if let Some(reason) =
+            blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, WALK_CAP)
+        {
+            assert!(
+                process_enumeration_uncertain(&reason),
+                "unexpected control blocker: {reason}"
+            );
+        }
         let state = tmp.0.join("state");
         let server = fake_daemon(
             &state,

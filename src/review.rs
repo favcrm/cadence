@@ -1853,87 +1853,323 @@ fn unknown_full_suite_row(step: &Step) -> Value {
 // Review worktree
 // ---------------------------------------------------------------------------
 
-/// Written into every worktree the review creates, checked before any
-/// destructive call — the tool only ever mutates or removes a tree it
-/// created in THIS run, so a crash-recovery path cannot destroy a
-/// reviewer's own checkout that happens to sit at the same path.
-const REVIEW_MARKER: &str = ".cadence-review-tree";
+/// Tool-owned detached checkout. Ownership, exact SHA and lifecycle state
+/// live in the repository ledger so an interrupted review is inventoryable.
+const REVIEW_TOOL: &str = "cadence review";
 
-/// A detached git checkout under `<root>/.cadence/wt/` that this run
-/// created — removed on drop unless `keep`.
 struct ReviewTree {
     root: PathBuf,
     dir: PathBuf,
+    owner: String,
+    pinned_sha: String,
     keep: bool,
+    retention_reason: Option<String>,
     git_secs: u64,
 }
 
 impl ReviewTree {
-    /// `git worktree add --detach <dir> <sha>`; refuses when the path
-    /// already exists (a `--keep` leftover counts — the operator
-    /// clears it), then writes the ownership marker.
-    fn checkout(root: &Path, name: &str, sha: &str, keep: bool, git_secs: u64) -> Result<Self> {
-        let dir = worktree::layout::worktree_dir(root, name);
-        if dir.exists() {
+    /// Create a detached, exact-SHA checkout. Existing paths are inventory-only
+    /// until explicitly adopted; this command never reuses an unknown tree.
+    fn checkout(
+        root: &Path,
+        name: &str,
+        sha: &str,
+        base_sha: Option<&str>,
+        keep: bool,
+        git_secs: u64,
+    ) -> Result<Self> {
+        let root = worktree::main_root(root)?;
+        let dir = worktree::layout::worktree_dir(&root, name);
+        let owner = std::env::var("CADENCE_ALIAS").unwrap_or_else(|_| "cadence-review".into());
+        let recovery = worktree::lifecycle::recoverable_record(
+            &root,
+            &dir,
+            "review",
+            REVIEW_TOOL,
+            None,
+            None,
+        )?;
+        if let Some(record) = &recovery {
+            if record.owner != owner {
+                return Err(Error::rejected(format!(
+                    "review checkout {} is owned by '{}', not '{}'; inventory it before recovery",
+                    dir.display(),
+                    record.owner,
+                    owner
+                )));
+            }
+            if record.pinned_sha != sha {
+                return Err(Error::rejected(format!(
+                    "review checkout {} is owned at pinned SHA {}, not {}; inventory and retain the existing checkout",
+                    dir.display(), record.pinned_sha, sha
+                )));
+            }
+            if dir.exists() {
+                Self::verify_recovery(&root, &dir, sha, git_secs)?;
+            } else if !matches!(record.state.as_str(), "preparing" | "setup-failed") {
+                return Err(Error::rejected(format!(
+                    "review checkout {} is recorded as {} but is missing; inventory it before retrying",
+                    dir.display(), record.state
+                )));
+            }
+        } else if dir.exists() {
             return Err(Error::rejected(format!(
-                "review checkout {} already exists — refusing to touch a \
-                 tree the review did not create; inspect it, then clear \
-                 it with `git worktree remove --force {}` or delete the \
-                 directory",
-                dir.display(),
+                "review checkout {} already exists without a recoverable lifecycle record — inventory it and explicitly adopt it before reuse",
                 dir.display()
             )));
         }
-        git(
-            root,
-            &["worktree", "add", "--detach", &dir.to_string_lossy(), sha],
-            git_secs,
-        )?;
-        if let Err(e) = std::fs::write(
-            dir.join(REVIEW_MARKER),
-            format!(
-                "created by `cadence review` at {} — this file marks the \
-                 tree as tool-owned\n",
-                time::iso(time::now_epoch())
-            ),
-        ) {
-            // No marker ⇒ not ours: deregister rather than leave a
-            // tree the drop guard would refuse to touch.
-            let mut rm = Command::new("git");
-            rm.arg("-C")
-                .arg(root)
-                .args(["worktree", "remove", "--force"])
-                .arg(&dir);
-            let _ = run_bounded(&mut rm, Duration::from_secs(git_secs));
-            return Err(e.into());
+        worktree::ensure_cadence_ignored(&root)?;
+        let mut record = worktree::lifecycle::new_record(worktree::lifecycle::CheckoutSpec {
+            repo: &root,
+            purpose: "review",
+            tool: REVIEW_TOOL,
+            owner: &owner,
+            path: &dir,
+            branch: None,
+            pinned_sha: sha,
+            issue: None,
+        });
+        record.base_sha = base_sha.map(str::to_string);
+        worktree::lifecycle::begin(&root, record.clone())?;
+        if !dir.exists() {
+            if let Err(e) = git(
+                &root,
+                &["worktree", "add", "--detach", &dir.to_string_lossy(), sha],
+                git_secs,
+            ) {
+                let _ = worktree::lifecycle::transition(
+                    &root,
+                    &dir,
+                    "setup-failed",
+                    Some(&e.to_string()),
+                );
+                return Err(e);
+            }
         }
+        // Activation failure leaves the linked checkout and pending record
+        // intact; recovery must not infer permission to remove it.
+        worktree::lifecycle::activate(&root, record)?;
         Ok(Self {
-            root: root.to_path_buf(),
+            root,
             dir,
-            keep,
+            owner,
+            pinned_sha: sha.to_string(),
+            // Errors before the report is durable preserve the tree for
+            // recovery. Successful completion opts into release explicitly.
+            keep: true,
+            retention_reason: Some(if keep {
+                "review --keep requested".into()
+            } else {
+                "review interrupted or failed; preserve for recovery".into()
+            }),
             git_secs,
         })
     }
 
-    /// Marker present ⇒ this run created the tree and may destroy it.
+    fn verify_recovery(root: &Path, dir: &Path, sha: &str, git_secs: u64) -> Result<()> {
+        let meta = std::fs::symlink_metadata(dir)?;
+        if !meta.is_dir()
+            || meta.file_type().is_symlink()
+            || dir.canonicalize()? != crate::issue::finish::lexical_path(dir)
+        {
+            return Err(Error::rejected(format!(
+                "review checkout {} is not a real canonical directory",
+                dir.display()
+            )));
+        }
+        if worktree::main_root(dir)?.canonicalize()? != root.canonicalize()? {
+            return Err(Error::rejected(format!(
+                "review checkout {} belongs to another Git common directory",
+                dir.display()
+            )));
+        }
+        let listed = git(root, &["worktree", "list", "--porcelain"], git_secs)?;
+        if !listed
+            .lines()
+            .any(|line| line == format!("worktree {}", dir.display()))
+        {
+            return Err(Error::rejected(format!(
+                "review checkout {} is not registered by git worktree list",
+                dir.display()
+            )));
+        }
+        let head = git(dir, &["rev-parse", "--verify", "HEAD^{commit}"], git_secs)?;
+        let branch = git_status(
+            dir,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            git_secs,
+        )?;
+        if head != sha || branch.timed_out || branch.status != Some(1) {
+            return Err(Error::rejected(format!(
+                "review checkout {} does not match detached pinned SHA {sha}: {}",
+                dir.display(),
+                branch.stderr.trim()
+            )));
+        }
+        let status = git(
+            dir,
+            &["status", "--porcelain", "--untracked-files=all"],
+            git_secs,
+        )?;
+        if !status.is_empty() {
+            return Err(Error::rejected(format!(
+                "review checkout {} is dirty — retain it for recovery",
+                dir.display()
+            )));
+        }
+        Ok(())
+    }
+
     fn owns(&self) -> bool {
-        self.dir.join(REVIEW_MARKER).is_file()
+        worktree::lifecycle::owns(
+            &self.root,
+            &self.dir,
+            REVIEW_TOOL,
+            &self.owner,
+            &self.pinned_sha,
+        )
+        .unwrap_or(false)
+    }
+
+    fn release_refusal(&self) -> Option<String> {
+        match std::fs::symlink_metadata(&self.dir) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+            Ok(_) => return Some("review checkout path is not a real directory".into()),
+            Err(e) => return Some(format!("cannot inspect review checkout path: {e}")),
+        }
+        let checkout_root = match worktree::main_root(&self.dir) {
+            Ok(root) => match root.canonicalize() {
+                Ok(root) => root,
+                Err(e) => return Some(format!("cannot resolve review Git common directory: {e}")),
+            },
+            Err(e) => return Some(format!("cannot verify review checkout identity: {e}")),
+        };
+        if checkout_root != self.root {
+            return Some("review checkout belongs to a different Git common directory".into());
+        }
+        let listed =
+            match crate::issue::finish::git(&self.root, &["worktree", "list", "--porcelain"]) {
+                Ok(listed) => listed,
+                Err(e) => return Some(format!("cannot enumerate registered worktrees: {e}")),
+            };
+        if !listed
+            .lines()
+            .any(|line| line == format!("worktree {}", self.dir.display()))
+        {
+            return Some("review checkout is no longer registered at its owned path".into());
+        }
+        let head =
+            match crate::issue::finish::git(&self.dir, &["rev-parse", "--verify", "HEAD^{commit}"])
+            {
+                Ok(head) => head,
+                Err(e) => return Some(format!("cannot verify pinned review HEAD: {e}")),
+            };
+        if head != self.pinned_sha {
+            return Some(format!(
+                "HEAD moved from pinned {} to {head}",
+                self.pinned_sha
+            ));
+        }
+        match crate::issue::finish::git(
+            &self.dir,
+            &["status", "--porcelain", "--untracked-files=all"],
+        ) {
+            Ok(status) if !status.is_empty() => {
+                return Some("review checkout has uncommitted changes".into())
+            }
+            Err(e) => return Some(format!("cannot inspect review checkout dirt: {e}")),
+            _ => {}
+        }
+        match crate::issue::finish::process_use_under(&self.dir) {
+            Ok(uses) if uses.enumeration_error.is_some() => Some(format!(
+                "cannot fully enumerate live process use: {}",
+                uses.enumeration_error
+                    .as_deref()
+                    .unwrap_or("unknown enumeration failure")
+            )),
+            Ok(uses) if !uses.cwd.is_empty() || !uses.fd.is_empty() => Some(format!(
+                "live process use remains (cwd pids: {:?}, open-fd pids: {:?})",
+                uses.cwd, uses.fd
+            )),
+            Err(e) => Some(format!("cannot enumerate live process use: {e}")),
+            _ => None,
+        }
     }
 }
 
 impl Drop for ReviewTree {
     fn drop(&mut self) {
-        if self.keep || !self.owns() {
+        if !self.owns() {
+            return;
+        }
+        if self.keep {
+            let reason = self
+                .retention_reason
+                .as_deref()
+                .unwrap_or("review explicitly retained");
+            if let Err(e) =
+                worktree::lifecycle::transition(&self.root, &self.dir, "retained", Some(reason))
+            {
+                tracing::warn!(event = "review_checkout_retention_record_failed", path = %self.dir.display(), error = %e);
+            }
+            return;
+        }
+        if let Some(reason) = self.release_refusal() {
+            let _ =
+                worktree::lifecycle::transition(&self.root, &self.dir, "retained", Some(&reason));
+            tracing::warn!(event = "review_checkout_release_refused", path = %self.dir.display(), reason = %reason);
+            return;
+        }
+        if let Err(e) = worktree::lifecycle::transition(
+            &self.root,
+            &self.dir,
+            "releasing",
+            Some("review completed"),
+        ) {
+            tracing::warn!(event = "review_checkout_release_record_failed", path = %self.dir.display(), error = %e);
+            return;
+        }
+        if let Some(reason) = self.release_refusal() {
+            let _ =
+                worktree::lifecycle::transition(&self.root, &self.dir, "retained", Some(&reason));
+            tracing::warn!(event = "review_checkout_release_refused", path = %self.dir.display(), reason = %reason);
             return;
         }
         let mut cmd = Command::new("git");
         cmd.arg("-C")
             .arg(&self.root)
-            .args(["worktree", "remove", "--force"])
+            .args(["worktree", "remove"])
             .arg(&self.dir);
-        let _ = run_bounded(&mut cmd, Duration::from_secs(self.git_secs));
-        if self.dir.exists() {
-            let _ = std::fs::remove_dir_all(&self.dir);
+        let result = run_bounded(&mut cmd, Duration::from_secs(self.git_secs));
+        let failure = match result {
+            Ok(out) if out.status.success() && !self.dir.exists() => {
+                let _ = worktree::lifecycle::transition(
+                    &self.root,
+                    &self.dir,
+                    "released",
+                    Some("review completed"),
+                );
+                None
+            }
+            Ok(out) => Some(format!(
+                "git worktree remove failed: {}{}",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                if self.dir.exists() {
+                    " (checkout still exists)"
+                } else {
+                    ""
+                }
+            )),
+            Err(e) => Some(format!("git worktree remove failed: {e}")),
+        };
+        if let Some(reason) = failure {
+            let _ = worktree::lifecycle::transition(
+                &self.root,
+                &self.dir,
+                "cleanup-failed",
+                Some(&reason),
+            );
+            tracing::warn!(event = "review_checkout_release_failed", path = %self.dir.display(), reason = %reason);
         }
     }
 }
@@ -2054,6 +2290,7 @@ pub fn run(opts: &Options) -> Result<i32> {
     // One review at a time per repo, host-wide.
     let reviews_dir = opts.state_dir.join("reviews");
     std::fs::create_dir_all(&reviews_dir)?;
+    let reviews_dir = reviews_dir.canonicalize()?;
     let lock_path = reviews_dir.join(format!("{}.review.lock", lock_slug(&slug, &root)));
     let _review_lock = Flock::try_lock(&lock_path)?.ok_or_else(|| {
         Error::rejected(format!(
@@ -2104,7 +2341,14 @@ pub fn run(opts: &Options) -> Result<i32> {
 
     // The review checkout — detached, never the author's worktree.
     let wt_name = format!("review-{}", pr.number);
-    let mut tree = ReviewTree::checkout(&root, &wt_name, &head_sha, opts.keep, t.git_secs)?;
+    let mut tree = ReviewTree::checkout(
+        &root,
+        &wt_name,
+        &head_sha,
+        Some(&base_sha),
+        opts.keep,
+        t.git_secs,
+    )?;
 
     // Env every step command sees: the review's own variables plus
     // CI's identity-less git (`gate_env`) under a scratch HOME that
@@ -2349,7 +2593,14 @@ pub fn run(opts: &Options) -> Result<i32> {
         // failure here is its own recorded step — it must not quietly
         // turn every base run into the same error.
         let base_name = format!("review-{}-base", pr.number);
-        let base_tree = ReviewTree::checkout(&root, &base_name, &base_sha, opts.keep, t.git_secs)?;
+        let mut base_tree = ReviewTree::checkout(
+            &root,
+            &base_name,
+            &base_sha,
+            Some(&base_sha),
+            opts.keep,
+            t.git_secs,
+        )?;
         let mut base_ready = true;
         for cmd in &cfg.prepare {
             let s = run_step(
@@ -2488,6 +2739,8 @@ pub fn run(opts: &Options) -> Result<i32> {
             }
             comparisons.push(row);
         }
+        base_tree.keep = opts.keep;
+        base_tree.retention_reason = opts.keep.then(|| "review --keep requested".into());
         drop(base_tree);
     }
     // A failed full suite without a named testcase is still evidence that
@@ -2675,13 +2928,34 @@ pub fn run(opts: &Options) -> Result<i32> {
     );
     let md_path = reviews_dir.join(format!("{base_name}.md"));
     let json_path = reviews_dir.join(format!("{base_name}.json"));
+    // Until both receipts are durable outside the checkout, a failure keeps
+    // the owned tree for recovery rather than releasing its evidence.
+    let artifacts_recorded = match worktree::lifecycle::declare_artifacts(
+        &root,
+        &tree.dir,
+        vec![
+            md_path.to_string_lossy().into_owned(),
+            json_path.to_string_lossy().into_owned(),
+        ],
+        Vec::new(),
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            report["checkout_lifecycle_warning"] = json!(e.to_string());
+            false
+        }
+    };
     report["report_md"] = json!(md_path.to_string_lossy());
     std::fs::write(&md_path, render_markdown(&report))?;
     std::fs::write(&json_path, serde_json::to_string_pretty(&report)?)?;
-
-    if opts.keep {
-        tree.keep = true;
-    }
+    tree.keep = opts.keep || !artifacts_recorded;
+    tree.retention_reason = if opts.keep {
+        Some("review --keep requested".into())
+    } else if !artifacts_recorded {
+        Some("receipt artifact declarations failed; preserve checkout for recovery".into())
+    } else {
+        None
+    };
 
     if opts.json {
         println!("{}", crate::output::json_text(&report)?);

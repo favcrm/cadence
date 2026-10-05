@@ -1,0 +1,881 @@
+//! Durable, repository-local ownership for cadence-managed checkouts.
+//!
+//! Issue refs remain authoritative for development lanes; this ledger records
+//! setup/release state and identifies review/validation trees. Inventory is
+//! read-only. Unknown worktrees are never adopted or deleted implicitly.
+
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::error::{Error, Result};
+use crate::issue::finish;
+use crate::issue::time;
+use crate::worktree::{self, layout};
+
+const LEDGER: &str = "managed-checkouts.json";
+const LOCK: &str = "managed-checkouts.lock";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Checkout {
+    pub repo: String,
+    pub purpose: String,
+    pub tool: String,
+    pub owner: String,
+    pub path: String,
+    pub branch: Option<String>,
+    /// Exact commit selected at setup/adoption. Development HEADs may advance;
+    /// review and validation HEADs remain pinned to this object.
+    pub pinned_sha: String,
+    #[serde(default)]
+    pub base_sha: Option<String>,
+    pub state: String,
+    pub issue: Option<String>,
+    pub retention_reason: Option<String>,
+    pub release_reason: Option<String>,
+    #[serde(default)]
+    pub release_artifacts: Vec<String>,
+    #[serde(default)]
+    pub rollback_artifacts: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Ledger {
+    schema: u32,
+    records: Vec<Checkout>,
+}
+
+impl Default for Ledger {
+    fn default() -> Self {
+        Self {
+            schema: 1,
+            records: Vec::new(),
+        }
+    }
+}
+
+fn canonical_root(repo: &Path) -> Result<PathBuf> {
+    let root = worktree::main_root(repo)?.canonicalize()?;
+    Ok(root)
+}
+
+fn metadata_dir(root: &Path, create: bool) -> Result<PathBuf> {
+    let dir = root.join(".cadence");
+    match fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(Error::rejected(format!(
+                "{} is not a real .cadence directory — refusing lifecycle metadata",
+                dir.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => fs::create_dir_all(&dir)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(dir),
+        Err(e) => return Err(e.into()),
+    }
+    Ok(dir)
+}
+
+fn ledger_path(root: &Path, create: bool) -> Result<PathBuf> {
+    Ok(metadata_dir(root, create)?.join(LEDGER))
+}
+
+fn read_ledger(root: &Path) -> Result<Ledger> {
+    let path = ledger_path(root, false)?;
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Ledger::default()),
+        Err(e) => return Err(e.into()),
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(Error::rejected(format!(
+            "{} is not a regular lifecycle ledger",
+            path.display()
+        )));
+    }
+    let bytes = fs::read(&path)?;
+    let ledger: Ledger = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::rejected(format!("{} is unreadable: {e}", path.display())))?;
+    if ledger.schema != 1 {
+        return Err(Error::rejected(format!(
+            "{} has unsupported schema {}",
+            path.display(),
+            ledger.schema
+        )));
+    }
+    Ok(ledger)
+}
+
+struct LedgerLock {
+    _file: fs::File,
+}
+
+impl LedgerLock {
+    fn acquire(root: &Path) -> Result<(PathBuf, Self)> {
+        let dir = metadata_dir(root, true)?;
+        let path = dir.join(LOCK);
+        if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(Error::rejected(format!(
+                "{} is a symlink — refusing lifecycle lock",
+                path.display()
+            )));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok((dir, Self { _file: file }))
+    }
+}
+
+fn write_ledger(dir: &Path, ledger: &Ledger) -> Result<()> {
+    let path = dir.join(LEDGER);
+    if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{} is a symlink — refusing lifecycle ledger write",
+            path.display()
+        )));
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = dir.join(format!(".{LEDGER}.{}-{nonce}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(ledger)?;
+    let mut created = false;
+    let mut write = || -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)?;
+        created = true;
+        use std::io::Write;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, &path)?;
+        OpenOptions::new().read(true).open(dir)?.sync_all()?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        if created {
+            let _ = fs::remove_file(&tmp);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn path_key(path: &Path) -> String {
+    let resolved = path
+        .canonicalize()
+        .unwrap_or_else(|_| finish::lexical_path(path));
+    resolved.to_string_lossy().into_owned()
+}
+
+fn validate_record(root: &Path, record: &Checkout) -> Result<()> {
+    if record.repo != root.to_string_lossy().as_ref() {
+        return Err(Error::rejected(
+            "lifecycle record repo does not match canonical repo",
+        ));
+    }
+    if record.owner.trim().is_empty()
+        || record.purpose.trim().is_empty()
+        || record.tool.trim().is_empty()
+    {
+        return Err(Error::rejected(
+            "lifecycle record requires explicit purpose, tool and owner",
+        ));
+    }
+    if record.pinned_sha.len() != 40 || !record.pinned_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::rejected(
+            "pinned_sha must be a full 40-hex commit SHA",
+        ));
+    }
+    if let Some(branch) = &record.branch {
+        if branch.is_empty() || branch.starts_with('-') {
+            return Err(Error::rejected("branch must be a non-option ref name"));
+        }
+    }
+    if !Path::new(&record.path).is_absolute() {
+        return Err(Error::rejected("lifecycle checkout path must be absolute"));
+    }
+    let checkout = path_key(Path::new(&record.path));
+    for artifact in record
+        .release_artifacts
+        .iter()
+        .chain(&record.rollback_artifacts)
+    {
+        let path = Path::new(artifact);
+        if !path.is_absolute() {
+            return Err(Error::rejected(format!(
+                "declared artifact path must be absolute: {artifact}"
+            )));
+        }
+        let name = path.file_name().ok_or_else(|| {
+            Error::rejected(format!(
+                "declared artifact path has no file name: {artifact}"
+            ))
+        })?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| {
+                Error::rejected(format!("declared artifact path has no parent: {artifact}"))
+            })?
+            .canonicalize()
+            .map_err(|e| {
+                Error::rejected(format!(
+                    "declared artifact parent is not resolvable: {artifact}: {e}"
+                ))
+            })?;
+        let resolved = parent.join(name);
+        let artifact_key = match path.canonicalize() {
+            Ok(path) => path,
+            Err(_)
+                if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) =>
+            {
+                return Err(Error::rejected(format!(
+                    "declared artifact symlink cannot be resolved: {artifact}"
+                )));
+            }
+            Err(_) => resolved,
+        };
+        if artifact_key.starts_with(&checkout) {
+            return Err(Error::rejected(format!(
+                "declared artifact {artifact} is inside the disposable checkout"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn same_identity(a: &Checkout, b: &Checkout) -> bool {
+    a.repo == b.repo
+        && a.purpose == b.purpose
+        && a.tool == b.tool
+        && a.path == b.path
+        && a.branch == b.branch
+        && a.issue == b.issue
+}
+
+/// Write a pending record before a new checkout is created. A crash after this
+/// point is visible as `preparing`, never permission to reclaim the path.
+pub fn begin(repo: &Path, mut record: Checkout) -> Result<()> {
+    let root = canonical_root(repo)?;
+    record.repo = root.to_string_lossy().into_owned();
+    record.path = path_key(Path::new(&record.path));
+    record.state = "preparing".into();
+    validate_record(&root, &record)?;
+    let (dir, _lock) = LedgerLock::acquire(&root)?;
+    let mut ledger = read_ledger(&root)?;
+    if let Some(existing) = ledger.records.iter_mut().find(|r| r.path == record.path) {
+        if !same_identity(existing, &record) {
+            return Err(Error::rejected(format!(
+                "{} already has lifecycle ownership metadata for a different repo, purpose, tool or branch",
+                record.path
+            )));
+        }
+        existing.state = "preparing".into();
+        existing.owner = record.owner;
+        existing.pinned_sha = record.pinned_sha;
+        existing.base_sha = record.base_sha;
+        existing.retention_reason = None;
+        existing.release_reason = None;
+        existing.updated_at = time::now_epoch();
+    } else {
+        ledger.records.push(record);
+    }
+    write_ledger(&dir, &ledger)
+}
+
+/// Register a native issue lane or mark a newly-created managed checkout
+/// active. An existing path is reusable only when every identity field agrees.
+pub fn activate(repo: &Path, mut record: Checkout) -> Result<()> {
+    let root = canonical_root(repo)?;
+    record.repo = root.to_string_lossy().into_owned();
+    record.path = path_key(Path::new(&record.path));
+    validate_record(&root, &record)?;
+    let (dir, _lock) = LedgerLock::acquire(&root)?;
+    let mut ledger = read_ledger(&root)?;
+    match ledger.records.iter_mut().find(|r| r.path == record.path) {
+        Some(existing) if same_identity(existing, &record) => {
+            if existing.pinned_sha != record.pinned_sha
+                && matches!(existing.purpose.as_str(), "review" | "validation")
+            {
+                return Err(Error::rejected(format!(
+                    "pinned checkout {} is recorded at {}, not {}",
+                    record.path, existing.pinned_sha, record.pinned_sha
+                )));
+            }
+            existing.state = "active".into();
+            existing.owner = record.owner;
+            if !matches!(existing.purpose.as_str(), "review" | "validation") {
+                existing.pinned_sha = record.pinned_sha;
+                existing.base_sha = record.base_sha;
+            }
+            existing.retention_reason = None;
+            existing.release_reason = None;
+            existing.updated_at = time::now_epoch();
+        }
+        Some(_) => {
+            return Err(Error::rejected(format!(
+                "{} is already managed for a different repo, purpose, owner or branch",
+                record.path
+            )))
+        }
+        None => {
+            record.state = "active".into();
+            record.created_at = time::now_epoch();
+            record.updated_at = record.created_at;
+            ledger.records.push(record);
+        }
+    }
+    write_ledger(&dir, &ledger)
+}
+
+/// Update the lifecycle state for a recorded checkout. This records release or
+/// retention; it never removes a checkout, branch, artifact or tracker ref.
+pub fn transition(repo: &Path, path: &Path, state: &str, reason: Option<&str>) -> Result<()> {
+    if !matches!(
+        state,
+        "active"
+            | "preparing"
+            | "setup-failed"
+            | "releasing"
+            | "released"
+            | "retained"
+            | "cleanup-failed"
+    ) {
+        return Err(Error::rejected(format!(
+            "unsupported checkout state '{state}'"
+        )));
+    }
+    if matches!(
+        state,
+        "setup-failed" | "releasing" | "released" | "retained" | "cleanup-failed"
+    ) && reason.is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(Error::rejected(format!(
+            "checkout state '{state}' requires a reason"
+        )));
+    }
+    let root = canonical_root(repo)?;
+    let key = path_key(path);
+    let (dir, _lock) = LedgerLock::acquire(&root)?;
+    let mut ledger = read_ledger(&root)?;
+    let record = ledger
+        .records
+        .iter_mut()
+        .find(|r| r.path == key)
+        .ok_or_else(|| Error::rejected(format!("{} has no managed checkout record", key)))?;
+    record.state = state.to_string();
+    record.updated_at = time::now_epoch();
+    if matches!(state, "retained") {
+        record.retention_reason = reason.map(str::to_string);
+    }
+    if matches!(state, "released" | "releasing" | "cleanup-failed") {
+        record.release_reason = reason.map(str::to_string);
+    }
+    write_ledger(&dir, &ledger)
+}
+
+/// Explicitly adopt a pre-existing linked checkout. The caller must already
+/// supply the repo, path, owner, purpose and pinned SHA; validation proves the
+/// checkout belongs to this Git common directory and is at that exact SHA.
+pub fn adopt(repo: &Path, mut record: Checkout) -> Result<()> {
+    let root = canonical_root(repo)?;
+    let path = Path::new(&record.path)
+        .canonicalize()
+        .map_err(|e| Error::rejected(format!("cannot resolve checkout {}: {e}", record.path)))?;
+    if path == root || worktree::main_root(&path)?.canonicalize()? != root {
+        return Err(Error::rejected(format!(
+            "{} is not a linked checkout of {}",
+            path.display(),
+            root.display()
+        )));
+    }
+    let head = finish::git(&path, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if head != record.pinned_sha {
+        return Err(Error::rejected(format!(
+            "checkout HEAD {head} does not match the supplied pinned SHA {}",
+            record.pinned_sha
+        )));
+    }
+    let branch = finish::git(&path, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
+    if branch != record.branch {
+        return Err(Error::rejected(format!(
+            "checkout branch {:?} does not match supplied branch {:?}",
+            branch, record.branch
+        )));
+    }
+    let listed = finish::git(&root, &["worktree", "list", "--porcelain"])?;
+    if !listed
+        .lines()
+        .any(|line| line == format!("worktree {}", path.display()))
+    {
+        return Err(Error::rejected(
+            "checkout is not registered by git worktree list",
+        ));
+    }
+    record.repo = root.to_string_lossy().into_owned();
+    record.path = path.to_string_lossy().into_owned();
+    record.state = "active".into();
+    record.created_at = time::now_epoch();
+    record.updated_at = record.created_at;
+    validate_record(&root, &record)?;
+    let (dir, _lock) = LedgerLock::acquire(&root)?;
+    let mut ledger = read_ledger(&root)?;
+    if ledger.records.iter().any(|r| r.path == record.path) {
+        return Err(Error::rejected(format!(
+            "{} already has a lifecycle record",
+            record.path
+        )));
+    }
+    ledger.records.push(record);
+    write_ledger(&dir, &ledger)
+}
+
+#[derive(Clone)]
+struct LiveTree {
+    path: PathBuf,
+    head: String,
+    branch: Option<String>,
+}
+
+fn live_trees(root: &Path) -> Result<Vec<LiveTree>> {
+    let text = finish::git(root, &["worktree", "list", "--porcelain"])?;
+    let mut trees = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    let mut head: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let push = |trees: &mut Vec<LiveTree>,
+                path: &mut Option<PathBuf>,
+                head: &mut Option<String>,
+                branch: &mut Option<String>| {
+        if let (Some(path), Some(head)) = (path.take(), head.take()) {
+            trees.push(LiveTree {
+                path,
+                head,
+                branch: branch.take(),
+            });
+        }
+        *branch = None;
+    };
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("worktree ") {
+            push(&mut trees, &mut path, &mut head, &mut branch);
+            path = Some(PathBuf::from(value));
+        } else if let Some(value) = line.strip_prefix("HEAD ") {
+            head = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("branch refs/heads/") {
+            branch = Some(value.to_string());
+        }
+    }
+    push(&mut trees, &mut path, &mut head, &mut branch);
+    Ok(trees)
+}
+
+fn dirty(path: &Path) -> Result<bool> {
+    let out = finish::git(path, &["status", "--porcelain", "--untracked-files=all"])?;
+    Ok(!out.is_empty())
+}
+
+fn bytes(path: &Path) -> Value {
+    match crate::doctor::host::dir_size(path) {
+        (n, false) => json!(n),
+        _ => Value::Null,
+    }
+}
+
+fn branch_exists(root: &Path, branch: Option<&str>) -> bool {
+    branch.is_some_and(|b| {
+        finish::git(
+            root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{b}"),
+            ],
+        )
+        .is_ok()
+    })
+}
+
+fn record_row(root: &Path, record: &Checkout, trees: &[LiveTree]) -> Value {
+    let expected = PathBuf::from(&record.path);
+    let expected_key = path_key(&expected);
+    let here = trees
+        .iter()
+        .find(|tree| path_key(&tree.path) == expected_key);
+    let mut moved = record.branch.as_deref().and_then(|branch| {
+        trees
+            .iter()
+            .find(|tree| tree.branch.as_deref() == Some(branch))
+    });
+    let mut ambiguous_detached_move = false;
+    if moved.is_none() && record.branch.is_none() {
+        let candidates: Vec<_> = trees
+            .iter()
+            .filter(|tree| tree.branch.is_none() && tree.head == record.pinned_sha)
+            .collect();
+        if candidates.len() == 1 {
+            moved = candidates.first().copied();
+        } else if candidates.len() > 1 {
+            ambiguous_detached_move = true;
+        }
+    }
+    let mut status = record.state.clone();
+    let mut reason = match record.state.as_str() {
+        "preparing" => "interrupted-setup",
+        "setup-failed" => "setup-failed-recoverable",
+        "released" => "released-awaiting-explicit-cleanup",
+        "retained" => "explicitly-retained",
+        "releasing" => "release-interrupted",
+        "cleanup-failed" => "cleanup-failed-recoverable",
+        _ => "managed-active",
+    };
+    let mut actual_path = here.map(|tree| tree.path.clone());
+    let mut actual_head = here.map(|tree| tree.head.clone());
+    let mut dirty_state = None;
+    if here.is_none() {
+        if let Some(moved) = moved {
+            status = "moved".into();
+            reason = "branch-checked-out-at-different-path-preserve-commits";
+            actual_path = Some(moved.path.clone());
+            actual_head = Some(moved.head.clone());
+        } else if ambiguous_detached_move {
+            status = "unknown".into();
+            reason = "detached-checkout-move-ambiguous-preserve-all-candidates";
+        } else if matches!(record.state.as_str(), "preparing" | "setup-failed") {
+            status = record.state.clone();
+            reason = if branch_exists(root, record.branch.as_deref()) {
+                "interrupted-setup-checkout-missing-branch-survives-preserve-branch"
+            } else {
+                "interrupted-setup-checkout-absent-retryable"
+            };
+        } else if matches!(record.purpose.as_str(), "review" | "validation")
+            && matches!(record.state.as_str(), "releasing" | "cleanup-failed")
+        {
+            status = "unknown".into();
+            reason = "tool-release-interrupted-checkout-missing-verify-registration";
+        } else if record.state == "released"
+            && matches!(record.purpose.as_str(), "review" | "validation")
+        {
+            status = "released".into();
+            reason = "released-tool-checkout-absent";
+        } else {
+            status = "missing".into();
+            reason = if branch_exists(root, record.branch.as_deref()) {
+                "checkout-missing-branch-survives-preserve-branch"
+            } else {
+                "checkout-and-branch-missing-close-refs-only"
+            };
+        }
+    } else if let Some(tree) = here {
+        if worktree::main_root(&tree.path)
+            .ok()
+            .and_then(|p| p.canonicalize().ok())
+            .as_deref()
+            != Some(root)
+        {
+            status = "unknown".into();
+            reason = "repo-identity-unknown";
+        } else if record
+            .branch
+            .as_deref()
+            .is_some_and(|b| tree.branch.as_deref() != Some(b))
+        {
+            status = "moved".into();
+            reason = "branch-mismatch-preserve-checkout";
+        } else if matches!(record.purpose.as_str(), "review" | "validation")
+            && tree.head != record.pinned_sha
+            && record.base_sha.as_deref() != Some(tree.head.as_str())
+        {
+            status = "unknown".into();
+            reason = "pinned-sha-mismatch-preserve-checkout";
+        } else {
+            match dirty(&tree.path) {
+                Ok(true) => {
+                    dirty_state = Some(true);
+                    let base = record
+                        .base_sha
+                        .as_deref()
+                        .unwrap_or(record.pinned_sha.as_str());
+                    let started = tree.head.as_str() != base;
+                    let merged = started
+                        && record
+                            .branch
+                            .as_deref()
+                            .and_then(|branch| {
+                                finish::default_ref(root).and_then(|into| {
+                                    finish::merge_rule(root, branch, &tree.head, &into)
+                                })
+                            })
+                            .is_some();
+                    if merged {
+                        status = "dirty-merged".into();
+                        reason = "merged-tip-but-dirty-retain-checkout-and-branch";
+                    } else {
+                        status = "dirty".into();
+                        reason = "dirty-retain-checkout-and-branch";
+                    }
+                }
+                Ok(false) => dirty_state = Some(false),
+                Err(_) => {
+                    status = "unknown".into();
+                    reason = "dirty-probe-failed-refuse-cleanup";
+                }
+            }
+        }
+    }
+    let size = actual_path
+        .as_deref()
+        .filter(|p| p.is_dir())
+        .map(bytes)
+        .unwrap_or(Value::Null);
+    let reclaimable = if status == "missing" {
+        json!(0)
+    } else {
+        Value::Null
+    };
+    json!({
+        "status": status,
+        "lifecycle_state": record.state,
+        "reason_code": reason,
+        "repo": record.repo,
+        "purpose": record.purpose,
+        "tool": record.tool,
+        "owner": record.owner,
+        "issue": record.issue,
+        "path": record.path,
+        "actual_path": actual_path.map(|p| p.to_string_lossy().into_owned()),
+        "branch": record.branch,
+        "pinned_sha": record.pinned_sha,
+        "base_sha": record.base_sha,
+        "actual_sha": actual_head,
+        "dirty": dirty_state,
+        "bytes_estimate": size,
+        "reclaimable_bytes": reclaimable,
+        "retention_reason": record.retention_reason,
+        "release_reason": record.release_reason,
+        "retained_artifacts": record.release_artifacts,
+        "rollback_artifacts": record.rollback_artifacts,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+    })
+}
+
+/// Read-only inventory for one repository. It performs no deletion, tracker
+/// mutation, lifecycle transition or notification. New checkout deletion is
+/// explicitly report-only; an unknown/foreign tree has no reclaim estimate.
+pub fn inventory(repo: &Path) -> Result<Value> {
+    let root = canonical_root(repo)?;
+    let ledger = read_ledger(&root)?;
+    let trees = live_trees(&root)?;
+    let mut rows = Vec::new();
+    let mut known = std::collections::HashSet::new();
+    for record in &ledger.records {
+        known.insert(path_key(Path::new(&record.path)));
+        rows.push(record_row(&root, record, &trees));
+    }
+    for tree in trees
+        .iter()
+        .filter(|tree| path_key(&tree.path) != path_key(&root))
+    {
+        let key = path_key(&tree.path);
+        if known.contains(&key) {
+            continue;
+        }
+        let (status, reason, dirty_state) = match dirty(&tree.path) {
+            Ok(true) => ("unmanaged", "unmanaged-dirty-inventory-only", Some(true)),
+            Ok(false) => (
+                "unmanaged",
+                "unmanaged-inventory-only-explicit-adoption-required",
+                Some(false),
+            ),
+            Err(_) => (
+                "unknown",
+                "unmanaged-dirty-probe-failed-inventory-only",
+                None,
+            ),
+        };
+        rows.push(json!({
+            "status": status,
+            "reason_code": reason,
+            "repo": root,
+            "purpose": "unknown",
+            "tool": Value::Null,
+            "owner": Value::Null,
+            "issue": Value::Null,
+            "path": tree.path,
+            "actual_path": tree.path,
+            "branch": tree.branch,
+            "pinned_sha": Value::Null,
+            "actual_sha": tree.head,
+            "dirty": dirty_state,
+            "bytes_estimate": bytes(&tree.path),
+            "reclaimable_bytes": Value::Null,
+            "retained_artifacts": [],
+            "rollback_artifacts": [],
+            "created_at": Value::Null,
+            "updated_at": Value::Null,
+        }));
+    }
+    let mut counts = serde_json::Map::new();
+    let mut lifecycle_counts = serde_json::Map::new();
+    for row in &rows {
+        let key = row["status"].as_str().unwrap_or("unknown").to_string();
+        let n = counts.get(&key).and_then(Value::as_u64).unwrap_or(0) + 1;
+        counts.insert(key, json!(n));
+        if let Some(state) = row["lifecycle_state"].as_str() {
+            let n = lifecycle_counts
+                .get(state)
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                + 1;
+            lifecycle_counts.insert(state.to_string(), json!(n));
+        }
+    }
+    Ok(json!({
+        "schema": "cadence.worktree-inventory/1",
+        "repo": root,
+        "cleanup_mode": "report-only",
+        "dry_run": true,
+        "counts": counts,
+        "lifecycle_counts": lifecycle_counts,
+        "resources": rows,
+    }))
+}
+
+pub struct CheckoutSpec<'a> {
+    pub repo: &'a Path,
+    pub purpose: &'a str,
+    pub tool: &'a str,
+    pub owner: &'a str,
+    pub path: &'a Path,
+    pub branch: Option<&'a str>,
+    pub pinned_sha: &'a str,
+    pub issue: Option<&'a str>,
+}
+
+/// Build a timestamped record for a new managed checkout.
+pub fn new_record(spec: CheckoutSpec<'_>) -> Checkout {
+    let now = time::now_epoch();
+    Checkout {
+        repo: spec.repo.to_string_lossy().into_owned(),
+        purpose: spec.purpose.to_string(),
+        tool: spec.tool.to_string(),
+        owner: spec.owner.to_string(),
+        path: path_key(spec.path),
+        branch: spec.branch.map(str::to_string),
+        pinned_sha: spec.pinned_sha.to_string(),
+        base_sha: None,
+        state: "preparing".into(),
+        issue: spec.issue.map(str::to_string),
+        retention_reason: None,
+        release_reason: None,
+        release_artifacts: Vec::new(),
+        rollback_artifacts: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Declare artifacts that are outside the disposable checkout and must be
+/// retained with its release/rollback record.
+pub fn declare_artifacts(
+    repo: &Path,
+    path: &Path,
+    release: Vec<String>,
+    rollback: Vec<String>,
+) -> Result<()> {
+    let root = canonical_root(repo)?;
+    let key = path_key(path);
+    let (dir, _lock) = LedgerLock::acquire(&root)?;
+    let mut ledger = read_ledger(&root)?;
+    let record = ledger
+        .records
+        .iter_mut()
+        .find(|r| r.path == key)
+        .ok_or_else(|| Error::rejected(format!("{} has no managed checkout record", key)))?;
+    record.release_artifacts = release;
+    record.rollback_artifacts = rollback;
+    validate_record(&root, record)?;
+    record.updated_at = time::now_epoch();
+    write_ledger(&dir, &ledger)
+}
+
+/// Whether a lifecycle record exists for this path (read-only).
+pub fn contains(repo: &Path, path: &Path) -> Result<bool> {
+    let root = canonical_root(repo)?;
+    let key = path_key(path);
+    Ok(read_ledger(&root)?
+        .records
+        .iter()
+        .any(|record| record.path == key))
+}
+
+/// Find a matching interrupted or active checkout that its creating tool may
+/// safely resume. Released/retained records are never implicit reuse permits.
+pub fn recoverable_record(
+    repo: &Path,
+    path: &Path,
+    purpose: &str,
+    tool: &str,
+    branch: Option<&str>,
+    issue: Option<&str>,
+) -> Result<Option<Checkout>> {
+    let root = canonical_root(repo)?;
+    let key = path_key(path);
+    let repo_key = root.to_string_lossy().into_owned();
+    let ledger = read_ledger(&root)?;
+    let record = ledger.records.into_iter().find(|record| {
+        record.repo == repo_key
+            && record.path == key
+            && record.purpose == purpose
+            && record.tool == tool
+            && record.branch.as_deref() == branch
+            && record.issue.as_deref() == issue
+            && matches!(
+                record.state.as_str(),
+                "preparing" | "setup-failed" | "active"
+            )
+    });
+    if let Some(record) = &record {
+        validate_record(&root, record)?;
+    }
+    Ok(record)
+}
+
+/// Verify that a particular tool and owner own this exact path and revision.
+pub fn owns(repo: &Path, path: &Path, tool: &str, owner: &str, pinned_sha: &str) -> Result<bool> {
+    let root = canonical_root(repo)?;
+    let key = path_key(path);
+    Ok(read_ledger(&root)?.records.iter().any(|record| {
+        record.path == key
+            && record.tool == tool
+            && record.owner == owner
+            && record.pinned_sha == pinned_sha
+            && record.state == "active"
+    }))
+}
+
+/// The native layout name remains the one source of development checkout paths.
+pub fn development_path(repo: &Path, name: &str) -> PathBuf {
+    layout::worktree_dir(repo, name)
+}

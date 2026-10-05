@@ -430,6 +430,47 @@ fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
                     .unwrap_or_default()
             ))
         })?;
+    let declared = start::declared_repos(&_project);
+    if !declared.contains(&root) {
+        return Err(Error::rejected(format!(
+            "Worktree {} belongs to undeclared repo {} — project {} declares: {}",
+            wt_dir
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            root.display(),
+            _project.key,
+            if declared.is_empty() {
+                "no local repo paths".to_string()
+            } else {
+                declared
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        )));
+    }
+    if let Some(path) = &wt_dir {
+        if layout::root_of(path).as_deref() != Some(root.as_path()) {
+            return Err(Error::rejected(format!(
+                "Worktree {} is outside the managed layout for repo {} — inventory and explicitly adopt unknown checkouts; issue finish will not delete them",
+                path.display(), root.display()
+            )));
+        }
+        if path.is_dir() {
+            let meta = std::fs::symlink_metadata(path)?;
+            if !meta.is_dir()
+                || meta.file_type().is_symlink()
+                || path.canonicalize()? != lexical_path(path)
+            {
+                return Err(Error::rejected(format!(
+                    "Worktree {} is symlinked or differs from its canonical managed path — refusing cleanup",
+                    path.display()
+                )));
+            }
+        }
+    }
     // Message refs bind the worktree they were dispatched against: a
     // ref carrying a `worktree` field scopes to that pair only, so a
     // re-start under `--name` doesn't inherit the earlier kickoff's
@@ -516,6 +557,103 @@ pub(crate) fn pids_cwd_under(dir: &Path) -> Vec<u32> {
         }
     }
     out
+}
+
+/// Cwd and open-descriptor holders under a managed checkout. Per-process
+/// permission failures are accumulated while the scan continues, so a known
+/// live holder is still named; any incomplete scan remains a deletion refusal.
+pub(crate) struct ProcessUse {
+    pub cwd: Vec<u32>,
+    pub fd: Vec<u32>,
+    pub enumeration_error: Option<String>,
+}
+
+pub(crate) fn process_use_under(dir: &Path) -> Result<ProcessUse> {
+    let dir = dir.canonicalize().map_err(|e| {
+        Error::rejected(format!(
+            "cannot resolve live-use path {}: {e}",
+            dir.display()
+        ))
+    })?;
+    let procs = std::fs::read_dir("/proc")
+        .map_err(|e| Error::rejected(format!("cannot enumerate /proc live-use checks: {e}")))?;
+    let me = std::process::id();
+    let mut use_ = ProcessUse {
+        cwd: Vec::new(),
+        fd: Vec::new(),
+        enumeration_error: None,
+    };
+    for entry in procs {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                use_.enumeration_error
+                    .get_or_insert_with(|| format!("cannot enumerate /proc: {e}"));
+                continue;
+            }
+        };
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let proc_dir = entry.path();
+        match std::fs::read_link(proc_dir.join("cwd")) {
+            Ok(cwd) if cwd.starts_with(&dir) => use_.cwd.push(pid),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !proc_dir.exists() => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                use_.enumeration_error.get_or_insert_with(|| {
+                    format!("cannot inspect process {pid} cwd during cleanup: {e}")
+                });
+            }
+        }
+        let fds = match std::fs::read_dir(proc_dir.join("fd")) {
+            Ok(fds) => fds,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !proc_dir.exists() => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                use_.enumeration_error.get_or_insert_with(|| {
+                    format!("cannot enumerate process {pid} file descriptors during cleanup: {e}")
+                });
+                continue;
+            }
+        };
+        let mut holds = false;
+        for fd in fds {
+            let fd = match fd {
+                Ok(fd) => fd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !proc_dir.exists() => break,
+                Err(e) => {
+                    use_.enumeration_error.get_or_insert_with(|| {
+                        format!(
+                            "cannot enumerate process {pid} file descriptors during cleanup: {e}"
+                        )
+                    });
+                    continue;
+                }
+            };
+            match std::fs::read_link(fd.path()) {
+                Ok(target) if target.starts_with(&dir) => {
+                    holds = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    use_.enumeration_error.get_or_insert_with(|| {
+                        format!("cannot inspect process {pid} file descriptor during cleanup: {e}")
+                    });
+                }
+            }
+        }
+        if holds {
+            use_.fd.push(pid);
+        }
+    }
+    Ok(use_)
 }
 
 /// CAD-275: how long a worktree must sit untouched before `finish`
@@ -1414,40 +1552,91 @@ fn in_use_blocks(view: &DaemonView, state_dir: &Path, t: &Target) -> (Vec<Block>
             }
         }
     }
-    // Any process standing in the worktree blocks it — an owner pane's
-    // descendants are named as such, everything else as a plain pid.
+    // Any process cwd or open descriptor in the worktree blocks removal.
+    // Enumeration failure is itself a refusal: an unreadable /proc entry
+    // cannot be interpreted as no live user.
     if let Some(d) = t.wt_dir.as_deref().filter(|d| d.is_dir()) {
-        let mut pane_hit = None;
-        let mut proc_hit = None;
-        for pid in pids_cwd_under(d) {
-            if pane_pid.is_some_and(|pp| pty::descends_from(pid, pp)) {
-                pane_hit.get_or_insert(pid);
-            } else {
-                proc_hit.get_or_insert(pid);
+        match process_use_under(d) {
+            Err(e) => blocks.push(Block {
+                tag: "process-enumeration-failed".to_string(),
+                reason: format!(
+                    "Cannot enumerate process cwd/open-fd use for {} ({e}) — refusing deletion",
+                    d.display()
+                ),
+            }),
+            Ok(uses) => {
+                if let Some(error) = &uses.enumeration_error {
+                    let live = uses
+                        .fd
+                        .first()
+                        .map(|pid| {
+                            format!(
+                                "; process {pid} ({}) holds an open file descriptor inside {}",
+                                comm_of(*pid),
+                                d.display()
+                            )
+                        })
+                        .or_else(|| {
+                            uses.cwd.first().map(|pid| {
+                                format!(
+                                    "; process {pid} ({}) has cwd inside {}",
+                                    comm_of(*pid),
+                                    d.display()
+                                )
+                            })
+                        })
+                        .unwrap_or_default();
+                    blocks.push(Block {
+                        tag: "process-enumeration-failed".to_string(),
+                        reason: format!(
+                            "Cannot fully enumerate process cwd/open-fd use ({error}){live} — refusing deletion"
+                        ),
+                    });
+                }
+                let mut pane_hit = None;
+                let mut proc_hit = None;
+                for pid in uses.cwd {
+                    if pane_pid.is_some_and(|pp| pty::descends_from(pid, pp)) {
+                        pane_hit.get_or_insert(pid);
+                    } else {
+                        proc_hit.get_or_insert(pid);
+                    }
+                }
+                if let Some(pid) = pane_hit {
+                    blocks.push(Block {
+                        tag: "pane-cwd".to_string(),
+                        reason: format!(
+                            "Owner '{}' pane descendant pid {pid} ({}) has cwd \
+                             inside {} — wait for it or pass --force",
+                            t.front.owner.as_deref().unwrap_or("?"),
+                            comm_of(pid),
+                            d.display()
+                        ),
+                    });
+                }
+                if let Some(pid) = proc_hit {
+                    blocks.push(Block {
+                        tag: "proc-cwd".to_string(),
+                        reason: format!(
+                            "Process {pid} ({}) has cwd inside {} — close it or \
+                             cd out of the worktree, or pass --force",
+                            comm_of(pid),
+                            d.display()
+                        ),
+                    });
+                }
+                if let Some(pid) = uses.fd.first() {
+                    blocks.push(Block {
+                        tag: "proc-open-fd".to_string(),
+                        reason: format!(
+                            "Process {pid} ({}) holds an open file descriptor inside {} — \
+                             close it before removing the worktree",
+                            comm_of(*pid),
+                            d.display()
+                        ),
+                    });
+                }
             }
-        }
-        if let Some(pid) = pane_hit {
-            blocks.push(Block {
-                tag: "pane-cwd".to_string(),
-                reason: format!(
-                    "Owner '{}' pane descendant pid {pid} ({}) has cwd \
-                     inside {} — wait for it or pass --force",
-                    t.front.owner.as_deref().unwrap_or("?"),
-                    comm_of(pid),
-                    d.display()
-                ),
-            });
-        }
-        if let Some(pid) = proc_hit {
-            blocks.push(Block {
-                tag: "proc-cwd".to_string(),
-                reason: format!(
-                    "Process {pid} ({}) has cwd inside {} — close it or \
-                     cd out of the worktree, or pass --force",
-                    comm_of(pid),
-                    d.display()
-                ),
-            });
         }
     }
     (blocks, deferred)
@@ -1631,6 +1820,19 @@ pub(crate) fn run(
         if refs_only && matches!(b.tag.as_str(), "not-started" | "unmerged-unpushed") {
             continue;
         }
+        let safety_probe_failed = matches!(
+            b.tag.as_str(),
+            "process-enumeration-failed"
+                | "daemon-unreachable"
+                | "agent-check-inconclusive"
+                | "activity-check-failed"
+        ) || b.tag.starts_with("dirty-check-failed:");
+        if safety_probe_failed && !refs_only {
+            return Err(Error::rejected(format!(
+                "{} — failed safety enumeration cannot be overridden with --force",
+                b.reason
+            )));
+        }
         if force {
             overridden.push(b.tag);
         } else {
@@ -1669,6 +1871,44 @@ pub(crate) fn run(
     // delete below, not this check.
     if let Some(reason) = stale_evidence_reason(&t.root, &t.branch, &ev) {
         return Err(Error::rejected(reason));
+    }
+    // Local live-use is rechecked at the destructive boundary. Daemon and
+    // tracker bindings were probed unlocked above; new tracker refs make the
+    // stale-probe check fail, while process cwd/FD use can change without a
+    // tracker write.
+    if !refs_only {
+        if let Some(d) = t.wt_dir.as_deref().filter(|d| d.is_dir()) {
+            match process_use_under(d) {
+                Err(e) => {
+                    return Err(Error::rejected(format!(
+                        "Cannot revalidate process cwd/open-fd use for {} ({e}) — refusing deletion; --force cannot override failed enumeration",
+                        d.display()
+                    )))
+                }
+                Ok(uses) if uses.enumeration_error.is_some() => {
+                    return Err(Error::rejected(format!(
+                        "Cannot fully revalidate process cwd/open-fd use for {} ({}) — refusing deletion; --force cannot override failed enumeration",
+                        d.display(), uses.enumeration_error.as_deref().unwrap_or("unknown process enumeration failure")
+                    )))
+                }
+                Ok(uses) if !uses.cwd.is_empty() || !uses.fd.is_empty() => {
+                    let pid = uses.cwd.first().or_else(|| uses.fd.first()).copied().unwrap_or(0);
+                    let tag = if uses.cwd.contains(&pid) { "proc-cwd" } else { "proc-open-fd" };
+                    let reason = format!(
+                        "Process {pid} ({}) began using {} during finish — close it before deletion",
+                        comm_of(pid), d.display()
+                    );
+                    if force {
+                        if !overridden.iter().any(|old| old == tag) {
+                            overridden.push(tag.to_string());
+                        }
+                    } else {
+                        return Err(Error::rejected(reason));
+                    }
+                }
+                Ok(_) => {}
+            }
+        }
     }
     let merged_by = merged_how.map_or(Value::Null, |h| json!(h));
     let dir = t.dir.clone();
@@ -1757,9 +1997,10 @@ pub(crate) fn run(
     // One tracker commit marks the refs closed — kept as history. A
     // branch this finish left standing (`--keep-branch`, kept for its
     // remote, an uncovered or moved tip) keeps its ref open, so the
-    // surviving work stays on the board and finishable (CAD-145). The
-    // refs-only close of a gone dir closes both (CAD-274).
-    let branch_kept = !refs_only && !deleted_branch && branch_tip(&root, &branch).is_some();
+    // surviving work stays on the board and finishable (CAD-145). A
+    // refs-only close of a missing checkout closes only the worktree ref;
+    // any surviving branch ref remains open for recovery.
+    let branch_kept = !deleted_branch && !branch.is_empty() && branch_tip(&root, &branch).is_some();
     for r in &mut t.front.refs {
         if (r.kind == "worktree"
             && wt_dir
@@ -1807,6 +2048,25 @@ pub(crate) fn run(
         }
         return Err(e);
     }
+    let disposition = if branch_kept {
+        format!("checkout released; branch {branch} retained")
+    } else {
+        format!("checkout released; branch {branch} removed or already missing")
+    };
+    // Record the checkout disposition while the issue lock still excludes a
+    // concurrent restart of this lane. This is local metadata only; the
+    // potentially slow remote delete remains after the lock is released.
+    let lifecycle_warning = wt_dir.as_deref().and_then(|d| {
+        match crate::worktree::lifecycle::contains(&root, d) {
+            Ok(false) => None, // Legacy issue refs remain authoritative.
+            Ok(true) => {
+                crate::worktree::lifecycle::transition(&root, d, "released", Some(&disposition))
+                    .err()
+                    .map(|e| e.to_string())
+            }
+            Err(e) => Some(e.to_string()),
+        }
+    });
     // The commit phase is done — the pm lock goes back before the
     // remote delete: a `push` can take seconds and the lock's spin
     // deadline is 15s. The lease below, not lock ordering, is what
@@ -1875,6 +2135,8 @@ pub(crate) fn run(
         "merged_by": merged_by,
         "not_started": matches!(ev.state, Branch::NotStarted { .. }),
         "refs_only": refs_only,
+        "checkout_disposition": disposition,
+        "lifecycle_warning": lifecycle_warning,
         "status": t.front.status,
     });
     if let Some(target) = &cargo_target {

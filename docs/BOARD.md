@@ -627,9 +627,10 @@ the `Issue: <ID>` trailer — as JSON.
   else it refuses naming the candidates. An explicit `--repo` must be
   one of the declared repos (code-commit discovery only walks those);
   an undeclared path is refused with the declared list and a pointer
-  to `repos` in `project.yaml`. **Base** resolves `--base`, then the
-  repo's `origin/HEAD` target, then the current branch; no fetch ever
-  runs.
+  to `repos` in `project.yaml`. **Base** resolves `--base`, else fetches
+  the branch named by `origin/HEAD` and pins its exact commit SHA; a
+  repository without a remote default falls back to its current branch.
+  A fetch failure refuses setup with a retry/explicit `--base` remedy.
 - The worktree is minted through the same helper as
   `cadence devin --worktree` (shared `src/worktree.rs`), including the
   `.gitignore` `.cadence/` rule — added only when missing.
@@ -685,6 +686,29 @@ the `Issue: <ID>` trailer — as JSON.
   every worktree's and the main checkout's root `.env`. Deleting them
   is manual (edit `<common-git-dir>/info/exclude`); `issue finish`
   deliberately does not, because other worktrees still use theirs.
+- `.cadence/managed-checkouts.json` records repository, purpose, tool,
+  owner, checkout path, branch and the exact setup SHA. A `preparing`
+  record is written before creating a new development lane; retries heal
+  setup and expose `setup-failed`/interrupted records instead of inferring
+  ownership from a name or directory prefix. Issue refs remain authoritative
+  for development lanes. Review and validation callers use the same ledger
+  for exact-SHA ownership and explicit `released`/`retained` state.
+- `cadence issue checkout inventory --repo <repo>` emits one structured,
+  read-only `cadence.worktree-inventory/1` report, including the repo-scoped
+  merged-lane and idle-cache cleanup plan. Unknown linked trees are
+  inventory-only; explicitly adopt one with complete fields:
+  ```sh
+  cadence issue checkout adopt --repo <repo> --path <path> \
+    --purpose validation --tool <tool> --owner <owner> --pinned-sha <full-sha>
+  ```
+  Adoption validates the Git common directory and exact HEAD. `checkout release`
+  and `checkout retain` only record the disposition — they never delete a
+  checkout, branch, receipt or artifact.
+- `cadence issue reclaim` is a read-only plan by default. It reports the
+  merged-lane sweep and idle lane-local target cache estimates using the same
+  guards as the scheduled pass; `--apply` opts into only the existing finish
+  and target-cache policy. New tool-checkout deletion remains report-only.
+  A truncated byte walk is `null`/unknown, never an invented estimate.
 - One tracker commit records a `branch` ref (label = repo basename)
   and a `worktree` ref (absolute path), the status/owner updates and
   the CAD-42 `Issue:`/`Actor:` trailers under subject
@@ -873,14 +897,18 @@ checked — it re-sends a task whose job was minted through the checked
 `issue finish <ID>` is the other end — safe cleanup of the recorded
 worktree+branch pair. An issue with several open worktree refs needs
 `--worktree <path>` to name one (a bare finish refuses, listing them);
-when that directory is already gone, `--worktree` only marks its
-worktree/branch refs `closed: true` in one tracker commit — no git
-state is touched and a surviving branch is kept (`refs_only: true`,
-`branch_note` says so). It refuses, naming what it found, while:
+when that directory is already gone, `--worktree` closes the missing
+worktree ref only; a surviving branch stays open and its commits are
+preserved (`refs_only: true`, `branch_note` and `checkout_disposition`
+name the result). If both the checkout and branch are missing, refs can be
+closed as tracker history without touching Git objects. A moved branch or
+checkout is not guessed at. It refuses, naming what it found, while:
 
 - the issue's `owner` agent has a queued/running message or a pty pane
   that probes busy (the daemon must be reachable — it refuses rather
   than guesses; an `inbox` owner is a durable mailbox, never busy),
+- a process has cwd or an open file descriptor under the checkout; failed
+  process enumeration is a refusal, not evidence that the tree is idle,
 - the worktree has uncommitted changes — ignored paths like the
   `ui/node_modules` build symlink don't count (the refusal lists what
   does),
@@ -915,8 +943,10 @@ literal check on the path after the removal (a target inside the
 worktree reports `false`; the field is omitted when nothing was
 recorded). The issue's status is not touched: status follows the job
 or the PM.
-`--force` overrides each refusal and is recorded — the `overrode`
-list in the output and a `Forced: true` trailer on the commit.
+`--force` overrides ordinary work/activity refusals and is recorded —
+the `overrode` list in the output and a `Forced: true` trailer on the
+commit. It cannot override a failed process, daemon-binding, dirty-tree
+or activity enumeration; an unknown check is not evidence of no live use.
 `--keep-branch` removes only the worktree.
 
 ## Project memory — `cadence memory`
