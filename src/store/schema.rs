@@ -129,9 +129,9 @@ impl Store {
         Self::open_mode(path, super::seal::OpenMode::Legacy)
     }
 
-    /// `open` with an explicit deployment mode. `Protected` is a startup
-    /// *request* (agent_uid/hosted.lease provenance) that forces strict
-    /// refusals — never external restore/init authority.
+    /// `open` with an explicit deployment mode. `Protected` is a refusal-only
+    /// selector, never authority derived from agent_uid or a hosted lease.
+    /// Authentic protected startup uses `open_owned`.
     pub fn open_mode(path: &Path, mode: super::seal::OpenMode) -> Result<Self> {
         Self::open_adopting_mode(path, None, mode).map(|(store, _)| store)
     }
@@ -190,7 +190,7 @@ impl Store {
             .map(|(store, _)| store)
     }
 
-    fn open_inner(
+    pub(super) fn open_inner(
         path: &Path,
         marker: Option<ConsumedMarker>,
         gate: bool,
@@ -995,6 +995,147 @@ impl Store {
         } else {
             None
         };
+        Ok((store, outcome))
+    }
+
+    /// Authentic opening is separate from the refusal-only mode selector.
+    /// No SQLite connection, journal recovery or writable open occurs before
+    /// the external owner consumes the exact one-use permit.
+    pub(super) fn open_protected(
+        permit: &super::seal::owner::StoreOpenPermit,
+    ) -> Result<(Self, RecoveryOutcome)> {
+        use super::seal::{self, owner};
+        use rusqlite::{OpenFlags, Transaction, TransactionBehavior};
+        let binding = permit.binding();
+        let path = Path::new(&binding.path);
+        owner::check_path(path)?;
+        permit.recheck()?;
+        permit.take()?;
+        permit.recheck()?;
+
+        // Build fresh schema privately in memory. The externally visible file
+        // never has a migration window without a closure/incarnation latch.
+        let (mut store, _) = Self::open_inner(
+            Path::new(":memory:"),
+            None,
+            false,
+            false,
+            seal::OpenMode::Legacy,
+        )?;
+        let mut destination;
+        if binding.purpose == owner::Purpose::Init {
+            use std::fs::OpenOptions;
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            permit.recheck()?;
+            // Existing (including empty) files cannot be fresh initialization.
+            // Failure leaves the external obligation spent; never erase/retry.
+            let file = options.open(path)?;
+            owner::check_path(path)?;
+            {
+                let conn = store.conn();
+                seal::with_owner_tx_control(&store.seal_state, || -> Result<()> {
+                    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+                    tx.execute_batch(seal::SEAL_SCHEMA)?;
+                    tx.execute_batch(owner::IDENTITY_SCHEMA)?;
+                    owner::insert_identity(&tx, binding)?;
+                    tx.execute(
+                        "INSERT INTO closure_state(id,closed,challenge,attempt,artifact,epoch,witness_done)
+                         VALUES(1,0,X'', '', '',?1,0)", [binding.database_epoch as i64],
+                    )?;
+                    permit.recheck()?;
+                    tx.commit()?;
+                    Ok(())
+                })?;
+                destination = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+                destination.busy_timeout(BUSY_TIMEOUT)?;
+                permit.recheck()?;
+                // A failed backup must leave a sealed refusal, not a latch-
+                // absent file a legacy writer could elect as fresh. SQLite's
+                // backup destination transaction replaces this only on success.
+                let seed =
+                    Transaction::new_unchecked(&destination, TransactionBehavior::Immediate)?;
+                seed.execute_batch(seal::SEAL_SCHEMA)?;
+                seed.execute(
+                    "INSERT INTO closure_state(id,closed,reason,challenge,attempt,artifact,epoch,witness_done)
+                     VALUES(1,1,'owner initialization incomplete',?1,?2,?3,?4,0)",
+                    rusqlite::params![binding.challenge, binding.attempt, binding.artifact, binding.database_epoch as i64],
+                )?;
+                permit.recheck()?;
+                seed.commit()?;
+                rusqlite::backup::Backup::new(&conn, &mut destination)?.run_to_completion(
+                    128,
+                    Duration::from_millis(10),
+                    None,
+                )?;
+            }
+            file.sync_all()?;
+            permit.recheck()?;
+        } else {
+            if !matches!(
+                binding.purpose,
+                owner::Purpose::Open | owner::Purpose::Restore
+            ) {
+                return Err(Error::rejected("wrong Store opening purpose"));
+            }
+            // Immutable read forbids SQLite recovery or SHM creation before
+            // validation. Restore digest covers a standalone image, no WAL.
+            owner::preflight_existing(path, binding)?;
+            permit.recheck()?;
+            owner::check_path(path)?;
+            destination = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            destination.busy_timeout(BUSY_TIMEOUT)?;
+        }
+        let state = std::sync::Arc::new(seal::GuardState::default());
+        seal::install_authorizer(&destination, state.clone());
+        seal::with_owner_tx_control(&state, || -> Result<()> {
+            permit.recheck()?;
+            // Fresh init or a validated standalone restored artifact may
+            // switch journal format ONLY after owner consumption/provenance.
+            let mode: String =
+                destination.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+            if mode != "wal" {
+                return Err(Error::rejected(
+                    "authenticated protected open could not establish WAL",
+                ));
+            }
+            permit.recheck()?;
+            let tx = Transaction::new_unchecked(&destination, TransactionBehavior::Immediate)?;
+            owner::validate_open_tx(&tx, binding)?;
+            if binding.purpose == owner::Purpose::Restore {
+                // Externally validated artifact and strictly newer incarnation
+                // authorize this transition, never the restored tombstone.
+                tx.execute(
+                    "UPDATE store_incarnation SET incarnation=?1,epoch=?2,operation=?3,artifact=?4 WHERE id=1",
+                    rusqlite::params![binding.incarnation, binding.database_epoch as i64,
+                        binding.operation, binding.artifact],
+                )?;
+                tx.execute(
+                    "UPDATE closure_state SET closed=0,reason=NULL,challenge=X'',attempt='',artifact='',
+                     epoch=?1,witness_done=0,closed_at=NULL WHERE id=1",
+                    [binding.database_epoch as i64],
+                )?;
+            }
+            permit.recheck()?;
+            tx.commit()?;
+            Ok(())
+        })?;
+        *state
+            .owner
+            .lock()
+            .map_err(|_| Error::rejected("Store owner binding poisoned"))? = Some(permit.current());
+        store.conn = Mutex::new(destination);
+        store.seal_state = state;
+        store.protected_open = true;
+        store.db_identity = binding.path.clone();
+        // Restored shutdown.json cannot adopt a process. All outstanding
+        // submitting/running obligations retain UNKNOWN after crash/ACK loss.
+        let outcome = store.recover(None)?;
+        permit.recheck()?;
         Ok((store, outcome))
     }
 
