@@ -149,8 +149,10 @@ fn entry() -> Result<()> {
         });
     }
     let provider_env = crate::adapter::ProviderEnv::default();
-    // Fixed application data routing, never an identity/authority selector.
-    provider_env.set("CADENCE_PM_DIR", "/workspace/pm");
+    // Match the helper's fixed mutable company PM leaf; /workspace itself
+    // remains supervisor-owned, non-writable to the guest. This path routes
+    // application data, never identity/authority or a model-policy bypass.
+    provider_env.set("CADENCE_PM_DIR", "/workspace/company/pm");
     provider_env.set("CADENCE_STATE_DIR", "/srv/cadence/protected/store");
     crate::daemon::serve_with(
         std::path::Path::new("/srv/cadence/protected/store"),

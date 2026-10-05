@@ -49,7 +49,9 @@ impl Task {
             } else {
                 "worker"
             },
-            cwd: "/workspace",
+            // Match the helper's held guest-writable repository leaf. The
+            // supervisor-owned /workspace ancestor remains non-writable.
+            cwd: "/workspace/company",
             sandbox: "native-protected",
             instructions: None,
             params: Some(&params),
