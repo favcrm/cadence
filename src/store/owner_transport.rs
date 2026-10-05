@@ -14,6 +14,12 @@ use std::sync::Mutex;
 
 const ENDPOINT: &str = "/run/cadence/private/store-owner.sock";
 const OWNER_UID: u32 = 21000;
+// ROOT creates/listens before handing an accepted FD to an optional sealed
+// proxy. SO_PEERCRED identifies that listener, not the socket inode's owner.
+// This authenticates transport only; the service must retain real caller
+// custody, qualified runtime scope and actual durable external facts.
+const SERVER_UID: u32 = 0;
+const SERVER_GID: u32 = 0;
 const MAX_FRAME: usize = 32 * 1024;
 const IO_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -268,8 +274,8 @@ impl Channel {
         if rc != 0
             || size as usize != std::mem::size_of::<libc::ucred>()
             || cred.pid <= 0
-            || cred.uid != OWNER_UID
-            || cred.gid != OWNER_UID
+            || cred.uid != SERVER_UID
+            || cred.gid != SERVER_GID
         {
             return Err(Error::rejected(
                 "Store owner kernel peer authentication refused",
