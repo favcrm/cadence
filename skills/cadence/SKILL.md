@@ -436,9 +436,11 @@ During implementation and handoff:
   does not itself authorize a merge, deployment, cleanup or message replay.
 
 When the increment merges, clean up before anything else: mark the ticket
-done (`cadence issue reconcile`), remove the worktree and branches
-(`cadence issue finish <ID> --remote`), delete your scratch and stop the
-processes you started, and close any PR you abandoned with a link.
+done with `cadence issue reconcile --project <key>` (say on the ticket why
+if it holds it), delete your scratch and stop the processes you started,
+and close any PR you abandoned with a link. Leave the worktree to a later
+reconcile sweep, which removes it once nothing stands in it; never
+`--force` `issue finish`.
 
 At a completed increment, QA revision, incident or repeated blocker, append a
 compact reflection to the existing task: **expected outcome; observed evidence;

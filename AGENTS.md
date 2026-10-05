@@ -415,10 +415,12 @@ mapping, process owner, permitted operations and rollback artifact.
 ### Finish: clean up as soon as the PR merges
 - Run `cadence issue reconcile --project <key>`. It marks the ticket done
   from the merge evidence; if it reports the tracker write lock, run it
-  again.
-- Run `cadence issue finish <ID> --remote` to remove the worktree and both
-  branches. It refuses a worktree touched in the last 30 minutes; wait,
-  don't `--force`.
+  again. If it holds the ticket (an open PR, a claim newer than the merge),
+  say why on the ticket so the PM can close it.
+- Leave the worktree to the sweep. GitHub deletes the merged branch, and a
+  later `issue reconcile` (also run by `issue sync`) removes the worktree
+  and local branch once no turn, shell or process stands in it. Never
+  `--force` `issue finish`.
 - Delete your own scratch files by name and stop the servers and processes
   you started.
 - A PR you abandon or replace: close it with a link to what replaces it and
