@@ -6,6 +6,8 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
 
 1. One PR per feature. Small PRs review and merge fast, and a split feature
    leaves main half-built.
+   Essentials first: the simplest change that meets the acceptance items,
+   extras to a follow-up ticket, polish in later PRs.
 2. Put the design note in the PR description, not in a separate document.
 3. Run `scripts/pre-push` before every push (`--tests` before asking for
    review of Rust changes).
