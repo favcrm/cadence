@@ -151,6 +151,43 @@ pub(crate) fn runtime_proof(until: Instant) -> Result<RuntimeProof> {
         until: r.auth.until,
     })
 }
+static PI_KEYS: OnceLock<Vec<super::PiKeyRecord>> = OnceLock::new();
+/// Only the real qualified root context and separately authenticated runtime
+/// can deliver these read-only PUBLIC keys. No caller key or guest key file.
+pub(crate) fn pi_public_keys(until: Instant) -> Result<&'static [super::PiKeyRecord]> {
+    let r = active()?;
+    r.check(until)?;
+    if PI_KEYS.get().is_none() {
+        let (bootstrap, _, _, _) = context::runtime_parts()?;
+        let ring = bootstrap.manifest.pi_trust.as_ref().ok_or_else(refused)?;
+        let keys = ring
+            .iter()
+            .map(|k| {
+                Ok((
+                    k.issuer.clone(),
+                    k.kid.clone(),
+                    k.key_version,
+                    decode(&k.public_key, 32)?
+                        .try_into()
+                        .map_err(|_| refused())?,
+                ))
+            })
+            .collect::<Result<Vec<super::PiKeyRecord>>>()?;
+        if keys.is_empty() {
+            return Err(refused());
+        }
+        PI_KEYS.set(keys).map_err(|_| refused())?;
+    }
+    r.check(until)?;
+    Ok(PI_KEYS.get().ok_or_else(refused)?.as_slice())
+}
+/// Pi signature expiry must be no later than this authenticated runtime/image
+/// bound, in addition to its own <=30s operation window and durable currentness.
+pub(crate) fn pi_expires_at_ms(until: Instant) -> Result<u64> {
+    let r = active()?;
+    r.check(until)?;
+    Ok(r.auth.expires_at_ms)
+}
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum StorePurpose {

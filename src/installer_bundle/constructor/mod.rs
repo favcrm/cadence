@@ -22,12 +22,15 @@ pub(crate) use context::{
 };
 pub(crate) use helper::{HelperPhase, HelperStdio, OwnedHelper};
 pub(crate) use lifecycle::{
-    pi_acquire, pi_consume, pi_current, runtime_current, runtime_proof, RuntimeProof,
+    pi_acquire, pi_consume, pi_current, pi_expires_at_ms, pi_public_keys, runtime_current,
+    runtime_proof, RuntimeProof,
 };
 use serde::{Deserialize, Serialize};
 use std::os::fd::AsRawFd;
 pub(crate) use wire::{Kind, OwnerResponse};
 
+/// PUBLIC purpose-elected keys only; never a signer or caller-shaped factory.
+pub(crate) type PiKeyRecord = (String, String, u64, [u8; 32]);
 const DOMAIN: &[u8] = b"cadence.native-image-qualification.v1\0";
 const MAX_SAFE: u64 = 9007199254740991;
 const MAX_KEY_VERSION: u64 = 2147483647;
@@ -133,6 +136,9 @@ pub(super) struct Manifest {
     /// authorize a runtime lifetime. Absent means runtime remains unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_trust: Option<Vec<PublicTrust>>,
+    /// Independent Pi purpose election; no receipt/grant/runtime fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi_trust: Option<Vec<PublicTrust>>,
 }
 
 /// Non-exported, non-Clone production token. Only authenticated bootstrap can
@@ -287,6 +293,9 @@ pub(super) fn authenticate_bootstrap(bytes: &[u8], now_ms: u64) -> Result<Qualif
     trust(&manifest.receipt_trust)?;
     trust(&manifest.grant_trust)?;
     if let Some(keys) = &manifest.runtime_trust {
+        trust(keys)?;
+    }
+    if let Some(keys) = &manifest.pi_trust {
         trust(keys)?;
     }
     let key = IMAGE_AUTHORITY_KEYS
