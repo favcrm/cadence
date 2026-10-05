@@ -24,7 +24,10 @@ it in later PRs. When two approaches both meet the ticket, pick the smaller
 one and say why in the PR. Plan the same way: one ticket per feature, its
 acceptance covering the feature end to end. Split into more tickets only for
 another repository or an outcome the operator can use on its own, never a
-ticket per step.
+ticket per step. Before asking for review, simplify your own diff: drop dead
+code, duplication and abstractions the change does not need, in the lines
+you changed only, with no behaviour change and no refactor outside the
+ticket. Doing it before review costs no extra head.
 
 ### Before you start, and before every push
 - Run `git fetch origin`. Then run
@@ -77,9 +80,12 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   security or ticket-requirement gap. Everything else (wording, docs,
   comments, style, extra tests) is a note: the reviewer PASSes with notes,
   and the author fixes them in a follow-up PR, not in the reviewed PR,
-  because a new head voids every verdict. A gate or daemon-enforced rule
-  change without its acceptance check ("Gates and security work") is a
-  REVISE, not a note.
+  because a new head voids every verdict. After a PASS with notes, the
+  author files one follow-up ticket listing them, or says on the ticket why
+  they are dropped. Complexity that hides a bug or makes the change
+  unverifiable is a correctness gap (REVISE); plain style stays a note. A
+  gate or daemon-enforced rule change without its acceptance check ("Gates
+  and security work") is a REVISE, not a note.
 - **The path list is a floor.** A single reviewer who sees auth, identity,
   credential, signature, secret or confinement logic (triggers 1 and 3) in
   a one-review PR returns REVISE asking for a second (Spec/security)
