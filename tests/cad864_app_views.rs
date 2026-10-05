@@ -490,10 +490,10 @@ fn cad864_descriptor_installs_and_rides_the_verified_receipt() {
     let descriptor = &shown["view_descriptor"];
     assert_eq!(descriptor["contract"], "app-views/v1");
     assert_eq!(descriptor["app"], "blog-post");
+    let expected_descriptor: Value = serde_json::from_str(&Workspace::descriptor_text()).unwrap();
     assert_eq!(
-        descriptor["views"].as_array().unwrap().len(),
-        3,
-        "descriptor serves its declared views through the receipt"
+        descriptor, &expected_descriptor,
+        "receipt serves the full source descriptor, including every declared view and field"
     );
     // The receipt's descriptor digest matches the bytes in the
     // installation's bundle digest (content-covered, so a descriptor
