@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -1371,12 +1372,36 @@ pub fn mark_done_on_merge(
     actor: &str,
     expect: Option<&str>,
 ) -> std::result::Result<Option<String>, DoneWriteFailure> {
+    mark_done_on_merge_waiting(pm, id, why, actor, expect, Duration::ZERO)
+}
+
+/// `mark_done_on_merge` for a CLI caller (CAD-1150): a busy tracker lock
+/// is retried with a short backoff for up to `wait` before it is
+/// reported. The daemon passes no wait and keeps the never-wait rule.
+pub fn mark_done_on_merge_waiting(
+    pm: &Pm,
+    id: &str,
+    why: &str,
+    actor: &str,
+    expect: Option<&str>,
+    wait: Duration,
+) -> std::result::Result<Option<String>, DoneWriteFailure> {
     let mut from = None;
     let result = (|| -> Result<Option<String>> {
-        let Some(_lock) = pm.try_lock()? else {
-            return Err(Error::rejected(
-                "the tracker is locked by another writer (write lock)",
-            ));
+        let deadline = Instant::now() + wait;
+        let mut backoff = Duration::from_millis(50);
+        let _lock = loop {
+            if let Some(lock) = pm.try_lock()? {
+                break lock;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Error::rejected(
+                    "the tracker is locked by another writer (write lock)",
+                ));
+            }
+            std::thread::sleep(backoff.min(left));
+            backoff = (backoff * 2).min(Duration::from_millis(500));
         };
         let (_project, dir) = issue_dir(pm, id)?;
         let (mut front, body) = load_front(&dir)?;
