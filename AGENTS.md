@@ -11,8 +11,17 @@ and discover peers with `cadence agent list`.
 
 ## Delivery workflow
 
-Main moves every few minutes and many sessions work in parallel. Follow
-this workflow exactly.
+Main moves every few minutes and many sessions work in parallel. The
+merge, approval and production-safety steps below are exact; follow them
+as written.
+
+### Scope: essentials first
+Deliver the ticket's acceptance items end to end with the simplest change
+that meets them, then stop. Refactors, new abstractions, adjacent fixes and
+nice-to-haves you notice go into a follow-up ticket, not this PR. Polish
+progressively: get the essential path working and reviewed first, improve
+it in later PRs. When two approaches both meet the ticket, pick the smaller
+one and say why in the PR.
 
 ### Before you start, and before every push
 - Run `git fetch origin`. Then run
@@ -242,32 +251,8 @@ work" below. Removing an existing check that guards merged code needs the
 operator's explicit decision, recorded on the ticket.
 
 #### Emergency clean-slate transition
-
-When the operator wants to retire the legacy suite without waiting for a full
-replacement, an explicit operator-approved ticket may declare a time-bounded
-transition and its merge gate. The declaration must name the deleted test scope,
-the reduced checks allowed to merge, residual controls, duration and how the
-normal gates return. An agent or PR may not grant that exception to itself.
-
-- During the window, an approved PR may remove the named legacy tests and merge
-  through only the approved reduced gate. The exception does not delete
-  production effects, authorization or enforcement code; it changes which
-  retained tests and required checks may be suspended for the named scope. A
-  documentation-only/non-logic diff may use the declared reduced gate instead
-  of the heavy compile/test pipeline where that gate has been explicitly
-  approved and wired; this section by itself does not alter required CI.
-- Changes merged under the transition must not produce release or production
-  artifacts, and cleanup cannot depend on unverified state. A check that still
-  protects a residual control remains mandatory; unknown or uncontrollable
-  effects stay outside the window.
-- Every reduced-gate PR still identifies the intended behavior and residual
-  unprotected contracts, records executed checks and limitations, and receives
-  the reviews/approval its own diff requires. A temporary gate cannot waive
-  the risk classification itself.
-- At expiry the declared restore criteria apply: the replacement behavior
-  checks or the restored mandatory controls must be present before ordinary
-  delivery resumes. The exception is evidence for a controlled transition, not
-  proof that the removed coverage was safe or equivalent.
+Only an explicit operator-approved ticket can open one; the rules are in
+`docs/DEV-CYCLE.md` ("Emergency clean-slate transition").
 
 ### Checks: trust exit codes, not filtered text
 - A shell hook routes commands through `rtk`, which can print "clean" or
@@ -283,7 +268,7 @@ normal gates return. An agent or PR may not grant that exception to itself.
 - Before every push run `scripts/pre-push` (fmt, live doctor split check,
   clippy, UI typecheck and active script contracts for what you changed).
   Use `scripts/pre-push --tests` before requesting review of Rust changes:
-  during CAD-1073 it always runs the safety floor, even when its source is
+  it always runs the safety floor, even when its source is
   unchanged. It is the regression floor, not proof of the ticket's outcome (see "Behavior-first verification").
   Integration split manifests are retired; do not run `split-map-sync`
   until a reviewed inventory restoration establishes its inputs.
