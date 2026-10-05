@@ -21,6 +21,12 @@ pub(crate) enum Packet {
         version: u8,
         domain: Domain,
     },
+    Serving {
+        version: u8,
+    },
+    ServingStopped {
+        version: u8,
+    },
     Close {
         version: u8,
         binding: crate::store::Binding,
@@ -66,6 +72,18 @@ pub(crate) enum Packet {
         version: u8,
     },
 }
+pub(crate) fn send_serving(
+    socket: &UnixDatagram,
+    private: &std::os::unix::net::UnixListener,
+    shared: &std::os::unix::net::UnixListener,
+) -> Result<()> {
+    send(
+        socket,
+        &Packet::Serving { version: 1 },
+        &[private.as_raw_fd(), shared.as_raw_fd()],
+        Deadline(std::time::Instant::now() + std::time::Duration::from_secs(10)),
+    )
+}
 #[repr(C)]
 struct Aligned([usize; 32]);
 pub(super) fn send(
@@ -74,7 +92,12 @@ pub(super) fn send(
     fds: &[RawFd],
     deadline: Deadline,
 ) -> Result<()> {
-    if fds.len() > 1 {
+    let expected = match packet {
+        Packet::Accepted { version: 1, .. } => 1,
+        Packet::Serving { version: 1 } => 2,
+        _ => 0,
+    };
+    if fds.len() != expected {
         return Err(refused());
     }
     let mut bytes = serde_json::to_vec(packet).map_err(|_| refused())?;
@@ -92,12 +115,14 @@ pub(super) fn send(
     if !fds.is_empty() {
         unsafe {
             msg.msg_control = control.0.as_mut_ptr().cast();
-            msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize;
+            msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) as usize;
             let c = libc::CMSG_FIRSTHDR(&msg);
             (*c).cmsg_level = libc::SOL_SOCKET;
             (*c).cmsg_type = libc::SCM_RIGHTS;
-            (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
-            std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<RawFd>(), fds[0]);
+            (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(fds) as u32) as usize;
+            for (i, fd) in fds.iter().enumerate() {
+                std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<RawFd>().add(i), *fd);
+            }
         }
     }
     loop {
@@ -181,10 +206,10 @@ pub(crate) fn receive(socket: &UnixDatagram) -> Result<Option<(Packet, Vec<Owned
     }
     bytes.truncate(n as usize);
     let packet: Packet = serde_json::from_slice(&bytes).map_err(|_| refused())?;
-    let expected = if matches!(&packet, Packet::Accepted { version: 1, .. }) {
-        1
-    } else {
-        0
+    let expected = match &packet {
+        Packet::Accepted { version: 1, .. } => 1,
+        Packet::Serving { version: 1 } => 2,
+        _ => 0,
     };
     if fds.len() != expected {
         return Err(refused());

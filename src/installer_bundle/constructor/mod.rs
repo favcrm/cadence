@@ -17,6 +17,7 @@ pub(crate) mod private_wire;
 mod runtime;
 pub(crate) mod runtime_child;
 mod runtime_kernel;
+mod serving;
 mod wire;
 pub use helper_trust::{helper_image_trust, HelperImageTrust};
 pub(crate) use runtime_kernel::OwnedDaemon;

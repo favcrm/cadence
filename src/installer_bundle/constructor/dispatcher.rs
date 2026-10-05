@@ -147,6 +147,10 @@ struct TaskState {
 struct Registry {
     task: Mutex<Option<TaskState>>,
     task_history: Mutex<std::collections::HashSet<String>>,
+    serving: OnceLock<super::serving::OwnedServing>,
+    serving_stopped: std::sync::atomic::AtomicBool,
+    buffered: Mutex<std::collections::VecDeque<(Packet, Vec<std::os::fd::OwnedFd>)>>,
+    buffered_bytes: std::sync::atomic::AtomicUsize,
     daemon: OwnedDaemon,
     layout: Layout,
     sockets: [Socket; 2],
@@ -157,6 +161,7 @@ static REGISTRY: OnceLock<Registry> = OnceLock::new();
 pub(super) fn launch_live(until: Instant) -> Result<()> {
     let r = registry()?;
     r.check(until)?;
+    r.serving_current(until)?;
     let task = r.task.lock().map_err(|_| refused())?;
     let task = task.as_ref().ok_or_else(refused)?;
     if task.cancelled || task.retiring || task.retired {
@@ -183,6 +188,87 @@ fn registry() -> Result<&'static Registry> {
     REGISTRY.get().ok_or_else(refused)
 }
 impl Registry {
+    fn serving_current(&self, until: Instant) -> Result<Value> {
+        use std::sync::atomic::Ordering;
+        self.sample_control()?;
+        if self.serving_stopped.load(Ordering::SeqCst) {
+            return Err(refused());
+        }
+        let proof = self.serving.get().ok_or_else(refused)?;
+        proof.recheck(&self.daemon, &self.layout, until)?;
+        self.database()?;
+        let facts = {
+            let db = self.db.lock().map_err(|_| refused())?;
+            if db.closed {
+                return Err(refused());
+            }
+            db.startup.clone().ok_or_else(refused)?
+        };
+        // Independent committed WAL-aware READ_ONLY identity/schema32/open-latch
+        // observation, never the same blocked Store mutex or a recovery writer.
+        super::capture::database_current(&facts.binding, until)?;
+        let (bootstrap, _, _, _) = context::runtime_parts()?;
+        let a = &bootstrap.manifest.artifacts;
+        proof.recheck(&self.daemon, &self.layout, until)?;
+        self.database()?;
+        self.sample_control()?;
+        if self.serving_stopped.load(Ordering::SeqCst) {
+            return Err(refused());
+        }
+        Ok(
+            json!({"version":1,"reference":self.reference,"revision":1,"databaseReference":facts.reference,"helperSha256":a.helper,"nodeSha256":a.node,"profileSha256":a.pi_graph,"policySha256":a.policy}),
+        )
+    }
+    // During a provider owner await, sample terminal LOCAL control NOW, not
+    // only after its reply. Retain all other actual packets/FDs in bounded FIFO
+    // for the outer serial dispatcher: never recursively exchange this channel.
+    fn sample_control(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let mut queue = self.buffered.lock().map_err(|_| refused())?;
+        while let Some((packet, fds)) = private_wire::receive(&self.daemon.control)? {
+            match packet {
+                Packet::ServingStopped { version: 1 } => {
+                    self.serving_stopped.store(true, Ordering::SeqCst);
+                }
+                Packet::Failed { .. } => {
+                    self.serving_stopped.store(true, Ordering::SeqCst);
+                    return Err(refused());
+                }
+                other @ (Packet::Accepted { version: 1, .. }
+                | Packet::Serving { version: 1 }
+                | Packet::TaskEvent { version: 1, .. }
+                | Packet::Retired { version: 1, .. }
+                | Packet::Closed { version: 1, .. }
+                | Packet::Witnessed { version: 1, .. }) => {
+                    let size = serde_json::to_vec(&other).map_err(|_| refused())?.len();
+                    let total = self
+                        .buffered_bytes
+                        .load(Ordering::SeqCst)
+                        .checked_add(size)
+                        .ok_or_else(refused)?;
+                    if queue.len() >= 4096 || total > 262144 {
+                        return Err(refused());
+                    }
+                    queue.push_back((other, fds));
+                    self.buffered_bytes.store(total, Ordering::SeqCst);
+                }
+                _ => return Err(refused()),
+            }
+        }
+        Ok(())
+    }
+    fn take_packet(&self) -> Result<Option<(Packet, Vec<std::os::fd::OwnedFd>)>> {
+        let mut queue = self.buffered.lock().map_err(|_| refused())?;
+        if let Some((packet, fds)) = queue.pop_front() {
+            self.buffered_bytes.fetch_sub(
+                serde_json::to_vec(&packet).map_err(|_| refused())?.len(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Ok(Some((packet, fds)))
+        } else {
+            private_wire::receive(&self.daemon.control)
+        }
+    }
     fn check(&self, until: Instant) -> Result<()> {
         self.daemon.recheck(until)?;
         self.layout.recheck(Deadline(until))?;
@@ -482,11 +568,36 @@ fn hex(bytes: &[u8]) -> String {
 }
 fn accepted() -> Result<Option<(Domain, UnixStream)>> {
     let r = registry()?;
-    let Some((packet, mut fds)) = private_wire::receive(&r.daemon.control)? else {
+    let Some((packet, mut fds)) = r.take_packet()? else {
         return Ok(None);
     };
     r.check(Instant::now() + Duration::from_secs(10))?;
     match packet {
+        Packet::Serving { version: 1 } => {
+            let until = Instant::now() + Duration::from_secs(10);
+            if r.serving_stopped.load(std::sync::atomic::Ordering::SeqCst)
+                || r.serving.get().is_some()
+            {
+                return Err(refused());
+            }
+            let proof = super::serving::OwnedServing::capture(
+                &r.daemon,
+                &r.layout,
+                fds.into_iter().map(File::from).collect(),
+                until,
+            )?;
+            r.serving.set(proof).map_err(|_| refused())?;
+            r.serving_current(until)?;
+            lifecycle::serving_ready(&r.reference, until)?;
+            r.serving_current(until)?;
+            Ok(None)
+        }
+        Packet::ServingStopped { version: 1 } => {
+            r.serving_stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // Terminal invalidation ONLY. No rearm/physical/durable FINAL.
+            Ok(None)
+        }
         Packet::TaskEvent {
             version: 1,
             task,
@@ -496,7 +607,7 @@ fn accepted() -> Result<Option<(Domain, UnixStream)>> {
             {
                 let mut t = r.task.lock().map_err(|_| refused())?;
                 let t = t.as_mut().ok_or_else(refused)?;
-                if t.id != task || t.part != part {
+                if t.id != task || t.part != part || t.retired {
                     return Err(refused());
                 }
                 t.part = t.part.checked_add(1).ok_or_else(refused)?;
@@ -795,6 +906,10 @@ pub(super) fn run(layout: Layout) -> Result<()> {
         .set(Registry {
             task: Mutex::new(None),
             task_history: Mutex::new(std::collections::HashSet::new()),
+            serving: OnceLock::new(),
+            serving_stopped: std::sync::atomic::AtomicBool::new(false),
+            buffered: Mutex::new(std::collections::VecDeque::new()),
+            buffered_bytes: std::sync::atomic::AtomicUsize::new(0),
             daemon,
             layout,
             sockets,
@@ -858,6 +973,7 @@ pub(super) fn run(layout: Layout) -> Result<()> {
                         return Err(refused());
                     }
                     {
+                        r.serving_current(until)?; // physical+consumed DB before task/Store/Pi effects
                         let mut state = r.task.lock().map_err(|_| refused())?;
                         if state.as_ref().is_some_and(|s| !s.retired) {
                             return Err(refused());
@@ -1054,9 +1170,17 @@ pub(super) fn run(layout: Layout) -> Result<()> {
 pub(super) fn readback(query: &Value, until: Instant) -> Result<Value> {
     let r = registry()?;
     r.check(until)?;
+    r.sample_control()?;
     let obj = query.as_object().ok_or_else(refused)?;
     let result = match obj.get("type").and_then(Value::as_str) {
         Some("current") if obj.len() == 1 => json!({"reference":r.reference,"revision":1}),
+        Some("serving-current") if obj.len() == 2 => {
+            let data = r.serving_current(until)?;
+            if obj.get("reference") != data.get("databaseReference") {
+                return Err(refused());
+            }
+            data
+        }
         Some("task") if obj.len() == 2 => {
             let state = r.task.lock().map_err(|_| refused())?;
             let state = state.as_ref().ok_or_else(refused)?;

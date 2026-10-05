@@ -22,6 +22,29 @@ impl Drop for Failed {
         }
     }
 }
+// Real bound listeners are transferred only from serve_with AFTER protected
+// Store startup/recovery and actor/control setup. No caller JSON/ready flag.
+pub(super) struct ServingLifetime {
+    control: Arc<std::os::unix::net::UnixDatagram>,
+}
+pub(super) fn publish_serving(
+    private: &std::os::unix::net::UnixListener,
+    shared: &std::os::unix::net::UnixListener,
+) -> Result<ServingLifetime> {
+    let control = crate::installer_bundle::constructor::runtime_child::control()
+        .ok_or_else(|| Error::rejected("actual protected runtime control unavailable"))?;
+    private_wire::send_serving(&control, private, shared)?;
+    Ok(ServingLifetime { control })
+}
+impl Drop for ServingLifetime {
+    fn drop(&mut self) {
+        // Terminal invalidation only; never used as evidence of retirement/FINAL.
+        if private_wire::send_child(&self.control, &Packet::ServingStopped { version: 1 }).is_err()
+        {
+            unsafe { libc::_exit(125) }
+        }
+    }
+}
 pub(super) struct Maintenance {
     completed: mpsc::SyncSender<Quiesced>,
     worker: thread::JoinHandle<Result<()>>,

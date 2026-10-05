@@ -121,13 +121,17 @@ impl TrustedKey {
     }
 }
 
-/// The private production trust-set factory — permanently `Err` until the
-/// operator approves a public-key manifest, an initial trusted version and a
-/// rotation/revocation policy. No live caller may supply trust.
+/// Private qualified-constructor trust-set factory. Missing authentic Root
+/// context remains unavailable; no caller manifest/key or format-valid receipt
+/// may elect public trust. Source integration is not image qualification.
 pub(crate) fn production_trust_set() -> Result<&'static [TrustedKey]> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        crate::installer_bundle::constructor::receipt_keys()
+        crate::installer_bundle::constructor::receipt_keys().map_err(|error| {
+            Error::rejected(format!(
+                "qualified constructor receipt trust unavailable: {error}"
+            ))
+        })
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     Err(Error::rejected(

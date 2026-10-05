@@ -210,6 +210,9 @@ enum Request<'a> {
     RuntimeDaemonReady {
         reference: &'a str,
     },
+    RuntimeServingReady {
+        reference: &'a str,
+    },
     StoreStartup,
     StoreDatabaseCurrent {
         reference: &'a str,
@@ -283,6 +286,9 @@ pub(super) enum Command {
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 enum Query {
     Current,
+    ServingCurrent {
+        reference: String,
+    },
     Task {
         task: String,
     },
@@ -432,6 +438,16 @@ pub(super) fn task_event(task: &str, part: u64, bytes: &str, until: Instant) -> 
 }
 pub(super) fn daemon_ready(reference: &str, until: Instant) -> Result<()> {
     let reply = exchange(Request::RuntimeDaemonReady { reference }, until)?;
+    if reply.store.is_some() || reply.pi.is_some() {
+        return Err(refused());
+    }
+    Ok(())
+}
+pub(super) fn serving_ready(reference: &str, until: Instant) -> Result<()> {
+    if !identifier(reference) {
+        return Err(refused());
+    }
+    let reply = exchange(Request::RuntimeServingReady { reference }, until)?;
     if reply.store.is_some() || reply.pi.is_some() {
         return Err(refused());
     }

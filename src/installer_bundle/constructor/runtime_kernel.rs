@@ -526,6 +526,9 @@ impl OwnedDaemon {
         }
         Ok(())
     }
+    pub(super) fn shared_gid(&self) -> u32 {
+        self.shared_gid
+    }
     pub(super) fn cancel(&self) {
         unsafe {
             libc::syscall(

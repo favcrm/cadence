@@ -5005,6 +5005,11 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if protected.is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+    }
     // Signal-driven shutdown: set the same flag as the rpc. Installed
     // before actors launch so a signal during relaunch — or a relaunch
     // failure — still reaches `shutdown` below rather than exiting
@@ -5138,6 +5143,18 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // A loop error is a stop, never a skip: `serve_error` is returned
     // only after the shutdown below has run — the refusals and the
     // marker it writes are the next start's adoption evidence.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let protected_serving = if protected.is_some() {
+        Some(protected_runtime::publish_serving(
+            &listener,
+            &shared_socket
+                .as_ref()
+                .ok_or_else(|| Error::rejected("protected shared listener unavailable"))?
+                .listener,
+        )?)
+    } else {
+        None
+    };
     let mut serve_error: Option<Error> = None;
     let mut accept_backoff = Duration::ZERO;
     // Persistent pressure (EMFILE) retries every ACCEPT_BACKOFF_MAX:
@@ -5217,10 +5234,12 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             }
         }
     }
-    // A loop that ended on error never observed `closing`: set it now
-    // so the watches and actors drain through the normal stop below.
-    // `begin_closing` is idempotent — a clean exit keeps the facts
-    // snapshot taken when its stop was requested.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    drop(protected_serving); // invalidate serving BEFORE drain/flush; not FINAL
+                             // A loop that ended on error never observed `closing`: set it now
+                             // so the watches and actors drain through the normal stop below.
+                             // `begin_closing` is idempotent — a clean exit keeps the facts
+                             // snapshot taken when its stop was requested.
     shared.begin_closing();
     // Former facts snapshot lived in `shutdown`. A test holds this
     // barrier until it has observed idle actors detach, which is the
