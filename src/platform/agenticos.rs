@@ -166,6 +166,15 @@ pub fn register_with_deployment_pin(
 /// `AGENTICOS_BOARD_COMPANY`: that variable is set on shared dev hosts
 /// that are not the hosted container.
 pub fn attach(opts: &mut crate::daemon::ServeOptions, hosted: &crate::lease::Hosted) -> Result<()> {
+    // CAD-1158: compose the trusted bridge-owned `smtp.internal` relay
+    // independently of platform registration and the Cadence lifecycle
+    // lease — before the early platform-registered return and before lease
+    // routing. ONLY the dedicated versioned image-owned SMTP proof
+    // (`hosted-smtp-relay@1` on fixed `http://smtp.internal`) admits;
+    // an arbitrary `CADENCE_AGENTICOS_URL`/`CADENCE_SMTP_INTERNAL_URL`,
+    // app/RPC field or forged pin never does. `hosted_email` stays on
+    // its lease-gated path: this admission must not activate it.
+    compose_hosted_smtp(opts)?;
     if opts.platforms.contains_key(PLATFORM) {
         return Ok(());
     }
@@ -186,8 +195,38 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions, hosted: &crate::lease::Hos
     register_from_composition(opts, &base, lease_is_on(hosted))
 }
 
+/// CAD-1158: independent trusted SMTP composition. Installs the fixed
+/// `smtp.internal` relay when (and only when) the image-owned metadata
+/// carries the dedicated `hosted-smtp-relay@1` admission. Runs before any
+/// platform-registration or lease check, so an already-registered platform
+/// or a disabled lifecycle lease never drops an independently admitted
+/// relay — and the absence of that proof never installs one. The relay
+/// base is fixed by the proof; caller-controlled env URLs cannot redirect
+/// the transport that will carry the custodied credential.
+fn compose_hosted_smtp(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
+    if opts.smtp_internal.is_some() {
+        return Ok(());
+    }
+    let admission = match &opts.provider_deployments {
+        Some(metadata) => metadata.hosted_smtp(),
+        // No in-memory composition: consult the fixed root-owned image
+        // file, the same source `register_with_loader` trusts for the
+        // platform pin. Absent file or no SMTP entry admits nothing.
+        None => super::deployments::load()?.and_then(|metadata| metadata.hosted_smtp()),
+    };
+    if let Some(admission) = admission {
+        opts.smtp_internal = Some(super::smtp_internal::SmtpInternal::from_admission(
+            &admission,
+        )?);
+    }
+    Ok(())
+}
+
 /// Trusted embedding route shared by hosted attach. A company lease alone
 /// supplies no pin; only exact image metadata can assert this deployment.
+/// CAD-1158: the SMTP relay is composed separately in `attach` (before the
+/// platform-registered early return), so this route only covers the
+/// `agenticos` platform pin itself — never SMTP authority.
 pub fn register_from_composition(
     opts: &mut crate::daemon::ServeOptions,
     base: &str,

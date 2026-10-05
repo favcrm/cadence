@@ -4823,8 +4823,10 @@ pub struct ServeOptions {
     pub hosted_email: Option<crate::platform::hosted_email::HostedEmail>,
     /// CAD-1126: the hosted `smtp.internal` pass-through. Set by
     /// `platform::agenticos::attach` on a daemon holding a hosted lease
-    /// (and by fixtures); `None` keeps direct SMTP. Never sourced from
-    /// RPC or PM.
+    /// (and by fixtures), or — CAD-1158 — from the dedicated versioned
+    /// image-owned SMTP admission (`hosted-smtp-relay@1` on fixed
+    /// `http://smtp.internal`) with the lifecycle lease off; `None` keeps
+    /// direct SMTP. Never sourced from RPC or PM.
     pub smtp_internal: Option<crate::platform::smtp_internal::SmtpInternal>,
     /// CAD-786: the public origin unsubscribe links mint
     /// (`{origin}/unsubscribe/<token>`). `https://` anywhere or
