@@ -2537,27 +2537,37 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_protected_hook_guard_only_rejects_an_actual_hook() {
+    fn shutdown_protected_missing_owner_and_hook_registration_are_refused() {
         let dir = TempDir::new().unwrap();
         let (_, mut store) = open_legacy(&dir);
-        // This toggles only the dormant hook guard; it does not qualify
-        // or construct a production Protected store (which still refuses).
+        // A flag cannot install authenticated ownership. This deliberately
+        // invalid state must refuse even an empty drain, without a hook.
         store.protected_open = true;
-        assert!(store
+        let err = store
             .shutdown_entries(&std::collections::HashMap::new())
-            .is_ok());
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("protected Store has no authenticated incarnation"),
+            "missing owner must reach the actual writer refusal: {err}"
+        );
+        assert!(!err.is_fenced(), "missing owner is not lease loss: {err}");
+        assert!(store.conn().is_autocommit());
         assert!(store
             .set_shutdown_entries_hook(Some(Arc::new(|_| panic!("hook must not run"))))
             .is_err());
-        // Simulate corrupted registration to prove execution also refuses.
+        // Corrupt registration cannot bypass the missing-owner guard or run
+        // the callback. This is not an authenticated hook-execution fixture.
         store.shutdown_entries_hook = Some(Arc::new(|_| panic!("hook must not run")));
         let err = store
             .shutdown_entries(&std::collections::HashMap::new())
             .unwrap_err();
         assert!(
-            !err.is_fenced(),
-            "hook policy failure is not lease loss: {err}"
+            err.to_string()
+                .contains("protected Store has no authenticated incarnation"),
+            "a hook must not bypass missing-owner refusal: {err}"
         );
+        assert!(!err.is_fenced(), "missing owner is not lease loss: {err}");
         assert!(store.conn().is_autocommit());
     }
 
