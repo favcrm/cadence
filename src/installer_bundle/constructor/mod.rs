@@ -21,6 +21,9 @@ mod serving;
 mod wire;
 pub use helper_trust::{helper_image_trust, HelperImageTrust};
 pub(crate) use runtime_kernel::OwnedDaemon;
+// One canonical opaque fixed-channel grant, not another issuer or Proof factory.
+// Keep owner::transport as its definition; this constructor name is an alias only.
+pub(crate) use crate::store::StoreOwnerGrant;
 
 use super::{fixed_arguments, refused, Deadline, Result};
 use crate::daemon::supervisor_grant as grant;

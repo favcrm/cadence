@@ -618,7 +618,7 @@ impl Shared {
             // This path only requests protected startup; it is NOT permission.
             // Authentic fixed-owner issuance selects mode/binding BEFORE SQL,
             // and unavailable/invalid ownership never falls back to Legacy.
-            let grant = crate::store::StoreOwnerGrant::startup()?;
+            let grant = crate::installer_bundle::constructor::StoreOwnerGrant::startup()?;
             crate::rollout::authorize_migration(Path::new(&grant.binding().path))?;
             Store::open_owned(grant)?
         } else {
