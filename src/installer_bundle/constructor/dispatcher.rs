@@ -141,10 +141,12 @@ struct TaskState {
     part: u64,
     launch_started: bool,
     cancelled: bool,
+    retiring: bool,
     retired: bool,
 }
 struct Registry {
     task: Mutex<Option<TaskState>>,
+    task_history: Mutex<std::collections::HashSet<String>>,
     daemon: OwnedDaemon,
     layout: Layout,
     sockets: [Socket; 2],
@@ -157,7 +159,7 @@ pub(super) fn launch_live(until: Instant) -> Result<()> {
     r.check(until)?;
     let task = r.task.lock().map_err(|_| refused())?;
     let task = task.as_ref().ok_or_else(refused)?;
-    if task.cancelled || task.retired {
+    if task.cancelled || task.retiring || task.retired {
         return Err(refused());
     }
     Ok(())
@@ -347,6 +349,9 @@ impl StoreSession {
         let is_database = matches!(&request, StoreRequest::DatabaseCurrent { .. });
         match request {
             StoreRequest::Startup { .. } if self.facts.is_none() && seq == 1 => {
+                // Pilot is fresh-only. Old DB/sidecars NEVER become fresh,
+                // restore/open and cold recovery remain explicitly unavailable.
+                fresh_target()?;
                 {
                     let mut db = r.db.lock().map_err(|_| refused())?;
                     if db.opening_peer.is_some() {
@@ -355,44 +360,10 @@ impl StoreSession {
                     db.opening_peer = Some(self.stream.try_clone().map_err(|_| refused())?);
                 }
                 let f = validate(lifecycle::store_startup(until)?, "issued", None, true)?;
-                if !matches!(
-                    f.binding.purpose,
-                    Purpose::Init | Purpose::Restore | Purpose::Open
-                ) {
+                if f.binding.purpose != Purpose::Init {
                     return Err(refused());
                 }
-                match f.binding.purpose {
-                    Purpose::Init
-                        if std::fs::symlink_metadata(DB)
-                            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
-                    Purpose::Restore => {
-                        r.database()?;
-                        let source = f.binding.source.as_ref().ok_or_else(refused)?;
-                        let file =
-                            r.db.lock()
-                                .map_err(|_| refused())?
-                                .file
-                                .as_ref()
-                                .ok_or_else(refused)?
-                                .try_clone()
-                                .map_err(|_| refused())?;
-                        let hash = crate::adapter::pi_guest::execfd::sha256_fd(
-                            &file,
-                            file.metadata().map_err(|_| refused())?.size(),
-                        )
-                        .map_err(|_| refused())?;
-                        if hex(&hash) != source.sha256 {
-                            return Err(refused());
-                        }
-                        for suffix in ["-wal", "-shm", "-journal"] {
-                            if std::fs::symlink_metadata(format!("{DB}{suffix}")).is_ok() {
-                                return Err(refused());
-                            }
-                        }
-                    }
-                    Purpose::Open => r.database()?,
-                    _ => return Err(refused()),
-                }
+                fresh_target()?;
                 if r.db.lock().map_err(|_| refused())?.startup.is_some() {
                     return Err(refused());
                 }
@@ -496,6 +467,16 @@ impl StoreSession {
         )
     }
 }
+fn fresh_target() -> Result<()> {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        if !std::fs::symlink_metadata(format!("{DB}{suffix}"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(refused());
+        }
+    }
+    Ok(())
+}
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -526,6 +507,18 @@ fn accepted() -> Result<Option<(Domain, UnixStream)>> {
                 &bytes,
                 Instant::now() + Duration::from_secs(10),
             )?;
+            Ok(None)
+        }
+        Packet::Retired { version: 1, task } => {
+            let mut state = r.task.lock().map_err(|_| refused())?;
+            let state = state.as_mut().ok_or_else(refused)?;
+            // This ACK proves only the actual daemon adapter/worker/stream
+            // quiesced. Root's prior retained namespace-init kernel retirement
+            // is mandatory; an ACK alone cannot create family-exit authority.
+            if state.id != task || !state.retiring || state.retired {
+                return Err(refused());
+            }
+            state.retired = true;
             Ok(None)
         }
         Packet::Accepted { version: 1, domain } => Ok(Some((
@@ -801,6 +794,7 @@ pub(super) fn run(layout: Layout) -> Result<()> {
     REGISTRY
         .set(Registry {
             task: Mutex::new(None),
+            task_history: Mutex::new(std::collections::HashSet::new()),
             daemon,
             layout,
             sockets,
@@ -865,7 +859,11 @@ pub(super) fn run(layout: Layout) -> Result<()> {
                     }
                     {
                         let mut state = r.task.lock().map_err(|_| refused())?;
-                        if state.is_some() {
+                        if state.as_ref().is_some_and(|s| !s.retired) {
+                            return Err(refused());
+                        }
+                        let mut history = r.task_history.lock().map_err(|_| refused())?;
+                        if history.len() >= 4096 || !history.insert(task.clone()) {
                             return Err(refused());
                         }
                         *state = Some(TaskState {
@@ -875,6 +873,7 @@ pub(super) fn run(layout: Layout) -> Result<()> {
                             part: 0,
                             launch_started: false,
                             cancelled: false,
+                            retiring: false,
                             retired: false,
                         });
                     }
@@ -911,7 +910,7 @@ pub(super) fn run(layout: Layout) -> Result<()> {
                     {
                         let t = r.task.lock().map_err(|_| refused())?;
                         let t = t.as_ref().ok_or_else(refused)?;
-                        if t.id != task || t.retired {
+                        if t.id != task || t.retiring || t.retired {
                             return Err(refused());
                         }
                     }
@@ -922,18 +921,19 @@ pub(super) fn run(layout: Layout) -> Result<()> {
                             run.helper.retire(until)?
                         }
                     }
+                    r.task
+                        .lock()
+                        .map_err(|_| refused())?
+                        .as_mut()
+                        .ok_or_else(refused)?
+                        .retiring = true;
                     private_wire::send(
                         &r.daemon.control,
                         &Packet::Retire { version: 1, task },
                         &[],
                         Deadline(until),
                     )?;
-                    r.task
-                        .lock()
-                        .map_err(|_| refused())?
-                        .as_mut()
-                        .ok_or_else(refused)?
-                        .retired = true;
+                    // No new generation until actual daemon quiescence ACK too.
                 }
                 lifecycle::Command::Close { binding } | lifecycle::Command::Witness { binding } => {
                     binding.validate()?;
@@ -1029,6 +1029,17 @@ pub(super) fn run(layout: Layout) -> Result<()> {
         let mut i = 0;
         while i < pi.len() {
             if ready(&pi[i].stream)? && pi[i].handle(&profile, &mut stores, until).is_err() {
+                // Losing control BEFORE owned retirement is UNKNOWN. Expected
+                // closure is admitted only by THIS session's private non-Clone
+                // namespace-init retirement evidence + actual kernel pidfd exit,
+                // not the CURRENT task's phase (which may already be a new one).
+                if pi[i]
+                    .running
+                    .as_ref()
+                    .is_none_or(|r| r.helper.retirement_verified(until).ok() != Some(true))
+                {
+                    return Err(refused());
+                }
                 pi.remove(i);
             } else {
                 i += 1
@@ -1046,17 +1057,32 @@ pub(super) fn readback(query: &Value, until: Instant) -> Result<Value> {
     let obj = query.as_object().ok_or_else(refused)?;
     let result = match obj.get("type").and_then(Value::as_str) {
         Some("current") if obj.len() == 1 => json!({"reference":r.reference,"revision":1}),
+        Some("task") if obj.len() == 2 => {
+            let state = r.task.lock().map_err(|_| refused())?;
+            let state = state.as_ref().ok_or_else(refused)?;
+            if obj.get("task").and_then(Value::as_str) != Some(state.id.as_str()) {
+                return Err(refused());
+            }
+            let phase = if state.retired {
+                "retired"
+            } else if state.retiring {
+                "retiring"
+            } else if state.cancelled {
+                "cancelled"
+            } else if state.launch_started {
+                "launch-reserved"
+            } else {
+                "selected"
+            };
+            json!({"version":1,"task":state.id,"alias":state.alias,"model":state.model,"phase":phase,"parts":state.part})
+        }
         Some("opening") if obj.len() == 1 => {
             {
                 let state = r.db.lock().map_err(|_| refused())?;
                 r.admit(state.opening_peer.as_ref().ok_or_else(refused)?, until)?;
             }
-            let purpose = match std::fs::symlink_metadata(DB) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => "init",
-                Ok(m) if m.is_file() => "restore",
-                _ => return Err(refused()),
-            };
-            json!({"reference":r.reference,"revision":1,"purpose":purpose,"path":DB})
+            fresh_target()?;
+            json!({"reference":r.reference,"revision":1,"purpose":"init","path":DB})
         }
         Some("database-current") if obj.len() == 2 => {
             let facts = {

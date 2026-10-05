@@ -283,6 +283,9 @@ pub(super) enum Command {
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 enum Query {
     Current,
+    Task {
+        task: String,
+    },
     Opening,
     DatabaseCurrent {
         reference: String,

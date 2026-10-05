@@ -88,6 +88,14 @@ impl Maintenance {
                             return Err(Error::rejected("native retirement task changed"));
                         }
                         current.retire()?;
+                        private_wire::send_child(
+                            &control,
+                            &Packet::Retired {
+                                version: 1,
+                                task: id,
+                            },
+                        )?;
+                        task_spent = false; // Root history/current/retirement admits the next generation.
                     }
                     Packet::Close {
                         version: 1,

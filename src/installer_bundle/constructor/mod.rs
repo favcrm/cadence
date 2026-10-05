@@ -9,6 +9,7 @@ mod context;
 mod custody;
 mod dispatcher;
 mod helper;
+mod helper_process;
 mod helper_trust;
 mod layout;
 mod lifecycle;

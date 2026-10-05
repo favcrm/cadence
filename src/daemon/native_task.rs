@@ -6,9 +6,14 @@ use super::*;
 use crate::adapter::{AdapterHooks, ProviderAdapter};
 use crate::installer_bundle::constructor::private_wire::{self, Packet};
 use std::os::unix::net::UnixDatagram;
+struct StreamState {
+    next: u64,
+    closed: bool,
+}
 pub(super) struct Task {
     pub(super) id: String,
     adapter: Arc<dyn ProviderAdapter>,
+    stream: Arc<Mutex<StreamState>>,
     worker: thread::JoinHandle<Result<()>>,
 }
 impl Task {
@@ -52,7 +57,11 @@ impl Task {
             model_policy: Some("provider_default"),
         })?;
         let agent = shared.store.agent(&alias)?;
-        let part = Arc::new(Mutex::new(0u64));
+        let part = Arc::new(Mutex::new(StreamState {
+            next: 0,
+            closed: false,
+        }));
+        let stream = part.clone();
         let event_control = control.clone();
         let event_task = id.clone();
         let event_part = part.clone();
@@ -141,6 +150,7 @@ impl Task {
         Ok(Self {
             id,
             adapter,
+            stream,
             worker,
         })
     }
@@ -156,21 +166,43 @@ impl Task {
             }
             thread::sleep(Duration::from_millis(1));
         }
-        self.worker
+        let outcome = self
+            .worker
             .join()
-            .map_err(|_| Error::unknown("native task worker lost"))?
+            .map_err(|_| Error::unknown("native task worker lost"))?;
+        // A failed/cancelled turn is not a successful result. Its failure event
+        // remains visible; this join acknowledges control quiescence ONLY after
+        // Root independently retired the actual namespace family. Seal streaming
+        // under the SAME callback mutex before the retirement ACK/new generation.
+        self.stream
+            .lock()
+            .map_err(|_| Error::unknown("native stream poisoned"))?
+            .closed = true;
+        if let Err(error) = outcome {
+            tracing::warn!("retired native turn failed: {error}");
+        }
+        Ok(())
     }
 }
-fn emit(control: &UnixDatagram, task: &str, part: &Mutex<u64>, value: &Value) -> Result<()> {
+fn emit(
+    control: &UnixDatagram,
+    task: &str,
+    part: &Mutex<StreamState>,
+    value: &Value,
+) -> Result<()> {
     use base64::Engine;
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
     let mut sequence = part
         .lock()
         .map_err(|_| Error::unknown("native stream poisoned"))?;
+    if sequence.closed {
+        return Ok(());
+    } // refuse late data; no retired-session mutation
     for chunk in bytes.chunks(16384) {
-        let index = *sequence;
-        *sequence = sequence
+        let index = sequence.next;
+        sequence.next = sequence
+            .next
             .checked_add(1)
             .ok_or_else(|| Error::unknown("native stream exhausted"))?;
         if index >= 9_007_199_254_740_991 {

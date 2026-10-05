@@ -1,13 +1,12 @@
 //! Fixed ROOT-owned helper creation. No PID adoption/command/environment/FD
 //! number API; selected argv is derived only from an opaque launch permit.
 use super::super::{files, refused, Deadline, Result};
+use super::helper_process::Process;
 use super::{custody, lifecycle};
 use crate::adapter::pi_guest::owner::LaunchPermit;
 use std::fs::File;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 #[derive(Clone, Copy)]
 pub(crate) enum HelperPhase {
@@ -15,14 +14,18 @@ pub(crate) enum HelperPhase {
     Sealed,
 }
 pub(crate) struct HelperStdio {
-    pub stdin: ChildStdin,
-    pub stdout: ChildStdout,
-    pub stderr: ChildStderr,
+    pub stdin: File,
+    pub stdout: File,
+    pub stderr: File,
 }
 /// Non-Clone actual own-created child, selected executable, pidfd and birth.
 /// SO_PEERCRED is checked against THIS retained handle, not supplied metadata.
+// Non-Clone kernel retirement evidence, never decoded from wire or ACK/PID.
+struct RetiredFamily {
+    _pidfd: File,
+}
 pub(crate) struct OwnedHelper {
-    child: Child,
+    child: Process,
     pidfd: File,
     birth: u64,
     artifact: files::HeldArtifact,
@@ -33,6 +36,7 @@ pub(crate) struct OwnedHelper {
     sealed_groups: Vec<u32>,
     namespaces: Vec<File>,
     node: std::sync::OnceLock<File>,
+    retired: std::sync::OnceLock<RetiredFamily>,
 }
 impl OwnedHelper {
     pub(crate) fn spawn(permit: &LaunchPermit, until: Instant) -> Result<(Self, HelperStdio)> {
@@ -66,12 +70,6 @@ impl OwnedHelper {
             .chain(args)
             .map(|s| std::ffi::CString::new(s).map_err(|_| refused()))
             .collect::<Result<_>>()?;
-        let argv: Vec<usize> = strings
-            .iter()
-            .map(|s| s.as_ptr() as usize)
-            .chain(std::iter::once(0))
-            .collect();
-        let fd = artifact.fd();
         let parent = std::process::id();
         let launch_gid = crate::adapter::pi_guest::topology::resolve_gid_pub("cadence-launch")?;
         if launch_gid == 0 {
@@ -80,70 +78,13 @@ impl OwnedHelper {
         let mut sealed_groups = vec![selected.guest_gid, selected.shared_gid];
         sealed_groups.sort_unstable();
         sealed_groups.dedup();
-        // pre_exec owns all backing strings AND parent-materialized pointer
-        // arrays. No allocation occurs after fork; never caller memory.
-        let mut command = Command::new("/opt/protected/bin/cadence-agent-exec");
-        command
-            .env_clear()
-            .current_dir("/")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        unsafe {
-            command.pre_exec(move || {
-                let fail = || std::io::Error::last_os_error();
-                if libc::setsid() < 0
-                    || libc::setgroups(1, &launch_gid) != 0
-                    || libc::setresgid(21000, 0, 0) != 0
-                    || libc::setresuid(21000, 0, 0) != 0
-                    || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
-                    || libc::getppid() != parent as i32
-                {
-                    return Err(fail());
-                }
-                if fd != 7 && libc::dup3(fd, 7, libc::O_CLOEXEC) < 0 {
-                    return Err(fail());
-                }
-                if libc::syscall(libc::SYS_close_range, 3u32, 6u32, 0u32) != 0
-                    || libc::syscall(libc::SYS_close_range, 8u32, u32::MAX, 0u32) != 0
-                {
-                    return Err(fail());
-                }
-                let _keep_backings = &strings;
-                let env = [std::ptr::null::<libc::c_char>()];
-                libc::syscall(
-                    libc::SYS_execveat,
-                    7,
-                    c"".as_ptr(),
-                    argv.as_ptr().cast::<*const libc::c_char>(),
-                    env.as_ptr(),
-                    libc::AT_EMPTY_PATH,
-                );
-                Err(fail())
-            });
-        }
-        let mut child = crate::reaper::spawn(&mut command).map_err(|_| refused())?;
+        // Own-created namespace PID1 and atomic pidfd, held at selected helper
+        // exec before ANY helper instruction. No fork/pgrp/PID-adoption fallback.
+        let mut child = Process::spawn(&artifact, &strings, launch_gid, deadline)?;
         let pid = child.id();
         let setup = (|| {
             let birth = crate::peer::proc_starttime(pid).ok_or_else(refused)?;
-            let p = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
-            if p < 0 {
-                return Err(refused());
-            }
-            let pidfd = unsafe { File::from_raw_fd(p as i32) };
-            // Helper cannot pass Arm while the root dispatcher is still
-            // registering it. Keep an exit-kill tracer BEFORE any authorization.
-            if unsafe {
-                libc::ptrace(
-                    libc::PTRACE_SEIZE,
-                    pid as libc::pid_t,
-                    std::ptr::null_mut::<libc::c_void>(),
-                    (libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_EXITKILL) as usize,
-                )
-            } != 0
-            {
-                return Err(refused());
-            }
+            let pidfd = child.pidfd()?;
             artifact.live_correspondence(pid, deadline)?;
             lifecycle::runtime_proof(until)?.recheck(until)?;
             permit.recheck()?;
@@ -159,8 +100,8 @@ impl OwnedHelper {
             Ok((pidfd, birth, stdio, namespaces))
         })();
         match setup {
-            Ok((pidfd, birth, stdio, namespaces)) => Ok((
-                Self {
+            Ok((pidfd, birth, stdio, namespaces)) => {
+                let owned = Self {
                     child,
                     pidfd,
                     birth,
@@ -172,11 +113,14 @@ impl OwnedHelper {
                     sealed_groups,
                     namespaces,
                     node: std::sync::OnceLock::new(),
-                },
-                stdio,
-            )),
+                    retired: std::sync::OnceLock::new(),
+                };
+                owned.namespaces_current()?;
+                owned.child.release()?;
+                Ok((owned, stdio))
+            }
             Err(e) => {
-                let _ = child.kill();
+                child.kill();
                 let until = Instant::now() + Duration::from_secs(2);
                 while Instant::now() < until {
                     let mut status = 0;
@@ -366,10 +310,24 @@ impl OwnedHelper {
                 .metadata()
                 .map_err(|_| refused())?;
             if (a.dev(), a.ino()) != (b.dev(), b.ino())
-                || (a.dev(), a.ino()) != (parent.dev(), parent.ino())
+                || (*name == "pid" && (a.dev(), a.ino()) == (parent.dev(), parent.ino()))
+                || (*name != "pid" && (a.dev(), a.ino()) != (parent.dev(), parent.ino()))
             {
                 return Err(refused());
             }
+        }
+        let status = custody::status(self.child.id())?;
+        let ids = custody::field(&status, "NSpid:")?
+            .split_ascii_whitespace()
+            .map(|s| s.parse::<u32>().map_err(|_| refused()))
+            .collect::<Result<Vec<_>>>()?;
+        let parent = custody::status(std::process::id())?;
+        let depth = custody::field(&parent, "NSpid:")?
+            .split_ascii_whitespace()
+            .count();
+        if ids.len() != depth + 1 || ids.first() != Some(&self.child.id()) || ids.last() != Some(&1)
+        {
+            return Err(refused());
         }
         Ok(())
     }
@@ -496,6 +454,10 @@ impl OwnedHelper {
         Ok(n > 0 && ready.revents & libc::POLLIN != 0)
     }
     pub(crate) fn retire(&self, until: Instant) -> Result<()> {
+        let until = until.min(Instant::now() + Duration::from_secs(10));
+        // This ACTUAL owned task is namespace init. Its kernel exit/reap is
+        // ordered after namespace descendant kill+reap, not a guessed PGID/list.
+        lifecycle::runtime_proof(until)?.recheck(until)?;
         if !self.exited(until)? {
             self.signal(libc::SIGKILL, until)?;
         }
@@ -503,7 +465,18 @@ impl OwnedHelper {
             Deadline(until).check()?;
             std::thread::sleep(Duration::from_millis(1));
         }
+        lifecycle::runtime_proof(until)?.recheck(until)?;
+        if self.retired.get().is_none() {
+            self.retired
+                .set(RetiredFamily {
+                    _pidfd: self.pidfd.try_clone().map_err(|_| refused())?,
+                })
+                .map_err(|_| refused())?;
+        }
         Ok(()) // physical result ONLY; not external durable retirement
+    }
+    pub(crate) fn retirement_verified(&self, until: Instant) -> Result<bool> {
+        Ok(self.retired.get().is_some() && self.exited(until)?)
     }
 }
 impl Drop for OwnedHelper {

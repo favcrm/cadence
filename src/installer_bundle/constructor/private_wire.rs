@@ -52,6 +52,10 @@ pub(crate) enum Packet {
         version: u8,
         task: String,
     },
+    Retired {
+        version: u8,
+        task: String,
+    },
     TaskEvent {
         version: u8,
         task: String,
