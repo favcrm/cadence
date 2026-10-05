@@ -11,7 +11,8 @@
 //! publication, the declaration↔file pairing is exact, descriptor
 //! bytes are identity and upgrade-pinned, a forged install journal is
 //! re-validated at recovery, and the descriptor read stays
-//! operator-only and installation-bound.
+//! operator-only and installation-bound; CAD-867's live-read check also
+//! refuses an authentic pre-upgrade descriptor pin through both peers.
 #![cfg(feature = "test-seam")]
 
 use cadence_agent::issue::Pm;
@@ -135,6 +136,28 @@ impl Workspace {
         }
     }
 
+    /// Add the shipped CRM binding example to this fixture package and
+    /// declare the companion contract in its manifest.
+    fn write_binding(&self) {
+        let bindings = self.source().join("bindings");
+        std::fs::create_dir_all(&bindings).unwrap();
+        std::fs::write(bindings.join("app-bindings-v1.json"), Self::binding_text()).unwrap();
+        let manifest = self.source().join("app.md");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        assert!(
+            !text.contains("bindings:"),
+            "source manifest already declares bindings"
+        );
+        std::fs::write(
+            &manifest,
+            text.replace(
+                "  connections: [publish]",
+                "  connections: [publish]\n  bindings:\n    contract: app-bindings/v1",
+            ),
+        )
+        .unwrap();
+    }
+
     /// The bundle as the board's `{files}` wire map — every source file
     /// as a `{path: utf8-text}` entry, the exact shape
     /// `workspace_upload` stages and `UpgradeWire`'s `FilesMap` decodes
@@ -149,6 +172,7 @@ impl Workspace {
             "templates/brief.md",
             "templates/post.md",
             "views/app-views-v1.json",
+            "bindings/app-bindings-v1.json",
         ] {
             if let Ok(text) = std::fs::read_to_string(source.join(name)) {
                 files.insert(name.to_string(), json!(text));
@@ -193,6 +217,15 @@ impl Workspace {
         let text = std::fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("contracts/app-views/v1/examples/crm.json"),
+        )
+        .unwrap();
+        text.replace("\"app\": \"crm\"", "\"app\": \"blog-post\"")
+    }
+
+    fn binding_text() -> String {
+        let text = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("contracts/app-bindings/v1/examples/crm.json"),
         )
         .unwrap();
         text.replace("\"app\": \"crm\"", "\"app\": \"blog-post\"")
@@ -947,4 +980,219 @@ fn cad864_board_files_transports_admit_the_descriptor() {
         w.show(&install_id)["view_descriptor"]["views"][0]["title"],
         json!("Clients")
     );
+}
+
+/// A genuine prior descriptor receipt must not authorize a live read
+/// after upgrade. The same real customer view succeeds on both peers
+/// with current pins, then one stale pin is refused at RPC and HTTP.
+/// The test-seam identity is asserted, not native-auth proof or full
+/// CAD-867 acceptance.
+#[test]
+fn cad867_stale_descriptor_pin_refuses_on_rpc_and_http() {
+    const CANARY_NAME: &str = "CAD867 guard canary";
+    const CANARY_EMAIL: &str = "cad867-private@example.invalid";
+
+    let w = Workspace::new();
+    w.write_descriptor(&Workspace::descriptor_text(), true);
+    w.write_binding();
+    let installed = w.install().unwrap();
+    let install_id = installed["install_id"].as_str().unwrap().to_string();
+    let stale_descriptor_digest = installed["view_descriptor_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(stale_descriptor_digest.starts_with("sha256:"));
+
+    let context = w.op(
+        "app_context_create",
+        json!({
+            "install_id": install_id,
+            "label": "CAD-867 acceptance",
+            "input_defaults": {},
+            "request_id": "cad867-view-context"
+        }),
+    );
+    let context_id = context["context"]["id"].as_str().unwrap().to_string();
+    let record_params = json!({
+        "install_id": install_id,
+        "context_id": context_id,
+        "record_id": "cad867-customer",
+        "profile": {
+            "schema": 1,
+            "display_name": CANARY_NAME,
+            "email": CANARY_EMAIL,
+            "tags": ["vip"],
+            "consent": {"email": "unknown"}
+        }
+    });
+    let created = w.op("app_record_create", record_params.clone());
+    assert_eq!(created["record"]["id"], json!("cad867-customer"));
+    let before = w.op(
+        "app_record_show",
+        record_params_without_profile(&record_params),
+    );
+
+    // Upgrade only the descriptor's display label (plus manifest
+    // version), leaving the live binding and its source mapping intact.
+    let descriptor_path = w.source().join("views/app-views-v1.json");
+    let descriptor = std::fs::read_to_string(&descriptor_path).unwrap();
+    assert!(descriptor.contains("\"Customers\""));
+    std::fs::write(
+        &descriptor_path,
+        descriptor.replace("\"Customers\"", "\"Clients\""),
+    )
+    .unwrap();
+    let manifest_path = w.source().join("app.md");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    assert!(manifest.contains("version: 0.1.0"));
+    std::fs::write(
+        &manifest_path,
+        manifest.replace("version: 0.1.0", "version: 0.2.0"),
+    )
+    .unwrap();
+    let proposed = w.upgrade_check(&installed);
+    let new_digest = proposed["digest"].as_str().unwrap().to_string();
+    assert_ne!(new_digest, installed["digest"]);
+    let generation = installed["catalog_generation"].as_str().unwrap();
+    w.op(
+        "app_workspace_upgrade",
+        json!({
+            "install_id": install_id,
+            "source": w.source(),
+            "expected_digest": installed["digest"],
+            "expected_generation": generation,
+            "expected_new_digest": new_digest,
+            "request_id": "cad867-view-upgrade"
+        }),
+    );
+    let current = w.show(&install_id);
+    assert_eq!(
+        current["view_descriptor"]["views"][0]["title"],
+        json!("Clients")
+    );
+    assert_ne!(
+        current["view_descriptor_digest"],
+        json!(stale_descriptor_digest)
+    );
+    assert_ne!(current["digest"], installed["digest"]);
+    assert_eq!(
+        current["view_binding_digest"],
+        installed["view_binding_digest"]
+    );
+
+    let current_params = json!({
+        "install_id": install_id,
+        "view_id": "customers",
+        "op": "list",
+        "digest": current["digest"],
+        "view_descriptor_digest": current["view_descriptor_digest"],
+        "view_binding_digest": current["view_binding_digest"],
+        "context_id": context_id
+    });
+    let rpc_positive = w
+        .rpc(Asserted::Operator, "app_view_read", current_params.clone())
+        .unwrap_or_else(|error| panic!("current-pin RPC control failed: {error}"));
+    assert_eq!(rpc_positive["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(rpc_positive["rows"][0]["name"], json!(CANARY_NAME));
+    assert_eq!(rpc_positive["rows"][0]["email"], json!(CANARY_EMAIL));
+    assert_eq!(rpc_positive["rows"][0]["tags"], json!(["vip"]));
+    for field in ["digest", "view_descriptor_digest", "view_binding_digest"] {
+        assert_eq!(
+            rpc_positive[field], current[field],
+            "RPC did not echo {field}"
+        );
+    }
+
+    let lease = test_port();
+    let port = lease.port;
+    let board_stop = Arc::new(AtomicBool::new(false));
+    let board = board_on(&w.state, &w.pm.dir, port, &board_stop);
+    struct BoardCleanup(
+        Arc<AtomicBool>,
+        Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
+    );
+    impl Drop for BoardCleanup {
+        fn drop(&mut self) {
+            self.0.store(true, SeqCst);
+            if let Some(board) = self.1.take() {
+                let _ = board.join();
+            }
+        }
+    }
+    let _board_cleanup = BoardCleanup(board_stop, Some(board));
+    let (cookie, session_key) = sign_in(&w.state, port);
+    let list_path = |descriptor_pin: &str| {
+        format!(
+            "/api/app-installations/{install_id}/views/customers/rows?digest={}&descriptor={descriptor_pin}&binding={}&context_id={context_id}",
+            current["digest"].as_str().unwrap(),
+            current["view_binding_digest"].as_str().unwrap()
+        )
+    };
+    let current_path = list_path(current["view_descriptor_digest"].as_str().unwrap());
+    let (http_status, _, http_body) = get_as(
+        &w.state,
+        port,
+        Some("operator"),
+        Some((&cookie, &session_key)),
+        &current_path,
+    );
+    assert_eq!(http_status, 200, "current-pin HTTP control: {http_body}");
+    let http_positive: Value = serde_json::from_str(&http_body).unwrap();
+    assert_eq!(http_positive["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(http_positive["rows"][0]["name"], json!(CANARY_NAME));
+    assert_eq!(http_positive["rows"][0]["email"], json!(CANARY_EMAIL));
+    assert_eq!(http_positive["rows"][0]["tags"], json!(["vip"]));
+    for field in ["digest", "view_descriptor_digest", "view_binding_digest"] {
+        assert_eq!(
+            http_positive[field], current[field],
+            "HTTP did not echo {field}"
+        );
+    }
+
+    // All other claims remain current and valid; only the descriptor
+    // pin is replayed from the authentic pre-upgrade receipt.
+    let mut stale_params = current_params;
+    stale_params["view_descriptor_digest"] = json!(stale_descriptor_digest);
+    let rpc_error = w
+        .rpc(Asserted::Operator, "app_view_read", stale_params)
+        .expect_err("a stale descriptor receipt authorized an RPC read");
+    assert!(
+        rpc_error
+            .to_string()
+            .contains("view descriptor digest is stale"),
+        "stale RPC refused for an unrelated reason: {rpc_error}"
+    );
+    assert!(!rpc_error.to_string().contains(CANARY_NAME));
+    assert!(!rpc_error.to_string().contains(CANARY_EMAIL));
+
+    let stale_path = list_path(&stale_descriptor_digest);
+    let (http_status, _, http_body) = get_as(
+        &w.state,
+        port,
+        Some("operator"),
+        Some((&cookie, &session_key)),
+        &stale_path,
+    );
+    assert_eq!(http_status, 400, "stale HTTP descriptor pin: {http_body}");
+    assert!(http_body.contains("app view read refused or unavailable"));
+    assert!(!http_body.contains(CANARY_NAME));
+    assert!(!http_body.contains(CANARY_EMAIL));
+
+    assert_eq!(
+        w.op(
+            "app_record_show",
+            record_params_without_profile(&record_params)
+        ),
+        before,
+        "a refused read mutated the customer record"
+    );
+    assert_eq!(w.show(&install_id)["digest"], current["digest"]);
+}
+
+fn record_params_without_profile(params: &Value) -> Value {
+    json!({
+        "install_id": params["install_id"],
+        "context_id": params["context_id"],
+        "record_id": params["record_id"]
+    })
 }
