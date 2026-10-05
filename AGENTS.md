@@ -79,13 +79,13 @@ PR needs each of the following as a PASS on the exact head you enqueue:
 - **Notes never block (CAD-1104).** REVISE only for a correctness,
   security or ticket-requirement gap. Everything else (wording, docs,
   comments, style, extra tests) is a note: the reviewer PASSes with notes,
-  and the author fixes them in a follow-up PR, not in the reviewed PR,
-  because a new head voids every verdict. After a PASS with notes, the
-  author files one follow-up ticket listing them, or says on the ticket why
-  they are dropped. Complexity that hides a bug or makes the change
-  unverifiable is a correctness gap (REVISE); plain style stays a note. A
-  gate or daemon-enforced rule change without its acceptance check ("Gates
-  and security work") is a REVISE, not a note.
+  and the author files one follow-up ticket listing them — the fixes land
+  in a follow-up PR, never in the reviewed PR, because a new head voids
+  every verdict — or says on the ticket why they are dropped. Complexity
+  that hides a bug or makes the change unverifiable is a correctness gap
+  (REVISE); plain style stays a note. A gate or daemon-enforced rule
+  change without its acceptance check ("Gates and security work") is a
+  REVISE, not a note.
 - **The path list is a floor.** A single reviewer who sees auth, identity,
   credential, signature, secret or confinement logic (triggers 1 and 3) in
   a one-review PR returns REVISE asking for a second (Spec/security)
