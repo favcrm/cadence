@@ -50,7 +50,9 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::issue::model;
 use crate::issue::parse;
-use crate::issue::{app_binding, app_view, board, plan, project, workflow, write, Pm};
+use crate::issue::{
+    app_action_v2, app_binding, app_view, board, plan, project, workflow, write, Pm,
+};
 
 /// `<pm>/<project>/apps/` — beside PROJECT.md and `workflows/`.
 pub const DIR: &str = "apps";
@@ -77,7 +79,9 @@ const GATED_KEYS: &[&str] = &["records", "actions", "ui", "settings", "actors"];
 /// package, each carrying a `screens.json` declaration plus flat
 /// `<stem>.<js|css|svg|json>` asset leaves. `views/` (CAD-864) holds
 /// exactly one app-views/v1 descriptor; `bindings/` (CAD-867) holds
-/// exactly one app-bindings/v1 companion and requires that descriptor.
+/// exactly one app-bindings/v1 companion and requires that descriptor;
+/// `actions/` holds the explicitly declared app-actions/v2 companion and
+/// requires both the descriptor and binding.
 const TOP_DIRS: &[&str] = &[
     "workflows",
     "rubrics",
@@ -85,6 +89,7 @@ const TOP_DIRS: &[&str] = &[
     "screens",
     "views",
     "bindings",
+    "actions",
 ];
 
 /// Largest single file in a bundle — workflows render to plans, so the
@@ -118,6 +123,9 @@ pub struct Manifest {
     /// CAD-867: `needs.bindings.contract` declares the companion read map.
     /// A binding is valid only alongside the descriptor it maps.
     pub binding_contract: Option<String>,
+    /// CAD-867: `needs.actions.contract` declares the explicit live-action
+    /// companion. V2 requires the paired descriptor and binding.
+    pub action_contract: Option<String>,
     pub guide: String,
 }
 
@@ -392,18 +400,22 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     let mut capabilities = BTreeMap::new();
     let mut view_contract: Option<String> = None;
     let mut binding_contract: Option<String> = None;
+    let mut action_contract: Option<String> = None;
     if let Some(needs) = get("needs") {
         let serde_yaml::Value::Mapping(needs) = needs else {
             return Err(Error::rejected(
-                "app.md `needs:` is a mapping — v0 knows connections, capabilities, views and bindings",
+                "app.md `needs:` is a mapping — v0 knows connections, capabilities, views, bindings and actions",
             ));
         };
         for key in needs.keys() {
             let k = key.as_str().unwrap_or_default();
-            if !matches!(k, "connections" | "capabilities" | "views" | "bindings") {
+            if !matches!(
+                k,
+                "connections" | "capabilities" | "views" | "bindings" | "actions"
+            ) {
                 return Err(Error::rejected(format!(
                     "app.md `needs.{k}` is unknown — v0 knows `needs.connections`, \
-                     `needs.capabilities`, `needs.views`, `needs.bindings`"
+                     `needs.capabilities`, `needs.views`, `needs.bindings`, `needs.actions`"
                 )));
             }
         }
@@ -453,6 +465,33 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
                     return Err(Error::rejected(
                         "app.md `needs.bindings.contract` is exactly `app-bindings/v1` — \
                          the contract the bundle's `bindings/app-bindings-v1.json` declares",
+                    ));
+                }
+            }
+        }
+        if let Some(value) = needs.get(serde_yaml::Value::String("actions".into())) {
+            let serde_yaml::Value::Mapping(actions) = value else {
+                return Err(Error::rejected(
+                    "app.md `needs.actions` is a mapping — `contract: app-actions/v2`",
+                ));
+            };
+            for key in actions.keys() {
+                if key.as_str() != Some("contract") {
+                    return Err(Error::rejected(
+                        "app.md `needs.actions` knows only `contract`",
+                    ));
+                }
+            }
+            match actions.get(serde_yaml::Value::String("contract".into())) {
+                Some(serde_yaml::Value::String(contract))
+                    if contract == app_action_v2::CONTRACT =>
+                {
+                    action_contract = Some(app_action_v2::CONTRACT.to_string());
+                }
+                _ => {
+                    return Err(Error::rejected(
+                        "app.md `needs.actions.contract` is exactly `app-actions/v2` — \
+                         the contract the bundle's `actions/app-actions-v2.json` declares",
                     ));
                 }
             }
@@ -517,6 +556,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         summary,
         view_contract,
         binding_contract,
+        action_contract,
         guide: body.to_string(),
     })
 }
@@ -679,6 +719,12 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
                 return Err(entry_err(
                     &format!("{top}/{name}"),
                     "bindings/ holds exactly app-bindings-v1.json",
+                ));
+            }
+            if top == "actions" && name != app_action_v2::FILE {
+                return Err(entry_err(
+                    &format!("{top}/{name}"),
+                    "actions/ holds exactly app-actions-v2.json",
                 ));
             }
             files.push((format!("{top}/{name}"), entry.path()));
@@ -910,6 +956,7 @@ fn validate_contents(
                     summary: None,
                     view_contract: None,
                     binding_contract: None,
+                    action_contract: None,
                     guide: String::new(),
                 }
             }
@@ -923,6 +970,7 @@ fn validate_contents(
             summary: None,
             view_contract: None,
             binding_contract: None,
+            action_contract: None,
             guide: String::new(),
         },
     };
@@ -979,6 +1027,7 @@ fn validate_contents(
         .iter()
         .find(|(rel, _)| rel == app_binding::REL_PATH)
         .map(|(_, text)| text.as_str());
+    let mut parsed_binding = None;
     match (manifest.binding_contract.as_deref(), binding_file) {
         (Some(app_binding::CONTRACT), Some(text)) => {
             if manifest.view_contract.is_none() {
@@ -995,6 +1044,7 @@ fn validate_contents(
                     ) {
                         errors.push(format!("{}: {e}", app_binding::REL_PATH));
                     }
+                    parsed_binding = Some(binding);
                 }
                 Err(e) => errors.push(format!("{}: {e}", app_binding::REL_PATH)),
             }
@@ -1006,6 +1056,42 @@ fn validate_contents(
         (None, Some(_)) => errors.push(format!(
             "{} is present but app.md never declares `needs.bindings.contract` — an undeclared binding can never install",
             app_binding::REL_PATH
+        )),
+        (None, None) => {}
+        (Some(_), Some(_)) => {}
+    }
+    let action_file = files
+        .iter()
+        .find(|(rel, _)| rel == app_action_v2::REL_PATH)
+        .map(|(_, text)| text.as_str());
+    match (manifest.action_contract.as_deref(), action_file) {
+        (Some(app_action_v2::CONTRACT), Some(text)) => {
+            if manifest.view_contract.is_none() || manifest.binding_contract.is_none() {
+                errors.push(
+                    "app.md declares `needs.actions` but actions/v2 requires both `needs.views` and `needs.bindings`".into(),
+                );
+            }
+            match app_action_v2::parse_str(text) {
+                Ok(actions) => {
+                    if let Err(error) = app_action_v2::validate_against(
+                        &actions,
+                        &manifest,
+                        parsed_descriptor.as_ref(),
+                        parsed_binding.as_ref(),
+                    ) {
+                        errors.push(format!("{}: {error}", app_action_v2::REL_PATH));
+                    }
+                }
+                Err(error) => errors.push(format!("{}: {error}", app_action_v2::REL_PATH)),
+            }
+        }
+        (Some(_), None) => errors.push(format!(
+            "app.md declares `needs.actions` but the bundle carries no {} — the declaration and action file install together or not at all",
+            app_action_v2::REL_PATH
+        )),
+        (None, Some(_)) => errors.push(format!(
+            "{} is present but app.md never declares `needs.actions.contract` — an undeclared action companion can never install",
+            app_action_v2::REL_PATH
         )),
         (None, None) => {}
         (Some(_), Some(_)) => {}

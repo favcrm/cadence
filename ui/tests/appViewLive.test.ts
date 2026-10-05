@@ -162,7 +162,7 @@ async function main() {
           source: "operator", consent_email: "granted", tags: ["vip"] }];
     const body = {
       rows,
-      ...(isDetail ? {} : { truncated: !cursor, next_cursor: cursor ? null : "cursor-2" }),
+      ...(isDetail ? { record_revision: 2 } : { truncated: !cursor, next_cursor: cursor ? null : "cursor-2" }),
       view_id: isDetail ? "customer-detail" : "customers",
       op: isDetail ? "show" : "list",
       digest: badResponsePin ? digest("d") : bundleDigest,

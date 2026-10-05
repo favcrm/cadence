@@ -15,8 +15,8 @@ use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
     app_audiences, app_content, app_contexts, app_records, app_release, app_runs, app_screens,
-    apps, connections, crm_send, crm_smtp, home, lane, operator, read_model, social_publish,
-    stages, threads, updates, wiki, workflows,
+    app_view_action, apps, connections, crm_send, crm_smtp, home, lane, operator, read_model,
+    social_publish, stages, threads, updates, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -966,6 +966,15 @@ pub(crate) fn write_route(
         }
         let resp = workflows::propose(&mut request, state_dir, key, name);
         send(request, resp);
+        return;
+    }
+    if let Some(route) = app_view_action::route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_view_action::handle(&mut request, state_dir, route, true);
+        send(request, response);
         return;
     }
     if let Some(route) = app_contexts::route(path) {

@@ -710,6 +710,13 @@
   gap: 0.4rem;
 }
 
+.av-form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .live-view-search {
   display: grid;
   gap: 0.35rem;

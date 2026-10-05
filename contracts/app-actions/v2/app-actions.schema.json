@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cadence:contracts:app-actions:v2:descriptor",
+  "title": "App actions descriptor (app-actions/v2)",
+  "description": "Data-only action declarations paired with one app-views/v1 descriptor and app-bindings/v1 binding. V2 adds an explicit form_view and nullable metadata; the selected app-views/v1 form remains an inert preview. The first executable adapter is intentionally closed to crm customer.create/customer.update and validates this complete descriptor pair. The host alone supplies identity, context, record ids and CAS revisions; package declarations cannot grant authority or widen host bounds.",
+  "type": "object",
+  "required": ["contract", "app", "title", "actions"],
+  "additionalProperties": false,
+  "properties": {
+    "contract": { "const": "app-actions/v2" },
+    "app": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+      "description": "App kind provenance; the first host adapter accepts crm only."
+    },
+    "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 280 },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/action" },
+      "description": "Action ids are unique; the installed CRM adapter requires exactly customer.create and customer.update."
+    }
+  },
+  "$defs": {
+    "safeObject": {
+      "type": "object",
+      "propertyNames": {
+        "not": {
+          "enum": [
+            "__proto__", "prototype", "constructor",
+            "script", "scripts", "code", "html", "innerHTML", "css", "style",
+            "javascript", "eval", "import", "module",
+            "url", "uri", "href", "src", "link", "endpoint", "method", "route",
+            "install_id", "installId", "context_id", "contextId",
+            "workspace", "workspace_id", "project", "project_id", "project_link",
+            "actor", "by", "role", "grant", "scope", "scopes",
+            "capability", "capabilities", "caller",
+            "secret", "secrets", "credential", "credentials", "token", "password",
+            "sql", "query", "path", "file",
+            "effect", "effects", "verified", "digest", "revision",
+            "revision_pin", "approval_pin", "actor_request", "guard",
+            "public", "unauthenticated", "skip_approval",
+            "default", "pattern", "regex", "expression", "formula",
+            "schema", "properties", "items", "send",
+            "consent", "consent_email", "consent_sms", "record_id", "recordId",
+            "expected_revision", "expectedRevision"
+          ]
+        }
+      }
+    },
+    "field": {
+      "allOf": [{ "$ref": "#/$defs/safeObject" }],
+      "type": "object",
+      "required": ["id", "label"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "type": {
+          "enum": ["text", "number", "date", "datetime", "enum", "tags"],
+          "default": "text",
+          "description": "Closed v1-compatible input vocabulary."
+        },
+        "required": { "type": "boolean", "default": false },
+        "nullable": {
+          "type": "boolean",
+          "default": false,
+          "description": "Only true for an optional text field; null/blank clears a host field only when that host field is explicitly nullable."
+        },
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 24,
+          "items": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "description": "Required only for enum and forbidden for other types; consumer-checked."
+        },
+        "maxLength": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096,
+          "description": "Optional text/tag-item bound; host maximums remain authoritative even if this is larger."
+        },
+        "maxItems": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "description": "Optional tags-list bound; host maximums remain authoritative even if this is larger."
+        }
+      }
+    },
+    "input": {
+      "allOf": [{ "$ref": "#/$defs/safeObject" }],
+      "type": "object",
+      "required": ["fields"],
+      "additionalProperties": false,
+      "properties": {
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/field" },
+          "description": "Field ids are unique; the consumer checks exact order and one-for-one parity with the selected preview."
+        }
+      }
+    },
+    "action": {
+      "allOf": [{ "$ref": "#/$defs/safeObject" }],
+      "type": "object",
+      "required": ["id", "title", "operation", "record", "form_view", "input"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}(\\.[a-z][a-z0-9_-]{0,63}){0,3}$"
+        },
+        "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "operation": { "enum": ["record.create", "record.update"] },
+        "record": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "description": "The first installed adapter accepts customer only."
+        },
+        "form_view": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "description": "An app-views/v1 form preview id from the same bundle; selecting it never activates the preview renderer."
+        },
+        "input": { "$ref": "#/$defs/input" }
+      }
+    }
+  }
+}

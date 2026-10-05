@@ -299,7 +299,16 @@ impl Shared {
                     .record
                     .ok_or_else(|| Error::rejected("a customers show needs its record id"))?;
                 let record = records.app_record_show(context, record_id)?;
-                Ok(json!({"rows": [project_customer(&record["record"], vb)?]}))
+                let revision = record["record"]["revision"]
+                    .as_i64()
+                    .filter(|revision| *revision > 0)
+                    .ok_or_else(|| {
+                        Error::rejected("customer show returned no host record revision")
+                    })?;
+                Ok(json!({
+                    "rows": [project_customer(&record["record"], vb)?],
+                    "record_revision": revision,
+                }))
             }
             other => Err(Error::rejected(format!(
                 "customers does not admit op '{other}'"

@@ -141,6 +141,22 @@ const { createRoot } = require("react-dom/client") as typeof import("react-dom/c
 const AppShellModule = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell"));
 const AppShell = AppShellModule.default;
 const entryApp = AppShellModule.entryApp;
+equal(
+  AppShellModule.boundActionHref(
+    "/app-installations/install-crm?ctx=ctx-a&crm=customers&view=stale&contract-preview=crm",
+    "customer.create", null, "ctx-b",
+  ),
+  "/app-installations/install-crm?ctx=ctx-b&action=customer.create",
+  "an action link pins its active context and clears competing outlet selectors",
+);
+equal(
+  AppShellModule.boundViewHref(
+    "/app-installations/install-crm?ctx=ctx-a&crm=customers&action=stale",
+    "customer-detail", "cust-1", "ctx-b",
+  ),
+  "/app-installations/install-crm?ctx=ctx-b&view=customer-detail&record=cust-1",
+  "a detail link pins its active context and clears competing outlet selectors",
+);
 // Context moves ride real URL writes — the same `navigate` the shell
 // uses, so tests exercise adoption exactly like a pasted link.
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");

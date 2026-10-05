@@ -17,7 +17,7 @@ receipt; full package/UI/actions acceptance remains open.
 | File | What it is |
 |---|---|
 | `app-view.schema.json` | JSON Schema (draft 2020-12) for one descriptor: `{contract, app, title, summary?, views[]}`. `contract` is exactly `"app-views/v1"`. |
-| `examples/crm.json` | The CRM worked example — customers table, customer detail, disabled create-form preview. Mirrors `ui/.../app-views/examples.ts`. |
+| `examples/crm.json` | The CRM worked example — customers table, customer detail, disabled customer-form preview. Mirrors `ui/.../app-views/examples.ts`. |
 | `examples/social-content.json` | The Social Content worked example — metadata table/detail plus a disabled caption-form preview. Synthetic preview fixtures may include extra fields; the live binding exposes only its closed metadata projection. |
 
 ## What a descriptor is
@@ -154,10 +154,12 @@ tag.
 
 ## Remaining acceptance
 
-The current UI/read seam is deliberately narrow: only receipt-paired
-`table` + `detail` views with bound `list`/`show` reads render live. Form
-previews and actions remain disabled. Full CAD-867 acceptance is still
-open pending verification against both installed packages, real list and
-detail rendering, scope/chat preservation, and desktop/narrow behavior;
-this implementation does not claim typed action dispatch or broader
+The current UI seam is deliberately narrow: only receipt-paired `table` +
+`detail` views with bound `list`/`show` reads render live; a declared
+`app-actions/v2` CRM companion may additionally draw host-owned create/update
+forms. The v1 form preview itself remains inert. Full CAD-867 acceptance remains
+open pending real CRM/Social installation and context checks, scope/chat
+preservation, independent/native action-guard review, and desktop/narrow QA
+against the installed packages. The current fixture and synthetic-browser
+checks are not full acceptance; this implementation does not claim broader
 CAD-811 write support.

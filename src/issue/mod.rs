@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod app_action;
+pub mod app_action_v2;
 pub mod app_binding;
 pub mod app_catalog;
 pub mod app_chat;

@@ -44,6 +44,7 @@ function parseReadPage(
   if (!body) throw new Error("The live read returned an invalid receipt.");
   const allowed = ["rows", "view_id", "op", "digest", "view_descriptor_digest", "view_binding_digest"];
   if (route.op === "list" && route.binding.source === "customers") allowed.push("truncated", "next_cursor");
+  if (route.op === "show" && route.binding.source === "customers") allowed.push("record_revision");
   if (Object.keys(body).some((key) => !allowed.includes(key))) {
     throw new Error("The live read receipt contains an unsupported field.");
   }
@@ -54,6 +55,10 @@ function parseReadPage(
     throw new Error("The live read receipt does not match the installed view pins.");
   }
   const rows = liveRows(route.view, body.rows);
+  if (route.op === "show" && route.binding.source === "customers"
+      && (!Number.isSafeInteger(body.record_revision) || (body.record_revision as number) < 1)) {
+    throw new Error("The customer detail read did not return a valid host revision.");
+  }
   const boundFields = new Set(route.binding.fields.map((field) => field.field));
   if (rows.some((row) => Object.keys(row).some((key) => !boundFields.has(key)))) {
     throw new Error("The live read returned a field outside this installed binding.");
@@ -103,6 +108,8 @@ export default function LiveAppView({
   returnHref,
   backHref,
   detailHref,
+  createActionHref,
+  editActionHref,
 }: {
   installId: string;
   contextId: string;
@@ -113,6 +120,8 @@ export default function LiveAppView({
   returnHref: string;
   backHref: string | null;
   detailHref: (viewId: string, recordId: string) => string;
+  createActionHref?: string | null;
+  editActionHref?: string | null;
 }) {
   const searchId = useId();
   const [searchDraft, setSearchDraft] = useState("");
@@ -284,11 +293,17 @@ export default function LiveAppView({
         </p>
       </header>
       <Notice state="live-read-only">
-        Live records are read through this installation's verified view and binding receipt. Forms and actions remain disabled.
+        Live records are read through this installation's verified view and binding receipt. The v1 form previews remain inert.
       </Notice>
 
-      {route.op === "show" && backHref && route.tableView && (
-        <p><Link href={backHref} className="lnk">← Back to {route.tableView.title}</Link></p>
+      {route.op === "list" && createActionHref && (
+        <p><Link href={createActionHref} className="btn btn-primary btn-sm">Create customer</Link></p>
+      )}
+      {route.op === "show" && (
+        <div className="live-view-search-row">
+          {backHref && route.tableView && <Link href={backHref} className="lnk">← Back to {route.tableView.title}</Link>}
+          {editActionHref && <Link href={editActionHref} className="btn btn-secondary btn-sm">Edit customer</Link>}
+        </div>
       )}
 
       {canSearch && (

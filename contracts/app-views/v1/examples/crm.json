@@ -2,7 +2,7 @@
   "contract": "app-views/v1",
   "app": "crm",
   "title": "CRM — customers overview",
-  "summary": "Data-only customers table, customer detail, and disabled create-form preview.",
+  "summary": "Data-only customers table, customer detail, and disabled customer-form preview.",
   "views": [
     {
       "id": "customers",
@@ -42,18 +42,19 @@
         { "id": "tags", "label": "Tags", "format": "tags", "kind": "list" },
         { "id": "tier", "label": "Tier", "format": "enum", "values": ["member", "vip", "vip_plus"] },
         { "id": "last_visit", "label": "Last visit", "format": "date" },
-        { "id": "notes", "label": "Notes", "format": "text", "createView": "customer-form" }
+        { "id": "notes", "label": "Notes", "format": "text" }
       ]
     },
     {
       "id": "customer-form",
-      "title": "New customer (preview)",
+      "title": "Customer form (preview)",
       "kind": "form",
       "previewOf": [
-        { "id": "name", "label": "Full name", "format": "text" },
+        { "id": "display_name", "label": "Display name", "format": "text" },
         { "id": "email", "label": "Email", "format": "text" },
-        { "id": "tier", "label": "Tier", "format": "enum", "values": ["member", "vip", "vip_plus"] },
-        { "id": "notes", "label": "Notes", "format": "text" }
+        { "id": "phone", "label": "Phone", "format": "text" },
+        { "id": "source", "label": "Source", "format": "text" },
+        { "id": "tags", "label": "Tags", "format": "tags", "kind": "list" }
       ]
     }
   ]

@@ -860,6 +860,7 @@ mod tests {
             summary: None,
             view_contract: Some(app_view::CONTRACT.to_string()),
             binding_contract: Some(CONTRACT.to_string()),
+            action_contract: None,
             guide: String::new(),
         }
     }
@@ -878,6 +879,7 @@ mod tests {
             summary: None,
             view_contract: Some(app_view::CONTRACT.to_string()),
             binding_contract: Some(CONTRACT.to_string()),
+            action_contract: None,
             guide: String::new(),
         }
     }
@@ -1233,6 +1235,7 @@ mod tests {
                 summary: None,
                 view_contract: Some(app_view::CONTRACT.to_string()),
                 binding_contract: Some(CONTRACT.to_string()),
+                action_contract: None,
                 guide: String::new(),
             };
             parse_and_validate(&binding, &manifest, &descriptor)
