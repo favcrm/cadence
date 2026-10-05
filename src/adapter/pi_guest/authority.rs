@@ -349,7 +349,11 @@ impl Channel {
             )
         } != 0
             || len as usize != std::mem::size_of::<libc::ucred>()
-            || cred.uid != SUPERVISOR_UID
+            // SO_PEERCRED reflects ROOT's creation/listen credentials, not
+            // the sealed21000 proxy that accepts and forwards this stream.
+            // Root UID is endpoint provenance only: the actual dispatcher
+            // must ALSO verify runtime/current purpose and owned kernel caller.
+            || cred.uid != 0
             || cred.pid <= 0
         {
             return Err(refused());
