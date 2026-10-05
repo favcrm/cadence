@@ -1,0 +1,23 @@
+{
+  "contract": "app-bindings/v1",
+  "app": "social-content",
+  "title": "Social Content bindings — caption runs",
+  "bindings": [
+    {
+      "view": "caption-runs",
+      "source": "caption-runs",
+      "ops": ["list"],
+      "fields": [
+        { "field": "subject", "key": "snapshot.inputs.subject", "format": "text" }
+      ]
+    },
+    {
+      "view": "caption-detail",
+      "source": "caption-runs",
+      "ops": ["show"],
+      "fields": [
+        { "field": "subject", "key": "snapshot.inputs.subject", "format": "text" }
+      ]
+    }
+  ]
+}

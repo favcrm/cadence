@@ -50,19 +50,22 @@ cadence app catalog show <install-id>
 ```
 
 The source must be an A1 bundle: `app.md`, checked workflow Markdown under
-`workflows/`, and supported optional `rubrics/`, `templates/` and `views/`
-files. `views/` may carry exactly one file — `views/app-views-v1.json`, a
-data-only [app-views/v1](../../contracts/app-views/v1/README.md) descriptor —
-and only when `app.md` declares it with `needs.views.contract: app-views/v1`.
-The declaration and the file pair up: either alone refuses install, and the
-descriptor's `app` must be the bundle's own `app` name. Descriptor bytes are
-inside the installed bundle's digest, so a byte change re-gates approval like
-any other structural change; the verified `app catalog show` receipt serves
-the validated descriptor as `view_descriptor` (plus `view_descriptor_digest`),
-or `null` on bundles without one. Descriptors are declarations only — they do
-not render live data or carry actions. See the existing
-[Blog post bundle](../../apps/blog-post/app.md) and
-[Social Content bundle](../../apps/social-content/app.md).
+`workflows/`, and supported optional `rubrics/`, `templates/`, `views/` and
+`bindings/` files. `views/` may carry exactly one file —
+`views/app-views-v1.json`, a data-only
+[app-views/v1](../../contracts/app-views/v1/README.md) descriptor — only when
+`app.md` declares `needs.views.contract: app-views/v1`. `bindings/` may carry
+exactly `bindings/app-bindings-v1.json`, the data-only
+[app-bindings/v1](../../contracts/app-bindings/v1/README.md) companion, only
+when `app.md` declares `needs.bindings.contract: app-bindings/v1` and the bundle
+also declares and ships its app-views/v1 descriptor. Declarations and files
+pair up; the manifest, descriptor and binding app names must match. Descriptor
+only packages remain supported. Descriptor and companion bytes contribute to
+the bundle digest; receipts expose `view_descriptor` with its digest and, when
+present, `view_binding` with its digest, both reparsed from the same verified
+snapshot. These declarations do not execute package code or carry actions. See
+the existing [Blog post bundle](../../apps/blog-post/app.md) and [Social
+Content bundle](../../apps/social-content/app.md).
 
 The React fixture preview at `app-previews/social-content` is **not** an
 installation bundle. Its independent development harness is documented in
@@ -111,6 +114,8 @@ objects. Useful fields include:
 | `project`, `project_link`, `storage_kind` | Optional legacy project metadata and `workspace` or `legacy` storage. |
 | `source`, `digest`, `installed_at` | Recorded source provenance, copied content digest, and installation time. |
 | `approval.state`, `approved`, `executable` | New workspace rows are `unapproved`, `false`, and `false`. Legacy catalog rows report approval `unknown` and `approved: null`; consult the existing legacy surface for approval verification. |
+| `view_descriptor`, `view_descriptor_digest` | Validated descriptor and pin, or both `null` for descriptor-free packages. |
+| `view_binding`, `view_binding_digest` | Validated companion and pin, or both `null` when absent; reparsed with the descriptor from one verified bundle snapshot. |
 | `guide`, `record`, `files` | Manifest guide, retained installation record, and bundle inventory. |
 
 Successful install/recover responses also report `committed: true` and
