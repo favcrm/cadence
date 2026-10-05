@@ -188,11 +188,29 @@ pub(in crate::store) fn refuse_legacy_path(path: &std::path::Path) -> Result<()>
     let enclave = std::path::Path::new(DATABASE_PATH)
         .parent()
         .ok_or_else(|| Error::rejected("protected Store enclave is invalid"))?;
-    let resolved = path
-        .canonicalize()
-        .ok()
-        .or_else(|| Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?)));
-    if path.starts_with(enclave) || resolved.is_some_and(|p| p.starts_with(enclave)) {
+    // Direct reserved selectors refuse without probing the real enclave.
+    // An unresolved symlink cannot safely elect a fresh legacy database: it
+    // could follow a dangling chain into an absent protected destination.
+    if path.starts_with(enclave) {
+        return Err(Error::rejected(
+            "raw/legacy writer refused in the protected Store enclave",
+        ));
+    }
+    let resolved = match path.canonicalize() {
+        Ok(path) => Some(path),
+        Err(_) => {
+            if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(Error::rejected(
+                    "unresolved raw/legacy writer alias refused",
+                ));
+            }
+            path.parent()
+                .and_then(|p| p.canonicalize().ok())
+                .zip(path.file_name())
+                .map(|(p, name)| p.join(name))
+        }
+    };
+    if resolved.is_some_and(|p| p.starts_with(enclave)) {
         return Err(Error::rejected(
             "raw/legacy writer refused in the protected Store enclave",
         ));
