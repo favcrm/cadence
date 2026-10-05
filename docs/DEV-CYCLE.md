@@ -195,3 +195,31 @@ required-check policy safely.
 CAD-1102 ended the reduced window: the current gate is permanent and releases
 are no longer frozen. New behavior checks follow AGENTS.md (CAD-1099), one
 acceptance check per enforced rule, not restoration of the retired suites.
+
+## Emergency clean-slate transition
+
+When the operator wants to retire the legacy suite without waiting for a full
+replacement, an explicit operator-approved ticket may declare a time-bounded
+transition and its merge gate. The declaration must name the deleted test scope,
+the reduced checks allowed to merge, residual controls, duration and how the
+normal gates return. An agent or PR may not grant that exception to itself.
+
+- During the window, an approved PR may remove the named legacy tests and merge
+  through only the approved reduced gate. The exception does not delete
+  production effects, authorization or enforcement code; it changes which
+  retained tests and required checks may be suspended for the named scope. A
+  documentation-only/non-logic diff may use the declared reduced gate instead
+  of the heavy compile/test pipeline where that gate has been explicitly
+  approved and wired; this section by itself does not alter required CI.
+- Changes merged under the transition must not produce release or production
+  artifacts, and cleanup cannot depend on unverified state. A check that still
+  protects a residual control remains mandatory; unknown or uncontrollable
+  effects stay outside the window.
+- Every reduced-gate PR still identifies the intended behavior and residual
+  unprotected contracts, records executed checks and limitations, and receives
+  the reviews/approval its own diff requires. A temporary gate cannot waive
+  the risk classification itself.
+- At expiry the declared restore criteria apply: the replacement behavior
+  checks or the restored mandatory controls must be present before ordinary
+  delivery resumes. The exception is evidence for a controlled transition, not
+  proof that the removed coverage was safe or equivalent.
