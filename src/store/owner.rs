@@ -453,18 +453,22 @@ pub(super) fn check_identity(conn: &Connection, binding: &Binding, source: bool)
     Ok(())
 }
 
-/// Facts captured under the closed all-writer barrier. This is neither an
-/// uploaded artifact nor externally validated FINAL/retirement evidence.
+/// Committed readback from `witness_owned`, not caller-supplied facts. Private
+/// fields and serialize-only access let the actual registered root encoder
+/// emit this result without a generic publish-JSON or DTO constructor.
+/// Serialization is DATA, not caller/runtime custody, an authoritative digest,
+/// an uploaded artifact or externally validated FINAL/retirement evidence.
+#[derive(Serialize)]
 pub(crate) struct QuiescedWitness {
-    pub sequence: u64,
-    pub business_highwater: u64,
-    pub database_id: String,
-    pub incarnation: String,
-    pub database_epoch: u64,
-    pub operation: String,
-    pub challenge: Vec<u8>,
-    pub attempt: String,
-    pub artifact: String,
+    sequence: u64,
+    business_highwater: u64,
+    database_id: String,
+    incarnation: String,
+    database_epoch: u64,
+    operation: String,
+    challenge: Vec<u8>,
+    attempt: String,
+    artifact: String,
 }
 
 impl super::super::Store {
