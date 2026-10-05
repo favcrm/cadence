@@ -366,7 +366,14 @@ impl ProtectedTopology {
                 is_dir: true,
             },
             Node {
-                path: "/opt/cadence/libexec",
+                path: "/opt/protected",
+                owner: 0,
+                group: 0,
+                mode: 0o755,
+                is_dir: true,
+            },
+            Node {
+                path: "/opt/protected/bin",
                 owner: 0,
                 group: 0,
                 mode: 0o755,

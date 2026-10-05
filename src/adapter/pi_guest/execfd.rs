@@ -62,7 +62,7 @@ pub(crate) struct ExecPin {
 /// The order is fixed: index 0 is the setuid helper, index 1 the node ELF.
 pub(crate) const EXEC_PINS: &[ExecPin] = &[
     ExecPin {
-        canon: "/opt/cadence/libexec/cadence-agent-exec",
+        canon: crate::protected_pi_profile::HELPER_PATH,
         owner: 0,
         group: Some(super::acct::LAUNCH_GROUP),
         mode: 0o4750,

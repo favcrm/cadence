@@ -21,6 +21,7 @@ static PROFILE_MINTED: AtomicBool = AtomicBool::new(false);
 // Independently authored ticket acceptance; implementers own registration only.
 #[cfg(test)]
 mod acceptance;
+mod authentication;
 mod provision;
 
 const PROFILE: &str = "/opt/cadence/pi-profile.json";
@@ -182,6 +183,7 @@ struct OperationReply {
     scope: OperationScope,
     outcome: Outcome,
     phase: OperationPhase,
+    authorization: String,
 }
 impl OperationReply {
     fn read(value: serde_json::Value) -> Result<Self> {
@@ -339,12 +341,26 @@ impl OwnerProfile {
         // Never retry this generation after a partial request or lost ACK.
         // Only the actual external owner's durable one-use operation can issue
         // the reference; local UUIDs/phase bits/current readbacks are not grants.
+        // ONLY actual independently qualified Pi-purpose PUBLIC trust. Neither
+        // a caller key nor receipt/grant/runtime trust can authorize this scope.
+        let keys = constructor::pi_public_keys(until)?;
+        let expiry = constructor::pi_expires_at_ms(until)?;
         let response = constructor::pi_acquire(&scope, until)?;
         let reply = OperationReply::read(response)?;
         reply.require(&scope, None, Outcome::Issued, OperationPhase::Issued)?;
+        let authorization = authentication::authenticate_operation(
+            &scope,
+            &reply.reference,
+            &reply.authorization,
+            keys,
+            authentication::now_ms()?,
+            expiry,
+        )?;
+        let until = until.min(authorization.deadline());
         if current(&self.proof, until)? != epoch {
             return Err(refuse());
         }
+        authorization.require(&reply.authorization, authentication::now_ms()?)?;
         let launch = Authorized {
             version: 1,
             selection,
@@ -363,6 +379,7 @@ impl OwnerProfile {
             epoch,
             scope,
             until,
+            authorization,
             phase: Cell::new(Phase::Prepared),
             unknown: Cell::new(false),
         })
@@ -383,6 +400,7 @@ pub(crate) struct LaunchPermit {
     epoch: Epoch,
     scope: OperationScope,
     until: Instant,
+    authorization: authentication::AuthenticatedOperation,
     phase: Cell<Phase>,
     unknown: Cell<bool>,
 }
@@ -409,6 +427,7 @@ impl LaunchPermit {
             return Err(refuse());
         }
         let result = (|| {
+            self.authorization.recheck(authentication::now_ms()?)?;
             if Instant::now() >= self.until || current(&self.proof, self.until)? != self.epoch {
                 return Err(refuse());
             }
@@ -432,9 +451,14 @@ impl LaunchPermit {
                     OperationPhase::Issued
                 },
             )?;
+            // Exact ORIGINAL independently signed authorization in every
+            // issued/current/consumed reply. A replacement/renewal is refused.
+            self.authorization
+                .require(&reply.authorization, authentication::now_ms()?)?;
             if current(&self.proof, self.until)? != self.epoch {
                 return Err(refuse());
             }
+            self.authorization.recheck(authentication::now_ms()?)?;
             Ok(())
         })();
         if result.is_err() {

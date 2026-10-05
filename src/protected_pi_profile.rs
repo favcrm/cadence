@@ -7,6 +7,8 @@ use std::os::unix::ffi::OsStrExt;
 /// private image owner, never a candidate capture or a helper caller.
 pub(crate) const IMAGE_ROOT: &str = "/opt/cadence/pi";
 pub(crate) const NODE_PATH: &str = "/opt/cadence/pi/node";
+/// Constructor-selected independently pinned artifact; no second helper/SUID election.
+pub(crate) const HELPER_PATH: &str = "/opt/protected/bin/cadence-agent-exec";
 pub(crate) const NODE_DIGEST: Option<[u8; 32]> = None; // Legacy unelected pin table only.
 #[path = "adapter/pi_guest/authority.rs"]
 pub(crate) mod authority;
