@@ -728,6 +728,17 @@ impl Shared {
     }
 }
 
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod cad1156_boundary_tests;
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod cad1156_downstream_tests;
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod cad1156_escaped_result_tests;
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod cad1156_summary_tests;
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod cad1156_tests;
+
 #[cfg(test)]
 mod cad1120_tests;
 #[cfg(test)]

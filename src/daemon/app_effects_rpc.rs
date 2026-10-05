@@ -4,6 +4,58 @@ use super::*;
 use crate::issue::app_catalog::workspace;
 use crate::store::{app_bindings::BindingProof, app_effects, app_runs, EffectRow};
 
+// Only positively classified SMTP adds native JSON-content patterns. Opaque
+// credentials retain the unchanged global raw whole/Unicode-window screen.
+fn publication_refuse_leak(
+    legacy_smtp: bool,
+    what: &'static str,
+    text: &str,
+    secret: &[u8],
+) -> Result<()> {
+    crate::platform::refuse_leak(what, text, secret)?;
+    if !legacy_smtp {
+        return Ok(());
+    }
+    let secret = std::str::from_utf8(secret)
+        .map_err(|_| Error::rejected("app release credential is invalid — withheld"))?;
+    let characters: Vec<_> = secret.chars().collect();
+    // Select each original eight-character window BEFORE encoding it.
+    for pattern in std::iter::once(secret.to_string()).chain(
+        characters
+            .windows(8)
+            .map(|window| window.iter().collect::<String>()),
+    ) {
+        let encoded = serde_json::to_string(&pattern)?;
+        // Remove exactly the two quotes constructed by string serialization.
+        let content = &encoded[1..encoded.len() - 1];
+        if content != pattern && text.contains(content) {
+            return Err(Error::internal(format!(
+                "{what} would carry the enrolled credential — withheld"
+            )));
+        }
+    }
+    Ok(())
+}
+
+// Callers classify the durable record while holding the custody lock.
+fn publication_smtp_envelope(
+    legacy_smtp: bool,
+    bytes: &[u8],
+) -> Result<Option<crate::platform::smtp::SmtpEnvelope>> {
+    if !legacy_smtp {
+        return Ok(None);
+    }
+    let (envelope, projection) = crate::platform::smtp::custody_decode(bytes)
+        .map_err(|_| Error::rejected("app release credential is invalid — withheld"))?;
+    publication_refuse_leak(
+        true,
+        "smtp publication projection",
+        &projection.to_json().to_string(),
+        envelope.secret(),
+    )?;
+    Ok(Some(envelope))
+}
+
 impl Shared {
     pub(super) fn rpc_app_effect(
         self: &Arc<Self>,
@@ -191,6 +243,7 @@ impl Shared {
                     .platforms
                     .get(provider)
                     .ok_or_else(|| Error::rejected("publication adapter unavailable"))?;
+                let legacy_smtp = self.legacy_smtp_publication(provider, account)?;
                 let input = adapter
                     .prepare_app_artifact(
                         required_str(params, "title")?,
@@ -198,7 +251,13 @@ impl Shared {
                         &authority["provenance"],
                         material.get("asset"),
                     )
-                    .map_err(Error::rejected)?;
+                    .map_err(|error| {
+                        if legacy_smtp {
+                            Error::rejected("app release preparation failed — withheld")
+                        } else {
+                            Error::rejected(error)
+                        }
+                    })?;
                 let preview = adapter.preview(account, tool, &input);
                 if serde_json::to_vec(&input)?.len() > 64 * 1024 || preview.len() > 16 * 1024 {
                     return Err(Error::rejected(
@@ -211,8 +270,33 @@ impl Shared {
                     provider,
                     account,
                 )?;
-                crate::platform::refuse_leak("app release input", &input.to_string(), &bytes)?;
-                crate::platform::refuse_leak("app release preview", &preview, &bytes)?;
+                let envelope = publication_smtp_envelope(legacy_smtp, &bytes)?;
+                let secret = envelope.as_ref().map_or(
+                    bytes.as_slice(),
+                    crate::platform::smtp::SmtpEnvelope::secret,
+                );
+                publication_refuse_leak(
+                    legacy_smtp,
+                    "app release input",
+                    &input.to_string(),
+                    secret,
+                )?;
+                publication_refuse_leak(legacy_smtp, "app release preview", &preview, secret)?;
+                let input_summary = required_str(params, "title")?;
+                if legacy_smtp {
+                    publication_refuse_leak(
+                        legacy_smtp,
+                        "app release input",
+                        input_summary,
+                        secret,
+                    )?;
+                    publication_refuse_leak(
+                        legacy_smtp,
+                        "app release input",
+                        &serde_json::to_string(input_summary)?,
+                        secret,
+                    )?;
+                }
                 let row = EffectRow {
                     effect_id,
                     request,
@@ -222,7 +306,7 @@ impl Shared {
                     tool: tool.into(),
                     label: None,
                     input,
-                    input_summary: required_str(params, "title")?.into(),
+                    input_summary: input_summary.into(),
                     preview,
                     source_name: None,
                     source_hash: Some(required_str(artifact, "digest")?.into()),
@@ -273,6 +357,26 @@ impl Shared {
         Ok(())
     }
 
+    fn legacy_smtp_publication(&self, provider: &str, account: &str) -> Result<bool> {
+        if provider != crate::platform::smtp::PLATFORM
+            || crate::platform::is_builtin(provider, account)
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .store
+            .platform_credential(provider, account)?
+            .is_some_and(|record| {
+                record.platform == crate::platform::smtp::PLATFORM
+                    && record.exchange == crate::platform::smtp::ENROLLMENT_SHAPE
+                    && matches!(
+                        record.custody.as_str(),
+                        crate::platform::custody::FILE_TAG
+                            | crate::platform::custody::LIBSECRET_TAG
+                    )
+            }))
+    }
+
     fn execute_app_artifact(&self, id: &str, digest: &str) -> Result<Value> {
         let frozen = self.store.app_effect_show(id)?;
         let authority = &frozen["effect"]["authority"];
@@ -294,12 +398,18 @@ impl Shared {
                 let config = &authority["binding"]["config"];
                 let provider = required_str(config, "provider")?;
                 let account = required_str(config, "account")?;
+                let legacy_smtp = self.legacy_smtp_publication(provider, account)?;
                 let bytes = crate::platform::load_credential(
                     &self.store,
                     &self.platform_custody,
                     provider,
                     account,
                 )?;
+                let envelope = publication_smtp_envelope(legacy_smtp, &bytes)?;
+                let secret = envelope.as_ref().map_or(
+                    bytes.as_slice(),
+                    crate::platform::smtp::SmtpEnvelope::secret,
+                );
                 let row = self
                     .store
                     .app_effect_claim(id, digest, |conn, current| {
@@ -338,24 +448,57 @@ impl Shared {
                 let verified = adapter.read_back(&row.tool, &row.input);
                 let (ok, uncertain, outcome) = match result {
                     Ok(value) => {
-                        if crate::platform::refuse_leak(
+                        let outcome = json!({"kind":"released","result":value,"verified":verified});
+                        if publication_refuse_leak(
+                            legacy_smtp,
                             "app release outcome",
-                            &value.to_string(),
-                            &bytes,
+                            &outcome["result"].to_string(),
+                            secret,
                         )
                         .is_err()
                         {
+                            let verified = if legacy_smtp {
+                                crate::contract_fixture::Verified::Unknown
+                            } else {
+                                verified
+                            };
                             (
                                 false,
                                 true,
                                 json!({"kind":"uncertain","error":"provider outcome withheld","verified":verified}),
                             )
                         } else {
-                            (
-                                true,
-                                false,
-                                json!({"kind":"released","result":value,"verified":verified}),
+                            (true, false, outcome)
+                        }
+                    }
+                    Err(error) if legacy_smtp => {
+                        let (uncertain, error) = match error {
+                            crate::platform::AppArtifactError::Refused(error) => (false, error),
+                            crate::platform::AppArtifactError::Uncertain(error) => (true, error),
+                        };
+                        let outcome = json!({"kind":if uncertain { "uncertain" } else { "refused" },"error":error,"verified":verified});
+                        if publication_refuse_leak(
+                            legacy_smtp,
+                            "app release error",
+                            outcome["error"].as_str().unwrap(),
+                            secret,
+                        )
+                        .is_err()
+                            || publication_refuse_leak(
+                                legacy_smtp,
+                                "app release error",
+                                &outcome["error"].to_string(),
+                                secret,
                             )
+                            .is_err()
+                        {
+                            (
+                                false,
+                                true,
+                                json!({"kind":"uncertain","error":"provider error withheld","verified":crate::contract_fixture::Verified::Unknown}),
+                            )
+                        } else {
+                            (false, uncertain, outcome)
                         }
                     }
                     Err(error) => {
