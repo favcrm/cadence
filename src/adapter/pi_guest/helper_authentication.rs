@@ -23,11 +23,15 @@ impl QualifiedImage {
     }
     pub(super) fn authenticate(
         self,
+        expected: &authority::Selection,
         launch: &authority::Authorized,
         signed: &authority::SignedOperation,
     ) -> io::Result<HelperAuthorization> {
         let scope = &signed.scope;
-        launch.validate(&launch.selection)?;
+        // Bind to the privately selected profile/client expectation, never the
+        // response's own self-selected description. Channel correlation is an
+        // additional prerequisite, not a substitute for this shared trust gate.
+        launch.validate(expected)?;
         if scope.version != 1 || scope.selection != launch.selection || scope.alias != launch.alias
         {
             return Err(authority::refused());

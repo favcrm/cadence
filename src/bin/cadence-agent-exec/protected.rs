@@ -43,7 +43,7 @@ fn private_authority(
         },
         &selection,
     )?;
-    let proof = qualified.authenticate(&authorized, &signed)?;
+    let proof = qualified.authenticate(&selection, &authorized, &signed)?;
     channel.bound_until(proof.deadline())?;
     Ok((channel, authorized, proof))
 }

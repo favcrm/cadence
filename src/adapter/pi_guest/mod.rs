@@ -24,6 +24,38 @@ pub(crate) mod topology;
 use crate::protected_pi_profile::authority;
 use topology::ProtectedTopology;
 
+/// Finite debug acceptance observation of the SAME helper/client trust gate.
+/// Public DTOs are data only: no keys, clock, callback, path, FD or kernel proof.
+/// Success discards the private math proof and grants no launch/current/custody.
+/// Actual execution must still enter through the owned service and retained
+/// Channel; helper trust passes BEFORE private_view/Graph/Node/seal effects.
+#[cfg(all(
+    debug_assertions,
+    feature = "test-seam",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub(crate) fn launch_trust_before_effects(frame: &[u8]) -> std::io::Result<()> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Frame {
+        version: u32,
+        selection: authority::Selection,
+        launch: authority::Authorized,
+        signed: authority::SignedOperation,
+    }
+    if frame.is_empty() || frame.len() > authority::MAX_FRAME {
+        return Err(authority::refused());
+    }
+    let frame: Frame = serde_json::from_slice(frame).map_err(|_| authority::refused())?;
+    if frame.version != 1 {
+        return Err(authority::refused());
+    }
+    authentication::QualifiedImage::load()?
+        .authenticate(&frame.selection, &frame.launch, &frame.signed)?
+        .recheck()
+}
+
 /// The four image-local accounts/groups the protected layout is built on —
 /// resolved by NSS name, never hardcoded to a uid and never taken from a
 /// caller. `cadence-supervisor` owns the private/protected tree; the guest
@@ -201,7 +233,7 @@ impl GuestCtx {
             },
             &selection,
         )?;
-        let proof = qualified.authenticate(&launch, &signed)?;
+        let proof = qualified.authenticate(&selection, &launch, &signed)?;
         channel.bound_until(proof.deadline())?;
         proof.recheck()?;
         let topo = ProtectedTopology::verify(agent_uid)?;
