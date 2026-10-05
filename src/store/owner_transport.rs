@@ -1,5 +1,5 @@
 //! Client for the fixed private Store owner service. This is NOT a generic
-//! authority RPC: finite startup/acquire/consume/current messages, exact
+//! authority RPC: finite startup/acquire/consume/current/database_current, exact
 //! bindings, one retained authenticated channel, no credentials, no
 //! reconnect/retry after ACK loss.
 //! The constructor service must admit actual enrolled caller custody and relay
@@ -46,6 +46,14 @@ enum Request<'a> {
         grant: &'a str,
         binding: &'a Binding,
     },
+    /// Exact original consumed opening tuple, not another activation/consume.
+    /// ROOT must recheck live runtime/kernel custody and durable consumed state.
+    DatabaseCurrent {
+        version: u8,
+        sequence: u64,
+        grant: &'a str,
+        binding: &'a Binding,
+    },
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,7 +77,14 @@ enum Outcome {
     Issued,
     Consumed,
     Current,
+    DatabaseCurrent,
     Unknown,
+}
+#[derive(Clone, Copy)]
+enum ExchangeKind {
+    Consume,
+    ActivationCurrent,
+    DatabaseCurrent,
 }
 
 #[cfg(target_os = "linux")]
@@ -162,63 +177,106 @@ impl StoreOwnerGrant {
                 "Store owner permit spent or UNKNOWN; replay refused",
             ));
         }
-        self.request(true)
+        self.request(ExchangeKind::Consume)
     }
+    /// Short activation/maintenance check, even after consumption. This never
+    /// extends the original permit's deadline during opening or closure effects.
     pub(crate) fn recheck(&self) -> Result<()> {
-        self.request(false)
+        self.request(ExchangeKind::ActivationCurrent)
     }
-    fn request(&self, consume: bool) -> Result<()> {
+    /// Business transactions use a DIFFERENT finite owner exchange. Local burn
+    /// or an expired tuple alone is insufficient: ROOT must freshly corroborate
+    /// actual consumed phase, live runtime and the same kernel/DB/lineage scope.
+    pub(super) fn recheck_database(&self) -> Result<()> {
+        self.request(ExchangeKind::DatabaseCurrent)
+    }
+    fn validate_for(&self, kind: ExchangeKind) -> Result<()> {
         if self.unknown.load(Ordering::SeqCst) {
             return Err(Error::rejected("Store owner outcome UNKNOWN; no replay"));
         }
-        if let Err(error) = self.binding.validate() {
-            self.unknown.store(true, Ordering::SeqCst);
-            return Err(error);
-        }
-        let mut channel = self
-            .channel
-            .lock()
-            .map_err(|_| Error::rejected("Store owner channel poisoned"))?;
-        let sequence = channel.next_sequence()?;
-        let request = if consume {
-            Request::Consume {
-                version: 1,
-                sequence,
-                grant: &self.grant,
-                binding: &self.binding,
-            }
-        } else {
-            Request::Current {
-                version: 1,
-                sequence,
-                grant: &self.grant,
-                binding: &self.binding,
-            }
-        };
-        let result = (|| {
-            let response = channel.exchange(&request)?;
-            if response.version != 1
-                || response.sequence != sequence
-                || response.grant != self.grant
-                || response.binding != self.binding
-                || response.outcome
-                    != if consume {
-                        Outcome::Consumed
-                    } else {
-                        Outcome::Current
-                    }
-                || response.phase
-                    != if self.consumed.load(Ordering::SeqCst) {
-                        Phase::Consumed
-                    } else {
-                        Phase::Issued
-                    }
+        if matches!(kind, ExchangeKind::DatabaseCurrent) {
+            if !self.consumed.load(Ordering::SeqCst)
+                || !matches!(
+                    self.binding.purpose,
+                    super::Purpose::Init | super::Purpose::Restore | super::Purpose::Open
+                )
             {
                 return Err(Error::rejected(
-                    "Store owner current/consumption is UNKNOWN",
+                    "database current requires a consumed opening grant",
                 ));
             }
+            self.binding.validate_stable()
+        } else {
             self.binding.validate()
+        }
+    }
+    fn request(&self, kind: ExchangeKind) -> Result<()> {
+        if self.unknown.load(Ordering::SeqCst) {
+            return Err(Error::rejected("Store owner outcome UNKNOWN; no replay"));
+        }
+        let result = (|| {
+            self.validate_for(kind)?;
+            let mut channel = self
+                .channel
+                .lock()
+                .map_err(|_| Error::rejected("Store owner channel poisoned"))?;
+            // Serialize UNKNOWN publication with exchanges on this channel:
+            // a queued business recheck cannot race past a failed predecessor.
+            let result = (|| {
+                self.validate_for(kind)?;
+                let sequence = channel.next_sequence()?;
+                let (request, outcome) = match kind {
+                    ExchangeKind::Consume => (
+                        Request::Consume {
+                            version: 1,
+                            sequence,
+                            grant: &self.grant,
+                            binding: &self.binding,
+                        },
+                        Outcome::Consumed,
+                    ),
+                    ExchangeKind::ActivationCurrent => (
+                        Request::Current {
+                            version: 1,
+                            sequence,
+                            grant: &self.grant,
+                            binding: &self.binding,
+                        },
+                        Outcome::Current,
+                    ),
+                    ExchangeKind::DatabaseCurrent => (
+                        Request::DatabaseCurrent {
+                            version: 1,
+                            sequence,
+                            grant: &self.grant,
+                            binding: &self.binding,
+                        },
+                        Outcome::DatabaseCurrent,
+                    ),
+                };
+                let response = channel.exchange(&request)?;
+                if response.version != 1
+                    || response.sequence != sequence
+                    || response.grant != self.grant
+                    || response.binding != self.binding
+                    || response.outcome != outcome
+                    || response.phase
+                        != if self.consumed.load(Ordering::SeqCst) {
+                            Phase::Consumed
+                        } else {
+                            Phase::Issued
+                        }
+                {
+                    return Err(Error::rejected(
+                        "Store owner current/consumption is UNKNOWN",
+                    ));
+                }
+                self.validate_for(kind)
+            })();
+            if result.is_err() {
+                self.unknown.store(true, Ordering::SeqCst);
+            }
+            result
         })();
         if result.is_err() {
             self.unknown.store(true, Ordering::SeqCst);

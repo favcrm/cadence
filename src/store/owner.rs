@@ -63,7 +63,18 @@ fn identifier(value: &str) -> bool {
 }
 
 impl Binding {
+    /// Activation and maintenance remain bounded by the original short permit.
     pub(crate) fn validate(&self) -> Result<()> {
+        self.validate_stable()?;
+        let now = super::super::now() as i64;
+        if self.deadline_unix.saturating_sub(now) > 300 || self.deadline_unix <= now {
+            return Err(Error::rejected("invalid or expired Store owner binding"));
+        }
+        Ok(())
+    }
+    /// Syntax of the ORIGINAL persisted tuple, not permission or renewal. Only
+    /// a fresh consumed database-current reply may corroborate it after expiry.
+    fn validate_stable(&self) -> Result<()> {
         if !identifier(&self.database_id)
             || !identifier(&self.incarnation)
             || !identifier(&self.operation)
@@ -73,16 +84,13 @@ impl Binding {
             || self.database_epoch == 0
             || self.database_epoch > MAX_OWNER_INTEGER as u64
             || self.challenge.iter().all(|b| *b == 0)
-            || self
-                .deadline_unix
-                .saturating_sub(super::super::now() as i64)
-                > 300
-            || self.deadline_unix <= super::super::now() as i64
+            || self.deadline_unix <= 0
+            || self.deadline_unix > MAX_OWNER_INTEGER
             || !std::path::Path::new(&self.path).is_absolute()
             || self.path.len() > 4096
             || self.path.as_bytes().contains(&0)
         {
-            return Err(Error::rejected("invalid or expired Store owner binding"));
+            return Err(Error::rejected("invalid Store owner binding tuple"));
         }
         match (&self.source, self.purpose) {
             (Some(source), Purpose::Restore)
@@ -152,7 +160,9 @@ impl CurrentDatabase {
         self.grant.binding()
     }
     pub(super) fn recheck(&self) -> Result<()> {
-        self.grant.recheck()
+        // Activation expiry is not a runtime lease. The actual owner must
+        // freshly attest durable consumed state and live database custody.
+        self.grant.recheck_database()
     }
     /// This check runs while BEGIN IMMEDIATE is held. A swapped incarnation,
     /// missing row, malformed epoch or extra identity row can never default-open.
