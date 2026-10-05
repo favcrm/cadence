@@ -468,6 +468,10 @@ pub fn release(
     }))
 }
 
+/// How old an unchanged live claim's `last_seen` gets before the sweep
+/// re-stamps it (CAD-1150).
+const LIVE_RESTAMP_SECS: i64 = 3600;
+
 /// The daemon-side claim sweep (CAD-755). `dead` maps every registered
 /// agent that no longer counts as live — stopped, fenced (`attention`),
 /// offline, or whose endpoint `agent_liveness` reports dead — to when
@@ -516,13 +520,15 @@ pub fn liveness_sweep(
                 return Ok(true);
             }
         } else if let Some(session) = live.get(c.by.as_str()) {
-            // Bound tracker writes during a frequent checkup, while
-            // retaining fresh persisted evidence across restarts.
+            // Bound tracker writes during a frequent checkup (CAD-1150:
+            // an unchanged live claim is re-stamped at most hourly, so
+            // the sweep stops holding the PM lock every few minutes),
+            // while retaining persisted evidence across restarts.
             let due = c
                 .last_seen
                 .as_deref()
                 .and_then(time::parse_iso)
-                .is_none_or(|seen| now - seen >= 300);
+                .is_none_or(|seen| now - seen >= LIVE_RESTAMP_SECS);
             if due || c.stale.is_some() || c.session != *session {
                 if c.stale.is_some() {
                     healed_ids.insert(front.id.clone());
@@ -773,7 +779,8 @@ mod tests {
         assert!(persisted.claim.unwrap().stale.is_none());
 
         // A same-session check inside the write interval makes no new
-        // evidence commit; crossing it refreshes the persisted time.
+        // evidence commit; crossing it (hourly, CAD-1150) refreshes the
+        // persisted time.
         let out =
             liveness_sweep(&pm, &HashMap::new(), &live, STALE_GRACE, now + 60, "daemon").unwrap();
         assert_eq!(out["healed"], json!([]));
@@ -792,7 +799,21 @@ mod tests {
         .unwrap();
         assert_eq!(
             json(&front_of(&pm, &id), now + 301)["last_seen"],
-            json!(time::iso(now + 301))
+            json!(time::iso(now)),
+            "an unchanged live claim is not re-stamped after 5 minutes"
+        );
+        liveness_sweep(
+            &pm,
+            &HashMap::new(),
+            &live,
+            STALE_GRACE,
+            now + 3600,
+            "daemon",
+        )
+        .unwrap();
+        assert_eq!(
+            json(&front_of(&pm, &id), now + 3600)["last_seen"],
+            json!(time::iso(now + 3600))
         );
 
         // A replacement session is recorded even before the interval.
@@ -802,12 +823,12 @@ mod tests {
             &HashMap::new(),
             &replacement,
             STALE_GRACE,
-            now + 302,
+            now + 3601,
             "daemon",
         )
         .unwrap();
         assert_eq!(
-            json(&front_of(&pm, &id), now + 302)["session"],
+            json(&front_of(&pm, &id), now + 3601)["session"],
             json!("session-2")
         );
     }

@@ -492,6 +492,10 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
 /// `held`/`stalled` rows are reported, not moved.
 /// Then `finish --merged` sweeps the same evidence — worktree refs
 /// and branches the merge already covered get cleaned up.
+/// How long a CLI reconcile waits for a busy tracker lock before it
+/// reports a close as `error` (CAD-1150).
+const CLI_CLOSE_LOCK_WAIT: Duration = Duration::from_secs(30);
+
 pub fn run(
     pm: &Pm,
     project: Option<&str>,
@@ -509,6 +513,7 @@ pub fn run(
         limit,
         &gh_list,
         &gh_view,
+        CLI_CLOSE_LOCK_WAIT,
     )
 }
 
@@ -518,7 +523,17 @@ pub fn run(
 /// bounds its probes). `limit` caps issues per tick; the
 /// next tick takes the rest.
 pub fn run_daemon(pm: &Pm, actor: &str, limit: usize) -> Result<Value> {
-    run_inner(pm, None, false, actor, None, limit, &gh_list, &gh_view)
+    run_inner(
+        pm,
+        None,
+        false,
+        actor,
+        None,
+        limit,
+        &gh_list,
+        &gh_view,
+        Duration::ZERO,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -531,6 +546,7 @@ fn run_inner(
     limit: usize,
     pr_list: PrLookup<'_>,
     pr_view: PrView<'_>,
+    close_lock_wait: Duration,
 ) -> Result<Value> {
     let issues = board::load_all(&pm.dir, project)?;
     // Candidacy follows the derived status, not only the file field:
@@ -621,7 +637,14 @@ fn run_inner(
                 if dry_run {
                     row["outcome"] = json!("would-close");
                 } else {
-                    match write::mark_done_on_merge(pm, &p.id, &why, actor, Some(&p.status)) {
+                    match write::mark_done_on_merge_waiting(
+                        pm,
+                        &p.id,
+                        &why,
+                        actor,
+                        Some(&p.status),
+                        close_lock_wait,
+                    ) {
                         Ok(None) => {
                             row["outcome"] = json!("closed");
                             done.push(p.id.clone());
@@ -853,7 +876,7 @@ mod tests {
     }
 
     fn sweep(rig: &Rig, dry: bool, pl: PrLookup<'_>, pv: PrView<'_>) -> Value {
-        run_inner(&rig.pm, None, dry, "op", None, 0, pl, pv).unwrap()
+        run_inner(&rig.pm, None, dry, "op", None, 0, pl, pv, Duration::ZERO).unwrap()
     }
 
     fn status(rig: &Rig, id: &str) -> String {
@@ -876,6 +899,38 @@ mod tests {
     /// diff reverse-applies, so `merge_rule` alone reports it "patch"
     /// merged — a freshly claimed ticket would read as done. CAD-754's
     /// own lane caught this on the first live dry run.
+    /// CAD-1150: a CLI close finding the tracker lock busy (a claim-sweep
+    /// commit in progress) waits and closes; with no wait (the daemon
+    /// path) it reports `error` at once.
+    #[test]
+    fn busy_lock_is_waited_out_by_the_cli_close_only() {
+        let rig = rig();
+        let id = put_issue(&rig, 1, None);
+        lane(&rig.repo, true);
+        let held = rig.pm.try_lock().unwrap().expect("lock free");
+        let out = sweep(&rig, false, &no_gh, &no_view);
+        assert_eq!(out["rows"][0]["outcome"], json!("error"), "{out}");
+        assert_eq!(status(&rig, &id), "doing");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            drop(held);
+        });
+        let out = run_inner(
+            &rig.pm,
+            None,
+            false,
+            "op",
+            None,
+            0,
+            &no_gh,
+            &no_view,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        releaser.join().unwrap();
+        assert_eq!(status(&rig, &id), "done", "{out}");
+    }
+
     #[test]
     fn unstarted_lane_is_not_merged() {
         let rig = rig();
@@ -1125,7 +1180,18 @@ mod tests {
         // CAD-99 sorts after all the idles and carries real refs.
         let id = put_issue(&rig, 99, None);
         lane(&rig.repo, true);
-        let out = run_inner(&rig.pm, None, false, "op", None, 5, &no_gh, &no_view).unwrap();
+        let out = run_inner(
+            &rig.pm,
+            None,
+            false,
+            "op",
+            None,
+            5,
+            &no_gh,
+            &no_view,
+            Duration::ZERO,
+        )
+        .unwrap();
         assert_eq!(status(&rig, &id), "done", "{out}");
         assert_eq!(out["classified"], 1, "{out}");
         let skipped = out["rows"]
