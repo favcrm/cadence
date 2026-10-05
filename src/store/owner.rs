@@ -12,6 +12,9 @@ use std::sync::Arc;
 pub(crate) use transport::StoreOwnerGrant;
 
 pub(super) const MAX_OWNER_INTEGER: i64 = 9_007_199_254_740_991;
+/// Fixed independently owner-provisioned writable enclave, never elected from
+/// a restored snapshot, caller path or environment variable.
+pub(crate) const DATABASE_PATH: &str = "/srv/cadence/protected/store/cadence.db";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -178,14 +181,33 @@ CREATE TABLE store_witness_capture(
     captured_at REAL NOT NULL);
 ";
 
-/// The authenticated constructor must additionally retain exclusive custody of
+/// Even an absent/partially initialized file in the fixed protected enclave
+/// cannot be elected as legacy. Recheck the SQLite main filename under the
+/// writer lock as well, so an alternate raw/side spelling cannot bypass this.
+pub(in crate::store) fn refuse_legacy_path(path: &std::path::Path) -> Result<()> {
+    let enclave = std::path::Path::new(DATABASE_PATH)
+        .parent()
+        .ok_or_else(|| Error::rejected("protected Store enclave is invalid"))?;
+    let resolved = path
+        .canonicalize()
+        .ok()
+        .or_else(|| Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?)));
+    if path.starts_with(enclave) || resolved.is_some_and(|p| p.starts_with(enclave)) {
+        return Err(Error::rejected(
+            "raw/legacy writer refused in the protected Store enclave",
+        ));
+    }
+    Ok(())
+}
+
+/// The authenticated constructor additionally retains exclusive custody of
 /// this parent directory/inode for the entire operation. Lexical checks alone
 /// are not path authority and cannot protect against a guest swap.
 pub(in crate::store) fn check_path(path: &std::path::Path) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::rejected("Store path has no parent"))?;
-    if path.file_name().and_then(|s| s.to_str()) != Some("cadence.sqlite3")
+    if path != std::path::Path::new(DATABASE_PATH)
         || parent.canonicalize()? != parent
         || std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file())
     {

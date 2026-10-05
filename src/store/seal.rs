@@ -674,9 +674,11 @@ pub enum SealError {
 /// outside the `Store` (rollout `connect`/`immediate`, backup
 /// copy-transform sources). Refuses when the file carries a closure
 /// latch — sealed *or* open-latch — or when it can't be read. A
-/// latch-absent legacy db and a non-existent path pass, so scratch
-/// copies and pre-init files are untouched.
+/// latch-absent legacy db and a non-existent path pass outside the fixed
+/// protected enclave. Inside it, even absent/partial/shadow paths refuse;
+/// only authentic owner startup can initialize the protected database.
 pub(crate) fn preflight_writer_guard(path: &std::path::Path) -> Result<()> {
+    owner::refuse_legacy_path(path)?;
     if !path.exists() {
         return Ok(());
     }
@@ -714,6 +716,12 @@ pub(crate) fn require_legacy_writer_tx(tx: &Transaction<'_>) -> Result<()> {
     if tx.is_autocommit() {
         return Err(SealError::Unknown("sibling writer has no held transaction".into()).into());
     }
+    let (name, filename): (String, String) =
+        tx.query_row("PRAGMA database_list", [], |r| Ok((r.get(1)?, r.get(2)?)))?;
+    if name != "main" {
+        return Err(SealError::Unknown("sibling writer has no actual main database".into()).into());
+    }
+    owner::refuse_legacy_path(Path::new(&filename))?;
     match preflight_read(tx)
         .map_err(|e| SealError::Unknown(format!("held writer-guard read: {e}")))?
     {
@@ -744,6 +752,9 @@ impl Store {
     /// Read-only preflight on the file — zero business writes before the
     /// decision. Runs *before* the writable `Connection::open`/WAL flip.
     pub(super) fn preflight(path: &Path, mode: OpenMode) -> Result<PreflightDecision> {
+        if mode == OpenMode::Legacy {
+            owner::refuse_legacy_path(path)?;
+        }
         if !path.exists() {
             return match mode {
                 OpenMode::Protected => Err(SealError::Unknown(

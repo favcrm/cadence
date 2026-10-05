@@ -197,15 +197,15 @@ impl Store {
         recover: bool,
         mode: super::seal::OpenMode,
     ) -> Result<(Self, Option<RecoveryOutcome>)> {
+        // Refuse fixed protected-enclave raw/side paths before even migration
+        // admission reads. Authenticated startup uses open_owned, never this
+        // selector-only constructor or a Legacy fallback.
+        let decision = Self::preflight(path, mode)?;
         let permit = if gate {
             crate::rollout::authorize_migration(path)?
         } else {
             crate::rollout::MigrationPermit { crossing: None }
         };
-        // CAD-1011: durable-closure preflight BEFORE any write or WAL
-        // mutation — read-only, so a sealed/protected file is never
-        // touched. Decides whether legacy WAL conversion may run.
-        let decision = Self::preflight(path, mode)?;
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // Fail-closed authorizer: disarmed until a guarded tx arms it.

@@ -1,6 +1,7 @@
 //! Client for the fixed private Store owner service. This is NOT a generic
-//! authority RPC: three finite lifecycle messages, exact bindings, one retained
-//! authenticated channel, no credentials, no reconnect/retry after ACK loss.
+//! authority RPC: finite startup/acquire/consume/current messages, exact
+//! bindings, one retained authenticated channel, no credentials, no
+//! reconnect/retry after ACK loss.
 //! The constructor service must admit actual enrolled caller custody and relay
 //! durable external consume/current with exclusive database-directory custody.
 //! A socket peer/Binding cannot issue a grant locally.
@@ -19,6 +20,9 @@ const IO_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Request<'a> {
+    /// No caller fields: the authenticated owner elects the current startup
+    /// purpose, DB binding and durable grant reference for this enrolled peer.
+    Startup { version: u8, sequence: u64 },
     Acquire {
         version: u8,
         sequence: u64,
@@ -84,26 +88,59 @@ pub(crate) struct StoreOwnerGrant {
     unknown: AtomicBool,
 }
 impl StoreOwnerGrant {
+    /// Fetch and acquire startup authority only from the fixed private owner
+    /// service. Never accepts caller fields, a snapshot marker, UID or lease as
+    /// authority. The returned binding remains sealed inside this capability.
+    pub(crate) fn startup() -> Result<Self> {
+        let mut channel = Channel::connect()?;
+        let response = channel.exchange(&Request::Startup {
+            version: 1,
+            sequence: 1,
+        })?;
+        if !matches!(
+            response.binding.purpose,
+            super::Purpose::Init | super::Purpose::Restore | super::Purpose::Open
+        ) {
+            return Err(Error::rejected(
+                "Store startup grant authorizes a different operation",
+            ));
+        }
+        Self::issued(channel, response)
+    }
+
     pub(crate) fn acquire(binding: Binding) -> Result<Self> {
         binding.validate()?;
+        if binding.path != super::DATABASE_PATH {
+            return Err(Error::rejected(
+                "Store owner selector names a different protected database path",
+            ));
+        }
         let mut channel = Channel::connect()?;
         let response = channel.exchange(&Request::Acquire {
             version: 1,
             sequence: 1,
             binding: &binding,
         })?;
+        if response.binding != binding {
+            return Err(Error::rejected("Store owner issuance binding unknown"));
+        }
+        Self::issued(channel, response)
+    }
+
+    fn issued(mut channel: Channel, response: Response) -> Result<Self> {
         if response.version != 1
             || response.sequence != 1
-            || response.binding != binding
+            || response.binding.path != super::DATABASE_PATH
             || response.outcome != Outcome::Issued
             || response.phase != Phase::Issued
             || !super::identifier(&response.grant)
         {
             return Err(Error::rejected("Store owner issuance binding unknown"));
         }
+        response.binding.validate()?;
         channel.set_sequence(1);
         Ok(Self {
-            binding,
+            binding: response.binding,
             grant: response.grant,
             channel: Mutex::new(channel),
             consumed: AtomicBool::new(false),
