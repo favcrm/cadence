@@ -87,12 +87,31 @@ impl SmtpInternal {
     }
 
     /// The configured base: [`BASE_ENV`] when set, else [`DEFAULT_BASE`].
+    /// Honoured only on the lease-gated path (a daemon holding a real
+    /// hosted lease); the CAD-1158 image-admitted path always uses the
+    /// fixed [`DEFAULT_BASE`] so caller env can never redirect it.
     pub fn from_env() -> Result<Self> {
         let base = std::env::var(BASE_ENV)
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
         Self::new(base.as_deref().unwrap_or(DEFAULT_BASE))
+    }
+
+    /// CAD-1158: build the bridge-owned relay from the dedicated
+    /// image-owned SMTP proof. The base is always the fixed
+    /// [`DEFAULT_BASE`]; no environment, app or RPC value redirects the
+    /// transport that carries the custodied credential.
+    pub(crate) fn from_admission(
+        _: &crate::platform::deployments::HostedSmtpAdmission,
+    ) -> Result<Self> {
+        Self::new(DEFAULT_BASE)
+    }
+
+    /// The relay origin under test or in production (`http://smtp.internal`
+    /// for image-admitted composition). Secret-free; safe to assert on.
+    pub fn base(&self) -> &str {
+        &self.base
     }
 
     /// Connect, TLS, EHLO, AUTH, QUIT — no send. `Ok(())` is a verified

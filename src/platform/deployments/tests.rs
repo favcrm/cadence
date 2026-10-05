@@ -134,6 +134,103 @@ fn hosted_media_transport_assertion_accepts_exact_composition() {
         metadata.pin("agenticos_external", "http://api.internal"),
         Some("agenticos-external-provider-tools@3")
     );
+    assert!(metadata.hosted_media().is_some());
+    // CAD-1158: a MEDIA assertion is never SMTP authority.
+    assert!(metadata.hosted_smtp().is_none());
+}
+
+/// CAD-1158: the dedicated bridge-owned SMTP admission tuple. Exact match
+/// admits; the SMTP proof never yields a media admission.
+const HOSTED_SMTP_CONFIG: &str = r#"{"schema":1,"providers":[{"provider":"smtp","origin":"http://smtp.internal","manifest_pin":"smtp-internal-relay@2","transport":"hosted-smtp-relay@1"}]}"#;
+
+#[test]
+fn hosted_smtp_transport_assertion_accepts_exact_composition() {
+    let metadata = DeploymentMetadata::parse(HOSTED_SMTP_CONFIG.as_bytes())
+        .expect("trusted hosted SMTP composition must be admitted");
+    assert_eq!(
+        metadata.pin("smtp", "http://smtp.internal"),
+        Some("smtp-internal-relay@2")
+    );
+    assert!(metadata.hosted_smtp().is_some());
+    // No cross-authorization: SMTP-only metadata grants no media door.
+    assert!(metadata.hosted_media().is_none());
+}
+
+#[test]
+fn hosted_smtp_transport_assertion_refuses_mismatched_composition() {
+    let config: serde_json::Value = serde_json::from_str(HOSTED_SMTP_CONFIG).unwrap();
+    // Any deviation from the exact reviewed tuple is refused fail-closed:
+    // the transport must not bind another provider, origin or pin.
+    for (field, value) in [
+        ("transport", serde_json::json!(null)),
+        ("transport", serde_json::json!("")),
+        ("transport", serde_json::json!("hosted-smtp-relay@2")),
+        ("transport", serde_json::json!("hosted-media-lease@1")),
+        ("transport", serde_json::json!("HOSTED-SMTP-RELAY@1")),
+        ("transport", serde_json::json!(true)),
+        (
+            "transport",
+            serde_json::json!({"mode": "hosted-smtp-relay@1"}),
+        ),
+        ("transport", serde_json::json!(["hosted-smtp-relay@1"])),
+        ("provider", serde_json::json!("agenticos")),
+        ("provider", serde_json::json!("agenticos_external")),
+        ("provider", serde_json::json!("other")),
+        ("origin", serde_json::json!("https://smtp.internal")),
+        ("origin", serde_json::json!("http://api.internal")),
+        ("origin", serde_json::json!("http://other.internal")),
+        ("origin", serde_json::json!("http://smtp.internal:80")),
+        ("origin", serde_json::json!("http://smtp.internal/")),
+        ("origin", serde_json::json!("http://SMTP.internal")),
+        ("origin", serde_json::json!("http://user@smtp.internal")),
+        ("origin", serde_json::json!(null)),
+        ("manifest_pin", serde_json::json!("smtp-internal-relay@1")),
+        ("manifest_pin", serde_json::json!("smtp-internal-relay@3")),
+        (
+            "manifest_pin",
+            serde_json::json!("agenticos-external-provider-tools@3"),
+        ),
+    ] {
+        let mut invalid = config.clone();
+        invalid["providers"][0][field] = value;
+        assert!(
+            DeploymentMetadata::parse(&serde_json::to_vec(&invalid).unwrap()).is_err(),
+            "mismatched hosted SMTP assertion accepted: {invalid}"
+        );
+    }
+    // A duplicated SMTP provider entry is refused, like any duplicate.
+    let entry: serde_json::Value = serde_json::from_str(HOSTED_SMTP_CONFIG).unwrap();
+    let mut duplicated: serde_json::Value = entry.clone();
+    duplicated["providers"]
+        .as_array_mut()
+        .unwrap()
+        .push(entry["providers"][0].clone());
+    assert!(
+        DeploymentMetadata::parse(&serde_json::to_vec(&duplicated).unwrap()).is_err(),
+        "duplicated SMTP assertion accepted"
+    );
+    // Unknown transport variants stay refused (no silent authority).
+    let mut unknown = config.clone();
+    unknown["providers"][0]["transport"] = serde_json::json!("hosted-smtp-relay@99");
+    assert!(
+        DeploymentMetadata::parse(&serde_json::to_vec(&unknown).unwrap()).is_err(),
+        "unknown SMTP transport accepted"
+    );
+}
+
+#[test]
+fn hosted_smtp_and_media_assertions_remain_independent() {
+    // Combined deployed-style file (media lease plus SMTP admission):
+    // each proof grants only its own transport.
+    let mut combined: serde_json::Value = serde_json::from_str(HOSTED_MEDIA_CONFIG).unwrap();
+    let smtp: serde_json::Value = serde_json::from_str(HOSTED_SMTP_CONFIG).unwrap();
+    combined["providers"]
+        .as_array_mut()
+        .unwrap()
+        .push(smtp["providers"][0].clone());
+    let metadata = DeploymentMetadata::parse(&serde_json::to_vec(&combined).unwrap()).unwrap();
+    assert!(metadata.hosted_media().is_some());
+    assert!(metadata.hosted_smtp().is_some());
 }
 
 #[test]

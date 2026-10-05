@@ -40,7 +40,17 @@ struct ProviderDeployment {
 #[derive(Clone, Debug)]
 enum DeploymentTransport {
     HostedMediaLease,
+    /// CAD-1158: dedicated bridge-owned SMTP admission. Binds the fixed
+    /// `smtp.internal` relay contract only; never media or lease authority.
+    HostedSmtpRelay,
 }
+
+/// CAD-1158: the exact image-owned SMTP admission tuple. Only this tuple
+/// admits the credential-carrying relay; no env URL, app input or other
+/// provider/origin/pin combination does.
+pub(crate) const SMTP_PROVIDER: &str = "smtp";
+pub(crate) const SMTP_ORIGIN: &str = "http://smtp.internal";
+pub(crate) const SMTP_MANIFEST_PIN: &str = "smtp-internal-relay@2";
 
 fn parse_transport<'de, D>(
     deserializer: D,
@@ -50,6 +60,7 @@ where
 {
     match String::deserialize(deserializer)?.as_str() {
         "hosted-media-lease@1" => Ok(Some(DeploymentTransport::HostedMediaLease)),
+        "hosted-smtp-relay@1" => Ok(Some(DeploymentTransport::HostedSmtpRelay)),
         _ => Err(serde::de::Error::custom(
             "unknown provider transport assertion",
         )),
@@ -60,6 +71,15 @@ where
 /// authorizes one fixed internal media door, not arbitrary HTTP or a lease.
 #[derive(Clone, Debug)]
 pub(crate) struct HostedMediaAdmission {
+    _private: (),
+}
+
+/// CAD-1158: only validated image metadata carrying the exact SMTP tuple
+/// can produce this construction proof. It authorizes one fixed internal
+/// relay (`http://smtp.internal`), never an arbitrary URL, media
+/// authority, hosted email or a lifecycle lease.
+#[derive(Clone, Debug)]
+pub(crate) struct HostedSmtpAdmission {
     _private: (),
 }
 
@@ -116,10 +136,25 @@ impl DeploymentMetadata {
                 || (entry.provider != crate::platform::agenticos_external::PLATFORM
                     && crate::proto::identifier(&entry.provider, "Provider").is_err())
                 || !valid_authority(authority)
-                || (entry.transport.is_some()
-                    && (entry.provider != crate::platform::agenticos_external::PLATFORM
-                        || entry.origin != "http://api.internal"
-                        || entry.manifest_pin != crate::platform::agenticos_external::MANIFEST_PIN))
+                // A transport assertion admits exactly its own reviewed
+                // tuple: the MEDIA lease or the CAD-1158 SMTP relay. Any
+                // other provider/origin/pin combination carrying a
+                // transport is refused fail-closed.
+                || entry.transport.as_ref().is_some_and(|transport| {
+                    match transport {
+                        DeploymentTransport::HostedMediaLease => {
+                            entry.provider != crate::platform::agenticos_external::PLATFORM
+                                || entry.origin != "http://api.internal"
+                                || entry.manifest_pin
+                                    != crate::platform::agenticos_external::MANIFEST_PIN
+                        }
+                        DeploymentTransport::HostedSmtpRelay => {
+                            entry.provider != SMTP_PROVIDER
+                                || entry.origin != SMTP_ORIGIN
+                                || entry.manifest_pin != SMTP_MANIFEST_PIN
+                        }
+                    }
+                })
                 || entry.manifest_pin.is_empty()
                 || entry.manifest_pin.len() > 256
                 || entry.manifest_pin.chars().any(char::is_control)
@@ -132,11 +167,31 @@ impl DeploymentMetadata {
         })
     }
 
+    /// The MEDIA assertion grants media only. CAD-1158: an explicit
+    /// transport match, so an SMTP-only assertion never yields a media
+    /// admission (the find-first-transport pitfall).
     pub(crate) fn hosted_media(&self) -> Option<HostedMediaAdmission> {
         self.providers
             .iter()
-            .find(|entry| entry.transport.is_some())
+            .find(|entry| matches!(entry.transport, Some(DeploymentTransport::HostedMediaLease)))
             .map(|_| HostedMediaAdmission { _private: () })
+    }
+
+    /// CAD-1158: the dedicated SMTP admission. `Some` only for the exact
+    /// reviewed tuple (provider `smtp`, fixed `http://smtp.internal`
+    /// origin, `smtp-internal-relay@2` pin, `hosted-smtp-relay@1`
+    /// transport) — all four fields, fail-closed on any mismatch.
+    /// A MEDIA assertion never yields this proof.
+    pub(crate) fn hosted_smtp(&self) -> Option<HostedSmtpAdmission> {
+        self.providers
+            .iter()
+            .find(|entry| {
+                entry.provider == SMTP_PROVIDER
+                    && entry.origin == SMTP_ORIGIN
+                    && entry.manifest_pin == SMTP_MANIFEST_PIN
+                    && matches!(entry.transport, Some(DeploymentTransport::HostedSmtpRelay))
+            })
+            .map(|_| HostedSmtpAdmission { _private: () })
     }
 
     pub fn pin(&self, provider: &str, origin: &str) -> Option<&str> {
