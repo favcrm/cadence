@@ -79,6 +79,19 @@ pub mod worktree;
 
 pub use error::{Error, Result};
 
+/// Fixed public-bootstrap entry. Activation remains closed in the CAD-1159
+/// draft; never a configurable exec/sign/credential or diagnostic-authority API.
+pub fn root_constructor_entry() -> Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        installer_bundle::constructor_entry()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        Err(Error::rejected("root constructor requires Linux x86_64"))
+    }
+}
+
 /// Fixed no-argument non-setuid carrier entry, never a configurable exec API.
 pub fn installer_carrier_entry() -> Result<()> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

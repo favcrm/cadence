@@ -3,6 +3,7 @@
 //! Proposed paths below are UNELECTED; no image pins/host custody exist yet.
 #![allow(dead_code)]
 mod carrier;
+mod constructor;
 mod files;
 mod observer;
 // Reuse the reviewed helper's actual seal, not its setuid policy/command parser.
@@ -152,6 +153,10 @@ struct WaitingConstruction {
 fn production_construction() -> Result<WaitingConstruction> {
     let _image = production_image()?;
     Err(refused()) // no independently qualified protected bootstrap/custody
+}
+
+pub(crate) fn constructor_entry() -> Result<()> {
+    constructor::entry()
 }
 
 pub(crate) fn carrier_entry() -> Result<()> {

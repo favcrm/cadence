@@ -73,7 +73,7 @@ mod slots_rpc;
 mod social_publish_driver;
 mod social_publish_rpc;
 mod social_publish_start;
-mod supervisor_grant;
+pub(crate) mod supervisor_grant;
 mod test_queue_rpc;
 mod threads_rpc;
 mod timers;
