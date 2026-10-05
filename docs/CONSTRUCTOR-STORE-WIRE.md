@@ -6,9 +6,13 @@ coordinator owns current-owner/Company/Global/shared registration. Cadence
 coordinator owns actual root constructor/caller registry/daemon/private relay;
 Store contributor owns Store schema/seal/owner adapter. No guard edits.
 
-Read platform current HEAD1c21ac01635d086849b6ebf3d266939f6a240b12 and
-installer-lineage-owner/service/construction.ts against Rust store/owner.rs,
-owner_transport.rs and schema.rs. No request/response schema is invented below.
+Originally aligned at platform1c21ac01635d086849b6ebf3d266939f6a240b12;
+current source reconciliation reads platform4f859e20d4e2031708020d9274ae98d89d8a7c59
+installer-lineage-owner/service/construction.ts and actual CompanyControl/carrier
+against Rust store/owner.rs, owner_transport.rs, schema.rs and constructor
+lifecycle/dispatcher/layout. Historical prepared-only/ACK cleanup and missing
+server descriptions are not current diagnostics. No operational qualification
+or new request/response schema is inferred from this source alignment.
 
 ## Four different references — do not substitute
 
@@ -79,15 +83,22 @@ Never fabricate phase from locally attempted consume or a echoed client flag.
 
 Host/root runtime carrier finite requests retain original operation/barrierNonce/
 sequence and separately authenticated runtime lifetime:
-store-acquire {purpose,attempt}; store-consume/current {reference}.
+store-startup with NO caller fields; store-acquire {purpose,attempt};
+store-consume/current/database-current {reference}. Startup owner elects the
+purpose/challenge/attempt, not a new guest-selected store-init-acquire frame.
 Root-host runtime-owner reply must have store:<EXACT {facts,phase}>,pi:null,
 plus genuine existing full-binding consumed OwnerCurrent and <=30s lease.
 For acquire, obtain currentStorePermitState after durable issue and demand issued;
 for successful consume obtain genuine consumed current before returning success.
 Failure/null/false/mismatch/expired/lost ACK is UNKNOWN, no retry/reissue. Exact
 facts stay frozen across requests. An outcome label alone cannot grant authority.
-This exact store payload binding is now agreed here; current Rust carrier returns
-Value, no actual server call site yet. Coordinator owns its typed validation.
+The actual Root StoreSession now strictly deserializes {facts,phase}, matches
+original full NativeLaunchBinding/lineage/DB tuple and expected durable phase,
+and admits the retained own-created daemon/kernel stream before/after replies.
+The private capability is produced only over that fixed authenticated channel,
+not reconstructed from Value or a generic RuntimeProof. Live business writes
+use distinct original consumed database-current, preserving the opening deadline;
+this is not activation renewal. Source wiring is not native runtime evidence.
 
 ## Fixed guest-private service and returned grant
 
@@ -148,15 +159,34 @@ captures/restores. Physical stop/exit/timeout/EOF, consume ACK or backup filenam
 never retires durable obligations. Captures and revoked ancestors remain permanent;
 failures/replay/current ABA/epoch/closure/revocation refuse without reissue.
 
-## Missing positive construction producer — not a claimed implementation
+## Current construction source and remaining native qualification
 
-Platform StoreOpeningObservation shape aligns current types EXACT
-{version:1,reference,revision,installation,purpose,path,deadlineMs}.
-Parent actual owned daemon/caller/kernel/mount factory and complete root Store
-server remain missing; do not mint these fields from guest Binding, Root PID,
-provider JSON, generic RootRuntimeProof or guessed policy. Signature/current
-snapshot is not that factory. No such readback should return positive until
-actual production custody exists. Coordinator retains implementation ownership;
-backend proceeds with current exact contract and genuinely captured facts only.
-Root public pins/actual acquired image/kernel/provider qualification/keys remain
-root-owned. Independent guards unchanged, no broad fixtures or operational claim.
+Platform StoreOpeningObservation shape remains EXACT
+{version:1,reference,revision,installation,purpose,path,deadlineMs}. Actual
+CompanyControl obtains its private RpcTarget from the retained Native runtime
+carrier; Root supplies finite opening readback only after authentic runtime
+release/current, retained own-created daemon and held fixed mount/path custody.
+Matching JSON/PID/UID/RuntimeProof alone cannot create this reference or grant.
+The actual parent kernel registry, private Store server and no-argument daemon
+startup are source integrated, not proof that a new native image has run.
+
+Root recursively seals first, then after authenticated runtime current self-binds
+ONLY four preprovisioned fixed data leaves RW, retaining NOSUID/NODEV and held
+FD/dev/inode/kernel mnt_id/DAC correspondence, BEFORE sockets/daemon/startup SQL.
+Pre-seal RW provisioning alone is insufficient. Store path is cadence.db, never
+cadence.sqlite3 or a caller profile; immutable executable/Pi graph remains RO.
+The first pilot allows only fresh Init and verifies genuine NotFound for DB and
+all SQLite sidecars before/after owner startup; Open/Restore stay inactive second
+milestone paths. Host pre-enrollment installation is a durable obligation, not
+proof of physical freshness.
+
+Enrollment ACK grants no lifetime/serving. Separately purpose-signed runtime
+release completes under the ORIGINAL bootstrap budget, then the SAME carrier
+and exact Company/Global capabilities are retained for bounded domain current.
+Loss/expiry remains UNKNOWN, no activation renewal or inferred retirement.
+See CONSTRUCTOR-RUNTIME-WIRE.md and CONSTRUCTOR-PRIVATE-RUNTIME.md for current
+lifetime and physical serving/task contracts. Root NEW image/kernel/provider/Pi
+qualification, genuine authority/current bad-case baseline, required coherent
+floor/CI, two noncontributor reviews and exact-head operator approval remain.
+Capture source is NOT immutable artifact acceptance or FINAL. Independent guard
+bodies unchanged; no broad fixtures, operational keys or readiness claim.
