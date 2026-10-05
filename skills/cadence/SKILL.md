@@ -426,7 +426,9 @@ During implementation and handoff:
   (capacity, memory or disk). A direct local command,
   an advisory alias or an unused slot is not admission. Never label such a run
   as an admitted gate. Reuse eligible evidence and avoid duplicate full suites.
-- Self-check before handoff; independent QA still reviews the exact change
+- Self-check before handoff, including a simplification pass over your own
+  diff (dead code, duplication, abstractions the change does not need; your
+  changed lines only, no behaviour change); independent QA still reviews the exact change
   against acceptance, regressions and applicable project standards. Bind the
   verdict to the actual revision and list checks run, skipped and limitations.
   QA tests the behavior and relevant failure paths, not just the author's report.
