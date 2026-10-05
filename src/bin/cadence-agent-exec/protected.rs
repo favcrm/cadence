@@ -159,7 +159,11 @@ fn private_view(profile: &Profile, authority: &authority::Authorized) -> io::Res
     Ok(PrivateView {
         cwd,
         env,
-        session: Some(format!("{base}/durable/sessions/session.json")),
+        // A fresh Pi generation on the SAME runtime must not implicitly reopen
+        // the previous task's chat/session. Home was privately create-new and
+        // is guest:primary0700; no durable-session or credential-copy fallback.
+        // Authorized durable restore is a separate owner operation/milestone.
+        session: (!profile.routing().no_session()).then(|| format!("{view}/home/session.json")),
     })
 }
 fn derived_env(view: &str, alias: &str) -> io::Result<Vec<CString>> {

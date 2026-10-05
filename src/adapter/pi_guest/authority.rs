@@ -381,8 +381,9 @@ impl Channel {
             // the sealed21000 proxy that accepts and forwards this stream.
             // Root UID is endpoint provenance only: the actual dispatcher
             // must ALSO verify runtime/current purpose and owned kernel caller.
+            // Root outside the helper's child PID namespace is reported as
+            // pid0. Never use that translated observation as authority.
             || cred.uid != 0
-            || cred.pid <= 0
         {
             return Err(refused());
         }
