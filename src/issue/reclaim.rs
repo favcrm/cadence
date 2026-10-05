@@ -243,11 +243,14 @@ fn reclaim_target(lane: &Path, cargo_target: Option<&str>) -> Result<Option<Path
 /// daemon enumeration, a registered agent whose cwd is bound to it, or
 /// a live/unknown message or task bound to it (finish's in-use
 /// evaluation). Re-run against a fresh `view` right before the delete.
-fn live_reason(
+type ProcessUseProbe = dyn Fn(&Path) -> Result<finish::ProcessUse>;
+
+fn live_reason_with_process_probe(
     view: &finish::DaemonView,
     state_dir: &Path,
     front: &crate::issue::model::Front,
     lane: &Path,
+    process_use_probe: &ProcessUseProbe,
 ) -> Option<String> {
     if view.up && !finish::cwd_holder_aliases(view, Some(lane)).is_empty() {
         return Some("a registered agent's cwd is on the lane".to_string());
@@ -255,7 +258,7 @@ fn live_reason(
     if let Some(reason) = finish::lane_in_use(view, state_dir, front, lane) {
         return Some(reason);
     }
-    let process_use = match finish::process_use_under(lane) {
+    let process_use = match process_use_probe(lane) {
         Ok(process_use) => process_use,
         Err(e) => return Some(format!("cannot enumerate process cwd/open-fd use: {e}")),
     };
@@ -286,7 +289,28 @@ fn blocked_reason(
     idle: Duration,
     cap: usize,
 ) -> Option<String> {
-    if let Some(r) = live_reason(view, state_dir, front, lane) {
+    blocked_reason_with_process_probe(
+        view,
+        state_dir,
+        front,
+        lane,
+        idle,
+        cap,
+        &finish::process_use_under,
+    )
+}
+
+fn blocked_reason_with_process_probe(
+    view: &finish::DaemonView,
+    state_dir: &Path,
+    front: &crate::issue::model::Front,
+    lane: &Path,
+    idle: Duration,
+    cap: usize,
+    process_use_probe: &ProcessUseProbe,
+) -> Option<String> {
+    if let Some(r) = live_reason_with_process_probe(view, state_dir, front, lane, process_use_probe)
+    {
         return Some(r);
     }
     match walk_writes(lane, idle, cap) {
@@ -315,12 +339,70 @@ pub fn run(pm: &Pm, state_dir: &Path, actor: &str) -> Result<Value> {
 /// (`pm.yaml [host] reclaim_target_idle_secs`, default 6 h). Tests pass a
 /// short window instead of aging a fixture for hours.
 pub fn run_with_idle(pm: &Pm, state_dir: &Path, actor: &str, idle_secs: u64) -> Result<Value> {
+    run_with_process_probe(pm, state_dir, actor, idle_secs, &finish::process_use_under)
+}
+
+/// Test-only process-scan inputs for exercising the real target-reclaim path.
+/// This type exists only with the crate's `test-seam` feature, which is refused
+/// by release builds.
+#[cfg(feature = "test-seam")]
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReclaimTestProcessUse {
+    /// A complete scan with no process cwd or open descriptor under the lane.
+    CompleteNoUse,
+    /// A partial scan that could not enumerate all process use.
+    Incomplete(String),
+}
+
+/// Run the normal reclaim path with a deterministic process-scan result.
+/// The merged-checkout sweep keeps its production probes; only lane target
+/// reclamation uses this test input. Intended for isolated integration tests.
+#[cfg(feature = "test-seam")]
+#[doc(hidden)]
+pub fn run_with_idle_test_process_use(
+    pm: &Pm,
+    state_dir: &Path,
+    actor: &str,
+    idle_secs: u64,
+    test_process_use: ReclaimTestProcessUse,
+) -> Result<Value> {
+    let probe = move |_lane: &Path| {
+        Ok(match &test_process_use {
+            ReclaimTestProcessUse::CompleteNoUse => finish::ProcessUse {
+                cwd: Vec::new(),
+                fd: Vec::new(),
+                enumeration_error: None,
+            },
+            ReclaimTestProcessUse::Incomplete(reason) => finish::ProcessUse {
+                cwd: Vec::new(),
+                fd: Vec::new(),
+                enumeration_error: Some(reason.clone()),
+            },
+        })
+    };
+    run_with_process_probe(pm, state_dir, actor, idle_secs, &probe)
+}
+
+fn run_with_process_probe(
+    pm: &Pm,
+    state_dir: &Path,
+    actor: &str,
+    idle_secs: u64,
+    process_use_probe: &ProcessUseProbe,
+) -> Result<Value> {
     finish::with_probe_timeout(PROBE_TIMEOUT, || {
-        run_bounded(pm, state_dir, actor, idle_secs)
+        run_bounded(pm, state_dir, actor, idle_secs, process_use_probe)
     })
 }
 
-fn run_bounded(pm: &Pm, state_dir: &Path, actor: &str, idle_secs: u64) -> Result<Value> {
+fn run_bounded(
+    pm: &Pm,
+    state_dir: &Path,
+    actor: &str,
+    idle_secs: u64,
+    process_use_probe: &ProcessUseProbe,
+) -> Result<Value> {
     let mut out = json!({"swept": 0, "reclaimed": [], "skipped": []});
     // Part 1: the merged sweep. dry_run=false — this runs the real
     // `finish` guards; a candidate that fails them is `skipped`/`refused`,
@@ -347,11 +429,19 @@ fn run_bounded(pm: &Pm, state_dir: &Path, actor: &str, idle_secs: u64) -> Result
     // /proc scans still carry the guard.
     let view = finish::daemon_view(state_dir);
     let idle = Duration::from_secs(idle_secs);
+    let context = ReclaimContext {
+        view: &view,
+        state_dir,
+        pm,
+        idle,
+        actor,
+        process_use_probe,
+    };
     let issues = board::load_all(&pm.dir, None)?;
     for issue in issues {
         let id = issue.front.id.clone();
         for lane in crate::issue::start::open_worktrees(&issue.front) {
-            let res = reclaim_lane_detailed(&view, state_dir, pm, &issue, &lane, idle, actor);
+            let res = reclaim_lane_with_context(&context, &issue, &lane);
             match res {
                 Ok(ReclaimAttempt::Reclaimed(bytes)) => out["reclaimed"]
                     .as_array_mut()
@@ -536,6 +626,7 @@ fn reclaim_lane(
 
 /// One lane's shared reclaim decision + delete. Refusals are returned to the
 /// scheduled report rather than silently disappearing.
+#[cfg(test)]
 fn reclaim_lane_detailed(
     view: &finish::DaemonView,
     state_dir: &Path,
@@ -545,10 +636,35 @@ fn reclaim_lane_detailed(
     idle: Duration,
     actor: &str,
 ) -> Result<ReclaimAttempt> {
+    let context = ReclaimContext {
+        view,
+        state_dir,
+        pm,
+        idle,
+        actor,
+        process_use_probe: &finish::process_use_under,
+    };
+    reclaim_lane_with_context(&context, issue, lane)
+}
+
+struct ReclaimContext<'a> {
+    view: &'a finish::DaemonView,
+    state_dir: &'a Path,
+    pm: &'a Pm,
+    idle: Duration,
+    actor: &'a str,
+    process_use_probe: &'a ProcessUseProbe,
+}
+
+fn reclaim_lane_with_context(
+    context: &ReclaimContext<'_>,
+    issue: &board::Issue,
+    lane: &Path,
+) -> Result<ReclaimAttempt> {
     if !lane.is_dir() {
         return Ok(ReclaimAttempt::Absent);
     }
-    declared_lane_root(pm, issue, lane)?;
+    declared_lane_root(context.pm, issue, lane)?;
     // The recorded cargo_target for this lane's open ref, if any — only
     // ever compared against the derived path, never deleted.
     let cargo_target = issue
@@ -561,7 +677,15 @@ fn reclaim_lane_detailed(
     let Some(target) = reclaim_target(lane, cargo_target.as_deref())? else {
         return Ok(ReclaimAttempt::Absent);
     };
-    if let Some(reason) = blocked_reason(view, state_dir, &issue.front, lane, idle, WALK_CAP) {
+    if let Some(reason) = blocked_reason_with_process_probe(
+        context.view,
+        context.state_dir,
+        &issue.front,
+        lane,
+        context.idle,
+        WALK_CAP,
+        context.process_use_probe,
+    ) {
         return Ok(ReclaimAttempt::Skipped(reason));
     }
     // Measure before the re-scan so nothing slow sits between the
@@ -572,8 +696,14 @@ fn reclaim_lane_detailed(
     #[cfg(test)]
     tests::before_rescan(lane);
     // I-C: re-fetch the daemon snapshot and re-run the live-use scan.
-    let fresh = finish::daemon_view(state_dir);
-    if let Some(appeared) = live_reason(&fresh, state_dir, &issue.front, lane) {
+    let fresh = finish::daemon_view(context.state_dir);
+    if let Some(appeared) = live_reason_with_process_probe(
+        &fresh,
+        context.state_dir,
+        &issue.front,
+        lane,
+        context.process_use_probe,
+    ) {
         tracing::info!(
             event = "reclaim_rescan_skip",
             lane = %lane.display(),
@@ -597,13 +727,13 @@ fn reclaim_lane_detailed(
         bytes
     );
     let _ = write::add_comment(
-        pm,
+        context.pm,
         &issue.front.id,
         &text,
         None,
         Some("reclaim"),
         None,
-        actor,
+        context.actor,
     );
     Ok(ReclaimAttempt::Reclaimed(bytes))
 }
