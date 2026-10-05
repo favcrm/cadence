@@ -1,32 +1,26 @@
 import { fixtureRows, parseAppView, type AppViewRow, type AppViewView } from "./contract";
 
-/**
- * The two worked app-views/v1 examples (CAD-861): the same descriptor
- * JSON mirrors contracts/app-views/v1/examples/*.json byte-for-byte —
- * keep them in sync; the contract test parses both files through the
- * same validator. Rows are *synthetic fixtures* supplied by the host,
- * never read from backend records, never shipped inside a descriptor.
- *
- * The Social Content example deliberately names a workspace app that
- * is not "CRM customers" — it demonstrates that one grammar and one
- * renderer cover different Apps without Social gaining an installed
- * record surface it does not have.
- */
+/** The worked app-views/v1 examples mirror contracts/app-views/v1/examples/*.json.
+ *  Preview fixtures stay synthetic; installed live reads use a separately
+ *  verified app-bindings/v1 receipt and render only fields that binding maps. */
 
 const crmDescriptorJson = {
   contract: "app-views/v1",
   app: "crm",
   title: "CRM — customers overview",
-  summary:
-    "Data-only view declarations a CRM package could ship: a customers table, a customer detail, and a disabled preview of the host's customer form.",
+  summary: "Data-only customers table, customer detail, and disabled create-form preview.",
   views: [
     {
       id: "customers",
       title: "Customers",
       kind: "table",
       fields: [
+        { id: "record_id", label: "Record ID", format: "text" },
         { id: "name", label: "Name", format: "text" },
         { id: "email", label: "Email", format: "text" },
+        { id: "phone", label: "Phone", format: "text" },
+        { id: "source", label: "Source", format: "text" },
+        { id: "consent_email", label: "Email consent", format: "enum", values: ["granted", "denied", "unknown"] },
         { id: "tier", label: "Tier", format: "enum", values: ["member", "vip", "vip_plus"] },
         { id: "visits", label: "Visits", format: "number" },
         { id: "tags", label: "Tags", format: "tags", kind: "list" },
@@ -34,8 +28,8 @@ const crmDescriptorJson = {
       columns: [
         { field: "name" },
         { field: "email" },
-        { field: "tier", label: "Level" },
-        { field: "visits" },
+        { field: "phone" },
+        { field: "consent_email" },
         { field: "tags" },
       ],
     },
@@ -44,8 +38,14 @@ const crmDescriptorJson = {
       title: "Customer detail",
       kind: "detail",
       fields: [
+        { id: "record_id", label: "Record ID", format: "text" },
         { id: "name", label: "Name", format: "text" },
         { id: "email", label: "Email", format: "text" },
+        { id: "phone", label: "Phone", format: "text" },
+        { id: "source", label: "Source", format: "text" },
+        { id: "consent_email", label: "Email consent", format: "enum", values: ["granted", "denied", "unknown"] },
+        { id: "consent_sms", label: "SMS consent", format: "enum", values: ["granted", "denied", "unknown"] },
+        { id: "tags", label: "Tags", format: "tags", kind: "list" },
         { id: "tier", label: "Tier", format: "enum", values: ["member", "vip", "vip_plus"] },
         { id: "last_visit", label: "Last visit", format: "date" },
         { id: "notes", label: "Notes", format: "text", createView: "customer-form" },
@@ -69,14 +69,17 @@ const socialDescriptorJson = {
   contract: "app-views/v1",
   app: "social-content",
   title: "Social Content — caption runs",
-  summary:
-    "Data-only view declarations a Social Content package could ship: a reviewed-caption run table, a run detail, and a disabled preview of the host's caption form.",
+  summary: "The live binding projects metadata only; preview fixtures also demonstrate inert text rendering for package-declared fields.",
   views: [
     {
       id: "caption-runs",
       title: "Caption runs",
       kind: "table",
       fields: [
+        { id: "id", label: "Run ID", format: "text" },
+        { id: "state", label: "State", format: "enum", values: ["awaiting_approval", "approved", "running", "succeeded", "failed", "cancelled"] },
+        { id: "workflow_title", label: "Workflow", format: "text" },
+        { id: "snapshot_digest", label: "Snapshot digest", format: "text" },
         { id: "subject", label: "Subject", format: "text" },
         { id: "channel", label: "Channel", format: "enum", values: ["instagram", "facebook"] },
         { id: "status", label: "Status", format: "enum", values: ["draft", "in_review", "released"] },
@@ -84,7 +87,10 @@ const socialDescriptorJson = {
         { id: "tags", label: "Tags", format: "tags", kind: "list" },
       ],
       columns: [
+        { field: "state" },
+        { field: "workflow_title" },
         { field: "subject" },
+        { field: "snapshot_digest" },
         { field: "channel" },
         { field: "status" },
         { field: "caption" },
@@ -96,6 +102,10 @@ const socialDescriptorJson = {
       title: "Caption run detail",
       kind: "detail",
       fields: [
+        { id: "id", label: "Run ID", format: "text" },
+        { id: "state", label: "State", format: "enum", values: ["awaiting_approval", "approved", "running", "succeeded", "failed", "cancelled"] },
+        { id: "workflow_title", label: "Workflow", format: "text" },
+        { id: "snapshot_digest", label: "Snapshot digest", format: "text" },
         { id: "subject", label: "Subject", format: "text" },
         { id: "channel", label: "Channel", format: "enum", values: ["instagram", "facebook"] },
         { id: "status", label: "Status", format: "enum", values: ["draft", "in_review", "released"] },
@@ -117,27 +127,38 @@ const socialDescriptorJson = {
   ],
 } as const;
 
-/** Fixture rows per view id — host-supplied, synthetic, never from
- *  backend records. */
+/** Synthetic preview rows only; no live backend record enters this map. */
 const crmRows: Record<string, Record<string, unknown>[]> = {
   customers: [
     {
+      record_id: "preview-customer-1",
       name: "Synthetic Ada Demo",
       email: "ada.demo@example.invalid",
+      phone: "+1 555 0100",
+      source: "synthetic preview",
+      consent_email: "granted",
       tier: "vip",
       visits: 12,
       tags: ["lunch", "ramen"],
     },
     {
+      record_id: "preview-customer-2",
       name: "Synthetic 嘉欣 Demo",
       email: "kayan.demo@example.invalid",
+      phone: "+1 555 0101",
+      source: "synthetic preview",
+      consent_email: "unknown",
       tier: "member",
       visits: 3,
       tags: ["dinner"],
     },
     {
+      record_id: "preview-customer-3",
       name: "<script>alert(1)</script>",
       email: "inert.demo@example.invalid",
+      phone: "+1 555 0102",
+      source: "synthetic preview",
+      consent_email: "denied",
       tier: "member",
       visits: 0,
       tags: [],
@@ -145,8 +166,14 @@ const crmRows: Record<string, Record<string, unknown>[]> = {
   ],
   "customer-detail": [
     {
+      record_id: "preview-customer-1",
       name: "Synthetic Ada Demo",
       email: "ada.demo@example.invalid",
+      phone: "+1 555 0100",
+      source: "synthetic preview",
+      consent_email: "granted",
+      consent_sms: "unknown",
+      tags: ["lunch", "ramen"],
       tier: "vip",
       last_visit: "2026-10-02",
       notes: "Synthetic preview notes; no messages sent.",
@@ -157,6 +184,10 @@ const crmRows: Record<string, Record<string, unknown>[]> = {
 const socialRows: Record<string, Record<string, unknown>[]> = {
   "caption-runs": [
     {
+      id: "preview-run-1",
+      state: "succeeded",
+      workflow_title: "Synthetic social caption workflow",
+      snapshot_digest: `sha256:${"a".repeat(64)}`,
       subject: "Summer ramen launch",
       channel: "instagram",
       status: "released",
@@ -164,6 +195,10 @@ const socialRows: Record<string, Record<string, unknown>[]> = {
       tags: ["kura", "summer"],
     },
     {
+      id: "preview-run-2",
+      state: "awaiting_approval",
+      workflow_title: "Synthetic social caption workflow",
+      snapshot_digest: `sha256:${"b".repeat(64)}`,
       subject: "Weekend brunch",
       channel: "facebook",
       status: "in_review",
@@ -171,6 +206,10 @@ const socialRows: Record<string, Record<string, unknown>[]> = {
       tags: ["brunch"],
     },
     {
+      id: "preview-run-3",
+      state: "failed",
+      workflow_title: "Synthetic social caption workflow",
+      snapshot_digest: `sha256:${"c".repeat(64)}`,
       subject: "<img src=x onerror=alert(1)>",
       channel: "instagram",
       status: "draft",
@@ -180,6 +219,10 @@ const socialRows: Record<string, Record<string, unknown>[]> = {
   ],
   "caption-detail": [
     {
+      id: "preview-run-1",
+      state: "succeeded",
+      workflow_title: "Synthetic social caption workflow",
+      snapshot_digest: `sha256:${"a".repeat(64)}`,
       subject: "Summer ramen launch",
       channel: "instagram",
       status: "released",

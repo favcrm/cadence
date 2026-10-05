@@ -710,6 +710,29 @@
   gap: 0.4rem;
 }
 
+.live-view-search {
+  display: grid;
+  gap: 0.35rem;
+  max-width: 42rem;
+}
+
+.live-view-search-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.live-view-search-row .av-input {
+  flex: 1 1 14rem;
+  min-width: min(100%, 14rem);
+  width: auto;
+}
+
+.live-view-more {
+  justify-self: start;
+}
+
 /* ============================================================
    CAD-1008 additive layer: CRM-only selectors + shared host
    primitives (CAD-866), appended after the parent's shared shell.

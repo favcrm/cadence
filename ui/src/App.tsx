@@ -4,7 +4,8 @@ import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
 import AppDetail from "./features/apps/AppDetail";
 import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell";
-import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
+import { buildAppNav, readLastApp, sectionFromApp, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
+import { installedViewReceipt } from "./features/app-shell/app-views/viewReceipt";
 import { workspaceApps } from "./features/workspace-apps/workspaceApps";
 import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
 import Board from "./features/projects/Board";
@@ -578,6 +579,10 @@ export default function App() {
       if (
         prev !== null && info !== null &&
         prev.installId === info.installId && prev.kind === info.kind && prev.title === info.title
+        && prev.bundleDigest === info.bundleDigest
+        && prev.viewReceipt?.descriptorDigest === info.viewReceipt?.descriptorDigest
+        && prev.viewReceipt?.bindingDigest === info.viewReceipt?.bindingDigest
+        && prev.viewReceipt?.error === info.viewReceipt?.error
       ) {
         return prev;
       }
@@ -591,22 +596,35 @@ export default function App() {
       .installations(controller.signal)
       .then((list) => {
         if (controller.signal.aborted || !Array.isArray(list)) return;
-        setInstalled(list.map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })));
+        setInstalled(list.map((i) => ({
+          installId: i.install_id,
+          kind: i.name,
+          title: i.title || i.name,
+          viewReceipt: installedViewReceipt(i),
+        })));
       })
       .catch(() => undefined); // keep the last good list
     return () => controller.abort();
   }, [route.screen]);
   const onAppScreen = route.screen === "workspaceApp";
   const receipt = onAppScreen && activeApp !== null && activeApp.installId === route.installId ? activeApp : null;
-  const menuApps =
-    receipt !== null && !installed.some((a) => a.installId === receipt.installId)
-      ? [...installed, { installId: receipt.installId, kind: receipt.kind, title: receipt.title }]
-      : installed;
+  const menuApps = receipt === null
+    ? installed
+    : installed.some((app) => app.installId === receipt.installId)
+      ? installed.map((app) => app.installId === receipt.installId
+        ? { ...app, kind: receipt.kind, title: receipt.title, viewReceipt: receipt.viewReceipt }
+        : app)
+      : [...installed, {
+        installId: receipt.installId,
+        kind: receipt.kind,
+        title: receipt.title,
+        viewReceipt: receipt.viewReceipt,
+      }];
   const activeId = onAppScreen
     ? menuApps.find((a) => a.installId === route.installId)?.installId ?? null
     : null;
   const [last, setLast] = useState<LastApp | null>(() => readLastApp());
-  const activeSection = activeId === null ? null : sectionFromSearch(menuApps.find((a) => a.installId === activeId)!.kind, search);
+  const activeSection = activeId === null ? null : sectionFromApp(menuApps.find((a) => a.installId === activeId)!, search);
   useEffect(() => {
     if (activeId === null) return;
     setLast((prev) => {

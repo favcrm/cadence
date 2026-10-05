@@ -81,7 +81,7 @@ function fieldMap(view: AppViewView): Map<string, AppViewField> {
   return new Map((view.fields ?? view.previewOf ?? []).map((f) => [f.id, f]));
 }
 
-function Cell({ field, value }: { field: AppViewField; value: AppViewCell | undefined }) {
+export function AppViewCellRenderer({ field, value }: { field: AppViewField; value: AppViewCell | undefined }) {
   const text = cellText(value);
   if (field.format === "enum") {
     return <span className="chip">{text}</span>;
@@ -122,7 +122,7 @@ function TableView({ view, rows }: { view: AppViewView; rows: AppViewRow[] }) {
       columns={columns.map((c) => ({
         key: c.field,
         header: c.label ?? fields.get(c.field)!.label,
-        cell: (row) => <Cell field={fields.get(c.field)!} value={row[c.field]} />,
+        cell: (row) => <AppViewCellRenderer field={fields.get(c.field)!} value={row[c.field]} />,
       }))}
       rows={rows}
     />
@@ -139,7 +139,7 @@ function DetailView({ view, rows }: { view: AppViewView; rows: AppViewRow[] }) {
       items={fields.map((field) => ({
         key: field.id,
         term: field.label,
-        value: <Cell field={field} value={row[field.id]} />,
+        value: <AppViewCellRenderer field={field} value={row[field.id]} />,
       }))}
     />
   );

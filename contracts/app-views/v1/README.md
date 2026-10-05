@@ -1,4 +1,4 @@
-# App view contract — v1 (CAD-861, toward CAD-811)
+# App view contract — v1 (CAD-861, CAD-867 live-read seam)
 
 A **versioned, data-only** grammar for the record views a workspace app
 package may describe for the trusted host shell. This directory is the
@@ -8,8 +8,9 @@ dev-only preview). Since CAD-864 the package side of the seam exists: a
 workspace bundle may carry exactly `views/app-views-v1.json`, declared
 by `needs.views.contract: app-views/v1` in `app.md`, installed through
 the same verified bundle machinery and served back over the verified
-installation receipt. Rendering it against *live* records remains later
-CAD-811 work.
+installation receipt. CAD-867 adds a generic, read-only UI for an
+installed descriptor paired with its separately pinned `app-bindings/v1`
+receipt; full package/UI/actions acceptance remains open.
 
 ## Contents
 
@@ -17,7 +18,7 @@ CAD-811 work.
 |---|---|
 | `app-view.schema.json` | JSON Schema (draft 2020-12) for one descriptor: `{contract, app, title, summary?, views[]}`. `contract` is exactly `"app-views/v1"`. |
 | `examples/crm.json` | The CRM worked example — customers table, customer detail, disabled create-form preview. Mirrors `ui/.../app-views/examples.ts`. |
-| `examples/social-content.json` | The Social Content worked example — caption-run table, run detail, disabled caption-form preview. A contract example inside any installation, never an installed Social surface. |
+| `examples/social-content.json` | The Social Content worked example — metadata table/detail plus a disabled caption-form preview. Synthetic preview fixtures may include extra fields; the live binding exposes only its closed metadata projection. |
 
 ## What a descriptor is
 
@@ -84,11 +85,11 @@ identifiers and labels may populate inert DOM/ARIA attributes.
 
 `fixtureRows` are **not** descriptor content and a package never ships
 them. The dev preview's host code supplies synthetic rows keyed by
-declared field ids and validates them through the same strict gate:
-unknown keys refuse, enum values must be declared, strings are length-
-and control-character-bounded. Today the rows are literal in
-`examples.ts`; when live records exist they will flow through the same
-projection — descriptor declares the shape, the host picks the data.
+declared field ids and validates them through the strict gate. Installed
+reads use the separate `liveRows` bound and the paired binding's field
+allowlist; only mapped fields are rendered, unknown keys refuse, enum
+values must be declared, and strings remain bounded text. Preview
+fixtures stay synthetic and are never used as live-read fallbacks.
 
 ## Versioning
 
@@ -101,14 +102,15 @@ tag.
 
 ## How consumers use it
 
-- **Board UI** (`ui/src/features/app-shell/app-views/contract.ts`):
-  `parseAppView` fails closed on the first violation with a dotted path
-  (`AppViewContractError`); `fixtureRows` validates record-shaped data
-  against a parsed view; `AppView` renders one view at a time as React
-  text; `AppViewContractPreview` mounts the worked examples behind
-  `?contract-preview=crm|social-content`, dev-only. Direct first-mount links
-  and same-installation view changes preserve preview state; changing the
-  installation clears both preview query keys and opens its normal outlet.
+- **Board UI** (`ui/src/features/app-shell/app-views/`):
+  `parseAppView` and `parseAppBinding` bound and cross-check the receipt's
+  paired descriptor/binding; `viewReceipt.ts` retains the bundle and both
+  file pins. `LiveAppView` routes declared table/detail ids through the
+  operator-gated bound-read HTTP peer, passes the host-owned active context
+  and all three pins, aborts superseded fetches, and renders only mapped
+  fields with shared table/detail/cell primitives. The dev-only
+  `AppViewContractPreview` still uses synthetic fixtures behind
+  `?contract-preview=...`; it is not the live renderer.
 - **Tests**: `ui/tests/appViewContract.test.ts` parses the schema-side
   examples, checks full parity with the renderer descriptors, asserts
   malformed/forbidden/oversized and non-JSON descriptors refuse, and
@@ -145,15 +147,17 @@ tag.
 - The verified workspace receipt (`app_workspace_show`, and its
   operator-gated `GET /api/app-installations/<id>` peer) carries
   `view_descriptor` (the validated JSON) and
-  `view_descriptor_digest`. A bundle without a descriptor serves `null`;
-  legacy project installs are unchanged.
+  `view_descriptor_digest`. When present, the paired `app-bindings/v1`
+  companion and `view_binding_digest` come from the same verified snapshot;
+  descriptor-only bundles remain compatible and legacy project installs
+  are unchanged.
 
-## Remaining CAD-811 integration (not this increment)
+## Remaining acceptance
 
-- The host loading a descriptor from the verified receipt into the
-  shared renderer (the dev preview still reads the fixture map) and
-  wiring `createView` to the host's real record-create path — the live
-  adapter lane.
-- Live record projection: `fixtureRows` becomes a fetch through the
-  existing scoped host-actions client; the descriptor keeps declaring
-  only shape, never query or path.
+The current UI/read seam is deliberately narrow: only receipt-paired
+`table` + `detail` views with bound `list`/`show` reads render live. Form
+previews and actions remain disabled. Full CAD-867 acceptance is still
+open pending verification against both installed packages, real list and
+detail rendering, scope/chat preservation, and desktop/narrow behavior;
+this implementation does not claim typed action dispatch or broader
+CAD-811 write support.

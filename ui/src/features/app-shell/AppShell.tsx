@@ -6,12 +6,15 @@ import type { Viewer } from "../projects/work";
 import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
+import { ErrorNotice } from "./shared/States";
 import Conversation from "./chat/Conversation";
 import { useAppChat } from "./chat/descriptorClient";
 import type { ChatBinding, ChatScope } from "./chat/types";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
+import LiveAppView from "./app-views/LiveAppView";
+import { installedViewReceipt, resolveLiveView, type AppViewReceipt } from "./app-views/viewReceipt";
 import { useChatCollapsed } from "./conversationClient";
 import "./app-shell.css";
 
@@ -44,6 +47,8 @@ export interface ActiveInstallation {
   installId: string;
   kind: string;
   title: string;
+  bundleDigest: string;
+  viewReceipt: AppViewReceipt | null;
 }
 
 export default function AppShell({
@@ -64,6 +69,10 @@ export default function AppShell({
   const href = useHref();
   const query = useMemo(() => new URLSearchParams(href.split("?")[1] ?? ""), [href]);
   const [installation, setInstallation] = useState<Installation | null>(null);
+  const viewReceipt = useMemo(
+    () => installation && installation.install_id === installId ? installedViewReceipt(installation) : null,
+    [installation, installId],
+  );
   const [contexts, setContexts] = useState<AppContext[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -106,7 +115,8 @@ export default function AppShell({
     record: string | null,
     appview: string | null,
     crm: string | null,
-  ) => `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}|${crm ?? ""}`;
+    liveView: string | null,
+  ) => `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}|${crm ?? ""}|${liveView ?? ""}`;
   const writeQuery = useCallback(
     (
       patch: {
@@ -114,6 +124,7 @@ export default function AppShell({
         appview?: OutletView | null;
         record?: string | null;
         crm?: CrmSection | null;
+        view?: string | null;
         clearContractPreview?: boolean;
       },
       opts?: { replace?: boolean },
@@ -139,11 +150,17 @@ export default function AppShell({
         if (patch.crm === null || patch.crm === "customers") q.delete("crm");
         else q.set("crm", patch.crm);
       }
+      if (patch.view !== undefined) {
+        if (patch.view === null || patch.view === "") q.delete("view");
+        else q.set("view", patch.view);
+      } else if (patch.appview !== undefined || patch.record !== undefined || patch.crm !== undefined) {
+        q.delete("view");
+      }
       if (patch.clearContractPreview) {
         q.delete("contract-preview");
         q.delete("contract-preview-view");
       }
-      handledQuery.current = queryKey(q.get("ctx"), q.get("record"), q.get("appview"), q.get("crm"));
+      handledQuery.current = queryKey(q.get("ctx"), q.get("record"), q.get("appview"), q.get("crm"), q.get("view"));
       const s = q.toString();
       navigate(path + (s ? `?${s}` : ""), { replace: opts?.replace });
     },
@@ -192,12 +209,14 @@ export default function AppShell({
         installId,
         kind: installation.name,
         title: installation.title || installation.name,
+        bundleDigest: installation.digest,
+        viewReceipt,
       });
     } else {
       onInstallation(null);
     }
     return () => onInstallation(null);
-  }, [installId, installation, onInstallation]);
+  }, [installId, installation, viewReceipt, onInstallation]);
 
   useEffect(() => {
     setSocialContext(rememberedContext(installId));
@@ -217,7 +236,7 @@ export default function AppShell({
     setLoadError(null);
     setLinkNotice(null);
     setContextId("");
-    writeQuery({ ctx: null, appview: null, record: null, crm: null, clearContractPreview: true }, { replace: true });
+    writeQuery({ ctx: null, appview: null, record: null, crm: null, view: null, clearContractPreview: true }, { replace: true });
     // The strip marks the emptied query handled: unmark so adoption
     // still runs once the new installation's contexts load.
     handledQuery.current = undefined;
@@ -254,8 +273,9 @@ export default function AppShell({
     // never adopt the surviving ctx (the cold deep-link defect). So
     // adoption is fall-through, not early-return: normalize each
     // param, then act on the still-valid remainder.
-    if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView, urlCrm)) return;
-    handledQuery.current = queryKey(urlCtx, urlRecord, urlView, urlCrm);
+    const urlLiveView = query.get("view");
+    if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView, urlCrm, urlLiveView)) return;
+    handledQuery.current = queryKey(urlCtx, urlRecord, urlView, urlCrm, urlLiveView);
     // An unknown CRM section never renders: strip it back to the
     // default instead of guessing a section. The explicit default
     // (`crm=customers`) is already canonical, so it is not rewritten.
@@ -398,6 +418,26 @@ export default function AppShell({
   // The chat's descriptor comes from the installation's own approved package
   // (served pinned to its digest); with none, the pane is plain shared chat.
   const verified = installation !== null && installation.install_id === installId;
+  const liveViewRequested = query.has("view");
+  const requestedLiveViewId = query.get("view");
+  const liveViewResult = useMemo(
+    () => liveViewRequested ? resolveLiveView(viewReceipt, requestedLiveViewId, recordId) : null,
+    [liveViewRequested, requestedLiveViewId, recordId, viewReceipt],
+  );
+  const liveContextId = binding.scope?.context_id ?? "";
+  const liveViewEnabled = viewer.operator && verified && !loading && loadError === null
+    && liveContextId !== "" && activeIds.includes(liveContextId);
+  const liveViewBlockedReason = !viewer.operator
+    ? "Sign in as the operator before reading live app data."
+    : loading
+      ? "Waiting for the verified installation and context receipts."
+      : loadError !== null
+        ? loadError
+        : !verified
+          ? "This route does not match a verified installed app."
+          : binding.error ?? (liveContextId === ""
+            ? "Choose an existing active app context before reading live records."
+            : !activeIds.includes(liveContextId) ? "The selected app context is no longer active." : null);
   const chatDescriptor = useAppChat(
     installId,
     verified ? installation.digest : null,
@@ -430,7 +470,7 @@ export default function AppShell({
           {loading ? "Loading…" : title}
         </span>
         <span className="flex-1" />
-        {isDev && installation !== null && (
+        {isDev && installation !== null && !liveViewRequested && (
           <a
             href={contractPreviewHref(href, previewKey === null ? "crm" : null)}
             className="lnk text-label app-shell-preview-toggle"
@@ -612,7 +652,31 @@ export default function AppShell({
                   {linkNotice}
                 </p>
               )}
-              {previewKey !== null ? (
+              {liveViewRequested ? (
+                liveViewResult?.ok ? (
+                  <LiveAppView
+                    key={`${installId}:${liveContextId}:${liveViewResult.route.view.id}:${liveViewResult.route.recordId ?? ""}`}
+                    installId={installId}
+                    contextId={liveContextId}
+                    receipt={viewReceipt!}
+                    route={liveViewResult.route}
+                    enabled={liveViewEnabled}
+                    blockedReason={liveViewBlockedReason}
+                    returnHref={clearLiveViewHref(href)}
+                    backHref={liveViewResult.route.tableView && liveViewResult.route.op === "show"
+                      ? boundViewHref(href, liveViewResult.route.tableView.id, null)
+                      : null}
+                    detailHref={(viewId, id) => boundViewHref(href, viewId, id)}
+                  />
+                ) : (
+                  <div className="av" data-live-view-refused>
+                    <ErrorNotice>
+                      {liveViewResult?.reason ?? "The requested live view is unavailable."}{" "}
+                      <Link href={clearLiveViewHref(href)} className="lnk">Return to the installed app</Link>
+                    </ErrorNotice>
+                  </div>
+                )
+              ) : previewKey !== null ? (
                 <AppViewContractPreview
                   exampleKey={previewKey}
                   installationKind={installation.name}
@@ -692,6 +756,30 @@ export function scopedEntryHref(href: string, contextId: string, boundId: string
   const [path, search] = href.split("?");
   const q = new URLSearchParams(search ?? "");
   q.set("ctx", contextId);
+  q.delete("record");
+  q.delete("appview");
+  q.delete("view");
+  const s = q.toString();
+  return path + (s ? `?${s}` : "");
+}
+
+function boundViewHref(href: string, viewId: string, recordId: string | null): string {
+  const [path, search] = href.split("?");
+  const q = new URLSearchParams(search ?? "");
+  q.set("view", viewId);
+  if (recordId === null) q.delete("record");
+  else q.set("record", recordId);
+  q.delete("appview");
+  q.delete("contract-preview");
+  q.delete("contract-preview-view");
+  const s = q.toString();
+  return path + (s ? `?${s}` : "");
+}
+
+function clearLiveViewHref(href: string): string {
+  const [path, search] = href.split("?");
+  const q = new URLSearchParams(search ?? "");
+  q.delete("view");
   q.delete("record");
   q.delete("appview");
   const s = q.toString();

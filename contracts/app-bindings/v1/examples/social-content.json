@@ -1,13 +1,17 @@
 {
   "contract": "app-bindings/v1",
   "app": "social-content",
-  "title": "Social Content bindings — caption runs",
+  "title": "Social Content bindings — caption-run metadata",
   "bindings": [
     {
       "view": "caption-runs",
       "source": "caption-runs",
       "ops": ["list"],
       "fields": [
+        { "field": "id", "key": "id", "format": "text" },
+        { "field": "state", "key": "state", "format": "enum" },
+        { "field": "workflow_title", "key": "snapshot.workflow.title", "format": "text" },
+        { "field": "snapshot_digest", "key": "snapshot_digest", "format": "text" },
         { "field": "subject", "key": "snapshot.inputs.subject", "format": "text" }
       ]
     },
@@ -16,6 +20,10 @@
       "source": "caption-runs",
       "ops": ["show"],
       "fields": [
+        { "field": "id", "key": "id", "format": "text" },
+        { "field": "state", "key": "state", "format": "enum" },
+        { "field": "workflow_title", "key": "snapshot.workflow.title", "format": "text" },
+        { "field": "snapshot_digest", "key": "snapshot_digest", "format": "text" },
         { "field": "subject", "key": "snapshot.inputs.subject", "format": "text" }
       ]
     }

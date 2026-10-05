@@ -25,8 +25,8 @@ unchanged: the companion is optional in one direction only.
 | File | What it is |
 |---|---|
 | `app-bindings.schema.json` | JSON Schema (draft 2020-12) for one binding file: `{contract, app, title, bindings[]}`. `contract` is exactly `"app-bindings/v1"`. |
-| `examples/crm.json` | The CRM companion — maps the customers table and customer detail of `contracts/app-views/v1/examples/crm.json` onto the `customers` source over real `CustomerProfile` fields. |
-| `examples/social-content.json` | The Social Content companion — maps the `subject` field on caption-run table/detail views to optional `snapshot.inputs.subject` metadata from `app_run_show`; it does not expose artifact content. |
+| `examples/crm.json` | The CRM companion — maps the table's hidden `record_id` identity and visible customer fields, plus a matching `show` detail, onto the real `customers` projection. |
+| `examples/social-content.json` | The Social Content companion — maps `id`, state, workflow title, snapshot digest and optional subject on a matching caption-run list/detail pair; it does not expose artifact content. |
 
 ## What a binding file is
 
@@ -43,6 +43,7 @@ unchanged: the companion is optional in one direction only.
       "source": "customers",
       "ops": ["list"],
       "fields": [
+        { "field": "record_id", "key": "record_id", "format": "text" },
         { "field": "name", "key": "display_name", "format": "text" },
         { "field": "email", "key": "email", "format": "text" },
         { "field": "tags", "key": "tags", "format": "tags" },
@@ -203,11 +204,14 @@ unknown field all fail closed: the RPC returns `rejected`; the HTTP
 peer maps schema/binding refusals to `400`, an operator-gate refusal
 to `403`, everything else to `503`.
 
-## Remaining CAD-867/CAD-811 work (not this increment)
+## Remaining acceptance
 
-- The live renderer/adapter that consumes `rows[]` against the
-  declared view shape.
-- Typed forms and action verbs: `form` views stay disabled previews —
-  no executable binding, no submit target.
-- Actor/scope/revision-bound writes and the per-package domain
-  stores/migrations of CAD-811.
+The board now has a generic, read-only consumer for installed table/detail
+pairs: it uses the verified receipt's descriptor/binding/bundle pins and
+host-owned active context with the bound-read HTTP peer. The examples show
+an explicit hidden row identity for detail navigation. This is not a claim
+of full CAD-867 acceptance; both installed packages, direct deep links,
+scope/chat preservation, and desktop/narrow rendering still need end-to-end
+verification. Typed forms and action verbs remain disabled, with no
+executable binding or submit target. Actor/scope/revision-bound writes and
+the per-package domain stores/migrations remain separate CAD-811 work.
