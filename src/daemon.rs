@@ -610,8 +610,17 @@ impl Shared {
         // read-write and migrates. A direct `daemon run` whose identity
         // does not hold the lease refuses here and leaves the database
         // unchanged. `open_adopting` repeats the same check.
-        crate::rollout::authorize_migration(&db_path)?;
-        let (mut store, recovered) = Store::open_adopting(&db_path, marker)?;
+        let (mut store, recovered) = if state_dir == Path::new("/srv/cadence/protected/store") {
+            // This path only requests protected startup; it is NOT permission.
+            // Authentic fixed-owner issuance selects mode/binding BEFORE SQL,
+            // and unavailable/invalid ownership never falls back to Legacy.
+            let grant = crate::store::StoreOwnerGrant::startup()?;
+            crate::rollout::authorize_migration(Path::new(&grant.binding().path))?;
+            Store::open_owned(grant)?
+        } else {
+            crate::rollout::authorize_migration(&db_path)?;
+            Store::open_adopting(&db_path, marker)?
+        };
         store.set_shutdown_entries_hook(opts.shutdown_entries_hook.clone())?;
         if let Some(ms) = opts.shutdown_backoff_ms_for_test {
             store.shutdown_backoff_ms = ms;

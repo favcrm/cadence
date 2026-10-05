@@ -326,6 +326,28 @@ pub(crate) fn acknowledge_children(
     c.handoff.lock().map_err(|_| refused())?.completed = true;
     Ok(())
 }
+pub(super) fn runtime_parts() -> Result<(
+    &'static QualifiedBootstrap,
+    Arc<custody::RootCustody>,
+    &'static str,
+    &'static str,
+)> {
+    let c = context()?;
+    if !c.handoff.lock().map_err(|_| refused())?.completed
+        || !c.provider.lock().map_err(|_| refused())?.consumed
+    {
+        return Err(refused());
+    }
+    Ok((
+        &c.bootstrap,
+        c.root.clone(),
+        &c.binding,
+        &c.recipient.generation,
+    ))
+}
+pub(super) fn runtime_wire<T>(f: impl FnOnce(&mut channel::Duplex) -> Result<T>) -> Result<T> {
+    f(&mut context()?.provider.lock().map_err(|_| refused())?.channel)
+}
 pub(super) fn finish() -> Result<()> {
     let c = context()?;
     c.check(c.deadline)?;
@@ -342,18 +364,8 @@ pub(super) fn finish() -> Result<()> {
     // Retain children during the platform post-ACK owner check. EOF/cancel is
     // physical cleanup only; never claims durable external retirement.
     drop(provider);
-    (|| loop {
-        c.deadline.wait(0)?;
-        let mut byte = [0u8; 1];
-        let n = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
-        if n == 0 {
-            return Ok(());
-        }
-        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
-            continue;
-        }
-        return Err(refused());
-    })() // runtime's one cleanup guard supplies the pair's total <=2s budget
+    super::lifecycle::enter(c.deadline)
+    // runtime's one cleanup guard supplies the pair's total <=2s budget
 }
 pub(super) fn cleanup() {
     if let Some(c) = CONTEXT.get() {

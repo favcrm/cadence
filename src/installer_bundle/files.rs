@@ -107,13 +107,24 @@ pub(super) fn measure(
     deadline: Deadline,
 ) -> Result<Stamp> {
     deadline.check()?;
+    measure_mode(file, expected, uid, uid, 0o755, deadline)
+}
+fn measure_mode(
+    file: &File,
+    expected: [u8; 32],
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    deadline: Deadline,
+) -> Result<Stamp> {
+    deadline.check()?;
     let before = stamp(file)?;
     if expected == [0; 32]
         || before.size > MAX_EXE
         || before.size < 64
-        || before.mode != libc::S_IFREG | 0o755
+        || before.mode != libc::S_IFREG | mode
         || before.uid != uid
-        || before.gid != uid
+        || before.gid != gid
         || before.links != 1
     {
         return Err(refused());
@@ -136,6 +147,7 @@ pub(super) enum Artifact {
     Observer,
     Constructor,
     Recipient,
+    Helper,
 }
 impl Artifact {
     fn path(self) -> &'static str {
@@ -145,6 +157,7 @@ impl Artifact {
             Self::Observer => OBSERVER,
             Self::Constructor => "/opt/protected/bin/cadence-root-constructor",
             Self::Recipient => "/opt/protected/bin/cadence-enrolled-recipient",
+            Self::Helper => "/opt/protected/bin/cadence-agent-exec",
         }
     }
 }
@@ -179,7 +192,10 @@ impl HeldArtifact {
         let file = File::from(
             open_at2(Path::new(kind.path()), OpenKind::ExecFile).map_err(|_| refused())?,
         );
-        stamps.push(measure(&file, expected, 0, deadline)?);
+        stamps.push(match kind {
+            Artifact::Helper => measure_mode(&file, expected, 0, 21000, 0o4750, deadline)?,
+            _ => measure(&file, expected, 0, deadline)?,
+        });
         Ok(Self {
             file,
             dirs,
@@ -218,6 +234,17 @@ impl HeldArtifact {
     }
     // Drop all held directories BEFORE close_range. No File destructor may
     // close a recycled descriptor after closure/exec; keep only the target FD.
+    pub(super) fn live_correspondence(&self, pid: u32, deadline: Deadline) -> Result<()> {
+        let file = File::open(format!("/proc/{pid}/exe")).map_err(|_| refused())?;
+        let live = match self.kind {
+            Artifact::Helper => measure_mode(&file, self.expected, 0, 21000, 0o4750, deadline)?,
+            _ => measure(&file, self.expected, 0, deadline)?,
+        };
+        if &live != self.selected_stamp() {
+            return Err(refused());
+        }
+        self.recheck(deadline)
+    }
     pub(super) fn into_exec(self) -> File {
         self.file
     }

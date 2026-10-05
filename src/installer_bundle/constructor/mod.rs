@@ -6,6 +6,9 @@ mod child;
 mod children;
 mod context;
 mod custody;
+mod helper;
+mod layout;
+mod lifecycle;
 mod runtime;
 mod wire;
 
@@ -16,6 +19,10 @@ pub(crate) use children::recipient_entry;
 pub(crate) use context::{
     acknowledge_children, binding_json, custody_recheck, enrollment, grant_keys, image,
     install_once, installer, owner_request, proof, receipt_keys, require_self, Proof,
+};
+pub(crate) use helper::{HelperPhase, HelperStdio, OwnedHelper};
+pub(crate) use lifecycle::{
+    pi_acquire, pi_consume, pi_current, runtime_current, runtime_proof, RuntimeProof,
 };
 use serde::{Deserialize, Serialize};
 use std::os::fd::AsRawFd;
@@ -122,6 +129,10 @@ pub(super) struct Manifest {
     expires_at_ms: u64,
     receipt_trust: Vec<PublicTrust>,
     grant_trust: Vec<PublicTrust>,
+    /// Distinct purpose election. An earlier receipt/grant ring does not
+    /// authorize a runtime lifetime. Absent means runtime remains unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_trust: Option<Vec<PublicTrust>>,
 }
 
 /// Non-exported, non-Clone production token. Only authenticated bootstrap can
@@ -275,6 +286,9 @@ pub(super) fn authenticate_bootstrap(bytes: &[u8], now_ms: u64) -> Result<Qualif
     }
     trust(&manifest.receipt_trust)?;
     trust(&manifest.grant_trust)?;
+    if let Some(keys) = &manifest.runtime_trust {
+        trust(keys)?;
+    }
     let key = IMAGE_AUTHORITY_KEYS
         .iter()
         .find(|k| k.kid == header.kid && k.version == header.key_version)

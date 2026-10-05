@@ -75,6 +75,18 @@ impl Duplex {
             failed: false,
         })
     }
+    /// Only a separately authenticated runtime authority may enter a new
+    /// operation window. Pending bytes and fatal framing state are preserved.
+    pub(super) fn begin_operation(&mut self, deadline: Deadline) -> Result<()> {
+        if self.failed {
+            return Err(refused());
+        }
+        deadline.check()?;
+        self.deadline = deadline;
+        self.frames = 0;
+        self.total = 0;
+        Ok(())
+    }
     fn count(&mut self, length: usize) -> Result<()> {
         self.deadline.check()?;
         if self.failed
