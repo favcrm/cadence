@@ -201,6 +201,7 @@ pub(crate) enum StorePurpose {
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 enum Request<'a> {
     RuntimeCurrent,
+    StoreStartup,
     PiAcquire {
         scope: &'a crate::adapter::pi_guest::owner::OperationScope,
     },
@@ -295,6 +296,33 @@ pub(crate) fn runtime_current(until: Instant) -> Result<wire::OwnerCurrent> {
     }
     Ok(reply.current)
 }
+fn store_reply(reply: Response, expected_phase: Option<&str>) -> Result<serde_json::Value> {
+    // Finite domain separation. Actual persisted phase accompanies facts;
+    // attempted consumption or an echoed guest Binding cannot supply it.
+    if reply.pi.is_some() {
+        return Err(refused());
+    }
+    let store = reply.store.ok_or_else(refused)?;
+    let object = store.as_object().ok_or_else(refused)?;
+    if object.len() != 2
+        || !object.contains_key("facts")
+        || !matches!(
+            object.get("phase").and_then(serde_json::Value::as_str),
+            Some("issued" | "consumed")
+        )
+        || expected_phase.is_some_and(|phase| {
+            object.get("phase").and_then(serde_json::Value::as_str) != Some(phase)
+        })
+    {
+        return Err(refused());
+    }
+    // This is transport schema only; the root owned-caller service MUST also
+    // validate exact launch/lineage/DB/path/purpose/facts and expected phase.
+    Ok(store)
+}
+pub(crate) fn store_startup(until: Instant) -> Result<serde_json::Value> {
+    store_reply(exchange(Request::StoreStartup, until)?, Some("issued"))
+}
 pub(crate) fn store_acquire(
     purpose: StorePurpose,
     attempt: &str,
@@ -303,26 +331,26 @@ pub(crate) fn store_acquire(
     if !super::hex(attempt, 32) {
         return Err(refused());
     }
-    exchange(Request::StoreAcquire { purpose, attempt }, until)?
-        .store
-        .ok_or_else(refused)
+    store_reply(
+        exchange(Request::StoreAcquire { purpose, attempt }, until)?,
+        Some("issued"),
+    )
 }
 pub(crate) fn store_consume(reference: &str, until: Instant) -> Result<serde_json::Value> {
     if !identifier(reference) {
         return Err(refused());
     }
     // No retry/reconnect here. The per-client grant must burn BEFORE calling.
-    exchange(Request::StoreConsume { reference }, until)?
-        .store
-        .ok_or_else(refused)
+    store_reply(
+        exchange(Request::StoreConsume { reference }, until)?,
+        Some("consumed"),
+    )
 }
 pub(crate) fn store_current(reference: &str, until: Instant) -> Result<serde_json::Value> {
     if !identifier(reference) {
         return Err(refused());
     }
-    exchange(Request::StoreCurrent { reference }, until)?
-        .store
-        .ok_or_else(refused)
+    store_reply(exchange(Request::StoreCurrent { reference }, until)?, None)
 }
 fn pi_reply(
     reply: Response,
