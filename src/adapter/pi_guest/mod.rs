@@ -8,8 +8,6 @@
 
 #![allow(dead_code)]
 
-use std::os::unix::io::AsRawFd;
-
 use super::ProviderEnv;
 use crate::error::{Error, Result};
 use crate::store::Agent;
@@ -17,10 +15,10 @@ use crate::store::Agent;
 mod envp;
 pub(crate) mod execfd;
 pub(crate) mod owner;
+pub(crate) mod service;
 pub(crate) mod topology;
 
 use crate::protected_pi_profile::authority;
-use execfd::PreparedExec;
 use topology::ProtectedTopology;
 
 /// The four image-local accounts/groups the protected layout is built on —
@@ -131,8 +129,10 @@ pub(crate) struct GuestCtx {
     /// routing text, never a path segment or a principal proof).
     alias: String,
     selection: authority::Selection,
-    /// Daemon owns only the helper; Node is reopened privately AFTER close_fds.
-    helper: execfd::BoundExec,
+    /// SAME authenticated supervisor control channel; actual root creates and
+    /// retains the helper. Daemon receives stdio only, never executable custody.
+    channel: authority::Channel,
+    launch: authority::Authorized,
 }
 
 /// Legacy unbound/unsupported-host probe. No operation/alias/model means no
@@ -187,7 +187,8 @@ impl GuestCtx {
         }
         // Provision is authenticated by the service against retained supervisor
         // custody and current owner policy before it creates ANY generation leaf.
-        let launch = authority::Channel::connect()?.authorize(
+        let mut channel = authority::Channel::connect()?;
+        let launch = channel.authorize(
             &authority::Request::Provision {
                 version: 1,
                 selection: selection.clone(),
@@ -199,43 +200,27 @@ impl GuestCtx {
         // Verify the durable + generation slot dirs exist and are exactly the
         // pre-provisioned shape; a missing slot refuses (never creates).
         topo.verify_view(&segs, role)?;
-        // Bind only the helper here. No parent Node fd survives helper close_fds.
-        let helper = execfd::open_bound(&execfd::ExecPin {
-            canon: "/opt/cadence/libexec/cadence-agent-exec",
-            owner: 0,
-            group: Some(acct::LAUNCH_GROUP),
-            mode: 0o4750,
-            sha256: Some(launch.image.helper_sha256),
-        })?;
+        // No local setuid exec: NNP/NOSUID cannot regain root. The constructor
+        // selects the measured helper for this retained owner operation and
+        // creates it realUID21000/effective0, retaining actual kernel custody.
         Ok(Self {
             topo,
             segs,
             role,
             alias: agent.alias.clone(),
             selection,
-            helper,
+            channel,
+            launch,
         })
     }
 
-    /// The verified helper fd for the `pre_exec` `execveat` — the daemon
-    /// executes this inode (kernel applies setuid to it), never a path.
-    pub(crate) fn helper_fd(&self) -> std::os::unix::io::RawFd {
-        self.helper.fd.as_raw_fd()
-    }
-
-    /// Build the spawn plan handed to `StdioAdapter::launch`: the materialized
-    /// argv/envp for `pre_exec`+`execveat`. Only the shared finite routing grammar
-    /// follows the profile tokens; the helper derives Node/CLI/env/cwd itself.
-    /// The plan takes
-    /// ownership of the bound helper fd's `OwnedFd` — custody moves with the
-    /// spawn, so no closed/reused descriptor can be exec'd in the child.
-    ///
-    /// This consumes the helper binding: a `GuestCtx` produces at most one
-    /// spawn plan, which is correct — one open, one launch, one fd.
-    pub(crate) fn spawn_plan(
+    /// Request the root-created exact helper and receive ONLY its three stdio
+    /// pipes plus the retained finite control channel. No PID/FD/executable
+    /// adoption, local SUID fallback, helper authority env or inherited FD.
+    pub(crate) fn launch(
         self,
         routing: &crate::protected_pi_profile::Routing,
-    ) -> Result<PreparedExec> {
+    ) -> Result<authority::RemoteLaunch> {
         // Routing must exactly echo the provisioned selectors. Only the helper's
         // separately authenticated arm/consume may authorize actual Node exec.
         if routing.model() != Some(self.selection.model.as_str())
@@ -246,8 +231,7 @@ impl GuestCtx {
             ));
         }
         self.topo.verify_view(&self.segs, self.role)?;
-        let draft = PreparedExec::assemble(&self.segs, &routing.tokens(), Vec::new())?;
-        Ok(draft.with_bound(self.helper))
+        Ok(self.channel.launch(&self.launch)?)
     }
 
     /// The verified per-launch view dirfd for `layer`.

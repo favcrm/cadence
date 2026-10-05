@@ -18,6 +18,11 @@ pub(crate) const GUEST_UID: u32 = 21001;
 pub(crate) const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const DEADLINE_SECS: u64 = 30;
 
+#[path = "transport.rs"]
+mod transport;
+pub(crate) type RemoteLaunch = transport::RemoteLaunch;
+pub(crate) type RemoteControl = transport::RemoteControl;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Role {
@@ -45,6 +50,26 @@ pub(crate) enum Request {
         selection: Selection,
     },
     Consume {
+        version: u32,
+        selection: Selection,
+        operation: String,
+    },
+    Launch {
+        version: u32,
+        selection: Selection,
+        operation: String,
+    },
+    Interrupt {
+        version: u32,
+        selection: Selection,
+        operation: String,
+    },
+    Retire {
+        version: u32,
+        selection: Selection,
+        operation: String,
+    },
+    Status {
         version: u32,
         selection: Selection,
         operation: String,
@@ -95,7 +120,26 @@ pub(crate) enum Response {
         selection: Selection,
         operation: String,
     },
+    Started {
+        version: u32,
+        selection: Selection,
+        operation: String,
+        pid: u32,
+    },
+    State {
+        version: u32,
+        selection: Selection,
+        operation: String,
+        pid: u32,
+        phase: ProcessPhase,
+    },
     Refused,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProcessPhase {
+    Running,
+    Exited,
 }
 pub(crate) fn refused() -> io::Error {
     io::Error::new(
@@ -366,7 +410,7 @@ impl Channel {
             return Err(refused());
         }
         // Burn BEFORE sending. Lost ACK remains UNKNOWN; never retry/reconnect.
-        if matches!(request, Request::Consume { .. }) {
+        if matches!(request, Request::Consume { .. } | Request::Retire { .. }) {
             self.consumed = true;
         }
         let frame = serde_json::to_vec(request).map_err(|_| refused())?;

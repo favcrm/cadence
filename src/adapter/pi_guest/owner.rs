@@ -460,6 +460,12 @@ impl LaunchPermit {
         }
         result
     }
+    pub(crate) fn require_provisioned(&self) -> Result<()> {
+        if self.phase.get() != Phase::Provisioned || self.unknown.get() {
+            return Err(refuse());
+        }
+        self.recheck()
+    }
     /// Root dispatcher must independently match the kernel caller against the
     /// retained own-created helper handle BEFORE invoking this scope transition.
     pub(crate) fn arm(&self, selection: &Selection) -> Result<()> {

@@ -2377,7 +2377,10 @@ impl ProviderAdapter for PiAdapter {
                 Some(ctx) => {
                     let routing = crate::protected_pi_profile::Routing::for_agent(master, want)
                         .map_err(Error::rejected)?;
-                    transport.launch_protected(ctx, &routing, &self.log_path)?
+                    let launch = ctx.launch(&routing)?;
+                    // Root alone owns creation/retirement. Adopt ONLY its exact
+                    // stdio pipes/control channel, never a returned PID as custody.
+                    transport.adopt_protected(launch, &self.log_path)?
                 }
                 None => transport.launch(&agent.cwd, &self.log_path, &env)?,
             };
