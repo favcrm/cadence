@@ -260,6 +260,7 @@ fn leaf_ok(seg: &str, need_md_tag: bool) -> bool {
 ///   `app.md`, `app-chat.json`         (exactly; CAD-1110)
 ///   `workflows/<tag>.md`              (valid_tag stem — the installer's rule)
 ///   `rubrics/<leaf>` `templates/<leaf>` (any visible flat leaf)
+///   `views/app-views-v1.json`         (exact descriptor filename)
 /// Empty segments (`//`, leading `/`, trailing `/`), `.`/`..`, `\`, `\0` and
 /// any other top-level name are refused. `snapshot`/`validate_texts` re-check
 /// daemon-side; this schema refuses bad keys before a single byte is staged.
@@ -275,6 +276,7 @@ fn upload_path_ok(path: &str) -> bool {
     match segs.as_slice() {
         ["app.md"] | ["app-chat.json"] => true,
         ["workflows", leaf] => leaf_ok(leaf, true),
+        ["views", leaf] => *leaf == crate::issue::app_view::FILE,
         ["rubrics", leaf] | ["templates", leaf] => leaf_ok(leaf, false),
         // CAD-1006: screens/<tag>/<leaf> — the one depth-2 entry: a
         // tag-named package dir holding `screens.json` or a
