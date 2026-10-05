@@ -92,9 +92,9 @@ fn caller_selected_build_key_pid_and_perfect_diagnostics_cannot_elect_authority(
 
     // Validate the actual production types/parsers, not merely JSON syntax.
     // The schema comes from platform 6b5502e85d40174c1f5de313c10ccda24dee7bce.
-    let parsed: super::Configure = serde_json::from_value(bootstrap.clone()).unwrap();
-    super::grant::parse_launch(&parsed.launch).unwrap();
-    super::grant::parse_lineage(&parsed.lineage).unwrap();
+    let _: super::Configure = serde_json::from_value(bootstrap.clone()).unwrap();
+    super::grant::parse_launch(&bootstrap["launch"]).unwrap();
+    super::grant::parse_lineage(&bootstrap["lineage"]).unwrap();
     let _: super::Header = super::canonical(canonical(&header).as_bytes()).unwrap();
     let _: super::Manifest = super::canonical(canonical(&payload).as_bytes()).unwrap();
 
