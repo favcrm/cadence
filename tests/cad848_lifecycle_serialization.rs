@@ -578,41 +578,13 @@ fn cad848_recovery_refuses_symlinked_worktree_parent() {
     fs::create_dir_all(fixture.home.join("data")).unwrap();
     fs::create_dir_all(fixture.home.join("cache")).unwrap();
     fs::write(fixture.home.join("gitconfig"), "").unwrap();
-    let env_updates = [
-        ("HOME", fixture.home.as_os_str().to_os_string()),
-        (
-            "XDG_CONFIG_HOME",
-            fixture.home.join("config").into_os_string(),
-        ),
-        ("XDG_DATA_HOME", fixture.home.join("data").into_os_string()),
-        (
-            "XDG_CACHE_HOME",
-            fixture.home.join("cache").into_os_string(),
-        ),
-        ("XDG_STATE_HOME", fixture.state.as_os_str().to_os_string()),
-        ("GIT_CONFIG_NOSYSTEM", "1".into()),
-        (
-            "GIT_CONFIG_GLOBAL",
-            fixture.home.join("gitconfig").into_os_string(),
-        ),
-    ];
-    let previous_env = env_updates
-        .iter()
-        .map(|(key, _)| (*key, std::env::var_os(*key)))
-        .collect::<Vec<_>>();
-    #[allow(unused_unsafe)]
-    unsafe {
-        for (key, value) in &env_updates {
-            std::env::set_var(*key, value);
-        }
-    }
 
     let name = "recovered-lane";
     let repo = fixture.repo.canonicalize().unwrap();
     let lane = cadence_agent::worktree::lifecycle::development_path(&repo, name);
     let branch = cadence_agent::worktree::layout::branch(name);
     let pinned_sha = git(&fixture.home, &repo, &["rev-parse", "HEAD"]);
-    let owner = "cad848-recovery-fixture";
+    let owner = std::env::var("CADENCE_ALIAS").unwrap_or_else(|_| "operator".to_string());
     assert!(
         !lane.exists(),
         "fixture lane unexpectedly exists before recovery"
@@ -621,7 +593,7 @@ fn cad848_recovery_refuses_symlinked_worktree_parent() {
         repo: &repo,
         purpose: "development",
         tool: "cadence agent worktree",
-        owner,
+        owner: &owner,
         path: &lane,
         branch: Some(&branch),
         pinned_sha: &pinned_sha,
@@ -676,29 +648,7 @@ fn cad848_recovery_refuses_symlinked_worktree_parent() {
 
     // `launch --worktree` first requires a daemon/agent lookup. Exercise the
     // same public production recovery function directly in this isolated repo.
-    let previous_alias = std::env::var_os("CADENCE_ALIAS");
-    #[allow(unused_unsafe)]
-    unsafe {
-        std::env::set_var("CADENCE_ALIAS", owner);
-    }
     let attempt = cadence_agent::worktree::create_worktree(&repo, name);
-    #[allow(unused_unsafe)]
-    unsafe {
-        match previous_alias {
-            Some(alias) => std::env::set_var("CADENCE_ALIAS", alias),
-            None => std::env::remove_var("CADENCE_ALIAS"),
-        }
-    }
-
-    #[allow(unused_unsafe)]
-    unsafe {
-        for (key, value) in previous_env {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
 
     let (result_ok, result_text) = match attempt {
         Ok(path) => (true, format!("Ok({})", path.display())),
