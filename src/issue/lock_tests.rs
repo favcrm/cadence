@@ -788,6 +788,21 @@ fn a_live_holders_refusal_names_its_pid() {
         e.contains(&pid),
         "a live holder's refusal names its pid: {e}"
     );
+    // The `holder: pid N (comm)` shape is only produced by the live
+    // /proc scan: a trailer-only report would say "no live holder
+    // found" instead, so this proves the scan ran, not just the file.
+    assert!(e.contains("holder: pid"), "no scan attribution: {e}");
+    #[cfg(target_os = "linux")]
+    {
+        let comm = std::fs::read_to_string("/proc/self/comm")
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            e.contains(&comm),
+            "a live holder's refusal names its command ({comm}): {e}"
+        );
+    }
     sigkill(child);
 }
 
@@ -807,6 +822,10 @@ fn a_held_fence_file_carries_a_parseable_trailer() {
     assert!(
         tail.contains(&format!("pid={}\n", std::process::id())),
         "trailer names no holder pid: {tail}"
+    );
+    assert!(
+        tail.contains("cmd="),
+        "trailer names no holder command: {tail}"
     );
     assert!(
         tail.contains(&format!("version={}\n", env!("CARGO_PKG_VERSION"))),
@@ -861,7 +880,7 @@ fn a_malformed_marker_tail_is_legacy_unknown() {
     let (_tmp, pm) = tracker();
     std::fs::write(
         pm.dir.join(".write.lock"),
-        format!("{marker}pid=1\nhost=h\nversion=9.9\nstarted_at=1\nbin=cadence\n"),
+        format!("{marker}pid=1\nhost=h\nversion=9.9\nstarted_at=1\ncmd=cadence\n"),
     )
     .unwrap();
     assert!(
@@ -894,6 +913,19 @@ fn a_disjoint_write_is_admitted_beside_an_interrupted_one() {
     std::fs::write(&file, text).unwrap();
     pm.commit_scoped(&lock, std::slice::from_ref(&file), "scoped test commit")
         .unwrap();
+    // A commit through the same scoped lock that touches the crash's
+    // paths is refused before any staging: HEAD, index and file stay.
+    let e = pm
+        .commit_scoped(
+            &lock,
+            std::slice::from_ref(&pm.dir.join("crashed").join("issue.md")),
+            "overlap the crash",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("overlaps"), "{e}");
+    assert!(e.contains("crashed/issue.md"), "{e}");
     drop(lock);
     assert_ne!(git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(), head);
     // The scoped admission must not consume the tripwire: the stale
@@ -957,6 +989,16 @@ fn a_merge_marker_refuses_even_disjoint_writes() {
         .to_string();
     assert!(e.contains("MERGE_HEAD"), "{e}");
     std::fs::remove_file(pm.dir.join(".git").join("MERGE_HEAD")).unwrap();
+    // A stale index lock is the same class of global marker: it
+    // refuses disjoint writes until git itself clears it.
+    std::fs::write(pm.dir.join(".git").join("index.lock"), "").unwrap();
+    let e = pm
+        .lock_for_paths(std::slice::from_ref(&other))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("index.lock"), "{e}");
+    std::fs::remove_file(pm.dir.join(".git").join("index.lock")).unwrap();
     assert!(
         pm.lock_for_paths(std::slice::from_ref(&other)).is_ok(),
         "disjoint writes resume once the global marker clears"
@@ -1002,5 +1044,101 @@ fn a_tripped_lease_stops_a_scoped_writer_waiting_for_the_lock() {
     assert!(
         start.elapsed() < Duration::from_secs(5),
         "waited out the lock"
+    );
+}
+
+/// A `..` component is refused as a caller bug in both admission and
+/// commit: git would resolve `dir/../../x` to `x`, letting a scoped
+/// write pass the checks as one path and commit another.
+#[test]
+fn dotdot_paths_are_refused_as_caller_bugs() {
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    let evil: PathBuf = pm.dir.join("cadence").join("..").join("elsewhere.md");
+    let e = pm
+        .lock_for_paths(std::slice::from_ref(&evil))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("escapes"), "{e}");
+    let lock = pm.lock().unwrap();
+    let e = pm
+        .commit_scoped(&lock, std::slice::from_ref(&evil), "escape")
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("escapes"), "{e}");
+}
+
+/// The tracker root is the whole tracker: it admits and commits
+/// ordinary files on a clean tree, and overlaps every leftover
+/// beside a crash — never silently disjoint.
+#[test]
+fn tracker_root_scope_covers_the_whole_tracker() {
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    let file = pm.dir.join("cadence").join("CAD-1").join("issue.md");
+    let lock = pm.lock_for_paths(std::slice::from_ref(&pm.dir)).unwrap();
+    let mut text = std::fs::read_to_string(&file).unwrap();
+    text.push_str("\nroot scoped\n");
+    std::fs::write(&file, text).unwrap();
+    pm.commit_scoped(&lock, std::slice::from_ref(&file), "root scoped commit")
+        .unwrap();
+    drop(lock);
+    let (child, _) = spawn_writer(&pm, "hold_dirty", false);
+    sigkill(child);
+    let e = pm
+        .lock_for_paths(std::slice::from_ref(&pm.dir))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("interrupted"), "root wrongly disjoint: {e}");
+}
+
+/// Guard against API misuse: every write.rs function that takes a
+/// scoped lock must commit only through the scoped wrappers. Plain
+/// commit never checks scope, so an unscoped call beside
+/// `lock_for_paths` would silently write outside the admitted set.
+/// This test reads the source it guards and fails the build on drift.
+#[test]
+fn write_rs_pairs_scoped_locks_with_scoped_commits() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/issue/write.rs"),
+    )
+    .unwrap();
+    let lines: Vec<&str> = src.lines().collect();
+    let mut bounds = vec![0usize];
+    for (i, l) in lines.iter().enumerate() {
+        if l.starts_with("pub fn ") || l.starts_with("pub(crate) fn ") || l.starts_with("fn ") {
+            bounds.push(i);
+        }
+    }
+    bounds.push(lines.len());
+    let mut bad = Vec::new();
+    for w in bounds.windows(2) {
+        let body = lines[w[0]..w[1]].join("\n");
+        if !body.contains("lock_for_paths") {
+            continue;
+        }
+        for pat in ["commit(", "commit_who(", "commit_staged("] {
+            let mut search = body.as_str();
+            while let Some(pos) = search.find(pat) {
+                // `fn commit...(` definitions are the wrappers themselves.
+                if search[..pos].ends_with("fn ") {
+                    search = &search[pos + pat.len()..];
+                    continue;
+                }
+                bad.push(format!(
+                    "{}: unscoped {pat} beside lock_for_paths",
+                    lines[w[0]]
+                ));
+                break;
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "scoped locks must pair with scoped commits:\n{}",
+        bad.join("\n")
     );
 }

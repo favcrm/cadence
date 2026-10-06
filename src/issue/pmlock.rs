@@ -73,8 +73,9 @@ pub(super) const MARKER: &str =
     "cadence-pm-write-lock v2 (kernel flock on .git/cadence-write.flock)\n";
 /// Trailer keys a writer may append after [`MARKER`]. The set is
 /// closed: an unknown key is a malformed tail, and a malformed tail
-/// is a legacy lock, never ours.
-const TRAILER_KEYS: [&str; 5] = ["pid", "host", "version", "started_at", "bin"];
+/// is a legacy lock, never ours. `cmd` is the binary basename only:
+/// a full argv could leak secrets (CAD-108), a basename cannot.
+const TRAILER_KEYS: [&str; 5] = ["pid", "host", "version", "started_at", "cmd"];
 
 /// Diagnostic trailer parsed from a `.write.lock` this build wrote.
 /// Every field is optional: markers from builds that predate trailers
@@ -85,7 +86,7 @@ pub struct MarkerMeta {
     pub host: Option<String>,
     pub version: Option<String>,
     pub started_at: Option<i64>,
-    pub bin: Option<String>,
+    pub cmd: Option<String>,
 }
 
 /// What `.write.lock` content means. `Ours` only for exact [`MARKER`]
@@ -143,7 +144,7 @@ fn parse_marker(content: &[u8]) -> MarkerClass {
                 Ok(n) => meta.started_at = Some(n),
                 Err(_) => return MarkerClass::Foreign,
             },
-            "bin" => meta.bin = Some(v.to_string()),
+            "cmd" => meta.cmd = Some(v.to_string()),
             _ => return MarkerClass::Foreign,
         }
     }
@@ -169,9 +170,7 @@ fn host_name() -> Option<String> {
     }
 }
 
-/// Basename of the running binary only: a full argv could leak secrets
-/// (CAD-108), a basename cannot.
-fn bin_name() -> Option<String> {
+fn cmd_name() -> Option<String> {
     let base = std::env::current_exe()
         .ok()?
         .file_name()?
@@ -199,16 +198,18 @@ fn marker_content() -> String {
     }
     line("version", env!("CARGO_PKG_VERSION"));
     line("started_at", &super::time::now_epoch().to_string());
-    if let Some(b) = bin_name() {
-        line("bin", &b);
+    if let Some(b) = cmd_name() {
+        line("cmd", &b);
     }
     out
 }
 
 /// A process holding a coordination file, found by scanning /proc.
 /// `comm` is the kernel's 15-byte process name, never argv: naming a
-/// holder must not leak secrets.
+/// holder must not leak secrets. Linux only: without /proc there is
+/// nothing to scan, so the type does not exist there either.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
 pub struct HolderInfo {
     pub pid: u32,
     pub comm: String,
@@ -220,9 +221,11 @@ pub struct HolderInfo {
 pub enum HolderScan {
     Unavailable,
     NoneFound,
+    #[cfg(target_os = "linux")]
     Found(Vec<HolderInfo>),
 }
 
+#[cfg(target_os = "linux")]
 fn sanitize_comm(c: &str) -> String {
     let c: String = c.chars().filter(|ch| !ch.is_control()).take(32).collect();
     if c.is_empty() {
@@ -287,6 +290,7 @@ fn scan_holders(_dev: u64, _ino: u64) -> HolderScan {
 /// or a positive statement that nobody does.
 fn describe_holder(scan: &HolderScan, meta: Option<&MarkerMeta>) -> String {
     let mut s = match scan {
+        #[cfg(target_os = "linux")]
         HolderScan::Found(hs) => {
             let who: Vec<String> = hs
                 .iter()
@@ -311,8 +315,8 @@ fn describe_holder(scan: &HolderScan, meta: Option<&MarkerMeta>) -> String {
         if let Some(t) = m.started_at {
             bits.push(format!("started_at={t}"));
         }
-        if let Some(b) = &m.bin {
-            bits.push(format!("bin={b}"));
+        if let Some(b) = &m.cmd {
+            bits.push(format!("cmd={b}"));
         }
         if !bits.is_empty() {
             s.push_str("; marker trailer ");
@@ -361,14 +365,20 @@ pub struct PmLock {
 
 /// Repo-relative path overlap, component-wise in both directions: a
 /// file under an admitted dir is admitted, and a dir over a blocked
-/// file is blocked.
+/// file is blocked. The empty scope is the tracker root: it overlaps
+/// everything, so a whole-tracker write is never "disjoint".
 fn paths_overlap(a: &str, b: &str) -> bool {
-    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+    a.is_empty()
+        || b.is_empty()
+        || a == b
+        || a.starts_with(&format!("{b}/"))
+        || b.starts_with(&format!("{a}/"))
 }
 
-/// True when `path` is `scope` itself or lives under it.
+/// True when `path` is `scope` itself or lives under it. The empty
+/// scope is the tracker root and contains every path.
 fn path_within(path: &str, scope: &str) -> bool {
-    path == scope || path.starts_with(&format!("{scope}/"))
+    scope.is_empty() || path == scope || path.starts_with(&format!("{scope}/"))
 }
 
 impl PmLock {

@@ -322,7 +322,16 @@ impl Pm {
     /// `paths` (absolute, or `pm.dir`-relative) as repo-relative
     /// strings, sorted and deduped. Shared by [`Self::commit`] and the
     /// scoped lock admission: one derivation, one caller-bug rule.
+    ///
+    /// A `..` component is a caller bug and refused: git resolves
+    /// `dir/../../other` to `other` at commit time, which would let a
+    /// scoped write pass the overlap check as one path and commit
+    /// another. `.` components and duplicate separators are normalized
+    /// away by reconstruction; the tracker root itself (`pm.dir`,
+    /// `.`) becomes the empty string, which the scope checks read as
+    /// the whole tracker.
     fn rel_paths(&self, paths: &[PathBuf]) -> Result<Vec<String>> {
+        use std::path::Component;
         let mut rel = Vec::with_capacity(paths.len());
         for p in paths {
             let abs = if p.is_absolute() {
@@ -337,7 +346,20 @@ impl Pm {
                     self.dir.display()
                 ))
             })?;
-            rel.push(r.to_string_lossy().into_owned());
+            let mut norm = PathBuf::new();
+            for c in r.components() {
+                match c {
+                    Component::ParentDir => {
+                        return Err(Error::internal(format!(
+                            "tracker write {} escapes the PM dir (.. is refused)",
+                            p.display()
+                        )));
+                    }
+                    Component::CurDir => {}
+                    _ => norm.push(c.as_os_str()),
+                }
+            }
+            rel.push(norm.to_string_lossy().into_owned());
         }
         rel.sort();
         rel.dedup();
