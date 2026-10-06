@@ -144,3 +144,129 @@ export function scopeHint(provider: ConnectionProvider): string[] {
   }
   return [...seen].sort();
 }
+
+/**
+ * CAD-1166 — mockup C "By service" grouping. One service group per
+ * provider that owns at least one visible thing: every registered
+ * provider, plus one group per unregistered provider name still on a
+ * connection (a stale provider that left the registry keeps its
+ * accounts visible under its own name — nothing is silently dropped
+ * or merged). The built-in `local` service reads "Local outbox".
+ *
+ * Group identity is the canonical provider name. The display label is
+ * presentation only — it is never used to merge accounts or as an
+ * authorization input.
+ */
+export interface ServiceGroup {
+  /** Canonical provider name — the group key, never the label. */
+  provider: string;
+  /** Presentation label for the service heading. */
+  label: string;
+  /** The registered provider row, when the group is a known service. */
+  info: ConnectionProvider | null;
+  /** True when every account is built-in and nothing can be enrolled. */
+  builtin: boolean;
+  /** This provider's connections, sorted by account for stability. */
+  connections: Connection[];
+}
+
+/** A friendly service label — presentation only, identity stays `provider`. */
+export function serviceLabel(provider: ConnectionProvider | null, providerName: string): string {
+  if (providerName === "local") return "Local outbox";
+  return provider?.provider ?? providerName;
+}
+
+/** The canonical sort: registered providers by name, the local/built-in service last. */
+export function serviceGroups(
+  providers: ConnectionProvider[],
+  connections: Connection[],
+): ServiceGroup[] {
+  const registered = new Map(providers.map((p) => [p.provider, p]));
+  const sorted = [...connections].sort(
+    (a, b) => a.account.localeCompare(b.account) || a.id.localeCompare(b.id),
+  );
+  const groups = new Map<string, ServiceGroup>();
+  const groupFor = (name: string): ServiceGroup => {
+    const known = groups.get(name);
+    if (known) return known;
+    const info = registered.get(name) ?? null;
+    const g: ServiceGroup = {
+      provider: name,
+      label: serviceLabel(info, name),
+      info,
+      builtin: false,
+      connections: [],
+    };
+    groups.set(name, g);
+    return g;
+  };
+  for (const row of sorted) groupFor(row.provider).connections.push(row);
+  // A registered provider with no accounts still gets a group so its
+  // setup/unsupported state is visible; a missing descriptor must not
+  // disappear the service.
+  for (const p of providers) groupFor(p.provider);
+  const out = [...groups.values()];
+  for (const g of out) {
+    g.builtin =
+      (g.info === null || enrollmentShapes(g.info).length === 0) &&
+      g.connections.length > 0 &&
+      g.connections.every((c) => c.kind === "builtin");
+  }
+  out.sort(
+    (a, b) =>
+      Number(a.provider === "local") - Number(b.provider === "local") ||
+      a.provider.localeCompare(b.provider),
+  );
+  return out;
+}
+
+/**
+ * The plain-language enrollment/testing support for one provider, or
+ * for a connection whose provider row may be missing. Nothing here
+ * invents support: an absent descriptor is "unavailable", an unknown
+ * shape is "unsupported".
+ */
+export function enrollmentSupport(provider: ConnectionProvider | null): {
+  /** Shapes the flow can actually offer, in stable order. */
+  shapes: string[];
+  /** Why nothing can be added, when `shapes` is empty. */
+  reason: string;
+} {
+  if (provider === null) {
+    return { shapes: [], reason: "This provider is not registered on this daemon." };
+  }
+  if (!provider.descriptor_available || provider.descriptor === null) {
+    return {
+      shapes: [],
+      reason: "This provider has no reviewed descriptor — enrollment is unavailable.",
+    };
+  }
+  const shapes = enrollmentShapes(provider);
+  if (shapes.length === 0) {
+    return {
+      shapes,
+      reason: "This provider declares no reviewed enrollment — there is nothing to set up.",
+    };
+  }
+  return { shapes, reason: "" };
+}
+
+/**
+ * Remote verification support (CAD-1166): honest, never simulated. No
+ * provider on this daemon offers a reviewed no-send verification
+ * operation through the approved broker yet — the owning teams (the
+ * CAD-1065 SMTP Verify contract and the CAD-1085 broker boundary)
+ * deliver it separately. Until then every provider reports unsupported
+ * and the page never shows a network-success result from the local
+ * metadata check. The reason names why for the disclosure.
+ */
+export function verificationSupport(_provider: ConnectionProvider | null): {
+  supported: boolean;
+  reason: string;
+} {
+  return {
+    supported: false,
+    reason:
+      "Remote login verification is not available on this daemon yet — no reviewed verification operation is offered for this service.",
+  };
+}

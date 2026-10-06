@@ -7,14 +7,21 @@ import {
   capabilityWords,
   connectionCapabilities,
   enrollmentShapes,
+  enrollmentSupport,
   isAvailable,
   pinWord,
   readinessText,
   scopeHint,
+  serviceGroups,
   smtpPortTlsError,
   smtpSummary,
+  verificationSupport,
 } from "../src/features/settings/connectionsView";
 import { connectionLabel, isLocalOutbox } from "../src/lib/connections";
+
+function assert(cond: unknown, msg: string): asserts cond {
+  if (!cond) throw new Error(`assert: ${msg}`);
+}
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -206,6 +213,62 @@ equal(smtpPortTlsError("localhost.", "587", "starttls"), null, "localhost traili
 equal(typeof smtpPortTlsError("localhost", "0", "implicit"), "string", "port 0 refused");
 equal(typeof smtpPortTlsError("localhost", "70000", "implicit"), "string", "port over 65535 refused");
 equal(typeof smtpPortTlsError("LOCALHOST", "40211", "implicit"), "string", "localhost is exact, not case-folded");
+
+// CAD-1166 service grouping: one group per provider, canonical identity
+// kept, built-ins last, unregistered providers never dropped or merged.
+{
+  const smtpP = provider({ provider: "smtp", descriptor: { ...provider().descriptor!, provider: "smtp", enrollment_shapes: ["smtp"] } });
+  const tokenP = provider({ provider: "agenticos_external", descriptor: { ...provider().descriptor!, provider: "agenticos_external", enrollment_shapes: ["token"] } });
+  const localP = provider();
+  const smtpConn = row({ id: "c-smtp", provider: "smtp", account: "news" });
+  const tokenConn = row({ id: "c-tok" });
+  const outbox = localRow();
+  const groups = serviceGroups([localP, tokenP, smtpP], [smtpConn, tokenConn, outbox]);
+  equal(
+    groups.map((g) => g.provider),
+    ["agenticos_external", "smtp", "local"],
+    "groups sort by provider, local last",
+  );
+  equal(groups[2].label, "Local outbox", "local service reads Local outbox");
+  equal(groups[2].builtin, true, "local group is built-in");
+  equal(groups[0].builtin, false, "enrollable group is not built-in");
+  equal(groups[0].connections.map((c) => c.id), ["c-tok"], "token account under its provider");
+  equal(groups[1].connections.map((c) => c.id), ["c-smtp"], "smtp account under its provider");
+
+  // A registered provider with no accounts still renders (setup state).
+  const empty = serviceGroups([tokenP], []);
+  equal(empty.length, 1, "empty provider still groups");
+  equal(empty[0].connections.length, 0, "empty provider has no accounts");
+
+  // A connection whose provider is not registered keeps its own group —
+  // it is never folded into the built-ins and never disappears.
+  const stale = serviceGroups([localP], [smtpConn, outbox]);
+  equal(
+    stale.map((g) => g.provider),
+    ["smtp", "local"],
+    "unregistered provider keeps its own group before local",
+  );
+  equal(stale[0].info, null, "unregistered group has no descriptor");
+  equal(stale[0].builtin, false, "an unregistered enrolled account is not labelled built-in");
+
+  // Empty groups of providers are suppressed only when nothing owns the name.
+  equal(serviceGroups([], []).length, 0, "no providers and no accounts: no groups");
+
+  // Enrollment support is read honestly from the descriptor.
+  equal(enrollmentSupport(tokenP).shapes, ["token"], "token provider offers token enrollment");
+  equal(enrollmentSupport(smtpP).shapes, ["smtp"], "smtp provider offers smtp enrollment");
+  equal(enrollmentSupport(localP).shapes, [], "local offers no enrollment");
+  assert(enrollmentSupport(localP).reason.length > 0, "no-enrollment reason is stated");
+  assert(enrollmentSupport(null).reason.length > 0, "unregistered names a reason");
+
+  // Remote verification is never simulated: every provider reports
+  // unsupported with an honest reason until the reviewed broker
+  // operation exists.
+  equal(verificationSupport(smtpP).supported, false, "smtp has no remote verify op yet");
+  equal(verificationSupport(tokenP).supported, false, "token provider unsupported");
+  equal(verificationSupport(null).supported, false, "unknown provider unsupported");
+  assert(verificationSupport(smtpP).reason.length > 0, "unsupported names why");
+}
 
 // The Settings Connections route survives refresh and paste.
 equal(matchRoute("/settings/connections"), { screen: "settings", section: "connections" }, "match connections");

@@ -4,7 +4,7 @@ import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import type { Connection, ConnectionProvider } from "../../lib/types";
 import Button from "../../ui/Button";
-import { ResourceGate } from "../../ui/ResourceStatus";
+import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconRefresh } from "../../ui/icons";
 import {
   acceptsSmtp,
@@ -12,16 +12,19 @@ import {
   canManage,
   capabilityWords,
   connectionCapabilities,
-  enrollmentShapes,
+  enrollmentSupport,
   isAvailable,
   pinWord,
   readinessText,
   scopeHint,
+  serviceGroups,
   smtpPortTlsError,
   smtpSummary,
   isSmtpSender,
   smtpUnreadable,
   smtpErrorMessage,
+  verificationSupport,
+  type ServiceGroup,
 } from "./connectionsView";
 import { connectionLabel } from "../../lib/connections";
 
@@ -76,10 +79,12 @@ function enrollErrorMessage(e: unknown): string {
 }
 
 /**
- * Settings → Connections (CAD-585): the operator's view of exact
- * provider accounts — the reviewed providers, the always-present Local
- * outbox, enrolled credentials and their local configuration check,
- * rotation and revocation.
+ * Settings → Connections (CAD-1166, selected mockup C "By service"):
+ * the operator's view grouped by the actual registered providers —
+ * service headings, the provider's account rows inside each group and
+ * a contextual Set-up action per group. Built-ins (the Local outbox and
+ * any connection whose provider left the registry) render in their own
+ * group, always visible and never editable.
  *
  * Reads and writes go through the existing strict HTTP APIs
  * (`/api/connection-providers`, `/api/connections…`), operator-only
@@ -87,6 +92,13 @@ function enrollErrorMessage(e: unknown): string {
  * form state of the create/rotate request that carries it — it is
  * cleared the moment the request settles and is never stored, logged
  * or rendered.
+ *
+ * Honesty: remote login verification is not offered on this daemon —
+ * no provider supplies a reviewed no-send check through the approved
+ * broker yet (CAD-1065/CAD-1085 own that contract). The page says so
+ * explicitly and never labels the local `connection_check` metadata
+ * read as a remote test. A provider-resource failure does not blank an
+ * already-loaded account list.
  */
 export default function Connections({
   viewer,
@@ -104,7 +116,8 @@ export default function Connections({
     if (providersRes) void providersRes.revalidate();
   }, [providersRes]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [adding, setAdding] = useState(false);
+  // `adding` is the provider name to pre-select, or "" for the pick list.
+  const [adding, setAdding] = useState<string | null>(null);
   const canWrite = viewer.operator && !viewer.readOnly;
   const rows = listState?.data ?? [];
   const providers = providersState?.data ?? [];
@@ -113,6 +126,8 @@ export default function Connections({
     if (listRes) void listRes.revalidate();
     if (providersRes) void providersRes.revalidate();
   };
+  const groups = serviceGroups(providers, rows);
+  const addProviders = providers.filter((p) => p.provider !== "local");
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connections-title">
@@ -122,12 +137,15 @@ export default function Connections({
             Connections
           </h1>
           <p className="text-label text-ink-400 mt-1 break-words">
-            Exact provider accounts in this workspace. Creating or selecting a connection grants
-            no worker, app or run permissions.
+            The accounts your apps use, grouped by service. Connect, check and disconnect —
+            a connection grants no worker, app or run permissions, and a check never sends,
+            publishes or delivers anything.
           </p>
         </div>
         {viewer.operator && (
-          <div className="flex flex-wrap gap-2 shrink-0">
+          <div className="flex flex-wrap gap-2 shrink-0 items-center">
+            <StaleChip state={listState ?? { data: null, status: "loading", error: null, asOf: null, inFlight: false }} />
+            <StaleChip state={providersState ?? { data: null, status: "loading", error: null, asOf: null, inFlight: false }} />
             <Button
               variant="ghost"
               icon={<IconRefresh />}
@@ -137,7 +155,11 @@ export default function Connections({
               Refresh
             </Button>
             {canWrite && (
-              <Button variant="primary" onClick={() => setAdding(true)} disabled={adding}>
+              <Button
+                variant="primary"
+                onClick={() => setAdding("")}
+                disabled={adding !== null}
+              >
                 Add connection
               </Button>
             )}
@@ -157,6 +179,8 @@ export default function Connections({
         </div>
       ) : (
         <>
+          {/* Each resource keeps its own gate: a provider-list failure
+             must not blank an account list that already loaded. */}
           <ResourceGate
             state={
               listState ?? { data: null, status: "loading", error: null, asOf: null, inFlight: false }
@@ -165,65 +189,60 @@ export default function Connections({
             failed="could not load connections"
             onRetry={refresh}
           />
-          {listState?.data && providersState?.data && (
+          <ResourceGate
+            state={
+              providersState ?? { data: null, status: "loading", error: null, asOf: null, inFlight: false }
+            }
+            loading="loading services…"
+            failed="could not load the registered services"
+            onRetry={refresh}
+          />
+          {listState?.data && (
             <div className="space-y-3 min-w-0">
-              {adding && (
+              {adding !== null && (
                 <AddConnection
-                  providers={providers}
+                  providers={addProviders}
                   existing={rows}
-                  onClose={() => setAdding(false)}
+                  preset={adding === "" ? null : adding}
+                  onClose={() => setAdding(null)}
                   onAdded={(id) => {
-                    setAdding(false);
+                    setAdding(null);
                     setSelected(id);
                     refresh();
                   }}
                 />
               )}
-              <section className="card px-4 py-3.5 min-w-0" aria-label="connections">
-                <h2 className="slabel mb-2">Connections</h2>
-                {rows.length === 0 ? (
-                  <p className="text-label text-ink-500">No connections.</p>
-                ) : (
-                  <ul className="space-y-1.5">
-                    {rows.map((row) => (
-                      <li key={row.id}>
-                        <button
-                          type="button"
-                          onClick={() => setSelected((cur) => (cur === row.id ? null : row.id))}
-                          aria-pressed={selected === row.id}
-                          aria-label={`${connectionLabel(row)} — ${readinessText(row)}`}
-                          className={`w-full text-left px-3 py-2 rounded border min-w-0 ${
-                            selected === row.id
-                              ? "border-accent/60 bg-accent/10"
-                              : "border-ink-700 bg-ink-850 hover:border-edge-hover"
-                          }`}
-                        >
-                          <span className="flex flex-wrap items-center gap-2 min-w-0">
-                            <span className="text-label font-medium text-ink-100 min-w-0 break-words flex-1">
-                              {connectionLabel(row)}
-                            </span>
-                            <span
-                              className={`chip ${row.kind === "builtin" ? "bg-ink-800 text-ink-300" : "bg-accent/15 text-accent"}`}
-                            >
-                              {row.kind === "builtin" ? "built-in" : "enrolled"}
-                            </span>
-                            {!isAvailable(row) && (
-                              <span className="chip bg-warn/10 text-warn">unavailable</span>
-                            )}
-                          </span>
-                          <span className="block text-micro text-ink-500 mt-0.5 break-words">
-                            {readinessText(row)}
-                          </span>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </section>
+              {!providersState?.data && (
+                <p className="text-label text-ink-500 break-words" role="note">
+                  The service list is unavailable — accounts still show below under their
+                  recorded provider.
+                </p>
+              )}
+              {groups.length === 0 ? (
+                <section className="card px-4 py-3.5 min-w-0" aria-label="connections">
+                  <p className="text-label text-ink-500">
+                    No services are registered and no accounts are connected.
+                  </p>
+                </section>
+              ) : (
+                groups.map((group) => (
+                  <ServiceSection
+                    key={group.provider}
+                    group={group}
+                    canWrite={canWrite}
+                    selected={selected}
+                    onSelect={(id) =>
+                      setSelected((cur) => (cur === id ? null : id))
+                    }
+                    onSetup={() => canWrite && setAdding(group.provider)}
+                  />
+                ))
+              )}
               {current && (
                 <ConnectionDetail
                   key={current.id}
                   row={current}
+                  provider={providers.find((p) => p.provider === current.provider) ?? null}
                   capabilities={connectionCapabilities(providers, current.provider)}
                   canWrite={canWrite}
                   onChanged={refresh}
@@ -233,39 +252,6 @@ export default function Connections({
                   }}
                 />
               )}
-              <section className="card px-4 py-3.5 min-w-0" aria-label="providers">
-                <h2 className="slabel mb-2">Providers</h2>
-                {providers.length === 0 ? (
-                  <p className="text-label text-ink-500">No providers registered.</p>
-                ) : (
-                  <ul className="space-y-2">
-                    {providers.map((p) => (
-                      <li key={p.provider} className="text-label min-w-0">
-                        <span className="text-ink-100 font-medium">{p.provider}</span>
-                        <span className="text-ink-500">
-                          {" — "}
-                          {!p.descriptor_available
-                            ? "no reviewed descriptor — unavailable"
-                            : (capabilityWords(p) ?? "no reviewed capabilities")}
-                          {p.descriptor_available &&
-                            ` · ${enrollmentText(p)}`}
-                        </span>
-                        <span className="block text-micro text-ink-500 mt-0.5 break-words">
-                          {pinWord({ manifest_status: p.manifest_status })} ·{" "}
-                          {p.network_checked
-                            ? "network checked"
-                            : "never checked over the network"}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                <p className="text-micro text-ink-500 mt-3 break-words">
-                  A declaration is not proof that the deployed service holds the reviewed
-                  contract. Capability names describe compatible purposes; each provider keeps
-                  its exact reviewed tools, scopes and effect classification.
-                </p>
-              </section>
             </div>
           )}
         </>
@@ -274,15 +260,120 @@ export default function Connections({
   );
 }
 
+/**
+ * One service group: the provider heading, its account rows and the
+ * contextual setup action (or the explicit unsupported state when this
+ * service declares no reviewed enrollment).
+ */
+function ServiceSection({
+  group,
+  canWrite,
+  selected,
+  onSelect,
+  onSetup,
+}: {
+  group: ServiceGroup;
+  canWrite: boolean;
+  selected: string | null;
+  onSelect: (id: string) => void;
+  onSetup: () => void;
+}) {
+  const support = enrollmentSupport(group.info);
+  return (
+    <section
+      className="card px-4 py-3.5 min-w-0"
+      aria-label={`${group.label} connections`}
+    >
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-2">
+        <h2 className="slabel">{group.label}</h2>
+        <span className="text-micro text-ink-500">
+          {group.connections.length === 0
+            ? "nothing connected"
+            : `${group.connections.length} connected`}
+        </span>
+        {!group.builtin && canWrite && support.shapes.length > 0 && (
+          <Button variant="ghost" size="sm" className="ml-auto" onClick={onSetup}>
+            Set up {group.label}
+          </Button>
+        )}
+      </div>
+      {group.info && capabilityWords(group.info) && (
+        <p className="text-micro text-ink-500 mb-2 break-words">
+          {capabilityWords(group.info)}
+        </p>
+      )}
+      {group.connections.length === 0 ? (
+        <p className="text-label text-ink-500 break-words">
+          {group.builtin
+            ? "No built-in accounts."
+            : support.shapes.length === 0
+              ? support.reason
+              : `No ${group.label} account connected yet.`}
+        </p>
+      ) : (
+        <ul className="space-y-1.5">
+          {group.connections.map((row) => (
+            <li key={row.id}>
+              <button
+                type="button"
+                onClick={() => onSelect(row.id)}
+                aria-pressed={selected === row.id}
+                aria-label={`${connectionLabel(row)} — ${readinessText(row)}`}
+                className={`w-full text-left px-3 py-2 rounded border min-w-0 ${
+                  selected === row.id
+                    ? "border-accent/60 bg-accent/10"
+                    : "border-ink-700 bg-ink-850 hover:border-edge-hover"
+                }`}
+              >
+                <span className="flex flex-wrap items-center gap-2 min-w-0">
+                  <span className="text-label font-medium text-ink-100 min-w-0 break-words flex-1">
+                    {connectionLabel(row)}
+                  </span>
+                  <span
+                    className={`chip ${row.kind === "builtin" ? "bg-ink-800 text-ink-300" : "bg-accent/15 text-accent"}`}
+                  >
+                    {row.kind === "builtin" ? "built-in" : "enrolled"}
+                  </span>
+                  {!isAvailable(row) && row.kind !== "builtin" && (
+                    <span className="chip bg-warn/10 text-warn">unavailable</span>
+                  )}
+                </span>
+                <span className="block text-micro text-ink-500 mt-0.5 break-words">
+                  {readinessText(row)}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {group.builtin && (
+        <p className="text-micro text-ink-500 mt-2 break-words">
+          Built-in accounts are always present — they carry no credential and cannot be
+          edited or disconnected here.
+        </p>
+      )}
+      {!group.builtin && !group.info && (
+        <p className="text-micro text-ink-500 mt-2 break-words">
+          This provider is not in the registered service list — the account is kept under
+          its recorded name and may be stale.
+        </p>
+      )}
+    </section>
+  );
+}
+
 /** One connection's detail: metadata, local check, rotate and revoke. */
 export function ConnectionDetail({
   row,
+  provider,
   capabilities,
   canWrite,
   onChanged,
   onRevoked,
 }: {
   row: Connection;
+  /** The registered provider row, when the service list knows it. */
+  provider?: ConnectionProvider | null;
   capabilities: string | null;
   canWrite: boolean;
   onChanged: () => void;
@@ -293,6 +384,7 @@ export function ConnectionDetail({
   const [checking, setChecking] = useState(false);
   const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
   const managed = canManage(row);
+  const verify = verificationSupport(provider ?? null);
 
   const check = () => {
     if (checking) return;
@@ -307,7 +399,14 @@ export function ConnectionDetail({
         });
         onChanged();
       })
-      .catch((e: ApiError) => setNote({ ok: false, text: e.message ?? String(e) }))
+      .catch((e: ApiError) =>
+        setNote({
+          ok: false,
+          text:
+            "The local configuration could not be read — treat this as a configuration problem, not a connection that works. " +
+            (e.message ?? String(e)),
+        }),
+      )
       .finally(() => setChecking(false));
   };
 
@@ -317,30 +416,12 @@ export function ConnectionDetail({
         {connectionLabel(row)}
       </h2>
       <dl className="mt-2 space-y-1 text-label min-w-0">
-        <div className="flex flex-wrap gap-x-2 min-w-0">
-          <dt className="text-ink-500">ID</dt>
-          <dd className="num text-ink-200 break-all">{row.id}</dd>
-        </div>
         <div className="flex flex-wrap gap-x-2">
           <dt className="text-ink-500">Account</dt>
           <dd className="text-ink-200 break-words">
             {row.provider} · {row.account}
           </dd>
         </div>
-        <div className="flex flex-wrap gap-x-2">
-          <dt className="text-ink-500">Credential</dt>
-          <dd className="text-ink-200">
-            {row.kind === "builtin"
-              ? "none — built-in"
-              : `revision ${row.revision ?? "?"}`}
-          </dd>
-        </div>
-        {row.scopes.length > 0 && (
-          <div className="flex flex-wrap gap-x-2 min-w-0">
-            <dt className="text-ink-500">Scopes</dt>
-            <dd className="num text-ink-200 break-words">{row.scopes.join(", ")}</dd>
-          </div>
-        )}
         {smtpSummary(row) && (
           <div className="flex flex-wrap gap-x-2 min-w-0">
             <dt className="text-ink-500">Sender</dt>
@@ -366,6 +447,69 @@ export function ConnectionDetail({
           <dd className="text-ink-200 break-words">{pinWord(row.status)}</dd>
         </div>
       </dl>
+
+      {/* CAD-1166: technical identity, revisions, scopes, pins and
+         registration metadata live behind a disclosure — the friendly
+         view above never changes which account this row authoritatively
+         is. */}
+      <details className="mt-2 text-label min-w-0">
+        <summary className="cursor-pointer select-none text-ink-400">
+          Technical details
+        </summary>
+        <dl className="mt-2 space-y-1 min-w-0">
+          <div className="flex flex-wrap gap-x-2 min-w-0">
+            <dt className="text-ink-500">Connection ID</dt>
+            <dd className="num text-ink-200 break-all">{row.id}</dd>
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            <dt className="text-ink-500">Credential</dt>
+            <dd className="text-ink-200">
+              {row.kind === "builtin"
+                ? "none — built-in"
+                : `revision ${row.revision ?? "?"}`}
+            </dd>
+          </div>
+          {row.scopes.length > 0 && (
+            <div className="flex flex-wrap gap-x-2 min-w-0">
+              <dt className="text-ink-500">Scopes</dt>
+              <dd className="num text-ink-200 break-words">{row.scopes.join(", ")}</dd>
+            </div>
+          )}
+          {row.registration_digest && (
+            <div className="flex flex-wrap gap-x-2 min-w-0">
+              <dt className="text-ink-500">Registration</dt>
+              <dd className="num text-ink-200 break-all">{row.registration_digest}</dd>
+            </div>
+          )}
+          {row.status.reviewed_pin && (
+            <div className="flex flex-wrap gap-x-2 min-w-0">
+              <dt className="text-ink-500">Reviewed pin</dt>
+              <dd className="num text-ink-200 break-all">{row.status.reviewed_pin}</dd>
+            </div>
+          )}
+          {row.status.reported_pin && (
+            <div className="flex flex-wrap gap-x-2 min-w-0">
+              <dt className="text-ink-500">Reported pin</dt>
+              <dd className="num text-ink-200 break-all">{row.status.reported_pin}</dd>
+            </div>
+          )}
+          <div className="flex flex-wrap gap-x-2 min-w-0">
+            <dt className="text-ink-500">Remote verification</dt>
+            <dd className="text-ink-200 break-words">
+              {verify.supported
+                ? "available"
+                : `unsupported — ${verify.reason}`}
+            </dd>
+          </div>
+          <p className="text-micro text-ink-500 pt-1 break-words">
+            The network was {row.status.network_checked ? "checked" : "never checked"} for
+            this account. A local configuration read or a login check verifies only the
+            named identity — it grants no execution permission and proves no message
+            delivery or sender entitlement.
+          </p>
+        </dl>
+      </details>
+
       {note && (
         <p className={`text-label mt-2 break-words ${note.ok ? "text-ink-300" : "text-fail"}`} role={note.ok ? "status" : "alert"}>
           {note.text}
@@ -386,7 +530,7 @@ export function ConnectionDetail({
                   setRotating((v) => !v);
                 }}
               >
-                Rotate…
+                Update credentials…
               </Button>
               <Button
                 variant="danger"
@@ -396,7 +540,7 @@ export function ConnectionDetail({
                   setRevoking((v) => !v);
                 }}
               >
-                Revoke…
+                Disconnect…
               </Button>
             </>
           )}
@@ -404,7 +548,8 @@ export function ConnectionDetail({
       )}
       {!canWrite && managed && (
         <p className="text-micro text-ink-500 mt-2">
-          Rotation and revocation are the operator&apos;s on an editable board.
+          Updating credentials and disconnecting are the operator&apos;s on an editable
+          board.
         </p>
       )}
       {managed && rotating && (
@@ -415,21 +560,12 @@ export function ConnectionDetail({
       )}
       {!managed && (
         <p className="text-micro text-ink-500 mt-2 break-words">
-          Built-in connections are always present — they cannot be rotated or revoked through
-          credential management.
+          Built-in connections are always present — they carry no credential and cannot be
+          edited or disconnected through credential management.
         </p>
       )}
     </section>
   );
-}
-
-/** Plain words for one provider's reviewed enrollment shapes. */
-function enrollmentText(p: ConnectionProvider): string {
-  const shapes = enrollmentShapes(p);
-  if (shapes.length === 0) return "no enrollment";
-  return shapes
-    .map((s) => (s === "smtp" ? "SMTP sender enrollment" : "token enrollment"))
-    .join(" + ");
 }
 
 /** Replace an enrolled credential. The token clears the moment the request settles. */
@@ -706,7 +842,7 @@ export function RotateForm({
   );
 }
 
-/** Revoke with an explicit confirmation — nothing happens on the first click. */
+/** Disconnect with an explicit confirmation — nothing happens on the first click. */
 function RevokeConfirm({
   row,
   onDone,
@@ -732,11 +868,11 @@ function RevokeConfirm({
   };
 
   return (
-    <div className="mt-3 space-y-2 border-t border-ink-700 pt-3" aria-label={`revoke ${connectionLabel(row)}`}>
+    <div className="mt-3 space-y-2 border-t border-ink-700 pt-3" aria-label={`disconnect ${connectionLabel(row)}`}>
       <p className="text-label text-ink-200 break-words">
-        Revoking removes this connection&apos;s grants and defaults and closes its pending
-        effects. This cannot be undone — re-enrolling the same account creates a new
-        connection.
+        Disconnecting removes this connection&apos;s grants and its bindings and defaults,
+        and closes its pending effects. This cannot be undone — re-enrolling the same
+        account creates a new connection.
       </p>
       <label className="flex items-start gap-2 text-label text-ink-300">
         <input
@@ -747,8 +883,8 @@ function RevokeConfirm({
           className="mt-0.5"
         />
         <span>
-          I understand revoking {connectionLabel(row)} removes its grants and closes pending
-          effects.
+          I understand disconnecting {connectionLabel(row)} removes its grants and bindings
+          and closes pending effects.
         </span>
       </label>
       {error && (
@@ -758,7 +894,7 @@ function RevokeConfirm({
       )}
       <div className="flex flex-wrap gap-2">
         <Button variant="danger" size="sm" onClick={submit} loading={busy} disabled={!armed}>
-          {busy ? "Revoking…" : "Revoke connection"}
+          {busy ? "Disconnecting…" : "Disconnect"}
         </Button>
         <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
           Cancel
@@ -768,15 +904,26 @@ function RevokeConfirm({
   );
 }
 
-/** Enroll a scoped token for a supported provider. The token clears on settle. */
+/**
+ * Enroll a scoped token or an SMTP sender for a supported provider. The
+ * secret clears on settle, and switching provider or cancelling resets
+ * the secret, the draft fields and the storage-risk consent — nothing
+ * secret survives a method change or a close.
+ *
+ * `preset` is the canonical provider name to open on (a service group's
+ * "Set up" action); `null` opens the pick list.
+ */
 export function AddConnection({
   providers,
   existing,
+  preset,
   onClose,
   onAdded,
 }: {
   providers: ConnectionProvider[];
   existing: Connection[];
+  /** The canonical provider name a service group's Set-up action opens on. */
+  preset?: string | null;
   onClose: () => void;
   onAdded: (id: string) => void;
 }) {
@@ -788,9 +935,14 @@ export function AddConnection({
     (p) => p.descriptor_available && (acceptsToken(p) || acceptsSmtp(p)),
   );
   // The providers load behind the resource: the selection follows the
-  // first candidate until the operator picks one explicitly.
-  const [explicit, setExplicit] = useState<string | null>(null);
-  const provider = explicit ?? candidates[0]?.provider ?? "";
+  // group preset or the first candidate until the operator picks one
+  // explicitly. Changing the provider resets the secret, the draft and
+  // the consent — state never carries across a method change.
+  const [explicit, setExplicit] = useState<string | null>(preset ?? null);
+  const provider =
+    explicit !== null && candidates.some((c) => c.provider === explicit)
+      ? explicit
+      : candidates[0]?.provider ?? "";
   const [account, setAccount] = useState("");
   const [scopes, setScopes] = useState("");
   const [token, setToken] = useState("");
@@ -804,6 +956,17 @@ export function AddConnection({
   // opaque token; the shape follows the chosen provider.
   const smtpShape = (chosen && acceptsSmtp(chosen) && !acceptsToken(chosen)) || false;
   const [smtp, setSmtp] = useState({ host: "", port: "465", tls_mode: "implicit", username: "", sender: "", sender_name: "" });
+
+  const chooseProvider = (next: string) => {
+    setExplicit(next);
+    setToken("");
+    setScopes("");
+    setAccount("");
+    setAcceptRisk(false);
+    setRiskNeeded(false);
+    setError(null);
+    setSmtp({ host: "", port: "465", tls_mode: "implicit", username: "", sender: "", sender_name: "" });
+  };
 
   const submit = () => {
     if (busy) return;
@@ -911,7 +1074,9 @@ export function AddConnection({
 
   return (
     <section className="card px-4 py-3.5 min-w-0" aria-label="add connection">
-      <h2 className="text-cardtitle font-medium text-ink-100">Add connection</h2>
+      <h2 className="text-cardtitle font-medium text-ink-100">
+        {chosen ? `Set up ${chosen.provider}` : "Add connection"}
+      </h2>
       {candidates.length === 0 ? (
         <p className="text-label text-ink-400 mt-2 break-words">
           No provider currently offers enrollment. {existing.length > 0 && (
@@ -928,12 +1093,12 @@ export function AddConnection({
         >
           <div>
             <label htmlFor={providerId} className="text-label font-medium text-ink-200">
-              Provider
+              Service
             </label>
             <select
               id={providerId}
               value={provider}
-              onChange={(e) => setExplicit(e.target.value)}
+              onChange={(e) => chooseProvider(e.target.value)}
               className="field w-full mt-1"
               disabled={busy}
             >
