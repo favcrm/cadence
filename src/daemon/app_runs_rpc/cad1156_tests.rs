@@ -66,6 +66,10 @@ impl Fx {
             Shared::new(dir.path(), &opts),
             "Shared initialization failed",
         );
+        assert!(
+            shared.platform_custody.tag() == crate::platform::custody::FILE_TAG,
+            "SETUP/ISOLATION: SMTP fixture requires private FILE custody before custody operations"
+        );
         let cwd = dir.path().to_str().unwrap();
         // Explicitly SIMULATED managed identities consistent with the g1
         // tokens below. set_identity records fixture state only; no launch.
