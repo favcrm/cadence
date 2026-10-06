@@ -24,6 +24,7 @@ struct CloneArgs {
 pub(super) struct Process {
     pid: u32,
     pidfd: File,
+    reaped: std::cell::Cell<bool>,
     pub stdin: Option<File>,
     pub stdout: Option<File>,
     pub stderr: Option<File>,
@@ -35,15 +36,10 @@ fn pipe() -> Result<(File, File)> {
     }
     Ok(unsafe { (File::from_raw_fd(p[0]), File::from_raw_fd(p[1])) })
 }
-fn wait(pid: u32, deadline: Deadline, event: i32) -> Result<()> {
+fn wait(process: &Process, deadline: Deadline, event: i32) -> Result<()> {
     loop {
         deadline.check()?;
-        let mut st = 0;
-        let n = unsafe { libc::waitpid(pid as i32, &mut st, libc::WNOHANG | libc::__WALL) };
-        if n < 0 {
-            return Err(refused());
-        }
-        if n > 0 {
+        if let Some(st) = process.wait_status()? {
             if !libc::WIFSTOPPED(st)
                 || libc::WSTOPSIG(st)
                     != if event == 0 {
@@ -163,6 +159,7 @@ impl Process {
         let mut process = Self {
             pid: pid as u32,
             pidfd: unsafe { File::from_raw_fd(pidfd) },
+            reaped: std::cell::Cell::new(false),
             stdin: None,
             stdout: None,
             stderr: None,
@@ -172,7 +169,7 @@ impl Process {
         process.stdin = Some(ends.remove(1));
         drop(ends);
         drop(held);
-        wait(process.pid, deadline, 0)?;
+        wait(&process, deadline, 0)?;
         if unsafe {
             libc::ptrace(
                 libc::PTRACE_SETOPTIONS,
@@ -185,7 +182,7 @@ impl Process {
             return Err(refused());
         }
         process.release()?;
-        wait(process.pid, deadline, libc::PTRACE_EVENT_EXEC)?;
+        wait(&process, deadline, libc::PTRACE_EVENT_EXEC)?;
         artifact.live_correspondence(process.pid, deadline)?;
         Ok(process) // Remains stopped before helper's first instruction.
     }
@@ -201,6 +198,26 @@ impl Process {
         }
         Ok(())
     }
+    /// Only the actual kernel wait on this own-created child records a reap.
+    /// No caller-provided status/boolean and no wait after numerical PID reuse.
+    pub(super) fn wait_status(&self) -> Result<Option<i32>> {
+        if self.reaped.get() {
+            return Err(refused());
+        }
+        let mut status = 0;
+        let rc =
+            unsafe { libc::waitpid(self.pid as i32, &mut status, libc::WNOHANG | libc::__WALL) };
+        if rc < 0 {
+            return Err(refused());
+        }
+        if rc == 0 {
+            return Ok(None);
+        }
+        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            self.reaped.set(true);
+        }
+        Ok(Some(status))
+    }
     pub(super) fn kill(&self) {
         unsafe {
             libc::syscall(
@@ -215,14 +232,16 @@ impl Process {
 }
 impl Drop for Process {
     fn drop(&mut self) {
+        if self.reaped.get() {
+            return;
+        }
         self.kill();
         let until = Instant::now() + Duration::from_secs(2);
         while Instant::now() < until {
-            let mut st = 0;
-            let n =
-                unsafe { libc::waitpid(self.pid as i32, &mut st, libc::WNOHANG | libc::__WALL) };
-            if n < 0 || (n > 0 && (libc::WIFEXITED(st) || libc::WIFSIGNALED(st))) {
-                break;
+            match self.wait_status() {
+                Err(_) => break,
+                Ok(Some(st)) if libc::WIFEXITED(st) || libc::WIFSIGNALED(st) => break,
+                _ => {}
             }
             std::thread::sleep(Duration::from_millis(1));
         }

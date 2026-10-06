@@ -3,6 +3,7 @@
 use super::super::{files, refused, Deadline, Result};
 use super::helper_process::Process;
 use super::{custody, lifecycle};
+use crate::adapter::pi_guest::authority::Selection;
 use crate::adapter::pi_guest::owner::LaunchPermit;
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -24,10 +25,35 @@ pub(crate) struct HelperStdio {
 struct RetiredFamily {
     _pidfd: File,
 }
+/// Borrowed actual family-exit custody, never a boolean/PID/serialized factory.
+/// The borrow retains the own-created helper, namespace FDs and parent reap.
+pub(crate) struct RetiredPiFamily<'a> {
+    helper: &'a OwnedHelper,
+}
+impl RetiredPiFamily<'_> {
+    pub(crate) fn require(
+        &self,
+        expected: &Selection,
+        original_operation: &str,
+        until: Instant,
+    ) -> Result<()> {
+        lifecycle::runtime_proof(until)?.recheck(until)?;
+        if expected != &self.helper.selection
+            || original_operation != self.helper.operation
+            || self.helper.retired.get().is_none()
+            || !self.helper.exited(until)?
+        {
+            return Err(refused());
+        }
+        lifecycle::runtime_proof(until)?.recheck(until)
+    }
+}
 pub(crate) struct OwnedHelper {
     child: Process,
     pidfd: File,
     birth: u64,
+    selection: Selection,
+    operation: String,
     artifact: files::HeldArtifact,
     guest: u32,
     guest_gid: u32,
@@ -105,6 +131,8 @@ impl OwnedHelper {
                     child,
                     pidfd,
                     birth,
+                    selection: selected.selection.clone(),
+                    operation: selected.operation.clone(),
                     artifact,
                     guest: selected.guest,
                     guest_gid: selected.guest_gid,
@@ -123,13 +151,14 @@ impl OwnedHelper {
                 child.kill();
                 let until = Instant::now() + Duration::from_secs(2);
                 while Instant::now() < until {
-                    let mut status = 0;
-                    let rc = unsafe {
-                        libc::waitpid(child.id() as i32, &mut status, libc::WNOHANG | libc::__WALL)
-                    };
-                    if rc < 0 || (rc > 0 && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)))
-                    {
-                        break;
+                    match child.wait_status() {
+                        Err(_) => break,
+                        Ok(Some(status))
+                            if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) =>
+                        {
+                            break;
+                        }
+                        _ => {}
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -145,21 +174,10 @@ impl OwnedHelper {
         permit.recheck()?;
         loop {
             deadline.check()?;
-            let mut status = 0;
-            let rc = unsafe {
-                libc::waitpid(
-                    self.child.id() as i32,
-                    &mut status,
-                    libc::WNOHANG | libc::__WALL,
-                )
-            };
-            if rc < 0 {
-                return Err(refused());
-            }
-            if rc == 0 {
+            let Some(status) = self.child.wait_status()? else {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
-            }
+            };
             if !libc::WIFSTOPPED(status)
                 || libc::WSTOPSIG(status) != libc::SIGTRAP
                 || (status >> 16) != libc::PTRACE_EVENT_EXEC
@@ -405,24 +423,30 @@ impl OwnedHelper {
         if n < 0 {
             return Err(refused());
         }
+        if self.retired.get().is_some() {
+            // Reuse ONLY our recorded successful parent reap and original
+            // pidfd. Never wait again on a now-reusable numerical PID.
+            if n == 0 || ready.revents & libc::POLLIN == 0 {
+                return Err(refused());
+            }
+            lifecycle::runtime_proof(until)?.recheck(until)?;
+            return Ok(true);
+        }
         if n == 0 {
             if crate::peer::proc_starttime(self.child.id()) != Some(self.birth) {
                 return Err(refused());
             }
             self.node_current()?;
         }
-        let mut status = 0;
-        let rc = unsafe {
-            libc::waitpid(
-                self.child.id() as i32,
-                &mut status,
-                libc::WNOHANG | libc::__WALL,
-            )
-        };
-        if rc > 0 {
+        if let Some(status) = self.child.wait_status()? {
             if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
                 lifecycle::runtime_proof(until)?.recheck(until)?;
-                return Ok(true); // actual retained-child kernel exit only
+                self.retired
+                    .set(RetiredFamily {
+                        _pidfd: self.pidfd.try_clone().map_err(|_| refused())?,
+                    })
+                    .map_err(|_| refused())?;
+                return Ok(true); // successful own-created namespace-init reap
             }
             // SEIZE keeps normal POSIX signal-delivery stops, including tool
             // SIGCHLD and owned SIGINT. Never suppress them or leave Node stuck.
@@ -447,13 +471,14 @@ impl OwnedHelper {
                 return Err(refused());
             }
         }
-        if rc < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ECHILD) {
-            return Err(refused());
-        }
         lifecycle::runtime_proof(until)?.recheck(until)?;
-        Ok(n > 0 && ready.revents & libc::POLLIN != 0)
+        Ok(false) // pidfd readiness/ECHILD alone does not establish parent reap.
     }
     pub(crate) fn retire(&self, until: Instant) -> Result<()> {
+        self.retire_family(until)?
+            .require(&self.selection, &self.operation, until)
+    }
+    pub(crate) fn retire_family(&self, until: Instant) -> Result<super::RetiredPiFamily<'_>> {
         let until = until.min(Instant::now() + Duration::from_secs(10));
         // This ACTUAL owned task is namespace init. Its kernel exit/reap is
         // ordered after namespace descendant kill+reap, not a guessed PGID/list.
@@ -466,14 +491,9 @@ impl OwnedHelper {
             std::thread::sleep(Duration::from_millis(1));
         }
         lifecycle::runtime_proof(until)?.recheck(until)?;
-        if self.retired.get().is_none() {
-            self.retired
-                .set(RetiredFamily {
-                    _pidfd: self.pidfd.try_clone().map_err(|_| refused())?,
-                })
-                .map_err(|_| refused())?;
-        }
-        Ok(()) // physical result ONLY; not external durable retirement
+        let proof = RetiredPiFamily { helper: self };
+        proof.require(&self.selection, &self.operation, until)?;
+        Ok(proof) // physical result ONLY; not external durable retirement
     }
     pub(crate) fn retirement_verified(&self, until: Instant) -> Result<bool> {
         Ok(self.retired.get().is_some() && self.exited(until)?)
@@ -481,6 +501,9 @@ impl OwnedHelper {
 }
 impl Drop for OwnedHelper {
     fn drop(&mut self) {
+        if self.retired.get().is_some() {
+            return; // already reaped: never wait on a reused numerical PID.
+        }
         unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
@@ -492,16 +515,10 @@ impl Drop for OwnedHelper {
         }
         let until = Instant::now() + Duration::from_secs(2);
         while Instant::now() < until {
-            let mut status = 0;
-            let n = unsafe {
-                libc::waitpid(
-                    self.child.id() as i32,
-                    &mut status,
-                    libc::WNOHANG | libc::__WALL,
-                )
-            };
-            if n < 0 || (n > 0 && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status))) {
-                break;
+            match self.child.wait_status() {
+                Err(_) => break,
+                Ok(Some(status)) if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) => break,
+                _ => {}
             }
             std::thread::sleep(Duration::from_millis(1));
         }

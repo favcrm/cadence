@@ -34,7 +34,7 @@ pub(crate) use context::{
     acknowledge_children, binding_json, custody_recheck, enrollment, grant_keys, image,
     install_once, installer, owner_request, proof, receipt_keys, require_self, Proof,
 };
-pub(crate) use helper::{HelperPhase, HelperStdio, OwnedHelper};
+pub(crate) use helper::{HelperPhase, HelperStdio, OwnedHelper, RetiredPiFamily};
 pub(crate) use lifecycle::{
     pi_acquire, pi_consume, pi_current, pi_expires_at_ms, pi_public_keys, runtime_current,
     runtime_proof, RuntimeProof,
