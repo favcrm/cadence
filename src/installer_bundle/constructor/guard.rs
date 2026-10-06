@@ -235,6 +235,7 @@ fn caller_selected_build_key_pid_and_perfect_diagnostics_cannot_elect_authority(
             "INSERT INTO closure_state VALUES(2,0,0,7)",
             false,
         ),
+        ("missing-latch", "DELETE FROM closure_state", false),
     ] {
         let path = sql_dir.path().join(format!("{case}.db"));
         let fixture = rusqlite::Connection::open(&path).unwrap();
@@ -276,7 +277,8 @@ fn caller_selected_build_key_pid_and_perfect_diagnostics_cannot_elect_authority(
         let before_changes: i64 = reader
             .query_row("SELECT total_changes()", [], |r| r.get(0))
             .unwrap();
-        let before_latch: String = reader.query_row(
+        // SQL NULL here records actual absence, not a default-open latch.
+        let before_latch: Option<String> = reader.query_row(
             "SELECT group_concat(id || ':' || closed || ':' || witness_done || ':' || epoch,';')
              FROM (SELECT * FROM closure_state ORDER BY id)", [], |r| r.get(0),
         ).unwrap();
@@ -305,16 +307,28 @@ fn caller_selected_build_key_pid_and_perfect_diagnostics_cannot_elect_authority(
                 .unwrap(),
             32
         );
-        assert_eq!(
-            reader
-                .query_row(
-                    "SELECT closed,witness_done FROM closure_state WHERE id=1",
-                    [],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-                )
-                .unwrap(),
-            (0, 0)
-        );
+        if case == "missing-latch" {
+            assert!(before_latch.is_none(), "missing-latch setup retained a row");
+            assert_eq!(
+                reader
+                    .query_row("SELECT count(*) FROM closure_state", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        } else {
+            assert!(before_latch.is_some(), "non-missing dataset lost its latch");
+            assert_eq!(
+                reader
+                    .query_row(
+                        "SELECT closed,witness_done FROM closure_state WHERE id=1",
+                        [],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                    )
+                    .unwrap(),
+                (0, 0)
+            );
+        }
 
         let result = super::capture::check_database_current(&reader, &binding);
         if matching {
@@ -345,7 +359,7 @@ fn caller_selected_build_key_pid_and_perfect_diagnostics_cannot_elect_authority(
         );
         assert_eq!(reader.query_row(
             "SELECT group_concat(id || ':' || closed || ':' || witness_done || ':' || epoch,';')
-             FROM (SELECT * FROM closure_state ORDER BY id)", [], |r| r.get::<_,String>(0),
+             FROM (SELECT * FROM closure_state ORDER BY id)", [], |r| r.get::<_,Option<String>>(0),
         ).unwrap(), before_latch, "{case} changed actual latch rows");
         assert_eq!(
             std::fs::read_to_string("/proc/thread-self/children").unwrap(),
