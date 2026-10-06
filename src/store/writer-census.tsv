@@ -17,7 +17,7 @@ daemon.rs	daemon-store-construction-and-inline-tests	transaction	2
 daemon/app_capabilities_rpc/tests.rs	test-fixtures	execute	1
 daemon/app_capabilities_rpc/tests.rs	test-fixtures	open	1
 daemon/effect_rpc.rs	non-sqlite-platform-adapter-execution	execute	2
-daemon/native_registration_acceptance.rs	independent-daemon-acceptance-fixtures	open	2
+daemon/native_registration_acceptance.rs	test-fixtures	open	2
 daemon/native_task.rs	test-fixtures	open	1
 daemon/social_publish_rpc.rs	non-sqlite-platform-publish-execution	execute	1
 daemon/watch.rs	provider-owned-db-checkpoint-and-tests	open	1
