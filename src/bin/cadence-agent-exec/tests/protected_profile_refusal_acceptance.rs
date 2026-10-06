@@ -117,6 +117,32 @@ fn protected_profile_caller_elections_and_missing_authority_never_spawn() {
         selection.role,
         protected_pi_profile::authority::Role::Master
     );
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        // Supported-path kernel-caller UNIT only. Fail before dispatch if this
+        // process could satisfy real custody; never skip or alter its identity.
+        let caller = (unsafe { libc::getuid() }, unsafe { libc::geteuid() });
+        assert_ne!(
+            caller,
+            (protected_pi_profile::authority::SUPERVISOR_UID, 0),
+            "acceptance caller has supervisor/root authority; dispatch forbidden"
+        );
+        let request = policy::parse(&valid_args).expect("same valid supported routing DATA");
+        let refused = dispatch_protected_request(request)
+            .err()
+            .expect("supported dispatcher admitted missing kernel caller custody");
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            refused.to_string(),
+            "protected Pi owner authorization refused/UNKNOWN"
+        );
+        assert_eq!(
+            protected_effect_count(),
+            before,
+            "kernel-caller refusal crossed a protected effect marker"
+        );
+        // No image, private grant/channel, main/NSS or native qualification.
+    }
     let before_shared = protected_effect_count();
     let unsupported = refuse_unsupported_protected_request(valid_request)
         .expect_err("valid selection bypassed actual unsupported-custody refusal");
