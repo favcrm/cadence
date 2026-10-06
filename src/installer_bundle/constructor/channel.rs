@@ -44,10 +44,21 @@ fn interrupted() -> bool {
         Some(libc::EINTR) | Some(libc::EAGAIN)
     )
 }
-fn valid(bytes: &[u8]) -> bool {
+#[derive(Clone, Copy)]
+enum Encoding {
+    Ascii,
+    Utf8,
+}
+fn valid(bytes: &[u8], encoding: Encoding) -> bool {
     !bytes.is_empty()
         && bytes.len() < MAX_FRAME
-        && bytes.iter().all(|b| b.is_ascii() && !b"\n\r\0".contains(b))
+        && bytes.iter().all(|b| !b"\n\r\0".contains(b))
+        && match encoding {
+            Encoding::Ascii => bytes.is_ascii(),
+            Encoding::Utf8 => {
+                !bytes.starts_with(&[0xef, 0xbb, 0xbf]) && std::str::from_utf8(bytes).is_ok()
+            }
+        }
 }
 
 /// Descriptors originate only from the provider entry or constructor-owned
@@ -59,6 +70,7 @@ pub(super) struct Duplex {
     frames: usize,
     total: usize,
     deadline: Deadline,
+    encoding: Encoding,
     failed: bool,
 }
 impl Duplex {
@@ -72,17 +84,21 @@ impl Duplex {
             frames: 0,
             total: 0,
             deadline,
+            encoding: Encoding::Ascii,
             failed: false,
         })
     }
-    /// Only a separately authenticated runtime authority may enter a new
-    /// operation window. Pending bytes and fatal framing state are preserved.
+    /// Only the separately authenticated retained runtime enters this window
+    /// (lifecycle::exchange). Bootstrap THROUGH runtime-release stays ASCII;
+    /// runtime DATA is strict UTF-8. Pending bytes, fatal framing state and all
+    /// original byte/count/deadline bounds survive the encoding transition.
     pub(super) fn begin_operation(&mut self, deadline: Deadline) -> Result<()> {
         if self.failed {
             return Err(refused());
         }
         deadline.check()?;
         self.deadline = deadline;
+        self.encoding = Encoding::Utf8;
         self.frames = 0;
         self.total = 0;
         Ok(())
@@ -117,7 +133,7 @@ impl Duplex {
         loop {
             self.deadline.check()?;
             if let Some(end) = self.pending.0.iter().position(|b| *b == b'\n') {
-                if !valid(&self.pending.0[..end]) {
+                if !valid(&self.pending.0[..end], self.encoding) {
                     return Err(refused());
                 }
                 self.count(end)?;
@@ -151,7 +167,7 @@ impl Duplex {
         result
     }
     fn send_once(&mut self, bytes: &[u8]) -> Result<()> {
-        if !valid(bytes) {
+        if !valid(bytes, self.encoding) {
             return Err(refused());
         }
         self.count(bytes.len())?; // budget consumed even if a partial write fails
@@ -177,5 +193,46 @@ impl Duplex {
             offset += n as usize;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    // Transport DATA only: real socketpair and production codec, not a fake
+    // runtime owner, signed authorization, custody or successful task launch.
+    #[test]
+    fn runtime_utf8_and_escaped_envelope_roundtrip_with_original_byte_cap() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let deadline = Deadline::new();
+        let mut left = Duplex::new(a.as_raw_fd(), a.as_raw_fd(), deadline).unwrap();
+        let mut right = Duplex::new(b.as_raw_fd(), b.as_raw_fd(), deadline).unwrap();
+        left.begin_operation(deadline).unwrap();
+        right.begin_operation(deadline).unwrap();
+        let cantonese = serde_json::to_vec(&serde_json::json!({"prompt":"請總結 😀"})).unwrap();
+        left.send(&cantonese).unwrap();
+        assert_eq!(right.receive().unwrap().0, cantonese);
+        right.send(&cantonese).unwrap();
+        assert_eq!(left.receive().unwrap().0, cantonese);
+
+        // JSON escapes double newline's encoded size. Fit the COMPLETE frame,
+        // including its delimiter, not only the decoded prompt byte count.
+        let mut prompt = "\n".repeat(32760);
+        let overhead = serde_json::to_vec(&serde_json::json!({"prompt":prompt}))
+            .unwrap()
+            .len();
+        prompt.push_str(&"x".repeat(MAX_FRAME - 1 - overhead));
+        assert!(prompt.len() <= 32768);
+        let envelope = serde_json::to_vec(&serde_json::json!({"prompt":prompt})).unwrap();
+        assert_eq!(envelope.len() + 1, MAX_FRAME);
+        left.send(&envelope).unwrap();
+        assert_eq!(right.receive().unwrap().0, envelope);
+        prompt.push('x');
+        let too_large = serde_json::to_vec(&serde_json::json!({"prompt":prompt})).unwrap();
+        assert_eq!(too_large.len() + 1, MAX_FRAME + 1);
+        assert!(left.send(&too_large).is_err());
     }
 }

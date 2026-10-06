@@ -113,8 +113,18 @@ Acquire uses {type:"acquire",version:1,sequence:1,binding}; root matches selecto
 against actually issued authority, cannot elect from it. Consume/current carry
 sequence/grant/binding EXACT original issued tuple on SAME retained channel.
 Response EXACT {version:1,sequence,grant:<facts.reference>,binding:<facts.binding>,
-outcome:"issued"|"consumed"|"current"|"unknown",phase:"issued"|"consumed"}.
-Backend facts.launch+lineageReference are Root-validated, not dropped unchecked.
+outcome:"issued"|"consumed"|"current"|"init_file"|"database_current"|"unknown",
+phase:"issued"|"consumed"}. The external facts.reference is the original canonical
+UUIDv4, distinct from Root's hex32 construction reference; never normalize or
+replace it. Backend facts.launch+lineageReference are Root-validated, not dropped unchecked.
+
+Init-only file delivery request EXACT
+{type:"init_file",version:1,sequence,grant,binding}, original consumed tuple.
+After its exact init_file/consumed JSON reply, Root sends ONE byte0x44 with ONE
+SCM_RIGHTS regular O_RDWR File; receiver requires CLOEXEC, no extra/truncated
+controls, actual FD/name/private-DAC/empty-file correspondence. JSON and FD share
+ONE absolute10s request budget. Delivery burns independently BEFORE wire, never
+resets consume or retries after loss. Other JSON frames require zero descriptors.
 
 ## Consumption ordering / init / restore
 
@@ -122,15 +132,24 @@ StoreOwnerGrant is nonClone/nonDeserialize private capability, not Binding.
 Store::open_owned(grant) issues private StoreOpenPermit for init/restore/open only.
 Actual schema.rs ordering: fixed path/mount-custody check, authentic current,
 consume burn BEFORE first SQLite connection/file creation, consumed-current,
-then memory/target work with repeated authentic current. Client local burn occurs
+then parameterless private permit.init_file BEFORE first memory SQLite connection,
+then memory/target work with ALL repeated authentic current checks. Client local burn occurs
 before wire send; external CAS must occur before guest mutation. Any loss leaves
 permanent consumed/UNKNOWN obligation; no fresh retry/erase/fallback.
 
-INIT: authentic initial epoch1/no restoredFrom/sourceNULL. Target must be absent;
-create_new0600, build reviewed schema32/latch/incarnation in memory, seed durable
-closed-refusal destination before backup; never adopt empty/existing guest file.
-After consumed/current, validate exact identity/latch under BEGIN IMMEDIATE,
-WAL/recovery only with same current owner. No Legacy fallback.
+INIT: authentic initial epoch1/no restoredFrom/sourceNULL. Main DB and all three
+sidecars must be absent before AND after issue. After local burn and actual
+external consumed/current, Root itself create_new0600/fchown21000:21000 and
+retains the actual creation File/held mount/own-daemon stream/original facts
+BEFORE Consume ACK. Loss leaves a spent partial file, never deletion/retry.
+Root opening current now corroborates that SAME held creation through incomplete
+construction (including private SQLite sidecars); it neither re-elects absence
+nor prematurely claims completed identity/latch. Store receives that original
+File once before SQLite, builds reviewed schema32/latch/incarnation in memory,
+seeds durable closed-refusal destination before backup and retains/syncs the File.
+No arbitrary empty/existing file is admitted. ALL original activation deadlines,
+peer/current/full-facts checks remain; final distinct database_current alone
+verifies committed WAL/schema32/identity/open-latch. No Legacy fallback.
 
 RESTORE: backend permanent source must actually be captured/witnessed and CASed
 to restored for this exact target; newer DB epoch/fresh incarnation/new lineage

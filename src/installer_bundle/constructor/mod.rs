@@ -11,6 +11,7 @@ mod dispatcher;
 mod helper;
 mod helper_process;
 mod helper_trust;
+mod init_file;
 mod layout;
 mod lifecycle;
 pub(crate) mod private_wire;

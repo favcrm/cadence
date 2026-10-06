@@ -19,7 +19,7 @@ use crate::store::{Binding, Purpose};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -66,6 +66,12 @@ enum StoreRequest {
         grant: String,
         binding: Binding,
     },
+    InitFile {
+        version: u8,
+        sequence: u64,
+        grant: String,
+        binding: Binding,
+    },
     DatabaseCurrent {
         version: u8,
         sequence: u64,
@@ -79,6 +85,7 @@ struct StoreSession {
     facts: Option<Facts>,
     phase: String,
     burned: bool,
+    file_delivered: bool,
 }
 struct PiSession {
     stream: UnixStream,
@@ -282,10 +289,103 @@ impl Registry {
         self.daemon.require_peer(stream, until)?;
         self.check(until)
     }
+    fn create_init(&self, facts: &Facts, stream: &UnixStream, until: Instant) -> Result<()> {
+        // Only this original locally burned + externally consumed Init session
+        // reaches here, after original activation-current. Root is the actual
+        // creator; a path/FD/UID observation can never elect an existing file.
+        self.admit(stream, until)?;
+        facts.binding.validate()?;
+        if facts.binding.purpose != Purpose::Init {
+            return Err(refused());
+        }
+        fresh_target()?;
+        let mut state = self.db.lock().map_err(|_| refused())?;
+        if state.closed || state.startup.is_some() || state.file.is_some() {
+            return Err(refused());
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(DB)
+            .map_err(|_| refused())?;
+        // A failure from here leaves a spent partial file. Never delete/retry.
+        if unsafe { libc::fchown(file.as_raw_fd(), 21000, 21000) } != 0
+            || unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0
+        {
+            return Err(refused());
+        }
+        self.layout.store_file(&file)?;
+        let m = file.metadata().map_err(|_| refused())?;
+        if !m.is_file()
+            || m.len() != 0
+            || m.nlink() != 1
+            || m.uid() != 21000
+            || m.gid() != 21000
+            || m.mode() & 0o7777 != 0o600
+        {
+            return Err(refused());
+        }
+        state.file = Some(file);
+        state.startup = Some(facts.clone());
+        drop(state);
+        self.database()?;
+        absent_sidecars()?;
+        facts.binding.validate()?;
+        self.admit(stream, until)
+    }
+    fn construction_current(&self, until: Instant) -> Result<()> {
+        let facts = {
+            let state = self.db.lock().map_err(|_| refused())?;
+            if state.closed {
+                return Err(refused());
+            }
+            self.admit(state.opening_peer.as_ref().ok_or_else(refused)?, until)?;
+            match (&state.startup, &state.file) {
+                (None, None) => None,
+                (Some(facts), Some(_)) if facts.binding.purpose == Purpose::Init => {
+                    Some(facts.clone())
+                }
+                _ => return Err(refused()), // never reset a held creation to absent.
+            }
+        };
+        if let Some(facts) = facts {
+            facts.binding.validate()?; // ORIGINAL opening deadline, not a lease.
+            self.database()?;
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let file = match OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                    .open(format!("{DB}{suffix}"))
+                {
+                    Ok(file) => file,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return Err(refused()),
+                };
+                let m = file.metadata().map_err(|_| refused())?;
+                if !m.is_file()
+                    || m.uid() != 21000
+                    || m.gid() != 21000
+                    || m.nlink() != 1
+                    || m.mode() & 0o7777 != 0o600
+                {
+                    return Err(refused());
+                }
+                self.layout.store_file(&file)?;
+            }
+            self.database()?;
+            facts.binding.validate()?;
+        } else {
+            fresh_target()?; // initial election only, never existing DB admission.
+        }
+        self.check(until)
+    }
     fn database(&self) -> Result<()> {
         let f = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(DB)
             .map_err(|_| refused())?;
         let m = f.metadata().map_err(|_| refused())?;
@@ -293,19 +393,18 @@ impl Registry {
             || m.uid() != 21000
             || m.gid() != 21000
             || m.nlink() != 1
-            || m.mode() & 0o077 != 0
+            || m.mode() & 0o7777 != 0o600
         {
             return Err(refused());
         }
-        let mut state = self.db.lock().map_err(|_| refused())?;
-        if let Some(old) = &state.file {
-            let old = old.metadata().map_err(|_| refused())?;
-            if (old.dev(), old.ino()) != (m.dev(), m.ino()) {
-                return Err(refused());
-            }
-        } else {
-            state.file = Some(f)
+        let state = self.db.lock().map_err(|_| refused())?;
+        let old = state.file.as_ref().ok_or_else(refused)?;
+        let held = old.metadata().map_err(|_| refused())?;
+        if (held.dev(), held.ino()) != (m.dev(), m.ino()) {
+            return Err(refused());
         }
+        self.layout.store_file(old)?;
+        self.layout.store_file(&f)?;
         Ok(())
     }
 }
@@ -325,7 +424,7 @@ fn read<T: for<'a> Deserialize<'a>>(
         while !b.is_empty() {
             s.set_read_timeout(Some(budget(until)?))
                 .map_err(|_| refused())?;
-            let n = s.read(b).map_err(|_| refused())?;
+            let n = super::init_file::read_plain(s, b)?;
             if n == 0 {
                 return Err(refused());
             }
@@ -393,7 +492,9 @@ fn validate(
         || f.binding.database_epoch != b.lineage.database_epoch
         || f.binding.operation != b.operation
         || f.binding.path != DB
-        || !super::hex(&f.reference, 32)
+        // External Store correlation is a canonical UUID, NOT Root's hex32
+        // construction reference. Preserve its exact issued bytes throughout.
+        || !store_reference(&f.reference)
         || expected.is_some_and(|e| serde_json::to_value(e).ok() != serde_json::to_value(&f).ok())
     {
         return Err(refused());
@@ -402,6 +503,13 @@ fn validate(
         f.binding.validate()?
     } // database-current keeps exact previously validated tuple; never renews it.
     Ok(f)
+}
+fn store_reference(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|id| {
+        id.get_variant() == uuid::Variant::RFC4122
+            && id.get_version() == Some(uuid::Version::Random)
+            && id.hyphenated().to_string() == value
+    })
 }
 impl StoreSession {
     fn handle(&mut self, until: Instant) -> Result<()> {
@@ -419,6 +527,9 @@ impl StoreSession {
             | StoreRequest::Current {
                 version, sequence, ..
             }
+            | StoreRequest::InitFile {
+                version, sequence, ..
+            }
             | StoreRequest::DatabaseCurrent {
                 version, sequence, ..
             } => (*version, *sequence),
@@ -433,6 +544,7 @@ impl StoreSession {
         let (mut outcome, mut phase) = ("issued", "issued");
         let is_consume = matches!(&request, StoreRequest::Consume { .. });
         let is_database = matches!(&request, StoreRequest::DatabaseCurrent { .. });
+        let mut delivery = None;
         match request {
             StoreRequest::Startup { .. } if self.facts.is_none() && seq == 1 => {
                 // Pilot is fresh-only. Old DB/sidecars NEVER become fresh,
@@ -485,6 +597,40 @@ impl StoreSession {
                 }
                 self.facts = Some(f);
             }
+            StoreRequest::InitFile { grant, binding, .. } => {
+                let f = self.facts.as_ref().ok_or_else(refused)?;
+                if self.phase != "consumed"
+                    || !self.burned
+                    || self.file_delivered
+                    || binding.purpose != Purpose::Init
+                    || f.reference != grant
+                    || f.binding != binding
+                {
+                    return Err(refused());
+                }
+                self.file_delivered = true; // burn BEFORE current or any response/FD write.
+                validate(
+                    lifecycle::store_current(&grant, until)?,
+                    "consumed",
+                    Some(f),
+                    true,
+                )?;
+                r.construction_current(until)?;
+                absent_sidecars()?;
+                let db = r.db.lock().map_err(|_| refused())?;
+                if db.startup.as_ref().is_none_or(|original| {
+                    serde_json::to_value(original).ok() != serde_json::to_value(f).ok()
+                }) {
+                    return Err(refused());
+                }
+                let file = db.file.as_ref().ok_or_else(refused)?;
+                if file.metadata().map_err(|_| refused())?.len() != 0 {
+                    return Err(refused());
+                }
+                delivery = Some(file.try_clone().map_err(|_| refused())?);
+                outcome = "init_file";
+                phase = "consumed";
+            }
             StoreRequest::Consume { grant, binding, .. }
             | StoreRequest::Current { grant, binding, .. }
             | StoreRequest::DatabaseCurrent { grant, binding, .. } => {
@@ -525,11 +671,16 @@ impl StoreSession {
                     self.phase = "consumed".into();
                     outcome = "consumed";
                     phase = "consumed";
-                    if matches!(
-                        binding.purpose,
-                        Purpose::Init | Purpose::Restore | Purpose::Open
-                    ) {
-                        r.db.lock().map_err(|_| refused())?.startup = Some(f.clone());
+                    if binding.purpose == Purpose::Init {
+                        validate(
+                            lifecycle::store_current(&grant, until)?,
+                            "consumed",
+                            Some(f),
+                            true,
+                        )?;
+                        r.create_init(f, &self.stream, until)?;
+                    } else if matches!(binding.purpose, Purpose::Restore | Purpose::Open) {
+                        return Err(refused()); // no fresh/restore fallback in this milestone.
                     }
                 } else {
                     validate(
@@ -550,8 +701,27 @@ impl StoreSession {
             &mut self.stream,
             &json!({"version":1,"sequence":seq,"grant":f.reference,"binding":f.binding,"outcome":outcome,"phase":phase}),
             until,
-        )
+        )?;
+        if let Some(file) = delivery {
+            f.binding.validate()?;
+            r.admit(&self.stream, until)?;
+            r.database()?;
+            super::init_file::send(&self.stream, &file, until)?;
+            f.binding.validate()?;
+            r.admit(&self.stream, until)?;
+        }
+        Ok(())
     }
+}
+fn absent_sidecars() -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        if !std::fs::symlink_metadata(format!("{DB}{suffix}"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(refused());
+        }
+    }
+    Ok(())
 }
 fn fresh_target() -> Result<()> {
     for suffix in ["", "-wal", "-shm", "-journal"] {
@@ -800,6 +970,7 @@ impl PiSession {
                                     facts: None,
                                     phase: "issued".into(),
                                     burned: false,
+                                    file_delivered: false,
                                 });
                             }
                         }
@@ -1126,6 +1297,7 @@ pub(super) fn run(layout: Layout) -> Result<()> {
                     facts: None,
                     phase: "issued".into(),
                     burned: false,
+                    file_delivered: false,
                 }),
             }
         }
@@ -1201,11 +1373,7 @@ pub(super) fn readback(query: &Value, until: Instant) -> Result<Value> {
             json!({"version":1,"task":state.id,"alias":state.alias,"model":state.model,"phase":phase,"parts":state.part})
         }
         Some("opening") if obj.len() == 1 => {
-            {
-                let state = r.db.lock().map_err(|_| refused())?;
-                r.admit(state.opening_peer.as_ref().ok_or_else(refused)?, until)?;
-            }
-            fresh_target()?;
+            r.construction_current(until)?;
             json!({"reference":r.reference,"revision":1,"purpose":"init","path":DB})
         }
         Some("database-current") if obj.len() == 2 => {
@@ -1223,7 +1391,9 @@ pub(super) fn readback(query: &Value, until: Instant) -> Result<Value> {
             };
             // Independent WAL-aware READ_ONLY connection, not the daemon's
             // currently held write mutex or immutable/recovery-writing reader.
+            r.database()?;
             super::capture::database_current(&facts.binding, until)?;
+            r.database()?;
             json!({"version":1,"reference":r.reference,"revision":1,"facts":facts,"phase":"consumed"})
         }
         Some("maintenance") if obj.len() == 3 => {

@@ -58,7 +58,13 @@ consumed phase. Consume burns before effects and lost ACK remains UNKNOWN.
 Pi OperationScope/OperationReply exact schema lives in pi_guest/owner.rs; its
 reference comes from the actual external one-use owner, not a local UUID/phase.
 
-Each bounded exchange has <=10s,64KiB/frame,32 frames/256KiB bidirectionally.
+Each bounded exchange has <=10s,64KiB/frame INCLUDING delimiter LF,32 frames/256KiB bidirectionally.
+Bootstrap THROUGH runtime-release stays ASCII. Only the separately verified
+retained runtime operation selects strict UTF-8 JSON, with no normalization or
+fallback. Complete serialized envelopes (including escaped text and LF) count,
+not decoded prompt length. Raw CR/NUL, BOM-prefix, malformed/truncated UTF-8,
+EOF without LF and excess budgets refuse; channel failure remains sticky.
+Signed canonical payload validation and exact authority/correlation are unchanged.
 Separately authenticated runtime scope permits a new operation window, preserving
 pending bytes and fatal state. Enrollment's existing budget is not weakened/reset.
 

@@ -146,6 +146,23 @@ impl Layout {
         layout.recheck(deadline)?;
         Ok(layout)
     }
+    /// Corroborate an actual held/named Store file against the originally
+    /// retained mutable mount. Metadata is not creation/permit authority.
+    pub(super) fn store_file(&self, file: &File) -> Result<()> {
+        let store = self
+            .mounts
+            .iter()
+            .find(|m| m.path == "/srv/cadence/protected/store")
+            .ok_or_else(refused)?;
+        let meta = file.metadata().map_err(|_| refused())?;
+        if meta.dev() != store.dev
+            || mount_id(file)? != store.mount_id
+            || mount_id(&store.file)? != store.mount_id
+        {
+            return Err(refused());
+        }
+        Ok(())
+    }
     pub(super) fn recheck(&self, deadline: Deadline) -> Result<()> {
         for m in &self.mounts {
             deadline.check()?;
