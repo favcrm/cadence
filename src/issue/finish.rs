@@ -616,6 +616,8 @@ pub(crate) struct ProcessUse {
     pub enumeration_error: Option<String>,
 }
 
+pub(crate) type ProcessUseProbe = dyn Fn(&Path) -> Result<ProcessUse>;
+
 pub(crate) fn process_use_under(dir: &Path) -> Result<ProcessUse> {
     let dir = dir.canonicalize().map_err(|e| {
         Error::rejected(format!(
@@ -915,6 +917,7 @@ pub(crate) fn lane_in_use(
     state_dir: &Path,
     front: &Front,
     lane: &Path,
+    process_use_probe: &ProcessUseProbe,
 ) -> Option<String> {
     let wt_name = lane.file_name().map(|n| n.to_string_lossy().into_owned());
     let t = Target {
@@ -928,7 +931,8 @@ pub(crate) fn lane_in_use(
         root: PathBuf::new(),
         cargo_target: None,
     };
-    let (mut blocks, deferred) = in_use_blocks(view, state_dir, &t);
+    let (mut blocks, deferred) =
+        in_use_blocks_with_process_probe(view, state_dir, &t, process_use_probe);
     blocks.extend(deferred);
     blocks.first().map(|b| b.reason.clone())
 }
@@ -1412,6 +1416,15 @@ fn inspect(view: &DaemonView, state_dir: &Path, t: &Target, ev: &Evidence) -> Ch
 /// bindings, pane trees and processes bound to this worktree. Returns
 /// the blocks and the deferred enumeration (meta) failures.
 fn in_use_blocks(view: &DaemonView, state_dir: &Path, t: &Target) -> (Vec<Block>, Vec<Block>) {
+    in_use_blocks_with_process_probe(view, state_dir, t, &process_use_under)
+}
+
+fn in_use_blocks_with_process_probe(
+    view: &DaemonView,
+    state_dir: &Path,
+    t: &Target,
+    process_use_probe: &ProcessUseProbe,
+) -> (Vec<Block>, Vec<Block>) {
     let mut blocks = Vec::new();
     let mut pane_pid = None;
     let mut unreachable = false;
@@ -1623,7 +1636,7 @@ fn in_use_blocks(view: &DaemonView, state_dir: &Path, t: &Target) -> (Vec<Block>
     // Enumeration failure is itself a refusal: an unreadable /proc entry
     // cannot be interpreted as no live user.
     if let Some(d) = t.wt_dir.as_deref().filter(|d| d.is_dir()) {
-        match process_use_under(d) {
+        match process_use_probe(d) {
             Err(e) => blocks.push(Block {
                 tag: "process-enumeration-failed".to_string(),
                 reason: format!(

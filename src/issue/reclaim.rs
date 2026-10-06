@@ -243,7 +243,7 @@ fn reclaim_target(lane: &Path, cargo_target: Option<&str>) -> Result<Option<Path
 /// daemon enumeration, a registered agent whose cwd is bound to it, or
 /// a live/unknown message or task bound to it (finish's in-use
 /// evaluation). Re-run against a fresh `view` right before the delete.
-type ProcessUseProbe = dyn Fn(&Path) -> Result<finish::ProcessUse>;
+type ProcessUseProbe = finish::ProcessUseProbe;
 
 fn live_reason_with_process_probe(
     view: &finish::DaemonView,
@@ -255,7 +255,7 @@ fn live_reason_with_process_probe(
     if view.up && !finish::cwd_holder_aliases(view, Some(lane)).is_empty() {
         return Some("a registered agent's cwd is on the lane".to_string());
     }
-    if let Some(reason) = finish::lane_in_use(view, state_dir, front, lane) {
+    if let Some(reason) = finish::lane_in_use(view, state_dir, front, lane, process_use_probe) {
         return Some(reason);
     }
     let process_use = match process_use_probe(lane) {
