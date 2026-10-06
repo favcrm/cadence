@@ -376,7 +376,7 @@ esac
         let stdout = fs::File::create(&stdout_path).unwrap();
         let stderr = fs::File::create(&stderr_path).unwrap();
         let mut command = Command::new(BINARY);
-        let child = command
+        command
             .args([
                 "--state-dir",
                 self.state.to_str().unwrap(),
@@ -408,9 +408,8 @@ esac
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .expect("start real cadence review CLI");
+            .stderr(Stdio::from(stderr));
+        let child = reaper::spawn(&mut command).expect("start real cadence review CLI");
         PausedRemoval {
             child: Some(child),
             allow_remove: self.allow_remove.clone(),
@@ -706,7 +705,7 @@ impl FinishFixture {
         let stdout = fs::File::create(&stdout_path).unwrap();
         let stderr = fs::File::create(&stderr_path).unwrap();
         let mut command = Command::new(BINARY);
-        let child = command
+        command
             .args([
                 "issue",
                 "finish",
@@ -737,9 +736,8 @@ impl FinishFixture {
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .expect("start real cadence issue finish CLI");
+            .stderr(Stdio::from(stderr));
+        let child = reaper::spawn(&mut command).expect("start real cadence issue finish CLI");
         PausedRemoval {
             child: Some(child),
             allow_remove: self.allow_remove.clone(),
