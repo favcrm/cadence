@@ -15,13 +15,17 @@
 //! writer also holds `.write.lock` for its whole write. That fences
 //! both directions: an old writer meets the file and waits; a new
 //! writer that meets a `.write.lock` it did not write fails closed.
-//! The new writer's file carries [`MARKER`]; an empty or foreign file is
-//! a legacy lock of unknown owner and is never removed, aged out or
+//! The new writer's file carries [`MARKER`] plus an optional diagnostic
+//! trailer naming the holder (`pid`, `host`, `version`, `started_at`,
+//! `bin`); an empty or foreign file — or MARKER with a malformed tail —
+//! is a legacy lock of unknown owner and is never removed, aged out or
 //! guessed at. A marker file left under a flock we now hold was written
 //! by a new writer that is gone (the kernel proved it) — so it can be
 //! reused, but only after the tracker's git state is shown to hold
-//! nothing the crashed writer left: an interrupted write is refused,
-//! never replayed.
+//! nothing the crashed writer left: a write touching the leftovers is
+//! refused, never replayed. A write that declares paths disjoint from
+//! the leftovers ([`Pm::lock_for_paths`]) is admitted with a scope that
+//! its commit must stay inside.
 //!
 //! "Nothing the crashed writer left" is measured against a snapshot.
 //! Every writer records the untracked and modified paths that already
@@ -30,9 +34,11 @@
 //! an `index.lock`, a merge/rebase/cherry-pick marker, a staged entry
 //! or a path that was not in the snapshot counts as interrupted.
 //!
-//! A `.write.lock` whose content is exactly [`MARKER`] is taken for a
-//! dead new-protocol writer's marker once the flock is ours; liveness
-//! comes from the flock alone.
+//! A `.write.lock` whose content is exactly [`MARKER`] — or MARKER plus
+//! a strictly well-formed trailer — is taken for a dead new-protocol
+//! writer's marker once the flock is ours; liveness comes from the
+//! flock alone, the trailer is diagnostic only and never proof of
+//! death.
 //!
 //! `flock` belongs to the open file description, which a `fork` copies,
 //! and `close` of one descriptor does not release it while a forked
@@ -59,9 +65,262 @@ use std::time::{Duration, Instant};
 use super::{Pm, MARKER_LOCK_FILE};
 use crate::error::{Error, Result};
 
-/// Content of `.write.lock` while a new-protocol writer holds it.
+/// Content of `.write.lock` while a new-protocol writer holds it:
+/// [`MARKER`] plus an optional diagnostic trailer, one `key=value`
+/// line each. Liveness comes from the flock alone; the trailer only
+/// names the holder in refusal messages and doctor output.
 pub(super) const MARKER: &str =
     "cadence-pm-write-lock v2 (kernel flock on .git/cadence-write.flock)\n";
+/// Trailer keys a writer may append after [`MARKER`]. The set is
+/// closed: an unknown key is a malformed tail, and a malformed tail
+/// is a legacy lock, never ours.
+const TRAILER_KEYS: [&str; 5] = ["pid", "host", "version", "started_at", "bin"];
+
+/// Diagnostic trailer parsed from a `.write.lock` this build wrote.
+/// Every field is optional: markers from builds that predate trailers
+/// carry none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarkerMeta {
+    pub pid: Option<u32>,
+    pub host: Option<String>,
+    pub version: Option<String>,
+    pub started_at: Option<i64>,
+    pub bin: Option<String>,
+}
+
+/// What `.write.lock` content means. `Ours` only for exact [`MARKER`]
+/// or MARKER plus a strictly well-formed trailer; anything else —
+/// empty, foreign, non-UTF-8, or MARKER with a malformed tail — is
+/// `Foreign` and is never removed, aged out or guessed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MarkerClass {
+    Ours(Option<MarkerMeta>),
+    Foreign,
+}
+
+/// Trailer values are short printable tokens: no whitespace, no path
+/// separators, no shell metacharacters. Anything else is malformed.
+fn trailer_value(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 128
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+' | b':'))
+}
+
+fn parse_marker(content: &[u8]) -> MarkerClass {
+    let text = match std::str::from_utf8(content) {
+        Ok(t) => t,
+        Err(_) => return MarkerClass::Foreign,
+    };
+    let Some(tail) = text.strip_prefix(MARKER) else {
+        return MarkerClass::Foreign;
+    };
+    if tail.is_empty() {
+        return MarkerClass::Ours(None);
+    }
+    let mut meta = MarkerMeta::default();
+    let mut seen: u8 = 0;
+    for line in tail.split_terminator('\n') {
+        let Some((k, v)) = line.split_once('=') else {
+            return MarkerClass::Foreign;
+        };
+        if !TRAILER_KEYS.contains(&k) || !trailer_value(v) {
+            return MarkerClass::Foreign;
+        }
+        let bit = 1u8 << TRAILER_KEYS.iter().position(|t| *t == k).unwrap_or(5);
+        if seen & bit != 0 {
+            return MarkerClass::Foreign;
+        }
+        seen |= bit;
+        match k {
+            "pid" => match v.parse::<u32>() {
+                Ok(n) => meta.pid = Some(n),
+                Err(_) => return MarkerClass::Foreign,
+            },
+            "host" => meta.host = Some(v.to_string()),
+            "version" => meta.version = Some(v.to_string()),
+            "started_at" => match v.parse::<i64>() {
+                Ok(n) => meta.started_at = Some(n),
+                Err(_) => return MarkerClass::Foreign,
+            },
+            "bin" => meta.bin = Some(v.to_string()),
+            _ => return MarkerClass::Foreign,
+        }
+    }
+    MarkerClass::Ours(Some(meta))
+}
+
+/// Best-effort hostname for the marker trailer, via libc: no new
+/// dependency for one syscall. Absent on error — the trailer simply
+/// omits the key.
+fn host_name() -> Option<String> {
+    let mut buf = [0 as libc::c_char; 256];
+    // SAFETY: a valid buffer with its length, owned by this frame.
+    if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } != 0 {
+        return None;
+    }
+    // SAFETY: gethostname succeeded, so the buffer holds a NUL-ended name.
+    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
+    let name = name.trim().to_string();
+    if trailer_value(&name) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// Basename of the running binary only: a full argv could leak secrets
+/// (CAD-108), a basename cannot.
+fn bin_name() -> Option<String> {
+    let base = std::env::current_exe()
+        .ok()?
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
+    trailer_value(&base).then_some(base)
+}
+
+/// Marker content for a new fence file: [`MARKER`] plus a best-effort
+/// diagnostic trailer. Values that fail validation are omitted, never
+/// mangled: the parser must accept whatever this writes.
+fn marker_content() -> String {
+    let mut out = MARKER.to_string();
+    let mut line = |k: &str, v: &str| {
+        if trailer_value(v) {
+            out.push_str(k);
+            out.push('=');
+            out.push_str(v);
+            out.push('\n');
+        }
+    };
+    line("pid", &std::process::id().to_string());
+    if let Some(h) = host_name() {
+        line("host", &h);
+    }
+    line("version", env!("CARGO_PKG_VERSION"));
+    line("started_at", &super::time::now_epoch().to_string());
+    if let Some(b) = bin_name() {
+        line("bin", &b);
+    }
+    out
+}
+
+/// A process holding a coordination file, found by scanning /proc.
+/// `comm` is the kernel's 15-byte process name, never argv: naming a
+/// holder must not leak secrets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderInfo {
+    pub pid: u32,
+    pub comm: String,
+}
+
+/// Result of a best-effort holder scan. `Unavailable` where /proc is
+/// absent (CAD-315) or unreadable: callers degrade, never crash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HolderScan {
+    Unavailable,
+    NoneFound,
+    Found(Vec<HolderInfo>),
+}
+
+fn sanitize_comm(c: &str) -> String {
+    let c: String = c.chars().filter(|ch| !ch.is_control()).take(32).collect();
+    if c.is_empty() {
+        "?".to_string()
+    } else {
+        c
+    }
+}
+
+/// Find processes holding the file at `(dev, ino)` by scanning
+/// `/proc/<pid>/fd`, comparing via fstat so hardlinks and renames
+/// cannot hide a holder. The caller itself is excluded. Best effort:
+/// exited processes and permission-denied fd dirs are skipped, and
+/// the result is capped — this runs on refusal paths, not hot ones.
+#[cfg(target_os = "linux")]
+fn scan_holders(dev: u64, ino: u64) -> HolderScan {
+    use std::os::unix::fs::MetadataExt;
+    let me = std::process::id();
+    let Ok(proc_) = std::fs::read_dir("/proc") else {
+        return HolderScan::Unavailable;
+    };
+    let mut found = Vec::new();
+    for entry in proc_.flatten() {
+        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            Some(p) if p != me => p,
+            _ => continue,
+        };
+        let dir = entry.path().join("fd");
+        let Ok(fds) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(m) = std::fs::metadata(fd.path()) else {
+                continue;
+            };
+            if m.dev() == dev && m.ino() == ino {
+                let comm = std::fs::read_to_string(entry.path().join("comm"))
+                    .map(|c| sanitize_comm(c.trim()))
+                    .unwrap_or_else(|_| "?".to_string());
+                found.push(HolderInfo { pid, comm });
+                break;
+            }
+        }
+        if found.len() >= 8 {
+            break;
+        }
+    }
+    if found.is_empty() {
+        HolderScan::NoneFound
+    } else {
+        HolderScan::Found(found)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scan_holders(_dev: u64, _ino: u64) -> HolderScan {
+    HolderScan::Unavailable
+}
+
+/// One human-readable holder attribution for refusal messages and
+/// doctor output: who holds the file, what the marker trailer claims,
+/// or a positive statement that nobody does.
+fn describe_holder(scan: &HolderScan, meta: Option<&MarkerMeta>) -> String {
+    let mut s = match scan {
+        HolderScan::Found(hs) => {
+            let who: Vec<String> = hs
+                .iter()
+                .map(|h| format!("pid {} ({})", h.pid, h.comm))
+                .collect();
+            format!("holder: {}", who.join(", "))
+        }
+        HolderScan::NoneFound => "no live holder found".to_string(),
+        HolderScan::Unavailable => "holder scan unavailable on this platform".to_string(),
+    };
+    if let Some(m) = meta {
+        let mut bits = Vec::new();
+        if let Some(p) = m.pid {
+            bits.push(format!("pid={p}"));
+        }
+        if let Some(h) = &m.host {
+            bits.push(format!("host={h}"));
+        }
+        if let Some(v) = &m.version {
+            bits.push(format!("version={v}"));
+        }
+        if let Some(t) = m.started_at {
+            bits.push(format!("started_at={t}"));
+        }
+        if let Some(b) = &m.bin {
+            bits.push(format!("bin={b}"));
+        }
+        if !bits.is_empty() {
+            s.push_str("; marker trailer ");
+            s.push_str(&bits.join(" "));
+        }
+    }
+    s
+}
 const FLOCK_FILE: &str = "cadence-write.flock";
 const DIRTY_FILE: &str = "cadence-write.dirty";
 const TMP_PREFIX: &str = "cadence-write.tmp-";
@@ -70,6 +329,20 @@ const WAIT: Duration = Duration::from_secs(15);
 /// lock taken, so a state probe's instant of ownership is not "busy".
 const PROBE_RETRIES: u32 = 3;
 const PROBE_RETRY_GAP: Duration = Duration::from_millis(2);
+
+/// What a [`PmLock`] may commit. `Full` is the unscoped lock: the
+/// whole tracker was clean when it was taken, or the caller asked for
+/// no scope. `Paths` admits only writes disjoint from a crashed
+/// writer's leftovers: `admitted` is what the caller declared,
+/// `blocked` is the crash's raw leftover paths.
+#[derive(Debug, Clone)]
+enum Scope {
+    Full,
+    Paths {
+        admitted: Vec<String>,
+        blocked: Vec<String>,
+    },
+}
 
 /// Held for the whole tracker mutation. Dropping removes the legacy
 /// fence file first (only if it is still the file this writer made),
@@ -82,7 +355,52 @@ pub struct PmLock {
     /// False while a reused marker is still under suspicion: a refusal
     /// must leave it in place so the next attempt checks again.
     armed: bool,
+    scope: Scope,
     _flock: Unlock,
+}
+
+/// Repo-relative path overlap, component-wise in both directions: a
+/// file under an admitted dir is admitted, and a dir over a blocked
+/// file is blocked.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
+/// True when `path` is `scope` itself or lives under it.
+fn path_within(path: &str, scope: &str) -> bool {
+    path == scope || path.starts_with(&format!("{scope}/"))
+}
+
+impl PmLock {
+    /// Refuse a commit that leaves this lock's scope: outside the
+    /// declared paths, or overlapping the crashed writer's leftovers.
+    /// `Full` locks admit everything (the unscoped behavior). Called
+    /// by [`Pm::commit_scoped`](super::Pm::commit_scoped); the plain
+    /// commit path never takes a scoped lock.
+    pub(super) fn check_commit(&self, rel: &[String]) -> Result<()> {
+        let Scope::Paths { admitted, blocked } = &self.scope else {
+            return Ok(());
+        };
+        for p in rel {
+            if blocked.iter().any(|b| paths_overlap(p, b)) {
+                return Err(Error::rejected(format!(
+                    "the tracker has an interrupted write: refusing to commit {p}, \
+                     which overlaps a crashed writer's leftovers ({}). Nothing was \
+                     committed; resolve those paths first, or commit only paths \
+                     disjoint from them",
+                    blocked.join(", ")
+                )));
+            }
+            if !admitted.iter().any(|a| path_within(p, a)) {
+                return Err(Error::rejected(format!(
+                    "commit {p} is outside this lock's admitted paths ({}); \
+                     declare every path a scoped write touches",
+                    admitted.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A held `flock` that is released explicitly on drop. `close` alone
@@ -120,20 +438,25 @@ impl Drop for PmLock {
 /// one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockState {
-    /// A live new-protocol writer holds the kernel lock.
-    Held,
+    /// A live new-protocol writer holds the kernel lock. `holder`
+    /// names it where the scan could (see [`describe_holder`]).
+    Held { holder: String },
     /// No writer holds it and no earlier writer left work behind.
     Free,
     /// No writer holds it, but a crashed writer left the tracker
-    /// mid-write. Every write is refused until the operator resolves
-    /// `paths`; `foreign` paths pre-date the crash and are left alone.
+    /// mid-write. Writes touching `paths` are refused until the
+    /// operator resolves them; writes to disjoint paths (via
+    /// [`Pm::lock_for_paths`](super::Pm::lock_for_paths)) proceed.
+    /// `foreign` paths pre-date the crash and are left alone.
     Interrupted {
         paths: Vec<String>,
         foreign: Vec<String>,
     },
     /// A `.write.lock` this build did not write: an older binary may
-    /// hold it, or crashed holding it. Owner unknown.
-    LegacyUnknown,
+    /// hold it, or crashed holding it. `holder` names it where the
+    /// scan could — it never proves death, and the file is never
+    /// removed on that basis.
+    LegacyUnknown { holder: String },
     /// The lock could not be examined.
     IoUnknown(String),
 }
@@ -141,14 +464,14 @@ pub enum LockState {
 impl std::fmt::Display for LockState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LockState::Held => write!(f, "held by a live writer"),
+            LockState::Held { .. } => write!(f, "held by a live writer"),
             LockState::Free => write!(f, "free"),
             LockState::Interrupted { paths, .. } => write!(
                 f,
                 "free, but a crashed writer left an interrupted write: {}",
                 paths.join(", ")
             ),
-            LockState::LegacyUnknown => write!(f, "legacy lock, owner unknown"),
+            LockState::LegacyUnknown { .. } => write!(f, "legacy lock, owner unknown"),
             LockState::IoUnknown(e) => write!(f, "unknown (I/O error: {e})"),
         }
     }
@@ -182,9 +505,15 @@ struct Tree {
 }
 
 /// What an interrupted write left, split from what was already there.
+/// `paths` are the raw repo-relative paths behind `named`, for overlap
+/// checks; `global` is true when git-level markers (`index.lock`,
+/// merge/rebase heads) are present — those refuse every write,
+/// disjoint or not.
 struct Interruption {
     named: Vec<String>,
     foreign: Vec<String>,
+    paths: Vec<String>,
+    global: bool,
 }
 
 fn open_coordination(path: &Path, create: bool) -> std::io::Result<Option<File>> {
@@ -288,23 +617,31 @@ fn sweep_tmp(git_dir: &Path) {
 fn classify(tree: &Tree, snapshot: &HashSet<String>) -> Option<Interruption> {
     let mut named: Vec<String> = Vec::new();
     let mut foreign: Vec<String> = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
     for s in &tree.git_state {
         named.push(format!("git state {s}"));
     }
     for p in &tree.staged {
         named.push(format!("staged {p}"));
+        paths.push(p.clone());
     }
     for (kind, p) in &tree.loose {
         if snapshot.contains(p) {
             foreign.push(format!("{kind} {p}"));
         } else {
             named.push(format!("{kind} {p}"));
+            paths.push(p.clone());
         }
     }
     if named.is_empty() {
         None
     } else {
-        Some(Interruption { named, foreign })
+        Some(Interruption {
+            global: !tree.git_state.is_empty(),
+            named,
+            foreign,
+            paths,
+        })
     }
 }
 
@@ -334,12 +671,15 @@ impl Pm {
         }
     }
 
-    /// Classify `.write.lock` without touching it. `Some((ours, ident))`
-    /// when it is a regular file: `ours` says its content is exactly
-    /// [`MARKER`]; `ident` is `(dev, ino)` from the descriptor read.
-    /// Opened `O_NOFOLLOW | O_NONBLOCK` so a link or FIFO swapped in
-    /// can neither be followed nor block a writer.
-    fn legacy_file(&self) -> std::io::Result<Option<(bool, (u64, u64))>> {
+    /// Classify `.write.lock` without touching it. `Some((class, ident))`
+    /// when it opens as a regular file: `class` says whether its
+    /// content is ours (exact [`MARKER`], or MARKER plus a strictly
+    /// well-formed trailer — see [`parse_marker`]); `ident` is
+    /// `(dev, ino)` from the descriptor read. Opened
+    /// `O_NOFOLLOW | O_NONBLOCK` so a link or FIFO swapped in can
+    /// neither be followed nor block a writer. The read cap covers
+    /// MARKER plus a full trailer; longer content is foreign.
+    fn legacy_file(&self) -> std::io::Result<Option<(MarkerClass, (u64, u64))>> {
         let path = self.dir.join(MARKER_LOCK_FILE);
         let file = match OpenOptions::new()
             .read(true)
@@ -349,17 +689,82 @@ impl Pm {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             // A symlink (ELOOP) is not our marker; owner unknown.
-            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(Some((false, (0, 0)))),
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                return Ok(Some((MarkerClass::Foreign, (0, 0))))
+            }
             Err(e) => return Err(e),
         };
         let m = file.metadata()?;
         let ident = (m.dev(), m.ino());
         if !m.is_file() {
-            return Ok(Some((false, ident)));
+            return Ok(Some((MarkerClass::Foreign, ident)));
         }
         let mut buf = Vec::new();
-        file.take(MARKER.len() as u64 + 1).read_to_end(&mut buf)?;
-        Ok(Some((buf == MARKER.as_bytes(), ident)))
+        file.take(4096).read_to_end(&mut buf)?;
+        Ok(Some((parse_marker(&buf), ident)))
+    }
+
+    /// Holder attribution for a live writer: fstat the open flock
+    /// descriptor (no path race) for the /proc scan, plus the fence
+    /// file's trailer where it is ours.
+    fn live_holder(&self, flock_fd: &File) -> String {
+        use std::os::unix::fs::MetadataExt;
+        let scan = match flock_fd.metadata() {
+            Ok(m) => scan_holders(m.dev(), m.ino()),
+            Err(_) => HolderScan::Unavailable,
+        };
+        let meta = self
+            .legacy_file()
+            .ok()
+            .flatten()
+            .and_then(|(c, _)| match c {
+                MarkerClass::Ours(m) => m,
+                MarkerClass::Foreign => None,
+            });
+        describe_holder(&scan, meta.as_ref())
+    }
+
+    /// Holder attribution for a legacy fence file: the /proc scan over
+    /// the path's live inode. The content is never parsed — it is not
+    /// ours by definition — and nothing here authorizes removal.
+    fn legacy_holder(&self) -> String {
+        use std::os::unix::fs::MetadataExt;
+        let path = self.dir.join(MARKER_LOCK_FILE);
+        let scan = match std::fs::metadata(&path) {
+            Ok(m) => scan_holders(m.dev(), m.ino()),
+            Err(_) => HolderScan::Unavailable,
+        };
+        describe_holder(&scan, None)
+    }
+
+    /// Holder attribution for a refusal: the flock file's live holders
+    /// plus the fence trailer where it is ours (live-writer case), or
+    /// the legacy file's holders (legacy case). Best effort throughout:
+    /// an unresolvable git dir degrades to a static note, never an
+    /// error on top of the refusal.
+    fn refusal_holder(&self, legacy: bool) -> String {
+        use std::os::unix::fs::MetadataExt;
+        let git_dir = match self.lock_git_dir() {
+            Ok(d) => d,
+            Err(_) => return "holder scan skipped: git dir unresolvable".to_string(),
+        };
+        if legacy {
+            return self.legacy_holder();
+        }
+        let flock_path = git_dir.join(FLOCK_FILE);
+        let scan = match std::fs::metadata(&flock_path) {
+            Ok(m) => scan_holders(m.dev(), m.ino()),
+            Err(_) => HolderScan::Unavailable,
+        };
+        let meta = self
+            .legacy_file()
+            .ok()
+            .flatten()
+            .and_then(|(c, _)| match c {
+                MarkerClass::Ours(m) => m,
+                MarkerClass::Foreign => None,
+            });
+        describe_holder(&scan, meta.as_ref())
     }
 
     /// `git status` as the lock sees it (`--no-optional-locks`: the
@@ -427,7 +832,14 @@ impl Pm {
         Ok(classify(tree, &read_snapshot(git_dir)?))
     }
 
-    fn attempt(&self) -> Result<Attempt> {
+    /// One acquisition attempt. `declared` (repo-relative or absolute
+    /// paths, same convention as [`Pm::commit`](super::Pm::commit)) is
+    /// `Some` for a scoped write ([`Pm::lock_for_paths`](super::Pm::lock_for_paths)):
+    /// when a reused marker reveals an interrupted write, a scoped
+    /// write disjoint from the leftovers is admitted with a scope its
+    /// commit must stay inside; an overlapping write — and every
+    /// unscoped one — is refused. `None` is today's global behavior.
+    fn attempt(&self, declared: Option<&[PathBuf]>) -> Result<Attempt> {
         let git_dir = self.lock_git_dir().map_err(|e| self.git_dir_error(e))?;
         let flock_path = git_dir.join(FLOCK_FILE);
         let file = open_coordination(&flock_path, true)
@@ -444,59 +856,112 @@ impl Pm {
         sweep_tmp(&git_dir);
         let legacy = self.dir.join(MARKER_LOCK_FILE);
         // Publish the marker atomically: a crash can never leave an
-        // empty `.write.lock` that would read as a legacy lock.
+        // empty `.write.lock` that would read as a legacy lock. The
+        // content carries a diagnostic trailer (holder pid, host,
+        // version, start time, binary); liveness still comes from the
+        // flock alone.
         let tmp = git_dir.join(format!("{TMP_PREFIX}{}", std::process::id()));
-        let tmp_file =
-            create_exclusive(&tmp, MARKER).map_err(|e| io_unknown(&tmp, "the lock marker", e))?;
+        let tmp_file = create_exclusive(&tmp, &marker_content())
+            .map_err(|e| io_unknown(&tmp, "the lock marker", e))?;
         let tmp_ident = tmp_file
             .metadata()
             .map(|m| (m.dev(), m.ino()))
             .map_err(|e| io_unknown(&tmp, "the lock marker", e))?;
         let linked = std::fs::hard_link(&tmp, &legacy);
         let _ = std::fs::remove_file(&tmp);
-        let (ident, reused) = match linked {
-            Ok(()) => (tmp_ident, false),
+        let (ident, reused, stale_meta) = match linked {
+            Ok(()) => (tmp_ident, false, None),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 match self.legacy_file() {
                     // Our own marker under a flock we now hold: the writer
                     // that left it is gone. Reuse it once the git state is
-                    // shown free of its leftovers.
-                    Ok(Some((true, id))) => (id, true),
+                    // shown free of its leftovers. Its trailer, where
+                    // present, names the dead writer in a refusal.
+                    Ok(Some((MarkerClass::Ours(meta), id))) => (id, true, meta),
                     Ok(_) => return Ok(Attempt::Legacy),
                     Err(e) => return Err(io_unknown(&legacy, ".write.lock", e)),
                 }
             }
             Err(e) => return Err(io_unknown(&legacy, ".write.lock", e)),
         };
+        // Declared paths as repo-relative strings, up front: a path
+        // outside the tracker is a caller bug, refused like commit's.
+        let declared_rel: Option<Vec<String>> =
+            declared.map(|ps| self.rel_paths(ps)).transpose()?;
         // Dropping an unarmed lock leaves the stale marker in place, so
         // a refused attempt is re-checked by the next one.
         let mut lock = PmLock {
             legacy,
             ident,
             armed: !reused,
+            scope: Scope::Full,
             _flock: file,
         };
         let tree = self.tree_state(&git_dir)?;
         if reused {
             if let Some(i) = self.interruption(&git_dir, &tree)? {
-                return Err(self.interrupted_error(&i));
+                match &declared_rel {
+                    // Unscoped writes keep today's global refusal.
+                    None => return Err(self.interrupted_error(&i, stale_meta.as_ref())),
+                    Some(admitted) => {
+                        let overlap = i.global
+                            || admitted
+                                .iter()
+                                .any(|a| i.paths.iter().any(|p| paths_overlap(a, p)));
+                        if overlap {
+                            return Err(self.interrupted_error(&i, stale_meta.as_ref()));
+                        }
+                        // Disjoint from the crash: admit, scoped. The
+                        // commit must stay inside the declared paths.
+                        // The crash's marker and snapshot stay exactly as
+                        // the dead writer left them (unarmed, no snapshot
+                        // rewrite): a scoped admission must not consume
+                        // the tripwire a later writer still needs. The
+                        // next writer re-classifies against the original
+                        // snapshot, so only the crash's own leftovers —
+                        // never this write's committed work — can refuse.
+                        lock.scope = Scope::Paths {
+                            admitted: admitted.clone(),
+                            blocked: i.paths.clone(),
+                        };
+                        return Ok(Attempt::Got(lock));
+                    }
+                }
             }
             lock.armed = true;
+        }
+        // A scoped write on a clean tracker still commits scoped: the
+        // admitted set is enforced even with nothing to avoid, so a
+        // caller bug that commits outside its declaration refuses
+        // instead of silently writing unscoped.
+        if let Some(admitted) = declared_rel {
+            if matches!(lock.scope, Scope::Full) {
+                lock.scope = Scope::Paths {
+                    admitted,
+                    blocked: Vec::new(),
+                };
+            }
         }
         // Before any mutation: what was already dirty is not ours.
         write_snapshot(&git_dir, &tree)?;
         Ok(Attempt::Got(lock))
     }
 
-    /// Take the writer lock, waiting up to `wait`. The lease and actor
-    /// fences are re-checked on every turn of the wait and again once
-    /// the lock is ours: a kernel lock that frees up is not authority.
-    pub(super) fn acquire(&self, wait: Option<Duration>) -> Result<Option<PmLock>> {
+    /// Take the writer lock, waiting up to `wait`. `declared` scopes
+    /// the admission (see [`Self::attempt`]); `None` is the unscoped
+    /// lock. The lease and actor fences are re-checked on every turn
+    /// of the wait and again once the lock is ours: a kernel lock that
+    /// frees up is not authority.
+    pub(super) fn acquire(
+        &self,
+        wait: Option<Duration>,
+        declared: Option<&[PathBuf]>,
+    ) -> Result<Option<PmLock>> {
         self.fence_check()?;
         let deadline = wait.map(|w| Instant::now() + w);
         let mut retries = 0;
         loop {
-            let busy = match self.attempt()? {
+            let busy = match self.attempt(declared)? {
                 Attempt::Got(lock) => {
                     self.fence_check()?;
                     return Ok(Some(lock));
@@ -523,15 +988,25 @@ impl Pm {
         self.acquire_for(WAIT)
     }
 
+    pub(super) fn acquire_scoped_default(&self, declared: &[PathBuf]) -> Result<PmLock> {
+        Ok(self
+            .acquire(Some(WAIT), Some(declared))?
+            .expect("a waiting acquire answers"))
+    }
+
     pub(super) fn acquire_for(&self, wait: Duration) -> Result<PmLock> {
         Ok(self
-            .acquire(Some(wait))?
+            .acquire(Some(wait), None)?
             .expect("a waiting acquire answers"))
     }
 
     fn busy_error(&self, legacy: bool) -> Error {
         // A live writer is not evidence that authority changed: app
         // validation defers on busy rather than revoking approval.
+        // Both refusals name the holder where the scan could — a
+        // positive "no live holder found" included — so the operator
+        // can tell waiting from clearing without a separate probe.
+        let holder = self.refusal_holder(legacy);
         if legacy {
             // Not transient: this build never removes or ages out the
             // file, so a retry loop would spin forever (CAD-876). A
@@ -541,8 +1016,8 @@ impl Pm {
                 "legacy_write_lock",
                 format!(
                     "PM dir is locked by a legacy write lock ({}) that this build did not \
-                     write; its owner cannot be identified — an older cadence \
-                     writer may be live, or may have crashed holding it. This build \
+                     write; an older cadence writer may be live, or may have \
+                     crashed holding it ({holder}). This build \
                      will not write beside it and will not remove it, and retrying will \
                      not help. Do not delete it as routine: the rollout owner must \
                      clear it during a quiescent migration, after every pre-flock \
@@ -551,11 +1026,10 @@ impl Pm {
                 ),
             )
         } else {
-            Error::busy(
+            Error::busy(format!(
                 "PM dir is locked by another live writer (kernel lock on \
-                 .git/cadence-write.flock); it frees when that process exits"
-                    .to_string(),
-            )
+                 .git/cadence-write.flock); it frees when that process exits ({holder})"
+            ))
         }
     }
 
@@ -584,15 +1058,21 @@ impl Pm {
         let _probe = match open_coordination(&flock_path, false) {
             Ok(Some(f)) => match flock(&f, libc::LOCK_EX) {
                 Ok(true) => Some(Unlock(f)),
-                Ok(false) => return LockState::Held,
+                Ok(false) => {
+                    return LockState::Held {
+                        holder: self.live_holder(&f),
+                    };
+                }
                 Err(e) => return LockState::IoUnknown(format!("{}: {e}", flock_path.display())),
             },
             Ok(None) => None,
             Err(e) => return LockState::IoUnknown(format!("{}: {e}", flock_path.display())),
         };
         match self.legacy_file() {
-            Ok(Some((false, _))) => LockState::LegacyUnknown,
-            Ok(Some((true, _))) => {
+            Ok(Some((MarkerClass::Foreign, _))) => LockState::LegacyUnknown {
+                holder: self.legacy_holder(),
+            },
+            Ok(Some((MarkerClass::Ours(_), _))) => {
                 match self
                     .tree_state(&git_dir)
                     .and_then(|t| self.interruption(&git_dir, &t))
@@ -615,7 +1095,9 @@ impl Pm {
 
     /// A crashed writer leaves the git index and worktree mid-write.
     /// Refuse, naming the exact state, rather than commit or replay it.
-    fn interrupted_error(&self, i: &Interruption) -> Error {
+    /// `meta` is the dead writer's marker trailer where it left one:
+    /// diagnostic only, never authority.
+    fn interrupted_error(&self, i: &Interruption, meta: Option<&MarkerMeta>) -> Error {
         const SHOW: usize = 8;
         let more = i.named.len().saturating_sub(SHOW);
         let named: Vec<&str> = i.named.iter().take(SHOW).map(String::as_str).collect();
@@ -632,12 +1114,20 @@ impl Pm {
                 i.foreign.len()
             )
         };
+        let trailer = match meta {
+            Some(m) => format!(
+                " The crashed writer's marker said: {}.",
+                describe_holder(&HolderScan::NoneFound, Some(m))
+            ),
+            None => String::new(),
+        };
         Error::rejected(format!(
             "the tracker has an interrupted write: a writer exited without \
              finishing, leaving {}{tail}. Nothing was replayed or committed and \
              the lock itself is free.{foreign} The write's outcome is uncertain — check \
              `git -C {} status` and `cadence issue lint`, then commit or discard \
-             those paths yourself; writes resume once they are resolved",
+             those paths yourself; writes touching them resume once they are resolved, \
+             while writes to disjoint paths (via lock_for_paths) proceed.{trailer}",
             named.join(", "),
             self.dir.display()
         ))
