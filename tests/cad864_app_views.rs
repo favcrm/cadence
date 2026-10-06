@@ -1196,3 +1196,442 @@ fn record_params_without_profile(params: &Value) -> Value {
         "record_id": params["record_id"]
     })
 }
+
+const CAPTION_CONTEXT_REQUIRED: &str = "a caption-runs read needs its live context";
+
+fn write_caption_context_package(w: &Workspace) {
+    let source = w.source();
+    std::fs::remove_dir_all(&source).unwrap();
+    std::fs::create_dir_all(source.join("views")).unwrap();
+    std::fs::create_dir_all(source.join("bindings")).unwrap();
+    std::fs::create_dir_all(source.join("workflows")).unwrap();
+    std::fs::write(
+        source.join("app.md"),
+        r#"---
+app: social-content
+title: Caption context test
+version: 1.0.0
+summary: Test-seam fixture for scoped caption-run reads.
+needs:
+  connections: []
+  views:
+    contract: app-views/v1
+  bindings:
+    contract: app-bindings/v1
+---
+
+A local-only test package exposing Social Content caption-run metadata.
+"#,
+    )
+    .unwrap();
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    std::fs::copy(
+        manifest_dir.join("apps/social-content/views/app-views-v1.json"),
+        source.join("views/app-views-v1.json"),
+    )
+    .unwrap();
+    // The versioned contract example includes both list and show bindings;
+    // the shipped app file currently enables list only.
+    std::fs::copy(
+        manifest_dir.join("contracts/app-bindings/v1/examples/social-content.json"),
+        source.join("bindings/app-bindings-v1.json"),
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("workflows/caption-context-probe.md"),
+        r#"---
+title: "Caption context probe: {{subject}}"
+goal: "Persist a host-produced row for the scoped read acceptance"
+label: Caption context probe
+inputs:
+  subject: { ask: "Metadata label for this test run" }
+  writer: { ask: "Registered local worker" }
+---
+
+## Persist caption metadata: {{subject}}
+agent: {{writer}}
+size: S
+action: local.text.produce
+
+Create only the local host run record used by the context-scope check.
+
+### Acceptance
+- [ ] The run row retains this subject and its installation context.
+"#,
+    )
+    .unwrap();
+}
+
+fn plant_caption_context_team(w: &Workspace) {
+    let store = Store::open(&w.state.join("cadence.sqlite3")).unwrap();
+    let cwd = w._root.path().to_str().unwrap();
+    for (alias, role, params) in [
+        ("cad867-caption-owner", "pm", None),
+        (
+            "cad867-caption-writer",
+            "worker",
+            Some("{\"upstream\":\"cad867-caption-owner\"}"),
+        ),
+    ] {
+        store
+            .register_agent(&cadence_agent::store::NewAgent {
+                alias,
+                provider: "claude",
+                endpoint_kind: "managed",
+                role,
+                cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        store
+            .set_identity(
+                alias,
+                &cadence_agent::adapter::Identity {
+                    thread_id: format!("test-{alias}"),
+                    session_id: format!("session-{alias}"),
+                    model: None,
+                    effort: None,
+                    pid: std::process::id(),
+                    endpoint: None,
+                    generation: Some("cad867-caption-context-fixture".into()),
+                    attach: None,
+                },
+            )
+            .unwrap();
+    }
+}
+
+fn caption_read_params(
+    receipt: &Value,
+    view: &str,
+    op: &str,
+    context_id: Option<&str>,
+    record_id: Option<&str>,
+) -> Value {
+    let mut params = json!({
+        "install_id": receipt["install_id"],
+        "view_id": view,
+        "op": op,
+        "digest": receipt["digest"],
+        "view_descriptor_digest": receipt["view_descriptor_digest"],
+        "view_binding_digest": receipt["view_binding_digest"]
+    });
+    if let Some(context_id) = context_id {
+        params["context_id"] = json!(context_id);
+    }
+    if let Some(record_id) = record_id {
+        params["record_id"] = json!(record_id);
+    }
+    params
+}
+
+fn caption_read_path(
+    receipt: &Value,
+    view: &str,
+    context_id: Option<&str>,
+    record_id: Option<&str>,
+) -> String {
+    let install_id = receipt["install_id"].as_str().unwrap();
+    let route = record_id
+        .map(|record_id| format!("rows/{record_id}"))
+        .unwrap_or_else(|| "rows".to_string());
+    let context = context_id
+        .map(|context_id| format!("&context_id={context_id}"))
+        .unwrap_or_default();
+    format!(
+        "/api/app-installations/{install_id}/views/{view}/{route}?digest={}&descriptor={}&binding={}{context}",
+        receipt["digest"].as_str().unwrap(),
+        receipt["view_descriptor_digest"].as_str().unwrap(),
+        receipt["view_binding_digest"].as_str().unwrap()
+    )
+}
+
+#[test]
+fn cad867_caption_runs_require_live_context_on_rpc_and_http() {
+    const SUBJECT_A: &str = "CAD867_CONTEXT_A_CANARY";
+    const SUBJECT_B: &str = "CAD867_CONTEXT_B_CANARY";
+
+    let w = Workspace::new();
+    write_caption_context_package(&w);
+    let installed = w.install().unwrap_or_else(|error| {
+        panic!("caption-run scope fixture did not install: {error}");
+    });
+    let install_id = installed["install_id"].as_str().unwrap().to_string();
+    let receipt = w.show(&install_id);
+    for pin in ["digest", "view_descriptor_digest", "view_binding_digest"] {
+        assert!(receipt[pin]
+            .as_str()
+            .is_some_and(|value| value.starts_with("sha256:")));
+    }
+    let approved = w.op(
+        "app_local_install_approve",
+        json!({"install_id": install_id, "digest": receipt["digest"]}),
+    );
+    assert_eq!(approved["approved"], true);
+    plant_caption_context_team(&w);
+
+    let make_context = |request_id: &str| {
+        w.op(
+            "app_context_create",
+            json!({
+                "install_id": install_id,
+                "label": "CAD-867 caption scope acceptance",
+                "input_defaults": {},
+                "request_id": request_id
+            }),
+        )["context"]["id"]
+            .as_str()
+            .expect("host context creation returned an id")
+            .to_string()
+    };
+    let context_a = make_context("cad867-caption-context-a");
+    let context_b = make_context("cad867-caption-context-b");
+    let make_run = |context: &str, subject: &str, request_id: &str| {
+        w.op(
+            "app_run_create",
+            json!({
+                "install_id": install_id,
+                "context_id": context,
+                "workflow": "caption-context-probe",
+                "inputs": {
+                    "subject": subject,
+                    "writer": "cad867-caption-writer"
+                },
+                "request_id": request_id,
+                "owner_pm": "cad867-caption-owner"
+            }),
+        )
+    };
+    let run_a = make_run(&context_a, SUBJECT_A, "cad867-caption-run-context-a");
+    let run_b = make_run(&context_b, SUBJECT_B, "cad867-caption-run-context-b");
+    assert_ne!(run_a["id"], run_b["id"]);
+    assert_eq!(run_a["context_id"], json!(context_a));
+    assert_eq!(run_b["context_id"], json!(context_b));
+
+    // These valid same-install producer rows prove context filtering and
+    // show authorization before any omitted-context request is judged.
+    for (context, expected_id, other_id, subject) in [
+        (&context_a, &run_a["id"], &run_b["id"], SUBJECT_A),
+        (&context_b, &run_b["id"], &run_a["id"], SUBJECT_B),
+    ] {
+        let list = w
+            .rpc(
+                Asserted::Operator,
+                "app_view_read",
+                caption_read_params(&receipt, "caption-runs", "list", Some(context), None),
+            )
+            .unwrap_or_else(|error| panic!("valid scoped RPC list refused: {error}"));
+        assert_eq!(list["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(list["rows"][0]["id"], *expected_id);
+        assert_ne!(list["rows"][0]["id"], *other_id);
+        assert_eq!(list["rows"][0]["subject"], json!(subject));
+        for pin in ["digest", "view_descriptor_digest", "view_binding_digest"] {
+            assert_eq!(list[pin], receipt[pin]);
+        }
+    }
+    let rpc_show_a = w
+        .rpc(
+            Asserted::Operator,
+            "app_view_read",
+            caption_read_params(
+                &receipt,
+                "caption-detail",
+                "show",
+                Some(&context_a),
+                run_a["id"].as_str(),
+            ),
+        )
+        .unwrap_or_else(|error| panic!("valid scoped RPC show refused: {error}"));
+    assert_eq!(rpc_show_a["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(rpc_show_a["rows"][0]["id"], run_a["id"]);
+    assert_eq!(rpc_show_a["rows"][0]["subject"], json!(SUBJECT_A));
+    let rpc_cross_context_show = w.rpc(
+        Asserted::Operator,
+        "app_view_read",
+        caption_read_params(
+            &receipt,
+            "caption-detail",
+            "show",
+            Some(&context_a),
+            run_b["id"].as_str(),
+        ),
+    );
+    let rpc_cross_context_error = rpc_cross_context_show
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert!(
+        rpc_cross_context_error.contains("run does not belong to this context"),
+        "explicit-context RPC show did not enforce context ownership"
+    );
+    for marker in [run_b["id"].as_str().unwrap(), SUBJECT_B] {
+        assert!(!rpc_cross_context_error.contains(marker));
+    }
+
+    let lease = test_port();
+    let port = lease.port;
+    let board_stop = Arc::new(AtomicBool::new(false));
+    let board = board_on(&w.state, &w.pm.dir, port, &board_stop);
+    struct CaptionBoardCleanup(
+        Arc<AtomicBool>,
+        Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
+    );
+    impl Drop for CaptionBoardCleanup {
+        fn drop(&mut self) {
+            self.0.store(true, SeqCst);
+            if let Some(board) = self.1.take() {
+                let _ = board.join();
+            }
+        }
+    }
+    let _board_cleanup = CaptionBoardCleanup(board_stop, Some(board));
+    let (cookie, session_key) = sign_in(&w.state, port);
+    let session = Some((cookie.as_str(), session_key.as_str()));
+
+    for (context, expected_id, other_id, subject) in [
+        (&context_a, &run_a["id"], &run_b["id"], SUBJECT_A),
+        (&context_b, &run_b["id"], &run_a["id"], SUBJECT_B),
+    ] {
+        let path = caption_read_path(&receipt, "caption-runs", Some(context), None);
+        let (status, _, body) = get_as(&w.state, port, Some("operator"), session, &path);
+        assert_eq!(status, 200, "valid scoped HTTP list refused");
+        let list: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(list["rows"][0]["id"], *expected_id);
+        assert_ne!(list["rows"][0]["id"], *other_id);
+        assert_eq!(list["rows"][0]["subject"], json!(subject));
+        for pin in ["digest", "view_descriptor_digest", "view_binding_digest"] {
+            assert_eq!(list[pin], receipt[pin]);
+        }
+    }
+    let path = caption_read_path(
+        &receipt,
+        "caption-detail",
+        Some(&context_a),
+        run_a["id"].as_str(),
+    );
+    let (status, _, body) = get_as(&w.state, port, Some("operator"), session, &path);
+    assert_eq!(status, 200, "valid scoped HTTP show refused");
+    let http_show_a: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(http_show_a["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(http_show_a["rows"][0]["id"], run_a["id"]);
+    assert_eq!(http_show_a["rows"][0]["subject"], json!(SUBJECT_A));
+    let path = caption_read_path(
+        &receipt,
+        "caption-detail",
+        Some(&context_a),
+        run_b["id"].as_str(),
+    );
+    let (status, _, body) = get_as(&w.state, port, Some("operator"), session, &path);
+    assert_eq!(status, 400, "cross-context HTTP show was not refused");
+    assert!(body.contains("app view read refused or unavailable"));
+    assert!(!body.contains(run_b["id"].as_str().unwrap()));
+    assert!(!body.contains(SUBJECT_B));
+
+    let omitted_rpc_list = w.rpc(
+        Asserted::Operator,
+        "app_view_read",
+        caption_read_params(&receipt, "caption-runs", "list", None, None),
+    );
+    let omitted_rpc_show = w.rpc(
+        Asserted::Operator,
+        "app_view_read",
+        caption_read_params(
+            &receipt,
+            "caption-detail",
+            "show",
+            None,
+            run_b["id"].as_str(),
+        ),
+    );
+    let omitted_http_list_path = caption_read_path(&receipt, "caption-runs", None, None);
+    let omitted_http_show_path =
+        caption_read_path(&receipt, "caption-detail", None, run_b["id"].as_str());
+    let (omitted_http_list_status, _, omitted_http_list_body) = get_as(
+        &w.state,
+        port,
+        Some("operator"),
+        session,
+        &omitted_http_list_path,
+    );
+    let (omitted_http_show_status, _, omitted_http_show_body) = get_as(
+        &w.state,
+        port,
+        Some("operator"),
+        session,
+        &omitted_http_show_path,
+    );
+
+    // Gather every omitted-context outcome before failing, so one RED
+    // run reports both peers and both operations without printing rows.
+    let mut failures = Vec::new();
+    for (label, result) in [
+        ("RPC list", &omitted_rpc_list),
+        ("RPC show", &omitted_rpc_show),
+    ] {
+        match result {
+            Err(error) => {
+                let text = error.to_string();
+                if !text.contains(CAPTION_CONTEXT_REQUIRED) {
+                    failures.push(format!("{label} refused for an unrelated reason"));
+                }
+                if [
+                    run_a["id"].as_str().unwrap(),
+                    run_b["id"].as_str().unwrap(),
+                    SUBJECT_A,
+                    SUBJECT_B,
+                ]
+                .iter()
+                .any(|marker| text.contains(marker))
+                {
+                    failures.push(format!("{label} refusal disclosed a run marker"));
+                }
+            }
+            Ok(value) => {
+                let count = value["rows"].as_array().map_or(0, Vec::len);
+                failures.push(format!(
+                    "{label} accepted omitted context and returned {count} row(s)"
+                ));
+            }
+        }
+    }
+    for (label, status, body) in [
+        (
+            "HTTP list",
+            omitted_http_list_status,
+            &omitted_http_list_body,
+        ),
+        (
+            "HTTP show",
+            omitted_http_show_status,
+            &omitted_http_show_body,
+        ),
+    ] {
+        if status != 400 || !body.contains("app view read refused or unavailable") {
+            failures.push(format!(
+                "{label} omitted-context request did not return generic 400"
+            ));
+        }
+        if [
+            run_a["id"].as_str().unwrap(),
+            run_b["id"].as_str().unwrap(),
+            SUBJECT_A,
+            SUBJECT_B,
+        ]
+        .iter()
+        .any(|marker| body.contains(marker))
+        {
+            failures.push(format!("{label} refusal disclosed a run marker"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "caption-runs omitted-context guard failed: {}",
+        failures.join("; ")
+    );
+}
