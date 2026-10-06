@@ -195,7 +195,14 @@ fn dispatch_protected_request(request: policy::Request) -> std::io::Result<prote
     }
 }
 #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
-fn dispatch_protected_request(_: policy::Request) -> std::io::Result<std::convert::Infallible> {
+fn dispatch_protected_request(
+    request: policy::Request,
+) -> std::io::Result<std::convert::Infallible> {
+    if let policy::Request::PiGuest(profile) = request {
+        profile
+            .selection()
+            .map_err(|why| std::io::Error::new(std::io::ErrorKind::PermissionDenied, why))?;
+    }
     Err(std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
         "protected Pi launch requires Linux x86_64 constructor custody; unsupported target refused",
