@@ -121,7 +121,6 @@ export default function Connections({
   const canWrite = viewer.operator && !viewer.readOnly;
   const rows = listState?.data ?? [];
   const providers = providersState?.data ?? [];
-  const current = rows.find((r) => r.id === selected) ?? null;
   const refresh = () => {
     if (listRes) void listRes.revalidate();
     if (providersRes) void providersRes.revalidate();
@@ -231,26 +230,18 @@ export default function Connections({
                     group={group}
                     canWrite={canWrite}
                     selected={selected}
+                    providers={providers}
                     onSelect={(id) =>
                       setSelected((cur) => (cur === id ? null : id))
                     }
                     onSetup={() => canWrite && setAdding(group.provider)}
+                    onChanged={refresh}
+                    onRevoked={() => {
+                      setSelected(null);
+                      refresh();
+                    }}
                   />
                 ))
-              )}
-              {current && (
-                <ConnectionDetail
-                  key={current.id}
-                  row={current}
-                  provider={providers.find((p) => p.provider === current.provider) ?? null}
-                  capabilities={connectionCapabilities(providers, current.provider)}
-                  canWrite={canWrite}
-                  onChanged={refresh}
-                  onRevoked={() => {
-                    setSelected(null);
-                    refresh();
-                  }}
-                />
               )}
             </div>
           )}
@@ -269,14 +260,20 @@ function ServiceSection({
   group,
   canWrite,
   selected,
+  providers,
   onSelect,
   onSetup,
+  onChanged,
+  onRevoked,
 }: {
   group: ServiceGroup;
   canWrite: boolean;
   selected: string | null;
+  providers: ConnectionProvider[];
   onSelect: (id: string) => void;
   onSetup: () => void;
+  onChanged: () => void;
+  onRevoked: () => void;
 }) {
   const support = enrollmentSupport(group.info);
   return (
@@ -342,6 +339,19 @@ function ServiceSection({
                   {readinessText(row)}
                 </span>
               </button>
+              {/* The account's own actions and detail expand in place —
+                 mockup C keeps the applicable actions on the selected
+                 account rather than on a detached panel. */}
+              {selected === row.id && (
+                <ConnectionDetail
+                  row={row}
+                  provider={providers.find((p) => p.provider === row.provider) ?? null}
+                  capabilities={connectionCapabilities(providers, row.provider)}
+                  canWrite={canWrite}
+                  onChanged={onChanged}
+                  onRevoked={onRevoked}
+                />
+              )}
             </li>
           ))}
         </ul>
