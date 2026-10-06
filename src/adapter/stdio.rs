@@ -10,7 +10,7 @@
 //! flips `disconnected` and resolves every pending request with
 //! `OutcomeUnknown` — callers must not retry blindly.
 
-#[cfg(all(unix, target_os = "linux"))]
+#[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -115,21 +115,21 @@ pub struct StdioAdapter {
 
 enum PipeInput {
     Local(ChildStdin),
-    #[cfg(all(unix, target_os = "linux"))]
+    #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
     Protected(File),
 }
 impl Write for PipeInput {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Local(pipe) => pipe.write(bytes),
-            #[cfg(all(unix, target_os = "linux"))]
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
             Self::Protected(pipe) => pipe.write(bytes),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Self::Local(pipe) => pipe.flush(),
-            #[cfg(all(unix, target_os = "linux"))]
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
             Self::Protected(pipe) => pipe.flush(),
         }
     }
@@ -138,14 +138,14 @@ impl AsRawFd for PipeInput {
     fn as_raw_fd(&self) -> RawFd {
         match self {
             Self::Local(pipe) => pipe.as_raw_fd(),
-            #[cfg(all(unix, target_os = "linux"))]
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
             Self::Protected(pipe) => pipe.as_raw_fd(),
         }
     }
 }
 struct Inner {
     child: Option<Child>,
-    #[cfg(all(unix, target_os = "linux"))]
+    #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
     remote: Option<Arc<crate::protected_pi_profile::authority::RemoteControl>>,
 }
 
@@ -185,7 +185,7 @@ impl StdioAdapter {
             on_disconnect,
             inner: Mutex::new(Inner {
                 child: None,
-                #[cfg(all(unix, target_os = "linux"))]
+                #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
                 remote: None,
             }),
             stdin: Mutex::new(None),
@@ -261,7 +261,7 @@ impl StdioAdapter {
 
     /// Adopt ONLY the fixed root-created helper's validated stdio and retained
     /// finite control channel. No local SUID exec, PID adoption or signal path.
-    #[cfg(all(unix, target_os = "linux"))]
+    #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn adopt_protected(
         self: &Arc<Self>,
         launch: crate::protected_pi_profile::authority::RemoteLaunch,
@@ -439,7 +439,7 @@ impl StdioAdapter {
 
     pub fn pid(&self) -> Option<u32> {
         let inner = self.inner.lock().unwrap();
-        #[cfg(all(unix, target_os = "linux"))]
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
         if let Some(remote) = &inner.remote {
             return Some(remote.pid());
         }
@@ -466,7 +466,7 @@ impl StdioAdapter {
     /// Interrupt the running turn without killing the process (SIGINT
     /// to the provider's own process group).
     pub fn interrupt(&self) {
-        #[cfg(all(unix, target_os = "linux"))]
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
         {
             let remote = self.inner.lock().unwrap().remote.clone();
             if let Some(remote) = remote {
@@ -503,7 +503,7 @@ impl StdioAdapter {
     /// Poll for child exit up to `timeout`; true when the process ended.
     pub fn wait_exit(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
-        #[cfg(all(unix, target_os = "linux"))]
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
         {
             let remote = self.inner.lock().unwrap().remote.clone();
             if let Some(remote) = remote {
@@ -541,7 +541,7 @@ impl StdioAdapter {
     /// Graceful terminate, then kill — scoped to this adapter's own process
     /// group only.
     pub fn close(&self) {
-        #[cfg(all(unix, target_os = "linux"))]
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
         {
             let remote = self.inner.lock().unwrap().remote.clone();
             if let Some(remote) = remote {

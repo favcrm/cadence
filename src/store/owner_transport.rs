@@ -12,14 +12,19 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+#[cfg(target_os = "linux")]
 const ENDPOINT: &str = "/run/cadence/private/store-owner.sock";
+#[cfg(target_os = "linux")]
 const OWNER_UID: u32 = 21000;
 // ROOT creates/listens before handing an accepted FD to an optional sealed
 // proxy. SO_PEERCRED identifies that listener, not the socket inode's owner.
 // This authenticates transport only; the service must retain real caller
 // custody, qualified runtime scope and actual durable external facts.
+#[cfg(target_os = "linux")]
 const SERVER_UID: u32 = 0;
+#[cfg(target_os = "linux")]
 const SERVER_GID: u32 = 0;
+#[cfg(target_os = "linux")]
 const MAX_FRAME: usize = 32 * 1024;
 const IO_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -29,6 +34,7 @@ enum Request<'a> {
     /// No caller fields: the authenticated owner elects the current startup
     /// purpose, DB binding and durable grant reference for this enrolled peer.
     Startup { version: u8, sequence: u64 },
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     Acquire {
         version: u8,
         sequence: u64,
@@ -140,6 +146,7 @@ impl StoreOwnerGrant {
         Self::issued(channel, response)
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn acquire(binding: Binding) -> Result<Self> {
         binding.validate()?;
         if binding.path != super::DATABASE_PATH {
