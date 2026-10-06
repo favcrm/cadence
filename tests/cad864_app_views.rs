@@ -1533,6 +1533,128 @@ fn cad867_caption_runs_require_live_context_on_rpc_and_http() {
     assert!(!body.contains(run_b["id"].as_str().unwrap()));
     assert!(!body.contains(SUBJECT_B));
 
+    let context_b_before_archive = w.op(
+        "app_context_show",
+        json!({"install_id": install_id, "context_id": context_b}),
+    );
+    assert_eq!(context_b_before_archive["context"]["state"], "active");
+    let archived_context = w.op(
+        "app_context_archive",
+        json!({
+            "install_id": install_id,
+            "context_id": context_b,
+            "expected_revision": context_b_before_archive["context"]["revision"]
+        }),
+    );
+    assert_eq!(archived_context["context"]["state"], "archived");
+    let shown_archived_context = w.op(
+        "app_context_show",
+        json!({"install_id": install_id, "context_id": context_b}),
+    );
+    assert_eq!(shown_archived_context["context"]["state"], "archived");
+
+    let archived_rpc_list = w.rpc(
+        Asserted::Operator,
+        "app_view_read",
+        caption_read_params(&receipt, "caption-runs", "list", Some(&context_b), None),
+    );
+    let archived_rpc_show = w.rpc(
+        Asserted::Operator,
+        "app_view_read",
+        caption_read_params(
+            &receipt,
+            "caption-detail",
+            "show",
+            Some(&context_b),
+            run_b["id"].as_str(),
+        ),
+    );
+    let archived_http_list_path =
+        caption_read_path(&receipt, "caption-runs", Some(&context_b), None);
+    let archived_http_show_path = caption_read_path(
+        &receipt,
+        "caption-detail",
+        Some(&context_b),
+        run_b["id"].as_str(),
+    );
+    let (archived_http_list_status, _, archived_http_list_body) = get_as(
+        &w.state,
+        port,
+        Some("operator"),
+        session,
+        &archived_http_list_path,
+    );
+    let (archived_http_show_status, _, archived_http_show_body) = get_as(
+        &w.state,
+        port,
+        Some("operator"),
+        session,
+        &archived_http_show_path,
+    );
+
+    let mut archived_failures = Vec::new();
+    for (label, result) in [
+        ("RPC list", &archived_rpc_list),
+        ("RPC show", &archived_rpc_show),
+    ] {
+        match result {
+            Err(error) => {
+                let text = error.to_string();
+                if [
+                    run_a["id"].as_str().unwrap(),
+                    run_b["id"].as_str().unwrap(),
+                    SUBJECT_A,
+                    SUBJECT_B,
+                ]
+                .iter()
+                .any(|marker| text.contains(marker))
+                {
+                    archived_failures.push(format!("{label} refusal disclosed a run marker"));
+                }
+            }
+            Ok(value) => {
+                let count = value["rows"].as_array().map_or(0, Vec::len);
+                archived_failures.push(format!(
+                    "{label} accepted archived context and returned {count} row(s)"
+                ));
+            }
+        }
+    }
+    for (label, status, body) in [
+        (
+            "HTTP list",
+            archived_http_list_status,
+            &archived_http_list_body,
+        ),
+        (
+            "HTTP show",
+            archived_http_show_status,
+            &archived_http_show_body,
+        ),
+    ] {
+        if status != 400 || !body.contains("app view read refused or unavailable") {
+            archived_failures.push(format!(
+                "{label} archived-context request did not return generic 400"
+            ));
+        }
+        if [
+            run_a["id"].as_str().unwrap(),
+            run_b["id"].as_str().unwrap(),
+            SUBJECT_A,
+            SUBJECT_B,
+        ]
+        .iter()
+        .any(|marker| body.contains(marker))
+        {
+            archived_failures.push(format!("{label} refusal disclosed a run marker"));
+        }
+    }
+    assert!(
+        archived_failures.is_empty(),
+        "archived-context read guard failed: {}",
+        archived_failures.join("; ")
+    );
+
     let omitted_rpc_list = w.rpc(
         Asserted::Operator,
         "app_view_read",
