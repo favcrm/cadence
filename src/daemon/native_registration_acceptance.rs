@@ -83,4 +83,245 @@ fn native_registration_changed_model_refuses_without_row_or_cache_repair() {
         before_version,
         "refusal committed a database/model/history mutation"
     );
+
+    // Additive four-P2 DATA coverage. Never turn creation timestamps, detached
+    // states or message rows into a native family/currentness certificate.
+    assert!(first.created.is_finite() && first.created > 0.0);
+    assert_eq!(registrations.created.len(), 1);
+    assert_eq!(registrations.created.get(alias), Some(&first.created));
+
+    fn refuse_unchanged(
+        registrations: &mut Registrations<'_>,
+        observer: &Connection,
+        alias: &str,
+        cwd: &str,
+        election: &str,
+        expected: &str,
+    ) {
+        let store = registrations.store;
+        let rows = format!("{:?}", store.agents().unwrap());
+        let history = format!("{:?}", store.messages(alias).unwrap());
+        let aliases = registrations.aliases.clone();
+        let created = registrations.created.clone();
+        let version: i64 = observer
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap();
+        match registrations.select(alias, cwd, election) {
+            Err(crate::Error::Rejected(message)) => assert_eq!(message, expected),
+            _ => panic!("native refusal did not reach intended boundary: {expected}"),
+        }
+        assert_eq!(
+            format!("{:?}", store.agents().unwrap()),
+            rows,
+            "refusal changed registry rows"
+        );
+        assert_eq!(
+            format!("{:?}", store.messages(alias).unwrap()),
+            history,
+            "refusal reconciled/deleted/changed history"
+        );
+        assert_eq!(
+            registrations.aliases, aliases,
+            "refusal changed remembered aliases"
+        );
+        assert_eq!(
+            registrations.created, created,
+            "refusal adopted a new creation witness"
+        );
+        assert_eq!(
+            observer
+                .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            version,
+            "refusal committed a write/history repair"
+        );
+    }
+
+    // Each negative has its own genuinely registered row. Setup commits occur
+    // BEFORE observation; no reset/reconcile is needed to make another case run.
+    for (fenced_alias, state, error) in [
+        ("native-guard-attention", "attention", None),
+        (
+            "native-guard-error",
+            "stopped",
+            Some("retained registration error"),
+        ),
+    ] {
+        let original = registrations.select(fenced_alias, cwd, election).unwrap();
+        store
+            .enqueue(
+                fenced_alias,
+                "保留歷史🔎",
+                None,
+                &format!("{fenced_alias}-history"),
+                "cli",
+            )
+            .unwrap();
+        store
+            .set_state_detached(fenced_alias, state, error)
+            .unwrap();
+        let fenced = store.agent(fenced_alias).unwrap();
+        assert_eq!(fenced.created, original.created);
+        assert_eq!(fenced.state, state);
+        assert_eq!(fenced.error.as_deref(), error);
+        assert!(!store.has_unknown(fenced_alias).unwrap());
+        assert!(
+            fenced.enabled
+                && fenced.pid.is_none()
+                && fenced.endpoint.is_none()
+                && fenced.generation.is_none()
+        );
+        refuse_unchanged(
+            &mut registrations,
+            &observer,
+            fenced_alias,
+            cwd,
+            election,
+            "native saved registration is fenced",
+        );
+    }
+
+    // Genuine non-nudge UNKNOWN through Store's durable lifecycle APIs, not
+    // a fake has_unknown callback or direct SQL state injection. The row itself
+    // stays starting/error-free, so the history predicate is the refusing gate.
+    let unknown_alias = "native-guard-unknown";
+    registrations.select(unknown_alias, cwd, election).unwrap();
+    let message_id = "native-guard-unknown-message";
+    store
+        .enqueue(unknown_alias, "實際 DATA 歷史🔎", None, message_id, "cli")
+        .unwrap();
+    store
+        .mark_running(message_id, "data-turn-marker-not-provider-proof")
+        .unwrap();
+    store
+        .orphan_running(unknown_alias, "durable uncertain DATA outcome")
+        .unwrap();
+    let uncertain = store.message(message_id).unwrap().unwrap();
+    assert_eq!(uncertain.state, "unknown");
+    assert_ne!(uncertain.source, "nudge");
+    assert_eq!(
+        store.unknown_messages(unknown_alias).unwrap(),
+        vec![message_id.to_owned()]
+    );
+    assert!(store.has_unknown(unknown_alias).unwrap());
+    let agent = store.agent(unknown_alias).unwrap();
+    assert_eq!(agent.state, "starting");
+    assert!(
+        agent.enabled
+            && agent.error.is_none()
+            && agent.pid.is_none()
+            && agent.endpoint.is_none()
+            && agent.generation.is_none()
+    );
+    refuse_unchanged(
+        &mut registrations,
+        &observer,
+        unknown_alias,
+        cwd,
+        election,
+        "native saved registration is fenced",
+    );
+
+    // Real stop/removal/re-registration ABA; no invented row-incarnation or
+    // timestamp setter. The cache must retain the FIRST committed witness.
+    let aba_alias = "native-guard-aba";
+    let original = registrations.select(aba_alias, cwd, election).unwrap();
+    assert!(original.created.is_finite() && original.created > 0.0);
+    store
+        .set_state_detached(aba_alias, "stopped", None)
+        .unwrap();
+    assert!(store
+        .remove_agent(
+            aba_alias,
+            false,
+            &json!({"by":"DATA acceptance","by_kind":"test"})
+        )
+        .unwrap()
+        .is_empty());
+    assert!(store.agent(aba_alias).is_err());
+    store
+        .register_agent(&super::registration(aba_alias, cwd, election))
+        .unwrap();
+    let replacement = store.agent(aba_alias).unwrap();
+    assert!(replacement.created.is_finite() && replacement.created > 0.0);
+    assert_ne!(
+        replacement.created, original.created,
+        "ABA setup did not produce a distinct real creation witness"
+    );
+    assert_eq!(replacement.provider, original.provider);
+    assert_eq!(replacement.endpoint_kind, original.endpoint_kind);
+    assert_eq!(replacement.role, original.role);
+    assert_eq!(replacement.sandbox, original.sandbox);
+    assert_eq!(replacement.params, original.params);
+    assert_eq!(replacement.cwd, original.cwd);
+    assert_eq!(replacement.state, "starting");
+    assert!(replacement.enabled && replacement.error.is_none());
+    assert!(replacement.instructions.is_none() && replacement.team_role.is_none());
+    assert!(
+        replacement.thread_id.is_none()
+            && replacement.session_id.is_none()
+            && replacement.model.is_none()
+            && replacement.effort.is_none()
+            && replacement.pid.is_none()
+            && replacement.pid_start.is_none()
+            && replacement.endpoint.is_none()
+            && replacement.generation.is_none()
+    );
+    assert!(!store.has_unknown(aba_alias).unwrap());
+    assert_eq!(
+        registrations.created.get(aba_alias),
+        Some(&original.created)
+    );
+    refuse_unchanged(
+        &mut registrations,
+        &observer,
+        aba_alias,
+        cwd,
+        election,
+        "native saved registration continuity lost",
+    );
+
+    // Actual native pre-effect identifier guard and select ingress. Unicode is
+    // still message/prompt DATA, not a normalized/truncated registry identity.
+    let longest = "a".repeat(64);
+    for valid in ["a", "worker-9", longest.as_str()] {
+        super::require_task_alias(valid).unwrap();
+    }
+    let too_long = "a".repeat(65);
+    for invalid in [
+        "",
+        "合成研究員🔎",
+        too_long.as_str(),
+        "Upper",
+        "two words",
+        "under_score",
+        "-leading",
+    ] {
+        let rows = format!("{:?}", store.agents().unwrap());
+        let aliases = registrations.aliases.clone();
+        let created = registrations.created.clone();
+        let version: i64 = observer
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap();
+        let expected = "native task alias must be 1-64 lowercase letters, digits or hyphens and not start with '-'";
+        for refusal in [
+            super::require_task_alias(invalid),
+            registrations.select(invalid, cwd, election).map(|_| ()),
+        ] {
+            match refusal {
+                Err(crate::Error::Rejected(message)) => assert_eq!(message, expected),
+                _ => panic!("incompatible alias bypassed real native identifier guard"),
+            }
+        }
+        assert_eq!(format!("{:?}", store.agents().unwrap()), rows);
+        assert_eq!(registrations.aliases, aliases);
+        assert_eq!(registrations.created, created);
+        assert_eq!(
+            observer
+                .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            version,
+            "invalid alias registered/deleted/changed history"
+        );
+    }
 }
