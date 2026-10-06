@@ -692,7 +692,12 @@ the `Issue: <ID>` trailer — as JSON.
   setup and expose `setup-failed`/interrupted records instead of inferring
   ownership from a name or directory prefix. Issue refs remain authoritative
   for development lanes. Review and validation callers use the same ledger
-  for exact-SHA ownership and explicit `released`/`retained` state.
+  for exact-SHA ownership and explicit `released`/`retained` state. Retained,
+  released and releasing lanes are not implicitly reactivated by open issue
+  refs. A present released checkout is recoverable only through explicit
+  `checkout resume`; retained checkouts must first be explicitly released.
+  The ledger lock spans destructive release and its final state write so a
+  concurrent retain cannot be ignored.
 - `cadence issue checkout inventory --repo <repo>` emits one structured,
   read-only `cadence.worktree-inventory/1` report, including the repo-scoped
   merged-lane and idle-cache cleanup plan. Unknown linked trees are
@@ -700,10 +705,19 @@ the `Issue: <ID>` trailer — as JSON.
   ```sh
   cadence issue checkout adopt --repo <repo> --path <path> \
     --purpose validation --tool <tool> --owner <owner> --pinned-sha <full-sha>
+  cadence issue checkout resume --repo <repo> --path <path> \
+    --pinned-sha <full-sha> --reason "<reason>"
   ```
   Adoption validates the Git common directory and exact HEAD. `checkout release`
   and `checkout retain` only record the disposition — they never delete a
-  checkout, branch, receipt or artifact.
+  checkout, branch, receipt or artifact; retain applies only to active records.
+  Resume accepts only an existing, exactly registered `released` checkout at
+  its recorded branch/detached state and supplied full SHA. It never resets Git
+  or writes issue refs; development may advance only on its recorded branch.
+  To recover an interrupted `releasing` record, inspect it and explicitly run
+  `checkout release --reason "<verified recovery reason>"` after the release lock
+  is available, then resume at the verified current SHA. No automatic recovery
+  or cleanup is performed.
 - `cadence issue reclaim` is a read-only plan by default. It reports the
   merged-lane sweep and idle lane-local target cache estimates using the same
   guards as the scheduled pass; `--apply` opts into only the existing finish
@@ -714,7 +728,8 @@ the `Issue: <ID>` trailer — as JSON.
   the CAD-42 `Issue:`/`Actor:` trailers under subject
   `<ID>: start <branch>`.
 - One issue, one lane (CAD-274): when the issue already has exactly
-  one open worktree ref, `issue start` reuses that lane — with or
+  one open worktree ref, `issue start` reuses that lane only if its
+  lifecycle record is not retained, released or releasing — with or
   without `--name`, and even after the title (hence the default slug)
   changed. It re-applies the cargo target config, re-attaches the
   branch if the dir was removed, and returns `created: false`; no

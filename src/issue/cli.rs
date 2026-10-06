@@ -46,7 +46,7 @@ pub enum CheckoutAction {
         #[arg(long = "rollback-artifact")]
         rollback_artifacts: Vec<String>,
     },
-    /// Record completion without deleting the checkout or its artifacts.
+    /// Explicitly release or resolve an interrupted release without deleting checkout data.
     Release {
         #[arg(long)]
         repo: PathBuf,
@@ -55,7 +55,18 @@ pub enum CheckoutAction {
         #[arg(long)]
         reason: String,
     },
-    /// Explicitly retain an active or released checkout for investigation.
+    /// Explicitly resume a released checkout at its exact current HEAD.
+    Resume {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        pinned_sha: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Explicitly retain an active checkout for investigation.
     Retain {
         #[arg(long)]
         repo: PathBuf,
@@ -908,6 +919,19 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 crate::worktree::lifecycle::transition(repo, path, "released", Some(reason))?;
                 print_json(&json!({"path": path, "state": "released", "reason": reason,
                     "deletion": "not-performed"}));
+                Ok(0)
+            }
+            CheckoutAction::Resume {
+                repo,
+                path,
+                pinned_sha,
+                reason,
+            } => {
+                crate::worktree::lifecycle::resume(repo, path, pinned_sha, reason)?;
+                print_json(
+                    &json!({"path": path, "state": "active", "pinned_sha": pinned_sha,
+                    "reason": reason, "deletion": "not-performed"}),
+                );
                 Ok(0)
             }
             CheckoutAction::Retain { repo, path, reason } => {

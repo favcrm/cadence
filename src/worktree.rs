@@ -86,14 +86,7 @@ pub(crate) fn validate_registered_branch(root: &Path, lane: &Path, branch: &str)
             root.display()
         )));
     }
-    if git(
-        &actual_path,
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    )
-    .ok()
-    .as_deref()
-        != Some(branch)
-    {
+    if crate::issue::finish::git_branch(&actual_path)?.as_deref() != Some(branch) {
         return Err(Error::rejected(format!(
             "Worktree {} is not checked out on expected branch {} — refusing reuse",
             lane.display(),

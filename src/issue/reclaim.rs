@@ -353,6 +353,8 @@ pub enum ReclaimTestProcessUse {
     CompleteNoUse,
     /// A partial scan that could not enumerate all process use.
     Incomplete(String),
+    /// Run the real proc scanner against an isolated proc-tree fixture.
+    ScanProcRoot(PathBuf),
 }
 
 /// Run the normal reclaim path with a deterministic process-scan result.
@@ -367,19 +369,20 @@ pub fn run_with_idle_test_process_use(
     idle_secs: u64,
     test_process_use: ReclaimTestProcessUse,
 ) -> Result<Value> {
-    let probe = move |_lane: &Path| {
-        Ok(match &test_process_use {
-            ReclaimTestProcessUse::CompleteNoUse => finish::ProcessUse {
-                cwd: Vec::new(),
-                fd: Vec::new(),
-                enumeration_error: None,
-            },
-            ReclaimTestProcessUse::Incomplete(reason) => finish::ProcessUse {
-                cwd: Vec::new(),
-                fd: Vec::new(),
-                enumeration_error: Some(reason.clone()),
-            },
-        })
+    let probe = move |lane: &Path| match &test_process_use {
+        ReclaimTestProcessUse::CompleteNoUse => Ok(finish::ProcessUse {
+            cwd: Vec::new(),
+            fd: Vec::new(),
+            enumeration_error: None,
+        }),
+        ReclaimTestProcessUse::Incomplete(reason) => Ok(finish::ProcessUse {
+            cwd: Vec::new(),
+            fd: Vec::new(),
+            enumeration_error: Some(reason.clone()),
+        }),
+        ReclaimTestProcessUse::ScanProcRoot(proc_root) => {
+            finish::process_use_under_from_proc_root(lane, proc_root)
+        }
     };
     run_with_process_probe(pm, state_dir, actor, idle_secs, &probe)
 }
@@ -414,7 +417,7 @@ fn run_bounded(
             for row in rows.into_iter().filter(|row| row["outcome"] == "refused") {
                 out["skipped"].as_array_mut().unwrap().push(json!({
                     "issue": row["issue"],
-                    "lane": row["path"],
+                    "lane": row["worktree"],
                     "reason_code": "merged-checkout-refused",
                     "reason": row["reason"],
                 }));

@@ -138,7 +138,6 @@ impl Fixture {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", self.home.join("gitconfig"))
         .env_remove("CADENCE_STATE_DIR")
-        .env_remove("CADENCE_ALIAS")
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR");
         cadence_agent::reaper::output(&mut cmd).expect("run real issue finish CLI")
@@ -279,6 +278,31 @@ fn refusal_text(out: &Output, expected: &[&str]) {
     );
 }
 
+fn refusal_names_fd_holder(out: &Output, pid: u32, lane: &Path) {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "finish unexpectedly succeeded with FD holder {pid}: {text}"
+    );
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+        .expect("read fixture FD holder process name")
+        .trim()
+        .to_string();
+    let finding = format!(
+        "process {pid} ({comm}) holds an open file descriptor inside {}",
+        lane.display()
+    )
+    .to_ascii_lowercase();
+    assert!(
+        text.to_ascii_lowercase().contains(&finding),
+        "finish refusal did not attribute open-FD guard to fixture PID {pid}; expected {finding:?}: {text}"
+    );
+}
+
 struct FdHolder {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -355,7 +379,6 @@ fn cad848_finish_refuses_open_fd_and_foreign_ownership() {
             .env("XDG_CACHE_HOME", sandbox.path().join("cache"))
             .env_remove("CADENCE_PM_DIR")
             .env_remove("CADENCE_STATE_DIR")
-            .env_remove("CADENCE_ALIAS")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CARGO_BUILD_TARGET_DIR")
             .env_remove("GIT_DIR")
@@ -414,8 +437,9 @@ fn cad848_finish_refuses_open_fd_and_foreign_ownership() {
     let elsewhere = managed._root.path().join("elsewhere");
     fs::create_dir_all(&elsewhere).unwrap();
     let mut holder = FdHolder::open_elsewhere(&sentinel, &elsewhere);
+    let holder_pid = holder.child.id();
     let result = managed.finish(id, &lane);
-    refusal_text(&result, &["open fd", "open file descriptor", "descriptor"]);
+    refusal_names_fd_holder(&result, holder_pid, &lane);
     assert!(
         lane.is_dir(),
         "managed lane was deleted despite its open FD"

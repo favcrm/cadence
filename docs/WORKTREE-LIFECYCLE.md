@@ -5,7 +5,9 @@ Cadence-created development, review and validation checkouts use the repo's
 development lane to its ticket. Cleanup also checks the project-declared repo,
 managed layout and canonical Git worktree registration. If lifecycle metadata is
 present, it must match the active development issue/branch and moves to
-`releasing` before deletion; legacy issue refs remain authoritative.
+`releasing` before deletion. The ledger lock stays held through deletion and the
+final state write: a retain that wins first blocks release, while one that races
+a completed release cannot rewrite it. Legacy issue refs remain authoritative.
 
 ## Create and recover
 
@@ -15,15 +17,24 @@ present, it must match the active development issue/branch and moves to
   Successful setup becomes `active` and the issue's branch/worktree refs stay
   the durable issue binding.
 - A same-issue restart reuses only its recorded repo/path/branch and does not
-  reset dirty source. A different repo or checked-out branch refuses. Setup
-  failures preserve the checkout and branch and are recorded as `setup-failed`;
-  retry `issue start` after correcting the cause. `preparing` after interruption
-  means inspect the path and branch, then retry to heal; it never authorizes
-  removal.
+  reset dirty source. A different repo or checked-out branch refuses. A
+  `retained` or `releasing` record is never implicitly reactivated. A `released`
+  record starts a new generation only on an explicit start/review request when
+  its path is absent and unregistered; development starts also require matching
+  recorded branch/worktree refs. For an existing released checkout, use explicit
+  `checkout resume`; it verifies the exact registered path, branch/detached state
+  and pinned HEAD without resetting or touching tracker refs. A retained checkout
+  must first be explicitly released. Setup failures preserve the checkout and
+  branch and are recorded as `setup-failed`; retry `issue start` after correcting
+  the cause. `preparing`
+  after interruption means inspect the path and branch, then retry to heal; it
+  never authorizes removal.
 - `cadence review` records its tool, owner and exact PR SHA before creating a
   detached tree. Normal completion records `released`; `--keep` records
-  `retained`. Its Markdown/JSON receipts are declared outside the disposable
-  tree. Validation tools should use the same registration/release interface.
+  `retained`. Merge-result restoration, receipt writes, final safety checks and
+  removal share one release lock; failures retain the checkout with a reason.
+  Its Markdown/JSON receipts are declared outside the disposable tree.
+  Validation tools should use the same registration/release interface.
 
 ## Inventory and explicit adoption
 
@@ -34,6 +45,8 @@ cadence issue checkout adopt --repo <repo> --path <path> \
   --pinned-sha <full-40-hex-sha> [--branch <branch>] \
   [--release-artifact <path>] [--rollback-artifact <path>]
 cadence issue checkout release --repo <repo> --path <path> --reason "<reason>"
+cadence issue checkout resume --repo <repo> --path <path> \
+  --pinned-sha <full-40-hex-sha> --reason "<reason>"
 cadence issue checkout retain --repo <repo> --path <path> --reason "<reason>"
 ```
 
@@ -43,10 +56,27 @@ retained artifacts, byte estimates and reason codes. A `null` reclaim estimate
 means unknown. Inventory does not modify Git, the tracker or the ledger, and
 sends no notifications. Unregistered existing trees—including trees outside
 `.cadence/wt`—remain inventory-only. Adoption requires explicit repo, path,
-purpose, tool, owner and exact current SHA; it verifies the Git common dir and
-branch rather than trusting path names or timestamps. Development lanes remain
+purpose, tool, owner and exact current SHA; it validates the path, Git common
+dir, HEAD, branch and registration while holding the ledger lock rather than
+trusting path names or timestamps. Development lanes remain
 bound by their issue refs and must be in a project-declared repo and registered
 at the canonical managed path before finish can remove them.
+
+Resume accepts only one valid `released` record whose exact canonical checkout
+still exists as a registered linked worktree of the recorded repo. The supplied
+full SHA must equal current HEAD; the registered branch/detached state must match
+the record. Non-development checkouts must still match their recorded pin;
+development may have advanced on its same recorded branch, in which case the
+pin is updated to its current HEAD. Owner, tool, purpose, issue binding and
+recovery artifact declarations are preserved. No Git checkout/reset or tracker
+write occurs. `checkout retain` applies to active checkouts only.
+
+To recover a retained checkout, explicitly release it with a reason, then resume
+it at its verified current SHA. If inventory shows `releasing`, inspect the
+checkout and use `checkout release --reason` to record an explicit recovery;
+the ledger lock serializes this against any live release guard. Then resume using
+the exact current SHA. A failed path, branch, pin or registration check leaves
+the record unchanged. Never edit the ledger or force a checkout active.
 
 ## Cleanup policy
 
@@ -70,6 +100,22 @@ symlink mismatch, a moved branch, a surviving unmerged tip or stale evidence
 retains the resource with an actionable reason. `--force` cannot override
 failed process/daemon binding, dirty-tree or activity enumeration; uncertainty
 is not a clean result.
+
+Process scans inspect cwd and open-FD holders without using UID, group,
+capability or path-permission heuristics to infer that a process lacks an
+inherited or transferred checkout descriptor. Any inaccessible status, cwd or
+FD inspection, or incomplete global enumeration retains the resource with the
+process identity and refusal reason when known. This deliberately fails closed
+when the host cannot provide a complete scan; cleanup requires an authorized
+complete inspection mechanism rather than suppressing unrelated `EACCES`.
+
+A successful review using a clean no-commit merge-result tree declares its
+receipt paths, then acquires an exact-owner release guard before verifying and
+restoring the tree to the detached pinned PR head. The guard remains held while
+report receipts are written, the final safety scan runs and the checkout is
+removed. If restoration, receipt writing or any safety check fails, the review
+is blocked and the checkout is retained with a recovery reason; it is never
+force-reset.
 
 For an absent checkout, `issue finish <ID> --worktree <path>` closes the
 worktree ref without deleting Git state. A surviving branch ref remains open

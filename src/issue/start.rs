@@ -7,6 +7,7 @@
 //! re-applies the cargo target and mints nothing; a `--name` for a
 //! different slug, or several open refs, refuses.
 
+use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use serde_json::{json, Value};
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::model::{self, Front, Ref};
-use crate::issue::{claim, git, parse, project, write, Pm};
+use crate::issue::{claim, finish, git, parse, project, write, Pm};
 use crate::worktree::{self, layout};
 
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
@@ -193,10 +194,110 @@ fn resolve_existing_base(root: &Path, branch: &str) -> Result<(String, String)> 
     Ok((base, branch_base(root, branch, &tip)))
 }
 
-/// The branch a worktree dir is checked out on (`symbolic-ref --short
-/// HEAD`), or None when the dir is not a worktree.
-fn worktree_branch(dir: &Path) -> Option<String> {
-    git(dir, &["symbolic-ref", "--short", "HEAD"]).ok()
+/// The branch a worktree dir is checked out on, None only when it is absent or detached.
+fn worktree_branch(dir: &Path) -> Result<Option<String>> {
+    match fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(Error::rejected(format!(
+                "{} is not a real worktree directory",
+                dir.display()
+            )))
+        }
+        Ok(_) => finish::git_branch(dir),
+    }
+}
+
+fn refuse_terminal_lifecycle_record(
+    repo: &Path,
+    lane: &Path,
+    front: &Front,
+    branch: &str,
+    branch_exists: bool,
+) -> Result<()> {
+    let Some(record) = worktree::lifecycle::managed_record(repo, lane)? else {
+        return Ok(());
+    };
+    if matches!(record.state.as_str(), "retained" | "releasing") {
+        let reason = record
+            .retention_reason
+            .as_deref()
+            .or(record.release_reason.as_deref())
+            .unwrap_or("no recorded reason");
+        return Err(Error::rejected(format!(
+            "lane {} is recorded as {} ({reason}); issue start will not implicitly reactivate it — inspect lifecycle inventory before explicit recovery",
+            lane.display(), record.state
+        )));
+    }
+    if record.state != "released" {
+        return Ok(());
+    }
+    let refs_match = front
+        .refs
+        .iter()
+        .any(|r| r.kind == "branch" && r.path.as_deref() == Some(branch))
+        && front.refs.iter().any(|r| {
+            r.kind == "worktree" && r.path.as_deref() == Some(lane.to_string_lossy().as_ref())
+        });
+    if record.purpose != "development"
+        || record.tool != "cadence issue start"
+        || record.issue.as_deref() != Some(front.id.as_str())
+        || record.branch.as_deref() != Some(branch)
+        || !refs_match
+    {
+        return Err(Error::rejected(format!(
+            "released lane {} does not match this issue's recorded branch disposition; refusing restart",
+            lane.display()
+        )));
+    }
+    match std::fs::symlink_metadata(lane) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(Error::rejected(format!(
+                "released lane {} still exists; issue start will not reactivate it",
+                lane.display()
+            )))
+        }
+        Err(error) => {
+            return Err(Error::rejected(format!(
+                "cannot verify released lane {} is absent: {error}",
+                lane.display()
+            )))
+        }
+    }
+    let listed = git(repo, &["worktree", "list", "--porcelain"])?;
+    let mut current = None;
+    let mut target_registered = false;
+    let mut branch_registered_elsewhere = false;
+    for line in listed.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(PathBuf::from(path));
+            if crate::issue::finish::lexical_path(Path::new(path))
+                == crate::issue::finish::lexical_path(lane)
+            {
+                target_registered = true;
+            }
+        } else if line == format!("branch refs/heads/{branch}")
+            && current.as_deref().is_some_and(|path| {
+                crate::issue::finish::lexical_path(path) != crate::issue::finish::lexical_path(lane)
+            })
+        {
+            branch_registered_elsewhere = true;
+        }
+    }
+    if target_registered {
+        return Err(Error::rejected(format!(
+            "released lane {} remains registered by Git; refusing restart",
+            lane.display()
+        )));
+    }
+    if branch_exists && branch_registered_elsewhere {
+        return Err(Error::rejected(format!(
+            "released branch {branch} is checked out elsewhere; refusing restart"
+        )));
+    }
+    Ok(())
 }
 
 /// The issue's open worktree refs, in recorded order.
@@ -270,7 +371,7 @@ fn reuse_lane(
     let branch = if open_branch(&named) {
         named
     } else {
-        worktree_branch(lane)
+        worktree_branch(lane)?
             .filter(|b| open_branch(b))
             .unwrap_or(named)
     };
@@ -427,6 +528,13 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         ],
     )
     .is_ok();
+    refuse_terminal_lifecycle_record(
+        &root,
+        &initial_lane,
+        &initial_front,
+        &initial_branch,
+        initial_branch_exists,
+    )?;
     let initial_lane_str = initial_lane.to_string_lossy().into_owned();
     let initial_refs_recorded = initial_front
         .refs
@@ -538,6 +646,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         ],
     )
     .is_ok();
+    refuse_terminal_lifecycle_record(&root, &wt_dir, &front, &branch, branch_exists)?;
     let lifecycle_record = worktree::lifecycle::recoverable_record(
         &root,
         &wt_dir,

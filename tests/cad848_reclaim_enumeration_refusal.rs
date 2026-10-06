@@ -1,8 +1,8 @@
 //! CAD-848 independent acceptance check for fail-closed target reclamation.
 //!
-//! Run with `--features test-seam`: only the process-scan result is injected;
-//! the real `reclaim::run_with_idle_test_process_use` path selects the lane,
-//! applies the live-use/idle guards, and performs the cache deletion. Each
+//! Run with `--features test-seam`: process outcomes use explicit refusal
+//! inputs or isolated proc-tree fixtures, while the real reclaim path selects
+//! the lane, applies live-use/idle guards, and performs cache deletion. Each
 //! fixture has a private PM, repo, unmerged lane and target sentinel.
 
 #![cfg(feature = "test-seam")]
@@ -14,7 +14,7 @@ use cadence_agent::issue::{
 };
 use serde_json::Value;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::{Builder, TempDir};
@@ -44,6 +44,7 @@ impl Fixture {
             .prefix("c848reclaim-")
             .tempdir_in("/tmp")
             .expect("isolated fixture root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let home = root.path().join("h");
         let state = root.path().join("s");
         let repo = root.path().join("repo");
@@ -130,6 +131,10 @@ impl Fixture {
         )
         .expect("run real target-reclaim path")
     }
+
+    fn reclaim_from_proc_root(&self, proc_root: &Path) -> Value {
+        self.reclaim(ReclaimTestProcessUse::ScanProcRoot(proc_root.to_path_buf()))
+    }
 }
 
 fn git(home: &Path, cwd: &Path, args: &[&str]) -> String {
@@ -204,6 +209,54 @@ fn target_with_sentinel(lane: &Path) -> PathBuf {
     fs::create_dir_all(&target).unwrap();
     fs::write(target.join(TARGET_SENTINEL), TARGET_CONTENT).unwrap();
     target
+}
+
+struct FakeCredentials<'a> {
+    uid: u32,
+    gid: u32,
+    groups: &'a [u32],
+    cap_eff: u64,
+}
+
+fn fake_process(
+    proc_root: &Path,
+    pid: u32,
+    credentials: FakeCredentials<'_>,
+    cwd: &Path,
+    fds: &[(&str, &Path)],
+) -> PathBuf {
+    let proc_dir = proc_root.join(pid.to_string());
+    let fd_dir = proc_dir.join("fd");
+    fs::create_dir_all(&fd_dir).unwrap();
+    let groups = credentials
+        .groups
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join("\t");
+    fs::write(
+        proc_dir.join("status"),
+        format!(
+            "Name:\tfixture\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nGroups:\t{groups}\nCapEff:\t{cap_eff:016x}\n",
+            uid = credentials.uid,
+            gid = credentials.gid,
+            cap_eff = credentials.cap_eff,
+        ),
+    )
+    .unwrap();
+    symlink(cwd, proc_dir.join("cwd")).unwrap();
+    for (fd, target) in fds {
+        symlink(target, fd_dir.join(fd)).unwrap();
+    }
+    proc_dir
+}
+
+fn foreign_uid(owner_uid: u32) -> u32 {
+    if owner_uid == u32::MAX {
+        owner_uid - 1
+    } else {
+        owner_uid + 1
+    }
 }
 
 fn assert_registration(fixture: &Fixture, lane: &Path, branch: &str, branch_tip: &str) {
@@ -390,4 +443,301 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         "source was deleted"
     );
     assert_registration(&walk_fixture, &walk_lane, &walk_branch, &walk_tip);
+
+    // This same-owner fake process holds a lane FD, but its fd directory is
+    // inaccessible. Refusal must name that process enumeration failure.
+    let owner_fixture = Fixture::new("owner uid inaccessible fd holder");
+    let (owner_lane, owner_branch, owner_tip) = owner_fixture.start_unmerged_lane();
+    let owner_target = target_with_sentinel(&owner_lane);
+    let owner_sentinel = owner_target.join(TARGET_SENTINEL);
+    let owner_held_file = owner_target.join("owner-inaccessible-fd");
+    fs::write(&owner_held_file, b"CAD848-OWNER-INACCESSIBLE-FD\n").unwrap();
+    let owner_metadata = fs::metadata(&owner_lane).unwrap();
+    let owner_uid = owner_metadata.uid();
+    let owner_gid = owner_metadata.gid();
+    let owner_proc_root = Builder::new()
+        .prefix("c848proc-owner-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let owner_elsewhere = owner_proc_root.path().join("elsewhere");
+    fs::create_dir(&owner_elsewhere).unwrap();
+    let owner_pid = u32::MAX - 2;
+    let owner_proc = fake_process(
+        owner_proc_root.path(),
+        owner_pid,
+        FakeCredentials {
+            uid: owner_uid,
+            gid: owner_gid,
+            groups: &[],
+            cap_eff: 0,
+        },
+        &owner_elsewhere,
+        &[("9", &owner_held_file)],
+    );
+    let owner_fd_dir = owner_proc.join("fd");
+    assert_eq!(
+        fs::read_link(owner_fd_dir.join("9")).unwrap(),
+        owner_held_file.canonicalize().unwrap(),
+        "owner fixture must hold a lane FD before its proc fd scan is denied"
+    );
+    fs::set_permissions(&owner_fd_dir, fs::Permissions::from_mode(0o0)).unwrap();
+    let owner_fd_error = match fs::read_dir(&owner_fd_dir) {
+        Ok(_) => panic!("owner-holder fd fixture unexpectedly readable"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        owner_fd_error.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "owner-holder fixture must produce a real fd PermissionDenied"
+    );
+    let restore_owner_fd_permissions = RestorePermissions(owner_fd_dir);
+    let result = owner_fixture.reclaim_from_proc_root(owner_proc_root.path());
+    drop(restore_owner_fd_permissions);
+    let reason = refusal_reason(&result, "Cannot fully enumerate process cwd/open-fd use");
+    assert!(
+        reason.contains(&format!("file descriptors for process {owner_pid}"))
+            && reason.contains("Permission denied"),
+        "owner-holder scan error did not identify the refusing PID: {reason}"
+    );
+    assert_eq!(fs::read(&owner_sentinel).unwrap(), TARGET_CONTENT);
+    assert_registration(&owner_fixture, &owner_lane, &owner_branch, &owner_tip);
+
+    // A foreign UID cannot traverse the private root, but an inaccessible FD
+    // scan cannot prove it lacks an inherited or transferred lane descriptor.
+    let foreign_fixture = Fixture::new("foreign uid inaccessible fd");
+    let (foreign_lane, foreign_branch, foreign_tip) = foreign_fixture.start_unmerged_lane();
+    let foreign_target = target_with_sentinel(&foreign_lane);
+    let foreign_held_file = foreign_target.join("foreign-inaccessible-fd");
+    fs::write(&foreign_held_file, b"CAD848-FOREIGN-INACCESSIBLE-FD\n").unwrap();
+    let foreign_metadata = fs::metadata(&foreign_lane).unwrap();
+    let foreign_process_uid = foreign_uid(foreign_metadata.uid());
+    let foreign_process_gid = foreign_uid(foreign_metadata.gid());
+    assert_eq!(
+        fs::metadata(foreign_fixture._root.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "foreign UID must be unable to traverse the private fixture root"
+    );
+    let foreign_proc_root = Builder::new()
+        .prefix("c848proc-foreign-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let foreign_elsewhere = foreign_proc_root.path().join("elsewhere");
+    fs::create_dir(&foreign_elsewhere).unwrap();
+    let foreign_pid = u32::MAX - 1;
+    let foreign_proc = fake_process(
+        foreign_proc_root.path(),
+        foreign_pid,
+        FakeCredentials {
+            uid: foreign_process_uid,
+            gid: foreign_process_gid,
+            groups: &[],
+            cap_eff: 0,
+        },
+        &foreign_elsewhere,
+        &[("9", &foreign_held_file)],
+    );
+    let foreign_fd_dir = foreign_proc.join("fd");
+    assert_eq!(
+        fs::read_link(foreign_fd_dir.join("9")).unwrap(),
+        foreign_held_file.canonicalize().unwrap(),
+        "foreign fixture must hold a lane FD before its proc fd scan is denied"
+    );
+    fs::set_permissions(&foreign_fd_dir, fs::Permissions::from_mode(0o0)).unwrap();
+    let fd_error = match fs::read_dir(&foreign_fd_dir) {
+        Ok(_) => panic!("foreign fd fixture unexpectedly readable"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        fd_error.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "fixture must produce a real foreign-fd PermissionDenied"
+    );
+    let restore_fd_permissions = RestorePermissions(foreign_fd_dir);
+    let result = foreign_fixture.reclaim_from_proc_root(foreign_proc_root.path());
+    drop(restore_fd_permissions);
+    let reason = refusal_reason(&result, "Cannot fully enumerate process cwd/open-fd use");
+    assert!(
+        reason.contains(&format!("process {foreign_pid}")) && reason.contains("Permission denied"),
+        "foreign inaccessible-FD error was not the fail-closed cause: {reason}"
+    );
+    assert_eq!(
+        fs::read(foreign_target.join(TARGET_SENTINEL)).unwrap(),
+        TARGET_CONTENT
+    );
+    assert!(foreign_target.is_dir(), "foreign EACCES deleted target");
+    assert!(
+        foreign_lane.join("unmerged.txt").is_file(),
+        "foreign EACCES deleted source"
+    );
+    assert_registration(
+        &foreign_fixture,
+        &foreign_lane,
+        &foreign_branch,
+        &foreign_tip,
+    );
+
+    // A root-UID holder can also have inherited a descriptor even when the
+    // private checkout path is not traversable. Its denied FD scan must refuse.
+    let root_fixture = Fixture::new("root uid inaccessible fd");
+    let (root_lane, root_branch, root_tip) = root_fixture.start_unmerged_lane();
+    let root_target = target_with_sentinel(&root_lane);
+    let root_sentinel = root_target.join(TARGET_SENTINEL);
+    let root_held_file = root_target.join("root-inaccessible-fd");
+    fs::write(&root_held_file, b"CAD848-ROOT-INACCESSIBLE-FD\n").unwrap();
+    let root_proc_root = Builder::new()
+        .prefix("c848proc-root-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root_elsewhere = root_proc_root.path().join("elsewhere");
+    fs::create_dir(&root_elsewhere).unwrap();
+    let root_pid = u32::MAX - 4;
+    let root_proc = fake_process(
+        root_proc_root.path(),
+        root_pid,
+        FakeCredentials {
+            uid: 0,
+            gid: 0,
+            groups: &[],
+            cap_eff: 0,
+        },
+        &root_elsewhere,
+        &[("9", &root_held_file)],
+    );
+    let root_fd_dir = root_proc.join("fd");
+    assert_eq!(
+        fs::read_link(root_fd_dir.join("9")).unwrap(),
+        root_held_file.canonicalize().unwrap(),
+        "root fixture must hold a lane FD before its proc fd scan is denied"
+    );
+    fs::set_permissions(&root_fd_dir, fs::Permissions::from_mode(0o0)).unwrap();
+    let root_fd_error = match fs::read_dir(&root_fd_dir) {
+        Ok(_) => panic!("root-holder fd fixture unexpectedly readable"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        root_fd_error.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "root-holder fixture must produce a real fd PermissionDenied"
+    );
+    let restore_root_fd_permissions = RestorePermissions(root_fd_dir);
+    let result = root_fixture.reclaim_from_proc_root(root_proc_root.path());
+    drop(restore_root_fd_permissions);
+    let reason = refusal_reason(&result, "Cannot fully enumerate process cwd/open-fd use");
+    assert!(
+        reason.contains(&format!("process {root_pid}")) && reason.contains("Permission denied"),
+        "root-holder FD scan error was not fail-closed: {reason}"
+    );
+    assert_eq!(fs::read(&root_sentinel).unwrap(), TARGET_CONTENT);
+    assert_registration(&root_fixture, &root_lane, &root_branch, &root_tip);
+
+    // A foreign UID with the checkout group can traverse the temp-root path.
+    // A denied FD scan must therefore remain fail-closed rather than being
+    // classified as unrelated.
+    let group_fixture = Fixture::new("foreign uid with checkout group");
+    let (group_lane, group_branch, group_tip) = group_fixture.start_unmerged_lane();
+    let group_target = target_with_sentinel(&group_lane);
+    let group_sentinel = group_target.join(TARGET_SENTINEL);
+    let group_root = group_fixture._root.path();
+    let group_root_metadata = fs::metadata(group_root).unwrap();
+    let checkout_gid = group_root_metadata.gid();
+    fs::set_permissions(group_root, fs::Permissions::from_mode(0o710)).unwrap();
+    assert_ne!(
+        fs::metadata(group_root).unwrap().permissions().mode() & 0o010,
+        0,
+        "group path component must permit traversal"
+    );
+    let group_uid = foreign_uid(group_root_metadata.uid());
+    let group_primary_gid = foreign_uid(checkout_gid);
+    let group_proc_root = Builder::new()
+        .prefix("c848proc-group-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let group_elsewhere = group_proc_root.path().join("elsewhere");
+    fs::create_dir(&group_elsewhere).unwrap();
+    let group_proc = fake_process(
+        group_proc_root.path(),
+        u32::MAX - 3,
+        FakeCredentials {
+            uid: group_uid,
+            gid: group_primary_gid,
+            groups: &[checkout_gid],
+            cap_eff: 0,
+        },
+        &group_elsewhere,
+        &[],
+    );
+    let group_fd_dir = group_proc.join("fd");
+    fs::set_permissions(&group_fd_dir, fs::Permissions::from_mode(0o0)).unwrap();
+    let group_fd_error = match fs::read_dir(&group_fd_dir) {
+        Ok(_) => panic!("group-access fd fixture unexpectedly readable"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        group_fd_error.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "group fixture must produce a real fd PermissionDenied"
+    );
+    let restore_group_fd_permissions = RestorePermissions(group_fd_dir);
+    let result = group_fixture.reclaim_from_proc_root(group_proc_root.path());
+    drop(restore_group_fd_permissions);
+    let reason = refusal_reason(&result, "Cannot fully enumerate process cwd/open-fd use");
+    assert!(
+        reason.contains(&format!("process {}", u32::MAX - 3))
+            && reason.contains("Permission denied"),
+        "group-traversable foreign process was not fail-closed: {reason}"
+    );
+    assert_eq!(fs::read(&group_sentinel).unwrap(), TARGET_CONTENT);
+    assert_registration(&group_fixture, &group_lane, &group_branch, &group_tip);
+
+    // A visible foreign-UID process is still checked. Its cwd is elsewhere,
+    // but a visible fd symlink into the lane must retain the target.
+    let visible_fixture = Fixture::new("visible foreign fd holder");
+    let (visible_lane, visible_branch, visible_tip) = visible_fixture.start_unmerged_lane();
+    let visible_target = target_with_sentinel(&visible_lane);
+    let visible_sentinel = visible_target.join(TARGET_SENTINEL);
+    let held_file = visible_target.join("foreign-open-file");
+    fs::write(&held_file, b"CAD848-FOREIGN-FD-HOLD\n").unwrap();
+    let visible_root = visible_fixture._root.path();
+    let visible_root_metadata = fs::metadata(visible_root).unwrap();
+    let visible_group = visible_root_metadata.gid();
+    fs::set_permissions(visible_root, fs::Permissions::from_mode(0o710)).unwrap();
+    let visible_uid = foreign_uid(visible_root_metadata.uid());
+    let visible_primary_gid = foreign_uid(visible_group);
+    let visible_groups = [visible_group];
+    let visible_proc_root = Builder::new()
+        .prefix("c848proc-visible-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let visible_elsewhere = visible_proc_root.path().join("elsewhere");
+    fs::create_dir(&visible_elsewhere).unwrap();
+    let visible_pid = u32::MAX;
+    fake_process(
+        visible_proc_root.path(),
+        visible_pid,
+        FakeCredentials {
+            uid: visible_uid,
+            gid: visible_primary_gid,
+            groups: &visible_groups,
+            cap_eff: 0,
+        },
+        &visible_elsewhere,
+        &[("9", &held_file)],
+    );
+    let result = visible_fixture.reclaim_from_proc_root(visible_proc_root.path());
+    let reason = refusal_reason(&result, &format!("Process {visible_pid}"));
+    assert!(
+        reason.contains("holds an open file descriptor inside"),
+        "visible foreign FD did not trigger the open-FD guard: {reason}"
+    );
+    assert_eq!(fs::read(&visible_sentinel).unwrap(), TARGET_CONTENT);
+    assert_registration(
+        &visible_fixture,
+        &visible_lane,
+        &visible_branch,
+        &visible_tip,
+    );
 }

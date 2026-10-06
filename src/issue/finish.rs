@@ -61,6 +61,34 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Resolve HEAD's branch; symbolic-ref exit 1 is Git's detached-HEAD result.
+pub(crate) fn git_branch(dir: &Path) -> Result<Option<String>> {
+    let args = ["symbolic-ref", "--quiet", "--short", "HEAD"];
+    let out = git_out(dir, &args, &[])?;
+    match out.status.code() {
+        Some(0) => {
+            let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if branch.is_empty() {
+                Err(Error::rejected(format!(
+                    "git {} returned an empty branch in {}",
+                    args.join(" "),
+                    dir.display()
+                )))
+            } else {
+                Ok(Some(branch))
+            }
+        }
+        Some(1) => Ok(None),
+        code => Err(Error::rejected(format!(
+            "git {} failed in {} with status {:?}: {}",
+            args.join(" "),
+            dir.display(),
+            code,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))),
+    }
+}
+
 /// Raw bounded git output for probes that need stdout on any exit.
 fn git_out(dir: &Path, args: &[&str], env: &[(&str, &Path)]) -> Result<Output> {
     let mut cmd = Command::new("git");
@@ -299,7 +327,7 @@ fn verify_checkout_ownership(
     // resolve has already bound the candidate to a declared repo and layout.
     let branch = expected_branch.or_else(|| record.as_ref().and_then(|r| r.branch.as_deref()));
     if path.is_dir() {
-        let actual = checked_out_branch(path).ok_or_else(|| {
+        let actual = checked_out_branch(path)?.ok_or_else(|| {
             Error::rejected(format!(
                 "checkout {} has no registered branch; refusing deletion",
                 path.display()
@@ -325,15 +353,17 @@ fn verify_checkout_ownership(
     Ok(record)
 }
 
-/// The branch a live worktree has checked out; `None` when the dir is
-/// gone, detached or not a git checkout.
-fn checked_out_branch(wt: &Path) -> Option<String> {
-    if !wt.is_dir() {
-        return None;
+/// The branch a live worktree has checked out; `None` only when it is absent
+/// or detached. Git and filesystem inspection errors remain errors.
+fn checked_out_branch(wt: &Path) -> Result<Option<String>> {
+    match std::fs::symlink_metadata(wt) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
+            Error::rejected(format!("{} is not a real worktree directory", wt.display())),
+        ),
+        Ok(_) => git_branch(wt),
     }
-    git(wt, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .ok()
-        .filter(|name| !name.is_empty())
 }
 
 /// The three ref states an issue can be in for finishing.
@@ -429,12 +459,19 @@ fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
     // or adopted) pairs by the branch it actually has checked out, when
     // that value is recorded as an open branch ref (CAD-166).
     let branch = match &wt_name {
-        Some(n) => open_branch(Some(&layout::branch(n)))
-            .or_else(|| {
-                let head = checked_out_branch(open_wt.as_deref()?)?;
-                open_branch(Some(&head))
-            })
-            .unwrap_or_default(),
+        Some(n) => {
+            if let Some(branch) = open_branch(Some(&layout::branch(n))) {
+                branch
+            } else {
+                let head = match open_wt.as_deref() {
+                    Some(path) => checked_out_branch(path)?,
+                    None => None,
+                };
+                head.as_deref()
+                    .and_then(|head| open_branch(Some(head)))
+                    .unwrap_or_default()
+            }
+        }
         None => open_branch(None).unwrap_or_default(),
     };
     // Tracker values reach git below — refuse one it would read as an
@@ -604,12 +641,19 @@ fn process_proc_root() -> PathBuf {
     if let Some(root) = PROCESS_PROC_ROOT.with(|root| root.borrow().clone()) {
         return root;
     }
+    // Release builds reject `test-seam`; integration checks can isolate proc
+    // enumeration without weakening the production `/proc` path.
+    #[cfg(feature = "test-seam")]
+    if let Some(root) = std::env::var_os("CADENCE_TEST_PROC_ROOT") {
+        return PathBuf::from(root);
+    }
     PathBuf::from("/proc")
 }
 
-/// Cwd and open-descriptor holders under a managed checkout. Per-process
-/// permission failures are accumulated while the scan continues, so a known
-/// live holder is still named; any incomplete scan remains a deletion refusal.
+/// Cwd and open-descriptor holders under a managed checkout. Any process that
+/// cannot be fully inspected leaves the scan incomplete; cleanup never infers
+/// that a process lacks an inherited or transferred checkout descriptor from
+/// its UID or path permissions.
 pub(crate) struct ProcessUse {
     pub cwd: Vec<u32>,
     pub fd: Vec<u32>,
@@ -618,15 +662,83 @@ pub(crate) struct ProcessUse {
 
 pub(crate) type ProcessUseProbe = dyn Fn(&Path) -> Result<ProcessUse>;
 
+fn proc_id_values(status: &str, key: &str, count: usize) -> Option<Vec<u32>> {
+    let line = status.lines().find_map(|line| line.strip_prefix(key))?;
+    line.split_whitespace()
+        .take(count)
+        .map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()
+        .filter(|values| values.len() == count)
+}
+
+// Validate the PID entry only; credentials are never used to skip cwd or FD
+// inspection or to infer that a process could not hold a checkout descriptor.
+fn proc_status_is_complete(status: &str) -> bool {
+    let credentials_complete = proc_id_values(status, "Uid:", 4).is_some()
+        && proc_id_values(status, "Gid:", 4).is_some()
+        && status
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))
+            .is_some_and(|groups| {
+                groups
+                    .split_whitespace()
+                    .all(|group| group.parse::<u32>().is_ok())
+            });
+    let capabilities_complete = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .is_some_and(|caps| u64::from_str_radix(caps.trim(), 16).is_ok());
+    credentials_complete && capabilities_complete
+}
+
+fn inspect_process_status(proc_dir: &Path) -> std::io::Result<bool> {
+    let status = match std::fs::read_to_string(proc_dir.join("status")) {
+        Ok(status) => status,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && matches!(
+                    std::fs::symlink_metadata(proc_dir),
+                    Err(ref gone) if gone.kind() == std::io::ErrorKind::NotFound
+                ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    if !proc_status_is_complete(&status) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process status has incomplete credentials",
+        ));
+    }
+    Ok(true)
+}
+
+fn process_gone(proc_dir: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(proc_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn record_process_error(use_: &mut ProcessUse, pid: u32, what: &str, error: &std::io::Error) {
+    use_.enumeration_error
+        .get_or_insert_with(|| format!("cannot {what} for process {pid} during cleanup: {error}"));
+}
+
 pub(crate) fn process_use_under(dir: &Path) -> Result<ProcessUse> {
+    process_use_under_from_proc_root(dir, &process_proc_root())
+}
+
+pub(crate) fn process_use_under_from_proc_root(dir: &Path, proc_root: &Path) -> Result<ProcessUse> {
     let dir = dir.canonicalize().map_err(|e| {
         Error::rejected(format!(
             "cannot resolve live-use path {}: {e}",
             dir.display()
         ))
     })?;
-    let proc_root = process_proc_root();
-    let procs = std::fs::read_dir(&proc_root).map_err(|e| {
+    let procs = std::fs::read_dir(proc_root).map_err(|e| {
         Error::rejected(format!(
             "cannot enumerate {} live-use checks: {e}",
             proc_root.display()
@@ -643,7 +755,7 @@ pub(crate) fn process_use_under(dir: &Path) -> Result<ProcessUse> {
             Ok(entry) => entry,
             Err(e) => {
                 use_.enumeration_error
-                    .get_or_insert_with(|| format!("cannot enumerate /proc: {e}"));
+                    .get_or_insert_with(|| format!("cannot enumerate process entries: {e}"));
                 continue;
             }
         };
@@ -654,39 +766,31 @@ pub(crate) fn process_use_under(dir: &Path) -> Result<ProcessUse> {
             continue;
         }
         let proc_dir = proc_root.join(entry.file_name());
+        match inspect_process_status(&proc_dir) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                use_.enumeration_error.get_or_insert_with(|| {
+                    format!("cannot establish process {pid} identity during cleanup: {error}")
+                });
+                continue;
+            }
+        }
         match std::fs::read_link(proc_dir.join("cwd")) {
             Ok(cwd) if cwd.starts_with(&dir) => use_.cwd.push(pid),
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !proc_dir.exists() => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if proc_dir.exists() {
-                    use_.enumeration_error.get_or_insert_with(|| {
-                        format!("cannot inspect process {pid} cwd during cleanup: {e}")
-                    });
-                }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && process_gone(&proc_dir) => {
+                continue;
             }
-            Err(e) => {
-                use_.enumeration_error.get_or_insert_with(|| {
-                    format!("cannot inspect process {pid} cwd during cleanup: {e}")
-                });
-            }
+            Err(e) => record_process_error(&mut use_, pid, "inspect cwd", &e),
         }
         let fds = match std::fs::read_dir(proc_dir.join("fd")) {
             Ok(fds) => fds,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if proc_dir.exists() {
-                    use_.enumeration_error.get_or_insert_with(|| {
-                        format!(
-                            "cannot enumerate process {pid} file descriptors during cleanup: {e}"
-                        )
-                    });
-                }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && process_gone(&proc_dir) => {
                 continue;
             }
             Err(e) => {
-                use_.enumeration_error.get_or_insert_with(|| {
-                    format!("cannot enumerate process {pid} file descriptors during cleanup: {e}")
-                });
+                record_process_error(&mut use_, pid, "enumerate file descriptors", &e);
                 continue;
             }
         };
@@ -694,13 +798,11 @@ pub(crate) fn process_use_under(dir: &Path) -> Result<ProcessUse> {
         for fd in fds {
             let fd = match fd {
                 Ok(fd) => fd,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !proc_dir.exists() => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && process_gone(&proc_dir) => {
+                    break;
+                }
                 Err(e) => {
-                    use_.enumeration_error.get_or_insert_with(|| {
-                        format!(
-                            "cannot enumerate process {pid} file descriptors during cleanup: {e}"
-                        )
-                    });
+                    record_process_error(&mut use_, pid, "enumerate file descriptors", &e);
                     continue;
                 }
             };
@@ -711,11 +813,7 @@ pub(crate) fn process_use_under(dir: &Path) -> Result<ProcessUse> {
                 }
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    use_.enumeration_error.get_or_insert_with(|| {
-                        format!("cannot inspect process {pid} file descriptor during cleanup: {e}")
-                    });
-                }
+                Err(e) => record_process_error(&mut use_, pid, "inspect file descriptor", &e),
             }
         }
         if holds {
@@ -2033,31 +2131,26 @@ pub(crate) fn run(
         && ev.remote_note.is_none()
         && ev.remote_tip.is_some()
         && (remote_covered || force);
-    let lifecycle_release_path =
+    let mut lifecycle_release =
         if !refs_only && (will_remove_worktree || will_delete_branch || will_delete_remote) {
             let path = wt_dir.as_deref().ok_or_else(|| {
                 Error::rejected(format!(
                     "issue {id} has no managed checkout path for branch {branch}; refusing deletion"
                 ))
             })?;
-            match verify_checkout_ownership(
+            verify_checkout_ownership(
                 &root,
                 path,
                 id,
                 (!branch.is_empty()).then_some(branch.as_str()),
-            )? {
-                Some(record) => {
-                    crate::worktree::lifecycle::begin_release(
-                        &root,
-                        path,
-                        id,
-                        record.branch.as_deref(),
-                        &format!("issue finish {id} for branch {branch}"),
-                    )?;
-                    Some(path.to_path_buf())
-                }
-                None => None,
-            }
+            )?;
+            Some(crate::worktree::lifecycle::begin_release(
+                &root,
+                path,
+                id,
+                (!branch.is_empty()).then_some(branch.as_str()),
+                &format!("issue finish {id} for branch {branch}"),
+            )?)
         } else {
             None
         };
@@ -2077,13 +2170,8 @@ pub(crate) fn run(
         args.push(&target);
         if let Err(e) = git(&root, &args) {
             let reason = format!("git worktree remove {} failed: {e}", d.display());
-            if lifecycle_release_path.is_some() {
-                let _ = crate::worktree::lifecycle::transition(
-                    &root,
-                    d,
-                    "cleanup-failed",
-                    Some(&reason),
-                );
+            if let Some(release) = lifecycle_release.as_mut() {
+                let _ = release.cleanup_failed(&reason);
             }
             return Err(Error::rejected(reason));
         }
@@ -2140,6 +2228,17 @@ pub(crate) fn run(
     // refs-only close of a missing checkout closes only the worktree ref;
     // any surviving branch ref remains open for recovery.
     let branch_kept = !deleted_branch && !branch.is_empty() && branch_tip(&root, &branch).is_some();
+    let disposition = if branch_kept {
+        format!("checkout released; branch {branch} retained")
+    } else {
+        format!("checkout released; branch {branch} removed or already missing")
+    };
+    // The lifecycle transaction ends at the destructive boundary, before any
+    // tracker write can fail after the checkout has already been removed.
+    let release_warning = lifecycle_release
+        .take()
+        .and_then(|mut release| release.released(&disposition).err())
+        .map(|e| e.to_string());
     for r in &mut t.front.refs {
         if (r.kind == "worktree"
             && wt_dir
@@ -2187,19 +2286,7 @@ pub(crate) fn run(
         }
         return Err(e);
     }
-    let disposition = if branch_kept {
-        format!("checkout released; branch {branch} retained")
-    } else {
-        format!("checkout released; branch {branch} removed or already missing")
-    };
-    // Complete lifecycle accounting only after the tracker refs are committed.
-    // `releasing` was recorded before any destructive operation; a failed
-    // tracker commit therefore leaves an explicit in-progress record.
-    let lifecycle_warning = if let Some(path) = lifecycle_release_path.as_deref() {
-        crate::worktree::lifecycle::transition(&root, path, "released", Some(&disposition))
-            .err()
-            .map(|e| e.to_string())
-    } else if refs_only {
+    let lifecycle_warning = if refs_only {
         wt_dir.as_deref().and_then(
             |path| match crate::worktree::lifecycle::contains(&root, path) {
                 Ok(false) => None,
@@ -2215,7 +2302,7 @@ pub(crate) fn run(
             },
         )
     } else {
-        None
+        release_warning
     };
     // The commit phase is done — the pm lock goes back before the
     // remote delete: a `push` can take seconds and the lock's spin

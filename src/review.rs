@@ -1857,6 +1857,12 @@ fn unknown_full_suite_row(step: &Step) -> Value {
 /// live in the repository ledger so an interrupted review is inventoryable.
 const REVIEW_TOOL: &str = "cadence review";
 
+struct MergeResultState {
+    base_sha: String,
+    merge_head: Option<String>,
+    tree_sha: String,
+}
+
 struct ReviewTree {
     root: PathBuf,
     dir: PathBuf,
@@ -1864,6 +1870,8 @@ struct ReviewTree {
     pinned_sha: String,
     keep: bool,
     retention_reason: Option<String>,
+    merge_result: Option<MergeResultState>,
+    release_guard: Option<worktree::lifecycle::ReleaseGuard>,
     git_secs: u64,
 }
 
@@ -1962,6 +1970,8 @@ impl ReviewTree {
             } else {
                 "review interrupted or failed; preserve for recovery".into()
             }),
+            merge_result: None,
+            release_guard: None,
             git_secs,
         })
     }
@@ -2017,6 +2027,156 @@ impl ReviewTree {
                 dir.display()
             )));
         }
+        Ok(())
+    }
+
+    fn begin_release_guard(&mut self) -> Result<()> {
+        if self.release_guard.is_none() {
+            self.release_guard = Some(worktree::lifecycle::begin_review_release(
+                &self.root,
+                &self.dir,
+                REVIEW_TOOL,
+                &self.owner,
+                &self.pinned_sha,
+                "review completed",
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Restore a successfully gated no-commit merge to the pinned PR head
+    /// before normal release. The held release guard has already validated
+    /// exact active ownership and keeps retention/removal serialized. Only abort
+    /// the merge when the index still equals the recorded merge tree, the
+    /// worktree has no extra changes, and no live process can be using it.
+    fn restore_merge_result(&mut self) -> Result<()> {
+        let Some(merge) = self.merge_result.as_ref() else {
+            return Ok(());
+        };
+        if self.release_guard.is_none() {
+            return Err(Error::rejected(
+                "review merge-result restoration requires its held release guard",
+            ));
+        }
+        let meta = std::fs::symlink_metadata(&self.dir)?;
+        if !meta.is_dir()
+            || meta.file_type().is_symlink()
+            || self.dir.canonicalize()? != crate::issue::finish::lexical_path(&self.dir)
+            || worktree::main_root(&self.dir)?.canonicalize()? != self.root
+        {
+            return Err(Error::rejected(
+                "review checkout identity changed before merge-result restoration",
+            ));
+        }
+        let registered =
+            crate::issue::finish::git(&self.root, &["worktree", "list", "--porcelain"])?;
+        if !registered
+            .lines()
+            .any(|line| line == format!("worktree {}", self.dir.display()))
+        {
+            return Err(Error::rejected(
+                "review checkout is no longer registered before merge-result restoration",
+            ));
+        }
+        let head =
+            crate::issue::finish::git(&self.dir, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+        if head != merge.base_sha {
+            return Err(Error::rejected(format!(
+                "review merge-result HEAD moved from base {} to {head}",
+                merge.base_sha
+            )));
+        }
+        let merge_head = git_status(
+            &self.dir,
+            &["rev-parse", "--quiet", "--verify", "MERGE_HEAD^{commit}"],
+            self.git_secs,
+        )?;
+        match (
+            &merge.merge_head,
+            merge_head.status,
+            merge_head.stdout.trim(),
+        ) {
+            (Some(expected), Some(0), actual) if expected == actual => {}
+            (None, Some(1), _) => {}
+            (Some(expected), _, actual) => {
+                return Err(Error::rejected(format!(
+                    "review MERGE_HEAD changed from recorded {expected} to {actual}"
+                )))
+            }
+            (None, status, _) => {
+                return Err(Error::rejected(format!(
+                    "review unexpectedly has MERGE_HEAD (git status {status:?})"
+                )))
+            }
+        }
+        let index_tree = crate::issue::finish::git(&self.dir, &["write-tree"])?;
+        if index_tree != merge.tree_sha {
+            return Err(Error::rejected(
+                "review merge-result index changed; retaining checkout",
+            ));
+        }
+        let unstaged = git_status(&self.dir, &["diff", "--quiet", "--"], self.git_secs)?;
+        if unstaged.timed_out || unstaged.status != Some(0) {
+            return Err(Error::rejected(
+                "review merge-result worktree changed; retaining checkout",
+            ));
+        }
+        let untracked =
+            crate::issue::finish::git(&self.dir, &["ls-files", "--others", "--exclude-standard"])?;
+        if !untracked.is_empty() {
+            return Err(Error::rejected(
+                "review merge-result has untracked files; retaining checkout",
+            ));
+        }
+        match crate::issue::finish::process_use_under(&self.dir) {
+            Ok(uses)
+                if uses.enumeration_error.is_none()
+                    && uses.cwd.is_empty()
+                    && uses.fd.is_empty() => {}
+            Ok(uses) => {
+                return Err(Error::rejected(format!(
+                    "review checkout has live or unknown process use; retaining checkout ({:?})",
+                    uses.enumeration_error
+                )))
+            }
+            Err(error) => {
+                return Err(Error::rejected(format!(
+                    "cannot enumerate review checkout process use; retaining checkout ({error})"
+                )))
+            }
+        }
+        if merge.merge_head.is_some() {
+            crate::issue::finish::git(&self.dir, &["merge", "--abort"])?;
+        }
+        let head =
+            crate::issue::finish::git(&self.dir, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+        let status = crate::issue::finish::git(
+            &self.dir,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )?;
+        if head != merge.base_sha || !status.is_empty() {
+            return Err(Error::rejected(
+                "review merge-result did not restore a clean base; retaining checkout",
+            ));
+        }
+        crate::issue::finish::git(&self.dir, &["checkout", "--detach", &self.pinned_sha])?;
+        let head =
+            crate::issue::finish::git(&self.dir, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+        let status = crate::issue::finish::git(
+            &self.dir,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )?;
+        let branch = git_status(
+            &self.dir,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            self.git_secs,
+        )?;
+        if head != self.pinned_sha || !status.is_empty() || branch.status != Some(1) {
+            return Err(Error::rejected(
+                "review checkout did not return to its clean detached pinned head; retaining checkout",
+            ));
+        }
+        self.merge_result = None;
         Ok(())
     }
 
@@ -2099,39 +2259,40 @@ impl ReviewTree {
 
 impl Drop for ReviewTree {
     fn drop(&mut self) {
-        if !self.owns() {
-            return;
-        }
         if self.keep {
             let reason = self
                 .retention_reason
                 .as_deref()
                 .unwrap_or("review explicitly retained");
-            if let Err(e) =
-                worktree::lifecycle::transition(&self.root, &self.dir, "retained", Some(reason))
-            {
-                tracing::warn!(event = "review_checkout_retention_record_failed", path = %self.dir.display(), error = %e);
+            if let Some(mut release) = self.release_guard.take() {
+                if let Err(e) = release.retained(reason) {
+                    tracing::warn!(event = "review_checkout_retention_record_failed", path = %self.dir.display(), error = %e);
+                }
+            } else if self.owns() {
+                if let Err(e) =
+                    worktree::lifecycle::transition(&self.root, &self.dir, "retained", Some(reason))
+                {
+                    tracing::warn!(event = "review_checkout_retention_record_failed", path = %self.dir.display(), error = %e);
+                }
             }
             return;
         }
-        if let Some(reason) = self.release_refusal() {
-            let _ =
-                worktree::lifecycle::transition(&self.root, &self.dir, "retained", Some(&reason));
-            tracing::warn!(event = "review_checkout_release_refused", path = %self.dir.display(), reason = %reason);
+        let Some(mut release) = self.release_guard.take() else {
+            let reason =
+                "review completed without its pre-acquired release guard; preserve checkout";
+            if self.owns() {
+                let _ = worktree::lifecycle::transition(
+                    &self.root,
+                    &self.dir,
+                    "retained",
+                    Some(reason),
+                );
+            }
+            tracing::warn!(event = "review_checkout_release_record_failed", path = %self.dir.display(), reason);
             return;
-        }
-        if let Err(e) = worktree::lifecycle::transition(
-            &self.root,
-            &self.dir,
-            "releasing",
-            Some("review completed"),
-        ) {
-            tracing::warn!(event = "review_checkout_release_record_failed", path = %self.dir.display(), error = %e);
-            return;
-        }
+        };
         if let Some(reason) = self.release_refusal() {
-            let _ =
-                worktree::lifecycle::transition(&self.root, &self.dir, "retained", Some(&reason));
+            let _ = release.retained(&reason);
             tracing::warn!(event = "review_checkout_release_refused", path = %self.dir.display(), reason = %reason);
             return;
         }
@@ -2143,12 +2304,9 @@ impl Drop for ReviewTree {
         let result = run_bounded(&mut cmd, Duration::from_secs(self.git_secs));
         let failure = match result {
             Ok(out) if out.status.success() && !self.dir.exists() => {
-                let _ = worktree::lifecycle::transition(
-                    &self.root,
-                    &self.dir,
-                    "released",
-                    Some("review completed"),
-                );
+                if let Err(e) = release.released("review completed") {
+                    tracing::warn!(event = "review_checkout_release_record_failed", path = %self.dir.display(), error = %e);
+                }
                 None
             }
             Ok(out) => Some(format!(
@@ -2163,12 +2321,7 @@ impl Drop for ReviewTree {
             Err(e) => Some(format!("git worktree remove failed: {e}")),
         };
         if let Some(reason) = failure {
-            let _ = worktree::lifecycle::transition(
-                &self.root,
-                &self.dir,
-                "cleanup-failed",
-                Some(&reason),
-            );
+            let _ = release.cleanup_failed(&reason);
             tracing::warn!(event = "review_checkout_release_failed", path = %self.dir.display(), reason = %reason);
         }
     }
@@ -2389,6 +2542,33 @@ pub fn run(opts: &Options) -> Result<i32> {
         )?;
         if m.status == Some(0) {
             gated_tree = "merge-result";
+            let merge_head = git_status(
+                &tree.dir,
+                &["rev-parse", "--quiet", "--verify", "MERGE_HEAD^{commit}"],
+                t.git_secs,
+            )?;
+            let merge_head = match merge_head.status {
+                Some(0) => Some(merge_head.stdout.trim().to_string()),
+                Some(1) => None,
+                status => {
+                    return Err(Error::rejected(format!(
+                        "cannot record merge-result MERGE_HEAD (git status {status:?})"
+                    )))
+                }
+            };
+            if merge_head
+                .as_deref()
+                .is_some_and(|merge_head| merge_head != head_sha)
+            {
+                return Err(Error::rejected(
+                    "review merge-result MERGE_HEAD does not match the pinned PR head",
+                ));
+            }
+            tree.merge_result = Some(MergeResultState {
+                base_sha: base_sha.clone(),
+                merge_head,
+                tree_sha: crate::issue::finish::git(&tree.dir, &["write-tree"])?,
+            });
             merge = json!({"attempted": true, "result": "clean"});
         } else {
             let conflicts = git(
@@ -2913,7 +3093,7 @@ pub fn run(opts: &Options) -> Result<i32> {
 
     // Suggested verdict — the reviewer still does the hands-on check;
     // `pass` only means the mechanical part found nothing.
-    let (verdict, reasons) = suggest(&report, prepare_failed);
+    let (mut verdict, mut reasons) = suggest(&report, prepare_failed);
     report["suggested_verdict"] = json!(verdict);
     report["verdict_reasons"] = json!(reasons);
     report["duration_ms"] = json!(started.elapsed().as_millis());
@@ -2945,16 +3125,39 @@ pub fn run(opts: &Options) -> Result<i32> {
             false
         }
     };
+    let merge_restore_error = if !opts.keep && artifacts_recorded {
+        match tree.begin_release_guard() {
+            Ok(()) => tree
+                .restore_merge_result()
+                .err()
+                .map(|error| error.to_string()),
+            Err(error) => Some(format!(
+                "cannot acquire the active review release guard before restoration: {error}"
+            )),
+        }
+    } else {
+        None
+    };
+    if let Some(error) = &merge_restore_error {
+        let warning = format!("review checkout retained for recovery: {error}");
+        report["checkout_lifecycle_warning"] = json!(warning);
+        verdict = "blocked";
+        reasons.push("review checkout release/restoration could not be safely completed".into());
+        report["suggested_verdict"] = json!(verdict);
+        report["verdict_reasons"] = json!(reasons);
+    }
     report["report_md"] = json!(md_path.to_string_lossy());
     std::fs::write(&md_path, render_markdown(&report))?;
     std::fs::write(&json_path, serde_json::to_string_pretty(&report)?)?;
-    tree.keep = opts.keep || !artifacts_recorded;
+    tree.keep = opts.keep || !artifacts_recorded || merge_restore_error.is_some();
     tree.retention_reason = if opts.keep {
         Some("review --keep requested".into())
     } else if !artifacts_recorded {
         Some("receipt artifact declarations failed; preserve checkout for recovery".into())
     } else {
-        None
+        merge_restore_error
+            .as_ref()
+            .map(|error| format!("review release/restoration failed: {error}"))
     };
 
     if opts.json {
@@ -2963,10 +3166,14 @@ pub fn run(opts: &Options) -> Result<i32> {
         println!("report: {}", md_path.display());
         println!("verdict: {verdict} — {}", reasons.join("; "));
     }
-    Ok(match verdict {
-        "pass" => 0,
-        "needs-hands-on" => 1,
-        _ => 2,
+    Ok(if merge_restore_error.is_some() {
+        2
+    } else {
+        match verdict {
+            "pass" => 0,
+            "needs-hands-on" => 1,
+            _ => 2,
+        }
     })
 }
 
@@ -3400,6 +3607,9 @@ fn render_markdown(r: &Value) -> String {
     ));
     for reason in r["verdict_reasons"].as_array().cloned().unwrap_or_default() {
         md.push_str(&format!("- {}\n", reason.as_str().unwrap_or("")));
+    }
+    if let Some(warning) = r["checkout_lifecycle_warning"].as_str() {
+        md.push_str(&format!("- checkout lifecycle warning: {warning}\n"));
     }
     md.push('\n');
 
