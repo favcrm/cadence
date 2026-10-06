@@ -26,12 +26,11 @@ impl Task {
         prompt: String,
         registrations: &mut Registrations<'_>,
     ) -> Result<Self> {
+        require_task_alias(&alias)?;
         if id.len() != 32
             || !id
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-            || alias.is_empty()
-            || alias.len() > 192
             || prompt.is_empty()
             || prompt.len() > 32768
             || !model.contains('/')
@@ -182,15 +181,18 @@ impl Task {
 pub(super) struct Registrations<'store> {
     store: &'store crate::store::Store,
     aliases: std::collections::HashSet<String>,
+    created: std::collections::HashMap<String, f64>,
 }
 impl<'store> Registrations<'store> {
     pub(super) fn new(store: &'store crate::store::Store) -> Self {
         Self {
             store,
             aliases: std::collections::HashSet::new(),
+            created: std::collections::HashMap::new(),
         }
     }
     fn select(&mut self, alias: &str, cwd: &str, params: &str) -> Result<crate::store::Agent> {
+        require_task_alias(alias)?;
         let expected = registration(alias, cwd, params);
         if !self.aliases.contains(alias) {
             if self.aliases.len() >= 4096 {
@@ -201,6 +203,25 @@ impl<'store> Registrations<'store> {
             self.store.register_agent(&expected)?;
         }
         let agent = self.store.agent(alias)?;
+        // Alias/config equality cannot adopt a legitimately removed and
+        // re-registered row. Retain the first committed creation witness,
+        // never normalize it or update it to make a replacement eligible.
+        if !agent.created.is_finite()
+            || agent.created <= 0.0
+            || (self.aliases.contains(alias) && self.created.get(alias) != Some(&agent.created))
+        {
+            return Err(Error::rejected("native saved registration continuity lost"));
+        }
+        // A native successor is not an operator resume/reconcile. Preserve
+        // durable uncertainty and recorded errors without any repair writes.
+        if !matches!(
+            agent.state.as_str(),
+            "starting" | "idle" | "stopped" | "offline"
+        ) || agent.error.is_some()
+            || self.store.has_unknown(alias)?
+        {
+            return Err(Error::rejected("native saved registration is fenced"));
+        }
         let expected_params: Value = serde_json::from_str(params)?;
         if agent.alias != expected.alias
             || agent.provider != expected.provider
@@ -228,8 +249,16 @@ impl<'store> Registrations<'store> {
             ));
         }
         self.aliases.insert(alias.to_owned());
+        self.created
+            .entry(alias.to_owned())
+            .or_insert(agent.created);
         Ok(agent)
     }
+}
+
+// UNIT selector validation only; no task/history/Store/adapter effects.
+fn require_task_alias(alias: &str) -> Result<()> {
+    crate::proto::identifier(alias, "native task alias").map(|_| ())
 }
 
 // Store registration metadata is not native launch permission. The adapter's

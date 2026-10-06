@@ -536,6 +536,13 @@ impl Registry {
         Ok(())
     }
 }
+// DATA grammar only, before task/history retention or daemon dispatch.
+pub(super) fn require_task_alias(alias: &str) -> Result<()> {
+    crate::proto::identifier(alias, "native task alias")
+        .map(|_| ())
+        .map_err(|_| refused())
+}
+
 fn budget(until: Instant) -> Result<Duration> {
     until
         .checked_duration_since(Instant::now())
@@ -1293,9 +1300,8 @@ pub(super) fn run(layout: Layout) -> Result<()> {
                     model,
                     prompt,
                 } => {
+                    require_task_alias(&alias)?;
                     if !super::hex(&task, 32)
-                        || alias.is_empty()
-                        || alias.len() > 192
                         || model.len() > 192
                         || !model.contains('/')
                         || prompt.is_empty()

@@ -123,6 +123,12 @@ fn validate(conn: &Connection, w: &Witness) -> Result<()> {
 }
 pub(super) fn database_current(binding: &Binding, until: Instant) -> Result<()> {
     let conn = source(until)?;
+    check_database_current(&conn, binding)?;
+    check(until)
+}
+// UNIT SQL observation only. The actual caller retains the original private
+// source/deadline/custody checks before and after this read-only comparison.
+pub(super) fn check_database_current(conn: &Connection, binding: &Binding) -> Result<()> {
     let identity: (i64, String, String, i64, String) = conn
         .query_row(
             "SELECT count(*),database_id,incarnation,epoch,operation FROM store_incarnation",
@@ -135,11 +141,12 @@ pub(super) fn database_current(binding: &Binding, until: Instant) -> Result<()> 
             Ok((r.get(0)?, r.get(1)?))
         })
         .map_err(|_| refused())?;
-    let latch: (i64, i64, i64) = conn
+    let latch: (i64, i64, i64, i64) = conn
         .query_row(
-            "SELECT count(*),closed,witness_done FROM closure_state",
+            "SELECT (SELECT count(*) FROM closure_state),closed,witness_done,epoch
+             FROM closure_state WHERE id=1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .map_err(|_| refused())?;
     if identity
@@ -151,11 +158,12 @@ pub(super) fn database_current(binding: &Binding, until: Instant) -> Result<()> 
             binding.operation.clone(),
         )
         || versions != (1, 32)
-        || latch != (1, 0, 0)
+        || latch.3 <= 0
+        || latch != (1, 0, 0, binding.database_epoch as i64)
     {
         return Err(refused());
     }
-    check(until)
+    Ok(())
 }
 pub(super) fn validate_witness(binding: &Binding, value: &Value) -> Result<()> {
     let w: Witness = serde_json::from_value(value.clone()).map_err(|_| refused())?;
