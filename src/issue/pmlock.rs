@@ -17,7 +17,7 @@
 //! writer that meets a `.write.lock` it did not write fails closed.
 //! The new writer's file carries [`MARKER`] plus an optional diagnostic
 //! trailer naming the holder (`pid`, `host`, `version`, `started_at`,
-//! `bin`); an empty or foreign file — or MARKER with a malformed tail —
+//! `cmd`); an empty or foreign file — or MARKER with a malformed tail —
 //! is a legacy lock of unknown owner and is never removed, aged out or
 //! guessed at. A marker file left under a flock we now hold was written
 //! by a new writer that is gone (the kernel proved it) — so it can be
@@ -379,6 +379,16 @@ fn paths_overlap(a: &str, b: &str) -> bool {
 /// scope is the tracker root and contains every path.
 fn path_within(path: &str, scope: &str) -> bool {
     scope.is_empty() || path == scope || path.starts_with(&format!("{scope}/"))
+}
+
+/// True when a repo-relative path carries git pathspec syntax that
+/// would expand beyond the literal string scope checks compare:
+/// wildcards, character classes, backslashes, and `:(magic)` or a
+/// leading `:` form. Callers never generate these (attachment and
+/// comment names are charset-restricted, issue files are fixed
+/// names), so refusal is fail-closed with no legitimate breakage.
+pub(super) fn has_pathspec_magic(s: &str) -> bool {
+    s.contains(['*', '?', '[', ']', '\\']) || s.contains(":(") || s.starts_with(':')
 }
 
 impl PmLock {
@@ -816,15 +826,28 @@ impl Pm {
                 continue;
             }
             let (code, path) = (&rec[..2], &rec[3..]);
-            if code.starts_with('R') || code.starts_with('C') {
-                fields.next();
-            }
+            // Renames and copies carry the source path in the next NUL
+            // field (`R  <to>\0<from>\0` under -z): both ends are
+            // affected paths. Dropping the source was safe for global
+            // refusal, but selective admission must block it too — a
+            // scoped write could otherwise recreate the source while
+            // the crashed rename's destination stays staged.
+            let renamed_from = if code.starts_with('R') || code.starts_with('C') {
+                fields.next()
+            } else {
+                None
+            };
             if path == MARKER_LOCK_FILE || path.starts_with(".index/") {
                 continue;
             }
             match code {
                 "??" => loose.push(("untracked", path.to_string())),
-                c if !c.starts_with(' ') => staged.push(path.to_string()),
+                c if !c.starts_with(' ') => {
+                    staged.push(path.to_string());
+                    if let Some(from) = renamed_from {
+                        staged.push(from.to_string());
+                    }
+                }
                 _ => loose.push(("modified", path.to_string())),
             }
         }

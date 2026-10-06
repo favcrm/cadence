@@ -326,7 +326,9 @@ impl Pm {
     /// A `..` component is a caller bug and refused: git resolves
     /// `dir/../../other` to `other` at commit time, which would let a
     /// scoped write pass the overlap check as one path and commit
-    /// another. `.` components and duplicate separators are normalized
+    /// another. Git pathspec syntax is refused for the same reason —
+    /// git would expand the pattern beyond the literal string the
+    /// scope checked. `.` components and duplicate separators are normalized
     /// away by reconstruction; the tracker root itself (`pm.dir`,
     /// `.`) becomes the empty string, which the scope checks read as
     /// the whole tracker.
@@ -359,7 +361,15 @@ impl Pm {
                     _ => norm.push(c.as_os_str()),
                 }
             }
-            rel.push(norm.to_string_lossy().into_owned());
+            let rel_str = norm.to_string_lossy().into_owned();
+            if pmlock::has_pathspec_magic(&rel_str) {
+                return Err(Error::internal(format!(
+                    "tracker write {} uses git pathspec syntax (refused: \
+                     scope checks are literal)",
+                    p.display()
+                )));
+            }
+            rel.push(rel_str);
         }
         rel.sort();
         rel.dedup();

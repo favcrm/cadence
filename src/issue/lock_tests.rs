@@ -60,6 +60,29 @@ fn lock_helper() {
         std::fs::write(dir.join("issue.md"), "half a write\n").unwrap();
         git(&pm.dir, &["add", "--", "crashed/issue.md"]).unwrap();
     }
+    if role == "hold_rename" {
+        let dir = pm.dir.join("renamed");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("victim.txt"), "rename me\n").unwrap();
+        git(&pm.dir, &["add", "--", "renamed/victim.txt"]).unwrap();
+        git(
+            &pm.dir,
+            &[
+                "-c",
+                "user.name=cadence",
+                "-c",
+                "user.email=cadence@localhost",
+                "commit",
+                "-q",
+                "-m",
+                "rename victim",
+                "--",
+                "renamed/victim.txt",
+            ],
+        )
+        .unwrap();
+        git(&pm.dir, &["mv", "renamed/victim.txt", "renamed/moved.txt"]).unwrap();
+    }
     std::fs::write(std::env::var("CAD852_READY").unwrap(), "ready").unwrap();
     std::thread::sleep(Duration::from_secs(600));
 }
@@ -791,7 +814,15 @@ fn a_live_holders_refusal_names_its_pid() {
     // The `holder: pid N (comm)` shape is only produced by the live
     // /proc scan: a trailer-only report would say "no live holder
     // found" instead, so this proves the scan ran, not just the file.
+    // Off Linux the scan deliberately reports unavailable while the
+    // trailer still names the holder pid.
+    #[cfg(target_os = "linux")]
     assert!(e.contains("holder: pid"), "no scan attribution: {e}");
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert!(e.contains("holder scan unavailable"), "{e}");
+        assert!(e.contains(&format!("pid={pid}")), "{e}");
+    }
     #[cfg(target_os = "linux")]
     {
         let comm = std::fs::read_to_string("/proc/self/comm")
@@ -833,13 +864,16 @@ fn a_held_fence_file_carries_a_parseable_trailer() {
     );
 }
 
-/// A stale legacy file's refusal says positively that nobody holds it
-/// (or that the scan is unavailable off Linux) — never silence, and
-/// still the non-retryable legacy gate.
+/// A legacy fence left beside a killed holder refuses as the
+/// non-retryable gate and says positively that nobody holds it — the
+/// CAD-999 production shape: a legacy file appears, its writer is
+/// dead, and the next write must diagnose, not wait.
 #[test]
-fn a_stale_legacy_refusal_states_holder_absence() {
+fn a_killed_holders_legacy_lock_states_no_live_holder() {
     let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold", false);
     std::fs::write(pm.dir.join(".write.lock"), "").unwrap();
+    sigkill(child);
     let e = pm.lock_for(Duration::from_millis(100)).err().unwrap();
     assert_eq!(e.code(), Some("legacy_write_lock"), "{e}");
     let text = e.to_string();
@@ -847,6 +881,7 @@ fn a_stale_legacy_refusal_states_holder_absence() {
     assert!(text.contains("no live holder found"), "{text}");
     #[cfg(not(target_os = "linux"))]
     assert!(text.contains("holder scan unavailable"), "{text}");
+    std::fs::remove_file(pm.dir.join(".write.lock")).unwrap();
 }
 
 /// MARKER plus a malformed tail is a legacy lock of unknown owner:
@@ -914,18 +949,34 @@ fn a_disjoint_write_is_admitted_beside_an_interrupted_one() {
     pm.commit_scoped(&lock, std::slice::from_ref(&file), "scoped test commit")
         .unwrap();
     // A commit through the same scoped lock that touches the crash's
-    // paths is refused before any staging: HEAD, index and file stay.
+    // paths is refused before any staging: HEAD, index bytes and the
+    // crashed file itself are byte-identical afterwards.
+    let head_before = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+    let index_before = git(&pm.dir, &["diff", "--cached"]).unwrap();
+    let crashed = pm.dir.join("crashed").join("issue.md");
+    let file_before = std::fs::read(&crashed).unwrap();
     let e = pm
-        .commit_scoped(
-            &lock,
-            std::slice::from_ref(&pm.dir.join("crashed").join("issue.md")),
-            "overlap the crash",
-        )
+        .commit_scoped(&lock, std::slice::from_ref(&crashed), "overlap the crash")
         .err()
         .unwrap()
         .to_string();
     assert!(e.contains("overlaps"), "{e}");
     assert!(e.contains("crashed/issue.md"), "{e}");
+    assert_eq!(
+        git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+        head_before,
+        "a refused commit moved HEAD"
+    );
+    assert_eq!(
+        git(&pm.dir, &["diff", "--cached"]).unwrap(),
+        index_before,
+        "a refused commit touched the index"
+    );
+    assert_eq!(
+        std::fs::read(&crashed).unwrap(),
+        file_before,
+        "a refused commit touched the crashed file"
+    );
     drop(lock);
     assert_ne!(git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(), head);
     // The scoped admission must not consume the tripwire: the stale
@@ -1141,4 +1192,64 @@ fn write_rs_pairs_scoped_locks_with_scoped_commits() {
         "scoped locks must pair with scoped commits:\n{}",
         bad.join("\n")
     );
+}
+
+/// A staged rename blocks BOTH ends: the destination is classified,
+/// and so is the source the crashed writer deleted. A scoped write to
+/// either is refused; an unrelated path is still admitted.
+#[test]
+fn a_staged_rename_blocks_both_ends() {
+    let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold_rename", false);
+    sigkill(child);
+    for end in ["renamed/victim.txt", "renamed/moved.txt"] {
+        let e = pm
+            .lock_for_paths(std::slice::from_ref(&pm.dir.join(end)))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains(end), "rename end not blocked ({end}): {e}");
+    }
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    let other = pm.dir.join("cadence").join("CAD-1");
+    assert!(
+        pm.lock_for_paths(std::slice::from_ref(&other)).is_ok(),
+        "an unrelated path must stay admitted beside a staged rename"
+    );
+}
+
+/// Git pathspec syntax is refused as a caller bug in both admission
+/// and commit: git would expand the pattern beyond the literal string
+/// the scope checked.
+#[test]
+fn pathspec_syntax_is_refused_as_caller_bug() {
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    for evil in [
+        "cadence/*.md",
+        "cadence/CAD-?/issue.md",
+        "cadence/[C]AD-1/issue.md",
+        ":(top)cadence",
+        ":!cadence/CAD-1/issue.md",
+        "back\\slash.md",
+    ] {
+        let p = pm.dir.join(evil);
+        let e = pm
+            .lock_for_paths(std::slice::from_ref(&p))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("pathspec"), "{evil}: {e}");
+    }
+    let lock = pm.lock().unwrap();
+    let e = pm
+        .commit_scoped(
+            &lock,
+            std::slice::from_ref(&pm.dir.join("cadence/*.md")),
+            "expand",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("pathspec"), "{e}");
 }
