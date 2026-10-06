@@ -15,7 +15,7 @@
 
 use serde_json::{json, Value};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::{Builder, TempDir};
@@ -25,15 +25,47 @@ const PR: &str = "41";
 static REVIEW_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn write_full_proc_mountinfo(proc_root: &Path) {
-    fs::create_dir_all(proc_root.join("self")).unwrap();
+    fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+    fs::create_dir_all(proc_root.join("2/fd")).unwrap();
+    fs::create_dir_all(proc_root.join("2/ns")).unwrap();
     fs::write(
         proc_root.join("self/mountinfo"),
         format!(
-            "29 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc rw\n",
+            "1 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc rw\n",
             proc_root.canonicalize().unwrap().display()
         ),
     )
     .unwrap();
+    fs::write(proc_root.join("self/kernel-release"), "7.0.0\n").unwrap();
+    fs::write(
+        proc_root.join("2/stat"),
+        "2 (kthreadd) S 0 0 0 0 -1 2097152 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+    )
+    .unwrap();
+    fs::write(
+        proc_root.join("2/status"),
+        "Name:\tkthreadd\nState:\tS (sleeping)\nUid:\t0 0 0 0\nGid:\t0 0 0 0\nGroups:\t0\nCapEff:\t0000000000000000\n",
+    )
+    .unwrap();
+    ensure_proc_symlink("/", &proc_root.join("2/cwd"));
+    ensure_proc_symlink("pid:[42]", &proc_root.join("self/ns/pid"));
+    ensure_proc_symlink("pid:[42]", &proc_root.join("2/ns/pid"));
+}
+
+fn ensure_proc_symlink(target: &str, path: &Path) {
+    if path.is_symlink() {
+        return;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            symlink(target, path).unwrap();
+        }
+        Err(error) => panic!(
+            "cannot inspect synthetic proc symlink {}: {error}",
+            path.display()
+        ),
+    }
 }
 
 struct Fixture {
@@ -262,6 +294,10 @@ esac
             )
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", self.home.join("gitconfig"))
+            .env("GIT_AUTHOR_NAME", "CAD-848 fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@invalid")
+            .env("GIT_COMMITTER_NAME", "CAD-848 fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@invalid")
             .env("CADENCE_CAD848_REAL_GIT", &self.real_git)
             .env("CADENCE_CAD848_ROOT", &self.repo)
             .env("CADENCE_CAD848_REVIEW_TREE", &self.review_tree)

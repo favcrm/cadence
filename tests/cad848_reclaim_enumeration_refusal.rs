@@ -8,19 +8,27 @@
 #![cfg(feature = "test-seam")]
 
 use cadence_agent::issue::{
+    model::Ref,
+    parse,
     reclaim::{self, ReclaimTestProcessUse},
     start::{self, StartArgs},
     write, Pm,
 };
 use cadence_agent::worktree::lifecycle;
 use serde_json::Value;
-use std::fs;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::ffi::CString;
+use std::fs::{self, File};
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::{Builder, TempDir};
 
 const TEST: &str = "cad848_reclaim_refuses_incomplete_enumeration";
+const NAMESPACE_TEST: &str = "cad848_reclaim_refuses_unproved_pid_namespace";
 const ISOLATED: &str = "CADENCE_CAD848_RECLAIM_ISOLATED";
 const PROJECT: &str = "guard";
 const PREFIX: &str = "C84";
@@ -226,11 +234,50 @@ fn write_proc_mountinfo(proc_root: &Path, hidepid: Option<u8>) {
     fs::write(
         proc_root.join("self/mountinfo"),
         format!(
-            "29 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc {super_options}\n31 23 0:5 net:[4026532471] /run/cad848-netns rw - nsfs nsfs rw\n",
+            "1 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc {super_options}\n31 23 0:5 net:[4026532471] /run/cad848-netns rw - nsfs nsfs rw\n",
             proc_root.canonicalize().unwrap().display()
         ),
     )
     .unwrap();
+    if hidepid.is_none() {
+        write_synthetic_proc_witness(proc_root, 2_097_152);
+    }
+}
+
+fn write_synthetic_proc_witness(proc_root: &Path, flags: u64) {
+    fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+    fs::create_dir_all(proc_root.join("2/fd")).unwrap();
+    fs::create_dir_all(proc_root.join("2/ns")).unwrap();
+    fs::write(proc_root.join("self/kernel-release"), "7.0.0\n").unwrap();
+    fs::write(
+        proc_root.join("2/stat"),
+        format!("2 (kthreadd) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"),
+    )
+    .unwrap();
+    fs::write(
+        proc_root.join("2/status"),
+        "Name:\tkthreadd\nState:\tS (sleeping)\nUid:\t0 0 0 0\nGid:\t0 0 0 0\nGroups:\t0\nCapEff:\t0000000000000000\n",
+    )
+    .unwrap();
+    ensure_proc_symlink("/", &proc_root.join("2/cwd"));
+    ensure_proc_symlink("pid:[42]", &proc_root.join("self/ns/pid"));
+    ensure_proc_symlink("pid:[42]", &proc_root.join("2/ns/pid"));
+}
+
+fn ensure_proc_symlink(target: &str, path: &Path) {
+    if path.is_symlink() {
+        return;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            symlink(target, path).unwrap();
+        }
+        Err(error) => panic!(
+            "cannot inspect synthetic proc symlink {}: {error}",
+            path.display()
+        ),
+    }
 }
 
 fn fake_process(
@@ -346,6 +393,149 @@ fn assert_reclaimed(out: &Value) {
             .any(|row| row["issue"].as_str() == Some(ISSUE)),
         "control lane was not reclaimed through the real path: {out}"
     );
+}
+
+fn assert_reclaim_refusal_preserves(
+    fixture: &Fixture,
+    lane: &Path,
+    branch: &str,
+    branch_tip: &str,
+    target: &Path,
+    proc_root: &Path,
+    specific: &str,
+) -> String {
+    let target_sentinel = target.join(TARGET_SENTINEL);
+    let source = lane.join("unmerged.txt");
+    let issue_path = fixture.pm.dir.join(PROJECT).join(ISSUE).join("issue.md");
+    let ledger_path = fixture.repo.join(".cadence/managed-checkouts.json");
+    let target_before = fs::read(&target_sentinel).unwrap();
+    let source_before = fs::read(&source).unwrap();
+    let issue_before = fs::read(&issue_path).unwrap();
+    let ledger_before = fs::read(&ledger_path).unwrap();
+    let refs_before = git(&fixture.home, &fixture.repo, &["show-ref", "--head"]);
+    let history_before = git(
+        &fixture.home,
+        &fixture.repo,
+        &["rev-list", "--all", "--objects"],
+    );
+    let registrations_before = git(
+        &fixture.home,
+        &fixture.repo,
+        &["worktree", "list", "--porcelain"],
+    );
+    let result = fixture.reclaim_from_proc_root(proc_root);
+    let reason = refusal_reason(&result, "Cannot fully enumerate process cwd/open-fd use");
+    let specific_lower = specific.to_ascii_lowercase();
+    assert!(
+        reason
+            .to_ascii_lowercase()
+            .contains(specific_lower.as_str()),
+        "refusal did not identify {specific}: {reason}"
+    );
+    assert!(target.is_dir(), "refusal deleted target");
+    assert_eq!(fs::read(&target_sentinel).unwrap(), target_before);
+    assert_eq!(fs::read(&source).unwrap(), source_before);
+    assert_eq!(fs::read(&issue_path).unwrap(), issue_before);
+    assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before);
+    assert_eq!(
+        git(&fixture.home, &fixture.repo, &["show-ref", "--head"]),
+        refs_before
+    );
+    assert_eq!(
+        git(
+            &fixture.home,
+            &fixture.repo,
+            &["rev-list", "--all", "--objects"]
+        ),
+        history_before
+    );
+    assert_eq!(
+        git(
+            &fixture.home,
+            &fixture.repo,
+            &["worktree", "list", "--porcelain"],
+        ),
+        registrations_before
+    );
+    assert_registration(fixture, lane, branch, branch_tip);
+    reason.to_string()
+}
+
+const LIVE_PROC_STATUS: &str = "Name:\tfixture\nState:\tS (fixture)\nUid:\t0 0 0 0\nGid:\t0 0 0 0\nGroups:\t0\nCapEff:\t0000000000000000\n";
+
+fn age_reclaim_inputs(paths: &[PathBuf]) {
+    let then = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(2 * 60 * 60);
+    for path in paths {
+        let mut command = Command::new("touch");
+        command.args(["-h", "-d", &format!("@{then}")]).arg(path);
+        let output = cadence_agent::reaper::output(&mut command).expect("age reclaim fixture");
+        assert!(
+            output.status.success(),
+            "cannot age fixture path {}",
+            path.display()
+        );
+    }
+}
+
+fn create_fifo(path: &Path) {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+    assert_eq!(
+        result,
+        0,
+        "mkfifo failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+fn reclaim_after_fifo_pid_disappears(
+    fixture: &Fixture,
+    proc_root: &Path,
+    proc_dir: &Path,
+) -> Value {
+    let fifo = proc_dir.join("status");
+    thread::scope(|scope| {
+        let scan = scope.spawn(|| fixture.reclaim_from_proc_root(proc_root));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut writer = loop {
+            assert!(
+                !scan.is_finished(),
+                "proc scan finished before opening the FIFO status reader"
+            );
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&fifo)
+            {
+                Ok(writer) => break writer,
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    if Instant::now() >= deadline {
+                        let mut unblocker = fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                            .open(&fifo)
+                            .expect("unblock timed-out FIFO scanner");
+                        fs::remove_dir_all(proc_dir).expect("remove only the FIFO process fixture");
+                        unblocker.write_all(LIVE_PROC_STATUS.as_bytes()).unwrap();
+                        drop(unblocker);
+                        scan.join().expect("join timed-out scoped reclaim scanner");
+                        panic!("proc scanner did not open FIFO status before the deadline");
+                    }
+                    thread::yield_now();
+                }
+                Err(error) => panic!("opening FIFO status writer failed: {error}"),
+            }
+        };
+        fs::remove_dir_all(proc_dir).expect("remove only the FIFO process fixture");
+        writer.write_all(LIVE_PROC_STATUS.as_bytes()).unwrap();
+        drop(writer);
+        scan.join().expect("join scoped reclaim scanner")
+    })
 }
 
 #[test]
@@ -818,6 +1008,7 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
     assert!(fs::read_dir(hidden_proc_root.path())
         .unwrap()
         .all(|entry| entry.unwrap().file_name() == "self"));
+    write_synthetic_proc_witness(hidden_proc_root.path(), 2_097_152);
     let result = hidden_fixture.reclaim_from_proc_root(hidden_proc_root.path());
     let reason = refusal_reason(&result, "Cannot fully enumerate process cwd/open-fd use");
     assert!(
@@ -984,6 +1175,120 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
     );
     assert_registration(&live_fixture, &live_lane, &live_branch, &live_tip);
 
+    let gone_fixture = Fixture::new("process gone after status read");
+    let (gone_lane, gone_branch, gone_tip) = gone_fixture.start_unmerged_lane();
+    let gone_target = target_with_sentinel(&gone_lane);
+    let gone_proc_root = Builder::new()
+        .prefix("c848proc-gone-fifo-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    write_proc_mountinfo(gone_proc_root.path(), None);
+    let gone_pid = u32::MAX - 12;
+    let gone_proc_dir = gone_proc_root.path().join(gone_pid.to_string());
+    fs::create_dir(&gone_proc_dir).unwrap();
+    create_fifo(&gone_proc_dir.join("status"));
+    let result =
+        reclaim_after_fifo_pid_disappears(&gone_fixture, gone_proc_root.path(), &gone_proc_dir);
+    assert_reclaimed(&result);
+    assert!(
+        !gone_target.exists(),
+        "confirmed-gone PID blocked cache reclaim"
+    );
+    assert_eq!(
+        fs::read(gone_lane.join("unmerged.txt")).unwrap(),
+        SOURCE_CONTENT
+    );
+    assert_registration(&gone_fixture, &gone_lane, &gone_branch, &gone_tip);
+
+    let mixed_fixture = Fixture::new("gone and still-live process attribution");
+    let (mixed_lane, mixed_branch, mixed_tip) = mixed_fixture.start_unmerged_lane();
+    let mixed_target = target_with_sentinel(&mixed_lane);
+    let mixed_sentinel = mixed_target.join(TARGET_SENTINEL);
+    let mixed_proc_root = Builder::new()
+        .prefix("c848proc-mixed-fifo-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    write_proc_mountinfo(mixed_proc_root.path(), None);
+    let mixed_gone_pid = u32::MAX - 14;
+    let mixed_gone_dir = mixed_proc_root.path().join(mixed_gone_pid.to_string());
+    fs::create_dir(&mixed_gone_dir).unwrap();
+    create_fifo(&mixed_gone_dir.join("status"));
+    let mixed_live_pid = u32::MAX - 13;
+    let mixed_elsewhere = mixed_proc_root.path().join("elsewhere");
+    fs::create_dir(&mixed_elsewhere).unwrap();
+    let mixed_live_dir = fake_process(
+        mixed_proc_root.path(),
+        mixed_live_pid,
+        FakeCredentials {
+            uid: 0,
+            gid: 0,
+            groups: &[],
+            cap_eff: 0,
+        },
+        &mixed_elsewhere,
+        &[],
+    );
+    fs::remove_dir(mixed_live_dir.join("fd")).unwrap();
+    let mixed_issue_path = mixed_fixture
+        .pm
+        .dir
+        .join(PROJECT)
+        .join(ISSUE)
+        .join("issue.md");
+    let mixed_ledger_path = mixed_fixture.repo.join(".cadence/managed-checkouts.json");
+    let mixed_issue_before = fs::read(&mixed_issue_path).unwrap();
+    let mixed_ledger_before = fs::read(&mixed_ledger_path).unwrap();
+    let mixed_refs_before = git(
+        &mixed_fixture.home,
+        &mixed_fixture.repo,
+        &["show-ref", "--head"],
+    );
+    let mixed_registrations_before = git(
+        &mixed_fixture.home,
+        &mixed_fixture.repo,
+        &["worktree", "list", "--porcelain"],
+    );
+    let result =
+        reclaim_after_fifo_pid_disappears(&mixed_fixture, mixed_proc_root.path(), &mixed_gone_dir);
+    let reason = refusal_reason(&result, "Cannot fully enumerate process cwd/open-fd use");
+    assert!(
+        reason.contains(&format!("process {mixed_live_pid}"))
+            && reason.to_ascii_lowercase().contains("file descriptors"),
+        "still-live PID incompleteness was cleared with the gone PID: {reason}"
+    );
+    assert!(
+        !reason.contains(&format!("process {mixed_gone_pid}")),
+        "confirmed-gone PID left its own transient error behind: {reason}"
+    );
+    assert_eq!(fs::read(&mixed_sentinel).unwrap(), TARGET_CONTENT);
+    assert!(
+        mixed_target.is_dir(),
+        "still-live PID uncertainty deleted target"
+    );
+    assert_eq!(
+        fs::read(mixed_lane.join("unmerged.txt")).unwrap(),
+        SOURCE_CONTENT
+    );
+    assert_eq!(fs::read(&mixed_issue_path).unwrap(), mixed_issue_before);
+    assert_eq!(fs::read(&mixed_ledger_path).unwrap(), mixed_ledger_before);
+    assert_eq!(
+        git(
+            &mixed_fixture.home,
+            &mixed_fixture.repo,
+            &["show-ref", "--head"]
+        ),
+        mixed_refs_before
+    );
+    assert_eq!(
+        git(
+            &mixed_fixture.home,
+            &mixed_fixture.repo,
+            &["worktree", "list", "--porcelain"],
+        ),
+        mixed_registrations_before
+    );
+    assert_registration(&mixed_fixture, &mixed_lane, &mixed_branch, &mixed_tip);
+
     let retained_fixture = Fixture::new("retained target refusal");
     let (retained_lane, retained_branch, retained_tip) = retained_fixture.start_unmerged_lane();
     let retained_target = target_with_sentinel(&retained_lane);
@@ -1077,4 +1382,279 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         &retained_branch,
         &retained_tip,
     );
+
+    let main_fixture = Fixture::new("main root planner structural refusal");
+    let (main_lane, main_branch, main_tip) = main_fixture.start_unmerged_lane();
+    let main_target = target_with_sentinel(&main_fixture.repo);
+    let main_sentinel = main_target.join(TARGET_SENTINEL);
+    let main_source = main_fixture.repo.join(".cad848-main-root-source");
+    fs::write(&main_source, b"CAD848-MAIN-ROOT-SOURCE-KEEP\n").unwrap();
+    let main_issue_path = main_fixture
+        .pm
+        .dir
+        .join(PROJECT)
+        .join(ISSUE)
+        .join("issue.md");
+    let issue_text = fs::read_to_string(&main_issue_path).unwrap();
+    let (mut front, body) = parse::parse_issue(&issue_text).unwrap();
+    front.refs = vec![Ref {
+        kind: "worktree".to_string(),
+        url: None,
+        path: Some(main_fixture.repo.display().to_string()),
+        label: None,
+        closed: None,
+        worktree: None,
+        cargo_target: None,
+        agent: None,
+    }];
+    fs::write(&main_issue_path, parse::render(&front, &body).unwrap()).unwrap();
+    assert!(
+        front
+            .refs
+            .iter()
+            .all(|reference| reference.kind != "branch"),
+        "main-root fixture must have no matching issue branch ref"
+    );
+    let main_ledger_path = main_fixture.repo.join(".cadence/managed-checkouts.json");
+    let main_issue_before = fs::read(&main_issue_path).unwrap();
+    let main_ledger_before = fs::read(&main_ledger_path).unwrap();
+    let main_target_before = fs::read(&main_sentinel).unwrap();
+    let main_source_before = fs::read(&main_source).unwrap();
+    let main_refs_before = git(
+        &main_fixture.home,
+        &main_fixture.repo,
+        &["show-ref", "--head"],
+    );
+    let main_history_before = git(
+        &main_fixture.home,
+        &main_fixture.repo,
+        &["rev-list", "--all", "--objects"],
+    );
+    let main_registrations_before = git(
+        &main_fixture.home,
+        &main_fixture.repo,
+        &["worktree", "list", "--porcelain"],
+    );
+    let main_root = main_fixture.repo.display().to_string();
+    let plan = reclaim::plan_for_repo(
+        &main_fixture.pm,
+        &main_fixture.state,
+        IDLE_SECS,
+        &main_fixture.repo,
+    )
+    .expect("read-only main-root reclaim plan");
+    let plan_row = plan["cache_resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["resource"]["path"].as_str() == Some(main_root.as_str()))
+        .expect("main-root cache plan row");
+    assert_eq!(plan_row["status"], "refused", "{plan_row}");
+    assert_eq!(
+        plan_row["reason_code"], "path-confinement-or-symlink-refused",
+        "{plan_row}"
+    );
+    assert_eq!(fs::read(&main_issue_path).unwrap(), main_issue_before);
+    assert_eq!(fs::read(&main_ledger_path).unwrap(), main_ledger_before);
+    assert_eq!(fs::read(&main_sentinel).unwrap(), main_target_before);
+    assert_eq!(fs::read(&main_source).unwrap(), main_source_before);
+    assert_eq!(
+        git(
+            &main_fixture.home,
+            &main_fixture.repo,
+            &["show-ref", "--head"]
+        ),
+        main_refs_before
+    );
+    assert_eq!(
+        git(
+            &main_fixture.home,
+            &main_fixture.repo,
+            &["rev-list", "--all", "--objects"],
+        ),
+        main_history_before
+    );
+    assert_eq!(
+        git(
+            &main_fixture.home,
+            &main_fixture.repo,
+            &["worktree", "list", "--porcelain"],
+        ),
+        main_registrations_before
+    );
+    let applied = main_fixture.reclaim(ReclaimTestProcessUse::CompleteNoUse);
+    let apply_row = applied["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["issue"].as_str() == Some(ISSUE) && row["lane"].as_str() == Some(main_root.as_str())
+        })
+        .expect("main-root apply refusal");
+    let apply_reason = apply_row["reason"].as_str().unwrap().to_ascii_lowercase();
+    assert!(
+        apply_reason.contains("not a linked worktree")
+            || apply_reason.contains("main checkout is never reclaimed"),
+        "apply did not report structural main-root refusal: {apply_row}"
+    );
+    assert!(applied["reclaimed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["issue"].as_str() != Some(ISSUE)));
+    assert_eq!(fs::read(&main_issue_path).unwrap(), main_issue_before);
+    assert_eq!(fs::read(&main_ledger_path).unwrap(), main_ledger_before);
+    assert_eq!(fs::read(&main_sentinel).unwrap(), main_target_before);
+    assert_eq!(fs::read(&main_source).unwrap(), main_source_before);
+    assert_eq!(
+        git(
+            &main_fixture.home,
+            &main_fixture.repo,
+            &["show-ref", "--head"]
+        ),
+        main_refs_before
+    );
+    assert_eq!(
+        git(
+            &main_fixture.home,
+            &main_fixture.repo,
+            &["rev-list", "--all", "--objects"],
+        ),
+        main_history_before
+    );
+    assert_eq!(
+        git(
+            &main_fixture.home,
+            &main_fixture.repo,
+            &["worktree", "list", "--porcelain"],
+        ),
+        main_registrations_before
+    );
+    assert_registration(&main_fixture, &main_lane, &main_branch, &main_tip);
+}
+
+#[test]
+fn cad848_reclaim_refuses_unproved_pid_namespace() {
+    if std::env::var_os(ISOLATED).is_none() {
+        let sandbox = Builder::new()
+            .prefix("c848namespace-run-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = sandbox.path().join("home");
+        let state = sandbox.path().join("state");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            NAMESPACE_TEST,
+            "--test-threads",
+            "1",
+            "--nocapture",
+        ])
+        .env(ISOLATED, "1")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
+        .env("XDG_DATA_HOME", sandbox.path().join("data"))
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_CACHE_HOME", sandbox.path().join("cache"))
+        .env_remove("CADENCE_PM_DIR")
+        .env_remove("CADENCE_STATE_DIR")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+        let out = cadence_agent::reaper::output(&mut cmd).unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "isolated namespace acceptance run failed: {text}"
+        );
+        assert!(
+            text.contains("1 passed"),
+            "child did not run the namespace check: {text}"
+        );
+        return;
+    }
+
+    let fixture = Fixture::new("unproved process PID namespace");
+    let (lane, branch, branch_tip) = fixture.start_unmerged_lane();
+    let target = target_with_sentinel(&lane);
+    let held_path = target.join("parent-held-fd");
+    fs::write(&held_path, b"CAD848-PARENT-OPEN-FD\n").unwrap();
+    let _parent_fd = File::open(&held_path).unwrap();
+    age_reclaim_inputs(&[lane.join("unmerged.txt"), target.join(TARGET_SENTINEL)]);
+    let proc_root = Builder::new()
+        .prefix("c848proc-unproved-namespace-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    write_proc_mountinfo(proc_root.path(), None);
+    write_synthetic_proc_witness(proc_root.path(), 0);
+    assert!(
+        !proc_root
+            .path()
+            .join(std::process::id().to_string())
+            .exists(),
+        "fake proc tree must exclude the parent process"
+    );
+    assert!(
+        fs::read_to_string(proc_root.path().join("2/stat"))
+            .unwrap()
+            .contains("2 (kthreadd) S 0 0 0 0 -1 0 "),
+        "namespace bad case must keep PID, comm, parent, and namespace labels plausible"
+    );
+    assert_eq!(
+        fs::read_link(proc_root.path().join("self/ns/pid")).unwrap(),
+        PathBuf::from("pid:[42]")
+    );
+    assert_eq!(
+        fs::read_link(proc_root.path().join("2/ns/pid")).unwrap(),
+        PathBuf::from("pid:[42]")
+    );
+    let reason = assert_reclaim_refusal_preserves(
+        &fixture,
+        &lane,
+        &branch,
+        &branch_tip,
+        &target,
+        proc_root.path(),
+        "namespace",
+    );
+    assert!(
+        reason.to_ascii_lowercase().contains("namespace"),
+        "unproved namespace refusal was not actionable: {reason}"
+    );
+    drop(_parent_fd);
+
+    for component in ["2", "self"] {
+        let fixture = Fixture::new(&format!("{component} proof submount refusal"));
+        let (lane, branch, branch_tip) = fixture.start_unmerged_lane();
+        let target = target_with_sentinel(&lane);
+        let proc_root = Builder::new()
+            .prefix("c848proc-proof-submount-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        write_proc_mountinfo(proc_root.path(), None);
+        let mountinfo_path = proc_root.path().join("self/mountinfo");
+        let mut mountinfo = fs::read_to_string(&mountinfo_path).unwrap();
+        mountinfo.push_str(&format!(
+            "32 1 0:55 /{component} {}/{component} rw,nosuid,nodev,noexec,relatime - proc proc rw\n",
+            proc_root.path().canonicalize().unwrap().display()
+        ));
+        fs::write(&mountinfo_path, mountinfo).unwrap();
+        assert_reclaim_refusal_preserves(
+            &fixture,
+            &lane,
+            &branch,
+            &branch_tip,
+            &target,
+            proc_root.path(),
+            "mount",
+        );
+    }
 }

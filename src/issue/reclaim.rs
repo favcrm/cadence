@@ -595,6 +595,24 @@ fn target_plan(
                 "reason_code": "foreign-or-undeclared-project-repo", "reason": e.to_string(), "reclaimable_bytes": null});
         }
     };
+    let cargo_target = issue
+        .front
+        .refs
+        .iter()
+        .filter(|r| r.kind == "worktree" && r.closed != Some(true))
+        .filter(|r| finish::same_path(Path::new(r.path.as_deref().unwrap_or_default()), lane))
+        .find_map(|r| r.cargo_target.clone());
+    let target = match reclaim_target(lane, cargo_target.as_deref()) {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            return json!({"resource": base, "status": "retained",
+            "reason_code": "target-not-lane-local", "reason": "recorded cargo target is not the lane-local target; no deletion", "reclaimable_bytes": null})
+        }
+        Err(e) => {
+            return json!({"resource": base, "status": "refused",
+            "reason_code": "path-confinement-or-symlink-refused", "reason": e.to_string(), "reclaimable_bytes": null})
+        }
+    };
     let branch = match declared_issue_branch(issue, lane) {
         Ok(branch) => branch,
         Err(e) => {
@@ -620,24 +638,6 @@ fn target_plan(
             "reason_code": "lifecycle-ownership-or-state-refused", "reason": e.to_string(),
             "lifecycle": lifecycle, "reclaimable_bytes": null});
     }
-    let cargo_target = issue
-        .front
-        .refs
-        .iter()
-        .filter(|r| r.kind == "worktree" && r.closed != Some(true))
-        .filter(|r| finish::same_path(Path::new(r.path.as_deref().unwrap_or_default()), lane))
-        .find_map(|r| r.cargo_target.clone());
-    let target = match reclaim_target(lane, cargo_target.as_deref()) {
-        Ok(Some(target)) => target,
-        Ok(None) => {
-            return json!({"resource": base, "status": "retained",
-            "reason_code": "target-not-lane-local", "reason": "recorded cargo target is not the lane-local target; no deletion", "reclaimable_bytes": null})
-        }
-        Err(e) => {
-            return json!({"resource": base, "status": "refused",
-            "reason_code": "path-confinement-or-symlink-refused", "reason": e.to_string(), "reclaimable_bytes": null})
-        }
-    };
     if let Some(reason) = blocked_reason(view, state_dir, &issue.front, lane, idle, WALK_CAP) {
         let code = if reason.contains("written within") {
             "source-recent"
@@ -980,6 +980,43 @@ mod tests {
         )
     }
 
+    fn ensure_fixture_symlink(target: impl AsRef<Path>, link: &Path) {
+        match std::fs::symlink_metadata(link) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => panic!("fixture path {} is not a symlink", link.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::os::unix::fs::symlink(target, link).unwrap();
+            }
+            Err(error) => panic!("cannot inspect fixture link {}: {error}", link.display()),
+        }
+    }
+
+    fn seed_synthetic_proc_view(proc_root: &Path) {
+        let root = proc_root.canonicalize().unwrap();
+        std::fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+        std::fs::create_dir_all(proc_root.join("2/fd")).unwrap();
+        std::fs::create_dir_all(proc_root.join("2/ns")).unwrap();
+        std::fs::write(proc_root.join("self/kernel-release"), "7.0.0\n").unwrap();
+        std::fs::write(
+            proc_root.join("self/mountinfo"),
+            format!("1 0 0:1 / {} rw - proc proc rw\n", root.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            proc_root.join("2/stat"),
+            "2 (kthreadd) S 0 0 0 0 -1 2097152 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proc_root.join("2/status"),
+            "Name:\tkthreadd\nState:\tS (sleeping)\nUid:\t0 0 0 0\nGid:\t0 0 0 0\nGroups:\t0\nCapEff:\t0000000000000000\n",
+        )
+        .unwrap();
+        ensure_fixture_symlink("/", &proc_root.join("2/cwd"));
+        ensure_fixture_symlink("pid:[42]", &proc_root.join("self/ns/pid"));
+        ensure_fixture_symlink("pid:[42]", &proc_root.join("2/ns/pid"));
+    }
+
     thread_local! {
         static PLANT: std::cell::RefCell<Option<std::process::Child>> =
             const { std::cell::RefCell::new(None) };
@@ -1004,7 +1041,12 @@ mod tests {
         if let Some(proc_root) = PLANT_PROC_ROOT.with(|root| root.borrow().clone()) {
             let fake_proc = proc_root.join(child.id().to_string());
             std::fs::create_dir_all(fake_proc.join("fd")).unwrap();
-            std::os::unix::fs::symlink(&want, fake_proc.join("cwd")).unwrap();
+            std::fs::write(
+                fake_proc.join("status"),
+                "Name:\tsleep\nState:\tS (sleeping)\nUid:\t1000 1000 1000 1000\nGid:\t1000 1000 1000 1000\nGroups:\t1000\nCapEff:\t0000000000000000\n",
+            )
+            .unwrap();
+            ensure_fixture_symlink(&want, &fake_proc.join("cwd"));
         }
         let link = format!("/proc/{}/cwd", child.id());
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1266,6 +1308,7 @@ mod tests {
         age(&lane, 7 * 3600);
         let proc_root = tmp.0.join("proc");
         std::fs::create_dir_all(&proc_root).unwrap();
+        seed_synthetic_proc_view(&proc_root);
         let _proc_root = finish::use_process_proc_root_for_test(proc_root.clone());
         PLANT_PROC_ROOT.with(|root| *root.borrow_mut() = Some(proc_root));
         PLANT_ARMED.with(|a| a.set(true));

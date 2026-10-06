@@ -1180,6 +1180,66 @@ fn retention_guards_legacy_adoption_and_released_generation_restart() {
             assert_eq!(closed_record.release_artifacts, release_artifacts);
             assert_eq!(closed_record.rollback_artifacts, rollback_artifacts);
             assert!(!interrupted_lane.exists());
+
+            let closed_ledger = ledger_bytes();
+            let closed_issue_bytes = fs::read(&issue_file).expect("snapshot closed issue refs");
+            let closed_tracker_head = git(&fx.home, &fx.pm.dir, &["rev-parse", "HEAD"]);
+            let closed_registration = git(&fx.home, &fx.repo, &["worktree", "list", "--porcelain"]);
+            let mut keep_branch = fx.cli();
+            keep_branch.args(["issue", "finish", "C84-12", "--keep-branch", "--json"]);
+            let keep_branch = cadence_agent::reaper::output(&mut keep_branch)
+                .expect("run branch-only keep CLI against released checkout");
+            assert!(
+                keep_branch.status.success(),
+                "branch-only keep failed: {}",
+                output_text(&keep_branch)
+            );
+            let report: serde_json::Value =
+                serde_json::from_slice(&keep_branch.stdout).expect("branch-only finish JSON");
+            assert_eq!(report["finished"].as_bool(), Some(false));
+            assert_eq!(report["branch"].as_str(), Some(interrupted_branch.as_str()));
+            assert_eq!(report["kept_branch"].as_bool(), Some(true));
+            let reason = report["reason"]
+                .as_str()
+                .expect("branch-only keep explains retained branch");
+            assert!(
+                reason.contains("no managed checkout path")
+                    && reason.contains("branch/ref retained")
+                    && reason.contains("issue start")
+                    && reason.contains("recorded lane/name")
+                    && reason.contains("reattach")
+                    && reason.contains("before finishing"),
+                "reason is not actionable for the retained branch: {reason}"
+            );
+            assert_eq!(fx.branch_tip(&interrupted_branch), interrupted_head);
+            assert_eq!(
+                git(
+                    &fx.home,
+                    &fx.repo,
+                    &["rev-list", "--reverse", &interrupted_branch]
+                ),
+                interrupted_history
+            );
+            assert_eq!(fx.issue_refs("C84-12"), closed_refs);
+            assert_eq!(ledger_bytes(), closed_ledger);
+            assert_eq!(fs::read(&issue_file).unwrap(), closed_issue_bytes);
+            assert_eq!(
+                git(&fx.home, &fx.pm.dir, &["rev-parse", "HEAD"]),
+                closed_tracker_head
+            );
+            assert_eq!(
+                git(&fx.home, &fx.repo, &["worktree", "list", "--porcelain"]),
+                closed_registration
+            );
+            assert_eq!(
+                fs::read(&release_artifact).unwrap(),
+                b"release artifact survives\n"
+            );
+            assert_eq!(
+                fs::read(&rollback_artifact).unwrap(),
+                b"rollback artifact survives\n"
+            );
+            assert!(!interrupted_lane.exists());
         }
 
         let (retained_missing, retained_branch) = fx.start_lane("C84-9", "missing-retained");
@@ -1550,6 +1610,7 @@ impl Fixture {
         let empty_proc_root = root.path().join("proc");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(empty_proc_root.join("self")).unwrap();
+        write_synthetic_namespace_proof(&empty_proc_root);
         let canonical_proc_root = empty_proc_root.canonicalize().unwrap();
         fs::write(
             empty_proc_root.join("self/mountinfo"),
@@ -1903,6 +1964,32 @@ impl Drop for RaceChildren {
         }
         if let Some(child) = self.adopt.as_mut() {
             let _ = child.wait();
+        }
+    }
+}
+
+fn write_synthetic_namespace_proof(proc_root: &Path) {
+    fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+    fs::create_dir_all(proc_root.join("2/fd")).unwrap();
+    fs::create_dir_all(proc_root.join("2/ns")).unwrap();
+    fs::write(proc_root.join("self/kernel-release"), "7.0.0").unwrap();
+    fs::write(
+        proc_root.join("2/stat"),
+        "2 (kthreadd) S 0 0 0 0 -1 2097152 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+    )
+    .unwrap();
+    fs::write(
+        proc_root.join("2/status"),
+        "Name:\tkthreadd\nState:\tS (sleeping)\nUid:\t0 0 0 0\nGid:\t0 0 0 0\nGroups:\t0\nCapEff:\t0000000000000000\n",
+    )
+    .unwrap();
+    for (path, target) in [
+        (proc_root.join("2/cwd"), "/"),
+        (proc_root.join("self/ns/pid"), "pid:[42]"),
+        (proc_root.join("2/ns/pid"), "pid:[42]"),
+    ] {
+        if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            std::os::unix::fs::symlink(target, &path).unwrap();
         }
     }
 }

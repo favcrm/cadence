@@ -93,16 +93,19 @@ merged-lane finish plan and idle `target/` cache plan using the same checks as
 the scheduled daemon pass. A retained, releasing or otherwise non-active
 lifecycle record is report-only for cache cleanup; the plan names its state and
 reason. Legacy lanes require the declared repo, canonical real worktree,
-registered matching branch and open issue refs. `cadence issue reclaim --apply`
-opts into the existing policy: merged checkout finish and bounded lane-local
-target cache reclamation. Immediately before the final process scan, reclaim
-holds the lifecycle lock through ownership revalidation and deletion; it drops
-the guard before writing a PM comment. Cache reclamation never changes lifecycle
-state or removes source or a branch. Branch deletion requires the issue-bound, project-declared
-checkout and exact-tip merge/push evidence; any present lifecycle record must
-also match and be active. Squash merges use the existing SHA-pinned ancestry,
-patch-equivalence or merged-PR evidence. Unmanaged or foreign checkouts remain
-inventory-only until explicitly adopted.
+registered matching branch and open issue refs. The plan checks declared repo
+ownership, then target path confinement, before branch and lifecycle policy, so
+a structural main/outside/symlink refusal is not hidden by an absent branch ref.
+`cadence issue reclaim --apply` opts into the existing policy: merged checkout
+finish and bounded lane-local target cache reclamation. Immediately before the
+final process scan, reclaim holds the lifecycle lock through ownership
+revalidation and deletion; it drops the guard before writing a PM comment. Cache
+reclamation never changes lifecycle state or removes source or a branch. Branch
+deletion requires the issue-bound, project-declared checkout and exact-tip
+merge/push evidence; any present lifecycle record must also match and be active.
+Squash merges use the existing SHA-pinned ancestry, patch-equivalence or
+merged-PR evidence. Unmanaged or foreign checkouts remain inventory-only until
+explicitly adopted.
 
 New review/validation checkout deletion has **no automatic cleanup policy**;
 inventory is report-only. Age, name prefix, `/tmp` location, ticket status and
@@ -114,18 +117,29 @@ retains the resource with an actionable reason. `--force` cannot override
 failed process/daemon binding, dirty-tree or activity enumeration; uncertainty
 is not a clean result.
 
-Process scans first prove that the canonical proc root has one full procfs
-mount (`mountinfo` root `/`) with no restricted `hidepid` mode; absent,
-unreadable, malformed, stacked or restricted visibility metadata refuses the
-scan. They then inspect cwd and open-FD holders without using UID, group,
-capability or path-permission heuristics to infer that a process lacks an
-inherited or transferred checkout descriptor. A complete status with `State: Z`
-or `State: X` is the only basis for skipping a dead process; missing or
-malformed state and inaccessible live status, cwd or FD inspection remain
-incomplete enumeration. Any such failure retains the resource with the process
-identity and refusal reason when known. This deliberately fails closed when the
-host cannot prove a complete process view; cleanup requires an authorized
-complete inspection mechanism rather than suppressing unrelated `EACCES`.
+On Linux, process scans hold an opened proc-root directory and derive PID paths
+through its anchored FD. Before an empty scan can establish absence, the scanner proves
+a unique full procfs mount (`mountinfo` root `/`), unrestricted `hidepid`,
+matching statx mount identity for the root and proof files, and the initial PID
+namespace using PID 2's verified `kthreadd` kernel-thread record plus matching
+PID-namespace links for PID 2 and the caller. Unavailable mount-ID support,
+unsupported kernel ABI, overlays of numeric PID, `self` or `thread-self` paths,
+and absent, unreadable, malformed, stacked or restricted visibility metadata
+refuse completeness. If the root opens and anchors, a failed proof remains a
+non-forceable enumeration error, but an anchored best-effort scan can report
+positive cwd/open-FD holders; an empty partial view never establishes absence.
+If opening or anchoring the root fails, enumeration refuses without a PID scan.
+The scan inspects holders without using UID, group, capability or
+path-permission heuristics to infer that a process lacks an inherited or
+transferred checkout descriptor. A complete
+status with `State: Z` or `State: X` is the only basis for skipping a dead
+process. A status, cwd or FD-directory `ENOENT` is ignored only after the PID
+directory is independently gone or a complete status reread reports `Z`/`X`; a
+listed FD link's `ENOENT` requires that exact symlink entry to be gone, and an
+FD-iterator error requires the PID directory to be gone. Other errors remain
+incomplete enumeration. Any failure retains the resource with the process
+identity and refusal reason when known; cleanup requires an authorized complete
+inspection mechanism rather than suppressing unrelated `EACCES`.
 
 A successful review using a clean no-commit merge-result tree declares its
 receipt paths, then acquires an exact-owner release guard before verifying and
@@ -147,7 +161,10 @@ use `checkout release --reason` as the explicit recovery, then resume only at a
 verified current SHA. A surviving branch ref remains open and its commits
 remain recoverable. If both checkout and branch refs are missing, the tracker
 refs may be closed as history. A branch checked out at a different path is
-reported as moved and is never removed from under its new checkout.
+reported as moved and is never removed from under its new checkout. When only a
+branch ref remains, `issue finish <ID> --keep-branch` without `--remote` is a
+no-op result (`finished: false`): it preserves the branch/ref and requires an
+explicit `issue start` with the recorded lane/name to reattach before finishing.
 
 ## Report-only rollout and rollback
 
