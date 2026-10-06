@@ -6,7 +6,9 @@
 //! Grant issuance/one-use replay and protected-open/close/witness integration
 //! remain to be exercised once the constructor's real relay contract exists.
 use super::owner;
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::Connection;
+#[cfg(test)]
+use rusqlite::{params, TransactionBehavior};
 use std::cell::Cell;
 use std::path::Path;
 
@@ -49,6 +51,7 @@ impl Drop for SqliteOpenProbe {
     }
 }
 
+#[cfg(test)]
 fn enclave_refused<T>(result: crate::error::Result<T>) {
     match result {
         Err(crate::Error::Rejected(message)) => assert_eq!(
@@ -59,6 +62,7 @@ fn enclave_refused<T>(result: crate::error::Result<T>) {
     }
 }
 
+#[cfg(test)]
 fn alias_refused<T>(result: crate::error::Result<T>) {
     match result {
         Err(crate::Error::Rejected(message)) => {
@@ -68,6 +72,7 @@ fn alias_refused<T>(result: crate::error::Result<T>) {
     }
 }
 
+#[cfg(test)]
 fn database_files(path: &Path) -> Vec<Option<Vec<u8>>> {
     ["", "-wal", "-shm", "-journal"]
         .into_iter()
@@ -81,6 +86,7 @@ fn database_files(path: &Path) -> Vec<Option<Vec<u8>>> {
         .collect()
 }
 
+#[cfg(test)]
 fn refused_without_mutation(conn: &mut Connection, path: &Path, binding: &owner::Binding) {
     // Exclude malformed selector/timeout false positives: this candidate is
     // valid public syntax and must reach the real database identity comparison.
@@ -127,6 +133,186 @@ fn refused_without_mutation(conn: &mut Connection, path: &Path, binding: &owner:
     );
 }
 
+/// Independently authored LOCAL retained-opening replay, not remote CAS,
+/// first-open admission or late-current acceptance. Root alone supplies the
+/// genuinely opened Shared Store and Prepared/Begin/Checked/Stop FD3 window.
+/// Pre-Begin original custody/current and post-Checked current stay OUTSIDE
+/// this comparison. No caller selectors, grants, callbacks or authority output.
+#[cfg(all(
+    debug_assertions,
+    feature = "test-seam",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub(crate) fn native_retained_opening_replay(store: &crate::store::Store) -> crate::Result<()> {
+    use std::fs::{Metadata, OpenOptions};
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::PathBuf;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FileState {
+        device: u64,
+        inode: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        links: u64,
+        length: u64,
+        accessed: (i64, i64),
+        modified: (i64, i64),
+        changed: (i64, i64),
+        bytes: Option<Vec<u8>>,
+        link: Option<PathBuf>,
+    }
+    fn state(metadata: &Metadata) -> FileState {
+        FileState {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            links: metadata.nlink(),
+            length: metadata.len(),
+            accessed: (metadata.atime(), metadata.atime_nsec()),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            bytes: None,
+            link: None,
+        }
+    }
+    fn files(path: &Path) -> crate::Result<Vec<Option<FileState>>> {
+        ["", "-wal", "-shm", "-journal"]
+            .into_iter()
+            .map(|suffix| {
+                let mut name = path.as_os_str().to_os_string();
+                name.push(suffix);
+                let name = PathBuf::from(name);
+                let metadata = match std::fs::symlink_metadata(&name) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(error.into()),
+                };
+                let mut snapshot = state(&metadata);
+                if metadata.file_type().is_symlink() {
+                    snapshot.link = Some(std::fs::read_link(&name)?);
+                } else if metadata.is_file() {
+                    // Read only our actual daemon-owned file, without following
+                    // a replacement link or causing snapshot atime writes. No
+                    // privilege acquisition/fallback if O_NOATIME is refused.
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
+                        .open(&name)?;
+                    if state(&file.metadata()?) != snapshot {
+                        return Err(crate::Error::rejected(
+                            "retained replay snapshot inode changed",
+                        ));
+                    }
+                    let mut bytes = Vec::new();
+                    (&file).read_to_end(&mut bytes)?;
+                    if state(&file.metadata()?) != snapshot
+                        || state(&std::fs::symlink_metadata(&name)?) != snapshot
+                    {
+                        return Err(crate::Error::rejected(
+                            "retained replay snapshot changed while read",
+                        ));
+                    }
+                    snapshot.bytes = Some(bytes);
+                }
+                Ok(Some(snapshot))
+            })
+            .collect()
+    }
+    #[derive(Debug, PartialEq, Eq)]
+    struct Canary {
+        identity: (String, String, i64, String, String),
+        highwater: i64,
+        latch: (i64, i64, i64),
+        changes: i64,
+    }
+    fn canary(conn: &Connection) -> crate::Result<Canary> {
+        Ok(Canary {
+            identity: conn.query_row(
+                "SELECT database_id,incarnation,epoch,operation,artifact FROM store_incarnation WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )?,
+            highwater: conn.query_row(
+                "SELECT sequence FROM store_business_highwater WHERE id=1", [], |row| row.get(0),
+            )?,
+            latch: conn.query_row(
+                "SELECT closed,witness_done,epoch FROM closure_state WHERE id=1", [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?,
+            changes: conn.query_row("SELECT total_changes()", [], |row| row.get(0))?,
+        })
+    }
+
+    if store.db_identity != owner::DATABASE_PATH
+        || !store.protected_open
+        || store.conn.is_poisoned()
+    {
+        return Err(crate::Error::rejected(
+            "retained replay requires the healthy original protected Store",
+        ));
+    }
+    // Use the SAME existing connection, disarmed for writes. Reject poison
+    // before conn() so its recovery/forensic writer is not a probe effect.
+    // Root must independently exclude other writers/readbacks in this window;
+    // this lock is not a caller-supplied quiescence or admission certificate.
+    let conn = store.conn();
+    let before_canary = canary(&conn)?;
+    let path = Path::new(owner::DATABASE_PATH);
+    let before_files = files(path)?;
+    if before_files[0]
+        .as_ref()
+        .is_none_or(|file| file.bytes.is_none() || file.link.is_some())
+    {
+        return Err(crate::Error::rejected(
+            "retained replay original database is absent or not regular",
+        ));
+    }
+    let sql_opens = SqliteOpenProbe::new();
+    let before_opens = sql_opens.count();
+    assert!(before_opens < u64::MAX, "SQLite open observer exhausted");
+
+    match store.reconsume_owned_opening() {
+        Err(crate::Error::Rejected(message)) => assert_eq!(
+            message, "Store owner permit spent or UNKNOWN; replay refused",
+            "retained original consume failed at a different boundary"
+        ),
+        _ => panic!("retained original opening consume did not reach exact LOCAL spent refusal"),
+    }
+    assert_eq!(
+        sql_opens.count(),
+        before_opens,
+        "retained consume opened SQLite"
+    );
+    // No current/flush/checkpoint/recovery or newly opened SQLite reader here.
+    // These actual read-only canaries use the already-held original connection.
+    assert_eq!(
+        canary(&conn)?,
+        before_canary,
+        "retained replay changed actual identity/latch/business canary"
+    );
+    assert_eq!(
+        files(path)?,
+        before_files,
+        "retained replay changed database/sidefile bytes, links, metadata or absence"
+    );
+    assert_eq!(
+        sql_opens.count(),
+        before_opens,
+        "retained comparison opened SQLite"
+    );
+    // All comparisons and observer/connection release finish before caller's
+    // Checked. Root performs post-current only afterward, then owned Stop/reap;
+    // this diagnostic must never continue into serving or business writers.
+    Ok(())
+}
+
+#[cfg(test)]
 #[test]
 fn store_owner_wrong_or_replaced_incarnation_refuses_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
