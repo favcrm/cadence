@@ -226,13 +226,30 @@ pub(crate) fn native_retained_opening_replay(store: &crate::store::Store) -> cra
     }
     #[derive(Debug, PartialEq, Eq)]
     struct Canary {
+        version: i64,
         identity: (String, String, i64, String, String),
         highwater: i64,
         latch: (i64, i64, i64),
         changes: i64,
     }
     fn canary(conn: &Connection) -> crate::Result<Canary> {
-        Ok(Canary {
+        // Missing, duplicate or malformed rows are setup failure, never a
+        // default canary or a metadata-created claim of Root provenance.
+        let counts: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT (SELECT count(*) FROM schema_version),
+                    (SELECT count(*) FROM store_incarnation),
+                    (SELECT count(*) FROM closure_state),
+                    (SELECT count(*) FROM store_business_highwater)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if counts != (1, 1, 1, 1) {
+            return Err(crate::Error::rejected(
+                "retained replay canary cardinality is invalid",
+            ));
+        }
+        let value = Canary {
+            version: conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))?,
             identity: conn.query_row(
                 "SELECT database_id,incarnation,epoch,operation,artifact FROM store_incarnation WHERE id=1",
                 [],
@@ -246,22 +263,34 @@ pub(crate) fn native_retained_opening_replay(store: &crate::store::Store) -> cra
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?,
             changes: conn.query_row("SELECT total_changes()", [], |row| row.get(0))?,
-        })
+        };
+        if value.version != 32
+            || value.identity.2 <= 0
+            || value.highwater < 0
+            || value.latch != (0, 0, value.identity.2)
+            || value.changes < 0
+        {
+            return Err(crate::Error::rejected(
+                "retained replay actual canary is malformed or closed",
+            ));
+        }
+        Ok(value)
     }
 
-    if store.db_identity != owner::DATABASE_PATH
-        || !store.protected_open
-        || store.conn.is_poisoned()
-    {
+    if store.db_identity != owner::DATABASE_PATH || !store.protected_open {
         return Err(crate::Error::rejected(
             "retained replay requires the healthy original protected Store",
         ));
     }
-    // Use the SAME existing connection, disarmed for writes. Reject poison
-    // before conn() so its recovery/forensic writer is not a probe effect.
-    // Root must independently exclude other writers/readbacks in this window;
-    // this lock is not a caller-supplied quiescence or admission certificate.
-    let conn = store.conn();
+    // Borrow the raw SAME existing disarmed connection. Do NOT use conn():
+    // that accessor can recover poison through rollback/event SQL/clear_poison.
+    // A poisoned lock is typed setup failure, without any recovery or writes.
+    // This held guard excludes same-Store writers, not external actors; Root
+    // independently establishes the real writer/reader-free comparison window.
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|_| crate::Error::rejected("retained replay Store connection is poisoned"))?;
     let before_canary = canary(&conn)?;
     let path = Path::new(owner::DATABASE_PATH);
     let before_files = files(path)?;
@@ -289,13 +318,9 @@ pub(crate) fn native_retained_opening_replay(store: &crate::store::Store) -> cra
         before_opens,
         "retained consume opened SQLite"
     );
-    // No current/flush/checkpoint/recovery or newly opened SQLite reader here.
-    // These actual read-only canaries use the already-held original connection.
-    assert_eq!(
-        canary(&conn)?,
-        before_canary,
-        "retained replay changed actual identity/latch/business canary"
-    );
+    // Finish the ENTIRE four-file comparison before after-canary SELECTs:
+    // their legitimate SQLite WAL readmark effects are outside this byte range.
+    // No current/flush/checkpoint/recovery or new SQLite reader in the range.
     assert_eq!(
         files(path)?,
         before_files,
@@ -304,7 +329,19 @@ pub(crate) fn native_retained_opening_replay(store: &crate::store::Store) -> cra
     assert_eq!(
         sql_opens.count(),
         before_opens,
-        "retained comparison opened SQLite"
+        "retained file comparison opened SQLite"
+    );
+    // Actual canary readback still completes BEFORE Checked, on the SAME
+    // already-held connection. Never hide its effects inside the local probe.
+    assert_eq!(
+        canary(&conn)?,
+        before_canary,
+        "retained replay changed actual identity/latch/business canary"
+    );
+    assert_eq!(
+        sql_opens.count(),
+        before_opens,
+        "retained canary readback opened SQLite"
     );
     // All comparisons and observer/connection release finish before caller's
     // Checked. Root performs post-current only afterward, then owned Stop/reap;
