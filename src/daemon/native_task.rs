@@ -261,6 +261,11 @@ fn registration<'a>(alias: &'a str, cwd: &'a str, params: &'a str) -> crate::sto
     }
 }
 
+// Independently authored DATA refusal body; implementers register only.
+#[cfg(test)]
+#[path = "native_registration_acceptance.rs"]
+mod registration_acceptance;
+
 #[cfg(test)]
 mod tests {
     use super::*;

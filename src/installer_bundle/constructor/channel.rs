@@ -196,6 +196,11 @@ impl Duplex {
     }
 }
 
+// Independently authored DATA refusal body; implementers register only.
+#[cfg(test)]
+#[path = "channel_acceptance.rs"]
+mod acceptance;
+
 #[cfg(test)]
 mod tests {
     use super::*;
