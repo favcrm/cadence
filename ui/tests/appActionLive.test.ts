@@ -1,4 +1,5 @@
 import { appViewExamples } from "../src/features/app-shell/app-views/examples";
+import { parseAppActionV2 } from "../src/features/app-shell/app-views/appAction";
 import { installedViewReceipt, resolveLiveAction, resolveLiveView, type ResolvedLiveAction } from "../src/features/app-shell/app-views/viewReceipt";
 import type { Installation } from "../src/features/workspace-apps/workspaceApps";
 
@@ -58,6 +59,32 @@ async function main() {
   const receipt = installedViewReceipt(makeInstallation());
   assert(receipt !== null && receipt.error === null && receipt.actionDescriptor !== null,
     "the explicit action companion parses only with its paired installed view receipt");
+  assert(receipt.descriptor !== null && receipt.binding !== null, "the action receipt has its paired view and binding");
+  const parseUnicodeAction = (label: string, title: string) => {
+    const actions = structuredClone(actionRaw);
+    const views = structuredClone(receipt.descriptor!);
+    actions.title = "é".repeat(120);
+    actions.actions[0].title = title;
+    actions.actions[0].input.fields[0].label = label;
+    const form = views.views.find((view) => view.id === actions.actions[0].form_view);
+    assert(form?.kind === "form" && form.previewOf !== undefined,
+      "the Unicode action still resolves to a declared form preview");
+    const preview = form.previewOf.find((field) => field.id === "display_name");
+    assert(preview !== undefined, "the Unicode action field still resolves to its paired preview");
+    preview.label = label;
+    return parseAppActionV2(actions, views, receipt.binding!);
+  };
+  equal(parseUnicodeAction("é".repeat(41), "🧪".repeat(120)).actions[0].input.fields[0].label,
+    "é".repeat(41), "accented metadata counts Unicode codepoints and the delegated V1 grammar accepts it");
+  equal(parseUnicodeAction("🧪".repeat(80), "Update customer").actions[0].input.fields[0].label,
+    "🧪".repeat(80), "astral metadata counts codepoints rather than UTF-16 code units");
+  let overlongUnicodeRefused = false;
+  try {
+    parseUnicodeAction("🧪".repeat(81), "Update customer");
+  } catch {
+    overlongUnicodeRefused = true;
+  }
+  assert(overlongUnicodeRefused, "the UI parser still refuses metadata over 80 Unicode codepoints");
   const create = resolveLiveAction(receipt, "customer.create", null);
   assert(create.ok && create.route.operation === "create", "customer.create resolves to a host create route");
   equal(create.route.action.form_view, "customer-create-form", "create selects its paired inert preview");

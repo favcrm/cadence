@@ -115,7 +115,7 @@ fn identifier(value: &Value, path: &str) -> Result<String> {
 fn bounded_text(value: &Value, path: &str, max: usize) -> Result<()> {
     let text = value.as_str().ok_or_else(|| fail(path, "expected text"))?;
     if text.is_empty()
-        || text.len() > max
+        || text.chars().count() > max
         || text
             .chars()
             .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
@@ -728,5 +728,35 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("forbidden descriptor key"));
+    }
+
+    #[test]
+    fn unicode_text_bounds_count_codepoints_through_the_delegated_v1_parser() {
+        let mut accented: Value = serde_json::from_str(include_str!(
+            "../../contracts/app-actions/v2/examples/crm.json"
+        ))
+        .unwrap();
+        accented["actions"][0]["input"]["fields"][0]["label"] = Value::String("é".repeat(41));
+        assert!(
+            parse(&accented).is_ok(),
+            "41 accented codepoints fit an 80-character label"
+        );
+
+        let mut astral: Value = serde_json::from_str(include_str!(
+            "../../contracts/app-actions/v2/examples/crm.json"
+        ))
+        .unwrap();
+        astral["actions"][0]["title"] = Value::String("🧪".repeat(120));
+        astral["actions"][0]["input"]["fields"][0]["label"] = Value::String("🧪".repeat(80));
+        assert!(
+            parse(&astral).is_ok(),
+            "120/80 astral codepoints fit their metadata bounds"
+        );
+
+        astral["actions"][0]["input"]["fields"][0]["label"] = Value::String("🧪".repeat(81));
+        assert!(
+            parse(&astral).is_err(),
+            "the delegated v1 bound still refuses 81 codepoints"
+        );
     }
 }

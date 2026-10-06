@@ -93,7 +93,7 @@ function object(value: unknown, allowed: readonly string[], path: string): Recor
 }
 
 function text(value: unknown, path: string, max: number): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > max
+  if (typeof value !== "string" || value.length === 0 || Array.from(value).length > max
       || /[\u0000-\u001f\u007f\u2028\u2029]/.test(value)) {
     return fail(path, `expected a bounded non-empty string (max ${max})`);
   }

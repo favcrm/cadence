@@ -316,33 +316,30 @@ impl Shared {
         }
     }
 
-    /// `caption-runs` — runs may be contextless; every list/show is
-    /// bound to the verified installation and the supplied optional
-    /// context. A shown run must belong to both the install and the
-    /// requested context; a supplied context must itself be a live,
-    /// owned context of the install (`app_context_proof`), not merely
-    /// a string that happens to match the run's `context_id`.
+    /// `caption-runs` — list/show always require a live, owned context
+    /// of this verified installation; there is no contextless fallback.
+    /// Lists filter to that exact context and shows require their run's
+    /// context to match before the typed projection is emitted.
     fn read_caption_runs(
         &self,
         install_id: &str,
         vb: &app_binding::ViewBinding,
         read: &ViewRead<'_>,
     ) -> Result<Value> {
+        let context = read
+            .context
+            .ok_or_else(|| Error::rejected("caption-runs read needs its live context"))?;
+        let _ = self.store.app_context_proof(install_id, context)?;
         if read.limit.is_some() || read.cursor.is_some() || read.query.is_some() {
             return Err(Error::rejected(
                 "a caption-runs read does not paginate or query",
             ));
         }
-        // A supplied context must be a real, live, owned context of
-        // this install — proven before any run row is read.
-        if let Some(context) = read.context {
-            let _ = self.store.app_context_proof(install_id, context)?;
-        }
         match read.op {
             "list" => {
                 let list = self
                     .store
-                    .app_run_list_filtered(Some(install_id), read.context)?;
+                    .app_run_list_filtered(Some(install_id), Some(context))?;
                 let raw_runs = list["runs"]
                     .as_array()
                     .ok_or_else(|| Error::rejected("run list producer returned no runs array"))?;
@@ -360,10 +357,8 @@ impl Shared {
                 if run["install_id"].as_str() != Some(install_id) {
                     return Err(Error::rejected("run does not belong to this installation"));
                 }
-                if let Some(context) = read.context {
-                    if run["context_id"].as_str() != Some(context) {
-                        return Err(Error::rejected("run does not belong to this context"));
-                    }
+                if run["context_id"].as_str() != Some(context) {
+                    return Err(Error::rejected("run does not belong to this context"));
                 }
                 Ok(json!({"rows": [project_run(&run, vb)?]}))
             }
