@@ -24,6 +24,7 @@ impl Task {
         alias: String,
         model: String,
         prompt: String,
+        registrations: &mut Registrations<'_>,
     ) -> Result<Self> {
         if id.len() != 32
             || !id
@@ -38,16 +39,16 @@ impl Task {
             return Err(Error::rejected("native task selectors refused"));
         }
         let params = serde_json::to_string(&json!({"model":model}))?;
-        // No stored/restored endpoint/PID is adopted. This bounded fresh path
-        // registers ONE new row and opens the actual root-owned launch channel.
-        shared.store.register_agent(&registration(
+        // Row reuse is DATA only, reached after the unchanged Root family-exit
+        // and daemon worker/stream retirement fences. Never adopt a saved
+        // endpoint, session or PID; every task builds a fresh protected adapter.
+        let agent = registrations.select(
             &alias,
             // Match the helper's held guest-writable repository leaf. The
             // supervisor-owned /workspace ancestor remains non-writable.
             "/workspace/company",
             &params,
-        ))?;
-        let agent = shared.store.agent(&alias)?;
+        )?;
         let part = Arc::new(Mutex::new(StreamState {
             next: 0,
             closed: false,
@@ -175,6 +176,62 @@ impl Task {
         Ok(())
     }
 }
+// Only remember rows actually registered by this retained native controller,
+// on its SAME Store. This bookkeeping cannot prove retirement or authorize a
+// launch: the private controller and Root retain those independent fences.
+pub(super) struct Registrations<'store> {
+    store: &'store crate::store::Store,
+    aliases: std::collections::HashSet<String>,
+}
+impl<'store> Registrations<'store> {
+    pub(super) fn new(store: &'store crate::store::Store) -> Self {
+        Self {
+            store,
+            aliases: std::collections::HashSet::new(),
+        }
+    }
+    fn select(&mut self, alias: &str, cwd: &str, params: &str) -> Result<crate::store::Agent> {
+        let expected = registration(alias, cwd, params);
+        if !self.aliases.contains(alias) {
+            if self.aliases.len() >= 4096 {
+                return Err(Error::rejected("native registration history exhausted"));
+            }
+            // An existing foreign alias still hits the real global duplicate
+            // guard. Never catch that failure and fetch/adopt an arbitrary row.
+            self.store.register_agent(&expected)?;
+        }
+        let agent = self.store.agent(alias)?;
+        let expected_params: Value = serde_json::from_str(params)?;
+        if agent.alias != expected.alias
+            || agent.provider != expected.provider
+            || agent.endpoint_kind != expected.endpoint_kind
+            || agent.role != expected.role
+            || agent.cwd != expected.cwd
+            || agent.sandbox != expected.sandbox
+            || agent.instructions.is_some()
+            || agent.team_role.is_some()
+            || !agent.enabled
+            || agent.params.as_ref() != Some(&expected_params)
+            || agent.thread_id.is_some()
+            || agent.session_id.is_some()
+            || agent.model.is_some()
+            || agent.effort.is_some()
+            || agent.pid.is_some()
+            || agent.pid_start.is_some()
+            || agent.endpoint.is_some()
+            || agent.generation.is_some()
+        {
+            // No mutation into eligibility, deletion or fallback model. Use
+            // only this checked real row snapshot for a fresh adapter open.
+            return Err(Error::rejected(
+                "native saved registration differs from election",
+            ));
+        }
+        self.aliases.insert(alias.to_owned());
+        Ok(agent)
+    }
+}
+
 // Store registration metadata is not native launch permission. The adapter's
 // fixed guest UID and alias-derived, signed master/worker selection remain the
 // independent physical launch path. `cwd` is fixed by Task::start; tests use an
@@ -213,24 +270,26 @@ mod tests {
     #[test]
     fn native_task_registration_uses_real_store_grammar_and_explicit_model() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::open(&dir.path().join("registration.db")).unwrap();
+        let store =
+            Arc::new(crate::store::Store::open(&dir.path().join("registration.db")).unwrap());
         let cwd = dir.path().to_str().unwrap();
         let params = r#"{"model":"openai-codex/gpt-6.1-sol"}"#;
+        let mut registrations = Registrations::new(&store);
         for (alias, role, sandbox) in [
             ("master", "pm", "read-only"),
             ("native-worker", "worker", "workspace-write"),
         ] {
-            store
-                .register_agent(&registration(alias, cwd, params))
-                .unwrap();
-            let row = store.agent(alias).unwrap();
-            assert_eq!(row.provider, "pi");
-            assert_eq!(row.endpoint_kind, "managed");
-            assert_eq!(row.role, role);
-            assert_eq!(row.sandbox, sandbox);
-            assert_eq!(row.cwd, cwd);
-            assert_eq!(row.params.unwrap()["model"], "openai-codex/gpt-6.1-sol");
+            let first = registrations.select(alias, cwd, params).unwrap();
+            let second = registrations.select(alias, cwd, params).unwrap();
+            assert_eq!(first.created, second.created); // SAME durable row, no deletion.
+            assert_eq!(second.provider, "pi");
+            assert_eq!(second.endpoint_kind, "managed");
+            assert_eq!(second.role, role);
+            assert_eq!(second.sandbox, sandbox);
+            assert_eq!(second.cwd, cwd);
+            assert_eq!(second.params.unwrap()["model"], "openai-codex/gpt-6.1-sol");
         }
+        assert_eq!(store.agents().unwrap().len(), 2);
     }
 }
 

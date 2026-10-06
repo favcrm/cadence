@@ -62,6 +62,7 @@ impl Maintenance {
             let mut closed = false;
             let mut task = None::<super::native_task::Task>;
             let mut task_spent = false;
+            let mut registrations = super::native_task::Registrations::new(&shared.store);
             loop {
                 let packet = match private_wire::receive_child(&control)? {
                     Some(p) => p,
@@ -86,6 +87,7 @@ impl Maintenance {
                             alias,
                             model,
                             prompt,
+                            &mut registrations,
                         )?);
                     }
                     Packet::Cancel {
