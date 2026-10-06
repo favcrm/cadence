@@ -520,6 +520,346 @@ fn cad848_setup_refuses_symlinked_worktree_parent() {
     );
 }
 
+#[test]
+fn cad848_recovery_refuses_symlinked_worktree_parent() {
+    fn tree_snapshot(root: &Path) -> Value {
+        fn collect(root: &Path, dir: &Path, entries: &mut Vec<Value>) {
+            use sha2::{Digest, Sha256};
+
+            for entry in fs::read_dir(dir).expect("read private external fixture") {
+                let path = entry.expect("read external entry").path();
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let metadata = fs::symlink_metadata(&path).expect("inspect external entry");
+                if metadata.file_type().is_symlink() {
+                    entries.push(json!({
+                        "path": relative,
+                        "kind": "symlink",
+                        "target": fs::read_link(&path).unwrap().to_string_lossy(),
+                    }));
+                } else if metadata.is_dir() {
+                    entries.push(json!({"path": relative, "kind": "directory"}));
+                    collect(root, &path, entries);
+                } else if metadata.is_file() {
+                    let bytes = fs::read(&path).expect("read external file");
+                    entries.push(json!({
+                        "path": relative,
+                        "kind": "file",
+                        "size": bytes.len(),
+                        "sha256": format!("{:x}", Sha256::digest(&bytes)),
+                    }));
+                } else {
+                    entries.push(json!({"path": relative, "kind": "other"}));
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        collect(root, root, &mut entries);
+        entries.sort_by(|left: &Value, right: &Value| {
+            left["path"].as_str().cmp(&right["path"].as_str())
+        });
+        Value::Array(entries)
+    }
+
+    fn optional_tree_snapshot(root: &Path) -> Value {
+        if root.is_dir() {
+            tree_snapshot(root)
+        } else {
+            Value::Null
+        }
+    }
+
+    let fixture = DevelopmentFixture::new();
+    fs::create_dir_all(fixture.home.join("config")).unwrap();
+    fs::create_dir_all(fixture.home.join("data")).unwrap();
+    fs::create_dir_all(fixture.home.join("cache")).unwrap();
+    fs::write(fixture.home.join("gitconfig"), "").unwrap();
+    let env_updates = [
+        ("HOME", fixture.home.as_os_str().to_os_string()),
+        (
+            "XDG_CONFIG_HOME",
+            fixture.home.join("config").into_os_string(),
+        ),
+        ("XDG_DATA_HOME", fixture.home.join("data").into_os_string()),
+        (
+            "XDG_CACHE_HOME",
+            fixture.home.join("cache").into_os_string(),
+        ),
+        ("XDG_STATE_HOME", fixture.state.as_os_str().to_os_string()),
+        ("GIT_CONFIG_NOSYSTEM", "1".into()),
+        (
+            "GIT_CONFIG_GLOBAL",
+            fixture.home.join("gitconfig").into_os_string(),
+        ),
+    ];
+    let previous_env = env_updates
+        .iter()
+        .map(|(key, _)| (*key, std::env::var_os(*key)))
+        .collect::<Vec<_>>();
+    #[allow(unused_unsafe)]
+    unsafe {
+        for (key, value) in &env_updates {
+            std::env::set_var(*key, value);
+        }
+    }
+
+    let name = "recovered-lane";
+    let repo = fixture.repo.canonicalize().unwrap();
+    let lane = cadence_agent::worktree::lifecycle::development_path(&repo, name);
+    let branch = cadence_agent::worktree::layout::branch(name);
+    let pinned_sha = git(&fixture.home, &repo, &["rev-parse", "HEAD"]);
+    let owner = "cad848-recovery-fixture";
+    assert!(
+        !lane.exists(),
+        "fixture lane unexpectedly exists before recovery"
+    );
+    let record = lifecycle::new_record(lifecycle::CheckoutSpec {
+        repo: &repo,
+        purpose: "development",
+        tool: "cadence agent worktree",
+        owner,
+        path: &lane,
+        branch: Some(&branch),
+        pinned_sha: &pinned_sha,
+        issue: None,
+    });
+    lifecycle::begin(&repo, record).expect("record interrupted preparing checkout");
+    let cadence_dir = repo.join(".cadence");
+    let ledger_path = cadence_dir.join("managed-checkouts.json");
+    let ledger_before = fs::read(&ledger_path).expect("preparing lifecycle ledger");
+    let ledger_before_value: Value = serde_json::from_slice(&ledger_before).unwrap();
+    assert!(ledger_before_value["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| {
+            entry["path"].as_str() == Some(lane.to_string_lossy().as_ref())
+                && entry["state"] == "preparing"
+        }));
+
+    let external = fixture._root.path().join("external");
+    fs::create_dir(&external).unwrap();
+    let sentinel = external.join("sentinel.txt");
+    fs::write(&sentinel, b"recovery external sentinel\n").unwrap();
+    let worktrees_parent = cadence_dir.join("wt");
+    symlink(&external, &worktrees_parent).unwrap();
+    let external_lane = external.join(name);
+    let git_admin_dir = repo.join(".git/worktrees");
+
+    let worktrees_before = git(&fixture.home, &repo, &["worktree", "list", "--porcelain"]);
+    let branch_refs_before = git(
+        &fixture.home,
+        &repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+        ],
+    );
+    let external_before = tree_snapshot(&external);
+    let git_admin_before = optional_tree_snapshot(&git_admin_dir);
+    let branch_ref = format!("refs/heads/{branch} ");
+    assert!(
+        !branch_refs_before
+            .lines()
+            .any(|line| line.starts_with(&branch_ref)),
+        "fixture branch unexpectedly exists before recovery"
+    );
+    assert!(
+        !external_lane.exists(),
+        "fixture external lane already exists"
+    );
+
+    // `launch --worktree` first requires a daemon/agent lookup. Exercise the
+    // same public production recovery function directly in this isolated repo.
+    let previous_alias = std::env::var_os("CADENCE_ALIAS");
+    #[allow(unused_unsafe)]
+    unsafe {
+        std::env::set_var("CADENCE_ALIAS", owner);
+    }
+    let attempt = cadence_agent::worktree::create_worktree(&repo, name);
+    #[allow(unused_unsafe)]
+    unsafe {
+        match previous_alias {
+            Some(alias) => std::env::set_var("CADENCE_ALIAS", alias),
+            None => std::env::remove_var("CADENCE_ALIAS"),
+        }
+    }
+
+    #[allow(unused_unsafe)]
+    unsafe {
+        for (key, value) in previous_env {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    let (result_ok, result_text) = match attempt {
+        Ok(path) => (true, format!("Ok({})", path.display())),
+        Err(error) => (false, format!("Err({error})")),
+    };
+    let worktrees_after = git(&fixture.home, &repo, &["worktree", "list", "--porcelain"]);
+    let branch_refs_after = git(
+        &fixture.home,
+        &repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+        ],
+    );
+    let external_after = tree_snapshot(&external);
+    let ledger_after = fs::read(&ledger_path).ok();
+    let ledger_after_value = ledger_after
+        .as_ref()
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+    let git_admin_after = optional_tree_snapshot(&git_admin_dir);
+    let external_canonical = external_lane.canonicalize().ok();
+    let registered_external = worktrees_after.lines().any(|line| {
+        line.strip_prefix("worktree ").is_some_and(|path| {
+            let path = Path::new(path);
+            path == external_lane.as_path()
+                || external_canonical
+                    .as_deref()
+                    .is_some_and(|canonical| path.canonicalize().ok().as_deref() == Some(canonical))
+        })
+    });
+    let records = ledger_after_value
+        .as_ref()
+        .and_then(|value| value["records"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    let record_names_lane = |record: &Value| {
+        record["path"].as_str().is_some_and(|path| {
+            let path = Path::new(path);
+            path == lane.as_path()
+                || path == external_lane.as_path()
+                || external_canonical
+                    .as_deref()
+                    .is_some_and(|canonical| path.canonicalize().ok().as_deref() == Some(canonical))
+        })
+    };
+    let matching_records = records
+        .iter()
+        .filter(|record| record_names_lane(record))
+        .count();
+    let external_record = records.iter().any(|record| {
+        record["path"].as_str().is_some_and(|path| {
+            external_canonical.as_deref().is_some_and(|canonical| {
+                Path::new(path).canonicalize().ok().as_deref() == Some(canonical)
+            })
+        })
+    });
+    let active_record = records
+        .iter()
+        .any(|record| record["state"] == "active" && record_names_lane(record));
+    let external_lane_exists = external_lane.is_dir();
+    let setup_side_effects = external_after
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["path"].as_str())
+        .filter(|path| path.starts_with(&format!("{name}/")))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let ledger_after_text = ledger_after
+        .as_ref()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+    let evidence = json!({
+        "route": concat!(
+            "cadence_agent::worktree::create_worktree",
+            " (same function called by launch --worktree)"
+        ),
+        "repo": repo.display().to_string(),
+        "worktrees_parent": worktrees_parent.display().to_string(),
+        "parent_symlink_target": fs::read_link(&worktrees_parent).unwrap().display().to_string(),
+        "external": external.display().to_string(),
+        "external_lane": external_lane.display().to_string(),
+        "state_before": "preparing",
+        "sentinel_before": "recovery external sentinel\n",
+        "external_before": external_before.clone(),
+        "external_after": external_after.clone(),
+        "external_lane_exists": external_lane_exists,
+        "external_lane_setup_paths": setup_side_effects,
+        "git_admin_before": git_admin_before.clone(),
+        "git_admin_after": git_admin_after.clone(),
+        "registered_external": registered_external,
+        "worktrees_before": worktrees_before.clone(),
+        "worktrees_after": worktrees_after.clone(),
+        "branch_refs_before": branch_refs_before.clone(),
+        "branch_refs_after": branch_refs_after.clone(),
+        "ledger_before": String::from_utf8_lossy(&ledger_before).into_owned(),
+        "ledger_after": ledger_after_text,
+        "lifecycle_records_after": records,
+        "matching_record_count": matching_records,
+        "external_record": external_record,
+        "active_record": active_record,
+        "result_ok": result_ok,
+        "result": result_text.clone(),
+    });
+    println!(
+        "CAD848_RECOVERY_PARENT_EVIDENCE={}",
+        serde_json::to_string(&evidence).unwrap()
+    );
+
+    assert!(
+        !result_ok,
+        "recovery unexpectedly accepted the symlinked destination: {evidence}"
+    );
+    assert!(
+        !external_lane_exists,
+        "recovery created the external lane before refusing the symlinked parent: {evidence}"
+    );
+    assert!(
+        !registered_external,
+        "Git registered the recovery checkout outside the repository: {evidence}"
+    );
+    assert_eq!(
+        external_after, external_before,
+        "external tree changed: {evidence}"
+    );
+    assert_eq!(
+        worktrees_after, worktrees_before,
+        "Git worktree registrations changed: {evidence}"
+    );
+    assert_eq!(
+        branch_refs_after, branch_refs_before,
+        "branch refs changed: {evidence}"
+    );
+    assert_eq!(
+        git_admin_after, git_admin_before,
+        "Git worktree metadata/setup changed: {evidence}"
+    );
+    assert!(
+        !external_record,
+        "lifecycle ledger acquired an external identity: {evidence}"
+    );
+    assert!(
+        !active_record,
+        "lifecycle ledger marked the lane active: {evidence}"
+    );
+    assert_eq!(
+        matching_records, 1,
+        "lifecycle record duplicated or disappeared: {evidence}"
+    );
+    let result_lower = result_text.to_ascii_lowercase();
+    assert!(
+        (result_text.contains(&worktrees_parent.to_string_lossy().to_string())
+            || result_text.contains(&external.to_string_lossy().to_string())
+            || result_text.contains(".cadence/wt"))
+            && ["symlink", "symbolic link", "confin"]
+                .iter()
+                .any(|word| result_lower.contains(word)),
+        "refusal must identify the symlinked destination/confinement problem: {evidence}"
+    );
+}
+
 struct ReviewFixture {
     _root: TempDir,
     repo: PathBuf,

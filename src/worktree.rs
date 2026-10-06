@@ -162,6 +162,9 @@ pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
         (crate::issue::start::resolve_base(&root, None)?.1, actor)
     };
     ensure_cadence_ignored(&root)?;
+    // The recovery branches below add a checkout without `begin`; refuse a
+    // symlinked destination parent before Git creates anything.
+    lifecycle::validate_creation_parent(&root, &dir)?;
     if let Some(record) = recovery {
         if dir.exists() {
             validate_registered_branch(&root, &dir, &branch)?;

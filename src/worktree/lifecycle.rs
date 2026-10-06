@@ -116,6 +116,17 @@ fn validate_destination_parent(root: &Path, parent: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Preflight for a managed `git worktree add` that does not run `begin`:
+/// recovery branches must refuse a destination whose existing parents are
+/// symlinks or non-directories before Git creates anything.
+pub(crate) fn validate_creation_parent(repo: &Path, path: &Path) -> Result<()> {
+    let root = canonical_root(repo)?;
+    match path.parent() {
+        Some(parent) => validate_destination_parent(&root, parent),
+        None => Ok(()),
+    }
+}
+
 fn read_ledger(root: &Path) -> Result<Ledger> {
     let path = ledger_path(root, false)?;
     let meta = match fs::symlink_metadata(&path) {
