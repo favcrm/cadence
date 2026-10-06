@@ -3,8 +3,8 @@
 use super::super::{files, refused, Deadline, Result};
 use super::helper_process::Process;
 use super::{custody, lifecycle};
-use crate::adapter::pi_guest::authority::Selection;
 use crate::adapter::pi_guest::owner::LaunchPermit;
+use crate::protected_pi_profile::authority::Selection;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
