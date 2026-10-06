@@ -526,6 +526,52 @@ impl OwnedDaemon {
         }
         Ok(())
     }
+    #[cfg(all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub(super) fn require_replay_window(&self, until: Instant) -> Result<()> {
+        self.recheck(until)?;
+        // The fixed entry has exactly main + the two accepted-FD forwarders.
+        // Combined with the actual pre-emitter Shared callsite, refuse any
+        // additional heartbeat/actor/writer, not a caller quiescence Boolean.
+        if custody::field(&custody::status(self.pid)?, "Threads:")? != "3" {
+            return Err(refused());
+        }
+        Ok(())
+    }
+    #[cfg(all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub(super) fn await_replay_exit(&self, until: Instant) -> Result<()> {
+        if !self.detached || self.reaped {
+            return Err(refused());
+        }
+        // This retained own child has never been reaped/adopted. Stop/EOF is
+        // not evidence: require actual parent waitpid and the SAME pidfd exit.
+        lifecycle::runtime_proof(until)?.recheck(until)?;
+        let status = wait(self.pid, Deadline(until))?;
+        lifecycle::runtime_proof(until)?.recheck(until)?;
+        let mut poll = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if !libc::WIFEXITED(status)
+            || libc::WEXITSTATUS(status) != 0
+            || unsafe { libc::poll(&mut poll, 1, 0) } != 1
+            || poll.revents & libc::POLLIN == 0
+            || poll.revents & libc::POLLNVAL != 0
+        {
+            return Err(refused());
+        }
+        Ok(())
+    }
     pub(super) fn shared_gid(&self) -> u32 {
         self.shared_gid
     }

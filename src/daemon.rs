@@ -783,6 +783,25 @@ impl Shared {
                 wiki_pm_lease,
             ),
         });
+        #[cfg(all(
+            debug_assertions,
+            feature = "test-seam",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        if state_dir == Path::new("/srv/cadence/protected/store") {
+            // Only the genuine protected opening can reach this window; path
+            // equality requests it, never admits a caller. The fixed Client
+            // controller additionally requires its original inherited Root FD3.
+            // No hosted lease heartbeat or seam worker may overlap comparison.
+            if shared.lease.is_some() || shared.seam.is_some() {
+                return Err(Error::unknown("retained Store replay window UNKNOWN"));
+            }
+            return crate::installer_bundle::constructor::runtime_child::retained_opening_replay(
+                &shared.store,
+            )
+            .and_then(|never| match never {});
+        }
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
         shared.emit_slot_events(boot_events);

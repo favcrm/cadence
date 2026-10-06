@@ -14,6 +14,79 @@ static CONTROL: OnceLock<Arc<UnixDatagram>> = OnceLock::new();
 pub(crate) fn control() -> Option<Arc<UnixDatagram>> {
     CONTROL.get().cloned()
 }
+/// Fixed diagnostic continuation of the actual admitted Client. Compilation
+/// exposes no issuer: CONTROL was installed only after Boot, image/self, seal
+/// and the real parent socket checks in entry(). No ordinary daemon can enter.
+#[cfg(all(
+    debug_assertions,
+    feature = "test-seam",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub(crate) fn retained_opening_replay(
+    store: &crate::store::Store,
+) -> Result<std::convert::Infallible> {
+    let control = control().ok_or_else(refused)?;
+    let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+    let parent = || -> Result<()> {
+        deadline.check()?;
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                control.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        } != 0
+            || len as usize != std::mem::size_of_val(&cred)
+            || cred.uid != 0
+            || cred.gid != 0
+            || cred.pid != unsafe { libc::getppid() }
+        {
+            return Err(refused());
+        }
+        Ok(())
+    };
+    let next = || -> Result<Packet> {
+        loop {
+            parent()?;
+            if let Some(packet) = private_wire::receive_child(&control)? {
+                return Ok(packet);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    parent()?;
+    private_wire::send(
+        &control,
+        &Packet::StoreReplayPrepared { version: 1 },
+        &[],
+        deadline,
+    )?;
+    if !matches!(next()?, Packet::StoreReplayBegin { version: 1 }) {
+        return Err(refused());
+    }
+    // Root's opening/WAL/current checks finished BEFORE Begin. No current,
+    // flush or recovery is inserted into the author's file comparison range.
+    crate::store::seal::owner_guard::native_retained_opening_replay(store)?;
+    parent()?;
+    private_wire::send(
+        &control,
+        &Packet::StoreReplayChecked { version: 1 },
+        &[],
+        deadline,
+    )?;
+    if !matches!(next()?, Packet::StoreReplayStop { version: 1 }) {
+        return Err(refused());
+    }
+    parent()?;
+    // Never resume business emitters/Serving, or drop SQLite into a checkpoint.
+    // Root must still independently observe this own child's clean exit/reap.
+    unsafe { libc::_exit(0) }
+}
 pub(super) fn try_entry() -> Option<Result<()>> {
     let mut ty = 0i32;
     let mut n = std::mem::size_of_val(&ty) as libc::socklen_t;

@@ -68,6 +68,42 @@ pub(crate) enum Packet {
         part: u64,
         bytes: String,
     },
+    #[cfg(all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    StoreReplayPrepared {
+        version: u8,
+    },
+    #[cfg(all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    StoreReplayBegin {
+        version: u8,
+    },
+    #[cfg(all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    StoreReplayChecked {
+        version: u8,
+    },
+    #[cfg(all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    StoreReplayStop {
+        version: u8,
+    },
     Failed {
         version: u8,
     },

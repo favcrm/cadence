@@ -152,6 +152,13 @@ struct TaskState {
     retired: bool,
 }
 struct Registry {
+    #[cfg(all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    store_replay: std::sync::atomic::AtomicU8,
     task: Mutex<Option<TaskState>>,
     task_history: Mutex<std::collections::HashSet<String>>,
     serving: OnceLock<super::serving::OwnedServing>,
@@ -241,12 +248,31 @@ impl Registry {
                     self.serving_stopped.store(true, Ordering::SeqCst);
                     return Err(refused());
                 }
-                other @ (Packet::Accepted { version: 1, .. }
-                | Packet::Serving { version: 1 }
-                | Packet::TaskEvent { version: 1, .. }
-                | Packet::Retired { version: 1, .. }
-                | Packet::Closed { version: 1, .. }
-                | Packet::Witnessed { version: 1, .. }) => {
+                other => {
+                    let allowed = matches!(
+                        &other,
+                        Packet::Accepted { version: 1, .. }
+                            | Packet::Serving { version: 1 }
+                            | Packet::TaskEvent { version: 1, .. }
+                            | Packet::Retired { version: 1, .. }
+                            | Packet::Closed { version: 1, .. }
+                            | Packet::Witnessed { version: 1, .. }
+                    );
+                    #[cfg(all(
+                        debug_assertions,
+                        feature = "test-seam",
+                        target_os = "linux",
+                        target_arch = "x86_64"
+                    ))]
+                    let allowed = allowed
+                        || matches!(
+                            &other,
+                            Packet::StoreReplayPrepared { version: 1 }
+                                | Packet::StoreReplayChecked { version: 1 }
+                        );
+                    if !allowed {
+                        return Err(refused());
+                    }
                     let size = serde_json::to_vec(&other).map_err(|_| refused())?.len();
                     let total = self
                         .buffered_bytes
@@ -259,7 +285,6 @@ impl Registry {
                     queue.push_back((other, fds));
                     self.buffered_bytes.store(total, Ordering::SeqCst);
                 }
-                _ => return Err(refused()),
             }
         }
         Ok(())
@@ -275,6 +300,109 @@ impl Registry {
         } else {
             private_wire::receive(&self.daemon.control)
         }
+    }
+    /// Source-only native diagnostic: original opening/current and independent
+    /// WAL-aware schema/latch observations, all OUTSIDE the author's comparison.
+    #[cfg(all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    fn replay_current(&self, until: Instant) -> Result<Facts> {
+        self.daemon.require_replay_window(until)?;
+        if self.serving.get().is_some()
+            || self
+                .serving_stopped
+                .load(std::sync::atomic::Ordering::SeqCst)
+            || self.task.lock().map_err(|_| refused())?.is_some()
+            || !self.task_history.lock().map_err(|_| refused())?.is_empty()
+        {
+            return Err(refused());
+        }
+        self.construction_current(until)?;
+        let facts = {
+            let db = self.db.lock().map_err(|_| refused())?;
+            if db.closed || db.intent.is_some() || db.witness.is_some() {
+                return Err(refused());
+            }
+            self.admit(db.opening_peer.as_ref().ok_or_else(refused)?, until)?;
+            db.startup.clone().ok_or_else(refused)?
+        };
+        validate(
+            lifecycle::store_current(&facts.reference, until)?,
+            "consumed",
+            Some(&facts),
+            true,
+        )?;
+        validate(
+            lifecycle::store_database_current(&facts.reference, until)?,
+            "consumed",
+            Some(&facts),
+            false,
+        )?;
+        self.database()?;
+        super::capture::database_current(&facts.binding, until)?;
+        self.database()?;
+        self.construction_current(until)?;
+        self.daemon.require_replay_window(until)?;
+        Ok(facts)
+    }
+    #[cfg(all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    fn run_retained_replay(&self, until: Instant) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        // Burn before checks/control; malformed, timeout or custody loss never
+        // re-arms this window. Packets supply no references/rights/authority.
+        self.store_replay
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| refused())?;
+        let facts = self.replay_current(until)?;
+        if !self.buffered.lock().map_err(|_| refused())?.is_empty() {
+            return Err(refused());
+        }
+        private_wire::send(
+            &self.daemon.control,
+            &Packet::StoreReplayBegin { version: 1 },
+            &[],
+            Deadline(until),
+        )?;
+        loop {
+            budget(until)?;
+            // Live kernel/Root runtime lifetime/Layout checks remain mandatory.
+            // These do not open SQLite or exchange owner-current/readbacks. The
+            // serial dispatcher does not insert a flush/heartbeat into compare.
+            self.check(until)?;
+            self.daemon.require_replay_window(until)?;
+            self.daemon.drain_logs()?;
+            match self.take_packet()? {
+                Some((Packet::StoreReplayChecked { version: 1 }, fds)) if fds.is_empty() => break,
+                None => std::thread::sleep(Duration::from_millis(1)),
+                _ => return Err(refused()),
+            }
+        }
+        // Checked only means the independent author's complete aftercomparison
+        // returned. Re-read the ORIGINAL scope/custody afterward, never during it.
+        let after = self.replay_current(until)?;
+        if serde_json::to_value(&facts).map_err(|_| refused())?
+            != serde_json::to_value(&after).map_err(|_| refused())?
+            || !self.buffered.lock().map_err(|_| refused())?.is_empty()
+        {
+            return Err(refused());
+        }
+        private_wire::send(
+            &self.daemon.control,
+            &Packet::StoreReplayStop { version: 1 },
+            &[],
+            Deadline(until),
+        )?;
+        self.daemon.await_replay_exit(until)?;
+        self.store_replay.store(2, Ordering::SeqCst);
+        Ok(())
     }
     fn check(&self, until: Instant) -> Result<()> {
         self.daemon.recheck(until)?;
@@ -750,6 +878,16 @@ fn accepted() -> Result<Option<(Domain, UnixStream)>> {
     };
     r.check(Instant::now() + Duration::from_secs(10))?;
     match packet {
+        #[cfg(all(
+            debug_assertions,
+            feature = "test-seam",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        Packet::StoreReplayPrepared { version: 1 } if fds.is_empty() => {
+            r.run_retained_replay(Instant::now() + Duration::from_secs(10))?;
+            Ok(None)
+        }
         Packet::Serving { version: 1 } => {
             let until = Instant::now() + Duration::from_secs(10);
             if r.serving_stopped.load(std::sync::atomic::Ordering::SeqCst)
@@ -1090,6 +1228,13 @@ pub(super) fn run(layout: Layout) -> Result<()> {
     getrandom::fill(&mut nonce).map_err(|_| refused())?;
     REGISTRY
         .set(Registry {
+            #[cfg(all(
+                debug_assertions,
+                feature = "test-seam",
+                target_os = "linux",
+                target_arch = "x86_64"
+            ))]
+            store_replay: std::sync::atomic::AtomicU8::new(0),
             task: Mutex::new(None),
             task_history: Mutex::new(std::collections::HashSet::new()),
             serving: OnceLock::new(),
@@ -1297,7 +1442,19 @@ pub(super) fn run(layout: Layout) -> Result<()> {
                 }
             }
         }
-        if let Some((domain, stream)) = accepted()? {
+        let incoming = accepted()?;
+        #[cfg(all(
+            debug_assertions,
+            feature = "test-seam",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        if r.store_replay.load(std::sync::atomic::Ordering::SeqCst) == 2 {
+            // Diagnostic-only termination after independent case, original
+            // aftercurrent and physical own-child exit/reap. Never Serving/FINAL.
+            return Ok(());
+        }
+        if let Some((domain, stream)) = incoming {
             r.admit(&stream, until)?;
             match domain {
                 Domain::Pi => pi.push(PiSession {
