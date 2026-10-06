@@ -266,38 +266,6 @@ fn registration<'a>(alias: &'a str, cwd: &'a str, params: &'a str) -> crate::sto
 #[path = "native_registration_acceptance.rs"]
 mod registration_acceptance;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Registration-contract check only: actual SQLite/Store/model resolution,
-    // no fabricated Root grant, custody, service, launch or provider response.
-    #[test]
-    fn native_task_registration_uses_real_store_grammar_and_explicit_model() {
-        let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(crate::store::Store::open(&dir.path().join("registration.db")).unwrap());
-        let cwd = dir.path().to_str().unwrap();
-        let params = r#"{"model":"openai-codex/gpt-6.1-sol"}"#;
-        let mut registrations = Registrations::new(&store);
-        for (alias, role, sandbox) in [
-            ("master", "pm", "read-only"),
-            ("native-worker", "worker", "workspace-write"),
-        ] {
-            let first = registrations.select(alias, cwd, params).unwrap();
-            let second = registrations.select(alias, cwd, params).unwrap();
-            assert_eq!(first.created, second.created); // SAME durable row, no deletion.
-            assert_eq!(second.provider, "pi");
-            assert_eq!(second.endpoint_kind, "managed");
-            assert_eq!(second.role, role);
-            assert_eq!(second.sandbox, sandbox);
-            assert_eq!(second.cwd, cwd);
-            assert_eq!(second.params.unwrap()["model"], "openai-codex/gpt-6.1-sol");
-        }
-        assert_eq!(store.agents().unwrap().len(), 2);
-    }
-}
-
 fn emit(
     control: &UnixDatagram,
     task: &str,
@@ -333,4 +301,36 @@ fn emit(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Registration-contract check only: actual SQLite/Store/model resolution,
+    // no fabricated Root grant, custody, service, launch or provider response.
+    #[test]
+    fn native_task_registration_uses_real_store_grammar_and_explicit_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(crate::store::Store::open(&dir.path().join("registration.db")).unwrap());
+        let cwd = dir.path().to_str().unwrap();
+        let params = r#"{"model":"openai-codex/gpt-6.1-sol"}"#;
+        let mut registrations = Registrations::new(&store);
+        for (alias, role, sandbox) in [
+            ("master", "pm", "read-only"),
+            ("native-worker", "worker", "workspace-write"),
+        ] {
+            let first = registrations.select(alias, cwd, params).unwrap();
+            let second = registrations.select(alias, cwd, params).unwrap();
+            assert_eq!(first.created, second.created); // SAME durable row, no deletion.
+            assert_eq!(second.provider, "pi");
+            assert_eq!(second.endpoint_kind, "managed");
+            assert_eq!(second.role, role);
+            assert_eq!(second.sandbox, sandbox);
+            assert_eq!(second.cwd, cwd);
+            assert_eq!(second.params.unwrap()["model"], "openai-codex/gpt-6.1-sol");
+        }
+        assert_eq!(store.agents().unwrap().len(), 2);
+    }
 }
