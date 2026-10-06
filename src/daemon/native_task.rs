@@ -40,24 +40,13 @@ impl Task {
         let params = serde_json::to_string(&json!({"model":model}))?;
         // No stored/restored endpoint/PID is adopted. This bounded fresh path
         // registers ONE new row and opens the actual root-owned launch channel.
-        shared.store.register_agent(&crate::store::NewAgent {
-            alias: &alias,
-            provider: "pi",
-            endpoint_kind: "managed",
-            role: if crate::master::is_master(&alias) {
-                "master"
-            } else {
-                "worker"
-            },
+        shared.store.register_agent(&registration(
+            &alias,
             // Match the helper's held guest-writable repository leaf. The
             // supervisor-owned /workspace ancestor remains non-writable.
-            cwd: "/workspace/company",
-            sandbox: "native-protected",
-            instructions: None,
-            params: Some(&params),
-            team_role: None,
-            model_policy: Some("provider_default"),
-        })?;
+            "/workspace/company",
+            &params,
+        ))?;
         let agent = shared.store.agent(&alias)?;
         let part = Arc::new(Mutex::new(StreamState {
             next: 0,
@@ -186,6 +175,65 @@ impl Task {
         Ok(())
     }
 }
+// Store registration metadata is not native launch permission. The adapter's
+// fixed guest UID and alias-derived, signed master/worker selection remain the
+// independent physical launch path. `cwd` is fixed by Task::start; tests use an
+// isolated existing directory to exercise the real Store contract without Root.
+fn registration<'a>(alias: &'a str, cwd: &'a str, params: &'a str) -> crate::store::NewAgent<'a> {
+    crate::store::NewAgent {
+        alias,
+        provider: "pi",
+        endpoint_kind: "managed",
+        role: if crate::master::is_master(alias) {
+            "pm"
+        } else {
+            "worker"
+        },
+        cwd,
+        sandbox: if crate::master::is_master(alias) {
+            "read-only"
+        } else {
+            "workspace-write"
+        },
+        instructions: None,
+        params: Some(params),
+        team_role: None,
+        // The task carries an explicit elected model. Provider-default would
+        // conflict with it; ordinary Store resolution keeps the explicit value.
+        model_policy: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Registration-contract check only: actual SQLite/Store/model resolution,
+    // no fabricated Root grant, custody, service, launch or provider response.
+    #[test]
+    fn native_task_registration_uses_real_store_grammar_and_explicit_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("registration.db")).unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let params = r#"{"model":"openai-codex/gpt-6.1-sol"}"#;
+        for (alias, role, sandbox) in [
+            ("master", "pm", "read-only"),
+            ("native-worker", "worker", "workspace-write"),
+        ] {
+            store
+                .register_agent(&registration(alias, cwd, params))
+                .unwrap();
+            let row = store.agent(alias).unwrap();
+            assert_eq!(row.provider, "pi");
+            assert_eq!(row.endpoint_kind, "managed");
+            assert_eq!(row.role, role);
+            assert_eq!(row.sandbox, sandbox);
+            assert_eq!(row.cwd, cwd);
+            assert_eq!(row.params.unwrap()["model"], "openai-codex/gpt-6.1-sol");
+        }
+    }
+}
+
 fn emit(
     control: &UnixDatagram,
     task: &str,
