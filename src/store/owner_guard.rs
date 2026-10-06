@@ -257,6 +257,121 @@ fn store_owner_wrong_or_replaced_incarnation_refuses_without_mutation() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
+        {
+            use std::fs::{File, OpenOptions};
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+            // CORE identity only: ordinary-UID real files, not Root creation,
+            // UID21000 custody, an Init grant or an authenticated FD exchange.
+            // Setup creation precedes the probe and is not a refusal effect.
+            let init_path = dir.path().join("init-custody.sqlite3");
+            let wrong_path = dir.path().join("wrong-init-custody.sqlite3");
+            let create_file = |candidate: &Path| {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(candidate)
+                    .unwrap()
+            };
+            let held = create_file(&init_path);
+            let wrong = create_file(&wrong_path);
+            let named = File::open(&init_path).unwrap();
+            let held_stat = held.metadata().unwrap();
+            let wrong_stat = wrong.metadata().unwrap();
+            assert!(held_stat.is_file() && wrong_stat.is_file());
+            assert_eq!(held_stat.len(), 0);
+            assert_eq!(wrong_stat.len(), 0);
+            assert_eq!(held_stat.nlink(), 1);
+            assert_eq!(wrong_stat.nlink(), 1);
+            assert_eq!(
+                (
+                    held_stat.dev(),
+                    held_stat.uid(),
+                    held_stat.gid(),
+                    held_stat.mode(),
+                ),
+                (
+                    wrong_stat.dev(),
+                    wrong_stat.uid(),
+                    wrong_stat.gid(),
+                    wrong_stat.mode(),
+                )
+            );
+            assert_ne!(held_stat.ino(), wrong_stat.ino());
+
+            // Record bytes, links, held-name identity and genuine sidefile
+            // absence BEFORE either comparison; never manufacture SQLite data.
+            let links = |candidate: &Path| {
+                ["", "-wal", "-shm", "-journal"]
+                    .into_iter()
+                    .map(|suffix| {
+                        let name = format!("{}{suffix}", candidate.display());
+                        match std::fs::symlink_metadata(&name) {
+                            Ok(metadata) => {
+                                let link = metadata
+                                    .file_type()
+                                    .is_symlink()
+                                    .then(|| std::fs::read_link(&name).unwrap());
+                                Some((
+                                    metadata.dev(),
+                                    metadata.ino(),
+                                    metadata.uid(),
+                                    metadata.gid(),
+                                    metadata.mode(),
+                                    metadata.nlink(),
+                                    metadata.len(),
+                                    link,
+                                ))
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(error) => panic!("could not inspect Init probe files: {error}"),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let observed = [
+                init_path.as_path(),
+                wrong_path.as_path(),
+                path.as_path(),
+                legacy_path.as_path(),
+                absent_path.as_path(),
+            ];
+            let before_files: Vec<_> = observed
+                .iter()
+                .map(|candidate| (database_files(candidate), links(candidate)))
+                .collect();
+            for candidate in [&init_path, &wrong_path] {
+                let files = database_files(candidate);
+                assert_eq!(files[0].as_deref(), Some(&[][..]));
+                assert!(files[1..].iter().all(Option::is_none));
+            }
+            let before_opens = sql_opens.count();
+            owner::check_init_file_identity(&held, &named).unwrap();
+            // Both inputs are regular, empty and otherwise matching metadata.
+            // Direct SAME production predicate reaches inode comparison, not
+            // an earlier fixed-path/UID/deadline/phase/cold-service rejection.
+            match owner::check_init_file_identity(&wrong, &named) {
+                Err(crate::Error::Rejected(message)) => {
+                    assert_eq!(message, "Store Init file descriptor/name identity changed")
+                }
+                _ => panic!("different real Init FD reached identity success"),
+            }
+            assert_eq!(
+                sql_opens.count(),
+                before_opens,
+                "Init identity opened SQLite"
+            );
+            assert_eq!(
+                observed
+                    .iter()
+                    .map(|candidate| (database_files(candidate), links(candidate)))
+                    .collect::<Vec<_>>(),
+                before_files,
+                "Init identity comparison mutated bytes, links or four-file absence"
+            );
+        }
         let healthy_alias = dir.path().join("healthy-alias.sqlite3");
         symlink(&path, &healthy_alias).unwrap();
         let before_healthy_alias = sql_opens.count();
