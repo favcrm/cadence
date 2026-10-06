@@ -295,6 +295,9 @@ enum Query {
     Task {
         task: String,
     },
+    TaskRetired {
+        task: String,
+    },
     Opening,
     DatabaseCurrent {
         reference: String,

@@ -1380,6 +1380,30 @@ pub(super) fn readback(query: &Value, until: Instant) -> Result<Value> {
             };
             json!({"version":1,"task":state.id,"alias":state.alias,"model":state.model,"phase":phase,"parts":state.part})
         }
+        Some("task-retired") if obj.len() == 2 => {
+            let task = obj
+                .get("task")
+                .and_then(Value::as_str)
+                .ok_or_else(refused)?;
+            if !super::hex(task, 32) {
+                return Err(refused());
+            }
+            let before = r.serving_current(until)?;
+            {
+                let state = r.task.lock().map_err(|_| refused())?;
+                let state = state.as_ref().ok_or_else(refused)?;
+                // Only the original physical-family + worker-ACK boundary sets
+                // this private state. Caller data/result/EOF cannot supply it.
+                if state.id != task || !state.retiring || !state.retired {
+                    return Err(refused());
+                }
+            }
+            let after = r.serving_current(until)?;
+            if before != after {
+                return Err(refused());
+            }
+            json!({"reference":r.reference,"revision":1,"databaseReference":after.get("databaseReference").ok_or_else(refused)?,"task":task,"phase":"retired"})
+        }
         Some("opening") if obj.len() == 1 => {
             r.construction_current(until)?;
             json!({"reference":r.reference,"revision":1,"purpose":"init","path":DB})
