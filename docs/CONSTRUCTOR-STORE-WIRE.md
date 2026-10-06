@@ -114,9 +114,9 @@ against actually issued authority, cannot elect from it. Consume/current carry
 sequence/grant/binding EXACT original issued tuple on SAME retained channel.
 Response EXACT {version:1,sequence,grant:<facts.reference>,binding:<facts.binding>,
 outcome:"issued"|"consumed"|"current"|"init_file"|"database_current"|"unknown",
-phase:"issued"|"consumed"}. The external facts.reference is the original canonical
-UUIDv4, distinct from Root's hex32 construction reference; never normalize or
-replace it. Backend facts.launch+lineageReference are Root-validated, not dropped unchecked.
+phase:"issued"|"consumed"}. The external facts.reference is the original bounded
+owner token `[A-Za-z0-9_-]{1,128}` (the current issuer uses UUIDv4), distinct from
+Root's hex32 custody and Pi reference; never normalize or replace it. Backend facts.launch+lineageReference are Root-validated, not dropped unchecked.
 
 Init-only file delivery request EXACT
 {type:"init_file",version:1,sequence,grant,binding}, original consumed tuple.

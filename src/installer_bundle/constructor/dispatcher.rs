@@ -492,8 +492,8 @@ fn validate(
         || f.binding.database_epoch != b.lineage.database_epoch
         || f.binding.operation != b.operation
         || f.binding.path != DB
-        // External Store correlation is a canonical UUID, NOT Root's hex32
-        // construction reference. Preserve its exact issued bytes throughout.
+        // External Store correlation is a bounded owner token, NOT Root's
+        // hex32 custody or Pi reference. Preserve exact issued bytes throughout.
         || !store_reference(&f.reference)
         || expected.is_some_and(|e| serde_json::to_value(e).ok() != serde_json::to_value(&f).ok())
     {
@@ -505,11 +505,11 @@ fn validate(
     Ok(f)
 }
 fn store_reference(value: &str) -> bool {
-    uuid::Uuid::parse_str(value).is_ok_and(|id| {
-        id.get_variant() == uuid::Variant::RFC4122
-            && id.get_version() == Some(uuid::Version::Random)
-            && id.hyphenated().to_string() == value
-    })
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 impl StoreSession {
     fn handle(&mut self, until: Instant) -> Result<()> {
