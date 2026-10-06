@@ -145,6 +145,11 @@ impl StoreOpenPermit {
     pub(in crate::store) fn recheck(&self) -> Result<()> {
         self.grant.recheck()
     }
+    /// Once-only delivery of Root's actual fresh file after authenticated
+    /// consumption. No caller path/descriptor can select or create this file.
+    pub(in crate::store) fn init_file(&self) -> Result<std::fs::File> {
+        self.grant.init_file()
+    }
     pub(in crate::store) fn current(&self) -> CurrentDatabase {
         CurrentDatabase {
             grant: self.grant.clone(),
@@ -267,6 +272,62 @@ pub(in crate::store) fn check_path(path: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Physical identity predicate used by the real Init FD delivery guard. Its
+/// UNIT result is not creation provenance, a consumed grant or Root authority.
+/// The caller must independently authenticate those before this comparison.
+pub(crate) fn check_init_file_identity(held: &std::fs::File, named: &std::fs::File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let held = held.metadata()?;
+        let named = named.metadata()?;
+        if !held.is_file()
+            || !named.is_file()
+            || held.dev() != named.dev()
+            || held.ino() != named.ino()
+        {
+            return Err(Error::rejected(
+                "Store Init file descriptor/name identity changed",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (held, named);
+        Err(Error::rejected("Store Init file custody requires Unix"))
+    }
+}
+
+/// Corroborate the FD received on the original authenticated consumed channel
+/// before ANY SQLite open. Root retains the actual creation FD/mount/caller;
+/// file metadata alone can neither mint that source nor elect an existing DB.
+pub(in crate::store) fn check_init_file(
+    file: &std::fs::File,
+    path: &std::path::Path,
+) -> Result<()> {
+    check_path(path)?;
+    check_init_file_identity(file, &read_file(path)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        if metadata.uid() != 21000
+            || metadata.gid() != 21000
+            || metadata.mode() & 0o7777 != 0o600
+            || metadata.nlink() != 1
+            || metadata.len() != 0
+        {
+            return Err(Error::rejected(
+                "Store Init file is not the private empty creation",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    Err(Error::rejected("Store Init file custody requires Unix"))
 }
 
 fn read_file(path: &std::path::Path) -> Result<std::fs::File> {

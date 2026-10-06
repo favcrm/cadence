@@ -1012,6 +1012,14 @@ impl Store {
         permit.recheck()?;
         permit.take()?;
         permit.recheck()?;
+        // Root created/pinned this exact file only after durable consumption.
+        // Authenticate its once-only FD delivery before even memory SQLite;
+        // a lost/malformed delivery leaves the obligation spent/UNKNOWN.
+        let init_file = if binding.purpose == owner::Purpose::Init {
+            Some(permit.init_file()?)
+        } else {
+            None
+        };
 
         // Build fresh schema privately in memory. The externally visible file
         // never has a migration window without a closure/incarnation latch.
@@ -1024,17 +1032,10 @@ impl Store {
         )?;
         let mut destination;
         if binding.purpose == owner::Purpose::Init {
-            use std::fs::OpenOptions;
-            #[cfg(unix)]
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut options = OpenOptions::new();
-            options.read(true).write(true).create_new(true);
-            #[cfg(unix)]
-            options.mode(0o600);
             permit.recheck()?;
-            // Existing (including empty) files cannot be fresh initialization.
+            // Never create/adopt a path locally: use Root's original held file.
             // Failure leaves the external obligation spent; never erase/retry.
-            let file = options.open(path)?;
+            let file = init_file.ok_or_else(|| Error::rejected("Root Init file is absent"))?;
             owner::check_path(path)?;
             {
                 let conn = store.conn();

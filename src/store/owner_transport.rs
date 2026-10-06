@@ -1,5 +1,5 @@
 //! Client for the fixed private Store owner service. This is NOT a generic
-//! authority RPC: finite startup/acquire/consume/current/database_current, exact
+//! authority RPC: finite startup/acquire/consume/current/init_file/database_current, exact
 //! bindings, one retained authenticated channel, no credentials, no
 //! reconnect/retry after ACK loss.
 //! The constructor service must admit actual enrolled caller custody and relay
@@ -46,6 +46,14 @@ enum Request<'a> {
         grant: &'a str,
         binding: &'a Binding,
     },
+    /// One delivery of Root's retained create-new file on THIS consumed Init
+    /// channel; selectors cannot choose an existing path or descriptor.
+    InitFile {
+        version: u8,
+        sequence: u64,
+        grant: &'a str,
+        binding: &'a Binding,
+    },
     /// Exact original consumed opening tuple, not another activation/consume.
     /// ROOT must recheck live runtime/kernel custody and durable consumed state.
     DatabaseCurrent {
@@ -77,6 +85,7 @@ enum Outcome {
     Issued,
     Consumed,
     Current,
+    InitFile,
     DatabaseCurrent,
     Unknown,
 }
@@ -84,6 +93,7 @@ enum Outcome {
 enum ExchangeKind {
     Consume,
     ActivationCurrent,
+    InitFile,
     DatabaseCurrent,
 }
 
@@ -106,6 +116,7 @@ pub(crate) struct StoreOwnerGrant {
     grant: String,
     channel: Mutex<Channel>,
     consumed: AtomicBool,
+    file_delivery_burned: AtomicBool,
     unknown: AtomicBool,
 }
 impl StoreOwnerGrant {
@@ -165,6 +176,7 @@ impl StoreOwnerGrant {
             grant: response.grant,
             channel: Mutex::new(channel),
             consumed: AtomicBool::new(false),
+            file_delivery_burned: AtomicBool::new(false),
             unknown: AtomicBool::new(false),
         })
     }
@@ -177,22 +189,47 @@ impl StoreOwnerGrant {
                 "Store owner permit spent or UNKNOWN; replay refused",
             ));
         }
-        self.request(ExchangeKind::Consume)
+        self.request(ExchangeKind::Consume).map(|_| ())
+    }
+    /// No caller inputs: one actual file from the SAME authenticated consumed
+    /// Init channel. Burn delivery locally before wire; lost/invalid FD is
+    /// permanently UNKNOWN, never another consume, path open or reconnect.
+    pub(super) fn init_file(&self) -> Result<std::fs::File> {
+        if self.file_delivery_burned.swap(true, Ordering::SeqCst)
+            || self.unknown.load(Ordering::SeqCst)
+        {
+            return Err(Error::rejected(
+                "Store Init file delivery spent or UNKNOWN; replay refused",
+            ));
+        }
+        let result = self.request(ExchangeKind::InitFile).and_then(|file| {
+            file.ok_or_else(|| Error::rejected("Store Init file delivery is UNKNOWN"))
+        });
+        if result.is_err() {
+            self.unknown.store(true, Ordering::SeqCst);
+        }
+        result
     }
     /// Short activation/maintenance check, even after consumption. This never
     /// extends the original permit's deadline during opening or closure effects.
     pub(crate) fn recheck(&self) -> Result<()> {
-        self.request(ExchangeKind::ActivationCurrent)
+        self.request(ExchangeKind::ActivationCurrent).map(|_| ())
     }
     /// Business transactions use a DIFFERENT finite owner exchange. Local burn
     /// or an expired tuple alone is insufficient: ROOT must freshly corroborate
     /// actual consumed phase, live runtime and the same kernel/DB/lineage scope.
     pub(super) fn recheck_database(&self) -> Result<()> {
-        self.request(ExchangeKind::DatabaseCurrent)
+        self.request(ExchangeKind::DatabaseCurrent).map(|_| ())
     }
     fn validate_for(&self, kind: ExchangeKind) -> Result<()> {
         if self.unknown.load(Ordering::SeqCst) {
             return Err(Error::rejected("Store owner outcome UNKNOWN; no replay"));
+        }
+        if matches!(kind, ExchangeKind::InitFile)
+            && (!self.consumed.load(Ordering::SeqCst)
+                || self.binding.purpose != super::Purpose::Init)
+        {
+            return Err(Error::rejected("Init file requires a consumed Init grant"));
         }
         if matches!(kind, ExchangeKind::DatabaseCurrent) {
             if !self.consumed.load(Ordering::SeqCst)
@@ -210,7 +247,7 @@ impl StoreOwnerGrant {
             self.binding.validate()
         }
     }
-    fn request(&self, kind: ExchangeKind) -> Result<()> {
+    fn request(&self, kind: ExchangeKind) -> Result<Option<std::fs::File>> {
         if self.unknown.load(Ordering::SeqCst) {
             return Err(Error::rejected("Store owner outcome UNKNOWN; no replay"));
         }
@@ -244,6 +281,15 @@ impl StoreOwnerGrant {
                         },
                         Outcome::Current,
                     ),
+                    ExchangeKind::InitFile => (
+                        Request::InitFile {
+                            version: 1,
+                            sequence,
+                            grant: &self.grant,
+                            binding: &self.binding,
+                        },
+                        Outcome::InitFile,
+                    ),
                     ExchangeKind::DatabaseCurrent => (
                         Request::DatabaseCurrent {
                             version: 1,
@@ -254,7 +300,10 @@ impl StoreOwnerGrant {
                         Outcome::DatabaseCurrent,
                     ),
                 };
-                let response = channel.exchange(&request)?;
+                // JSON acknowledgement and tagged FD share ONE absolute IO
+                // budget. Receiving a file cannot refresh activation authority.
+                let deadline = std::time::Instant::now() + IO_BUDGET;
+                let response = channel.exchange_until(&request, deadline)?;
                 if response.version != 1
                     || response.sequence != sequence
                     || response.grant != self.grant
@@ -271,7 +320,20 @@ impl StoreOwnerGrant {
                         "Store owner current/consumption is UNKNOWN",
                     ));
                 }
-                self.validate_for(kind)
+                let file = if matches!(kind, ExchangeKind::InitFile) {
+                    let file = channel.receive_init_file(deadline)?;
+                    super::check_init_file(&file, std::path::Path::new(&self.binding.path))?;
+                    Some(file)
+                } else {
+                    None
+                };
+                self.validate_for(kind)?;
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::rejected(
+                        "Store owner exchange deadline; outcome UNKNOWN",
+                    ));
+                }
+                Ok(file)
             })();
             if result.is_err() {
                 self.unknown.store(true, Ordering::SeqCst);
@@ -465,8 +527,14 @@ impl Channel {
         Ok(())
     }
     fn exchange(&mut self, request: &Request<'_>) -> Result<Response> {
+        self.exchange_until(request, std::time::Instant::now() + IO_BUDGET)
+    }
+    fn exchange_until(
+        &mut self,
+        request: &Request<'_>,
+        deadline: std::time::Instant,
+    ) -> Result<Response> {
         use std::io::Write;
-        let deadline = std::time::Instant::now() + IO_BUDGET;
         let frame = serde_json::to_vec(request)?;
         if frame.len() > MAX_FRAME {
             return Err(Error::rejected("Store owner request too large"));
@@ -502,21 +570,113 @@ impl Channel {
         Ok(response)
     }
     fn read_until(&mut self, mut bytes: &mut [u8], deadline: std::time::Instant) -> Result<()> {
-        use std::io::Read;
         while !bytes.is_empty() {
-            self.stream.set_read_timeout(Some(
-                deadline
-                    .checked_duration_since(std::time::Instant::now())
-                    .filter(|d| !d.is_zero())
-                    .ok_or_else(|| Error::rejected("Store owner read deadline"))?,
-            ))?;
-            let n = self.stream.read(bytes)?;
-            if n == 0 {
-                return Err(Error::rejected("Store owner ACK lost; outcome UNKNOWN"));
+            let (n, fds) = self.receive(bytes, deadline)?;
+            if !fds.is_empty() {
+                return Err(Error::rejected(
+                    "unexpected Store owner ancillary descriptors",
+                ));
             }
             bytes = &mut bytes[n..];
         }
         Ok(())
+    }
+    /// Bounded ancillary handling for the original stream only. Adopt EVERY
+    /// visible right before validation so extra/truncated control cannot leak
+    /// descriptors; JSON reads require zero, Init's exact tag requires one.
+    fn receive(
+        &mut self,
+        bytes: &mut [u8],
+        deadline: std::time::Instant,
+    ) -> Result<(usize, Vec<std::os::fd::OwnedFd>)> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let mut control = [0usize; 16];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: bytes.len(),
+        };
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = std::mem::size_of_val(&control);
+        self.stream.set_read_timeout(Some(
+            deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| Error::rejected("Store owner read deadline"))?,
+        ))?;
+        let n = unsafe {
+            libc::recvmsg(
+                self.stream.as_raw_fd(),
+                &mut message,
+                libc::MSG_CMSG_CLOEXEC,
+            )
+        };
+        let mut fds = Vec::new();
+        let mut valid = true;
+        let mut headers = 0;
+        unsafe {
+            let mut c = libc::CMSG_FIRSTHDR(&message);
+            while !c.is_null() {
+                headers += 1;
+                if (*c).cmsg_len < libc::CMSG_LEN(0) as usize {
+                    valid = false;
+                    break;
+                }
+                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                    let size = (*c).cmsg_len - libc::CMSG_LEN(0) as usize;
+                    if !size.is_multiple_of(std::mem::size_of::<i32>()) {
+                        valid = false;
+                    }
+                    for i in 0..size / std::mem::size_of::<i32>() {
+                        let raw = *libc::CMSG_DATA(c).cast::<i32>().add(i);
+                        if raw < 0 {
+                            valid = false;
+                        } else {
+                            fds.push(OwnedFd::from_raw_fd(raw));
+                        }
+                    }
+                } else {
+                    valid = false;
+                }
+                c = libc::CMSG_NXTHDR(&message, c);
+            }
+        }
+        if n <= 0
+            || !valid
+            || headers > 1
+            || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
+            || std::time::Instant::now() >= deadline
+        {
+            return Err(Error::rejected(
+                "Store owner channel/ancillary lost; outcome UNKNOWN",
+            ));
+        }
+        Ok((n as usize, fds))
+    }
+    fn receive_init_file(&mut self, deadline: std::time::Instant) -> Result<std::fs::File> {
+        use std::os::fd::AsRawFd;
+        self.check()?;
+        let mut tag = [0u8; 1];
+        let (n, mut fds) = self.receive(&mut tag, deadline)?;
+        if n != 1 || tag != [0x44] || fds.len() != 1 {
+            return Err(Error::rejected("Store Init file descriptor frame refused"));
+        }
+        let fd = fds
+            .pop()
+            .ok_or_else(|| Error::rejected("Store Init file descriptor absent"))?;
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        let descriptor_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0
+            || flags & libc::O_ACCMODE != libc::O_RDWR
+            || descriptor_flags < 0
+            || descriptor_flags & libc::FD_CLOEXEC == 0
+        {
+            return Err(Error::rejected("Store Init file descriptor access refused"));
+        }
+        self.check()?;
+        Ok(std::fs::File::from(fd))
     }
 }
 #[cfg(not(target_os = "linux"))]
@@ -529,6 +689,12 @@ impl Channel {
         Err(Error::rejected("authenticated Store owner requires Linux"))
     }
     fn exchange(&mut self, _: &Request<'_>) -> Result<Response> {
+        Err(Error::rejected("authenticated Store owner requires Linux"))
+    }
+    fn exchange_until(&mut self, _: &Request<'_>, _: std::time::Instant) -> Result<Response> {
+        Err(Error::rejected("authenticated Store owner requires Linux"))
+    }
+    fn receive_init_file(&mut self, _: std::time::Instant) -> Result<std::fs::File> {
         Err(Error::rejected("authenticated Store owner requires Linux"))
     }
 }
