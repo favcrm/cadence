@@ -729,15 +729,6 @@ fn reclaim_lane_with_context(
         return Ok(ReclaimAttempt::Absent);
     }
     let root = declared_lane_root(context.pm, issue, lane)?;
-    let branch = match declared_issue_branch(issue, lane) {
-        Ok(branch) => branch,
-        Err(reason) => return Ok(ReclaimAttempt::Skipped(reason.to_string())),
-    };
-    if let Err(reason) =
-        crate::worktree::lifecycle::validate_target_reclaim(&root, lane, &issue.front.id, &branch)
-    {
-        return Ok(ReclaimAttempt::Skipped(reason.to_string()));
-    }
     // The recorded cargo_target for this lane's open ref, if any — only
     // ever compared against the derived path, never deleted.
     let cargo_target = issue
@@ -750,6 +741,15 @@ fn reclaim_lane_with_context(
     let Some(target) = reclaim_target(lane, cargo_target.as_deref())? else {
         return Ok(ReclaimAttempt::Absent);
     };
+    let branch = match declared_issue_branch(issue, lane) {
+        Ok(branch) => branch,
+        Err(reason) => return Ok(ReclaimAttempt::Skipped(reason.to_string())),
+    };
+    if let Err(reason) =
+        crate::worktree::lifecycle::validate_target_reclaim(&root, lane, &issue.front.id, &branch)
+    {
+        return Ok(ReclaimAttempt::Skipped(reason.to_string()));
+    }
     if let Some(reason) = blocked_reason_with_process_probe(
         context.view,
         context.state_dir,
