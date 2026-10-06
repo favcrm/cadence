@@ -26,6 +26,7 @@ static PROFILE_MINTED: AtomicBool = AtomicBool::new(false);
 mod acceptance;
 mod authentication;
 mod provision;
+pub(crate) use provision::GenerationView;
 
 const PROFILE: &str = "/opt/cadence/pi-profile.json";
 const POLICY: &str = "/opt/cadence/pi-policy.json";
@@ -365,6 +366,7 @@ impl OwnerProfile {
             authorization,
             phase: Cell::new(Phase::Prepared),
             unknown: Cell::new(false),
+            view: RefCell::new(None),
         })
     }
 }
@@ -386,6 +388,7 @@ pub(crate) struct LaunchPermit {
     authorization: authentication::AuthenticatedOperation,
     phase: Cell<Phase>,
     unknown: Cell<bool>,
+    view: RefCell<Option<GenerationView>>,
 }
 /// Same production binding guard used by arm/consume. Expected values are the
 /// retained owner's permit, not echoed caller fields. Exposed within crate for
@@ -471,13 +474,30 @@ impl LaunchPermit {
         if self.phase.get() != Phase::Prepared || self.unknown.get() {
             return Err(refuse());
         }
-        let result = provision::create(self);
+        let result = (|| {
+            let view = provision::create(self)?;
+            let mut slot = self.view.try_borrow_mut().map_err(|_| refuse())?;
+            if slot.is_some() {
+                return Err(refuse());
+            }
+            *slot = Some(view);
+            self.phase.set(Phase::Provisioned);
+            Ok(())
+        })();
         if result.is_err() {
             self.unknown.set(true);
-        } else {
-            self.phase.set(Phase::Provisioned);
         }
         result
+    }
+    /// Move ONLY the originally provisioned view after successful durable
+    /// consume/current. Called by serve on its successful Node-release path;
+    /// later retirement uses runtime lifetime, not this expired launch H.P.S.
+    pub(crate) fn into_generation_view(self) -> Result<GenerationView> {
+        if self.phase.get() != Phase::Burned || self.unknown.get() {
+            return Err(refuse());
+        }
+        self.recheck()?;
+        self.view.into_inner().ok_or_else(refuse)
     }
     pub(crate) fn require_provisioned(&self) -> Result<()> {
         if self.phase.get() != Phase::Provisioned || self.unknown.get() {

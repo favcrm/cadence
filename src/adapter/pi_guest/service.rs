@@ -2,12 +2,13 @@
 //! authentic one-use launch permit. Wire descriptions/selectors cannot create
 //! this object. The constructor admits its supervisor before issuance/spawn;
 //! accepted helper streams themselves are forwarded to root, never claimed PIDs.
-use super::owner::LaunchPermit;
+use super::owner::{GenerationView, LaunchPermit};
 use crate::error::{Error, Result};
 use crate::installer_bundle::constructor::{HelperPhase, HelperStdio, OwnedHelper};
 use crate::protected_pi_profile::authority::{
     self, Authorized, Request, Response, SignedOperation,
 };
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -104,9 +105,13 @@ impl PendingLaunch {
         // ACK lets the helper attempt selected exec; constructor's tracer keeps
         // Node stopped before any user instruction until this actual gate passes.
         self.helper.release_node(&self.permit, until)?;
+        let selection = self.permit.describe().selection.clone();
+        let view = self.permit.into_generation_view()?;
         Ok(RunningLaunch {
             helper: self.helper,
-            selection: self.permit.describe().selection.clone(),
+            selection,
+            view,
+            retirement: Cell::new(Retirement::Live),
         })
     }
 }
@@ -116,6 +121,46 @@ impl PendingLaunch {
 pub(crate) struct RunningLaunch {
     pub(crate) helper: OwnedHelper,
     pub(crate) selection: authority::Selection,
+    view: GenerationView,
+    retirement: Cell<Retirement>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retirement {
+    Live,
+    Unknown,
+    Completed,
+}
+impl RunningLaunch {
+    /// Kernel family retirement AND exact held view isolation, before a retire
+    /// reply/drain. Worker/stream quiescence is still an independent later ACK.
+    pub(crate) fn retire(&self, until: Instant) -> Result<()> {
+        let until = until.min(Instant::now() + Duration::from_secs(10));
+        match self.retirement.get() {
+            Retirement::Completed => return self.require_retired(until),
+            Retirement::Unknown => return Err(refused()),
+            Retirement::Live => self.retirement.set(Retirement::Unknown),
+        }
+        let family = self.helper.retire_family(until)?;
+        self.view.isolate(&family, until)?;
+        self.retirement.set(Retirement::Completed);
+        Ok(())
+    }
+    /// Expected control closure requires THIS completed view and actual original
+    /// family witness. A helper-only retired flag cannot discard an UNKNOWN view.
+    pub(crate) fn require_retired(&self, until: Instant) -> Result<()> {
+        if self.retirement.get() != Retirement::Completed {
+            return Err(refused());
+        }
+        let until = until.min(Instant::now() + Duration::from_secs(10));
+        let result = (|| {
+            let family = self.helper.retire_family(until)?;
+            self.view.require_isolated(&family, until)
+        })();
+        if result.is_err() {
+            self.retirement.set(Retirement::Unknown);
+        }
+        result
+    }
 }
 struct Wire {
     stream: UnixStream,
