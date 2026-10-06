@@ -198,6 +198,12 @@ fn dispatch_protected_request(request: policy::Request) -> std::io::Result<prote
 fn dispatch_protected_request(
     request: policy::Request,
 ) -> std::io::Result<std::convert::Infallible> {
+    refuse_unsupported_protected_request(request)
+}
+#[cfg(all(target_os = "linux", any(test, not(target_arch = "x86_64"))))]
+fn refuse_unsupported_protected_request(
+    request: policy::Request,
+) -> std::io::Result<std::convert::Infallible> {
     if let policy::Request::PiGuest(profile) = request {
         profile
             .selection()
