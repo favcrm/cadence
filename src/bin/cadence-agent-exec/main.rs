@@ -25,7 +25,7 @@
 mod capabilities;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod policy;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod protected;
 #[path = "../../protected_pi_profile.rs"]
 #[allow(dead_code)] // Same grammar compiled into both artifacts, not a caller policy port.
@@ -115,15 +115,23 @@ fn run() -> i32 {
     // Missing real private prerequisites refuse even for a kernel-admitted caller.
     enum Action {
         Legacy(policy::Request),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         Protected(protected::OwnedLaunch),
     }
     let action = match request {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         policy::Request::PiGuest(_) => match dispatch_protected_request(request) {
             Ok(plan) => Action::Protected(plan),
             Err(e) => return refuse(&e.to_string()),
         },
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        policy::Request::PiGuest(_) => match dispatch_protected_request(request) {
+            Ok(never) => match never {},
+            Err(e) => return refuse(&e.to_string()),
+        },
         other => Action::Legacy(other),
     };
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if matches!(&action, Action::Protected(_)) {
         protected_effect();
     }
@@ -134,6 +142,7 @@ fn run() -> i32 {
         Ok(last) => last,
         Err(e) => return fail(&format!("capability seal preparation: {e}")),
     };
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if matches!(&action, Action::Protected(_)) {
         protected_effect();
     }
@@ -151,6 +160,7 @@ fn run() -> i32 {
         return fail(&format!("capability seal verification: {e}"));
     }
     let request = match action {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         Action::Protected(plan) => {
             return match plan.exec() {
                 Ok(()) => fail("protected exec unexpectedly returned"),
@@ -174,7 +184,7 @@ fn run() -> i32 {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn dispatch_protected_request(request: policy::Request) -> std::io::Result<protected::OwnedLaunch> {
     match request {
         policy::Request::PiGuest(profile) => protected::prepare(profile),
@@ -184,9 +194,16 @@ fn dispatch_protected_request(request: policy::Request) -> std::io::Result<prote
         )),
     }
 }
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+fn dispatch_protected_request(_: policy::Request) -> std::io::Result<std::convert::Infallible> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "protected Pi launch requires Linux x86_64 constructor custody; unsupported target refused",
+    ))
+}
 #[cfg(all(target_os = "linux", test))]
 std::thread_local! { static PROTECTED_EFFECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn protected_effect() {
     #[cfg(test)]
     PROTECTED_EFFECTS.with(|count| count.set(count.get() + 1));
