@@ -207,6 +207,9 @@ enum Request<'a> {
         part: u64,
         bytes: &'a str,
     },
+    TaskRetired {
+        task: &'a str,
+    },
     RuntimeDaemonReady {
         reference: &'a str,
     },
@@ -431,6 +434,18 @@ pub(super) fn task_event(task: &str, part: u64, bytes: &str, until: Instant) -> 
         return Err(refused());
     }
     let reply = exchange(Request::TaskEvent { task, part, bytes }, until)?;
+    if reply.store.is_some() || reply.pi.is_some() {
+        return Err(refused());
+    }
+    Ok(())
+}
+/// Observation of the dispatcher's already completed physical + worker fences.
+/// The notification is not a constructor for retirement or successor authority.
+pub(super) fn task_retired(task: &str, until: Instant) -> Result<()> {
+    if !super::hex(task, 32) {
+        return Err(refused());
+    }
+    let reply = exchange(Request::TaskRetired { task }, until)?;
     if reply.store.is_some() || reply.pi.is_some() {
         return Err(refused());
     }

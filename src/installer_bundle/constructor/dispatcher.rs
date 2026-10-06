@@ -791,15 +791,23 @@ fn accepted() -> Result<Option<(Domain, UnixStream)>> {
             Ok(None)
         }
         Packet::Retired { version: 1, task } => {
-            let mut state = r.task.lock().map_err(|_| refused())?;
-            let state = state.as_mut().ok_or_else(refused)?;
-            // This ACK proves only the actual daemon adapter/worker/stream
-            // quiesced. Root's prior retained namespace-init kernel retirement
-            // is mandatory; an ACK alone cannot create family-exit authority.
-            if state.id != task || !state.retiring || state.retired {
-                return Err(refused());
+            {
+                let mut state = r.task.lock().map_err(|_| refused())?;
+                let state = state.as_mut().ok_or_else(refused)?;
+                // This ACK proves only the actual daemon adapter/worker/stream
+                // quiesced. Root's prior retained namespace-init kernel retirement
+                // is mandatory; an ACK alone cannot create family-exit authority.
+                if state.id != task || !state.retiring || state.retired {
+                    return Err(refused());
+                }
+                state.retired = true;
             }
-            state.retired = true;
+            // Release the task mutex before the owner exchange: its same-pending
+            // task readback must observe these fences without a recursive lock.
+            let until = Instant::now() + Duration::from_secs(10);
+            r.check(until)?;
+            lifecycle::task_retired(&task, until)?;
+            r.check(until)?;
             Ok(None)
         }
         Packet::Accepted { version: 1, domain } => Ok(Some((

@@ -34,6 +34,11 @@ This new source/artifact requires new root qualification; none is inherited.
 Each request carries version1, original operation/barrierNonce and positive
 JS-safe monotonic sequence, plus its exact selected fields:
 - `runtime-current`
+- `runtime-daemon-ready`: actual Root-owned daemon reference, NOT serving
+- `runtime-serving-ready`: same reference only after actual physical serving capture
+- `task-event`: task32hex, zero-based ordered part, canonical base64url bytes1..16384
+- `task-retired`: task32hex only after actual Root family exit and daemon worker/
+  adapter/stream quiescence; observation, not provider/successor retirement authority
 - `store-startup`: NO caller-selected binding/purpose/attempt; actual owner elects facts
 - `store-acquire`: purpose init|restore|open|close|witness, attempt32hex
 - `store-consume` / `store-current`: opaque reference
@@ -51,6 +56,10 @@ correlation, full binding, epoch/lineage/closure, wall-clock regression and actu
 root custody. Store/Pi domain-specific code must validate exact issued facts,
 durable phase, scoped revision/ABA and appropriate outcome. Runtime current alone
 cannot issue a Pi or Store one-use grant. Only requested domain reply is nonnull.
+Optional `commands` carries at most8 closed finite command objects; task/cancel/
+retire are Host-to-Root DATA selectors, not new Root request types or permission.
+Ready/task events/task retirement carry no Store/Pi reply. Physical readbacks
+remain reentrant inside the SAME pending exchange; see CONSTRUCTOR-PRIVATE-RUNTIME.md.
 
 Root requests no Store binding/path/witness claims. Actual fixed company lineage
 methods acquire/consume/current return StorePermitFacts and durable issued versus
