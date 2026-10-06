@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
@@ -354,8 +354,9 @@ function ServiceSection({
       )}
       {!group.builtin && !group.info && (
         <p className="text-micro text-ink-500 mt-2 break-words">
-          This provider is not in the registered service list — the account is kept under
-          its recorded name and may be stale.
+          This provider&apos;s service metadata could not be loaded — the account stays
+          under its recorded name. Refresh services; a failed load is not proof the
+          provider was removed.
         </p>
       )}
     </section>
@@ -384,18 +385,53 @@ export function ConnectionDetail({
   const [note, setNote] = useState<{ ok: boolean; warn?: boolean; text: string } | null>(null);
   const managed = canManage(row);
   const verify = verificationSupport(provider ?? null);
+  // Each check is bound to a monotonically increasing generation and the
+  // exact identity it was issued against (id + credential revision +
+  // registration digest). A rotation, provider re-registration or a
+  // disconnect/selection change produces a new context: it bumps the
+  // generation and clears the note so a late response can never overwrite
+  // newer state, and a response that does not match the live context is
+  // treated as stale, not as evidence about the current account.
+  const checkGen = useRef(0);
+  const context = `${row.id}:${row.revision ?? "x"}:${row.registration_digest ?? "x"}`;
+  useEffect(() => {
+    checkGen.current += 1;
+    setNote(null);
+    setChecking(false);
+  }, [context]);
+  useEffect(() => {
+    return () => {
+      checkGen.current += 1; // unmount invalidates any in-flight check
+    };
+  }, []);
 
   const check = () => {
     if (checking) return;
+    const gen = ++checkGen.current;
+    const want = { id: row.id, revision: row.revision ?? null, registration_digest: row.registration_digest ?? null };
     setChecking(true);
     setNote(null);
     api
       .connectionCheck(row.id)
       .then((out) => {
-        // Use the returned connection, not the request's success: a
-        // refused adapter/descriptor/custody or an unreadable SMTP
-        // sender is a configuration problem, never a healthy account.
-        const c = out.connection ?? row;
+        if (gen !== checkGen.current) return; // a newer context superseded this
+        // No fallback to the request's row: an absent or malformed
+        // connection, or one whose identity/revision/registration no
+        // longer matches what was checked, is a fixed secret-safe
+        // configuration error — never the old row re-shown as healthy.
+        const c = out && typeof out === "object" ? out.connection : null;
+        const identityMatches =
+          c !== null &&
+          c.id === want.id &&
+          (c.revision ?? null) === want.revision &&
+          (c.registration_digest ?? null) === want.registration_digest;
+        if (c == null || typeof c !== "object" || !identityMatches) {
+          setNote({
+            ok: false,
+            text: "The check did not return this connection's current state — treat this as a configuration problem, not a connection that works.",
+          });
+          return;
+        }
         const smtpErr = smtpErrorMessage(c);
         if (!isAvailable(c) || smtpErr !== null) {
           setNote({
@@ -421,13 +457,16 @@ export function ConnectionDetail({
         }
         onChanged();
       })
-      .catch(() =>
+      .catch(() => {
+        if (gen !== checkGen.current) return;
         setNote({
           ok: false,
           text: "The local configuration could not be read — treat this as a configuration problem, not a connection that works.",
-        }),
-      )
-      .finally(() => setChecking(false));
+        });
+      })
+      .finally(() => {
+        if (gen === checkGen.current) setChecking(false);
+      });
   };
 
   return (
@@ -940,15 +979,13 @@ export function AddConnection({
   const candidates = providers.filter(
     (p) => p.descriptor_available && (acceptsToken(p) || acceptsSmtp(p)),
   );
-  // The providers load behind the resource: the selection follows the
-  // preset or the first candidate until the operator picks one
-  // explicitly. A preset that is not currently enrollable stays pinned
-  // (never silently re-targets another provider's credential) — the form
-  // is disabled until the operator chooses a real one.
-  const [explicit, setExplicit] = useState<string | null>(preset ?? null);
-  const pinned = explicit !== null && !candidates.some((c) => c.provider === explicit);
-  const provider =
-    explicit !== null && !pinned ? explicit : pinned ? explicit! : (candidates[0]?.provider ?? "");
+  // The providers load behind the resource: the canonical selection is
+  // captured ONCE at mount — the preset, else the first candidate, else
+  // "" (choose-service). It never re-reads a later candidate as a
+  // fallback, so a refresh that removes the default can never silently
+  // retarget a typed credential at a different provider.
+  const [explicit, setExplicit] = useState<string>(preset ?? candidates[0]?.provider ?? "");
+  const provider = explicit;
   const [account, setAccount] = useState("");
   const [token, setToken] = useState("");
   const [acceptRisk, setAcceptRisk] = useState(false);
@@ -999,25 +1036,44 @@ export function AddConnection({
     });
   };
 
+  // The selection's semantic fingerprint: provider + registration digest
+  // + descriptor revision + enrollment shapes. A refresh that changes any
+  // of them (registration rolled, descriptor re-reviewed, shapes gained
+  // or lost) invalidates the in-flight draft — secret, method, account
+  // and consent reset — while the canonical provider stays selected.
+  const fingerprint = chosen
+    ? `${chosen.provider}:${chosen.registration_digest ?? "x"}:${chosen.descriptor?.revision ?? "x"}:${(chosen.descriptor?.enrollment_shapes ?? []).join(",")}`
+    : provider === "" ? "none" : `gone:${provider}`;
+  const prevFingerprint = useRef<string | null>(null);
+  useEffect(() => {
+    if (prevFingerprint.current !== null && prevFingerprint.current !== fingerprint) {
+      resetDraft();
+    }
+    prevFingerprint.current = fingerprint;
+  }, [fingerprint]);
+
   const chooseProvider = (next: string) => {
     setExplicit(next);
     resetDraft();
   };
 
   const chooseMethod = (next: "token" | "smtp") => {
+    // A method change discards the whole prior draft — the SMTP
+    // transport/login/sender, the token, the account hint and the
+    // consent never carry across.
+    resetDraft();
     setMethod(next);
-    // A method change is a draft change: nothing typed under the old
-    // method (secret, account hint, consent) carries into the new one.
-    setToken("");
-    setScopePicks(new Set());
-    setAccount("");
-    setAcceptRisk(false);
-    setRiskNeeded(false);
-    setError(null);
   };
 
   const choosePreset = (next: Preset) => {
     setSmtpPreset(next);
+    // A preset change retargets the SMTP service: the password and the
+    // custody consent never carry into a different mail server. The
+    // non-secret account/sender fields may stay; transport follows the
+    // new preset's paired host/port/TLS.
+    setToken("");
+    setAcceptRisk(false);
+    setRiskNeeded(false);
     setSmtp((cur) => ({ ...cur, host: next.host, tls_mode: next.tls, port: String(next.port) }));
     setError(null);
   };
@@ -1032,7 +1088,7 @@ export function AddConnection({
   };
 
   const submit = () => {
-    if (busy || pinned) return;
+    if (busy || provider === "" || unavailable || methodPending) return;
     setRiskNeeded(false);
     const cleanedAccount = account.trim();
     // CAD-1013 SMTP simplification: an SMTP sender enrolls exactly the
@@ -1139,6 +1195,13 @@ export function AddConnection({
       });
   };
 
+  // provider === "" is the choose-service placeholder; a selected
+  // provider that is not currently enrollable (removed from the
+  // registry, or its descriptor/shapes gone) is `unavailable`. Either
+  // disables submission and never sends a draft.
+  const unavailable = provider !== "" && chosen === null;
+  const cannotSubmit = busy || provider === "" || unavailable || methodPending;
+
   return (
     <section className="card px-4 py-3.5 min-w-0" aria-label="add connection">
       <h2 className="text-cardtitle font-medium text-ink-100">
@@ -1169,7 +1232,12 @@ export function AddConnection({
               className="field w-full mt-1"
               disabled={busy}
             >
-              {pinned && (
+              {provider === "" && (
+                <option value="" disabled>
+                  Choose a service…
+                </option>
+              )}
+              {unavailable && (
                 <option value={provider}>{provider} — unavailable now</option>
               )}
               {candidates.map((p) => (
@@ -1179,14 +1247,19 @@ export function AddConnection({
                 </option>
               ))}
             </select>
-            {pinned && (
+            {provider === "" && (
+              <p className="text-micro text-ink-500 mt-1 break-words">
+                Choose a service to connect.
+              </p>
+            )}
+            {unavailable && (
               <p className="text-micro text-warn mt-1 break-words" role="alert">
                 That service is no longer available — pick another service to connect, or
                 cancel. Nothing typed here can go to a different service.
               </p>
             )}
           </div>
-          {pinned ? null : (
+          {provider === "" || unavailable ? null : (
           <>
           {bothShapes && (
             <div role="group" aria-label="How to connect" className="flex flex-wrap gap-2">
@@ -1489,7 +1562,7 @@ export function AddConnection({
             </label>
           )}
           <div className="flex flex-wrap gap-2">
-            <Button variant="primary" size="sm" type="submit" loading={busy} disabled={busy || pinned || methodPending}>
+            <Button variant="primary" size="sm" type="submit" loading={busy} disabled={cannotSubmit}>
               {busy ? "Adding…" : "Add connection"}
             </Button>
             <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>

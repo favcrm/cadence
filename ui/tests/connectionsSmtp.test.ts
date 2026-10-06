@@ -509,7 +509,10 @@ async function main() {
   assert(byTextIn(host5, "button", "Set up Email (SMTP)"), "smtp service has a Set up action");
   assert(byTextIn(host5, "button", "Set up AgenticOS"), "token service has a Set up action");
   assert(text5().includes("No empty_svc account connected yet"), "empty provider names its setup state");
-  assert(text5().includes("not in the registered service list") || text5().includes("may be stale"), "unregistered provider is honest");
+  assert(
+    text5().includes("could not be loaded") || text5().includes("not proof") || text5().includes("may be stale") || text5().includes("not registered"),
+    "unregistered provider is honest — metadata-missing is not deregistration",
+  );
 
   // Expand the smtp row: its detail lands in place with the local-only
   // check and the honest unsupported remote-verification line.

@@ -209,7 +209,11 @@ export function enrollmentSupport(provider: ConnectionProvider | null): {
   reason: string;
 } {
   if (provider === null) {
-    return { shapes: [], reason: "This provider is not registered on this daemon." };
+    return {
+      shapes: [],
+      reason:
+        "This provider's metadata could not be loaded — refresh services before assuming it was removed.",
+    };
   }
   if (!provider.descriptor_available || provider.descriptor === null) {
     return {
