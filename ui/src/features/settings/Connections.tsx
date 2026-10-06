@@ -1199,7 +1199,7 @@ export function AddConnection({
   // provider that is not currently enrollable (removed from the
   // registry, or its descriptor/shapes gone) is `unavailable`. Either
   // disables submission and never sends a draft.
-  const unavailable = provider !== "" && chosen === null;
+  const unavailable = provider !== "" && !candidates.some((p) => p.provider === provider);
   const cannotSubmit = busy || provider === "" || unavailable || methodPending;
 
   return (
