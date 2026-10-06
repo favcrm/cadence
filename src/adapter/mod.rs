@@ -53,22 +53,21 @@ pub mod codex;
 pub mod fake;
 pub mod link;
 pub mod pi;
-// The protected managed-Pi launch seam is Linux-only (openat2 + fd-exec +
-// NSS account topology). On other targets the whole module is a stub whose
-// `protected_prereqs_satisfied` still fails closed — a non-Linux build never
-// reaches a spawn through the split path.
-#[cfg(all(unix, target_os = "linux"))]
+// The protected managed-Pi launch seam requires the Linux x86_64 constructor
+// (held exec, kernel custody and NSS topology). Other targets retain only the
+// fail-closed prerequisite probe; they never reach a protected spawn.
+#[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod pi_guest;
 
-#[cfg(not(all(unix, target_os = "linux")))]
+#[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
 pub(crate) mod pi_guest {
     use crate::error::{Error, Result};
-    /// Non-Linux builds fail closed: the protected launch seam does not exist
-    /// off Linux, so eligibility is permanently UNKNOWN.
+    /// Unsupported builds fail closed: no constructor means eligibility is
+    /// permanently UNKNOWN.
     pub(crate) fn protected_prereqs_satisfied() -> Result<()> {
         Err(Error::rejected(
-            "protected managed-Pi launch is Linux-only — openat2/fd-exec \
-             unavailable; eligibility UNKNOWN and refused",
+            "protected managed-Pi launch requires Linux x86_64 constructor \
+             custody; eligibility UNKNOWN and refused",
         ))
     }
 }
