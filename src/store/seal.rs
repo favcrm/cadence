@@ -143,6 +143,7 @@ pub(super) struct OwnerMaintenancePermit {
 impl OwnerMaintenancePermit {
     /// Only the authenticated constructor relay supplies this opaque grant.
     /// Binding selectors alone, a hosted lease or a launch grant cannot.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub(super) fn issue(grant: owner::StoreOwnerGrant) -> Result<Self> {
         let b = grant.binding();
         b.validate()?;

@@ -540,6 +540,7 @@ pub(super) fn check_identity(conn: &Connection, binding: &Binding, source: bool)
 /// emit this result without a generic publish-JSON or DTO constructor.
 /// Serialization is DATA, not caller/runtime custody, an authoritative digest,
 /// an uploaded artifact or externally validated FINAL/retirement evidence.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[derive(Serialize)]
 pub(crate) struct QuiescedWitness {
     sequence: u64,
@@ -562,12 +563,14 @@ impl super::super::Store {
         let permit = StoreOpenPermit::issue(grant)?;
         Self::open_protected(&permit)
     }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn close_owned(&self, grant: StoreOwnerGrant, reason: &str) -> Result<()> {
         let permit = super::OwnerMaintenancePermit::issue(grant)?;
         self.propose_close(&permit, reason)
     }
     /// A witness sequence is not the business highwater, a capture/upload,
     /// external artifact validation or FINAL. Those remain distinct owner steps.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn witness_owned(&self, grant: StoreOwnerGrant) -> Result<QuiescedWitness> {
         let binding = grant.binding().clone();
         let permit = super::OwnerMaintenancePermit::issue(grant)?;
