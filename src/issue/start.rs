@@ -7,6 +7,7 @@
 //! re-applies the cargo target and mints nothing; a `--name` for a
 //! different slug, or several open refs, refuses.
 
+use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use serde_json::{json, Value};
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::model::{self, Front, Ref};
-use crate::issue::{claim, git, parse, project, write, Pm};
+use crate::issue::{claim, finish, git, parse, project, write, Pm};
 use crate::worktree::{self, layout};
 
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
@@ -113,20 +114,39 @@ pub(crate) fn resolve_repo(
     )))
 }
 
-/// Base resolution per decision 1: `--base`, then the repo's
-/// `origin/HEAD` target, then the current branch, then `HEAD`.
-/// Returns `(ref, sha)`; no fetch.
+/// Base resolution: an explicit `--base`, else fetch and pin the repo's
+/// `origin/HEAD` target, else use the local branch (for repos without a remote
+/// default). Returns the selected ref and its exact commit SHA.
 pub(crate) fn resolve_base(root: &Path, flag: Option<&str>) -> Result<(String, String)> {
-    let base = if let Some(b) = flag {
-        b.to_string()
+    let (base, fetch_default) = if let Some(b) = flag {
+        (b.to_string(), false)
     } else if let Ok(origin_head) = git(
         root,
         &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
     ) {
-        origin_head
+        (origin_head, true)
     } else {
-        git(root, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| "HEAD".to_string())
+        (
+            git(root, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| "HEAD".to_string()),
+            false,
+        )
     };
+    if fetch_default {
+        let (remote, branch) = base.split_once('/').ok_or_else(|| {
+            Error::rejected(format!("origin/HEAD resolved to invalid ref '{base}'"))
+        })?;
+        let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+        git(
+            root,
+            &["fetch", "--no-tags", "--no-write-fetch-head", remote, &refspec],
+        )
+        .map_err(|e| {
+            Error::rejected(format!(
+                "Could not refresh default base '{base}' in {} ({e}) — retry when origin is reachable or pass --base <ref>",
+                root.display()
+            ))
+        })?;
+    }
     let sha = git(
         root,
         &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
@@ -140,10 +160,144 @@ pub(crate) fn resolve_base(root: &Path, flag: Option<&str>) -> Result<(String, S
     Ok((base, sha))
 }
 
-/// The branch a worktree dir is checked out on (`symbolic-ref --short
-/// HEAD`), or None when the dir is not a worktree.
-fn worktree_branch(dir: &Path) -> Option<String> {
-    git(dir, &["symbolic-ref", "--short", "HEAD"]).ok()
+fn branch_base(root: &Path, branch: &str, fallback: &str) -> String {
+    git(
+        root,
+        &[
+            "reflog",
+            "show",
+            "--format=%H",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .ok()
+    .and_then(|log| log.lines().last().map(str::to_string))
+    .filter(|sha| !sha.is_empty())
+    .unwrap_or_else(|| fallback.to_string())
+}
+
+fn resolve_existing_base(root: &Path, branch: &str) -> Result<(String, String)> {
+    let base = git(
+        root,
+        &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
+    )
+    .or_else(|_| git(root, &["symbolic-ref", "--short", "HEAD"]))
+    .unwrap_or_else(|_| branch.to_string());
+    let tip = git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ],
+    )?;
+    Ok((base, branch_base(root, branch, &tip)))
+}
+
+/// The branch a worktree dir is checked out on, None only when it is absent or detached.
+fn worktree_branch(dir: &Path) -> Result<Option<String>> {
+    match fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(Error::rejected(format!(
+                "{} is not a real worktree directory",
+                dir.display()
+            )))
+        }
+        Ok(_) => finish::git_branch(dir),
+    }
+}
+
+fn refuse_terminal_lifecycle_record(
+    repo: &Path,
+    lane: &Path,
+    front: &Front,
+    branch: &str,
+    branch_exists: bool,
+) -> Result<()> {
+    let Some(record) = worktree::lifecycle::managed_record(repo, lane)? else {
+        return Ok(());
+    };
+    if matches!(record.state.as_str(), "retained" | "releasing") {
+        let reason = record
+            .retention_reason
+            .as_deref()
+            .or(record.release_reason.as_deref())
+            .unwrap_or("no recorded reason");
+        return Err(Error::rejected(format!(
+            "lane {} is recorded as {} ({reason}); issue start will not implicitly reactivate it — inspect lifecycle inventory before explicit recovery",
+            lane.display(), record.state
+        )));
+    }
+    if record.state != "released" {
+        return Ok(());
+    }
+    let refs_match = front
+        .refs
+        .iter()
+        .any(|r| r.kind == "branch" && r.path.as_deref() == Some(branch))
+        && front.refs.iter().any(|r| {
+            r.kind == "worktree" && r.path.as_deref() == Some(lane.to_string_lossy().as_ref())
+        });
+    if record.purpose != "development"
+        || record.tool != "cadence issue start"
+        || record.issue.as_deref() != Some(front.id.as_str())
+        || record.branch.as_deref() != Some(branch)
+        || !refs_match
+    {
+        return Err(Error::rejected(format!(
+            "released lane {} does not match this issue's recorded branch disposition; refusing restart",
+            lane.display()
+        )));
+    }
+    match std::fs::symlink_metadata(lane) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(Error::rejected(format!(
+                "released lane {} still exists; issue start will not reactivate it",
+                lane.display()
+            )))
+        }
+        Err(error) => {
+            return Err(Error::rejected(format!(
+                "cannot verify released lane {} is absent: {error}",
+                lane.display()
+            )))
+        }
+    }
+    let listed = git(repo, &["worktree", "list", "--porcelain"])?;
+    let mut current = None;
+    let mut target_registered = false;
+    let mut branch_registered_elsewhere = false;
+    for line in listed.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(PathBuf::from(path));
+            if crate::issue::finish::lexical_path(Path::new(path))
+                == crate::issue::finish::lexical_path(lane)
+            {
+                target_registered = true;
+            }
+        } else if line == format!("branch refs/heads/{branch}")
+            && current.as_deref().is_some_and(|path| {
+                crate::issue::finish::lexical_path(path) != crate::issue::finish::lexical_path(lane)
+            })
+        {
+            branch_registered_elsewhere = true;
+        }
+    }
+    if target_registered {
+        return Err(Error::rejected(format!(
+            "released lane {} remains registered by Git; refusing restart",
+            lane.display()
+        )));
+    }
+    if branch_exists && branch_registered_elsewhere {
+        return Err(Error::rejected(format!(
+            "released branch {branch} is checked out elsewhere; refusing restart"
+        )));
+    }
+    Ok(())
 }
 
 /// The issue's open worktree refs, in recorded order.
@@ -217,7 +371,7 @@ fn reuse_lane(
     let branch = if open_branch(&named) {
         named
     } else {
-        worktree_branch(lane)
+        worktree_branch(lane)?
             .filter(|b| open_branch(b))
             .unwrap_or(named)
     };
@@ -345,10 +499,8 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     let (project, dir) = write::issue_dir(pm, id)?;
     // CAD-360: the plan gate, before anything is created — `issue
     // start`, `dispatch` and `dispatch --job` all come through here.
-    {
-        let (front, body) = write::load_front(&dir)?;
-        crate::issue::plan::gate(&pm.dir, &front, &body)?;
-    }
+    let (initial_front, initial_body) = write::load_front(&dir)?;
+    crate::issue::plan::gate(&pm.dir, &initial_front, &initial_body)?;
     // CAD-202: a pty assignee whose pane cwd is deleted or outside the
     // project's repos refuses here, before anything is created.
     let cwd_override = match &args.job {
@@ -364,7 +516,52 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = resolve_repo(&project, args.repo.as_deref(), &cwd)?;
-    let (base, base_sha) = resolve_base(&root, args.base.as_deref())?;
+    let (initial_lane, initial_branch) = resolve_lane(&initial_front, args.name.as_deref(), &root)?;
+    let initial_open = open_worktrees(&initial_front);
+    let initial_branch_exists = git(
+        &root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{initial_branch}"),
+        ],
+    )
+    .is_ok();
+    refuse_terminal_lifecycle_record(
+        &root,
+        &initial_lane,
+        &initial_front,
+        &initial_branch,
+        initial_branch_exists,
+    )?;
+    let initial_lane_str = initial_lane.to_string_lossy().into_owned();
+    let initial_refs_recorded = initial_front
+        .refs
+        .iter()
+        .any(|r| r.kind == "branch" && r.path.as_deref() == Some(initial_branch.as_str()))
+        && initial_front
+            .refs
+            .iter()
+            .any(|r| r.kind == "worktree" && r.path.as_deref() == Some(initial_lane_str.as_str()));
+    let initial_lifecycle_record = worktree::lifecycle::recoverable_record(
+        &root,
+        &initial_lane,
+        "development",
+        "cadence issue start",
+        Some(&initial_branch),
+        Some(&initial_front.id),
+    )?;
+    let initial_reuse = initial_branch_exists
+        && (!initial_open.is_empty()
+            || initial_refs_recorded
+            || initial_lifecycle_record.is_some());
+    let (base, base_sha) = if initial_reuse && args.base.is_none() {
+        resolve_existing_base(&root, &initial_branch)?
+    } else {
+        resolve_base(&root, args.base.as_deref())?
+    };
+    let shared_deps = worktree::shared_deps_enabled(&project)?;
 
     // CAD-383: who is asking, and the owner this start would record.
     if let Some(by) = &args.by {
@@ -449,41 +646,102 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         ],
     )
     .is_ok();
+    refuse_terminal_lifecycle_record(&root, &wt_dir, &front, &branch, branch_exists)?;
+    let lifecycle_record = worktree::lifecycle::recoverable_record(
+        &root,
+        &wt_dir,
+        "development",
+        "cadence issue start",
+        Some(&branch),
+        Some(&front.id),
+    )?;
     let reuse = branch_exists
-        && (!open.is_empty() || recorded("branch", &branch) && recorded("worktree", &wt_str));
+        && (!open.is_empty()
+            || recorded("branch", &branch) && recorded("worktree", &wt_str)
+            || lifecycle_record.is_some());
+    if initial_reuse && !reuse && args.base.is_none() {
+        return Err(Error::rejected(
+            "the recorded lane changed while issue start was waiting; retry to refresh and pin the default base",
+        ));
+    }
     let repo_label = root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| root.display().to_string());
+    let checkout_owner = front
+        .owner
+        .clone()
+        .or_else(|| new_owner.clone())
+        .unwrap_or_else(|| requester.clone());
+    let pinned_base = if branch_exists {
+        branch_base(&root, &branch, &base_sha)
+    } else {
+        base_sha.clone()
+    };
+    let lane_base_sha = if reuse {
+        pinned_base.clone()
+    } else {
+        base_sha.clone()
+    };
+    let checkout_record = || {
+        let mut record = worktree::lifecycle::new_record(worktree::lifecycle::CheckoutSpec {
+            repo: &root,
+            purpose: "development",
+            tool: "cadence issue start",
+            owner: &checkout_owner,
+            path: &wt_dir,
+            branch: Some(&branch),
+            pinned_sha: &pinned_base,
+            issue: Some(&front.id),
+        });
+        record.base_sha = Some(pinned_base.clone());
+        record
+    };
 
     let mut created = false;
     let cargo_target: Option<PathBuf>;
     if reuse {
-        if !dir_exists {
-            // Refs still accurate — re-attach the existing branch.
-            worktree::add(&root, &wt_dir, None, &branch)?;
+        let reattached = !dir_exists;
+        if reattached {
+            // Refs still accurate — record the interrupted recovery before
+            // re-attaching the surviving branch.
             worktree::ensure_cadence_ignored(&root)?;
-        } else if worktree_branch(&wt_dir).as_deref() != Some(branch.as_str()) {
-            return Err(Error::rejected(format!(
-                "Worktree {} is checked out on '{}' — expected '{}'. \
-                 Fix it or remove it before re-starting",
-                wt_dir.display(),
-                worktree_branch(&wt_dir).unwrap_or_else(|| "(detached)".to_string()),
-                branch
-            )));
+            worktree::lifecycle::begin(&root, checkout_record())?;
+            if let Err(e) = worktree::add(&root, &wt_dir, None, &branch) {
+                let _ = worktree::lifecycle::transition(
+                    &root,
+                    &wt_dir,
+                    "setup-failed",
+                    Some(&e.to_string()),
+                );
+                return Err(e);
+            }
+        } else {
+            worktree::validate_registered_branch(&root, &wt_dir, &branch)?;
         }
-        cargo_target = worktree::configure_cargo_target(
-            &wt_dir,
-            &root,
-            worktree::shared_deps_enabled(&project)?,
-        )?;
-        // CAD-1021: a reused lane still gets its pre-push hook installed
-        // (a lane created before the gate, or one whose git dir was
-        // wiped, re-heals here). Idempotent and per-worktree.
-        // CAD-1021: a reused lane still gets its pre-push hook installed
-        // (a lane created before the gate, or one whose git dir was
-        // wiped, re-heals here). Idempotent and per-worktree.
-        worktree::install_pre_push_hook(&wt_dir)?;
+        let setup = worktree::setup_development(&wt_dir, &root, shared_deps);
+        cargo_target = match setup {
+            Ok(target) => target,
+            Err(e) => {
+                let _ = worktree::lifecycle::transition(
+                    &root,
+                    &wt_dir,
+                    "setup-failed",
+                    Some(&e.to_string()),
+                );
+                return Err(e);
+            }
+        };
+        // Reused lanes re-heal shared cargo setup and the per-worktree hook.
+        if let Err(e) = worktree::lifecycle::activate(&root, checkout_record()) {
+            let _ = worktree::lifecycle::transition(
+                &root,
+                &wt_dir,
+                "setup-failed",
+                Some(&e.to_string()),
+            );
+            return Err(e);
+        }
         // Idempotent: same lane — no commit, unless its refs need a
         // fix: a stale recorded cargo target (project config flipped,
         // an older cadence recorded a different layout), a closed
@@ -526,31 +784,43 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 first_recorded("branch").unwrap_or_else(|| "(none)".to_string())
             )));
         }
-        worktree::add(&root, &wt_dir, Some(&branch), &base_sha)?;
+        // Persist intent first: if the process stops during setup, inventory
+        // reports an interrupted checkout instead of inferring ownership from
+        // its directory name.
         worktree::ensure_cadence_ignored(&root)?;
-        // A failed target setup leaves the lane behind — roll the git
-        // side back so a retry starts clean.
-        let setup = worktree::configure_cargo_target(
-            &wt_dir,
-            &root,
-            worktree::shared_deps_enabled(&project)?,
-        )
-        .and_then(|t| {
-            // CAD-1021: install the lane's pre-push hook before the lane
-            // counts as minted — fail closed so a lane that cannot run the
-            // gate is never recorded. Same rollback as a target failure.
-            worktree::install_pre_push_hook(&wt_dir).map(|_| t)
-        });
-        match setup {
-            Ok(target) => cargo_target = target,
+        worktree::lifecycle::begin(&root, checkout_record())?;
+        if let Err(e) = worktree::add(&root, &wt_dir, Some(&branch), &base_sha) {
+            let _ = worktree::lifecycle::transition(
+                &root,
+                &wt_dir,
+                "setup-failed",
+                Some(&e.to_string()),
+            );
+            return Err(e);
+        }
+        // Existing build-target and pre-push setup must succeed before the
+        // checkout becomes active in the tracker.
+        let setup = worktree::setup_development(&wt_dir, &root, shared_deps);
+        cargo_target = match setup {
+            Ok(target) => target,
             Err(e) => {
-                let _ = git(
+                let _ = worktree::lifecycle::transition(
                     &root,
-                    &["worktree", "remove", "--force", &wt_dir.to_string_lossy()],
+                    &wt_dir,
+                    "setup-failed",
+                    Some(&e.to_string()),
                 );
-                let _ = git(&root, &["branch", "-D", &branch]);
                 return Err(e);
             }
+        };
+        if let Err(e) = worktree::lifecycle::activate(&root, checkout_record()) {
+            let _ = worktree::lifecycle::transition(
+                &root,
+                &wt_dir,
+                "setup-failed",
+                Some(&e.to_string()),
+            );
+            return Err(e);
         }
         created = true;
 
@@ -573,9 +843,8 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         if new_front.claim.is_none() || checked.warning.is_some() {
             new_front.claim = Some(claim::new_claim(&requester, None));
         }
-        // The worktree, the branch and the tracker commit stand or
-        // fall together: a refused commit (hook lint, disk error)
-        // rolls the file and the git side back so a retry is clean.
+        // A refused tracker commit restores the frontmatter but keeps the
+        // managed checkout in setup-failed state for an explicit retry.
         let committed = write::save_front(&dir, &new_front, &body).and_then(|_| {
             // `Actor:` is the requester (the dispatching PM), so the
             // lane's advisory code-area PM is bound to this record and
@@ -591,11 +860,12 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         });
         if let Err(e) = committed {
             let _ = write::save_front(&dir, &front, &body);
-            let _ = git(
+            let _ = worktree::lifecycle::transition(
                 &root,
-                &["worktree", "remove", "--force", &wt_dir.to_string_lossy()],
+                &wt_dir,
+                "setup-failed",
+                Some(&e.to_string()),
             );
-            let _ = git(&root, &["branch", "-D", &branch]);
             return Err(e);
         }
         front = new_front;
@@ -606,7 +876,15 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     // reported, never silently swallowed.
     let slot_env = match write_slot_env(&wt_dir, &pm.dir) {
         Ok(path) => json!({"path": path}),
-        Err(e) => json!({"error": e.to_string()}),
+        Err(e) => {
+            let _ = worktree::lifecycle::transition(
+                &root,
+                &wt_dir,
+                "setup-failed",
+                Some(&e.to_string()),
+            );
+            json!({"error": e.to_string(), "recovery": format!("retry issue start to reapply setup: {e}")})
+        }
     };
     let mut claim_out = claim::json(&front, crate::issue::time::now_epoch());
     claim_out["warning"] = json!(checked.warning);
@@ -619,7 +897,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         "repo": root,
         "worktree": wt_dir,
         "branch": branch,
-        "base": {"ref": base, "sha": base_sha},
+        "base": {"ref": base, "sha": lane_base_sha},
         "trailer": format!("Issue: {}", front.id),
         "created": created,
         "target_dir": cargo_target,
@@ -638,9 +916,9 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             "job_new",
             json!({"pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
                    "title": front.title, "issue": front.id,
-                   "repo": root, "base_ref": base_sha,
+                   "repo": root, "base_ref": lane_base_sha,
                    "task_worktree": wt_name, "task_branch": branch,
-                   "task_base_sha": base_sha,
+                   "task_base_sha": lane_base_sha,
                    "task_assignee": job.assignee,
                    "task_acceptance": task_acceptance}),
         )?;
