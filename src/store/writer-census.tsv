@@ -31,6 +31,8 @@ installer_bundle/constructor/capture.rs	root-owned-read-only-source-and-private-
 installer_bundle/constructor/capture.rs	root-owned-read-only-source-and-private-standalone-capture	open	2
 installer_bundle/constructor/capture.rs	root-owned-read-only-source-and-private-standalone-capture	prepare	1
 installer_bundle/constructor/child.rs	capability-seal-non-sqlite-prepare	prepare	1
+installer_bundle/constructor/guard.rs	test-fixtures	execute	3
+installer_bundle/constructor/guard.rs	test-fixtures	open	2
 installer_bundle/constructor/runtime_kernel.rs	capability-seal-non-sqlite-prepare	prepare	1
 issue/app.rs	guarded-store-side-open-and-read-queries	open	1
 issue/app.rs	guarded-store-side-open-and-read-queries	prepare	3
