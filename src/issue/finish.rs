@@ -1188,10 +1188,7 @@ fn supported_kernel_abi(release: &str) -> bool {
     if major.is_empty() || !major.bytes().all(|byte| byte.is_ascii_digit()) {
         return false;
     }
-    let Some(minor) = rest
-        .split(|character| character == '.' || character == '-')
-        .next()
-    else {
+    let Some(minor) = rest.split(['.', '-']).next() else {
         return false;
     };
     if minor.is_empty() || !minor.bytes().all(|byte| byte.is_ascii_digit()) {
