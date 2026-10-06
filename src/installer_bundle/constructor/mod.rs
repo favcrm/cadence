@@ -34,6 +34,7 @@ pub(crate) use context::{
     acknowledge_children, binding_json, custody_recheck, enrollment, grant_keys, image,
     install_once, installer, owner_request, proof, receipt_keys, require_self, Proof,
 };
+pub(crate) use dispatcher::fresh_target_at as require_absent_startup_target;
 pub(crate) use helper::{HelperPhase, HelperStdio, OwnedHelper, RetiredPiFamily};
 pub(crate) use lifecycle::{
     pi_acquire, pi_consume, pi_current, pi_expires_at_ms, pi_public_keys, runtime_current,

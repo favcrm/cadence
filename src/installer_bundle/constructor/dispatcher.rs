@@ -724,11 +724,11 @@ fn absent_sidecars() -> Result<()> {
     Ok(())
 }
 fn fresh_target() -> Result<()> {
-    fresh_target_at(std::path::Path::new(DB))
+    super::require_absent_startup_target(std::path::Path::new(DB))
 }
 /// The same read-only absence predicate used at every fixed production barrier.
 /// A path is filesystem DATA, not a registry, Init grant or alternate DB route.
-pub(super) fn fresh_target_at(path: &std::path::Path) -> Result<()> {
+pub(crate) fn fresh_target_at(path: &std::path::Path) -> Result<()> {
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let mut target = path.as_os_str().to_os_string();
         target.push(suffix);
