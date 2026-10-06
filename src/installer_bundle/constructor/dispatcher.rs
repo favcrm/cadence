@@ -724,8 +724,15 @@ fn absent_sidecars() -> Result<()> {
     Ok(())
 }
 fn fresh_target() -> Result<()> {
+    fresh_target_at(std::path::Path::new(DB))
+}
+/// The same read-only absence predicate used at every fixed production barrier.
+/// A path is filesystem DATA, not a registry, Init grant or alternate DB route.
+pub(super) fn fresh_target_at(path: &std::path::Path) -> Result<()> {
     for suffix in ["", "-wal", "-shm", "-journal"] {
-        if !std::fs::symlink_metadata(format!("{DB}{suffix}"))
+        let mut target = path.as_os_str().to_os_string();
+        target.push(suffix);
+        if !std::fs::symlink_metadata(std::path::Path::new(&target))
             .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
         {
             return Err(refused());
