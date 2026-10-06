@@ -145,38 +145,24 @@ export function scopeHint(provider: ConnectionProvider): string[] {
   return [...seen].sort();
 }
 
-/**
- * CAD-1166 — mockup C "By service" grouping. One service group per
- * provider that owns at least one visible thing: every registered
- * provider, plus one group per unregistered provider name still on a
- * connection (a stale provider that left the registry keeps its
- * accounts visible under its own name — nothing is silently dropped
- * or merged). The built-in `local` service reads "Local outbox".
- *
- * Group identity is the canonical provider name. The display label is
- * presentation only — it is never used to merge accounts or as an
- * authorization input.
- */
+// CAD-1166 — mockup C grouping. Group identity is the canonical
+// provider name; the label is presentation only.
 export interface ServiceGroup {
-  /** Canonical provider name — the group key, never the label. */
   provider: string;
-  /** Presentation label for the service heading. */
   label: string;
-  /** The registered provider row, when the group is a known service. */
   info: ConnectionProvider | null;
-  /** True when every account is built-in and nothing can be enrolled. */
   builtin: boolean;
-  /** This provider's connections, sorted by account for stability. */
   connections: Connection[];
 }
 
-/** A friendly service label — presentation only, identity stays `provider`. */
-export function serviceLabel(provider: ConnectionProvider | null, providerName: string): string {
+export function serviceLabel(providerName: string): string {
+  if (providerName === "smtp") return "Email (SMTP)";
+  if (providerName === "agenticos" || providerName === "agenticos_external")
+    return "AgenticOS";
   if (providerName === "local") return "Local outbox";
-  return provider?.provider ?? providerName;
+  return providerName;
 }
 
-/** The canonical sort: registered providers by name, the local/built-in service last. */
 export function serviceGroups(
   providers: ConnectionProvider[],
   connections: Connection[],
@@ -192,7 +178,7 @@ export function serviceGroups(
     const info = registered.get(name) ?? null;
     const g: ServiceGroup = {
       provider: name,
-      label: serviceLabel(info, name),
+      label: serviceLabel(name),
       info,
       builtin: false,
       connections: [],
@@ -201,9 +187,6 @@ export function serviceGroups(
     return g;
   };
   for (const row of sorted) groupFor(row.provider).connections.push(row);
-  // A registered provider with no accounts still gets a group so its
-  // setup/unsupported state is visible; a missing descriptor must not
-  // disappear the service.
   for (const p of providers) groupFor(p.provider);
   const out = [...groups.values()];
   for (const g of out) {
@@ -220,16 +203,9 @@ export function serviceGroups(
   return out;
 }
 
-/**
- * The plain-language enrollment/testing support for one provider, or
- * for a connection whose provider row may be missing. Nothing here
- * invents support: an absent descriptor is "unavailable", an unknown
- * shape is "unsupported".
- */
+// Why a provider cannot enroll, when it cannot.
 export function enrollmentSupport(provider: ConnectionProvider | null): {
-  /** Shapes the flow can actually offer, in stable order. */
   shapes: string[];
-  /** Why nothing can be added, when `shapes` is empty. */
   reason: string;
 } {
   if (provider === null) {
@@ -251,15 +227,10 @@ export function enrollmentSupport(provider: ConnectionProvider | null): {
   return { shapes, reason: "" };
 }
 
-/**
- * Remote verification support (CAD-1166): honest, never simulated. No
- * provider on this daemon offers a reviewed no-send verification
- * operation through the approved broker yet — the owning teams (the
- * CAD-1065 SMTP Verify contract and the CAD-1085 broker boundary)
- * deliver it separately. Until then every provider reports unsupported
- * and the page never shows a network-success result from the local
- * metadata check. The reason names why for the disclosure.
- */
+// CAD-1166: no provider offers a reviewed no-send verification through
+// the approved broker yet (CAD-1065/CAD-1085 own that contract). The
+// page reports unsupported honestly and never turns the local metadata
+// check into a network result.
 export function verificationSupport(_provider: ConnectionProvider | null): {
   supported: boolean;
   reason: string;

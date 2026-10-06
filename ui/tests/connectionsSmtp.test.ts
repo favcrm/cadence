@@ -162,26 +162,34 @@ async function main() {
   });
   await settle(() => assert(host.querySelector('section[aria-label="add connection"]'), "add connection renders"));
 
-  // Pick the SMTP provider, then the form is SMTP-focused.
+  // Pick the SMTP provider, then the form is SMTP-focused. The guided
+  // form leads with email address + app password behind presets; the
+  // custom host/port/security live behind "Other".
   const providerSelect = host.querySelector("select") as HTMLSelectElement;
   act(() => {
     const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value")!.set!;
     setter.call(providerSelect, "smtp");
     providerSelect.dispatchEvent(new Event("change", { bubbles: true }));
   });
-  await settle(() => assert(field("Server host"), "SMTP host field renders"));
+  await settle(() => assert(field("Your email address"), "SMTP email field renders"));
   assert(field("Email account name"), "account is labelled for email");
-  assert(field("Port & security"), "port & security select renders");
-  assert(field("Password"), "password field renders");
+  assert(field("App password"), "app password field renders");
   assert(field("Sender address"), "sender address renders");
   assert(!field("Scopes"), "no raw Scopes grant field in the SMTP form");
+  assert(byText("button", "Gmail / Google Workspace"), "Gmail preset renders");
+  assert(byText("button", "Other"), "Other preset renders");
+  // Advanced host + paired port/security only under the Other preset.
+  assert(!field("Mail server"), "custom host hidden until Other");
+  act(() => (byText("button", "Other") as HTMLButtonElement).click());
+  await settle(() => assert(field("Mail server"), "Other opens the custom mail server"));
+  assert(field("Port & security"), "paired port & security select renders");
 
   // Fill the SMTP form and submit: the body carries ONLY email:send —
   // never the union including email:read.
   fill("Email account name", "newsletter");
-  fill("Server host", "mail.example.com");
-  fill("Username", "mailer");
-  fill("Password", "s3cret-password");
+  fill("Mail server", "mail.example.com");
+  fill("Your email address", "mailer");
+  fill("App password", "s3cret-password");
   fill("Sender address", "news@example.com");
   const addBtn = () => byText("button", "Add connection") as HTMLButtonElement | null;
   await act(async () => addBtn()!.click());
@@ -191,7 +199,7 @@ async function main() {
   assert(posts[0].body.secret === undefined || posts[0].body.secret === "s3cret-password", "secret crosses only in the request body");
 
   // Password cleared from the form on settle.
-  const pw = field("Password")!.parentElement!.querySelector("input") as HTMLInputElement;
+  const pw = field("App password")!.parentElement!.querySelector("input") as HTMLInputElement;
   assert(pw.value === "", "password field is cleared after submit");
 
   // custody_unprotected → visible explicit consent beside Save, not pre-checked.
@@ -200,7 +208,7 @@ async function main() {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
-  fill("Password", "s3cret-password");
+  fill("App password", "s3cret-password");
   await act(async () => addBtn()!.click());
   await settle(() => {
     assert(text().includes("nothing was stored"), "custody_unprotected reports nothing was stored");
@@ -218,20 +226,29 @@ async function main() {
   act(() => {
     consent.checked && consent.click();
   });
-  fill("Password", "s3cret-password");
+  fill("App password", "s3cret-password");
   await act(async () => addBtn()!.click());
   await settle(() => assert(text().includes("Could not confirm the connection was added"), "unknown failure is honest"));
   assert(!text().includes("s3cret"), "the credential never echoes back in the error");
   assert(!text().includes("nothing was saved") || text().includes("Could not confirm"), "no fake 'nothing saved' on an unknown outcome");
 
-  // Token provider path unchanged: raw Scopes field is present there.
+  // Token provider: permissions are explicit labeled checkboxes derived
+  // from the reviewed scope hint, not a raw text field and never a union.
   act(() => {
     const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value")!.set!;
     setter.call(providerSelect, "agenticos_external");
     providerSelect.dispatchEvent(new Event("change", { bubbles: true }));
   });
-  await settle(() => assert(field("Scopes"), "token provider keeps its scope field"));
-  assert(!field("Server host"), "token provider has no SMTP fields");
+  await settle(() => assert(text().includes("provider.read"), "token provider shows its reviewed scope as a choice"));
+  assert(!field("Mail server"), "token provider has no SMTP fields");
+  assert(!field("Scopes"), "token provider has no raw Scopes text field");
+  const scopeBox = Array.from(host.querySelectorAll('input[type="checkbox"]')).find((c) =>
+    (c.parentElement?.textContent ?? "").includes("provider.read"),
+  ) as HTMLInputElement | undefined;
+  assert(scopeBox, "provider.read is a checkbox choice");
+  assert(!scopeBox!.checked, "permissions are never pre-checked");
+  act(() => scopeBox!.click());
+  await settle(() => assert(scopeBox!.checked, "the chosen scope checks on"));
 
   globalThis.fetch = innerFetch;
   await act(async () => root.unmount());
@@ -479,8 +496,8 @@ async function main() {
   });
   await settle(() => {
     const labels = sections().map(groupLabel);
-    assert(labels.includes("smtp connections"), "smtp service group renders");
-    assert(labels.includes("agenticos_external connections"), "token service group renders");
+    assert(labels.includes("Email (SMTP) connections"), "smtp service group renders under its friendly label");
+    assert(labels.includes("AgenticOS connections"), "token service group renders under AgenticOS");
     assert(labels.includes("Local outbox connections"), "built-in Local outbox group renders");
     assert(labels.includes("empty_svc connections"), "registered-but-empty provider keeps a group");
     assert(labels.includes("ghost_provider connections"), "unregistered provider keeps its own group");
@@ -489,8 +506,8 @@ async function main() {
   const text5 = () => host5.textContent ?? "";
   // Contextual setup on enrollable services only; explicit unsupported
   // reason on the empty/built-in ones; built-in outbox not editable.
-  assert(byTextIn(host5, "button", "Set up smtp"), "smtp service has a Set up action");
-  assert(byTextIn(host5, "button", "Set up agenticos_external"), "token service has a Set up action");
+  assert(byTextIn(host5, "button", "Set up Email (SMTP)"), "smtp service has a Set up action");
+  assert(byTextIn(host5, "button", "Set up AgenticOS"), "token service has a Set up action");
   assert(text5().includes("No empty_svc account connected yet"), "empty provider names its setup state");
   assert(text5().includes("not in the registered service list") || text5().includes("may be stale"), "unregistered provider is honest");
 

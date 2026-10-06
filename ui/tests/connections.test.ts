@@ -13,6 +13,7 @@ import {
   readinessText,
   scopeHint,
   serviceGroups,
+  serviceLabel,
   smtpPortTlsError,
   smtpSummary,
   verificationSupport,
@@ -230,6 +231,10 @@ equal(typeof smtpPortTlsError("LOCALHOST", "40211", "implicit"), "string", "loca
     "groups sort by provider, local last",
   );
   equal(groups[2].label, "Local outbox", "local service reads Local outbox");
+  equal(groups[0].label, "AgenticOS", "agenticos_external presents as AgenticOS");
+  equal(groups[1].label, "Email (SMTP)", "smtp presents as Email (SMTP)");
+  equal(serviceLabel("agenticos"), "AgenticOS", "agenticos presents as AgenticOS");
+  equal(serviceLabel("unknown_svc"), "unknown_svc", "unknown provider label is unchanged");
   equal(groups[2].builtin, true, "local group is built-in");
   equal(groups[0].builtin, false, "enrollable group is not built-in");
   equal(groups[0].connections.map((c) => c.id), ["c-tok"], "token account under its provider");

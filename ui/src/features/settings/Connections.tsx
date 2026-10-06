@@ -26,6 +26,7 @@ import {
   verificationSupport,
   type ServiceGroup,
 } from "./connectionsView";
+import { PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
 import { connectionLabel } from "../../lib/connections";
 
 /**
@@ -79,12 +80,10 @@ function enrollErrorMessage(e: unknown): string {
 }
 
 /**
- * Settings → Connections (CAD-1166, selected mockup C "By service"):
- * the operator's view grouped by the actual registered providers —
- * service headings, the provider's account rows inside each group and
- * a contextual Set-up action per group. Built-ins (the Local outbox and
- * any connection whose provider left the registry) render in their own
- * group, always visible and never editable.
+ * Settings → Connections (CAD-585): the operator's view of exact
+ * provider accounts — the reviewed providers, the always-present Local
+ * outbox, enrolled credentials and their local configuration check,
+ * rotation and revocation.
  *
  * Reads and writes go through the existing strict HTTP APIs
  * (`/api/connection-providers`, `/api/connections…`), operator-only
@@ -92,13 +91,6 @@ function enrollErrorMessage(e: unknown): string {
  * form state of the create/rotate request that carries it — it is
  * cleared the moment the request settles and is never stored, logged
  * or rendered.
- *
- * Honesty: remote login verification is not offered on this daemon —
- * no provider supplies a reviewed no-send check through the approved
- * broker yet (CAD-1065/CAD-1085 own that contract). The page says so
- * explicitly and never labels the local `connection_check` metadata
- * read as a remote test. A provider-resource failure does not blank an
- * already-loaded account list.
  */
 export default function Connections({
   viewer,
@@ -116,7 +108,8 @@ export default function Connections({
     if (providersRes) void providersRes.revalidate();
   }, [providersRes]);
   const [selected, setSelected] = useState<string | null>(null);
-  // `adding` is the provider name to pre-select, or "" for the pick list.
+  // The provider an open Add flow is pinned to, or "" for the pick list;
+  // null = closed.
   const [adding, setAdding] = useState<string | null>(null);
   const canWrite = viewer.operator && !viewer.readOnly;
   const rows = listState?.data ?? [];
@@ -127,6 +120,7 @@ export default function Connections({
   };
   const groups = serviceGroups(providers, rows);
   const addProviders = providers.filter((p) => p.provider !== "local");
+  const addBusy = adding !== null;
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connections-title">
@@ -136,9 +130,8 @@ export default function Connections({
             Connections
           </h1>
           <p className="text-label text-ink-400 mt-1 break-words">
-            The accounts your apps use, grouped by service. Connect, check and disconnect —
-            a connection grants no worker, app or run permissions, and a check never sends,
-            publishes or delivers anything.
+            Exact provider accounts in this workspace. Creating or selecting a connection grants
+            no worker, app or run permissions.
           </p>
         </div>
         {viewer.operator && (
@@ -157,7 +150,7 @@ export default function Connections({
               <Button
                 variant="primary"
                 onClick={() => setAdding("")}
-                disabled={adding !== null}
+                disabled={addBusy}
               >
                 Add connection
               </Button>
@@ -178,8 +171,6 @@ export default function Connections({
         </div>
       ) : (
         <>
-          {/* Each resource keeps its own gate: a provider-list failure
-             must not blank an account list that already loaded. */}
           <ResourceGate
             state={
               listState ?? { data: null, status: "loading", error: null, asOf: null, inFlight: false }
@@ -200,6 +191,10 @@ export default function Connections({
             <div className="space-y-3 min-w-0">
               {adding !== null && (
                 <AddConnection
+                  // The draft (secret + consent) lives only in this
+                  // component; keying on the preset means a different
+                  // group Setup can never reuse it.
+                  key={adding}
                   providers={addProviders}
                   existing={rows}
                   preset={adding === "" ? null : adding}
@@ -210,12 +205,6 @@ export default function Connections({
                     refresh();
                   }}
                 />
-              )}
-              {!providersState?.data && (
-                <p className="text-label text-ink-500 break-words" role="note">
-                  The service list is unavailable — accounts still show below under their
-                  recorded provider.
-                </p>
               )}
               {groups.length === 0 ? (
                 <section className="card px-4 py-3.5 min-w-0" aria-label="connections">
@@ -229,6 +218,7 @@ export default function Connections({
                     key={group.provider}
                     group={group}
                     canWrite={canWrite}
+                    addBusy={addBusy}
                     selected={selected}
                     providers={providers}
                     onSelect={(id) =>
@@ -259,6 +249,7 @@ export default function Connections({
 function ServiceSection({
   group,
   canWrite,
+  addBusy,
   selected,
   providers,
   onSelect,
@@ -268,6 +259,7 @@ function ServiceSection({
 }: {
   group: ServiceGroup;
   canWrite: boolean;
+  addBusy: boolean;
   selected: string | null;
   providers: ConnectionProvider[];
   onSelect: (id: string) => void;
@@ -289,16 +281,17 @@ function ServiceSection({
             : `${group.connections.length} connected`}
         </span>
         {!group.builtin && canWrite && support.shapes.length > 0 && (
-          <Button variant="ghost" size="sm" className="ml-auto" onClick={onSetup}>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="ml-auto"
+            onClick={onSetup}
+            disabled={addBusy}
+          >
             Set up {group.label}
           </Button>
         )}
       </div>
-      {group.info && capabilityWords(group.info) && (
-        <p className="text-micro text-ink-500 mb-2 break-words">
-          {capabilityWords(group.info)}
-        </p>
-      )}
       {group.connections.length === 0 ? (
         <p className="text-label text-ink-500 break-words">
           {group.builtin
@@ -331,7 +324,7 @@ function ServiceSection({
                   >
                     {row.kind === "builtin" ? "built-in" : "enrolled"}
                   </span>
-                  {!isAvailable(row) && row.kind !== "builtin" && (
+                  {!isAvailable(row) && (
                     <span className="chip bg-warn/10 text-warn">unavailable</span>
                   )}
                 </span>
@@ -339,9 +332,6 @@ function ServiceSection({
                   {readinessText(row)}
                 </span>
               </button>
-              {/* The account's own actions and detail expand in place —
-                 mockup C keeps the applicable actions on the selected
-                 account rather than on a detached panel. */}
               {selected === row.id && (
                 <ConnectionDetail
                   row={row}
@@ -382,7 +372,6 @@ export function ConnectionDetail({
   onRevoked,
 }: {
   row: Connection;
-  /** The registered provider row, when the service list knows it. */
   provider?: ConnectionProvider | null;
   capabilities: string | null;
   canWrite: boolean;
@@ -392,7 +381,7 @@ export function ConnectionDetail({
   const [rotating, setRotating] = useState(false);
   const [revoking, setRevoking] = useState(false);
   const [checking, setChecking] = useState(false);
-  const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
+  const [note, setNote] = useState<{ ok: boolean; warn?: boolean; text: string } | null>(null);
   const managed = canManage(row);
   const verify = verificationSupport(provider ?? null);
 
@@ -402,19 +391,40 @@ export function ConnectionDetail({
     setNote(null);
     api
       .connectionCheck(row.id)
-      .then(() => {
-        setNote({
-          ok: true,
-          text: "Configuration checked — local inspection only. No provider effect was sent and this proves no upstream connectivity.",
-        });
+      .then((out) => {
+        // Use the returned connection, not the request's success: a
+        // refused adapter/descriptor/custody or an unreadable SMTP
+        // sender is a configuration problem, never a healthy account.
+        const c = out.connection ?? row;
+        const smtpErr = smtpErrorMessage(c);
+        if (!isAvailable(c) || smtpErr !== null) {
+          setNote({
+            ok: false,
+            text:
+              readinessText(c) +
+              (smtpErr ? " " + smtpErr : "") +
+              " Fix the configuration, then check again.",
+          });
+        } else if (c.status.manifest_status !== "matched") {
+          setNote({
+            ok: false,
+            warn: true,
+            text:
+              pinWord(c.status) +
+              " — the local configuration is present but its deployment does not match the reviewed contract, so this is not a verified connection.",
+          });
+        } else {
+          setNote({
+            ok: true,
+            text: "Configuration available — local inspection only. No provider effect was sent and this proves no upstream connectivity.",
+          });
+        }
         onChanged();
       })
-      .catch((e: ApiError) =>
+      .catch(() =>
         setNote({
           ok: false,
-          text:
-            "The local configuration could not be read — treat this as a configuration problem, not a connection that works. " +
-            (e.message ?? String(e)),
+          text: "The local configuration could not be read — treat this as a configuration problem, not a connection that works.",
         }),
       )
       .finally(() => setChecking(false));
@@ -452,16 +462,8 @@ export function ConnectionDetail({
             <dd className="text-ink-200 break-words">{capabilities}</dd>
           </div>
         )}
-        <div className="flex flex-wrap gap-x-2 min-w-0">
-          <dt className="text-ink-500">Deployment</dt>
-          <dd className="text-ink-200 break-words">{pinWord(row.status)}</dd>
-        </div>
       </dl>
 
-      {/* CAD-1166: technical identity, revisions, scopes, pins and
-         registration metadata live behind a disclosure — the friendly
-         view above never changes which account this row authoritatively
-         is. */}
       <details className="mt-2 text-label min-w-0">
         <summary className="cursor-pointer select-none text-ink-400">
           Technical details
@@ -504,6 +506,10 @@ export function ConnectionDetail({
             </div>
           )}
           <div className="flex flex-wrap gap-x-2 min-w-0">
+            <dt className="text-ink-500">Deployment</dt>
+            <dd className="text-ink-200 break-words">{pinWord(row.status)}</dd>
+          </div>
+          <div className="flex flex-wrap gap-x-2 min-w-0">
             <dt className="text-ink-500">Remote verification</dt>
             <dd className="text-ink-200 break-words">
               {verify.supported
@@ -513,15 +519,15 @@ export function ConnectionDetail({
           </div>
           <p className="text-micro text-ink-500 pt-1 break-words">
             The network was {row.status.network_checked ? "checked" : "never checked"} for
-            this account. A local configuration read or a login check verifies only the
-            named identity — it grants no execution permission and proves no message
-            delivery or sender entitlement.
+            this account. A local configuration read verifies only the named identity — it
+            grants no execution permission and proves no message delivery or sender
+            entitlement.
           </p>
         </dl>
       </details>
 
       {note && (
-        <p className={`text-label mt-2 break-words ${note.ok ? "text-ink-300" : "text-fail"}`} role={note.ok ? "status" : "alert"}>
+        <p className={`text-label mt-2 break-words ${note.ok ? "text-ink-300" : note.warn ? "text-warn" : "text-fail"}`} role={note.ok ? "status" : "alert"}>
           {note.text}
         </p>
       )}
@@ -852,7 +858,7 @@ export function RotateForm({
   );
 }
 
-/** Disconnect with an explicit confirmation — nothing happens on the first click. */
+/** Revoke with an explicit confirmation — nothing happens on the first click. */
 function RevokeConfirm({
   row,
   onDone,
@@ -914,15 +920,7 @@ function RevokeConfirm({
   );
 }
 
-/**
- * Enroll a scoped token or an SMTP sender for a supported provider. The
- * secret clears on settle, and switching provider or cancelling resets
- * the secret, the draft fields and the storage-risk consent — nothing
- * secret survives a method change or a close.
- *
- * `preset` is the canonical provider name to open on (a service group's
- * "Set up" action); `null` opens the pick list.
- */
+/** Enroll a scoped token for a supported provider. The token clears on settle. */
 export function AddConnection({
   providers,
   existing,
@@ -932,29 +930,26 @@ export function AddConnection({
 }: {
   providers: ConnectionProvider[];
   existing: Connection[];
-  /** The canonical provider name a service group's Set-up action opens on. */
   preset?: string | null;
   onClose: () => void;
   onAdded: (id: string) => void;
 }) {
   const providerId = useId();
   const accountId = useId();
-  const scopesId = useId();
   const tokenId = useId();
   const candidates = providers.filter(
     (p) => p.descriptor_available && (acceptsToken(p) || acceptsSmtp(p)),
   );
   // The providers load behind the resource: the selection follows the
-  // group preset or the first candidate until the operator picks one
-  // explicitly. Changing the provider resets the secret, the draft and
-  // the consent — state never carries across a method change.
+  // preset or the first candidate until the operator picks one
+  // explicitly. A preset that is not currently enrollable stays pinned
+  // (never silently re-targets another provider's credential) — the form
+  // is disabled until the operator chooses a real one.
   const [explicit, setExplicit] = useState<string | null>(preset ?? null);
+  const pinned = explicit !== null && !candidates.some((c) => c.provider === explicit);
   const provider =
-    explicit !== null && candidates.some((c) => c.provider === explicit)
-      ? explicit
-      : candidates[0]?.provider ?? "";
+    explicit !== null && !pinned ? explicit : pinned ? explicit! : (candidates[0]?.provider ?? "");
   const [account, setAccount] = useState("");
-  const [scopes, setScopes] = useState("");
   const [token, setToken] = useState("");
   const [acceptRisk, setAcceptRisk] = useState(false);
   const [riskNeeded, setRiskNeeded] = useState(false);
@@ -962,33 +957,91 @@ export function AddConnection({
   const [error, setError] = useState<string | null>(null);
   const chosen = providers.find((p) => p.provider === provider) ?? null;
   const hint = chosen ? scopeHint(chosen) : [];
+  // Token setup is an explicit per-scope choice, never the union.
+  const [scopePicks, setScopePicks] = useState<Set<string>>(new Set());
+  // When a provider offers both shapes the method is an explicit choice;
+  // there is no automatic combination.
+  const bothShapes = chosen !== null && acceptsToken(chosen) && acceptsSmtp(chosen);
+  const [method, setMethod] = useState<"token" | "smtp" | null>(null);
+  const smtpShape =
+    chosen !== null &&
+    acceptsSmtp(chosen) &&
+    (!acceptsToken(chosen) || (bothShapes && method === "smtp"));
+  const methodPending = bothShapes && method === null;
   // SMTP senders enroll typed transport material instead of an
   // opaque token; the shape follows the chosen provider.
-  const smtpShape = (chosen && acceptsSmtp(chosen) && !acceptsToken(chosen)) || false;
-  const [smtp, setSmtp] = useState({ host: "", port: "465", tls_mode: "implicit", username: "", sender: "", sender_name: "" });
+  const [smtpPreset, setSmtpPreset] = useState<Preset>(PRESETS[0]);
+  const [smtp, setSmtp] = useState({
+    host: PRESETS[0].host,
+    port: "465",
+    tls_mode: "implicit" as TlsMode,
+    username: "",
+    sender: "",
+    sender_name: "",
+  });
 
-  const chooseProvider = (next: string) => {
-    setExplicit(next);
+  const resetDraft = () => {
     setToken("");
-    setScopes("");
+    setScopePicks(new Set());
     setAccount("");
     setAcceptRisk(false);
     setRiskNeeded(false);
     setError(null);
-    setSmtp({ host: "", port: "465", tls_mode: "implicit", username: "", sender: "", sender_name: "" });
+    setMethod(null);
+    setSmtpPreset(PRESETS[0]);
+    setSmtp({
+      host: PRESETS[0].host,
+      port: "465",
+      tls_mode: "implicit",
+      username: "",
+      sender: "",
+      sender_name: "",
+    });
+  };
+
+  const chooseProvider = (next: string) => {
+    setExplicit(next);
+    resetDraft();
+  };
+
+  const chooseMethod = (next: "token" | "smtp") => {
+    setMethod(next);
+    // A method change is a draft change: nothing typed under the old
+    // method (secret, account hint, consent) carries into the new one.
+    setToken("");
+    setScopePicks(new Set());
+    setAccount("");
+    setAcceptRisk(false);
+    setRiskNeeded(false);
+    setError(null);
+  };
+
+  const choosePreset = (next: Preset) => {
+    setSmtpPreset(next);
+    setSmtp((cur) => ({ ...cur, host: next.host, tls_mode: next.tls, port: String(next.port) }));
+    setError(null);
+  };
+
+  const toggleScope = (scope: string) => {
+    setScopePicks((cur) => {
+      const next = new Set(cur);
+      if (next.has(scope)) next.delete(scope);
+      else next.add(scope);
+      return next;
+    });
   };
 
   const submit = () => {
-    if (busy) return;
+    if (busy || pinned) return;
     setRiskNeeded(false);
     const cleanedAccount = account.trim();
     // CAD-1013 SMTP simplification: an SMTP sender enrolls exactly the
     // send capability's reviewed scope — not operator-typed, and never
-    // the union of every provider permission. Token providers still take
-    // an explicit scope list.
+    // the union of every provider permission. Token providers take the
+    // operator's explicit per-scope choice, not a typed union.
     const wanted = smtpShape
       ? smtpRequiredScopes(chosen)
-      : scopes.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+      : hint.filter((s) => scopePicks.has(s));
     if (smtpShape && wanted.length === 0) {
       // No reviewed send capability on this provider — SMTP enrollment is
       // unsupported here; do not widen the grant to unrelated permissions.
@@ -1001,7 +1054,7 @@ export function AddConnection({
       setError(
         smtpShape
           ? "Name this email account and fill in the SMTP details below."
-          : "Choose a provider and fill in the account and at least one scope.",
+          : "Choose a provider, fill in the account and tick at least one permission.",
       );
       return;
     }
@@ -1053,8 +1106,12 @@ export function AddConnection({
         });
       return;
     }
+    if (methodPending) {
+      setError("Choose how to connect this service — token or SMTP.");
+      return;
+    }
     if (token.trim() === "") {
-      setError("Choose a provider and fill in the account, at least one scope and the token.");
+      setError("Fill in the account, tick at least one permission and enter the token.");
       return;
     }
     setBusy(true);
@@ -1112,6 +1169,9 @@ export function AddConnection({
               className="field w-full mt-1"
               disabled={busy}
             >
+              {pinned && (
+                <option value={provider}>{provider} — unavailable now</option>
+              )}
               {candidates.map((p) => (
                 <option key={p.provider} value={p.provider}>
                   {p.provider}
@@ -1119,7 +1179,44 @@ export function AddConnection({
                 </option>
               ))}
             </select>
+            {pinned && (
+              <p className="text-micro text-warn mt-1 break-words" role="alert">
+                That service is no longer available — pick another service to connect, or
+                cancel. Nothing typed here can go to a different service.
+              </p>
+            )}
           </div>
+          {pinned ? null : (
+          <>
+          {bothShapes && (
+            <div role="group" aria-label="How to connect" className="flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                variant={method === "token" ? "primary" : "secondary"}
+                aria-pressed={method === "token"}
+                disabled={busy}
+                onClick={() => chooseMethod("token")}
+              >
+                API token
+              </Button>
+              <Button
+                size="sm"
+                variant={method === "smtp" ? "primary" : "secondary"}
+                aria-pressed={method === "smtp"}
+                disabled={busy}
+                onClick={() => chooseMethod("smtp")}
+              >
+                Email (SMTP)
+              </Button>
+            </div>
+          )}
+          {methodPending && (
+            <p className="text-micro text-ink-500 break-words">
+              Choose how to connect {provider} — a scoped API token, or an SMTP sender.
+            </p>
+          )}
+          {!methodPending && (
+          <>
           <div>
             <label htmlFor={accountId} className="text-label font-medium text-ink-200">
               {smtpShape ? "Email account name" : "Account"}
@@ -1149,77 +1246,62 @@ export function AddConnection({
             )}
           </div>
           {!smtpShape && (
-            <div>
-              <label htmlFor={scopesId} className="text-label font-medium text-ink-200">
-                Scopes
-              </label>
-              <input
-                id={scopesId}
-                type="text"
-                autoComplete="off"
-                spellCheck={false}
-                value={scopes}
-                onChange={(e) => setScopes(e.target.value)}
-                placeholder={hint.length > 0 ? hint.join(", ") : "scope names"}
-                className="field w-full mt-1"
-                disabled={busy}
-              />
-              {hint.length > 0 && (
+            <fieldset>
+              <legend className="text-label font-medium text-ink-200">
+                Permissions <span className="text-ink-500 font-normal">(declare only what the provider granted)</span>
+              </legend>
+              {hint.length === 0 ? (
                 <p className="text-micro text-ink-500 mt-1 break-words">
-                  Reviewed scopes for this provider: <span className="num">{hint.join(", ")}</span>.
-                  Declare only the scopes granted at the provider&apos;s consent screen.
+                  This provider declares no reviewed permission scopes — there is nothing to
+                  enroll safely.
                 </p>
+              ) : (
+                <div className="mt-1 space-y-1">
+                  {hint.map((s) => (
+                    <label key={s} className="flex items-start gap-2 text-label text-ink-300">
+                      <input
+                        type="checkbox"
+                        checked={scopePicks.has(s)}
+                        onChange={() => toggleScope(s)}
+                        disabled={busy}
+                        className="mt-0.5"
+                      />
+                      <span className="num">{s}</span>
+                    </label>
+                  ))}
+                </div>
               )}
-            </div>
+              <p className="text-micro text-ink-500 mt-1 break-words">
+                These declarations select which reviewed capabilities the account enrolls —
+                they do not grant new upstream scopes.
+              </p>
+            </fieldset>
           )}
           {smtpShape ? (
             <fieldset className="space-y-2">
               <legend className="text-label font-medium text-ink-200">
                 SMTP server — encrypted submission only
               </legend>
-              <p className="text-micro text-ink-500 break-words">
-                The daemon verifies the server certificate and refuses plaintext, downgrades
-                and unverifiable hosts before sending. Choose the security your provider
-                expects — port and TLS move together.
+              <div role="group" aria-label="Email provider" className="flex flex-wrap gap-2">
+                {PRESETS.map((p) => (
+                  <Button
+                    key={p.id}
+                    size="sm"
+                    variant={p.id === smtpPreset.id ? "primary" : "secondary"}
+                    aria-pressed={p.id === smtpPreset.id}
+                    disabled={busy}
+                    onClick={() => choosePreset(p)}
+                  >
+                    {p.label}
+                  </Button>
+                ))}
+              </div>
+              <p className="text-micro text-ink-500 break-words" data-hint={smtpPreset.id}>
+                {smtpPreset.hint}
               </p>
               <div>
-                <label htmlFor={`${tokenId}-host`} className="text-label text-ink-300">
-                  Server host
-                </label>
-                <input
-                  id={`${tokenId}-host`}
-                  type="text"
-                  autoComplete="off"
-                  spellCheck={false}
-                  value={smtp.host}
-                  onChange={(e) => setSmtp((cur) => ({ ...cur, host: e.target.value }))}
-                  placeholder="mail.example.com"
-                  className="field w-full mt-1"
-                  disabled={busy}
-                />
-              </div>
-              <div>
-                <label htmlFor={`${tokenId}-tls`} className="text-label text-ink-300">
-                  Port &amp; security
-                </label>
-                <select
-                  id={`${tokenId}-tls`}
-                  value={smtp.tls_mode}
-                  onChange={(e) => setSmtp((cur) => ({
-                    ...cur,
-                    tls_mode: e.target.value,
-                    port: e.target.value === "implicit" ? "465" : "587",
-                  }))}
-                  className="field w-full mt-1"
-                  disabled={busy}
-                >
-                  <option value="implicit">465 — implicit TLS</option>
-                  <option value="starttls">587 — STARTTLS</option>
-                </select>
-              </div>
-              <div>
                 <label htmlFor={`${tokenId}-username`} className="text-label text-ink-300">
-                  Username
+                  Your email address
                 </label>
                 <input
                   id={`${tokenId}-username`}
@@ -1228,13 +1310,14 @@ export function AddConnection({
                   spellCheck={false}
                   value={smtp.username}
                   onChange={(e) => setSmtp((cur) => ({ ...cur, username: e.target.value }))}
+                  placeholder="you@yourcompany.com"
                   className="field w-full mt-1"
                   disabled={busy}
                 />
               </div>
               <div>
                 <label htmlFor={tokenId} className="text-label font-medium text-ink-200">
-                  Password
+                  App password
                 </label>
                 <input
                   id={tokenId}
@@ -1283,6 +1366,53 @@ export function AddConnection({
                   disabled={busy}
                 />
               </div>
+              {smtpPreset.id !== "other" && (
+                <p className="text-micro text-ink-500 num break-words" data-server>
+                  {smtp.host} · port {portFor(smtp.tls_mode)} ·{" "}
+                  {smtp.tls_mode === "implicit" ? "SSL/TLS" : "STARTTLS"}
+                </p>
+              )}
+              {smtpPreset.id === "other" && (
+                <>
+                  <div>
+                    <label htmlFor={`${tokenId}-host`} className="text-label text-ink-300">
+                      Mail server
+                    </label>
+                    <input
+                      id={`${tokenId}-host`}
+                      type="text"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={smtp.host}
+                      onChange={(e) => setSmtp((cur) => ({ ...cur, host: e.target.value }))}
+                      placeholder="mail.example.com"
+                      className="field w-full mt-1"
+                      disabled={busy}
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor={`${tokenId}-tls`} className="text-label text-ink-300">
+                      Port &amp; security
+                    </label>
+                    <select
+                      id={`${tokenId}-tls`}
+                      value={smtp.tls_mode}
+                      onChange={(e) =>
+                        setSmtp((cur) => ({
+                          ...cur,
+                          tls_mode: e.target.value as TlsMode,
+                          port: String(portFor(e.target.value as TlsMode)),
+                        }))
+                      }
+                      className="field w-full mt-1"
+                      disabled={busy}
+                    >
+                      <option value="implicit">465 — SSL/TLS</option>
+                      <option value="starttls">587 — STARTTLS</option>
+                    </select>
+                  </div>
+                </>
+              )}
             </fieldset>
           ) : (
             <div>
@@ -1304,6 +1434,10 @@ export function AddConnection({
                 this form afterwards. Never paste a credential anywhere else on this board.
               </p>
             </div>
+          )}
+          </>
+          )}
+          </>
           )}
           {/* CAD-1013: the storage consent stays collapsed while it is
              optional. When the daemon reports custody_unprotected it
@@ -1355,7 +1489,7 @@ export function AddConnection({
             </label>
           )}
           <div className="flex flex-wrap gap-2">
-            <Button variant="primary" size="sm" type="submit" loading={busy}>
+            <Button variant="primary" size="sm" type="submit" loading={busy} disabled={busy || pinned || methodPending}>
               {busy ? "Adding…" : "Add connection"}
             </Button>
             <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
