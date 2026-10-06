@@ -85,6 +85,37 @@ fn ledger_path(root: &Path, create: bool) -> Result<PathBuf> {
     Ok(metadata_dir(root, create)?.join(LEDGER))
 }
 
+/// A managed destination component must be a real directory, or absent so
+/// Git creates real directories itself. A symlinked `.cadence/wt` (or any
+/// ancestor below the canonical root) would make `git worktree add` create
+/// the checkout outside the repository, where activation would then record
+/// a second canonical identity.
+fn ensure_real_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => Err(Error::rejected(
+            format!(
+                "{} is a symbolic link, not a real worktree directory — refusing to create a managed checkout outside the repository layout",
+                path.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn validate_destination_parent(root: &Path, parent: &Path) -> Result<()> {
+    let Ok(suffix) = parent.strip_prefix(root) else {
+        return ensure_real_directory(parent);
+    };
+    let mut current = root.to_path_buf();
+    for component in suffix.components() {
+        current.push(component);
+        ensure_real_directory(&current)?;
+    }
+    Ok(())
+}
+
 fn read_ledger(root: &Path) -> Result<Ledger> {
     let path = ledger_path(root, false)?;
     let meta = match fs::symlink_metadata(&path) {
@@ -307,6 +338,9 @@ fn ensure_released_path_absent(root: &Path, key: &str) -> Result<()> {
 /// point is visible as `preparing`, never permission to reclaim the path.
 pub fn begin(repo: &Path, mut record: Checkout) -> Result<()> {
     let root = canonical_root(repo)?;
+    if let Some(parent) = Path::new(&record.path).parent() {
+        validate_destination_parent(&root, parent)?;
+    }
     record.repo = root.to_string_lossy().into_owned();
     record.path = path_key(Path::new(&record.path));
     record.state = "preparing".into();
@@ -368,6 +402,27 @@ pub fn begin(repo: &Path, mut record: Checkout) -> Result<()> {
 /// active. An existing path is reusable only when every identity field agrees.
 pub fn activate(repo: &Path, mut record: Checkout) -> Result<()> {
     let root = canonical_root(repo)?;
+    let requested = Path::new(&record.path);
+    if let Some(parent) = requested.parent() {
+        validate_destination_parent(&root, parent)?;
+    }
+    match fs::symlink_metadata(requested) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(Error::rejected(format!(
+                "{} is a symbolic link, not a real checkout — refusing activation outside the repository layout",
+                requested.display()
+            )))
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(Error::rejected(format!(
+                "{} is not a real checkout directory — refusing activation",
+                requested.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     record.repo = root.to_string_lossy().into_owned();
     record.path = path_key(Path::new(&record.path));
     validate_record(&root, &record)?;
