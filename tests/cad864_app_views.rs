@@ -1197,7 +1197,7 @@ fn record_params_without_profile(params: &Value) -> Value {
     })
 }
 
-const CAPTION_CONTEXT_REQUIRED: &str = "a caption-runs read needs its live context";
+const CAPTION_CONTEXT_REQUIRED: &str = "caption-runs read needs its live context";
 
 fn write_caption_context_package(w: &Workspace) {
     let source = w.source();
