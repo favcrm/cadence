@@ -102,6 +102,7 @@ ammonia = "4"
 # safety-floor binary in tests/ is autodiscovered and needs no entry.
 
 [dev-dependencies]
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 jsonschema = { version = "=0.56.0", default-features = false }
 shlex = "2.0.1"
 # CAD-785: the isolated synthetic SMTP tests terminate test-only TLS in
