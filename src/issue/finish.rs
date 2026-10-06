@@ -353,6 +353,39 @@ fn verify_checkout_ownership(
     Ok(record)
 }
 
+fn verify_refs_only_ownership(
+    root: &Path,
+    path: &Path,
+    issue: &str,
+    expected_branch: Option<&str>,
+) -> Result<()> {
+    let Some(record) = crate::worktree::lifecycle::managed_record(root, path)? else {
+        return Ok(());
+    };
+    if record.purpose != "development"
+        || record.issue.as_deref() != Some(issue)
+        || expected_branch.is_some_and(|branch| record.branch.as_deref() != Some(branch))
+    {
+        return Err(Error::rejected(format!(
+            "refs-only finish ownership for {} does not match issue {issue}, branch {:?}, purpose {}",
+            path.display(), record.branch, record.purpose
+        )));
+    }
+    if !matches!(record.state.as_str(), "active" | "released") {
+        let reason = record
+            .retention_reason
+            .as_deref()
+            .or(record.release_reason.as_deref())
+            .unwrap_or("no recorded lifecycle reason");
+        return Err(Error::rejected(format!(
+            "refs-only finish refuses {} recorded as {} ({reason})",
+            path.display(),
+            record.state
+        )));
+    }
+    Ok(())
+}
+
 /// The branch a live worktree has checked out; `None` only when it is absent
 /// or detached. Git and filesystem inspection errors remain errors.
 fn checked_out_branch(wt: &Path) -> Result<Option<String>> {
@@ -650,6 +683,166 @@ fn process_proc_root() -> PathBuf {
     PathBuf::from("/proc")
 }
 
+fn decode_mountinfo_path(value: &str) -> Option<PathBuf> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            decoded.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let digits = bytes.get(i + 1..i + 4)?;
+        let escaped = match digits {
+            b"040" => b' ',
+            b"011" => b'\t',
+            b"012" => b'\n',
+            b"134" => b'\\',
+            _ => return None,
+        };
+        decoded.push(escaped);
+        i += 4;
+    }
+    if decoded.contains(&0) {
+        return None;
+    }
+    String::from_utf8(decoded).ok().map(PathBuf::from)
+}
+
+fn validate_proc_mount_options(options: &[&str]) -> std::result::Result<(), String> {
+    let mut hidepid_seen = false;
+    for option in options.iter().flat_map(|options| options.split(',')) {
+        if option.is_empty() {
+            return Err("mountinfo contains an empty mount option".into());
+        }
+        if option == "hidepid" {
+            return Err("proc mount has an unparseable hidepid option".into());
+        }
+        if let Some(value) = option.strip_prefix("hidepid=") {
+            if hidepid_seen {
+                return Err("proc mount has ambiguous duplicate hidepid options".into());
+            }
+            hidepid_seen = true;
+            if value != "0" {
+                return Err(format!(
+                    "proc mount restricts process visibility with hidepid={value}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_complete_proc_view(proc_root: &Path) -> Result<()> {
+    let canonical = proc_root.canonicalize().map_err(|error| {
+        Error::rejected(format!(
+            "cannot prove complete procfs visibility for {}: cannot resolve proc root: {error}",
+            proc_root.display()
+        ))
+    })?;
+    let mountinfo = canonical.join("self/mountinfo");
+    let text = std::fs::read_to_string(&mountinfo).map_err(|error| {
+        Error::rejected(format!(
+            "cannot prove complete procfs visibility for {}: cannot read {}: {error}",
+            canonical.display(),
+            mountinfo.display()
+        ))
+    })?;
+    let mut exact_mounts = 0usize;
+    let mut mount_ids = std::collections::HashSet::new();
+    for (line_index, line) in text.lines().enumerate() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let separators: Vec<usize> = fields
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| (*field == "-").then_some(index))
+            .collect();
+        if line.is_empty()
+            || fields.len() < 10
+            || fields[0].parse::<u64>().is_err()
+            || fields[1].parse::<u64>().is_err()
+            || separators.len() != 1
+        {
+            return Err(Error::rejected(format!(
+                "cannot prove complete procfs visibility for {}: malformed mountinfo line {}",
+                canonical.display(),
+                line_index + 1
+            )));
+        }
+        let separator = separators[0];
+        let device = fields[2].split_once(':');
+        if separator < 6
+            || fields.len() < separator + 4
+            || !mount_ids.insert(fields[0])
+            || device.is_none_or(|(major, minor)| {
+                major.parse::<u64>().is_err() || minor.parse::<u64>().is_err()
+            })
+        {
+            return Err(Error::rejected(format!(
+                "cannot prove complete procfs visibility for {}: malformed mountinfo line {}",
+                canonical.display(),
+                line_index + 1
+            )));
+        }
+        let mount_root = decode_mountinfo_path(fields[3]);
+        let mount_point = decode_mountinfo_path(fields[4]);
+        let (Some(mount_root), Some(mount_point)) = (mount_root, mount_point) else {
+            return Err(Error::rejected(format!(
+                "cannot prove complete procfs visibility for {}: malformed escaped path on mountinfo line {}",
+                canonical.display(),
+                line_index + 1
+            )));
+        };
+        if !mount_point.is_absolute()
+            || (fields[separator + 1] != "nsfs" && !mount_root.is_absolute())
+        {
+            return Err(Error::rejected(format!(
+                "cannot prove complete procfs visibility for {}: non-absolute mount path on line {}",
+                canonical.display(),
+                line_index + 1
+            )));
+        }
+        if fields[5].split(',').any(str::is_empty)
+            || fields[separator + 3].split(',').any(str::is_empty)
+        {
+            return Err(Error::rejected(format!(
+                "cannot prove complete procfs visibility for {}: malformed mount options on line {}",
+                canonical.display(),
+                line_index + 1
+            )));
+        }
+        if mount_point == canonical {
+            exact_mounts += 1;
+            if exact_mounts != 1 {
+                return Err(Error::rejected(format!(
+                    "cannot prove complete procfs visibility for {}: ambiguous stacked mounts",
+                    canonical.display()
+                )));
+            }
+            if mount_root != Path::new("/") || fields[separator + 1] != "proc" {
+                return Err(Error::rejected(format!(
+                    "cannot prove complete procfs visibility for {}: mount is not a full procfs root",
+                    canonical.display()
+                )));
+            }
+            validate_proc_mount_options(&[fields[5], fields[separator + 3]]).map_err(|reason| {
+                Error::rejected(format!(
+                    "cannot prove complete procfs visibility for {}: {reason}",
+                    canonical.display()
+                ))
+            })?;
+        }
+    }
+    if exact_mounts != 1 {
+        return Err(Error::rejected(format!(
+            "cannot prove complete procfs visibility for {}: mountinfo has no unique full procfs root",
+            canonical.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Cwd and open-descriptor holders under a managed checkout. Any process that
 /// cannot be fully inspected leaves the scan incomplete; cleanup never infers
 /// that a process lacks an inherited or transferred checkout descriptor from
@@ -672,6 +865,22 @@ fn proc_id_values(status: &str, key: &str, count: usize) -> Option<Vec<u32>> {
         .filter(|values| values.len() == count)
 }
 
+fn proc_status_state(status: &str) -> Option<char> {
+    let mut states = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("State:"));
+    let state = states.next()?.split_whitespace().next()?;
+    if states.next().is_some() || state.len() != 1 {
+        return None;
+    }
+    let state = state.chars().next()?;
+    matches!(
+        state,
+        'R' | 'S' | 'D' | 'T' | 't' | 'Z' | 'X' | 'x' | 'K' | 'W' | 'P' | 'I'
+    )
+    .then_some(state)
+}
+
 // Validate the PID entry only; credentials are never used to skip cwd or FD
 // inspection or to infer that a process could not hold a checkout descriptor.
 fn proc_status_is_complete(status: &str) -> bool {
@@ -689,37 +898,24 @@ fn proc_status_is_complete(status: &str) -> bool {
         .lines()
         .find_map(|line| line.strip_prefix("CapEff:"))
         .is_some_and(|caps| u64::from_str_radix(caps.trim(), 16).is_ok());
-    credentials_complete && capabilities_complete
+    proc_status_state(status).is_some() && credentials_complete && capabilities_complete
 }
 
 fn inspect_process_status(proc_dir: &Path) -> std::io::Result<bool> {
-    let status = match std::fs::read_to_string(proc_dir.join("status")) {
-        Ok(status) => status,
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && matches!(
-                    std::fs::symlink_metadata(proc_dir),
-                    Err(ref gone) if gone.kind() == std::io::ErrorKind::NotFound
-                ) =>
-        {
-            return Ok(false);
-        }
-        Err(error) => return Err(error),
-    };
+    let status = std::fs::read_to_string(proc_dir.join("status"))?;
+    let state = proc_status_state(&status).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process status has a missing or malformed State field",
+        )
+    })?;
     if !proc_status_is_complete(&status) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "process status has incomplete credentials",
         ));
     }
-    Ok(true)
-}
-
-fn process_gone(proc_dir: &Path) -> bool {
-    matches!(
-        std::fs::symlink_metadata(proc_dir),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-    )
+    Ok(!matches!(state, 'Z' | 'X'))
 }
 
 fn record_process_error(use_: &mut ProcessUse, pid: u32, what: &str, error: &std::io::Error) {
@@ -738,7 +934,14 @@ pub(crate) fn process_use_under_from_proc_root(dir: &Path, proc_root: &Path) -> 
             dir.display()
         ))
     })?;
-    let procs = std::fs::read_dir(proc_root).map_err(|e| {
+    let proc_root = proc_root.canonicalize().map_err(|e| {
+        Error::rejected(format!(
+            "cannot prove complete procfs visibility for {}: cannot resolve proc root: {e}",
+            proc_root.display()
+        ))
+    })?;
+    validate_complete_proc_view(&proc_root)?;
+    let procs = std::fs::read_dir(&proc_root).map_err(|e| {
         Error::rejected(format!(
             "cannot enumerate {} live-use checks: {e}",
             proc_root.display()
@@ -779,16 +982,10 @@ pub(crate) fn process_use_under_from_proc_root(dir: &Path, proc_root: &Path) -> 
         match std::fs::read_link(proc_dir.join("cwd")) {
             Ok(cwd) if cwd.starts_with(&dir) => use_.cwd.push(pid),
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && process_gone(&proc_dir) => {
-                continue;
-            }
             Err(e) => record_process_error(&mut use_, pid, "inspect cwd", &e),
         }
         let fds = match std::fs::read_dir(proc_dir.join("fd")) {
             Ok(fds) => fds,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && process_gone(&proc_dir) => {
-                continue;
-            }
             Err(e) => {
                 record_process_error(&mut use_, pid, "enumerate file descriptors", &e);
                 continue;
@@ -798,9 +995,6 @@ pub(crate) fn process_use_under_from_proc_root(dir: &Path, proc_root: &Path) -> 
         for fd in fds {
             let fd = match fd {
                 Ok(fd) => fd,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && process_gone(&proc_dir) => {
-                    break;
-                }
                 Err(e) => {
                     record_process_error(&mut use_, pid, "enumerate file descriptors", &e);
                     continue;
@@ -812,7 +1006,6 @@ pub(crate) fn process_use_under_from_proc_root(dir: &Path, proc_root: &Path) -> 
                     break;
                 }
                 Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => record_process_error(&mut use_, pid, "inspect file descriptor", &e),
             }
         }
@@ -1738,7 +1931,7 @@ fn in_use_blocks_with_process_probe(
             Err(e) => blocks.push(Block {
                 tag: "process-enumeration-failed".to_string(),
                 reason: format!(
-                    "Cannot enumerate process cwd/open-fd use for {} ({e}) — refusing deletion",
+                    "Cannot fully enumerate process cwd/open-fd use for {} ({e}) — refusing deletion",
                     d.display()
                 ),
             }),
@@ -1974,20 +2167,28 @@ pub(crate) fn run(
     let refs_only = args.close_if_gone && probe.wt_dir.as_deref().is_some_and(|d| !d.is_dir());
     let keep_branch = args.keep_branch || refs_only;
     let remote = args.remote && !refs_only;
-    if !refs_only {
-        if let Some(path) = probe.wt_dir.as_deref() {
-            let _ = verify_checkout_ownership(
-                &probe.root,
-                path,
-                id,
-                (!probe.branch.is_empty()).then_some(probe.branch.as_str()),
-            )?;
-        } else if !probe.branch.is_empty() && (!keep_branch || remote) {
-            return Err(Error::rejected(format!(
-                "issue {id} has no managed checkout path for branch {}; refusing deletion",
-                probe.branch
-            )));
-        }
+    if refs_only {
+        let path = probe.wt_dir.as_deref().ok_or_else(|| {
+            Error::rejected(format!("issue {id} has no path for refs-only finish"))
+        })?;
+        verify_refs_only_ownership(
+            &probe.root,
+            path,
+            id,
+            (!probe.branch.is_empty()).then_some(probe.branch.as_str()),
+        )?;
+    } else if let Some(path) = probe.wt_dir.as_deref() {
+        let _ = verify_checkout_ownership(
+            &probe.root,
+            path,
+            id,
+            (!probe.branch.is_empty()).then_some(probe.branch.as_str()),
+        )?;
+    } else if !probe.branch.is_empty() && (!keep_branch || remote) {
+        return Err(Error::rejected(format!(
+            "issue {id} has no managed checkout path for branch {}; refusing deletion",
+            probe.branch
+        )));
     }
     let ev = evidence(&probe, remote);
     let (merged_how, tip, _) = survivability(&ev, &probe);
@@ -2131,51 +2332,63 @@ pub(crate) fn run(
         && ev.remote_note.is_none()
         && ev.remote_tip.is_some()
         && (remote_covered || force);
-    let mut lifecycle_release =
-        if !refs_only && (will_remove_worktree || will_delete_branch || will_delete_remote) {
-            let path = wt_dir.as_deref().ok_or_else(|| {
-                Error::rejected(format!(
-                    "issue {id} has no managed checkout path for branch {branch}; refusing deletion"
-                ))
-            })?;
-            verify_checkout_ownership(
-                &root,
-                path,
-                id,
-                (!branch.is_empty()).then_some(branch.as_str()),
-            )?;
-            Some(crate::worktree::lifecycle::begin_release(
-                &root,
-                path,
-                id,
-                (!branch.is_empty()).then_some(branch.as_str()),
-                &format!("issue finish {id} for branch {branch}"),
-            )?)
-        } else {
-            None
-        };
+    let mut lifecycle_release = if refs_only {
+        let path = wt_dir.as_deref().ok_or_else(|| {
+            Error::rejected(format!("issue {id} has no path for refs-only finish"))
+        })?;
+        Some(crate::worktree::lifecycle::begin_refs_only_finish(
+            &root,
+            path,
+            id,
+            (!branch.is_empty()).then_some(branch.as_str()),
+            &format!("issue finish {id} refs-only closure"),
+        )?)
+    } else if will_remove_worktree || will_delete_branch || will_delete_remote {
+        let path = wt_dir.as_deref().ok_or_else(|| {
+            Error::rejected(format!(
+                "issue {id} has no managed checkout path for branch {branch}; refusing deletion"
+            ))
+        })?;
+        verify_checkout_ownership(
+            &root,
+            path,
+            id,
+            (!branch.is_empty()).then_some(branch.as_str()),
+        )?;
+        Some(crate::worktree::lifecycle::begin_release(
+            &root,
+            path,
+            id,
+            (!branch.is_empty()).then_some(branch.as_str()),
+            &format!("issue finish {id} for branch {branch}"),
+        )?)
+    } else {
+        None
+    };
 
     // Removal: the worktree first (frees the branch), then the branch
     // — and only the exact tip the evidence covered: a tip that moved
     // (or was never covered) keeps its commits, so an uncovered branch
     // is never `branch -D`'d even under --force.
     let mut removed_worktree = false;
-    if let Some(d) = wt_dir.as_deref().filter(|d| d.is_dir()) {
-        let target = d.to_string_lossy().into_owned();
-        let mut args = vec!["worktree", "remove"];
-        if force {
-            args.push("--force");
-        }
-        args.push("--");
-        args.push(&target);
-        if let Err(e) = git(&root, &args) {
-            let reason = format!("git worktree remove {} failed: {e}", d.display());
-            if let Some(release) = lifecycle_release.as_mut() {
-                let _ = release.cleanup_failed(&reason);
+    if !refs_only {
+        if let Some(d) = wt_dir.as_deref().filter(|d| d.is_dir()) {
+            let target = d.to_string_lossy().into_owned();
+            let mut args = vec!["worktree", "remove"];
+            if force {
+                args.push("--force");
             }
-            return Err(Error::rejected(reason));
+            args.push("--");
+            args.push(&target);
+            if let Err(e) = git(&root, &args) {
+                let reason = format!("git worktree remove {} failed: {e}", d.display());
+                if let Some(release) = lifecycle_release.as_mut() {
+                    let _ = release.cleanup_failed(&reason);
+                }
+                return Err(Error::rejected(reason));
+            }
+            removed_worktree = true;
         }
-        removed_worktree = true;
     }
     let mut deleted_branch = false;
     let mut branch_note = Value::Null;
@@ -2235,10 +2448,14 @@ pub(crate) fn run(
     };
     // The lifecycle transaction ends at the destructive boundary, before any
     // tracker write can fail after the checkout has already been removed.
-    let release_warning = lifecycle_release
-        .take()
-        .and_then(|mut release| release.released(&disposition).err())
-        .map(|e| e.to_string());
+    let release_warning = if refs_only {
+        None
+    } else {
+        lifecycle_release
+            .take()
+            .and_then(|mut release| release.released(&disposition).err())
+            .map(|e| e.to_string())
+    };
     for r in &mut t.front.refs {
         if (r.kind == "worktree"
             && wt_dir
@@ -2287,20 +2504,10 @@ pub(crate) fn run(
         return Err(e);
     }
     let lifecycle_warning = if refs_only {
-        wt_dir.as_deref().and_then(
-            |path| match crate::worktree::lifecycle::contains(&root, path) {
-                Ok(false) => None,
-                Ok(true) => crate::worktree::lifecycle::transition(
-                    &root,
-                    path,
-                    "released",
-                    Some(&disposition),
-                )
-                .err()
-                .map(|e| e.to_string()),
-                Err(e) => Some(e.to_string()),
-            },
-        )
+        lifecycle_release
+            .take()
+            .and_then(|mut release| release.released(&disposition).err())
+            .map(|e| e.to_string())
     } else {
         release_warning
     };
@@ -2432,7 +2639,7 @@ pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
 /// The worktree path that currently has `branch` checked out, from
 /// `git worktree list --porcelain`. Enumeration errors are returned to
 /// destructive callers so they fail closed.
-fn registered_branch_path(root: &Path, branch: &str) -> Result<Option<PathBuf>> {
+pub(crate) fn registered_branch_path(root: &Path, branch: &str) -> Result<Option<PathBuf>> {
     if branch.is_empty() {
         return Ok(None);
     }

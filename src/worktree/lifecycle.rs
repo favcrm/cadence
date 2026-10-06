@@ -467,20 +467,15 @@ pub fn transition(repo: &Path, path: &Path, state: &str, reason: Option<&str>) -
         )));
     }
     let record = &mut ledger.records[matches[0]];
-    let interrupted_release_recovery = record.state == "releasing" && state == "released";
-    if record.state == "releasing" && !interrupted_release_recovery {
+    if record.state == "releasing" {
         return Err(Error::rejected(format!(
-            "{} is recorded as releasing or release-interrupted; only an explicit release with a reason may resolve it",
+            "{} is recorded as releasing or release-interrupted; only explicit checkout release with a reason may resolve it",
             key
         )));
-    }
-    if interrupted_release_recovery {
-        validate_record(&root, record)?;
     }
     let terminal_change = match record.state.as_str() {
         "retained" => !matches!(state, "retained" | "released"),
         "released" => state != "released",
-        "releasing" => !interrupted_release_recovery,
         _ => false,
     };
     if terminal_change {
@@ -497,6 +492,55 @@ pub fn transition(repo: &Path, path: &Path, state: &str, reason: Option<&str>) -
     if matches!(state, "released" | "releasing" | "cleanup-failed") {
         record.release_reason = reason.map(str::to_string);
     }
+    write_ledger(&dir, &ledger)
+}
+
+pub fn release(repo: &Path, path: &Path, reason: &str) -> Result<()> {
+    if reason.trim().is_empty() {
+        return Err(Error::rejected("checkout release requires a reason"));
+    }
+    let root = canonical_root(repo)?;
+    let key = path_key(path);
+    let (dir, _lock) = LedgerLock::acquire(&root)?;
+    let mut ledger = read_ledger(&root)?;
+    let matches: Vec<usize> = ledger
+        .records
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| record_path_matches(record, &key).then_some(index))
+        .collect();
+    if matches.len() != 1 {
+        return Err(Error::rejected(format!(
+            "{} must have exactly one managed checkout record to release; found {}",
+            path.display(),
+            matches.len()
+        )));
+    }
+    let record = &mut ledger.records[matches[0]];
+    validate_record(&root, record)?;
+    if record.path != key {
+        return Err(Error::rejected(format!(
+            "checkout path {} differs from recorded path {}; refusing moved or noncanonical ownership",
+            path.display(),
+            record.path
+        )));
+    }
+    if record.state == "released" {
+        return Ok(());
+    }
+    if !matches!(
+        record.state.as_str(),
+        "active" | "preparing" | "setup-failed" | "releasing" | "retained" | "cleanup-failed"
+    ) {
+        return Err(Error::rejected(format!(
+            "{} has unsupported lifecycle state {}; refusing explicit release",
+            path.display(),
+            record.state
+        )));
+    }
+    record.state = "released".into();
+    record.release_reason = Some(reason.to_string());
+    record.updated_at = time::now_epoch();
     write_ledger(&dir, &ledger)
 }
 
@@ -1186,13 +1230,69 @@ impl ReleaseGuard {
     }
 }
 
+fn validate_refs_only_finish_target(root: &Path, path: &Path, branch: Option<&str>) -> Result<()> {
+    let lexical = finish::lexical_path(path);
+    if !path.is_absolute() || path != lexical.as_path() {
+        return Err(Error::rejected(format!(
+            "refs-only finish path {} is not canonical; refusing closure",
+            path.display()
+        )));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        Error::rejected(format!(
+            "refs-only finish path {} has no parent; refusing closure",
+            path.display()
+        ))
+    })?;
+    let canonical_parent = parent.canonicalize().map_err(|error| {
+        Error::rejected(format!(
+            "cannot verify refs-only finish parent {}: {error}",
+            parent.display()
+        ))
+    })?;
+    if canonical_parent != parent {
+        return Err(Error::rejected(format!(
+            "refs-only finish path {} has a symlinked parent alias; refusing closure",
+            path.display()
+        )));
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(Error::rejected(format!(
+                "refs-only finish path {} reappeared; refusing closure",
+                path.display()
+            )))
+        }
+        Err(error) => {
+            return Err(Error::rejected(format!(
+                "cannot verify refs-only finish path {} is absent: {error}",
+                path.display()
+            )))
+        }
+    }
+    if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+        if let Some(live) = finish::registered_branch_path(root, branch)?
+            .filter(|live| !finish::same_path(live, path))
+        {
+            return Err(Error::rejected(format!(
+                "issue-owned branch {branch} is checked out at {}, not {}; refusing refs-only finish",
+                live.display(),
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn begin_release_transaction(
     repo: &Path,
     path: &Path,
     reason: &str,
     refused: String,
     allow_legacy_absence: bool,
-    expected: impl FnOnce(&Checkout) -> bool,
+    allow_already_released: bool,
+    expected: impl FnOnce(Option<&Checkout>) -> Result<bool>,
 ) -> Result<ReleaseGuard> {
     if reason.trim().is_empty() {
         return Err(Error::rejected("checkout release requires a reason"));
@@ -1220,6 +1320,9 @@ fn begin_release_transaction(
                 path.display()
             )));
         }
+        if !expected(None)? {
+            return Err(Error::rejected(refused));
+        }
         return Ok(ReleaseGuard {
             root,
             dir,
@@ -1236,7 +1339,26 @@ fn begin_release_transaction(
             record.path
         )));
     }
-    if record.state != "active" || !expected(record) {
+    if record.state == "released" && allow_already_released {
+        if !expected(Some(record))? {
+            return Err(Error::rejected(format!(
+                "{refused} (lifecycle state released)"
+            )));
+        }
+        return Ok(ReleaseGuard {
+            root,
+            dir,
+            key: None,
+            _lock: lock,
+        });
+    }
+    if record.state != "active" {
+        return Err(Error::rejected(format!(
+            "{refused} (lifecycle state {})",
+            record.state
+        )));
+    }
+    if !expected(Some(record))? {
         return Err(Error::rejected(refused));
     }
     let record = &mut ledger.records[index];
@@ -1271,10 +1393,42 @@ pub fn begin_release(
             path.display()
         ),
         true,
+        false,
         |record| {
-            record.purpose == "development"
-                && record.issue.as_deref() == Some(issue)
-                && record.branch.as_deref() == branch
+            Ok(record.is_none_or(|record| {
+                record.purpose == "development"
+                    && record.issue.as_deref() == Some(issue)
+                    && record.branch.as_deref() == branch
+            }))
+        },
+    )
+}
+
+pub fn begin_refs_only_finish(
+    repo: &Path,
+    path: &Path,
+    issue: &str,
+    branch: Option<&str>,
+    reason: &str,
+) -> Result<ReleaseGuard> {
+    let root = canonical_root(repo)?;
+    begin_release_transaction(
+        &root,
+        path,
+        reason,
+        format!(
+            "refs-only finish ownership for {} changed before closing issue {issue}; refusing closure",
+            path.display()
+        ),
+        true,
+        true,
+        |record| {
+            validate_refs_only_finish_target(&root, path, branch)?;
+            Ok(record.is_none_or(|record| {
+                record.purpose == "development"
+                    && record.issue.as_deref() == Some(issue)
+                    && record.branch.as_deref() == branch
+            }))
         },
     )
 }
@@ -1298,13 +1452,127 @@ pub fn begin_review_release(
             path.display()
         ),
         false,
+        false,
         |record| {
-            record.purpose == "review"
-                && record.tool == tool
-                && record.owner == owner
-                && record.pinned_sha == pinned_sha
+            Ok(record.is_some_and(|record| {
+                record.purpose == "review"
+                    && record.tool == tool
+                    && record.owner == owner
+                    && record.pinned_sha == pinned_sha
+            }))
         },
     )
+}
+
+pub struct ReclaimGuard {
+    _lock: LedgerLock,
+}
+
+fn validate_target_reclaim_at_root(
+    root: &Path,
+    path: &Path,
+    issue: &str,
+    branch: &str,
+) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(Error::rejected(format!(
+            "target reclaim path {} is not absolute",
+            path.display()
+        )));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        Error::rejected(format!(
+            "cannot inspect target reclaim checkout {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::rejected(format!(
+            "target reclaim checkout {} is not a real directory",
+            path.display()
+        )));
+    }
+    let canonical = path.canonicalize()?;
+    if canonical.as_os_str() != path.as_os_str()
+        || canonical == root
+        || worktree::main_root(&canonical)?.canonicalize()? != root
+    {
+        return Err(Error::rejected(format!(
+            "target reclaim checkout {} is not its canonical linked path in {}",
+            path.display(),
+            root.display()
+        )));
+    }
+    if finish::git_branch(&canonical)?.as_deref() != Some(branch) {
+        return Err(Error::rejected(format!(
+            "target reclaim checkout {} is not on issue-owned branch {branch}",
+            path.display()
+        )));
+    }
+    worktree::validate_registered_branch(root, &canonical, branch)?;
+
+    let key = canonical.to_string_lossy().into_owned();
+    let ledger = read_ledger(root)?;
+    let matches: Vec<&Checkout> = ledger
+        .records
+        .iter()
+        .filter(|record| record_path_matches(record, &key))
+        .collect();
+    if matches.len() > 1 {
+        return Err(Error::rejected(format!(
+            "multiple lifecycle ownership records name {}; refusing target reclaim",
+            path.display()
+        )));
+    }
+    if let Some(record) = matches.first().copied() {
+        validate_record(root, record)?;
+        if record.path != key {
+            return Err(Error::rejected(format!(
+                "target reclaim path {} differs from recorded path {}; refusing moved or noncanonical ownership",
+                path.display(),
+                record.path
+            )));
+        }
+        if record.purpose != "development"
+            || record.issue.as_deref() != Some(issue)
+            || record.branch.as_deref() != Some(branch)
+        {
+            return Err(Error::rejected(format!(
+                "target reclaim lifecycle ownership for {} does not match development issue {issue}, branch {branch}",
+                path.display()
+            )));
+        }
+        if record.state != "active" {
+            let reason = record
+                .retention_reason
+                .as_deref()
+                .or(record.release_reason.as_deref())
+                .unwrap_or("no recorded lifecycle reason");
+            return Err(Error::rejected(format!(
+                "target reclaim refused: {} is recorded as {} ({reason})",
+                path.display(),
+                record.state
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_target_reclaim(repo: &Path, path: &Path, issue: &str, branch: &str) -> Result<()> {
+    let root = canonical_root(repo)?;
+    validate_target_reclaim_at_root(&root, path, issue, branch)
+}
+
+pub fn begin_target_reclaim(
+    repo: &Path,
+    path: &Path,
+    issue: &str,
+    branch: &str,
+) -> Result<ReclaimGuard> {
+    let root = canonical_root(repo)?;
+    let (_dir, lock) = LedgerLock::acquire(&root)?;
+    validate_target_reclaim_at_root(&root, path, issue, branch)?;
+    Ok(ReclaimGuard { _lock: lock })
 }
 
 /// Whether a lifecycle record exists for this path (read-only).

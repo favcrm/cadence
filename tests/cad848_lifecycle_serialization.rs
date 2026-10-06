@@ -32,6 +32,18 @@ const BINARY: &str = env!("CARGO_BIN_EXE_cadence");
 const PROJECT: &str = "fixture";
 const PR: &str = "41";
 
+fn write_full_proc_mountinfo(proc_root: &Path) {
+    fs::create_dir_all(proc_root.join("self")).unwrap();
+    fs::write(
+        proc_root.join("self/mountinfo"),
+        format!(
+            "29 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc rw\n",
+            proc_root.canonicalize().unwrap().display()
+        ),
+    )
+    .unwrap();
+}
+
 struct DevelopmentFixture {
     _root: TempDir,
     home: PathBuf,
@@ -254,6 +266,7 @@ impl ReviewFixture {
         for dir in [&state, &home, &bin, &proc_root] {
             fs::create_dir_all(dir).unwrap();
         }
+        write_full_proc_mountinfo(&proc_root);
         fs::create_dir_all(&repo).unwrap();
         git(&home, &repo, &["init", "--quiet", "--initial-branch=main"]);
         fs::write(
@@ -634,6 +647,7 @@ impl FinishFixture {
         let proc_root = development._root.path().join("proc");
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&proc_root).unwrap();
+        write_full_proc_mountinfo(&proc_root);
         let real_git = find_on_path("git");
         write_executable(&bin.join("git"), GIT_REMOVAL_OBSERVER);
 
@@ -894,6 +908,253 @@ fn cad848_issue_finish_release_lock_defeats_concurrent_retain() {
     assert_eq!(probe["state_before_remove"], "releasing");
     assert!(!probe["force"].as_bool().unwrap_or(true));
     assert!(probe["remove_succeeded"].as_bool().unwrap_or(false));
+}
+
+#[test]
+fn cad848_target_reclaim_guard_serializes_retain_and_adopt() {
+    let fixture = DevelopmentFixture::new();
+    let started = fixture.start();
+    assert!(started.status.success(), "initial issue start failed");
+    let started: Value = serde_json::from_slice(&started.stdout).unwrap();
+    let lane = PathBuf::from(started["worktree"].as_str().unwrap());
+    let branch = started["branch"].as_str().unwrap().to_string();
+    let target = lane.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let sentinel = target.join(".cad848-reclaim-guard-sentinel");
+    fs::write(&sentinel, b"reclaim guard owns no lifecycle mutation\n").unwrap();
+    let ledger_path = fixture.repo.join(".cadence/managed-checkouts.json");
+    let issue_path = fixture.pm.dir.join(PROJECT).join("C84-1/issue.md");
+    let ledger_before = fs::read(&ledger_path).unwrap();
+    let issue_before = fs::read(&issue_path).unwrap();
+    let branch_before = git(
+        &fixture.home,
+        &fixture.repo,
+        &["rev-parse", &format!("refs/heads/{branch}")],
+    );
+    let trees_before = git(
+        &fixture.home,
+        &fixture.repo,
+        &["worktree", "list", "--porcelain"],
+    );
+
+    let guard = lifecycle::begin_target_reclaim(&fixture.repo, &lane, "C84-1", &branch)
+        .expect("acquire read-only target-reclaim guard");
+    assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before);
+    let repo = fixture.repo.clone();
+    let lane_for_retain = lane.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let retain_thread = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let result = lifecycle::transition(
+            &repo,
+            &lane_for_retain,
+            "retained",
+            Some("retain waits for target reclamation guard"),
+        )
+        .map_err(|error| error.to_string());
+        let _ = done_tx.send(result);
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("concurrent retain attempt started");
+    assert!(
+        matches!(
+            done_rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "retain completed while target reclamation owned the lifecycle guard"
+    );
+    assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before);
+    assert_eq!(
+        fs::read(&sentinel).unwrap(),
+        b"reclaim guard owns no lifecycle mutation\n"
+    );
+    assert!(
+        lane.join("tracked.txt").is_file(),
+        "retain race deleted source"
+    );
+    assert_eq!(fs::read(&issue_path).unwrap(), issue_before);
+    assert_eq!(
+        git(
+            &fixture.home,
+            &fixture.repo,
+            &["rev-parse", &format!("refs/heads/{branch}")],
+        ),
+        branch_before
+    );
+    assert_eq!(
+        git(
+            &fixture.home,
+            &fixture.repo,
+            &["worktree", "list", "--porcelain"],
+        ),
+        trees_before
+    );
+    drop(guard);
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("retain completes after guard release")
+        .expect("retain proceeds only after target-reclaim guard release");
+    retain_thread.join().unwrap();
+    let retained_ledger = fs::read(&ledger_path).unwrap();
+    let retained_record = lifecycle_record(&retained_ledger, &lane);
+    assert_eq!(retained_record["state"], "retained");
+    assert_eq!(
+        retained_record["retention_reason"],
+        "retain waits for target reclamation guard"
+    );
+    assert!(
+        lifecycle::begin_target_reclaim(&fixture.repo, &lane, "C84-1", &branch).is_err(),
+        "a retain completed before acquisition must prevent target reclamation"
+    );
+    assert_eq!(fs::read(&ledger_path).unwrap(), retained_ledger);
+    assert_eq!(fs::read(&issue_path).unwrap(), issue_before);
+    assert_eq!(
+        fs::read(&sentinel).unwrap(),
+        b"reclaim guard owns no lifecycle mutation\n"
+    );
+    assert!(
+        lane.join("tracked.txt").is_file(),
+        "retained target refusal deleted source"
+    );
+    assert_eq!(
+        git(
+            &fixture.home,
+            &fixture.repo,
+            &["rev-parse", &format!("refs/heads/{branch}")],
+        ),
+        branch_before
+    );
+    assert_eq!(
+        git(
+            &fixture.home,
+            &fixture.repo,
+            &["worktree", "list", "--porcelain"],
+        ),
+        trees_before
+    );
+
+    let adoption_fixture = DevelopmentFixture::new();
+    let started = adoption_fixture.start();
+    assert!(started.status.success(), "legacy lane setup failed");
+    let started: Value = serde_json::from_slice(&started.stdout).unwrap();
+    let legacy_lane = PathBuf::from(started["worktree"].as_str().unwrap());
+    let legacy_branch = started["branch"].as_str().unwrap().to_string();
+    let legacy_tip = git(&adoption_fixture.home, &legacy_lane, &["rev-parse", "HEAD"]);
+    let legacy_target = legacy_lane.join("target");
+    fs::create_dir_all(&legacy_target).unwrap();
+    let legacy_sentinel = legacy_target.join(".cad848-legacy-reclaim-sentinel");
+    fs::write(&legacy_sentinel, b"legacy cache remains untouched\n").unwrap();
+    let adoption_ledger_path = adoption_fixture
+        .repo
+        .join(".cadence/managed-checkouts.json");
+    let issue_before =
+        fs::read(adoption_fixture.pm.dir.join(PROJECT).join("C84-1/issue.md")).unwrap();
+    let mut legacy_ledger: Value =
+        serde_json::from_slice(&fs::read(&adoption_ledger_path).unwrap()).unwrap();
+    legacy_ledger["records"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|record| record["path"].as_str() != Some(legacy_lane.to_str().unwrap()));
+    fs::write(
+        &adoption_ledger_path,
+        serde_json::to_vec_pretty(&legacy_ledger).unwrap(),
+    )
+    .unwrap();
+    let legacy_ledger_before = fs::read(&adoption_ledger_path).unwrap();
+    let owner = actor();
+    let repo = adoption_fixture.repo.canonicalize().unwrap();
+    let adoption = lifecycle::new_record(lifecycle::CheckoutSpec {
+        repo: &repo,
+        purpose: "development",
+        tool: "cadence issue start",
+        owner: &owner,
+        path: &legacy_lane,
+        branch: Some(&legacy_branch),
+        pinned_sha: &legacy_tip,
+        issue: Some("C84-1"),
+    });
+    let legacy_guard = lifecycle::begin_target_reclaim(
+        &adoption_fixture.repo,
+        &legacy_lane,
+        "C84-1",
+        &legacy_branch,
+    )
+    .expect("legacy issue-ref checkout guard fences explicit adoption");
+    assert_eq!(
+        fs::read(&adoption_ledger_path).unwrap(),
+        legacy_ledger_before
+    );
+    let repo = adoption_fixture.repo.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let adoption_thread = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let result = lifecycle::adopt(&repo, adoption).map_err(|error| error.to_string());
+        let _ = done_tx.send(result);
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("adoption attempt started");
+    assert!(
+        matches!(
+            done_rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "adoption completed while target reclamation owned the lifecycle guard"
+    );
+    assert_eq!(
+        fs::read(&adoption_ledger_path).unwrap(),
+        legacy_ledger_before
+    );
+    assert_eq!(
+        fs::read(&legacy_sentinel).unwrap(),
+        b"legacy cache remains untouched\n"
+    );
+    assert!(
+        legacy_lane.join("tracked.txt").is_file(),
+        "adoption race deleted source"
+    );
+    assert_eq!(
+        fs::read(adoption_fixture.pm.dir.join(PROJECT).join("C84-1/issue.md")).unwrap(),
+        issue_before
+    );
+    drop(legacy_guard);
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("adoption completes after target-reclaim guard release")
+        .expect("explicit adoption proceeds after guard release");
+    adoption_thread.join().unwrap();
+    let adopted = lifecycle_record(&fs::read(&adoption_ledger_path).unwrap(), &legacy_lane);
+    assert_eq!(adopted["state"], "active");
+    assert_eq!(adopted["issue"], "C84-1");
+    assert_eq!(adopted["branch"], legacy_branch);
+    assert_eq!(
+        fs::read(&legacy_sentinel).unwrap(),
+        b"legacy cache remains untouched\n"
+    );
+    assert!(
+        legacy_lane.join("tracked.txt").is_file(),
+        "adoption deleted source"
+    );
+    assert_eq!(
+        git(
+            &adoption_fixture.home,
+            &adoption_fixture.repo,
+            &["rev-parse", &legacy_branch],
+        ),
+        legacy_tip
+    );
+    assert!(registered(
+        &adoption_fixture.home,
+        &adoption_fixture.repo,
+        &legacy_lane
+    ));
+    assert_eq!(
+        fs::read(adoption_fixture.pm.dir.join(PROJECT).join("C84-1/issue.md")).unwrap(),
+        issue_before
+    );
 }
 
 fn lifecycle_record(bytes: &[u8], path: &Path) -> Value {

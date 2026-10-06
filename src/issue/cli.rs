@@ -916,7 +916,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 Ok(0)
             }
             CheckoutAction::Release { repo, path, reason } => {
-                crate::worktree::lifecycle::transition(repo, path, "released", Some(reason))?;
+                crate::worktree::lifecycle::release(repo, path, reason)?;
                 print_json(&json!({"path": path, "state": "released", "reason": reason,
                     "deletion": "not-performed"}));
                 Ok(0)

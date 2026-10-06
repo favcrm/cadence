@@ -395,6 +395,10 @@ fn retention_guards_legacy_adoption_and_released_generation_restart() {
         fx.new_issue("C84-6", "moved resume refusal");
         fx.new_issue("C84-7", "interrupted release recovery");
         fx.new_issue("C84-8", "canonical path alias refusal");
+        fx.new_issue("C84-9", "missing retained checkout refusal");
+        fx.new_issue("C84-10", "refs-only path reappearance refusal");
+        fx.new_issue("C84-11", "reappearing checkout preservation");
+        fx.new_issue("C84-12", "missing interrupted checkout recovery");
 
         let (resume_lane, resume_branch) = fx.start_lane("C84-5", "explicit-resume");
         fs::write(
@@ -862,6 +866,547 @@ fn retention_guards_legacy_adoption_and_released_generation_restart() {
         );
         assert_eq!(fx.issue_refs("C84-7"), interrupted_refs);
 
+        {
+            let (interrupted_lane, interrupted_branch) =
+                fx.start_lane("C84-12", "interrupted-release-missing-path");
+            fs::write(
+                interrupted_lane.join("interrupted-history.txt"),
+                "preserve interrupted checkout\n",
+            )
+            .unwrap();
+            git(
+                &fx.home,
+                &interrupted_lane,
+                &["add", "interrupted-history.txt"],
+            );
+            git(
+                &fx.home,
+                &interrupted_lane,
+                &["commit", "--quiet", "-m", "interrupted release history"],
+            );
+            let interrupted_head = git(&fx.home, &interrupted_lane, &["rev-parse", "HEAD"]);
+            let interrupted_history = git(
+                &fx.home,
+                &interrupted_lane,
+                &["rev-list", "--reverse", "HEAD"],
+            );
+            let release_artifact = fx._root.path().join("C84-12-release-artifact.txt");
+            let rollback_artifact = fx._root.path().join("C84-12-rollback-artifact.txt");
+            fs::write(&release_artifact, "release artifact survives\n").unwrap();
+            fs::write(&rollback_artifact, "rollback artifact survives\n").unwrap();
+            let release_artifacts = vec![release_artifact.display().to_string()];
+            let rollback_artifacts = vec![rollback_artifact.display().to_string()];
+            lifecycle::declare_artifacts(
+                &fx.repo,
+                &interrupted_lane,
+                release_artifacts.clone(),
+                rollback_artifacts.clone(),
+            )
+            .expect("declare external recovery artifacts");
+            let interrupted_identity = lifecycle::managed_record(&fx.repo, &interrupted_lane)
+                .expect("read interrupted release identity")
+                .expect("interrupted release record exists");
+            let interrupted_refs = fx.issue_refs("C84-12");
+            let guard = lifecycle::begin_release(
+                &fx.repo,
+                &interrupted_lane,
+                "C84-12",
+                Some(&interrupted_branch),
+                "simulate a process interrupted during release",
+            )
+            .expect("begin real guarded release transaction");
+            assert!(lifecycle_lock_is_held(&fx.repo).expect("probe live release lock"));
+
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let resume_repo = fx.repo.clone();
+            let resume_path = interrupted_lane.clone();
+            let resume_pin = interrupted_head.clone();
+            let waiting_resume = thread::spawn(move || {
+                started_tx.send(()).expect("signal resume thread start");
+                result_tx
+                    .send(
+                        lifecycle::resume(
+                            &resume_repo,
+                            &resume_path,
+                            &resume_pin,
+                            "resume cannot cross live release lock",
+                        )
+                        .map_err(|error| error.to_string()),
+                    )
+                    .expect("send resume result");
+            });
+            started_rx
+                .recv()
+                .expect("resume thread starts while release lock is held");
+            assert!(
+                matches!(
+                    result_rx.recv_timeout(Duration::from_millis(500)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "resume returned while the release transaction still held its lock"
+            );
+            git(
+                &fx.home,
+                &fx.repo,
+                &[
+                    "worktree",
+                    "remove",
+                    "--",
+                    interrupted_lane
+                        .to_str()
+                        .expect("interrupted worktree path"),
+                ],
+            );
+            assert!(!interrupted_lane.exists());
+            assert!(fx.branch_exists(&interrupted_branch));
+            assert_eq!(fx.branch_tip(&interrupted_branch), interrupted_head);
+            assert_eq!(
+                git(
+                    &fx.home,
+                    &fx.repo,
+                    &["rev-list", "--reverse", &interrupted_branch]
+                ),
+                interrupted_history
+            );
+            drop(guard);
+            let resume_error = result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("resume completes after interrupted lock is released")
+                .expect_err("resume must reject interrupted releasing metadata");
+            assert!(
+                resume_error.contains("interrupted release"),
+                "unexpected interrupted resume refusal: {resume_error}"
+            );
+            waiting_resume.join().expect("join resumed release waiter");
+            let releasing = lifecycle::managed_record(&fx.repo, &interrupted_lane)
+                .expect("read interrupted release record")
+                .expect("interrupted record remains");
+            assert_eq!(releasing.state, "releasing");
+            assert!(
+                !lifecycle_lock_is_held(&fx.repo).expect("probe dropped release lock"),
+                "release recovery must run only after the live guard is gone"
+            );
+            let interrupted_ledger = ledger_bytes();
+            let issue_file = fx.pm.dir.join(PROJECT).join("C84-12/issue.md");
+            let interrupted_issue_bytes = fs::read(&issue_file).expect("snapshot interrupted refs");
+            let tracker_head = git(&fx.home, &fx.pm.dir, &["rev-parse", "HEAD"]);
+            assert_eq!(fx.issue_refs("C84-12"), interrupted_refs);
+            assert!(!interrupted_lane.exists());
+            assert!(
+                !git(&fx.home, &fx.repo, &["worktree", "list", "--porcelain"])
+                    .contains(&format!("worktree {}", interrupted_lane.display())),
+                "the crash fixture must have removed the Git worktree registration"
+            );
+            assert_eq!(
+                releasing.release_reason.as_deref(),
+                Some("simulate a process interrupted during release")
+            );
+
+            let mut finish = fx.finish_command("C84-12", &interrupted_lane);
+            let finish = cadence_agent::reaper::output(&mut finish)
+                .expect("run ordinary finish against missing interrupted checkout");
+            assert_refused(&finish, "release");
+            assert_eq!(ledger_bytes(), interrupted_ledger);
+            assert_eq!(fs::read(&issue_file).unwrap(), interrupted_issue_bytes);
+            assert_eq!(
+                git(&fx.home, &fx.pm.dir, &["rev-parse", "HEAD"]),
+                tracker_head,
+                "refusal must not add tracker history"
+            );
+            assert_eq!(fx.issue_refs("C84-12"), interrupted_refs);
+            assert_eq!(fx.branch_tip(&interrupted_branch), interrupted_head);
+            assert_eq!(
+                git(
+                    &fx.home,
+                    &fx.repo,
+                    &["rev-list", "--reverse", &interrupted_branch]
+                ),
+                interrupted_history
+            );
+            assert_eq!(
+                fs::read(&release_artifact).unwrap(),
+                b"release artifact survives\n"
+            );
+            assert_eq!(
+                fs::read(&rollback_artifact).unwrap(),
+                b"rollback artifact survives\n"
+            );
+            assert!(!interrupted_lane.exists());
+
+            let generic_release = lifecycle::transition(
+                &fx.repo,
+                &interrupted_lane,
+                "released",
+                Some("generic transition cannot resolve interrupted release"),
+            )
+            .expect_err("generic transition must not finalize interrupted release")
+            .to_string();
+            assert!(
+                generic_release.contains("release") || generic_release.contains("releasing"),
+                "unexpected generic release refusal: {generic_release}"
+            );
+            assert_eq!(ledger_bytes(), interrupted_ledger);
+            let generic_retain = fx.retain(
+                &interrupted_lane,
+                "generic retention cannot resolve interrupted release",
+            );
+            assert_refused(&generic_retain, "release-interrupted");
+            assert_eq!(ledger_bytes(), interrupted_ledger);
+            let generic_activate = lifecycle::transition(
+                &fx.repo,
+                &interrupted_lane,
+                "active",
+                Some("generic activation cannot resolve interrupted release"),
+            )
+            .expect_err("generic active transition must not recover interrupted release")
+            .to_string();
+            assert!(
+                generic_activate.contains("release-interrupted"),
+                "unexpected generic activation refusal: {generic_activate}"
+            );
+            assert_eq!(ledger_bytes(), interrupted_ledger);
+            let empty_release = fx.release(&interrupted_lane, "  ");
+            assert_refused(&empty_release, "requires a reason");
+            assert_eq!(ledger_bytes(), interrupted_ledger);
+            assert_eq!(
+                lifecycle::managed_record(&fx.repo, &interrupted_lane)
+                    .expect("read after refused generic mutations")
+                    .expect("interrupted record remains")
+                    .state,
+                "releasing"
+            );
+
+            let recovery_reason = "inspected missing checkout; preserve surviving branch";
+            let recovered = fx.release(&interrupted_lane, recovery_reason);
+            assert!(
+                recovered.status.success(),
+                "reasoned release recovery failed: {}",
+                output_text(&recovered)
+            );
+            let released = lifecycle::managed_record(&fx.repo, &interrupted_lane)
+                .expect("read reasoned release recovery")
+                .expect("recovered record remains");
+            assert_eq!(released.state, "released");
+            assert_eq!(released.release_reason.as_deref(), Some(recovery_reason));
+            assert_eq!(released.repo, interrupted_identity.repo);
+            assert_eq!(released.path, interrupted_identity.path);
+            assert_eq!(released.purpose, interrupted_identity.purpose);
+            assert_eq!(released.tool, interrupted_identity.tool);
+            assert_eq!(released.owner, interrupted_identity.owner);
+            assert_eq!(released.branch, interrupted_identity.branch);
+            assert_eq!(released.issue, interrupted_identity.issue);
+            assert_eq!(released.base_sha, interrupted_identity.base_sha);
+            assert_eq!(released.release_artifacts, release_artifacts);
+            assert_eq!(released.rollback_artifacts, rollback_artifacts);
+            assert_eq!(fx.issue_refs("C84-12"), interrupted_refs);
+            assert!(!interrupted_lane.exists());
+            assert!(fx.branch_exists(&interrupted_branch));
+            assert_eq!(fx.branch_tip(&interrupted_branch), interrupted_head);
+            assert_eq!(
+                git(
+                    &fx.home,
+                    &fx.repo,
+                    &["rev-list", "--reverse", &interrupted_branch]
+                ),
+                interrupted_history
+            );
+            assert_eq!(
+                fs::read(&release_artifact).unwrap(),
+                b"release artifact survives\n"
+            );
+            assert_eq!(
+                fs::read(&rollback_artifact).unwrap(),
+                b"rollback artifact survives\n"
+            );
+            assert_eq!(fs::read(&issue_file).unwrap(), interrupted_issue_bytes);
+            assert_eq!(
+                git(&fx.home, &fx.pm.dir, &["rev-parse", "HEAD"]),
+                tracker_head,
+                "explicit recovery must not mutate tracker history"
+            );
+
+            let mut finish = fx.finish_command("C84-12", &interrupted_lane);
+            let finish = cadence_agent::reaper::output(&mut finish)
+                .expect("close the explicitly recovered missing worktree ref");
+            assert!(
+                finish.status.success(),
+                "refs-only closure failed: {}",
+                output_text(&finish)
+            );
+            let closed_refs = fx.issue_refs("C84-12");
+            assert_eq!(
+                closed_refs
+                    .iter()
+                    .find(|r| r.kind == "worktree")
+                    .expect("worktree ref remains as history")
+                    .closed,
+                Some(true)
+            );
+            assert_ne!(
+                closed_refs
+                    .iter()
+                    .find(|r| r.kind == "branch")
+                    .expect("branch ref remains open")
+                    .closed,
+                Some(true)
+            );
+            assert!(fx.branch_exists(&interrupted_branch));
+            assert_eq!(fx.branch_tip(&interrupted_branch), interrupted_head);
+            assert_eq!(
+                git(
+                    &fx.home,
+                    &fx.repo,
+                    &["rev-list", "--reverse", &interrupted_branch]
+                ),
+                interrupted_history
+            );
+            assert_eq!(
+                fs::read(&release_artifact).unwrap(),
+                b"release artifact survives\n"
+            );
+            assert_eq!(
+                fs::read(&rollback_artifact).unwrap(),
+                b"rollback artifact survives\n"
+            );
+            let closed_record = lifecycle::managed_record(&fx.repo, &interrupted_lane)
+                .expect("read released refs-only lifecycle record")
+                .expect("released record remains");
+            assert_eq!(closed_record.state, "released");
+            assert_eq!(
+                closed_record.release_reason.as_deref(),
+                Some(recovery_reason)
+            );
+            assert_eq!(closed_record.release_artifacts, release_artifacts);
+            assert_eq!(closed_record.rollback_artifacts, rollback_artifacts);
+            assert!(!interrupted_lane.exists());
+        }
+
+        let (retained_missing, retained_branch) = fx.start_lane("C84-9", "missing-retained");
+        fs::write(
+            retained_missing.join("retained-history.txt"),
+            "preserve retained branch history\n",
+        )
+        .unwrap();
+        git(
+            &fx.home,
+            &retained_missing,
+            &["add", "retained-history.txt"],
+        );
+        git(
+            &fx.home,
+            &retained_missing,
+            &["commit", "--quiet", "-m", "retained branch history"],
+        );
+        let retained_head = git(&fx.home, &retained_missing, &["rev-parse", "HEAD"]);
+        let retained_history = git(
+            &fx.home,
+            &retained_missing,
+            &["rev-list", "--reverse", "HEAD"],
+        );
+        let retained_reason = "retain missing lane pending explicit recovery";
+        let retained = fx.retain(&retained_missing, retained_reason);
+        assert!(
+            retained.status.success(),
+            "retain failed: {}",
+            output_text(&retained)
+        );
+        git(
+            &fx.home,
+            &fx.repo,
+            &[
+                "worktree",
+                "remove",
+                "--",
+                retained_missing.to_str().expect("retained worktree path"),
+            ],
+        );
+        assert!(!retained_missing.exists());
+        let retained_missing_ledger = ledger_bytes();
+        let retained_issue_file = fx.pm.dir.join(PROJECT).join("C84-9/issue.md");
+        let retained_issue_bytes = fs::read(&retained_issue_file).unwrap();
+        let retained_tracker_head = git(&fx.home, &fx.pm.dir, &["rev-parse", "HEAD"]);
+        let retained_refs = fx.issue_refs("C84-9");
+        let mut finish = fx.finish_command("C84-9", &retained_missing);
+        let finish = cadence_agent::reaper::output(&mut finish)
+            .expect("run refs-only finish against missing retained checkout");
+        assert_refused(&finish, "retained");
+        assert_eq!(ledger_bytes(), retained_missing_ledger);
+        assert_eq!(
+            fs::read(&retained_issue_file).unwrap(),
+            retained_issue_bytes
+        );
+        assert_eq!(
+            git(&fx.home, &fx.pm.dir, &["rev-parse", "HEAD"]),
+            retained_tracker_head
+        );
+        assert_eq!(fx.issue_refs("C84-9"), retained_refs);
+        assert_eq!(fx.branch_tip(&retained_branch), retained_head);
+        assert_eq!(
+            git(
+                &fx.home,
+                &fx.repo,
+                &["rev-list", "--reverse", &retained_branch]
+            ),
+            retained_history
+        );
+        let retained_record = lifecycle::managed_record(&fx.repo, &retained_missing)
+            .expect("read missing retained record")
+            .expect("retained record remains");
+        assert_eq!(retained_record.state, "retained");
+        assert_eq!(
+            retained_record.retention_reason.as_deref(),
+            Some(retained_reason)
+        );
+        assert!(!retained_missing.exists());
+        assert!(fx.branch_exists(&retained_branch));
+
+        let (gone_lane, gone_branch) = fx.start_lane("C84-10", "c84-10");
+        fs::write(
+            gone_lane.join("gone-history.txt"),
+            "original lane history\n",
+        )
+        .unwrap();
+        git(&fx.home, &gone_lane, &["add", "gone-history.txt"]);
+        git(
+            &fx.home,
+            &gone_lane,
+            &["commit", "--quiet", "-m", "original lane history"],
+        );
+        let gone_head = git(&fx.home, &gone_lane, &["rev-parse", "HEAD"]);
+        let gone_history = git(&fx.home, &gone_lane, &["rev-list", "--reverse", "HEAD"]);
+        git(
+            &fx.home,
+            &fx.repo,
+            &[
+                "worktree",
+                "remove",
+                "--",
+                gone_lane.to_str().expect("initially missing worktree path"),
+            ],
+        );
+        assert!(!gone_lane.exists());
+        let gone_refs = fx.issue_refs("C84-10");
+
+        let (reappearing_lane, reappearing_branch) = fx.start_lane("C84-11", "c84-11");
+        fs::write(
+            reappearing_lane.join("reappearing-history.txt"),
+            "other linked checkout survives\n",
+        )
+        .unwrap();
+        git(
+            &fx.home,
+            &reappearing_lane,
+            &["add", "reappearing-history.txt"],
+        );
+        git(
+            &fx.home,
+            &reappearing_lane,
+            &["commit", "--quiet", "-m", "other linked checkout history"],
+        );
+        let reappearing_head = git(&fx.home, &reappearing_lane, &["rev-parse", "HEAD"]);
+        let reappearing_history = git(
+            &fx.home,
+            &reappearing_lane,
+            &["rev-list", "--reverse", "HEAD"],
+        );
+        let reappearing_refs = fx.issue_refs("C84-11");
+        let reappearing_issue_file = fx.pm.dir.join(PROJECT).join("C84-11/issue.md");
+        let reappearing_issue_bytes = fs::read(&reappearing_issue_file).unwrap();
+        let observer = GitObserver::at_first_matching_git_arg(
+            &fx,
+            "refs-only-reappearance",
+            format!("refs/heads/{gone_branch}"),
+        );
+        let mut finish = fx.finish_command("C84-10", &gone_lane);
+        finish.arg("--force");
+        observer.configure(&mut finish);
+        let finish_child =
+            cadence_agent::reaper::spawn(&mut finish).expect("spawn reappearance finish CLI");
+        let mut race = RaceChildren {
+            finish: Some(finish_child),
+            retain: None,
+            adopt: None,
+            gate: observer.gate.clone(),
+        };
+        wait_for_file(&observer.entered, race.finish.as_mut().unwrap())
+            .expect("finish has resolved the target path as missing");
+        assert!(
+            !observer.events.exists(),
+            "finish reached Git worktree removal before the path reappeared"
+        );
+        assert!(!gone_lane.exists());
+        git(
+            &fx.home,
+            &fx.repo,
+            &[
+                "worktree",
+                "move",
+                reappearing_lane.to_str().expect("other worktree path"),
+                gone_lane.to_str().expect("reappearing target path"),
+            ],
+        );
+        assert!(!reappearing_lane.exists());
+        assert!(gone_lane.is_dir());
+        assert_eq!(
+            fs::read_to_string(gone_lane.join("reappearing-history.txt")).unwrap(),
+            "other linked checkout survives\n"
+        );
+        let expected_registration = git(&fx.home, &fx.repo, &["worktree", "list", "--porcelain"]);
+        assert!(expected_registration.contains(&format!("worktree {}", gone_lane.display())));
+        assert!(expected_registration.contains(&format!("branch refs/heads/{reappearing_branch}")));
+        let reappearance_ledger = ledger_bytes();
+        let gone_issue_file = fx.pm.dir.join(PROJECT).join("C84-10/issue.md");
+        let gone_issue_bytes = fs::read(&gone_issue_file).unwrap();
+        let reappearance_tracker_head = git(&fx.home, &fx.pm.dir, &["rev-parse", "HEAD"]);
+        fs::write(&observer.gate, "continue\n").expect("release Git probe barrier");
+        let finish = race
+            .finish
+            .take()
+            .unwrap()
+            .wait_with_output()
+            .expect("wait for refs-only finish after path reappearance");
+        assert_refused(&finish, "reappeared");
+        assert!(
+            !observer.events.exists(),
+            "refs-only finish attempted to remove a reappeared registered checkout"
+        );
+        assert_eq!(ledger_bytes(), reappearance_ledger);
+        assert_eq!(fs::read(&gone_issue_file).unwrap(), gone_issue_bytes);
+        assert_eq!(
+            fs::read(&reappearing_issue_file).unwrap(),
+            reappearing_issue_bytes
+        );
+        assert_eq!(
+            git(&fx.home, &fx.pm.dir, &["rev-parse", "HEAD"]),
+            reappearance_tracker_head
+        );
+        assert_eq!(fx.issue_refs("C84-10"), gone_refs);
+        assert_eq!(fx.issue_refs("C84-11"), reappearing_refs);
+        assert_eq!(fx.branch_tip(&gone_branch), gone_head);
+        assert_eq!(
+            git(&fx.home, &fx.repo, &["rev-list", "--reverse", &gone_branch]),
+            gone_history
+        );
+        assert_eq!(fx.branch_tip(&reappearing_branch), reappearing_head);
+        assert_eq!(
+            git(
+                &fx.home,
+                &fx.repo,
+                &["rev-list", "--reverse", &reappearing_branch]
+            ),
+            reappearing_history
+        );
+        assert_eq!(
+            fs::read_to_string(gone_lane.join("reappearing-history.txt")).unwrap(),
+            "other linked checkout survives\n"
+        );
+        assert_eq!(
+            git(&fx.home, &fx.repo, &["worktree", "list", "--porcelain"]),
+            expected_registration
+        );
+        drop(race);
+
         let (alias_lane, alias_branch) = fx.start_lane("C84-8", "alias-owner");
         fs::write(
             alias_lane.join("alias-history.txt"),
@@ -1004,7 +1549,16 @@ impl Fixture {
         let repo = root.path().join("repo");
         let empty_proc_root = root.path().join("proc");
         fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(&empty_proc_root).unwrap();
+        fs::create_dir_all(empty_proc_root.join("self")).unwrap();
+        let canonical_proc_root = empty_proc_root.canonicalize().unwrap();
+        fs::write(
+            empty_proc_root.join("self/mountinfo"),
+            format!(
+                "1 0 0:1 / {} rw - proc proc rw\n",
+                canonical_proc_root.display()
+            ),
+        )
+        .unwrap();
         init_repo(&home, &repo);
 
         let pm = Pm::init(&root.path().join("pm")).expect("isolated PM");
@@ -1266,6 +1820,7 @@ impl Fixture {
         let mut cmd = self.cli();
         cmd.args(["issue", "finish", id, "--worktree"])
             .arg(lane)
+            .env("CADENCE_TEST_PROC_ROOT", &self.empty_proc_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd
@@ -1278,6 +1833,7 @@ struct GitObserver {
     entered: PathBuf,
     gate: PathBuf,
     events: PathBuf,
+    wait_match: Option<String>,
 }
 
 impl GitObserver {
@@ -1288,7 +1844,7 @@ impl GitObserver {
         let shim = bin.join("git");
         fs::write(
             &shim,
-            "#!/bin/sh\nset -eu\ncase \" $* \" in\n  *\" worktree remove \"*)\n    printf '%s\\n' \"$*\" >> \"$CADENCE_C848_EVENTS\"\n    : > \"$CADENCE_C848_ENTERED\"\n    while [ ! -e \"$CADENCE_C848_GATE\" ]; do sleep 0.01; done\n    ;;\nesac\nexec \"$CADENCE_C848_REAL_GIT\" \"$@\"\n",
+            "#!/bin/sh\nset -eu\ncase \" $* \" in\n  *\" worktree remove \"*)\n    printf '%s\\n' \"$*\" >> \"$CADENCE_C848_EVENTS\"\n    : > \"$CADENCE_C848_ENTERED\"\n    while [ ! -e \"$CADENCE_C848_GATE\" ]; do sleep 0.01; done\n    ;;\nesac\nif [ -n \"${CADENCE_C848_WAIT_MATCH:-}\" ]; then\n  case \" $* \" in\n    *\"$CADENCE_C848_WAIT_MATCH\"*)\n      : > \"$CADENCE_C848_ENTERED\"\n      while [ ! -e \"$CADENCE_C848_GATE\" ]; do sleep 0.01; done\n      ;;\n  esac\nfi\nexec \"$CADENCE_C848_REAL_GIT\" \"$@\"\n",
         )
         .unwrap();
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1298,10 +1854,17 @@ impl GitObserver {
             entered: dir.join("entered"),
             gate: dir.join("continue"),
             events: dir.join("events"),
+            wait_match: None,
         };
         if gate_open {
             fs::write(&observer.gate, "continue\n").unwrap();
         }
+        observer
+    }
+
+    fn at_first_matching_git_arg(fx: &Fixture, name: &str, needle: String) -> Self {
+        let mut observer = Self::new(fx, name, false);
+        observer.wait_match = Some(needle);
         observer
     }
 
@@ -1314,7 +1877,11 @@ impl GitObserver {
             .env("CADENCE_C848_REAL_GIT", &self.real_git)
             .env("CADENCE_C848_ENTERED", &self.entered)
             .env("CADENCE_C848_GATE", &self.gate)
-            .env("CADENCE_C848_EVENTS", &self.events);
+            .env("CADENCE_C848_EVENTS", &self.events)
+            .env(
+                "CADENCE_C848_WAIT_MATCH",
+                self.wait_match.as_deref().unwrap_or(""),
+            );
     }
 }
 

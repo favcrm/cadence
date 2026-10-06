@@ -12,6 +12,7 @@ use cadence_agent::issue::{
     start::{self, StartArgs},
     write, Pm,
 };
+use cadence_agent::worktree::lifecycle;
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -218,6 +219,20 @@ struct FakeCredentials<'a> {
     cap_eff: u64,
 }
 
+fn write_proc_mountinfo(proc_root: &Path, hidepid: Option<u8>) {
+    fs::create_dir_all(proc_root.join("self")).unwrap();
+    let super_options =
+        hidepid.map_or_else(|| "rw".to_string(), |value| format!("rw,hidepid={value}"));
+    fs::write(
+        proc_root.join("self/mountinfo"),
+        format!(
+            "29 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc {super_options}\n31 23 0:5 net:[4026532471] /run/cad848-netns rw - nsfs nsfs rw\n",
+            proc_root.canonicalize().unwrap().display()
+        ),
+    )
+    .unwrap();
+}
+
 fn fake_process(
     proc_root: &Path,
     pid: u32,
@@ -225,9 +240,19 @@ fn fake_process(
     cwd: &Path,
     fds: &[(&str, &Path)],
 ) -> PathBuf {
+    fake_process_with_state(proc_root, pid, credentials, "S", Some(cwd), fds)
+}
+
+fn fake_process_with_state(
+    proc_root: &Path,
+    pid: u32,
+    credentials: FakeCredentials<'_>,
+    state: &str,
+    cwd: Option<&Path>,
+    fds: &[(&str, &Path)],
+) -> PathBuf {
     let proc_dir = proc_root.join(pid.to_string());
-    let fd_dir = proc_dir.join("fd");
-    fs::create_dir_all(&fd_dir).unwrap();
+    fs::create_dir_all(&proc_dir).unwrap();
     let groups = credentials
         .groups
         .iter()
@@ -237,16 +262,20 @@ fn fake_process(
     fs::write(
         proc_dir.join("status"),
         format!(
-            "Name:\tfixture\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nGroups:\t{groups}\nCapEff:\t{cap_eff:016x}\n",
+            "Name:\tfixture\nState:\t{state} (fixture)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nGroups:\t{groups}\nCapEff:\t{cap_eff:016x}\n",
             uid = credentials.uid,
             gid = credentials.gid,
             cap_eff = credentials.cap_eff,
         ),
     )
     .unwrap();
-    symlink(cwd, proc_dir.join("cwd")).unwrap();
-    for (fd, target) in fds {
-        symlink(target, fd_dir.join(fd)).unwrap();
+    if let Some(cwd) = cwd {
+        symlink(cwd, proc_dir.join("cwd")).unwrap();
+        let fd_dir = proc_dir.join("fd");
+        fs::create_dir_all(&fd_dir).unwrap();
+        for (fd, target) in fds {
+            symlink(target, fd_dir.join(fd)).unwrap();
+        }
     }
     proc_dir
 }
@@ -378,12 +407,18 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         process_target.is_dir(),
         "process uncertainty deleted target"
     );
+    assert!(
+        process_lane.join("unmerged.txt").is_file(),
+        "process uncertainty deleted source"
+    );
     assert_registration(
         &process_fixture,
         &process_lane,
         &process_branch,
         &process_tip,
     );
+    let process_ledger_path = process_fixture.repo.join(".cadence/managed-checkouts.json");
+    let process_ledger_before = fs::read(&process_ledger_path).unwrap();
     let result = process_fixture.reclaim(ReclaimTestProcessUse::CompleteNoUse);
     assert_reclaimed(&result);
     assert!(
@@ -399,6 +434,11 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         &process_lane,
         &process_branch,
         &process_tip,
+    );
+    assert_eq!(
+        fs::read(&process_ledger_path).unwrap(),
+        process_ledger_before,
+        "target-cache reclaim changed lifecycle metadata"
     );
 
     // With a complete no-use scan, an unreadable source directory makes the
@@ -430,6 +470,10 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         fs::read(unreadable_source.join("keep")).unwrap(),
         b"CAD848-SOURCE-KEEP\n"
     );
+    assert!(
+        walk_lane.join("unmerged.txt").is_file(),
+        "incomplete idle walk deleted source"
+    );
     assert_registration(&walk_fixture, &walk_lane, &walk_branch, &walk_tip);
 
     // Both scenarios would delete only the lane-local cache once their
@@ -459,6 +503,7 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         .prefix("c848proc-owner-")
         .tempdir_in("/tmp")
         .unwrap();
+    write_proc_mountinfo(owner_proc_root.path(), None);
     let owner_elsewhere = owner_proc_root.path().join("elsewhere");
     fs::create_dir(&owner_elsewhere).unwrap();
     let owner_pid = u32::MAX - 2;
@@ -500,6 +545,10 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         "owner-holder scan error did not identify the refusing PID: {reason}"
     );
     assert_eq!(fs::read(&owner_sentinel).unwrap(), TARGET_CONTENT);
+    assert!(
+        owner_lane.join("unmerged.txt").is_file(),
+        "owner EACCES deleted source"
+    );
     assert_registration(&owner_fixture, &owner_lane, &owner_branch, &owner_tip);
 
     // A foreign UID cannot traverse the private root, but an inaccessible FD
@@ -525,6 +574,7 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         .prefix("c848proc-foreign-")
         .tempdir_in("/tmp")
         .unwrap();
+    write_proc_mountinfo(foreign_proc_root.path(), None);
     let foreign_elsewhere = foreign_proc_root.path().join("elsewhere");
     fs::create_dir(&foreign_elsewhere).unwrap();
     let foreign_pid = u32::MAX - 1;
@@ -592,6 +642,7 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         .prefix("c848proc-root-")
         .tempdir_in("/tmp")
         .unwrap();
+    write_proc_mountinfo(root_proc_root.path(), None);
     let root_elsewhere = root_proc_root.path().join("elsewhere");
     fs::create_dir(&root_elsewhere).unwrap();
     let root_pid = u32::MAX - 4;
@@ -632,6 +683,10 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         "root-holder FD scan error was not fail-closed: {reason}"
     );
     assert_eq!(fs::read(&root_sentinel).unwrap(), TARGET_CONTENT);
+    assert!(
+        root_lane.join("unmerged.txt").is_file(),
+        "root EACCES deleted source"
+    );
     assert_registration(&root_fixture, &root_lane, &root_branch, &root_tip);
 
     // A foreign UID with the checkout group can traverse the temp-root path.
@@ -656,6 +711,7 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         .prefix("c848proc-group-")
         .tempdir_in("/tmp")
         .unwrap();
+    write_proc_mountinfo(group_proc_root.path(), None);
     let group_elsewhere = group_proc_root.path().join("elsewhere");
     fs::create_dir(&group_elsewhere).unwrap();
     let group_proc = fake_process(
@@ -691,6 +747,10 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         "group-traversable foreign process was not fail-closed: {reason}"
     );
     assert_eq!(fs::read(&group_sentinel).unwrap(), TARGET_CONTENT);
+    assert!(
+        group_lane.join("unmerged.txt").is_file(),
+        "group EACCES deleted source"
+    );
     assert_registration(&group_fixture, &group_lane, &group_branch, &group_tip);
 
     // A visible foreign-UID process is still checked. Its cwd is elsewhere,
@@ -712,6 +772,7 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         .prefix("c848proc-visible-")
         .tempdir_in("/tmp")
         .unwrap();
+    write_proc_mountinfo(visible_proc_root.path(), None);
     let visible_elsewhere = visible_proc_root.path().join("elsewhere");
     fs::create_dir(&visible_elsewhere).unwrap();
     let visible_pid = u32::MAX;
@@ -734,10 +795,286 @@ fn cad848_reclaim_refuses_incomplete_enumeration() {
         "visible foreign FD did not trigger the open-FD guard: {reason}"
     );
     assert_eq!(fs::read(&visible_sentinel).unwrap(), TARGET_CONTENT);
+    assert!(
+        visible_lane.join("unmerged.txt").is_file(),
+        "visible FD holder deleted source"
+    );
     assert_registration(
         &visible_fixture,
         &visible_lane,
         &visible_branch,
         &visible_tip,
+    );
+
+    let hidden_fixture = Fixture::new("hidepid omits other uid");
+    let (hidden_lane, hidden_branch, hidden_tip) = hidden_fixture.start_unmerged_lane();
+    let hidden_target = target_with_sentinel(&hidden_lane);
+    let hidden_sentinel = hidden_target.join(TARGET_SENTINEL);
+    let hidden_proc_root = Builder::new()
+        .prefix("c848proc-hidepid-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    write_proc_mountinfo(hidden_proc_root.path(), Some(2));
+    assert!(fs::read_dir(hidden_proc_root.path())
+        .unwrap()
+        .all(|entry| entry.unwrap().file_name() == "self"));
+    let result = hidden_fixture.reclaim_from_proc_root(hidden_proc_root.path());
+    let reason = refusal_reason(&result, "Cannot fully enumerate process cwd/open-fd use");
+    assert!(
+        reason.to_ascii_lowercase().contains("hidepid"),
+        "restricted PID visibility was not the refusal reason: {reason}"
+    );
+    assert_eq!(fs::read(&hidden_sentinel).unwrap(), TARGET_CONTENT);
+    assert!(hidden_target.is_dir());
+    assert!(hidden_lane.join("unmerged.txt").is_file());
+    assert_registration(&hidden_fixture, &hidden_lane, &hidden_branch, &hidden_tip);
+
+    let visibility_fixture = Fixture::new("missing proc mountinfo");
+    let (visibility_lane, visibility_branch, visibility_tip) =
+        visibility_fixture.start_unmerged_lane();
+    let visibility_target = target_with_sentinel(&visibility_lane);
+    let visibility_sentinel = visibility_target.join(TARGET_SENTINEL);
+    let missing_proc_root = Builder::new()
+        .prefix("c848proc-no-mountinfo-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let missing = visibility_fixture.reclaim_from_proc_root(missing_proc_root.path());
+    let missing_reason = refusal_reason(&missing, "Cannot fully enumerate process cwd/open-fd use");
+    assert!(
+        missing_reason.to_ascii_lowercase().contains("mountinfo"),
+        "missing visibility metadata was not identified: {missing_reason}"
+    );
+    assert_eq!(fs::read(&visibility_sentinel).unwrap(), TARGET_CONTENT);
+    assert!(
+        visibility_lane.join("unmerged.txt").is_file(),
+        "missing mountinfo deleted source"
+    );
+    assert_registration(
+        &visibility_fixture,
+        &visibility_lane,
+        &visibility_branch,
+        &visibility_tip,
+    );
+
+    let malformed_proc_root = Builder::new()
+        .prefix("c848proc-malformed-mountinfo-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::create_dir_all(malformed_proc_root.path().join("self")).unwrap();
+    fs::write(
+        malformed_proc_root.path().join("self/mountinfo"),
+        "not a mountinfo record\n",
+    )
+    .unwrap();
+    let malformed = visibility_fixture.reclaim_from_proc_root(malformed_proc_root.path());
+    let malformed_reason =
+        refusal_reason(&malformed, "Cannot fully enumerate process cwd/open-fd use");
+    assert!(
+        malformed_reason.to_ascii_lowercase().contains("mountinfo"),
+        "malformed visibility metadata was not identified: {malformed_reason}"
+    );
+    assert_eq!(fs::read(&visibility_sentinel).unwrap(), TARGET_CONTENT);
+    assert!(visibility_target.is_dir());
+    assert!(visibility_lane.join("unmerged.txt").is_file());
+    assert_registration(
+        &visibility_fixture,
+        &visibility_lane,
+        &visibility_branch,
+        &visibility_tip,
+    );
+
+    let invalid_escape_proc_root = Builder::new()
+        .prefix("c848proc-invalid-mountinfo-escape-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    write_proc_mountinfo(invalid_escape_proc_root.path(), None);
+    let mountinfo_path = invalid_escape_proc_root.path().join("self/mountinfo");
+    let mut mountinfo = fs::read_to_string(&mountinfo_path).unwrap();
+    mountinfo.push_str(
+        r"30 23 0:56 / /mnt/cad848\440-unrelated rw,nosuid,nodev,noexec,relatime - ext4 /dev/test rw
+",
+    );
+    fs::write(&mountinfo_path, mountinfo).unwrap();
+    let invalid_escape = visibility_fixture.reclaim_from_proc_root(invalid_escape_proc_root.path());
+    let invalid_escape_reason = refusal_reason(
+        &invalid_escape,
+        "Cannot fully enumerate process cwd/open-fd use",
+    );
+    assert!(
+        invalid_escape_reason
+            .to_ascii_lowercase()
+            .contains("mountinfo"),
+        "invalid octal escape was accepted as a mountinfo path: {invalid_escape_reason}"
+    );
+    assert_eq!(fs::read(&visibility_sentinel).unwrap(), TARGET_CONTENT);
+    assert!(visibility_target.is_dir());
+    assert!(visibility_lane.join("unmerged.txt").is_file());
+    assert_registration(
+        &visibility_fixture,
+        &visibility_lane,
+        &visibility_branch,
+        &visibility_tip,
+    );
+
+    for state in ["Z", "X"] {
+        let dead_fixture = Fixture::new(&format!("known-dead {state} process"));
+        let (dead_lane, dead_branch, dead_tip) = dead_fixture.start_unmerged_lane();
+        let dead_target = target_with_sentinel(&dead_lane);
+        let dead_proc_root = Builder::new()
+            .prefix("c848proc-dead-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        write_proc_mountinfo(dead_proc_root.path(), None);
+        fake_process_with_state(
+            dead_proc_root.path(),
+            u32::MAX - 10,
+            FakeCredentials {
+                uid: 0,
+                gid: 0,
+                groups: &[],
+                cap_eff: 0,
+            },
+            state,
+            None,
+            &[],
+        );
+        let result = dead_fixture.reclaim_from_proc_root(dead_proc_root.path());
+        assert_reclaimed(&result);
+        assert!(
+            !dead_target.exists(),
+            "known-dead {state} process blocked cleanup"
+        );
+        assert!(dead_lane.join("unmerged.txt").is_file());
+        assert_registration(&dead_fixture, &dead_lane, &dead_branch, &dead_tip);
+    }
+
+    let live_fixture = Fixture::new("live state with unavailable proc entries");
+    let (live_lane, live_branch, live_tip) = live_fixture.start_unmerged_lane();
+    let live_target = target_with_sentinel(&live_lane);
+    let live_sentinel = live_target.join(TARGET_SENTINEL);
+    let live_proc_root = Builder::new()
+        .prefix("c848proc-live-unknown-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    write_proc_mountinfo(live_proc_root.path(), None);
+    fake_process_with_state(
+        live_proc_root.path(),
+        u32::MAX - 11,
+        FakeCredentials {
+            uid: 0,
+            gid: 0,
+            groups: &[],
+            cap_eff: 0,
+        },
+        "S",
+        None,
+        &[],
+    );
+    let result = live_fixture.reclaim_from_proc_root(live_proc_root.path());
+    let reason = refusal_reason(&result, "Cannot fully enumerate process cwd/open-fd use");
+    assert!(
+        reason.contains(&format!("process {}", u32::MAX - 11)),
+        "live process with missing cwd/fd was not identified: {reason}"
+    );
+    assert_eq!(fs::read(&live_sentinel).unwrap(), TARGET_CONTENT);
+    assert!(live_target.is_dir());
+    assert!(
+        live_lane.join("unmerged.txt").is_file(),
+        "unavailable live proc entries deleted source"
+    );
+    assert_registration(&live_fixture, &live_lane, &live_branch, &live_tip);
+
+    let retained_fixture = Fixture::new("retained target refusal");
+    let (retained_lane, retained_branch, retained_tip) = retained_fixture.start_unmerged_lane();
+    let retained_target = target_with_sentinel(&retained_lane);
+    let retained_sentinel = retained_target.join(TARGET_SENTINEL);
+    let retained_reason = "CAD-848 preserve retained lane target";
+    lifecycle::transition(
+        &retained_fixture.repo,
+        &retained_lane,
+        "retained",
+        Some(retained_reason),
+    )
+    .expect("record retained lifecycle state");
+    let ledger_path = retained_fixture
+        .repo
+        .join(".cadence/managed-checkouts.json");
+    let issue_path = retained_fixture
+        .pm
+        .dir
+        .join(PROJECT)
+        .join(ISSUE)
+        .join("issue.md");
+    let ledger_before = fs::read(&ledger_path).unwrap();
+    let issue_before = fs::read(&issue_path).unwrap();
+    let branch_before = git(
+        &retained_fixture.home,
+        &retained_fixture.repo,
+        &["rev-parse", &retained_branch],
+    );
+    let plan = reclaim::plan_for_repo(
+        &retained_fixture.pm,
+        &retained_fixture.state,
+        IDLE_SECS,
+        &retained_fixture.repo,
+    )
+    .expect("read-only reclaim plan");
+    let plan_row = plan["cache_resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["resource"]["issue"].as_str() == Some(ISSUE))
+        .expect("retained lane cache plan row");
+    assert_ne!(plan_row["status"], "reclaimable-cache-only", "{plan_row}");
+    assert!(
+        plan_row["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains("retained"),
+        "plan did not identify retained lifecycle state: {plan_row}"
+    );
+    assert!(plan_row["reclaimable_bytes"].is_null(), "{plan_row}");
+    assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before);
+    assert_eq!(fs::read(&issue_path).unwrap(), issue_before);
+
+    let result = retained_fixture.reclaim(ReclaimTestProcessUse::CompleteNoUse);
+    let refused = result["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["issue"].as_str() == Some(ISSUE))
+        .expect("retained target reported as refused");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains("retained"),
+        "scheduled refusal did not identify retained lifecycle state: {refused}"
+    );
+    assert!(result["reclaimed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["issue"].as_str() != Some(ISSUE)));
+    assert_eq!(fs::read(&retained_sentinel).unwrap(), TARGET_CONTENT);
+    assert!(retained_target.is_dir());
+    assert!(retained_lane.join("unmerged.txt").is_file());
+    assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before);
+    assert_eq!(fs::read(&issue_path).unwrap(), issue_before);
+    assert_eq!(
+        git(
+            &retained_fixture.home,
+            &retained_fixture.repo,
+            &["rev-parse", &retained_branch],
+        ),
+        branch_before
+    );
+    assert_registration(
+        &retained_fixture,
+        &retained_lane,
+        &retained_branch,
+        &retained_tip,
     );
 }

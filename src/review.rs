@@ -2571,21 +2571,92 @@ pub fn run(opts: &Options) -> Result<i32> {
             });
             merge = json!({"attempted": true, "result": "clean"});
         } else {
-            let conflicts = git(
+            let unmerged_probe = git(
                 &tree.dir,
                 &["diff", "--name-only", "--diff-filter=U"],
                 t.git_secs,
-            )?;
-            let files: Vec<String> = conflicts
-                .lines()
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let _ = git_status(&tree.dir, &["merge", "--abort"], t.git_secs);
-            git(&tree.dir, &["checkout", "--detach", &head_sha], t.git_secs)?;
-            git(&tree.dir, &["reset", "--hard", &head_sha], t.git_secs)?;
-            merge = json!({"attempted": true, "result": "conflict",
-                "conflict_files": files});
+            );
+            let files = unmerged_probe.as_ref().ok().map(|unmerged| {
+                unmerged
+                    .lines()
+                    .map(str::to_string)
+                    .filter(|path| !path.is_empty())
+                    .collect::<Vec<_>>()
+            });
+            let merge_head_probe = git_status(
+                &tree.dir,
+                &["rev-parse", "--quiet", "--verify", "MERGE_HEAD^{commit}"],
+                t.git_secs,
+            );
+            let matching_merge_head = merge_head_probe.as_ref().ok().is_some_and(|probe| {
+                !probe.timed_out && probe.status == Some(0) && probe.stdout.trim() == head_sha
+            });
+            let actual_conflict = !m.timed_out
+                && m.status == Some(1)
+                && files.as_ref().is_some_and(|files| !files.is_empty())
+                && matching_merge_head;
+            let reason = if actual_conflict {
+                let conflict_files = files
+                    .as_ref()
+                    .map(|files| files.join(", "))
+                    .unwrap_or_else(|| "unmerged paths unavailable".into());
+                format!(
+                    "review merge of pinned head {head_sha} onto base {base_sha} has an actual conflict (unmerged files: {conflict_files}); preserve for explicit owner inspection and recovery"
+                )
+            } else {
+                let command_error = if m.timed_out {
+                    format!("git merge timed out after {}s", t.git_secs)
+                } else {
+                    format!("git merge exited with status {:?}", m.status)
+                };
+                let command_error = if !m.stderr.trim().is_empty() {
+                    format!("{command_error}: {}", m.stderr.trim())
+                } else if !m.stdout.trim().is_empty() {
+                    format!("{command_error}: {}", m.stdout.trim())
+                } else {
+                    command_error
+                };
+                let unmerged_state = match &unmerged_probe {
+                    Ok(_) if files.as_ref().is_some_and(|files| files.is_empty()) => {
+                        "no unmerged index paths".to_string()
+                    }
+                    Ok(_) => format!(
+                        "unmerged index paths: {}",
+                        files
+                            .as_ref()
+                            .map(|files| files.join(", "))
+                            .unwrap_or_default()
+                    ),
+                    Err(error) => format!("could not inspect unmerged paths: {error}"),
+                };
+                let merge_head_state = match &merge_head_probe {
+                    Err(error) => format!("could not verify MERGE_HEAD: {error}"),
+                    Ok(probe) if probe.timed_out => "MERGE_HEAD verification timed out".into(),
+                    Ok(probe) => match probe.status {
+                        Some(0) if probe.stdout.trim() == head_sha => {
+                            "MERGE_HEAD matches the pinned head".into()
+                        }
+                        Some(0) => format!(
+                            "MERGE_HEAD is {}, not the pinned head {head_sha}",
+                            probe.stdout.trim()
+                        ),
+                        Some(1) => "MERGE_HEAD is absent".into(),
+                        status => format!(
+                            "MERGE_HEAD verification exited with status {status:?}: {}",
+                            probe.stderr.trim()
+                        ),
+                    },
+                };
+                format!(
+                    "review merge command for pinned head {head_sha} onto base {base_sha} failed ({command_error}; {unmerged_state}; {merge_head_state}); preserve for explicit owner inspection and recovery"
+                )
+            };
+            tree.keep = true;
+            tree.retention_reason = Some(reason.clone());
+            return Err(Error::rejected(format!(
+                "review checkout {} retained after {reason}; no gates ran on the incomplete merge tree",
+                tree.dir.display()
+            )));
         }
     }
 
@@ -2919,8 +2990,23 @@ pub fn run(opts: &Options) -> Result<i32> {
             }
             comparisons.push(row);
         }
-        base_tree.keep = opts.keep;
-        base_tree.retention_reason = opts.keep.then(|| "review --keep requested".into());
+        if opts.keep {
+            base_tree.keep = true;
+            base_tree.retention_reason = Some("review --keep requested".into());
+        } else {
+            match base_tree.begin_release_guard() {
+                Ok(()) => {
+                    base_tree.keep = false;
+                    base_tree.retention_reason = None;
+                }
+                Err(error) => {
+                    base_tree.keep = true;
+                    base_tree.retention_reason = Some(format!(
+                        "comparison base checkout retained because its release guard could not be acquired: {error}"
+                    ));
+                }
+            }
+        }
         drop(base_tree);
     }
     // A failed full suite without a named testcase is still evidence that

@@ -519,6 +519,39 @@ fn declared_lane_root(pm: &Pm, issue: &board::Issue, lane: &Path) -> Result<Path
     Ok(root)
 }
 
+fn declared_issue_branch(issue: &board::Issue, lane: &Path) -> Result<String> {
+    let name = lane
+        .file_name()
+        .ok_or_else(|| Error::rejected(format!("{} has no lane name", lane.display())))?
+        .to_string_lossy();
+    let layout_branch = crate::worktree::layout::branch(&name);
+    if issue.front.refs.iter().any(|reference| {
+        reference.kind == "branch"
+            && reference.closed != Some(true)
+            && reference.path.as_deref() == Some(layout_branch.as_str())
+    }) {
+        return Ok(layout_branch);
+    }
+    let actual_branch = finish::git_branch(lane)?.ok_or_else(|| {
+        Error::rejected(format!(
+            "target lane {} has no checked-out branch to match its issue ref",
+            lane.display()
+        ))
+    })?;
+    if issue.front.refs.iter().any(|reference| {
+        reference.kind == "branch"
+            && reference.closed != Some(true)
+            && reference.path.as_deref() == Some(actual_branch.as_str())
+    }) {
+        return Ok(actual_branch);
+    }
+    Err(Error::rejected(format!(
+        "issue {} has no open branch ref matching target lane {} ({layout_branch} or {actual_branch})",
+        issue.front.id,
+        lane.display()
+    )))
+}
+
 fn plan_bounded(pm: &Pm, state_dir: &Path, idle_secs: u64) -> Result<Value> {
     let merged = finish::sweep(pm, None, false, true, "", state_dir)?;
     let view = finish::daemon_view(state_dir);
@@ -550,14 +583,42 @@ fn target_plan(
     let branch = lane
         .file_name()
         .map(|name| crate::worktree::layout::branch(&name.to_string_lossy()));
-    let base = json!({"issue": issue.front.id, "path": lane, "branch": branch.clone()});
+    let mut base = json!({"issue": issue.front.id, "path": lane, "branch": branch.clone()});
     if !lane.is_dir() {
         return json!({"resource": base, "status": "missing", "reason_code": "checkout-missing",
             "reason": "checkout is missing; branch and tracker refs are preserved", "reclaimable_bytes": 0});
     }
-    if let Err(e) = declared_lane_root(pm, issue, lane) {
-        return json!({"resource": base, "status": "refused",
-            "reason_code": "foreign-or-undeclared-project-repo", "reason": e.to_string(), "reclaimable_bytes": null});
+    let root = match declared_lane_root(pm, issue, lane) {
+        Ok(root) => root,
+        Err(e) => {
+            return json!({"resource": base, "status": "refused",
+                "reason_code": "foreign-or-undeclared-project-repo", "reason": e.to_string(), "reclaimable_bytes": null});
+        }
+    };
+    let branch = match declared_issue_branch(issue, lane) {
+        Ok(branch) => branch,
+        Err(e) => {
+            return json!({"resource": base, "status": "retained",
+                "reason_code": "issue-branch-ref-mismatch", "reason": e.to_string(), "reclaimable_bytes": null});
+        }
+    };
+    base["branch"] = json!(branch.clone());
+    if let Err(e) =
+        crate::worktree::lifecycle::validate_target_reclaim(&root, lane, &issue.front.id, &branch)
+    {
+        let record = crate::worktree::lifecycle::managed_record(&root, lane)
+            .ok()
+            .flatten();
+        let lifecycle = record.as_ref().map(|record| {
+            json!({
+                "state": record.state,
+                "reason": record.retention_reason.as_deref()
+                    .or(record.release_reason.as_deref()),
+            })
+        });
+        return json!({"resource": base, "status": "retained",
+            "reason_code": "lifecycle-ownership-or-state-refused", "reason": e.to_string(),
+            "lifecycle": lifecycle, "reclaimable_bytes": null});
     }
     let cargo_target = issue
         .front
@@ -667,7 +728,16 @@ fn reclaim_lane_with_context(
     if !lane.is_dir() {
         return Ok(ReclaimAttempt::Absent);
     }
-    declared_lane_root(context.pm, issue, lane)?;
+    let root = declared_lane_root(context.pm, issue, lane)?;
+    let branch = match declared_issue_branch(issue, lane) {
+        Ok(branch) => branch,
+        Err(reason) => return Ok(ReclaimAttempt::Skipped(reason.to_string())),
+    };
+    if let Err(reason) =
+        crate::worktree::lifecycle::validate_target_reclaim(&root, lane, &issue.front.id, &branch)
+    {
+        return Ok(ReclaimAttempt::Skipped(reason.to_string()));
+    }
     // The recorded cargo_target for this lane's open ref, if any — only
     // ever compared against the derived path, never deleted.
     let cargo_target = issue
@@ -698,6 +768,15 @@ fn reclaim_lane_with_context(
     // check→delete gap, proving the re-scan below catches it.
     #[cfg(test)]
     tests::before_rescan(lane);
+    let reclaim_guard = match crate::worktree::lifecycle::begin_target_reclaim(
+        &root,
+        lane,
+        &issue.front.id,
+        &branch,
+    ) {
+        Ok(guard) => guard,
+        Err(reason) => return Ok(ReclaimAttempt::Skipped(reason.to_string())),
+    };
     // I-C: re-fetch the daemon snapshot and re-run the live-use scan.
     let fresh = finish::daemon_view(context.state_dir);
     if let Some(appeared) = live_reason_with_process_probe(
@@ -712,15 +791,18 @@ fn reclaim_lane_with_context(
             lane = %lane.display(),
             reason = %appeared
         );
+        drop(reclaim_guard);
         return Ok(ReclaimAttempt::Skipped(appeared));
     }
     // Re-derive the one deletable path and re-verify it is still a real
     // dir immediately before the delete — a swap to a symlink must never
     // be followed.
     let Some(target) = reclaim_target(lane, cargo_target.as_deref())? else {
+        drop(reclaim_guard);
         return Ok(ReclaimAttempt::Absent);
     };
     std::fs::remove_dir_all(&target)?;
+    drop(reclaim_guard);
     // Log the freed bytes on the issue — a reclaim is recorded, never
     // silent.
     let text = format!(

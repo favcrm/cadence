@@ -24,6 +24,18 @@ const BINARY: &str = env!("CARGO_BIN_EXE_cadence");
 const PR: &str = "41";
 static REVIEW_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn write_full_proc_mountinfo(proc_root: &Path) {
+    fs::create_dir_all(proc_root.join("self")).unwrap();
+    fs::write(
+        proc_root.join("self/mountinfo"),
+        format!(
+            "29 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc rw\n",
+            proc_root.canonicalize().unwrap().display()
+        ),
+    )
+    .unwrap();
+}
+
 struct Fixture {
     _root: TempDir,
     repo: PathBuf,
@@ -36,12 +48,33 @@ struct Fixture {
     base_sha: String,
     head_sha: String,
     review_tree: PathBuf,
+    base_tree: PathBuf,
     changed_marker: PathBuf,
+    gate_probe: PathBuf,
+    conflict_marker: PathBuf,
+    conflict_edit: PathBuf,
+    inject_conflict: bool,
     proc_root: PathBuf,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::build(false, "true", false)
+    }
+
+    fn conflict() -> Self {
+        Self::build(true, "true", true)
+    }
+
+    fn comparison_failure() -> Self {
+        Self::build(
+            false,
+            "printf 'test named_failure ... FAILED\\n\\nfailures:\\n    named_failure\\n'; exit 1",
+            false,
+        )
+    }
+
+    fn build(inject_conflict: bool, full_suite: &str, observe_gate: bool) -> Self {
         let root = Builder::new()
             .prefix("c848review-")
             .tempdir_in("/tmp")
@@ -50,6 +83,7 @@ impl Fixture {
             .expect("restrict review fixture root to its owner");
         let proc_root = root.path().join("proc");
         fs::create_dir(&proc_root).unwrap();
+        write_full_proc_mountinfo(&proc_root);
         let repo = root.path().join("repo");
         let origin = root.path().join("origin.git");
         let state = root.path().join("state");
@@ -61,26 +95,49 @@ impl Fixture {
         fs::create_dir_all(&bin).unwrap();
 
         git(&repo, &["init", "--quiet", "--initial-branch=main"]);
+        let gate_probe = root.path().join("review-gate-ran");
+        let gates = if observe_gate {
+            format!("[\"touch {}\"]", gate_probe.display())
+        } else {
+            "[\"true\"]".to_string()
+        };
         fs::write(
             repo.join("cadence-review.toml"),
-            "prepare = []\ngates = [\"true\"]\nfull_suite = \"true\"\n\
-             test_globs = [\"tests/**\"]\ntest_command = \"true {test}\"\n\
-             stress_pattern = []\n",
+            format!(
+                "prepare = []\ngates = {gates}\nfull_suite = {full_suite:?}\n\
+                 test_globs = [\"tests/**\"]\ntest_command = \"true {{test}}\"\n\
+                 stress_pattern = []\n"
+            ),
         )
         .unwrap();
         fs::write(repo.join("base.txt"), "base\n").unwrap();
-        git(&repo, &["add", "cadence-review.toml", "base.txt"]);
+        fs::create_dir_all(repo.join("tests")).unwrap();
+        fs::write(
+            repo.join("tests/fixture.rs"),
+            "#[test]\nfn named_failure() {}\n",
+        )
+        .unwrap();
+        if inject_conflict {
+            fs::write(repo.join("conflict.txt"), "base conflict\n").unwrap();
+        }
+        git(&repo, &["add", "."]);
         git(&repo, &["commit", "--quiet", "-m", "fixture base"]);
 
         git(&repo, &["checkout", "--quiet", "-b", "pr-head"]);
         fs::write(repo.join("pr-only.txt"), "from PR\n").unwrap();
-        git(&repo, &["add", "pr-only.txt"]);
+        if inject_conflict {
+            fs::write(repo.join("conflict.txt"), "PR conflict\n").unwrap();
+        }
+        git(&repo, &["add", "."]);
         git(&repo, &["commit", "--quiet", "-m", "fixture PR change"]);
         let head_sha = git(&repo, &["rev-parse", "HEAD"]);
 
         git(&repo, &["checkout", "--quiet", "main"]);
         fs::write(repo.join("base-only.txt"), "from base\n").unwrap();
-        git(&repo, &["add", "base-only.txt"]);
+        if inject_conflict {
+            fs::write(repo.join("conflict.txt"), "base advance conflict\n").unwrap();
+        }
+        git(&repo, &["add", "."]);
         git(&repo, &["commit", "--quiet", "-m", "fixture base advance"]);
         let base_sha = git(&repo, &["rev-parse", "HEAD"]);
 
@@ -110,7 +167,10 @@ impl Fixture {
         let real_git = find_on_path("git");
         let events = root.path().join("git-events.jsonl");
         let review_tree = repo.join(".cadence/wt/review-41");
+        let base_tree = repo.join(".cadence/wt/review-41-base");
         let changed_marker = review_tree.join(".cad848-external-change");
+        let conflict_marker = root.path().join("merge-conflict-injected");
+        let conflict_edit = review_tree.join("base.txt");
 
         let gh_view = root.path().join("pr-view.json");
         fs::write(
@@ -158,12 +218,25 @@ esac
             base_sha,
             head_sha,
             review_tree,
+            base_tree,
             changed_marker,
+            gate_probe,
+            conflict_marker,
+            conflict_edit,
+            inject_conflict,
             proc_root,
         }
     }
 
     fn review(&self, externally_change_tree: bool, run_id: &str) -> Output {
+        self.review_mode(externally_change_tree, run_id, true)
+    }
+
+    fn comparison_review(&self, run_id: &str) -> Output {
+        self.review_mode(false, run_id, false)
+    }
+
+    fn review_mode(&self, externally_change_tree: bool, run_id: &str, no_full: bool) -> Output {
         let mut paths = vec![self.bin.clone()];
         paths.extend(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
@@ -178,21 +251,29 @@ esac
                 PR,
                 "--repo",
                 "fixture/repo",
-                "--no-full",
-                "--json",
             ])
+            .arg("--json")
             .current_dir(&self.repo)
             .env("PATH", path)
             .env("HOME", &self.home)
+            .env(
+                "CADENCE_SUITE_LOCK",
+                self._root.path().join("fixture-suite.lock"),
+            )
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", self.home.join("gitconfig"))
             .env("CADENCE_CAD848_REAL_GIT", &self.real_git)
             .env("CADENCE_CAD848_ROOT", &self.repo)
             .env("CADENCE_CAD848_REVIEW_TREE", &self.review_tree)
+            .env("CADENCE_CAD848_BASE_TREE", &self.base_tree)
             .env("CADENCE_CAD848_EXPECTED_HEAD", &self.head_sha)
             .env("CADENCE_CAD848_PROBE", self.probe_path(run_id))
             .env("CADENCE_CAD848_EVENTS", &self.events)
             .env("CADENCE_CAD848_RUN_ID", run_id)
+            .env(
+                "CADENCE_CAD848_CONFLICT_INDEX_SNAPSHOT",
+                self._root.path().join("conflict-index.before"),
+            )
             .env("CADENCE_TEST_PROC_ROOT", &self.proc_root)
             .env(
                 "CADENCE_CAD848_GH_VIEW",
@@ -206,10 +287,22 @@ esac
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE");
+        if no_full {
+            command.arg("--no-full");
+        }
         if externally_change_tree {
             command.env("CADENCE_CAD848_TAMPER_SENTINEL", &self.changed_marker);
         } else {
             command.env_remove("CADENCE_CAD848_TAMPER_SENTINEL");
+        }
+        if self.inject_conflict {
+            command
+                .env("CADENCE_CAD848_CONFLICT_MARKER", &self.conflict_marker)
+                .env("CADENCE_CAD848_CONFLICT_INJECT", &self.conflict_edit);
+        } else {
+            command
+                .env_remove("CADENCE_CAD848_CONFLICT_MARKER")
+                .env_remove("CADENCE_CAD848_CONFLICT_INJECT");
         }
         cadence_agent::reaper::output(&mut command).expect("run real cadence review CLI")
     }
@@ -221,6 +314,14 @@ esac
     }
 
     fn record(&self) -> Value {
+        self.record_for(&self.review_tree)
+    }
+
+    fn base_record(&self) -> Value {
+        self.record_for(&self.base_tree)
+    }
+
+    fn record_for(&self, path: &Path) -> Value {
         let ledger: Value = serde_json::from_slice(
             &fs::read(self.repo.join(".cadence/managed-checkouts.json"))
                 .expect("managed checkout ledger"),
@@ -231,7 +332,7 @@ esac
             .unwrap()
             .iter()
             .rev()
-            .find(|row| row["path"].as_str() == Some(self.review_tree.to_str().unwrap()))
+            .find(|row| row["path"].as_str() == Some(path.to_str().unwrap()))
             .cloned()
             .expect("review checkout lifecycle record")
     }
@@ -341,6 +442,186 @@ fn assert_release_guard_events(fixture: &Fixture, run_id: &str) {
         ],
         "release lock must span restoration through removal for {run_id}"
     );
+}
+
+fn assert_base_release(fixture: &Fixture, run_id: &str) {
+    assert!(
+        !fixture.base_tree.exists(),
+        "comparison base checkout remains after {run_id}"
+    );
+    assert!(!registered(&fixture.repo, &fixture.base_tree));
+    let events = fs::read_to_string(&fixture.events).unwrap();
+    let probes: Vec<Value> = events
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| {
+            event["kind"] == "release-lock-probe"
+                && event["run_id"] == run_id
+                && event["phase"] == "base-worktree-remove"
+        })
+        .collect();
+    assert_eq!(probes.len(), 1, "base removal lock probe missing: {events}");
+    assert_eq!(probes[0]["blocked"], true);
+    let removal = events
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["kind"] == "base-checkout-remove" && event["run_id"] == run_id)
+        .expect("base checkout removal evidence");
+    assert_eq!(removal["state_before_remove"], "releasing");
+    assert_eq!(removal["force"], false);
+    assert_eq!(removal["removed"], true);
+    let record = fixture.base_record();
+    assert_eq!(record["state"], "released");
+    assert!(record["retention_reason"].is_null());
+}
+
+#[test]
+fn cad848_conflict_retains_tracked_edit_index_and_merge_state() {
+    let _lock = REVIEW_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let fixture = Fixture::conflict();
+    let output = fixture.review(false, "conflict");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "merge conflict was reported as a successful review: {text}"
+    );
+    assert!(text.to_ascii_lowercase().contains("conflict"), "{text}");
+    assert!(
+        text.contains(&fixture.review_tree.display().to_string()),
+        "blocked result did not name the retained lane: {text}"
+    );
+    assert!(
+        text.contains("conflict.txt"),
+        "blocked result omitted conflicts: {text}"
+    );
+    assert!(fixture.conflict_marker.is_file());
+    assert_eq!(
+        fs::read_to_string(&fixture.conflict_edit).unwrap(),
+        "external tracked edit after merge conflict\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.review_tree.join("pr-only.txt")).unwrap(),
+        "from PR\n",
+        "conflict handling changed the source tree"
+    );
+    let index_path = PathBuf::from(git(
+        &fixture.review_tree,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    ));
+    assert_eq!(
+        fs::read(index_path).unwrap(),
+        fs::read(fixture._root.path().join("conflict-index.before")).unwrap(),
+        "conflict index changed after merge failure"
+    );
+    assert_eq!(
+        git(
+            &fixture.review_tree,
+            &["rev-parse", "--verify", "MERGE_HEAD"],
+        ),
+        fixture.head_sha
+    );
+    let unmerged = git(&fixture.review_tree, &["ls-files", "--unmerged"]);
+    for stage in [" 1\tconflict.txt", " 2\tconflict.txt", " 3\tconflict.txt"] {
+        assert!(
+            unmerged.contains(stage),
+            "conflict stages changed: {unmerged}"
+        );
+    }
+    let status = git(
+        &fixture.review_tree,
+        &["status", "--porcelain", "--untracked-files=all"],
+    );
+    assert!(
+        status
+            .lines()
+            .any(|line| line.ends_with("base.txt") && line.starts_with(" M")),
+        "{status}"
+    );
+    assert!(fixture.review_tree.is_dir());
+    assert!(registered(&fixture.repo, &fixture.review_tree));
+    let record = fixture.record();
+    assert_eq!(record["state"], "retained");
+    assert!(record["retention_reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains("conflict"));
+    assert!(
+        !fixture.gate_probe.exists(),
+        "gates ran on an unresolved merge"
+    );
+    assert!(!fixture.probe_path("conflict").exists());
+    let events = fs::read_to_string(&fixture.events).unwrap();
+    assert!(
+        events.contains("merge-conflict"),
+        "merge conflict was not observed: {events}"
+    );
+    for line in events.lines() {
+        let event: Value = serde_json::from_str(line).unwrap();
+        assert_ne!(
+            event["kind"], "post-conflict-operation",
+            "conflict checkout was aborted, checked out, reset or removed: {event}"
+        );
+    }
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "refs/heads/main"]),
+        fixture.base_sha
+    );
+    assert_eq!(
+        git(
+            &fixture.origin,
+            &["rev-parse", &format!("refs/pull/{PR}/head")]
+        ),
+        fixture.head_sha
+    );
+}
+
+#[test]
+fn cad848_named_failure_comparison_releases_base_checkout_twice() {
+    let _lock = REVIEW_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let fixture = Fixture::comparison_failure();
+    for run_id in ["comparison-first", "comparison-second"] {
+        let output = fixture.comparison_review(run_id);
+        assert!(
+            !output.stdout.is_empty(),
+            "comparison review report missing: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).expect("comparison review JSON");
+        let comparison = report["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["test"].as_str() == Some("named_failure"))
+            .expect("named failure comparison row");
+        assert_eq!(comparison["gated"]["outcome"], "pass", "{comparison}");
+        assert_eq!(comparison["base"]["outcome"], "pass", "{comparison}");
+        assert_base_release(&fixture, run_id);
+        assert!(
+            !fixture.review_tree.exists(),
+            "main review checkout remains after {run_id}"
+        );
+        assert!(!registered(&fixture.repo, &fixture.review_tree));
+        assert_eq!(
+            git(&fixture.repo, &["rev-parse", "refs/heads/main"]),
+            fixture.base_sha
+        );
+        assert_eq!(
+            git(
+                &fixture.origin,
+                &["rev-parse", &format!("refs/pull/{PR}/head")]
+            ),
+            fixture.head_sha
+        );
+    }
 }
 
 #[test]
@@ -482,7 +763,9 @@ fn git(cwd: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string()
 }
 
 fn find_on_path(program: &str) -> PathBuf {
@@ -506,6 +789,10 @@ args = sys.argv[1:]
 real = os.environ["CADENCE_CAD848_REAL_GIT"]
 root = os.environ["CADENCE_CAD848_ROOT"]
 tree = os.environ["CADENCE_CAD848_REVIEW_TREE"]
+base_tree = os.path.realpath(os.environ["CADENCE_CAD848_BASE_TREE"])
+conflict_marker = os.environ.get("CADENCE_CAD848_CONFLICT_MARKER", "")
+conflict_inject = os.environ.get("CADENCE_CAD848_CONFLICT_INJECT", "")
+conflict_index = os.environ.get("CADENCE_CAD848_CONFLICT_INDEX_SNAPSHOT", "")
 probe_path = os.environ["CADENCE_CAD848_PROBE"]
 events_path = os.environ["CADENCE_CAD848_EVENTS"]
 run_id = os.environ["CADENCE_CAD848_RUN_ID"]
@@ -574,17 +861,49 @@ def destructive():
     return False
 
 
-remove = "worktree" in args and "remove" in args and any(
+remove_command = "worktree" in args and "remove" in args
+remove_main = remove_command and any(
     not arg.startswith("-") and os.path.realpath(arg) == os.path.realpath(tree)
     for arg in args
 )
-if in_tree() and "merge" in args and "--abort" in args:
+remove_base = remove_command and any(
+    not arg.startswith("-") and os.path.realpath(arg) == base_tree for arg in args
+)
+remove = remove_main or remove_base
+post_conflict = bool(conflict_marker and os.path.exists(conflict_marker))
+conflict_abort = "merge" in args and "--abort" in args
+conflict_operation = (
+    conflict_abort or "checkout" in args or "reset" in args or remove
+)
+if post_conflict and (in_tree() or remove) and conflict_operation:
+    log_event({"kind": "post-conflict-operation", "run_id": run_id, "args": args})
+if in_tree() and conflict_abort and not post_conflict:
     require_release_lock("merge-abort")
 if (in_tree() and "checkout" in args and "--detach" in args
-        and os.environ["CADENCE_CAD848_EXPECTED_HEAD"] in args):
+        and os.environ["CADENCE_CAD848_EXPECTED_HEAD"] in args and not post_conflict):
     require_release_lock("pinned-checkout")
-if remove:
+if remove_main and not post_conflict:
     require_release_lock("worktree-remove")
+if remove_base:
+    require_release_lock("base-worktree-remove")
+
+if (in_tree() and "merge" in args and "--no-commit" in args
+        and "--no-ff" in args):
+    result = subprocess.run([real, *args], env=os.environ.copy())
+    if result.returncode != 0 and conflict_inject:
+        conflicts = git("-C", tree, "diff", "--name-only", "--diff-filter=U").stdout.splitlines()
+        if conflicts:
+            index_path = git("-C", tree, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout.strip()
+            with open(index_path, "rb") as stream:
+                index_bytes = stream.read()
+            with open(conflict_index, "wb") as stream:
+                stream.write(index_bytes)
+            with open(conflict_inject, "w", encoding="utf-8") as stream:
+                stream.write("external tracked edit after merge conflict\n")
+            with open(conflict_marker, "w", encoding="utf-8") as stream:
+                stream.write("merge conflict observed\n")
+            log_event({"kind": "merge-conflict", "run_id": run_id, "files": conflicts})
+    sys.exit(result.returncode)
 
 sentinel = os.environ.get("CADENCE_CAD848_TAMPER_SENTINEL", "")
 changed = bool(sentinel and os.path.exists(sentinel))
@@ -595,7 +914,24 @@ if changed and (in_tree() or remove):
         print("refusing destructive operation on externally changed review tree", file=sys.stderr)
         sys.exit(93)
 
-if remove:
+if remove_base:
+    record_path = os.path.join(root, ".cadence", "managed-checkouts.json")
+    records = json.load(open(record_path, encoding="utf-8"))["records"]
+    record = next((row for row in reversed(records)
+                   if os.path.realpath(row["path"]) == base_tree), None)
+    force = "--force" in args or "-f" in args
+    event = {"kind": "base-checkout-remove", "run_id": run_id,
+             "state_before_remove": record.get("state") if record else None,
+             "force": force}
+    if not record or record.get("state") != "releasing" or force:
+        print("base checkout removal lacked its held release state: " + json.dumps(event), file=sys.stderr)
+        sys.exit(94)
+    result = subprocess.run([real, *args], env=os.environ.copy())
+    event["removed"] = result.returncode == 0 and not os.path.exists(base_tree)
+    log_event(event)
+    sys.exit(result.returncode)
+
+if remove_main:
     record_path = os.path.join(root, ".cadence", "managed-checkouts.json")
     records = json.load(open(record_path, encoding="utf-8"))["records"]
     record = next((row for row in reversed(records)
