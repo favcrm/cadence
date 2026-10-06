@@ -32,9 +32,17 @@ use super::Store;
 #[path = "owner.rs"]
 pub(crate) mod owner;
 
-#[cfg(test)]
+#[cfg(any(
+    test,
+    all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )
+))]
 #[path = "owner_guard.rs"]
-mod owner_guard;
+pub(crate) mod owner_guard;
 
 /// Raw SQLite callers must distinguish a lease refusal from a closure
 /// refusal or a callback rejection. Only this module can construct the
@@ -749,6 +757,29 @@ pub(super) enum PreflightDecision {
 }
 
 impl Store {
+    /// Closed native diagnostic on the SAME genuinely opened Store. Root must
+    /// establish healthy original consumed/current custody and a writer-free
+    /// window outside this local probe; its result is not remote CAS evidence.
+    #[cfg(all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub(crate) fn reconsume_owned_opening(&self) -> Result<()> {
+        let owner = self
+            .seal_state
+            .owner
+            .lock()
+            .map_err(|_| Error::rejected("retained opening replay Store owner is poisoned"))?;
+        owner
+            .as_ref()
+            .ok_or_else(|| {
+                Error::rejected("retained opening replay has no authenticated Store owner")
+            })?
+            .reconsume_opening()
+    }
+
     /// Read-only preflight on the file — zero business writes before the
     /// decision. Runs *before* the writable `Connection::open`/WAL flip.
     pub(super) fn preflight(path: &Path, mode: OpenMode) -> Result<PreflightDecision> {

@@ -161,6 +161,17 @@ pub(in crate::store) struct CurrentDatabase {
     grant: Arc<StoreOwnerGrant>,
 }
 impl CurrentDatabase {
+    /// Borrow the original retained capability; never mint/clone/expose one or
+    /// recheck current/SQLite inside the measured LOCAL consumed replay probe.
+    #[cfg(all(
+        debug_assertions,
+        feature = "test-seam",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub(super) fn reconsume_opening(&self) -> Result<()> {
+        self.grant.consume()
+    }
     pub(super) fn binding(&self) -> &Binding {
         self.grant.binding()
     }
