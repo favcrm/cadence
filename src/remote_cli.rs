@@ -204,10 +204,26 @@ fn post(
     Ok((status, retry_after, value))
 }
 
+fn request_timeout(deadline: Instant, cap: Duration) -> Result<Duration> {
+    let exhausted = || {
+        Error::busy_coded(
+            "waking",
+            "remote wake budget exhausted — retry or increase --wake-timeout",
+        )
+    };
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(exhausted)?;
+    if remaining.is_zero() {
+        return Err(exhausted());
+    }
+    Ok(remaining.min(cap))
+}
+
 /// `POST /__platform/cli/authorize` — exchange the live `hct_` for one
 /// cli-scoped actor envelope. The request is the strict AOS-128 shape;
 /// the answer must echo the version and carry a compact-JWS envelope.
-fn authorize(target: &RemoteTarget, cred: &Credential) -> Result<String> {
+fn authorize(target: &RemoteTarget, cred: &Credential, timeout: Duration) -> Result<String> {
     let (status, _, body) = post(
         &target.endpoint,
         "/__platform/cli/authorize",
@@ -219,7 +235,7 @@ fn authorize(target: &RemoteTarget, cred: &Credential) -> Result<String> {
             "requested_scopes": ["cli.read", "cli.write"],
             "ttl_seconds": MAX_TTL,
         }),
-        AUTH_TIMEOUT,
+        timeout,
     )?;
     let body = body.ok_or_else(|| reject("remote authorize answered non-JSON"))?;
     match status {
@@ -254,8 +270,9 @@ fn call_once(
     cred: &Credential,
     verb: &str,
     arguments: &Map<String, Value>,
+    deadline: Instant,
 ) -> Result<(u16, Option<u64>, Option<Value>)> {
-    let envelope = authorize(target, cred)?;
+    let envelope = authorize(target, cred, request_timeout(deadline, AUTH_TIMEOUT)?)?;
     let mut body = json!({
         "version": CLI_VERSION,
         "envelope": envelope,
@@ -269,7 +286,7 @@ fn call_once(
         "/__platform/cli/call",
         &cred.access_token,
         &body,
-        CALL_TIMEOUT,
+        request_timeout(deadline, CALL_TIMEOUT)?,
     )
 }
 
@@ -355,25 +372,33 @@ fn call_verb_in(
         )));
     }
     let cred = load_credential(dir, target)?;
-    let deadline = Instant::now() + Duration::from_secs(wake_timeout);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(wake_timeout))
+        .ok_or_else(|| reject("invalid wake timeout"))?;
+    let budget_over = || -> Error {
+        // The remote was still waking when the budget ran out —
+        // retryable by the operator's own choice, so `busy` (75)
+        // with the `waking` code the contract pins.
+        Error::busy_coded(
+            "waking",
+            format!(
+                "org '{}' is still waking after {}s — retry, or pass a \
+                 larger --wake-timeout",
+                target.org, wake_timeout
+            ),
+        )
+    };
     loop {
-        let (status, retry_after, body) = call_once(target, &cred, verb, &arguments)?;
+        let (status, retry_after, body) = call_once(target, &cred, verb, &arguments, deadline)?;
         match classify(status, retry_after, body) {
             Verdict::Done(result) => return result,
             Verdict::Waking(wait) => {
                 let now = Instant::now();
-                if now + wait > deadline {
-                    // The remote was still waking when the budget ran out —
-                    // retryable by the operator's own choice, so `busy` (75)
-                    // with the `waking` code the contract pins.
-                    return Err(Error::busy_coded(
-                        "waking",
-                        format!(
-                            "org '{}' is still waking after {}s — retry, or pass a \
-                             larger --wake-timeout",
-                            target.org, wake_timeout
-                        ),
-                    ));
+                let remaining = deadline
+                    .checked_duration_since(now)
+                    .ok_or_else(budget_over)?;
+                if wait >= remaining {
+                    return Err(budget_over());
                 }
                 note(&format!("waking {}… ({}s)", target.org, wait.as_secs()));
                 sleep(wait);
@@ -388,6 +413,7 @@ mod tests {
     use serde_json::json;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
+    use std::path::PathBuf;
     use std::thread;
 
     const ORG: &str = "acme";
@@ -736,5 +762,185 @@ mod tests {
         let envs = envelopes(&requests);
         assert_eq!(envs.len(), 2);
         assert_ne!(envs[0], envs[1], "a wake retry reused the envelope");
+    }
+
+    fn credentialed(listener: &TcpListener) -> (RemoteTarget, tempfile::TempDir, PathBuf) {
+        let target = target(listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        (target, root, dir)
+    }
+
+    fn write_answer(socket: &mut std::net::TcpStream, status: &str, extra: &str, body: &Value) {
+        let bytes = serde_json::to_vec(body).unwrap();
+        let _ = write!(
+            socket,
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{extra}\r\n",
+            bytes.len()
+        );
+        let _ = socket.write_all(&bytes);
+        let _ = socket.flush();
+    }
+
+    fn finite_worker(
+        n: usize,
+        serve: impl Fn(usize, &mut std::net::TcpStream, &Request) + Send + 'static,
+    ) -> (
+        TcpListener,
+        std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.try_clone().unwrap();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Request>>> = Default::default();
+        let requests = seen.clone();
+        let handle = thread::spawn(move || {
+            for i in 0..n {
+                let Ok((socket, _)) = server.accept() else {
+                    return;
+                };
+                let (mut socket, req) = {
+                    let (s, r) = read_request(socket);
+                    (s, r)
+                };
+                requests.lock().unwrap().push(clone_request(&req));
+                serve(i, &mut socket, &req);
+            }
+        });
+        (listener, seen, handle)
+    }
+
+    fn clone_request(req: &Request) -> Request {
+        Request {
+            path: req.path.clone(),
+            bearer: req.bearer.clone(),
+            body: req.body.clone(),
+        }
+    }
+
+    #[test]
+    fn a_slow_authorize_is_capped_by_the_wake_budget() {
+        let (listener, seen, server) = finite_worker(1, |_i, socket, _req| {
+            thread::sleep(Duration::from_secs(3));
+            write_answer(
+                socket,
+                "200 OK",
+                "",
+                &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+            );
+        });
+        let (target, _root, dir) = credentialed(&listener);
+        let start = Instant::now();
+        let out = call_verb_in(&target, "status", Map::new(), 1, &dir, |_| {}, |_| {});
+        let elapsed = start.elapsed();
+        assert!(out.is_err());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a 1s budget let authorize run {elapsed:?}"
+        );
+        server.join().unwrap();
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/__platform/cli/authorize");
+    }
+
+    #[test]
+    fn authorize_and_call_share_one_deadline() {
+        let (listener, seen, server) = finite_worker(2, |i, socket, _req| {
+            if i == 0 {
+                thread::sleep(Duration::from_secs(1));
+                write_answer(
+                    socket,
+                    "200 OK",
+                    "",
+                    &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                );
+            } else {
+                thread::sleep(Duration::from_secs(3));
+                write_answer(socket, "200 OK", "", &json!({"ok": true}));
+            }
+        });
+        let (target, _root, dir) = credentialed(&listener);
+        let start = Instant::now();
+        let out = call_verb_in(&target, "status", Map::new(), 2, &dir, |_| {}, |_| {});
+        let elapsed = start.elapsed();
+        assert!(out.is_err());
+        assert!(
+            elapsed < Duration::from_millis(2750),
+            "authorize+call did not share the 2s deadline: {elapsed:?}"
+        );
+        server.join().unwrap();
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert!(check_authorize(&reqs[0]), "authorize schema");
+        assert!(check_call(&reqs[1]), "call schema");
+    }
+
+    #[test]
+    fn call_response_body_is_bounded_by_remaining_deadline() {
+        let (listener, _seen, server) = finite_worker(2, |i, socket, _req| {
+            if i == 0 {
+                write_answer(
+                    socket,
+                    "200 OK",
+                    "",
+                    &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                );
+            } else {
+                let body = serde_json::to_vec(&json!({"ok": true})).unwrap();
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(&body[..1]);
+                let _ = socket.flush();
+                thread::sleep(Duration::from_secs(3));
+                let _ = socket.write_all(&body[1..]);
+            }
+        });
+        let (target, _root, dir) = credentialed(&listener);
+        let start = Instant::now();
+        let out = call_verb_in(&target, "status", Map::new(), 1, &dir, |_| {}, |_| {});
+        let elapsed = start.elapsed();
+        assert!(out.is_err());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a 1s budget let the body read run {elapsed:?}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_zero_budget_never_sends_a_byte() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (target, _root, dir) = credentialed(&listener);
+        let out = call_verb_in(&target, "status", Map::new(), 0, &dir, |_| {}, |_| {});
+        assert!(out.is_err());
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a dead budget opened a socket"
+        );
+    }
+
+    #[test]
+    fn a_wake_sleep_that_would_pass_the_deadline_is_the_retryable_busy() {
+        let (out, _requests) = run(
+            vec![
+                (503, "", json!({"state": "waking", "retry_after_s": 5})),
+                (503, "", json!({"state": "waking", "retry_after_s": 5})),
+            ],
+            "status",
+            Map::new(),
+            2,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "busy");
+        assert_eq!(err.code(), Some("waking"));
     }
 }

@@ -12,7 +12,7 @@ export default function StatusChips({
 }: {
   /** The server refuses every write (meta.read_only) — the lock chip. */
   readOnly: boolean;
-  health: Health | null;
+  health: Health | null | "unavailable";
   onRefresh: () => void;
   variant: "header" | "menu";
   children?: ReactNode;
@@ -21,8 +21,16 @@ export default function StatusChips({
   const statusId = useId();
   const refreshId = useId();
   const labelCls = header ? "sr-only" : undefined;
-  const reachable = health?.daemon === "reachable";
-  const connection = !health ? "Checking connection…" : reachable ? "Daemon connected" : "Daemon disconnected — live activity is unavailable";
+  const checking = health === null;
+  const failed = health === "unavailable";
+  const reachable = !checking && !failed && health.daemon === "reachable";
+  const connection = checking
+    ? "Checking connection…"
+    : failed
+      ? "Connection unavailable — Refresh to retry"
+      : reachable
+        ? "Daemon connected"
+        : "Daemon disconnected";
   return (
     <>
       {readOnly && (
@@ -39,8 +47,8 @@ export default function StatusChips({
         <>
           <span className="header-control-wrap">
             <span tabIndex={0} role="img" aria-label={connection} aria-describedby={statusId}
-              className={`header-icon connection-icon ${!health ? "text-ink-500" : reachable ? "text-ink-400" : "text-warn"}`}>
-              {health && !reachable ? <IconWarning size={16} /> : <IconConnection size={18} />}
+              className={`header-icon connection-icon ${checking ? "text-ink-500" : reachable ? "text-ink-400" : "text-warn"}`}>
+              {!checking && !reachable ? <IconWarning size={16} /> : <IconConnection size={18} />}
               {reachable && <span className="connection-dot" aria-hidden />}
             </span>
             <span id={statusId} role="tooltip" className="header-tooltip">{connection}</span>
@@ -55,7 +63,7 @@ export default function StatusChips({
         </>
       ) : (
         <>
-          {health && <span className={`chip ${reachable ? "bg-ink-800 text-ink-400" : "bg-warn/10 text-warn"}`}>
+          {!checking && <span className={`chip ${reachable ? "bg-ink-800 text-ink-400" : "bg-warn/10 text-warn"}`}>
             {reachable ? <IconConnection /> : <IconWarning />}<span>{connection}</span>
           </span>}
           <button type="button" onClick={onRefresh} className="chip bg-accent/10 text-accent hover:bg-accent/20 transition-colors">
