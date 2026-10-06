@@ -2149,10 +2149,12 @@ impl ProviderAdapter for PiAdapter {
         refuse_confined_devin_agent(agent)?;
         // A split launch requires the fixed private owner service. Unsupported
         // hosts refuse before provisioning; selectors never establish authority.
-        #[cfg(not(all(unix, target_os = "linux")))]
+        #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
         if self.agent_uid.is_some() {
             super::pi_guest::protected_prereqs_satisfied()?;
-            return Err(Error::rejected("protected managed-Pi launch is Linux-only"));
+            return Err(Error::rejected(
+                "protected managed-Pi launch requires Linux x86_64",
+            ));
         }
         let master = crate::master::is_master(&agent.alias);
         let params = agent.params.clone().unwrap_or(Value::Null);
@@ -2182,7 +2184,7 @@ impl ProviderAdapter for PiAdapter {
             if master { "master" } else { "worker" },
             want,
         )?;
-        #[cfg(all(unix, target_os = "linux"))]
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
         let protected = if let Some(uid) = self.agent_uid {
             let generation = Uuid::new_v4().simple().to_string();
             Some(super::pi_guest::GuestCtx::establish(
@@ -2218,12 +2220,12 @@ impl ProviderAdapter for PiAdapter {
             let role = if master { "master" } else { "worker" };
             self.log_confinement(role, policy)?;
         }
-        #[cfg(all(unix, target_os = "linux"))]
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
         let generation = protected
             .as_ref()
             .map(|ctx| ctx.segments().generation_hex())
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string()[..12].to_string());
-        #[cfg(not(all(unix, target_os = "linux")))]
+        #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
         let generation = Uuid::new_v4().simple().to_string()[..12].to_string();
         *self.shared.generation.lock().unwrap() = generation.clone();
         self.shared.dead.store(false, Ordering::SeqCst);
@@ -2372,7 +2374,7 @@ impl ProviderAdapter for PiAdapter {
         // Keep all fallible post-launch work inside one cleanup boundary.
         *self.transport.write().unwrap() = Arc::clone(&transport);
         let initialized = (|| {
-            #[cfg(all(unix, target_os = "linux"))]
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
             let pid = match protected {
                 Some(ctx) => {
                     let routing = crate::protected_pi_profile::Routing::for_agent(master, want)
@@ -2384,7 +2386,7 @@ impl ProviderAdapter for PiAdapter {
                 }
                 None => transport.launch(&agent.cwd, &self.log_path, &env)?,
             };
-            #[cfg(not(all(unix, target_os = "linux")))]
+            #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
             let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
             // Effort: validate against the model's real levels, then verify
             // what stuck — Pi answers success even on a silent fallback.

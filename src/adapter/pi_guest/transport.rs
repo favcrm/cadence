@@ -6,6 +6,7 @@ use super::{
 };
 use std::fs::File;
 use std::io;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
