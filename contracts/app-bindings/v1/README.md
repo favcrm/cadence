@@ -175,9 +175,15 @@ come from the *installed binding*, never the request.
 | `view_id` | descriptor view id | always |
 | `op` | `"list"` \| `"show"` | always |
 | `digest`, `view_descriptor_digest`, `view_binding_digest` | `sha256:<64hex>` | always — must equal the ONE verified snapshot's, else refused |
-| `context_id` | identifier | required by `customers`; optional/live-proved on `caption-runs` |
+| `context_id` | identifier | required for both `customers` and `caption-runs`, on both `list` and `show`; must be live and installation-owned |
 | `record_id` | identifier | required on `show`; never on `list` |
 | `query`, `limit` (1..=100), `cursor` | bounded | `customers` `list` only; refused on `show` and on `caption-runs` |
+
+For both sources and both operations, the request's `context_id` must be
+live and owned by the installation. Caption runs are exposed only within
+that context; contextless runs are not exposed. Optional `context_id` or
+`snapshot.context.id` values in a returned run are projection metadata and
+do not waive the request's live-context requirement.
 
 **Response** — a uniform envelope. `rows[]` is an array for **both**
 `list` and `show` (show carries one row); each row is keyed by
