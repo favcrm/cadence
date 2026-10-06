@@ -1,0 +1,38 @@
+{
+  "contract": "app-views/v1",
+  "app": "social-content",
+  "title": "Social Content — caption runs",
+  "summary": "List and detail for host-owned run metadata only; no captions or artifacts are projected.",
+  "views": [
+    {
+      "id": "caption-runs",
+      "title": "Caption runs",
+      "kind": "table",
+      "fields": [
+        { "id": "id", "label": "Run ID", "format": "text" },
+        { "id": "state", "label": "State", "format": "enum", "values": ["awaiting_approval", "approved", "running", "succeeded", "failed", "cancelled"] },
+        { "id": "workflow_title", "label": "Workflow", "format": "text" },
+        { "id": "snapshot_digest", "label": "Snapshot digest", "format": "text" },
+        { "id": "subject", "label": "Subject", "format": "text" }
+      ],
+      "columns": [
+        { "field": "state" },
+        { "field": "workflow_title" },
+        { "field": "subject" },
+        { "field": "snapshot_digest" }
+      ]
+    },
+    {
+      "id": "caption-detail",
+      "title": "Caption run detail",
+      "kind": "detail",
+      "fields": [
+        { "id": "id", "label": "Run ID", "format": "text" },
+        { "id": "state", "label": "State", "format": "enum", "values": ["awaiting_approval", "approved", "running", "succeeded", "failed", "cancelled"] },
+        { "id": "workflow_title", "label": "Workflow", "format": "text" },
+        { "id": "snapshot_digest", "label": "Snapshot digest", "format": "text" },
+        { "id": "subject", "label": "Subject", "format": "text" }
+      ]
+    }
+  ]
+}

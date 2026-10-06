@@ -1,0 +1,68 @@
+{
+  "contract": "app-views/v1",
+  "app": "crm",
+  "title": "CRM — customers",
+  "summary": "CustomerProfile list/detail and separate create/edit form previews.",
+  "views": [
+    {
+      "id": "customers",
+      "title": "Customers",
+      "kind": "table",
+      "fields": [
+        { "id": "record_id", "label": "Record ID", "format": "text" },
+        { "id": "display_name", "label": "Name", "format": "text" },
+        { "id": "email", "label": "Email", "format": "text" },
+        { "id": "phone", "label": "Phone", "format": "text" },
+        { "id": "source", "label": "Source", "format": "text" },
+        { "id": "consent_email", "label": "Email consent", "format": "enum", "values": ["granted", "denied", "unknown"] },
+        { "id": "tags", "label": "Tags", "format": "tags", "kind": "list" }
+      ],
+      "columns": [
+        { "field": "display_name" },
+        { "field": "email" },
+        { "field": "phone" },
+        { "field": "consent_email" },
+        { "field": "tags" }
+      ]
+    },
+    {
+      "id": "customer-detail",
+      "title": "Customer detail",
+      "kind": "detail",
+      "fields": [
+        { "id": "record_id", "label": "Record ID", "format": "text" },
+        { "id": "display_name", "label": "Name", "format": "text" },
+        { "id": "email", "label": "Email", "format": "text" },
+        { "id": "phone", "label": "Phone", "format": "text" },
+        { "id": "source", "label": "Source", "format": "text" },
+        { "id": "consent_email", "label": "Email consent", "format": "enum", "values": ["granted", "denied", "unknown"] },
+        { "id": "consent_sms", "label": "SMS consent", "format": "enum", "values": ["granted", "denied", "unknown"] },
+        { "id": "tags", "label": "Tags", "format": "tags", "kind": "list" }
+      ]
+    },
+    {
+      "id": "customer-create-form",
+      "title": "Create customer (preview)",
+      "kind": "form",
+      "previewOf": [
+        { "id": "display_name", "label": "Display name", "format": "text" },
+        { "id": "email", "label": "Email", "format": "text" },
+        { "id": "phone", "label": "Phone", "format": "text" },
+        { "id": "source", "label": "Source", "format": "text" },
+        { "id": "tags", "label": "Tags", "format": "tags", "kind": "list" }
+      ]
+    },
+    {
+      "id": "customer-edit-form",
+      "title": "Edit customer (preview)",
+      "kind": "form",
+      "previewOf": [
+        { "id": "display_name", "label": "Display name", "format": "text" },
+        { "id": "email", "label": "Email", "format": "text" },
+        { "id": "phone", "label": "Phone", "format": "text" },
+        { "id": "source", "label": "Source", "format": "text" },
+        { "id": "tags", "label": "Tags", "format": "tags", "kind": "list" }
+      ]
+    }
+  ]
+}

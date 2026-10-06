@@ -2,15 +2,19 @@
   "contract": "app-views/v1",
   "app": "crm",
   "title": "CRM — customers overview",
-  "summary": "Data-only view declarations a CRM package could ship: a customers table, a customer detail, and a disabled preview of the host's customer form.",
+  "summary": "Data-only customers table/detail plus disabled create and edit form previews.",
   "views": [
     {
       "id": "customers",
       "title": "Customers",
       "kind": "table",
       "fields": [
+        { "id": "record_id", "label": "Record ID", "format": "text" },
         { "id": "name", "label": "Name", "format": "text" },
         { "id": "email", "label": "Email", "format": "text" },
+        { "id": "phone", "label": "Phone", "format": "text" },
+        { "id": "source", "label": "Source", "format": "text" },
+        { "id": "consent_email", "label": "Email consent", "format": "enum", "values": ["granted", "denied", "unknown"] },
         { "id": "tier", "label": "Tier", "format": "enum", "values": ["member", "vip", "vip_plus"] },
         { "id": "visits", "label": "Visits", "format": "number" },
         { "id": "tags", "label": "Tags", "format": "tags", "kind": "list" }
@@ -18,8 +22,8 @@
       "columns": [
         { "field": "name" },
         { "field": "email" },
-        { "field": "tier", "label": "Level" },
-        { "field": "visits" },
+        { "field": "phone" },
+        { "field": "consent_email" },
         { "field": "tags" }
       ]
     },
@@ -28,22 +32,41 @@
       "title": "Customer detail",
       "kind": "detail",
       "fields": [
+        { "id": "record_id", "label": "Record ID", "format": "text" },
         { "id": "name", "label": "Name", "format": "text" },
         { "id": "email", "label": "Email", "format": "text" },
+        { "id": "phone", "label": "Phone", "format": "text" },
+        { "id": "source", "label": "Source", "format": "text" },
+        { "id": "consent_email", "label": "Email consent", "format": "enum", "values": ["granted", "denied", "unknown"] },
+        { "id": "consent_sms", "label": "SMS consent", "format": "enum", "values": ["granted", "denied", "unknown"] },
+        { "id": "tags", "label": "Tags", "format": "tags", "kind": "list" },
         { "id": "tier", "label": "Tier", "format": "enum", "values": ["member", "vip", "vip_plus"] },
         { "id": "last_visit", "label": "Last visit", "format": "date" },
-        { "id": "notes", "label": "Notes", "format": "text", "createView": "customer-form" }
+        { "id": "notes", "label": "Notes", "format": "text" }
       ]
     },
     {
-      "id": "customer-form",
+      "id": "customer-create-form",
       "title": "New customer (preview)",
       "kind": "form",
       "previewOf": [
-        { "id": "name", "label": "Full name", "format": "text" },
+        { "id": "display_name", "label": "Display name", "format": "text" },
         { "id": "email", "label": "Email", "format": "text" },
-        { "id": "tier", "label": "Tier", "format": "enum", "values": ["member", "vip", "vip_plus"] },
-        { "id": "notes", "label": "Notes", "format": "text" }
+        { "id": "phone", "label": "Phone", "format": "text" },
+        { "id": "source", "label": "Source", "format": "text" },
+        { "id": "tags", "label": "Tags", "format": "tags", "kind": "list" }
+      ]
+    },
+    {
+      "id": "customer-edit-form",
+      "title": "Edit customer (preview)",
+      "kind": "form",
+      "previewOf": [
+        { "id": "display_name", "label": "Display name", "format": "text" },
+        { "id": "email", "label": "Email", "format": "text" },
+        { "id": "phone", "label": "Phone", "format": "text" },
+        { "id": "source", "label": "Source", "format": "text" },
+        { "id": "tags", "label": "Tags", "format": "tags", "kind": "list" }
       ]
     }
   ]

@@ -41,6 +41,8 @@ mod app_records;
 mod app_release;
 mod app_runs;
 mod app_screens;
+mod app_view_action;
+mod app_view_read;
 mod apps;
 mod cli_route;
 mod connections;

@@ -34,7 +34,7 @@ async function main() {
 // --- The two worked examples parse clean through the shared gate. ---
 equal(appViewExamples.crm.descriptor.contract, "app-views/v1", "crm example declares the v1 contract");
 equal(appViewExamples.crm.descriptor.app, "crm", "crm example names its app kind");
-equal(appViewExamples.crm.descriptor.views.length, 3, "crm example declares three views");
+equal(appViewExamples.crm.descriptor.views.length, 4, "crm example declares four views");
 equal(appViewExamples["social-content"].descriptor.app, "social-content", "social example names its app kind");
 equal(appViewExamples["social-content"].descriptor.views.length, 3, "social example declares three views");
 
@@ -52,7 +52,7 @@ for (const name of ["crm", "social-content"]) {
   );
   const parsed = parseAppView(raw);
   equal(parsed.app, name === "crm" ? "crm" : "social-content", `${name}.json parses and names its app`);
-  equal(parsed.views.length, 3, `${name}.json declares three views`);
+  equal(parsed.views.length, name === "crm" ? 4 : 3, `${name}.json declares its expected views`);
   equal(parsed, appViewExamples[name as keyof typeof appViewExamples].descriptor,
     `${name}.json matches the renderer descriptor, including fields and formats`);
 }
@@ -176,7 +176,7 @@ equal(cellText(okRows[0].email), "—", "absent cell renders as em-dash");
 equal(cellText(["a", "b"]), "a, b", "list cell joins for display");
 
 // A form view declares no fields — fixture rows for it refuse.
-const crmForm = appViewExamples.crm.descriptor.views.find((v) => v.id === "customer-form")!;
+const crmForm = appViewExamples.crm.descriptor.views.find((v) => v.id === "customer-create-form")!;
 refused((v) => fixtureRows(crmForm, v), [{}], "a form view has no row-bearing fields");
 
 // --- Inert script-looking text is allowed as data but never runs. ---
@@ -295,7 +295,7 @@ await React.act(async () => {
     React.createElement(AppView, {
       descriptor: appViewExamples.crm.descriptor,
       rows: appViewExamples.crm.rows,
-      initialViewId: "customer-form",
+      initialViewId: "customer-create-form",
     }),
   );
 });
@@ -361,9 +361,9 @@ await React.act(async () => { shellRoot.render(React.createElement(AppShell, {
 })); });
 await flush(); await flush(); await flush();
 assert(host.querySelector('[data-contract-preview="crm"]'), "first-mount direct preview link remains");
-await React.act(async () => { navigate("/app-installations/install-a?contract-preview=crm&contract-preview-view=customer-form"); });
+await React.act(async () => { navigate("/app-installations/install-a?contract-preview=crm&contract-preview-view=customer-create-form"); });
 await flush();
-assert(host.querySelector('[data-app-view="customer-form"]'), "same-installation preview navigation remains");
+assert(host.querySelector('[data-app-view="customer-create-form"]'), "same-installation preview navigation remains");
 const { matchRoute } = require("../src/lib/router") as typeof import("../src/lib/router");
 const menuQuery = contextNavigationSearch(
   matchRoute(location.pathname), matchRoute("/app-installations/install-b"), location.search.slice(1),

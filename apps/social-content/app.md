@@ -5,6 +5,10 @@ version: 0.1.0
 summary: One source post into per-destination social drafts, brand-checked, staged for your release.
 needs:
   connections: [publish]
+  views:
+    contract: app-views/v1
+  bindings:
+    contract: app-bindings/v1
 ---
 
 # Working in Social content
@@ -18,6 +22,9 @@ against `rubrics/brand.md`.
 - `workflows/social-localize.md` — New post: Adapt → Image → Review →
   Publish.
 - `rubrics/brand.md` — the reviewer's checklist and verdict format.
+- `views/app-views-v1.json` and `bindings/app-bindings-v1.json` — host-owned
+  caption-run list/detail metadata views; the binding does not expose caption
+  artifacts or invent a Social write action.
 - `app.md` — this guide.
 
 ## The job in one line

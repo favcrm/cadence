@@ -17,8 +17,9 @@ use super::write_path::{
 };
 use super::{
     app_audiences, app_chat, app_content, app_contexts, app_records, app_release, app_runs,
-    app_screens, apps, cli_route, connections, crm_send, delivery_sync, home, lane, operator,
-    platform_account, read_model, social_publish, stages, threads, updates, wiki, workflows,
+    app_screens, app_view_read, apps, cli_route, connections, crm_send, delivery_sync, home, lane,
+    operator, platform_account, read_model, social_publish, stages, threads, updates, wiki,
+    workflows,
 };
 use super::{push_device_login_config, ready_file, tailnet_url, ServeOpts, READY_NONCE_ENV};
 use crate::adapter::registry;
@@ -1543,6 +1544,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     threads::conversations(state_dir, crate::master::ALIAS, &|key: &str| {
                         (key == "install").then(|| install.to_string())
                     });
+                send(request, response);
+                return;
+            }
+            if let Some(route) = app_view_read::route(&path) {
+                if request.method() != &Method::Get {
+                    send(request, err_response(405, "method not allowed"));
+                    return;
+                }
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                let response = app_view_read::handle(&mut request, state_dir, route, false);
                 send(request, response);
                 return;
             }

@@ -64,6 +64,7 @@ export function crmSectionHref(href: string, section: CrmSection): string {
   else q.set("crm", section);
   q.delete("appview");
   q.delete("record");
+  q.delete("view");
   const s = q.toString();
   return path + (s ? `?${s}` : "");
 }

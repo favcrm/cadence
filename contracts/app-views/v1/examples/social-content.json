@@ -2,13 +2,17 @@
   "contract": "app-views/v1",
   "app": "social-content",
   "title": "Social Content — caption runs",
-  "summary": "Data-only view declarations a Social Content package could ship: a reviewed-caption run table, a run detail, and a disabled preview of the host's caption form.",
+  "summary": "The live binding projects metadata only; preview fixtures also demonstrate inert text rendering for package-declared fields.",
   "views": [
     {
       "id": "caption-runs",
       "title": "Caption runs",
       "kind": "table",
       "fields": [
+        { "id": "id", "label": "Run ID", "format": "text" },
+        { "id": "state", "label": "State", "format": "enum", "values": ["awaiting_approval", "approved", "running", "succeeded", "failed", "cancelled"] },
+        { "id": "workflow_title", "label": "Workflow", "format": "text" },
+        { "id": "snapshot_digest", "label": "Snapshot digest", "format": "text" },
         { "id": "subject", "label": "Subject", "format": "text" },
         { "id": "channel", "label": "Channel", "format": "enum", "values": ["instagram", "facebook"] },
         { "id": "status", "label": "Status", "format": "enum", "values": ["draft", "in_review", "released"] },
@@ -16,7 +20,10 @@
         { "id": "tags", "label": "Tags", "format": "tags", "kind": "list" }
       ],
       "columns": [
+        { "field": "state" },
+        { "field": "workflow_title" },
         { "field": "subject" },
+        { "field": "snapshot_digest" },
         { "field": "channel" },
         { "field": "status" },
         { "field": "caption" },
@@ -28,6 +35,10 @@
       "title": "Caption run detail",
       "kind": "detail",
       "fields": [
+        { "id": "id", "label": "Run ID", "format": "text" },
+        { "id": "state", "label": "State", "format": "enum", "values": ["awaiting_approval", "approved", "running", "succeeded", "failed", "cancelled"] },
+        { "id": "workflow_title", "label": "Workflow", "format": "text" },
+        { "id": "snapshot_digest", "label": "Snapshot digest", "format": "text" },
         { "id": "subject", "label": "Subject", "format": "text" },
         { "id": "channel", "label": "Channel", "format": "enum", "values": ["instagram", "facebook"] },
         { "id": "status", "label": "Status", "format": "enum", "values": ["draft", "in_review", "released"] },

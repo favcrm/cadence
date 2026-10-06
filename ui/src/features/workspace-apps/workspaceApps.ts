@@ -8,6 +8,11 @@ export interface Installation {
   summary: string; digest: string; catalog_generation: string; storage_kind: "workspace" | "legacy";
   project_link: string | null; approved: boolean | null; executable: boolean;
   approval: { state: string }; guide: string; files: string[];
+  /** Same verified workspace snapshot; UI parsing is additional defense, not authority. */
+  view_descriptor?: unknown | null; view_descriptor_digest?: string | null;
+  view_binding?: unknown | null; view_binding_digest?: string | null;
+  /** Explicit app-actions/v2 companion from the same verified bundle snapshot. */
+  action_descriptor?: unknown | null;
   /** Declared slot contract from the live bundle manifest (CAD-585): typed capability slots. */
   capabilities: Record<string, SlotDeclaration> | null;
   /** Untyped legacy slots from `needs.connections`, kept working as before. */
@@ -150,6 +155,31 @@ export interface WorkspaceOutbox {
   };
 }
 type BindingCreate = { slot: string; connection_id: string; request_id: string; context_id?: string };
+export interface BoundViewReadRequest {
+  installId: string;
+  viewId: string;
+  recordId?: string;
+  bundleDigest: string;
+  descriptorDigest: string;
+  bindingDigest: string;
+  contextId: string;
+  source: "customers" | "caption-runs";
+  query?: string;
+  limit?: number;
+  cursor?: string;
+}
+export interface BoundViewActionRequest {
+  installId: string;
+  contextId: string;
+  viewId: string;
+  actionId: string;
+  recordId?: string;
+  expectedRevision?: number;
+  bundleDigest: string;
+  descriptorDigest: string;
+  bindingDigest: string;
+  input: Record<string, unknown>;
+}
 const part = encodeURIComponent;
 const installation = (id: string) => `/api/app-installations/${part(id)}`;
 const run = (id: string) => `/api/app-runs/${part(id)}`;
@@ -174,6 +204,35 @@ async function request<T>(path: string, signal?: AbortSignal, body?: object): Pr
 export const workspaceApps = {
   installations: (signal?: AbortSignal) => request<Installation[]>("/api/app-installations", signal),
   detail: (id: string, signal?: AbortSignal) => request<Installation>(installation(id), signal),
+  viewRead: (input: BoundViewReadRequest, signal?: AbortSignal) => {
+    if (!input.contextId) throw new ApiError("A live view read needs an active app context", 400);
+    const isList = input.recordId === undefined;
+    const path = `${installation(input.installId)}/views/${part(input.viewId)}/rows${isList ? "" : `/${part(input.recordId!)}`}`;
+    const query = new URLSearchParams({
+      digest: input.bundleDigest,
+      descriptor: input.descriptorDigest,
+      binding: input.bindingDigest,
+      context_id: input.contextId,
+    });
+    if (isList && input.source === "customers") {
+      query.set("limit", String(input.limit ?? 50));
+      if (input.cursor) query.set("cursor", input.cursor);
+      if (input.query) query.set("query", input.query);
+    }
+    return request<unknown>(`${path}?${query.toString()}`, signal);
+  },
+  viewAction: (input: BoundViewActionRequest, signal?: AbortSignal) => {
+    if (!input.contextId) throw new ApiError("A live app action needs an active app context", 400);
+    const path = `${installation(input.installId)}/contexts/${part(input.contextId)}/views/${part(input.viewId)}/actions/${part(input.actionId)}${input.recordId === undefined ? "" : `/records/${part(input.recordId)}`}`;
+    const body = {
+      digest: input.bundleDigest,
+      descriptor: input.descriptorDigest,
+      binding: input.bindingDigest,
+      ...(input.expectedRevision === undefined ? {} : { expected_revision: input.expectedRevision }),
+      input: input.input,
+    };
+    return request<unknown>(path, signal, body);
+  },
   upgradeCheck: (id: string, body: { source: string; expected_digest: string; expected_generation: string }) =>
     request<UpgradeProposal>(`${installation(id)}/upgrade/check`, undefined, body),
   upgrade: (id: string, body: { source: string; expected_digest: string; expected_generation: string; expected_new_digest: string; request_id: string }) =>

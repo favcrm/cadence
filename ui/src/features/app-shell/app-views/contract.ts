@@ -122,12 +122,15 @@ const MAX_LABEL_LENGTH = 80;
 const MAX_TITLE_LENGTH = 120;
 const MAX_SUMMARY_LENGTH = 280;
 const MAX_ROWS = 64;
+const MAX_LIVE_ROWS = 1000;
 const MAX_ROW_TEXT = 512;
 const MAX_LIST_ITEMS = 16;
 const MAX_ROW_KEYS = 32;
 /** Whole input, serialized: a bound on the bytes a caller can push
- *  through `parseAppView`/`fixtureRows` in one shot. */
+ *  through `parseAppView`/row validation in one shot. */
 const MAX_SERIALIZED_BYTES = 64 * 1024;
+const MAX_LIVE_BYTES = 4 * 1024 * 1024;
+const MAX_LIVE_NODES = 100_000;
 
 /** Identifier grammar shared by field ids, view ids and app names:
  *  lowercase, starts with a letter, then letters/digits/`-`/`_`. */
@@ -242,29 +245,40 @@ function fail(path: string, message: string): never {
  *  Runs before shape validation so a hostile payload cannot push the
  *  shape checks through a huge or nested shell. Arrays and objects
  *  both count toward one shared node budget. */
-function scanUnsafe(value: unknown, path: string, budget: { nodes: number }, depth = 0): void {
+function scanUnsafe(
+  value: unknown,
+  path: string,
+  budget: { nodes: number },
+  depth = 0,
+  maxNodes = 4096,
+): void {
   if (depth > 24) fail(path, "input is nested too deeply");
-  if (++budget.nodes > 4096) fail(path, "input has too many nodes");
+  if (++budget.nodes > maxNodes) fail(path, "input has too many nodes");
   if (value === null || typeof value === "boolean" || typeof value === "string") return;
   if (typeof value === "number" && Number.isFinite(value)) return;
   if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) scanUnsafe(value[i], `${path}.${i}`, budget, depth + 1);
+    for (let i = 0; i < value.length; i++) scanUnsafe(value[i], `${path}.${i}`, budget, depth + 1, maxNodes);
     return;
   }
   if (!isObj(value)) fail(path, "expected plain JSON data");
   for (const [key, property] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
     if (FORBIDDEN.has(key)) fail(path, `forbidden descriptor key: ${key}`);
     if (property.get || property.set) fail(path, "accessors are not JSON data");
-    scanUnsafe(property.value, `${path}.${key}`, budget, depth + 1);
+    scanUnsafe(property.value, `${path}.${key}`, budget, depth + 1, maxNodes);
   }
 }
 
-function boundedJson(raw: unknown, path: string): void {
+function boundedJson(
+  raw: unknown,
+  path: string,
+  maxBytes = MAX_SERIALIZED_BYTES,
+  maxNodes = 4096,
+): void {
   // Scan before serialization: cycles, executable values and custom object
   // prototypes must refuse without running toJSON or overflowing the stack.
-  scanUnsafe(raw, path, { nodes: 0 });
+  scanUnsafe(raw, path, { nodes: 0 }, 0, maxNodes);
   const bytes = new TextEncoder().encode(JSON.stringify(raw)).byteLength;
-  if (bytes > MAX_SERIALIZED_BYTES) fail(path, `input exceeds ${MAX_SERIALIZED_BYTES} bytes`);
+  if (bytes > maxBytes) fail(path, `input exceeds ${maxBytes} bytes`);
 }
 
 function text(v: unknown, path: string, max: number): string {
@@ -521,11 +535,28 @@ function cell(raw: unknown, field: AppViewField, path: string): AppViewCell {
  * though only the host's own examples ship today.
  */
 export function fixtureRows(view: AppViewView, raw: unknown): AppViewRow[] {
-  boundedJson(raw, "rows");
+  return checkedRows(view, raw, MAX_ROWS, MAX_SERIALIZED_BYTES, 4096);
+}
+
+/** Validate one bounded page from the live host adapter. The adapter's
+ *  response cap is 4 MiB and `caption-runs` is not paged, so live rows
+ *  use a separate ceiling from small synthetic preview fixtures. */
+export function liveRows(view: AppViewView, raw: unknown): AppViewRow[] {
+  return checkedRows(view, raw, MAX_LIVE_ROWS, MAX_LIVE_BYTES, MAX_LIVE_NODES);
+}
+
+function checkedRows(
+  view: AppViewView,
+  raw: unknown,
+  maxRows: number,
+  maxBytes: number,
+  maxNodes: number,
+): AppViewRow[] {
+  boundedJson(raw, "rows", maxBytes, maxNodes);
   const declared = new Map((view.fields ?? []).map((f) => [f.id, f]));
   if (declared.size === 0) fail("rows", `view ${JSON.stringify(view.id)} declares no fields`);
   if (!Array.isArray(raw)) fail("rows", "expected an array of row objects");
-  if (raw.length > MAX_ROWS) fail("rows", `more than ${MAX_ROWS} rows`);
+  if (raw.length > maxRows) fail("rows", `more than ${maxRows} rows`);
   return raw.map((row, i) => {
     const path = `rows.${i}`;
     if (!isObj(row)) fail(path, "row must be an object");

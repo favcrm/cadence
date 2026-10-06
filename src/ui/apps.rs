@@ -261,6 +261,8 @@ fn leaf_ok(seg: &str, need_md_tag: bool) -> bool {
 ///   `workflows/<tag>.md`              (valid_tag stem — the installer's rule)
 ///   `rubrics/<leaf>` `templates/<leaf>` (any visible flat leaf)
 ///   `views/app-views-v1.json`         (exact descriptor filename)
+///   `bindings/app-bindings-v1.json`   (exact companion filename)
+///   `actions/app-actions-v2.json`     (exact live-action filename)
 /// Empty segments (`//`, leading `/`, trailing `/`), `.`/`..`, `\`, `\0` and
 /// any other top-level name are refused. `snapshot`/`validate_texts` re-check
 /// daemon-side; this schema refuses bad keys before a single byte is staged.
@@ -277,6 +279,8 @@ fn upload_path_ok(path: &str) -> bool {
         ["app.md"] | ["app-chat.json"] => true,
         ["workflows", leaf] => leaf_ok(leaf, true),
         ["views", leaf] => *leaf == crate::issue::app_view::FILE,
+        ["bindings", leaf] => *leaf == crate::issue::app_binding::FILE,
+        ["actions", leaf] => *leaf == crate::issue::app_action_v2::FILE,
         ["rubrics", leaf] | ["templates", leaf] => leaf_ok(leaf, false),
         // CAD-1006: screens/<tag>/<leaf> — the one depth-2 entry: a
         // tag-named package dir holding `screens.json` or a
@@ -1123,6 +1127,23 @@ pub(super) fn workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_contract_companion_filenames_are_exact_for_install_and_upgrade_maps() {
+        assert!(upload_path_ok("bindings/app-bindings-v1.json"));
+        assert!(upload_path_ok("views/app-views-v1.json"));
+        assert!(upload_path_ok("actions/app-actions-v2.json"));
+        assert!(!upload_path_ok("bindings/app-bindings-v2.json"));
+        assert!(!upload_path_ok("bindings/other.json"));
+        assert!(!upload_path_ok("bindings/app-bindings-v1.json/extra"));
+        assert!(!upload_path_ok("bindings/../app-bindings-v1.json"));
+        assert!(!upload_path_ok("views/other.json"));
+        assert!(!upload_path_ok("actions/app-actions-v1.json"));
+        assert!(!upload_path_ok("actions/other.json"));
+        assert!(!upload_path_ok("actions/app-actions-v2.json/extra"));
+        assert!(!upload_path_ok("actions/../app-actions-v2.json"));
+        assert!(upload_path_ok("screens/social-content/screens.json"));
+    }
 
     /// The read route's shape: exactly the list, `<project>/<name>`, or
     /// one app's `runs` / `outputs` — no partial segment, no deeper

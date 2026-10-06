@@ -62,8 +62,8 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                       onClick={onNavigate}
                       className="navlink navlink-sub"
                       title={app.title}
-                      aria-current={here && app.current ? (app.sections ? "true" : "page") : undefined}
-                      data-parent-current={here && app.current && app.sections ? "" : undefined}
+                      aria-current={here && app.current ? (app.sections || app.views ? "true" : "page") : undefined}
+                      data-parent-current={here && app.current && (app.sections || app.views) ? "" : undefined}
                     >
                       <span className="truncate">{app.title}</span>
                     </Link>
@@ -78,6 +78,21 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                             aria-current={s.current && app.current ? "page" : undefined}
                           >
                             {s.label}
+                          </Link>
+                        ))}
+                      </nav>
+                    )}
+                    {app.views && (
+                      <nav aria-label={`${app.title} live views`} className="grid gap-[1px] ml-[10px] border-l border-ink-700 pl-[6px]">
+                        {app.views.map((view, index) => (
+                          <Link
+                            key={`${index}:${view.href}`}
+                            href={view.href}
+                            onClick={onNavigate}
+                            className="navlink navlink-sub"
+                            aria-current={view.current && app.current ? "page" : undefined}
+                          >
+                            {view.label}
                           </Link>
                         ))}
                       </nav>

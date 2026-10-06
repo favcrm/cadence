@@ -6,12 +6,16 @@ import type { Viewer } from "../projects/work";
 import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
+import { ErrorNotice } from "./shared/States";
 import Conversation from "./chat/Conversation";
 import { useAppChat } from "./chat/descriptorClient";
 import type { ChatBinding, ChatScope } from "./chat/types";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
+import LiveAppView from "./app-views/LiveAppView";
+import LiveAppAction from "./app-views/LiveAppAction";
+import { installedViewReceipt, resolveLiveAction, resolveLiveView, type AppViewReceipt } from "./app-views/viewReceipt";
 import { useChatCollapsed } from "./conversationClient";
 import "./app-shell.css";
 
@@ -44,6 +48,8 @@ export interface ActiveInstallation {
   installId: string;
   kind: string;
   title: string;
+  bundleDigest: string;
+  viewReceipt: AppViewReceipt | null;
 }
 
 export default function AppShell({
@@ -64,6 +70,10 @@ export default function AppShell({
   const href = useHref();
   const query = useMemo(() => new URLSearchParams(href.split("?")[1] ?? ""), [href]);
   const [installation, setInstallation] = useState<Installation | null>(null);
+  const viewReceipt = useMemo(
+    () => installation && installation.install_id === installId ? installedViewReceipt(installation) : null,
+    [installation, installId],
+  );
   const [contexts, setContexts] = useState<AppContext[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -106,7 +116,9 @@ export default function AppShell({
     record: string | null,
     appview: string | null,
     crm: string | null,
-  ) => `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}|${crm ?? ""}`;
+    liveView: string | null,
+    liveAction: string | null,
+  ) => `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}|${crm ?? ""}|${liveView ?? ""}|${liveAction ?? ""}`;
   const writeQuery = useCallback(
     (
       patch: {
@@ -114,6 +126,8 @@ export default function AppShell({
         appview?: OutletView | null;
         record?: string | null;
         crm?: CrmSection | null;
+        view?: string | null;
+        action?: string | null;
         clearContractPreview?: boolean;
       },
       opts?: { replace?: boolean },
@@ -139,11 +153,23 @@ export default function AppShell({
         if (patch.crm === null || patch.crm === "customers") q.delete("crm");
         else q.set("crm", patch.crm);
       }
+      if (patch.view !== undefined) {
+        if (patch.view === null || patch.view === "") q.delete("view");
+        else q.set("view", patch.view);
+      } else if (patch.appview !== undefined || patch.record !== undefined || patch.crm !== undefined) {
+        q.delete("view");
+      }
+      if (patch.action !== undefined) {
+        if (patch.action === null || patch.action === "") q.delete("action");
+        else q.set("action", patch.action);
+      } else if (patch.appview !== undefined || patch.record !== undefined || patch.crm !== undefined || patch.view !== undefined) {
+        q.delete("action");
+      }
       if (patch.clearContractPreview) {
         q.delete("contract-preview");
         q.delete("contract-preview-view");
       }
-      handledQuery.current = queryKey(q.get("ctx"), q.get("record"), q.get("appview"), q.get("crm"));
+      handledQuery.current = queryKey(q.get("ctx"), q.get("record"), q.get("appview"), q.get("crm"), q.get("view"), q.get("action"));
       const s = q.toString();
       navigate(path + (s ? `?${s}` : ""), { replace: opts?.replace });
     },
@@ -192,12 +218,14 @@ export default function AppShell({
         installId,
         kind: installation.name,
         title: installation.title || installation.name,
+        bundleDigest: installation.digest,
+        viewReceipt,
       });
     } else {
       onInstallation(null);
     }
     return () => onInstallation(null);
-  }, [installId, installation, onInstallation]);
+  }, [installId, installation, viewReceipt, onInstallation]);
 
   useEffect(() => {
     setSocialContext(rememberedContext(installId));
@@ -217,7 +245,7 @@ export default function AppShell({
     setLoadError(null);
     setLinkNotice(null);
     setContextId("");
-    writeQuery({ ctx: null, appview: null, record: null, crm: null, clearContractPreview: true }, { replace: true });
+    writeQuery({ ctx: null, appview: null, record: null, crm: null, view: null, clearContractPreview: true }, { replace: true });
     // The strip marks the emptied query handled: unmark so adoption
     // still runs once the new installation's contexts load.
     handledQuery.current = undefined;
@@ -254,8 +282,10 @@ export default function AppShell({
     // never adopt the surviving ctx (the cold deep-link defect). So
     // adoption is fall-through, not early-return: normalize each
     // param, then act on the still-valid remainder.
-    if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView, urlCrm)) return;
-    handledQuery.current = queryKey(urlCtx, urlRecord, urlView, urlCrm);
+    const urlLiveView = query.get("view");
+    const urlLiveAction = query.get("action");
+    if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView, urlCrm, urlLiveView, urlLiveAction)) return;
+    handledQuery.current = queryKey(urlCtx, urlRecord, urlView, urlCrm, urlLiveView, urlLiveAction);
     // An unknown CRM section never renders: strip it back to the
     // default instead of guessing a section. The explicit default
     // (`crm=customers`) is already canonical, so it is not rewritten.
@@ -398,6 +428,38 @@ export default function AppShell({
   // The chat's descriptor comes from the installation's own approved package
   // (served pinned to its digest); with none, the pane is plain shared chat.
   const verified = installation !== null && installation.install_id === installId;
+  const liveViewRequested = query.has("view");
+  const requestedLiveViewId = query.get("view");
+  const liveViewResult = useMemo(
+    () => liveViewRequested ? resolveLiveView(viewReceipt, requestedLiveViewId, recordId) : null,
+    [liveViewRequested, requestedLiveViewId, recordId, viewReceipt],
+  );
+  const liveActionRequested = query.has("action");
+  const actionValues = query.getAll("action");
+  const actionScopeValid = query.getAll("ctx").length <= 1;
+  const requestedLiveActionId = actionValues.length === 1 && actionScopeValid ? actionValues[0] : null;
+  const actionRecordValues = query.getAll("record");
+  const actionRecordId = actionRecordValues.length <= 1 ? recordId : "";
+  const conflictingOutletRequested = ["view", "appview", "crm", "contract-preview", "contract-preview-view"]
+    .some((key) => query.has(key));
+  const liveActionResult = useMemo(
+    () => liveActionRequested ? resolveLiveAction(viewReceipt, requestedLiveActionId, actionRecordId, conflictingOutletRequested) : null,
+    [liveActionRequested, requestedLiveActionId, actionRecordId, viewReceipt, conflictingOutletRequested],
+  );
+  const liveContextId = binding.scope?.context_id ?? "";
+  const liveViewEnabled = viewer.operator && verified && !loading && loadError === null
+    && liveContextId !== "" && activeIds.includes(liveContextId);
+  const liveViewBlockedReason = !viewer.operator
+    ? "Sign in as the operator before reading live app data."
+    : loading
+      ? "Waiting for the verified installation and context receipts."
+      : loadError !== null
+        ? loadError
+        : !verified
+          ? "This route does not match a verified installed app."
+          : binding.error ?? (liveContextId === ""
+            ? "Choose an existing active app context before reading live records."
+            : !activeIds.includes(liveContextId) ? "The selected app context is no longer active." : null);
   const chatDescriptor = useAppChat(
     installId,
     verified ? installation.digest : null,
@@ -430,7 +492,7 @@ export default function AppShell({
           {loading ? "Loading…" : title}
         </span>
         <span className="flex-1" />
-        {isDev && installation !== null && (
+        {isDev && installation !== null && !liveViewRequested && !liveActionRequested && (
           <a
             href={contractPreviewHref(href, previewKey === null ? "crm" : null)}
             className="lnk text-label app-shell-preview-toggle"
@@ -612,7 +674,60 @@ export default function AppShell({
                   {linkNotice}
                 </p>
               )}
-              {previewKey !== null ? (
+              {liveActionRequested ? (
+                liveActionResult?.ok ? (
+                  <LiveAppAction
+                    key={`${installId}:${liveContextId}:${liveActionResult.route.action.id}:${liveActionResult.route.recordId ?? ""}:${viewReceipt?.bundleDigest ?? ""}`}
+                    installId={installId}
+                    contextId={liveContextId}
+                    receipt={viewReceipt!}
+                    route={liveActionResult.route}
+                    enabled={liveViewEnabled}
+                    blockedReason={liveViewBlockedReason}
+                    returnHref={boundViewHref(href, liveActionResult.route.operation === "create"
+                      ? liveActionResult.route.tableView.id : liveActionResult.route.detailViewId,
+                    liveActionResult.route.operation === "create" ? null : liveActionResult.route.recordId, liveContextId)}
+                    detailHref={(viewId, id) => boundViewHref(href, viewId, id, liveContextId)}
+                  />
+                ) : (
+                  <div className="av" data-live-action-refused>
+                    <ErrorNotice>
+                      {liveActionResult?.reason ?? "The requested live action is unavailable."}{" "}
+                      <Link href={clearLiveViewHref(href)} className="lnk">Return to the installed app</Link>
+                    </ErrorNotice>
+                  </div>
+                )
+              ) : liveViewRequested ? (
+                liveViewResult?.ok ? (
+                  <LiveAppView
+                    key={`${installId}:${liveContextId}:${liveViewResult.route.view.id}:${liveViewResult.route.recordId ?? ""}`}
+                    installId={installId}
+                    contextId={liveContextId}
+                    receipt={viewReceipt!}
+                    route={liveViewResult.route}
+                    enabled={liveViewEnabled}
+                    blockedReason={liveViewBlockedReason}
+                    returnHref={clearLiveViewHref(href)}
+                    backHref={liveViewResult.route.tableView && liveViewResult.route.op === "show"
+                      ? boundViewHref(href, liveViewResult.route.tableView.id, null, liveContextId)
+                      : null}
+                    detailHref={(viewId, id) => boundViewHref(href, viewId, id, liveContextId)}
+                    createActionHref={viewReceipt?.actionDescriptor?.actions.some((action) => action.id === "customer.create")
+                      && liveViewResult.route.op === "list" && liveViewResult.route.binding.source === "customers"
+                      ? boundActionHref(href, "customer.create", null, liveContextId) : null}
+                    editActionHref={viewReceipt?.actionDescriptor?.actions.some((action) => action.id === "customer.update")
+                      && liveViewResult.route.op === "show" && liveViewResult.route.binding.source === "customers"
+                      ? boundActionHref(href, "customer.update", liveViewResult.route.recordId, liveContextId) : null}
+                  />
+                ) : (
+                  <div className="av" data-live-view-refused>
+                    <ErrorNotice>
+                      {liveViewResult?.reason ?? "The requested live view is unavailable."}{" "}
+                      <Link href={clearLiveViewHref(href)} className="lnk">Return to the installed app</Link>
+                    </ErrorNotice>
+                  </div>
+                )
+              ) : previewKey !== null ? (
                 <AppViewContractPreview
                   exampleKey={previewKey}
                   installationKind={installation.name}
@@ -692,6 +807,51 @@ export function scopedEntryHref(href: string, contextId: string, boundId: string
   const [path, search] = href.split("?");
   const q = new URLSearchParams(search ?? "");
   q.set("ctx", contextId);
+  q.delete("record");
+  q.delete("appview");
+  q.delete("view");
+  q.delete("action");
+  const s = q.toString();
+  return path + (s ? `?${s}` : "");
+}
+
+export function boundViewHref(href: string, viewId: string, recordId: string | null, contextId: string): string {
+  const [path, search] = href.split("?");
+  const q = new URLSearchParams(search ?? "");
+  if (contextId) q.set("ctx", contextId);
+  q.set("view", viewId);
+  if (recordId === null) q.delete("record");
+  else q.set("record", recordId);
+  q.delete("appview");
+  q.delete("crm");
+  q.delete("action");
+  q.delete("contract-preview");
+  q.delete("contract-preview-view");
+  const s = q.toString();
+  return path + (s ? `?${s}` : "");
+}
+
+export function boundActionHref(href: string, actionId: string, recordId: string | null, contextId: string): string {
+  const [path, search] = href.split("?");
+  const q = new URLSearchParams(search ?? "");
+  if (contextId) q.set("ctx", contextId);
+  q.set("action", actionId);
+  if (recordId === null) q.delete("record");
+  else q.set("record", recordId);
+  q.delete("view");
+  q.delete("crm");
+  q.delete("appview");
+  q.delete("contract-preview");
+  q.delete("contract-preview-view");
+  const s = q.toString();
+  return path + (s ? `?${s}` : "");
+}
+
+function clearLiveViewHref(href: string): string {
+  const [path, search] = href.split("?");
+  const q = new URLSearchParams(search ?? "");
+  q.delete("view");
+  q.delete("action");
   q.delete("record");
   q.delete("appview");
   const s = q.toString();
