@@ -128,13 +128,6 @@ where
 {
     T::deserialize(de).map(Some)
 }
-/// CAD-1065: the `POST /api/connections/:id/test` body. Both expected
-/// values are required keys — each is `null` or a well-formed value;
-/// `null` is an exact compare at the daemon, never a wildcard, and a
-/// missing key or a malformed value is a schema refusal here
-/// (`invalid connection request schema`, never a relayed daemon
-/// diagnostic — the request body never reaches the daemon).
-/// `deny_unknown_fields` closes the body.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Test {
@@ -144,8 +137,6 @@ struct Test {
     expected_registration_digest: Option<String>,
 }
 
-/// `expected_revision`: present, `null`, or a positive integer —
-/// `0`, a negative, a float, a non-number all refuse the body.
 fn required_nullable_revision<'de, D>(de: D) -> Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -161,8 +152,6 @@ where
     }
 }
 
-/// `expected_registration_digest`: present, `null`, or the canonical
-/// `sha256:` + 64 lowercase-hex form — anything else refuses the body.
 fn required_nullable_digest<'de, D>(de: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,

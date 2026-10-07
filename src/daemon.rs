@@ -489,16 +489,7 @@ pub struct Shared {
     /// `test-seam`: parks the send worker between recipient rows.
     #[cfg(feature = "test-seam")]
     crm_send_row_gate: Option<Arc<crate::test_seam::SendRowGate>>,
-    /// CAD-1065: the `connection_test` resolver's single in-flight
-    /// slot — one DNS worker per daemon; a second check is `busy`
-    /// until the syscall actually ends, so a timed-out caller never
-    /// frees a still-resolving worker's slot.
     connection_test_resolver: Arc<AtomicBool>,
-    /// CAD-1065: set when a `connection_test` libsecret child could
-    /// not be provably killed and reaped. While set the whole
-    /// verification path stays closed (`busy`) — a process that may
-    /// still hold credential bytes fences the feature, never one
-    /// retry.
     connection_test_fenced: AtomicBool,
     /// CAD-506: the registered platform adapters the effect gate drives
     /// (`platform` name → adapter). A platform with none fails closed —

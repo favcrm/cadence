@@ -1214,136 +1214,110 @@ pub(crate) fn screened(text: &str, secret: &[u8]) -> String {
     excerpt
 }
 
-/// CAD-1065: the closed failure codes of a login-only check and the
-/// pipeline step that produced them. `code`/`step` are wire constants —
-/// no server text, credential material or hostname ever rides them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCode {
+    StaleConnection,
+    Busy,
+    UnsupportedProvider,
+    UnsupportedDeployment,
+    UnsupportedCustody,
+    CustodyUnavailable,
+    ConfigurationUnavailable,
+    DnsFailed,
+    DestinationRefused,
+    ConnectFailed,
+    TlsFailed,
+    AuthFailed,
+    Timeout,
+    QuitFailed,
+    VerificationFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Step {
+    Admission,
+    Configuration,
+    Dns,
+    Connect,
+    Tls,
+    Auth,
+    Quit,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct LoginFailure {
-    pub code: &'static str,
-    pub step: &'static str,
+    pub code: FailureCode,
+    pub step: Step,
 }
 
-impl LoginFailure {
-    fn at(code: &'static str, step: &'static str) -> Self {
-        Self { code, step }
+struct DeadlineSocket<'d> {
+    stream: TcpStream,
+    deadline: &'d crate::platform::OpDeadline,
+}
+
+impl<'d> DeadlineSocket<'d> {
+    fn new(stream: TcpStream, deadline: &'d crate::platform::OpDeadline) -> Self {
+        Self { stream, deadline }
+    }
+
+    fn install(&mut self) -> std::result::Result<(), LoginFault> {
+        let remaining = self.deadline.remaining().ok_or(LoginFault::Timeout)?;
+        self.stream
+            .set_read_timeout(Some(remaining))
+            .and_then(|()| self.stream.set_write_timeout(Some(remaining)))
+            .map_err(|_| LoginFault::Io)
+    }
+
+    fn recheck(&self) -> std::result::Result<(), LoginFault> {
+        if self.deadline.expired() {
+            return Err(LoginFault::Timeout);
+        }
+        Ok(())
     }
 }
 
-/// One login-only check inside `deadline`, over addresses the caller
-/// already resolved (the DNS slot is the caller's — a timed-out lookup
-/// never reaches here). Speaks the reviewed AUTH grammar — greeting,
-/// EHLO, AUTH LOGIN-then-PLAIN, QUIT — and stops there: `MAIL`, `RCPT`
-/// and `DATA` are never sent, so this function can never submit.
-///
-/// `Ok(())` requires an authenticated 235 AND a clean 221 to QUIT —
-/// every other ending is a classified `LoginFailure`, `timeout` naming
-/// the step that ran out of `deadline`.
-pub fn verify_login(
-    envelope: &SmtpEnvelope,
-    addresses: &[std::net::SocketAddr],
-    extra_ca_pem: Option<&[u8]>,
-    deadline: &super::OpDeadline,
-) -> std::result::Result<(), LoginFailure> {
-    // Refuse to open submission sockets at non-loopback addresses when
-    // the enrolled host is the isolated-test name — the same rule
-    // `SmtpSession::dial` enforces on its own resolution.
-    if envelope.host == "localhost" && !addresses.iter().all(|a| a.ip().is_loopback()) {
-        return Err(LoginFailure::at("destination_refused", "dns"));
+impl std::io::Read for DeadlineSocket<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.install()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "budget"))?;
+        let r = self.stream.read(buf);
+        self.recheck()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "budget"))?;
+        r
     }
-    let remaining = || {
-        deadline
-            .remaining()
-            .ok_or_else(|| LoginFailure::at("timeout", "connect"))
-    };
-    let mut stream = None;
-    DIRECT_DIALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    for addr in addresses {
-        match TcpStream::connect_timeout(addr, remaining()?) {
-            Ok(s) => {
-                stream = Some(s);
-                break;
-            }
-            Err(_) => {
-                deadline
-                    .remaining()
-                    .ok_or_else(|| LoginFailure::at("timeout", "connect"))?;
-            }
-        }
-    }
-    let stream = stream.ok_or(LoginFailure::at("connect_failed", "connect"))?;
-    let tls = tls_config(extra_ca_pem)
-        .map_err(|_| LoginFailure::at("verification_failed", "configuration"))?;
-    let mut session = LoginSession {
-        wire: Wire::Plain(BufReader::new(stream)),
-        deadline,
-    };
-    if envelope.tls_mode == TLS_IMPLICIT {
-        session = session
-            .upgrade_tls(&envelope.host, &tls)
-            .map_err(|_| LoginFailure::at("tls_failed", "tls"))?;
-        // The first read completes the handshake with certificate
-        // verification: a rogue certificate or a plaintext speaker
-        // fails here as a TLS refusal, never as a downgrade.
-        let greeting = session
-            .read_reply()
-            .map_err(|_| LoginFailure::at("tls_failed", "tls"))?;
-        if greeting.code != 220 {
-            return Err(LoginFailure::at("tls_failed", "tls"));
-        }
-    } else {
-        let greeting = session
-            .read_reply()
-            .map_err(|_| LoginFailure::at("connect_failed", "connect"))?;
-        if greeting.code != 220 {
-            return Err(LoginFailure::at("destination_refused", "connect"));
-        }
-        let ehlo = session
-            .command(&format!("EHLO {EHLO_NAME}"), &[250])
-            .map_err(|f| f.classify("connect"))?;
-        if !advertises(&ehlo.text, "STARTTLS") {
-            return Err(LoginFailure::at("tls_failed", "tls"));
-        }
-        session
-            .command("STARTTLS", &[220])
-            .map_err(|f| f.classify("tls"))?;
-        session = session
-            .upgrade_tls(&envelope.host, &tls)
-            .map_err(|_| LoginFailure::at("tls_failed", "tls"))?;
-        // RFC 3207: everything below — including this EHLO — runs
-        // inside the verified tunnel.
-        session
-            .command(&format!("EHLO {EHLO_NAME}"), &[250])
-            .map_err(|f| f.classify("tls"))?;
-    }
-    let ehlo = session
-        .command(&format!("EHLO {EHLO_NAME}"), &[250])
-        .map_err(|f| f.classify("auth"))?;
-    let mechanisms = auth_mechanisms(&ehlo.text);
-    let secret = std::str::from_utf8(&envelope.secret)
-        .map_err(|_| LoginFailure::at("verification_failed", "auth"))?;
-    let mut authenticated = false;
-    if mechanisms.iter().any(|name| name == "LOGIN") {
-        authenticated =
-            login_auth(&mut session, &envelope.username, secret).map_err(|f| f.classify("auth"))?;
-    }
-    if !authenticated && mechanisms.iter().any(|name| name == "PLAIN") {
-        authenticated =
-            plain_auth(&mut session, &envelope.username, secret).map_err(|f| f.classify("auth"))?;
-    }
-    if !authenticated {
-        return Err(LoginFailure::at("auth_failed", "auth"));
-    }
-    session
-        .command("QUIT", &[221])
-        .map_err(|f| f.classify("quit"))?;
-    Ok(())
 }
 
-/// The login dialog's refusal: either the wire broke (`Io` — timeout,
-/// reset, malformed or absent reply) or the server answered out of
-/// grammar (`Refused`). `classify` maps it onto the closed codes with
-/// the step the caller says was in flight — a spend-out is always
-/// `timeout` at that step.
+impl std::io::Write for DeadlineSocket<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.install()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "budget"))?;
+        let r = self.stream.write(buf);
+        self.recheck()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "budget"))?;
+        r
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.install()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "budget"))?;
+        let r = self.stream.flush();
+        self.recheck()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "budget"))?;
+        r
+    }
+}
+
+enum LoginWire<'d> {
+    Plain(BufReader<DeadlineSocket<'d>>),
+    Tls(Box<BufReader<rustls::StreamOwned<rustls::ClientConnection, DeadlineSocket<'d>>>>),
+}
+
+struct LoginSession<'d> {
+    wire: LoginWire<'d>,
+    deadline: &'d crate::platform::OpDeadline,
+}
+
 enum LoginFault {
     Io,
     Refused,
@@ -1351,92 +1325,43 @@ enum LoginFault {
 }
 
 impl LoginFault {
-    fn classify(self, step: &'static str) -> LoginFailure {
+    fn classify(self, step: Step) -> LoginFailure {
         let code = match (self, step) {
-            (LoginFault::Timeout, _) => "timeout",
-            (LoginFault::Io, "dns") => "dns_failed",
-            (LoginFault::Io, "connect") => "connect_failed",
-            (LoginFault::Io, "tls") => "tls_failed",
-            (LoginFault::Io, "auth") => "auth_failed",
-            (LoginFault::Io, "quit") => "quit_failed",
-            (LoginFault::Io, _) => "verification_failed",
-            (LoginFault::Refused, "connect") => "destination_refused",
-            (LoginFault::Refused, "tls") => "tls_failed",
-            (LoginFault::Refused, "auth") => "auth_failed",
-            (LoginFault::Refused, "quit") => "quit_failed",
-            (LoginFault::Refused, _) => "verification_failed",
+            (LoginFault::Timeout, _) => FailureCode::Timeout,
+            (LoginFault::Io, Step::Dns) => FailureCode::DnsFailed,
+            (LoginFault::Io, Step::Connect) => FailureCode::ConnectFailed,
+            (LoginFault::Io, Step::Tls) => FailureCode::TlsFailed,
+            (LoginFault::Io, Step::Auth) => FailureCode::AuthFailed,
+            (LoginFault::Io, Step::Quit) => FailureCode::QuitFailed,
+            (LoginFault::Io, _) => FailureCode::VerificationFailed,
+            (LoginFault::Refused, Step::Connect) => FailureCode::DestinationRefused,
+            (LoginFault::Refused, Step::Tls) => FailureCode::TlsFailed,
+            (LoginFault::Refused, Step::Auth) => FailureCode::AuthFailed,
+            (LoginFault::Refused, Step::Quit) => FailureCode::QuitFailed,
+            (LoginFault::Refused, _) => FailureCode::VerificationFailed,
         };
-        LoginFailure::at(code, step)
+        LoginFailure { code, step }
     }
 }
 
-/// The login-only session: same wire grammar as `SmtpSession`, but
-/// every read and write reinstalls the operation's remaining budget
-/// and every reply line is pulled through a capped reader — the
-/// bounded sibling the login check runs instead of the send dialog.
-struct LoginSession<'d> {
-    wire: Wire,
-    deadline: &'d super::OpDeadline,
-}
+impl<'d> LoginSession<'d> {
+    const REPLY_TOTAL_CAP: usize = 64 * 1024;
+    const REPLY_MAX_LINES: usize = 100;
 
-impl LoginSession<'_> {
-    /// Reinstall the operation's remaining budget on the socket —
-    /// called before every underlying read and write so no syscall
-    /// ever outlives the deadline.
-    fn refresh_timeouts(&mut self) -> std::result::Result<(), LoginFault> {
-        let remaining = self.deadline.remaining().ok_or(LoginFault::Timeout)?;
-        let stream: &mut TcpStream = match &mut self.wire {
-            Wire::Plain(reader) => reader.get_mut(),
-            Wire::Tls(reader) => &mut reader.get_mut().sock,
-        };
-        stream
-            .set_read_timeout(Some(remaining))
-            .and_then(|()| stream.set_write_timeout(Some(remaining)))
-            .map_err(|_| LoginFault::Io)
-    }
-
-    /// Move the plaintext session into the verified tunnel by value —
-    /// after this returns only TLS exists; no handle can still speak
-    /// plaintext.
-    fn upgrade_tls(
-        self,
-        host: &str,
-        tls: &Arc<rustls::ClientConfig>,
-    ) -> std::result::Result<Self, LoginFault> {
-        match self.wire {
-            Wire::Plain(reader) => {
-                let stream = reader.into_inner();
-                let name = rustls::pki_types::ServerName::try_from(host.to_string())
-                    .map_err(|_| LoginFault::Io)?;
-                let connection =
-                    rustls::ClientConnection::new(tls.clone(), name).map_err(|_| LoginFault::Io)?;
-                Ok(Self {
-                    wire: Wire::Tls(Box::new(BufReader::new(rustls::StreamOwned::new(
-                        connection, stream,
-                    )))),
-                    deadline: self.deadline,
-                })
-            }
-            Wire::Tls(_) => Err(LoginFault::Io),
-        }
-    }
-
-    /// One reply under the remaining budget: lines are pulled through
-    /// `BufRead::fill_buf`/`consume` capped at `REPLY_LINE_CAP` so an
-    /// unbounded line refuses before allocation, and at most 100
-    /// continuation lines make one reply.
     fn read_reply(&mut self) -> std::result::Result<SmtpLine, LoginFault> {
         let mut text = String::new();
         let mut code = 0u16;
         let mut lines = 0usize;
         loop {
-            self.refresh_timeouts()?;
-            let line = self.read_line_capped()?;
-            lines += 1;
-            if lines > 100 {
+            if lines >= Self::REPLY_MAX_LINES {
                 return Err(LoginFault::Io);
             }
-            if line.len() < 4 {
+            if text.len() >= Self::REPLY_TOTAL_CAP {
+                return Err(LoginFault::Io);
+            }
+            let line = self.read_line_capped()?;
+            lines += 1;
+            if line.len() < 4 || !line.as_bytes().iter().take(3).all(|b| b.is_ascii_digit()) {
                 return Err(LoginFault::Io);
             }
             let parsed: u16 = line[..3].parse().map_err(|_| LoginFault::Io)?;
@@ -1448,10 +1373,13 @@ impl LoginSession<'_> {
             let payload = line[3..]
                 .trim_end_matches(['\r', '\n'])
                 .trim_start_matches(['-', ' ']);
+            if text.len() + payload.len() + 1 > Self::REPLY_TOTAL_CAP {
+                return Err(LoginFault::Io);
+            }
             text.push_str(payload);
-            match line.chars().nth(3) {
-                Some(' ') => return Ok(SmtpLine { code, text }),
-                Some('-') => {
+            match line.as_bytes().get(3) {
+                Some(b' ') => return Ok(SmtpLine { code, text }),
+                Some(b'-') => {
                     text.push('\n');
                     continue;
                 }
@@ -1460,36 +1388,26 @@ impl LoginSession<'_> {
         }
     }
 
-    /// Read one line, at most `REPLY_LINE_CAP` bytes, off the wire's
-    /// buffered reader without ever allocating past the cap. `0` means
-    /// the peer closed; an over-cap line is malformed, not truncated.
     fn read_line_capped(&mut self) -> std::result::Result<String, LoginFault> {
         let mut out = Vec::with_capacity(64);
         loop {
-            self.refresh_timeouts()?;
             let reader: &mut dyn BufRead = match &mut self.wire {
-                Wire::Plain(reader) => reader,
-                Wire::Tls(reader) => reader,
+                LoginWire::Plain(reader) => reader,
+                LoginWire::Tls(reader) => reader,
             };
-            let available = reader.fill_buf().map_err(|e| {
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut
-                {
-                    LoginFault::Timeout
-                } else {
-                    LoginFault::Io
-                }
-            })?;
+            let available = reader.fill_buf().map_err(|e| login_fault_io(&e))?;
             if available.is_empty() {
                 return Err(LoginFault::Io);
             }
-            let take = available.len().min(REPLY_LINE_CAP + 1 - out.len());
-            let end = available[..take].iter().position(|b| *b == b'\n');
-            match end {
+            let room = REPLY_LINE_CAP + 1 - out.len().min(REPLY_LINE_CAP + 1);
+            if room == 0 {
+                return Err(LoginFault::Io);
+            }
+            let take = available.len().min(room);
+            match available[..take].iter().position(|b| *b == b'\n') {
                 Some(at) => {
                     out.extend_from_slice(&available[..=at]);
-                    let consumed = at + 1;
-                    reader.consume(consumed);
+                    reader.consume(at + 1);
                     if out.len() > REPLY_LINE_CAP {
                         return Err(LoginFault::Io);
                     }
@@ -1497,8 +1415,7 @@ impl LoginSession<'_> {
                 }
                 None => {
                     out.extend_from_slice(&available[..take]);
-                    let consumed = take;
-                    reader.consume(consumed);
+                    reader.consume(take);
                     if out.len() > REPLY_LINE_CAP {
                         return Err(LoginFault::Io);
                     }
@@ -1507,35 +1424,55 @@ impl LoginSession<'_> {
         }
     }
 
-    /// One command + reply. The write rides the same per-call
-    /// remaining-budget timeout; a refusal is `Refused`, a broken
-    /// wire `Io` and a spent budget `Timeout`.
     fn command(&mut self, text: &str, expect: &[u16]) -> std::result::Result<SmtpLine, LoginFault> {
         if text.contains(['\r', '\n']) {
             return Err(LoginFault::Io);
         }
-        self.refresh_timeouts()?;
         let writer: &mut dyn Write = match &mut self.wire {
-            Wire::Plain(reader) => reader.get_mut(),
-            Wire::Tls(reader) => reader.get_mut(),
+            LoginWire::Plain(reader) => reader.get_mut(),
+            LoginWire::Tls(reader) => reader.get_mut(),
         };
         writer
             .write_all(format!("{text}\r\n").as_bytes())
             .and_then(|()| writer.flush())
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut
-                {
-                    LoginFault::Timeout
-                } else {
-                    LoginFault::Io
-                }
-            })?;
+            .map_err(|e| login_fault_io(&e))?;
         let reply = self.read_reply()?;
         if !expect.contains(&reply.code) {
             return Err(LoginFault::Refused);
         }
         Ok(reply)
+    }
+
+    fn upgrade_tls(
+        self,
+        host: &str,
+        tls: &Arc<rustls::ClientConfig>,
+    ) -> std::result::Result<Self, LoginFault> {
+        self.deadline.remaining().ok_or(LoginFault::Timeout)?;
+        match self.wire {
+            LoginWire::Plain(reader) => {
+                let stream = reader.into_inner();
+                let name = rustls::pki_types::ServerName::try_from(host.to_string())
+                    .map_err(|_| LoginFault::Io)?;
+                let connection =
+                    rustls::ClientConnection::new(tls.clone(), name).map_err(|_| LoginFault::Io)?;
+                Ok(Self {
+                    wire: LoginWire::Tls(Box::new(BufReader::new(rustls::StreamOwned::new(
+                        connection, stream,
+                    )))),
+                    deadline: self.deadline,
+                })
+            }
+            LoginWire::Tls(_) => Err(LoginFault::Io),
+        }
+    }
+}
+
+fn login_fault_io(e: &std::io::Error) -> LoginFault {
+    if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock {
+        LoginFault::Timeout
+    } else {
+        LoginFault::Io
     }
 }
 
@@ -1586,6 +1523,120 @@ fn plain_auth(
     }
 }
 
+pub fn verify_login(
+    envelope: &SmtpEnvelope,
+    addresses: &[std::net::SocketAddr],
+    extra_ca_pem: Option<&[u8]>,
+    deadline: &crate::platform::OpDeadline,
+) -> std::result::Result<(), LoginFailure> {
+    if envelope.host == "localhost" && !addresses.iter().all(|a| a.ip().is_loopback()) {
+        return Err(LoginFailure {
+            code: FailureCode::DestinationRefused,
+            step: Step::Dns,
+        });
+    }
+    let remaining = || {
+        deadline.remaining().ok_or(LoginFailure {
+            code: FailureCode::Timeout,
+            step: Step::Connect,
+        })
+    };
+    let mut stream = None;
+    DIRECT_DIALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    for addr in addresses {
+        match TcpStream::connect_timeout(addr, remaining()?) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => {
+                deadline.remaining().ok_or(LoginFailure {
+                    code: FailureCode::Timeout,
+                    step: Step::Connect,
+                })?;
+            }
+        }
+    }
+    let stream = stream.ok_or(LoginFailure {
+        code: FailureCode::ConnectFailed,
+        step: Step::Connect,
+    })?;
+    let tls = tls_config(extra_ca_pem).map_err(|_| LoginFailure {
+        code: FailureCode::VerificationFailed,
+        step: Step::Configuration,
+    })?;
+    let mut session = LoginSession {
+        wire: LoginWire::Plain(BufReader::new(DeadlineSocket::new(stream, deadline))),
+        deadline,
+    };
+    if envelope.tls_mode == TLS_IMPLICIT {
+        session = session
+            .upgrade_tls(&envelope.host, &tls)
+            .map_err(|f| f.classify(Step::Tls))?;
+        let greeting = session.read_reply().map_err(|f| f.classify(Step::Tls))?;
+        if greeting.code != 220 {
+            return Err(LoginFailure {
+                code: FailureCode::TlsFailed,
+                step: Step::Tls,
+            });
+        }
+    } else {
+        let greeting = session
+            .read_reply()
+            .map_err(|f| f.classify(Step::Connect))?;
+        if greeting.code != 220 {
+            return Err(LoginFailure {
+                code: FailureCode::DestinationRefused,
+                step: Step::Connect,
+            });
+        }
+        let ehlo = session
+            .command(&format!("EHLO {EHLO_NAME}"), &[250])
+            .map_err(|f| f.classify(Step::Connect))?;
+        if !advertises(&ehlo.text, "STARTTLS") {
+            return Err(LoginFailure {
+                code: FailureCode::TlsFailed,
+                step: Step::Tls,
+            });
+        }
+        session
+            .command("STARTTLS", &[220])
+            .map_err(|f| f.classify(Step::Tls))?;
+        session = session
+            .upgrade_tls(&envelope.host, &tls)
+            .map_err(|f| f.classify(Step::Tls))?;
+        session
+            .command(&format!("EHLO {EHLO_NAME}"), &[250])
+            .map_err(|f| f.classify(Step::Tls))?;
+    }
+    let ehlo = session
+        .command(&format!("EHLO {EHLO_NAME}"), &[250])
+        .map_err(|f| f.classify(Step::Auth))?;
+    let mechanisms = auth_mechanisms(&ehlo.text);
+    let secret = std::str::from_utf8(&envelope.secret).map_err(|_| LoginFailure {
+        code: FailureCode::VerificationFailed,
+        step: Step::Auth,
+    })?;
+    let mut authenticated = false;
+    if mechanisms.iter().any(|name| name == "LOGIN") {
+        authenticated = login_auth(&mut session, &envelope.username, secret)
+            .map_err(|f| f.classify(Step::Auth))?;
+    }
+    if !authenticated && mechanisms.iter().any(|name| name == "PLAIN") {
+        authenticated = plain_auth(&mut session, &envelope.username, secret)
+            .map_err(|f| f.classify(Step::Auth))?;
+    }
+    if !authenticated {
+        return Err(LoginFailure {
+            code: FailureCode::AuthFailed,
+            step: Step::Auth,
+        });
+    }
+    session
+        .command("QUIT", &[221])
+        .map_err(|f| f.classify(Step::Quit))?;
+    Ok(())
+}
 /// CAD-1126: the "build" half of a submission, shared by the direct
 /// socket path and the hosted `smtp.internal` pass-through so both put
 /// the exact same bytes (Date, Message-ID, List-Unsubscribe, ...) on

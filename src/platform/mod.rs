@@ -92,29 +92,21 @@ use crate::store::{Grant, Store};
 
 pub use custody::{Custody, Key};
 
-/// CAD-1065: one fixed monotonic budget for the whole
-/// `connection_test` operation. Every bounded step — custody read,
-/// DNS slot, connect, TLS, AUTH, QUIT — draws from the same deadline;
-/// `remaining` returns `None` once it has elapsed, so no step ever
-/// computes a zero or negative wait.
 pub struct OpDeadline {
     end: std::time::Instant,
 }
 
 impl OpDeadline {
-    /// A fresh budget of `seconds` from now.
     pub fn in_seconds(seconds: u64) -> Self {
         Self {
             end: std::time::Instant::now() + std::time::Duration::from_secs(seconds),
         }
     }
 
-    /// Time left, or `None` when the budget is spent.
     pub fn remaining(&self) -> Option<std::time::Duration> {
         self.end.checked_duration_since(std::time::Instant::now())
     }
 
-    /// True when nothing is left — the operation classifies `timeout`.
     pub fn expired(&self) -> bool {
         self.remaining().is_none()
     }

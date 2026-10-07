@@ -1,26 +1,4 @@
-//! CAD-1065: `connection_test` — the operator-only, stored-connection
-//! SMTP login-without-send check. The full contract lives in the
-//! CAD-1065 design supplement (`.tmp/cad1065-supplement-v2/`); this
-//! module carries exactly it:
-//!
-//! * Authority first — the caller must already have passed
-//!   `operator_connection` (this method runs behind `rpc_connection`'s
-//!   prologue); nothing here reaches a Connection lookup, credential,
-//!   DNS, socket or state write before that.
-//! * Both `expected_revision` and `expected_registration_digest` are
-//!   required keys; `null` is an exact compare, never a wildcard.
-//! * One fixed 20-second monotonic budget, started after caller
-//!   admission and before any custody or lookup work.
-//! * The admission (`platform_custody_lock`) and store guards are
-//!   try-locked: contention, poison or a fenced cleanup path is `busy`,
-//!   never a wait, a retry or a forensic write.
-//! * DNS runs in a single in-flight resolver slot — a worker that sees
-//!   only `(host, port)`, never credential material; a timed-out
-//!   resolution holds its slot until the syscall actually finishes.
-//! * The receipt carries only non-secret metadata and is emitted by one
-//!   dedicated serializer; the provider byte stream is never captured.
-
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -34,21 +12,29 @@ use super::*;
 use crate::platform;
 use crate::store::CredentialRecord;
 
-/// The published operation name every receipt and support row carries.
 const OPERATION: &str = "smtp-login-no-send-v1";
-/// The whole call's monotonic budget, from just after caller admission.
 const BUDGET: Duration = Duration::from_secs(20);
-/// Custody bytes are the canonical nine-field writer's document; at the
-/// field caps (host 253, username 320, secret 1024, sender 254,
-/// sender_name 80, port, tls_mode, provider, schema) worst-case JSON
-/// escaping stays well under this — a bigger blob is torn, never read.
 const MATERIAL_CAP: usize = 16 * 1024;
-/// Resolver wait granularity while the in-flight slot's worker runs.
 const RESOLVE_POLL: Duration = Duration::from_millis(25);
+const MAX_RESOLVED: usize = 64;
 
-/// One `connection_test` result. Serialized once, by [`Self::value`];
-/// only non-secret metadata may be a field — credential bytes, server
-/// text and host material never are.
+use crate::platform::smtp::{FailureCode, Step};
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Status {
+    Success,
+    Failed,
+    Stale,
+    Unsupported,
+}
+
+#[derive(Serialize)]
+struct Failure {
+    code: FailureCode,
+    step: Step,
+}
+
 #[derive(Serialize)]
 struct VerificationReceipt {
     schema: u32,
@@ -58,7 +44,7 @@ struct VerificationReceipt {
     registration_digest: Option<String>,
     started_at: String,
     completed_at: String,
-    status: &'static str,
+    status: Status,
     network_attempted: bool,
     authentication_verified: bool,
     email_sent: bool,
@@ -66,12 +52,6 @@ struct VerificationReceipt {
     sender_entitlement_verified: bool,
     execution_authority: bool,
     failure: Option<Failure>,
-}
-
-#[derive(Serialize)]
-struct Failure {
-    code: &'static str,
-    step: &'static str,
 }
 
 impl VerificationReceipt {
@@ -84,7 +64,7 @@ impl VerificationReceipt {
             registration_digest: None,
             started_at: crate::issue::time::iso(started_at),
             completed_at: String::new(),
-            status: "failed",
+            status: Status::Failed,
             network_attempted: false,
             authentication_verified: false,
             email_sent: false,
@@ -95,23 +75,18 @@ impl VerificationReceipt {
         }
     }
 
-    /// Stamp the completion wall-clock and return `{"verification": ..}`.
     fn value(mut self) -> Value {
         self.completed_at = crate::issue::time::iso(crate::issue::time::now_epoch());
         json!({ "verification": self })
     }
 
-    /// The classified failure: `status` + `{code, step}`.
-    fn failed(mut self, status: &'static str, code: &'static str, step: &'static str) -> Self {
+    fn failed(mut self, status: Status, code: FailureCode, step: Step) -> Self {
         self.status = status;
         self.failure = Some(Failure { code, step });
         self
     }
 }
 
-/// `expected_revision` — the key must be present; its value is `null`
-/// or a positive integer. Anything else is malformed and refuses with
-/// the fixed neutral text (the supplied value is never echoed).
 fn expected_revision(params: &Value) -> Result<Option<u64>> {
     match params.get("expected_revision") {
         None => Err(Error::rejected("connection test parameters are malformed")),
@@ -124,8 +99,6 @@ fn expected_revision(params: &Value) -> Result<Option<u64>> {
     }
 }
 
-/// `expected_registration_digest` — present; `null` or the canonical
-/// `sha256:` + 64 lowercase-hex digest. Anything else refuses.
 fn expected_registration_digest(params: &Value) -> Result<Option<String>> {
     match params.get("expected_registration_digest") {
         None => Err(Error::rejected("connection test parameters are malformed")),
@@ -147,64 +120,69 @@ fn expected_registration_digest(params: &Value) -> Result<Option<String>> {
     }
 }
 
-/// Whether a provider/record pair may ever answer `connection_test`:
-/// only the self-hosted direct-SMTP shape — canonical `smtp` provider,
-/// `smtp` exchange, `file`/`libsecret` custody — on a daemon that is
-/// not hosted. The reason is the same closed vocabulary the receipt's
-/// `failure.code` uses; `None` when supported.
-fn verification_support(
+fn registration_digest_for(shared: &Shared, provider: &str) -> Option<String> {
+    let adapter = shared.platforms.get(provider)?;
+    let descriptor = shared.connection_descriptor(provider).ok();
+    adapter.connection_registration().map(|r| {
+        crate::platform::connections::registration_digest(&format!(
+            "{r}:{}",
+            serde_json::to_string(&descriptor).unwrap_or_default()
+        ))
+    })
+}
+
+fn supported_reason(
     provider: &str,
     record: Option<&CredentialRecord>,
     hosted: bool,
     custody_tag: &'static str,
-) -> Option<&'static str> {
+) -> Option<FailureCode> {
     if hosted {
-        return Some("unsupported_deployment");
+        return Some(FailureCode::UnsupportedDeployment);
     }
     if provider != platform::smtp::PLATFORM {
-        return Some("unsupported_provider");
+        return Some(FailureCode::UnsupportedProvider);
     }
     if let Some(record) = record {
         if record.exchange != platform::smtp::ENROLLMENT_SHAPE {
-            return Some("unsupported_provider");
+            return Some(FailureCode::UnsupportedProvider);
         }
         if !matches!(
             record.custody.as_str(),
             platform::custody::FILE_TAG | platform::custody::LIBSECRET_TAG
         ) || record.custody != custody_tag
         {
-            return Some("unsupported_custody");
+            return Some(FailureCode::UnsupportedCustody);
         }
     }
     None
 }
 
-/// The `verification_support` metadata a connection or provider row
-/// carries: non-authorizing advertisement only — `supported` false or
-/// the metadata absent never proves admission, and `supported` true
-/// never grants it.
-pub(super) fn verification_support_json(reason: Option<&'static str>) -> Value {
+pub(super) fn verification_support_json(reason: Option<FailureCode>) -> Value {
     json!({
-        "operation": match reason {
-            None => json!(OPERATION),
-            Some(_) => Value::Null,
-        },
+        "operation": if reason.is_none() { json!(OPERATION) } else { Value::Null },
         "supported": reason.is_none(),
-        "reason_code": reason,
+        "reason_code": reason.map(|r| serde_json::to_value(r).unwrap_or(Value::Null)).unwrap_or(Value::Null),
     })
 }
 
+enum ConnectionIdentity {
+    Enrolled(CredentialRecord, Option<String>),
+    Builtin {
+        provider: String,
+        account: String,
+        digest: Option<String>,
+    },
+}
+
 impl Shared {
-    /// The `verification_support` field for a connection row —
-    /// per-record admission shape recomputed from live daemon state,
-    /// informational and never authority.
     pub(super) fn connection_verification_support(
         &self,
         provider: &str,
         record: Option<&CredentialRecord>,
     ) -> Value {
         let hosted = self.smtp_internal.is_some() || self.hosted_email.is_some();
-        verification_support_json(verification_support(
+        verification_support_json(supported_reason(
             provider,
             record,
             hosted,
@@ -212,12 +190,49 @@ impl Shared {
         ))
     }
 
-    /// The `connection_test` handler. Caller admission
-    /// (`operator_connection`) and the parameter allowlist already ran
-    /// in `rpc_connection`; this starts the fixed budget, takes the
-    /// fail-fast admission and store guards, then either refuses with
-    /// a fixed neutral envelope (before a trusted row exists) or
-    /// returns a typed receipt built only from server-side state.
+    fn resolve_builtin(&self, id: &str) -> Result<Option<(String, String, Option<String>)>> {
+        let workspace = self.store.connection_workspace_id_strict()?;
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        if !self.platforms.contains_key("local") {
+            candidates.push(("local".to_string(), "local".to_string()));
+        }
+        for (provider, adapter) in &self.platforms {
+            if let Some(descriptor) = adapter.connection_descriptor() {
+                if descriptor.validate(adapter.table()).is_ok() {
+                    for account in descriptor.builtin_accounts {
+                        if provider != "local" || account != "local" {
+                            candidates.push((provider.clone(), account.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        for (provider, account) in candidates {
+            let candidate = self.builtin_connection_id(&provider, &account)?;
+            if candidate == id {
+                let digest = registration_digest_for(self, &provider);
+                return Ok(Some((provider, account, digest)));
+            }
+        }
+        let _ = workspace;
+        Ok(None)
+    }
+
+    fn resolve_identity(&self, id: &str) -> Result<Option<ConnectionIdentity>> {
+        if let Some(record) = self.store.connection_credential_strict(id)? {
+            let digest = registration_digest_for(self, &record.platform);
+            return Ok(Some(ConnectionIdentity::Enrolled(record, digest)));
+        }
+        if let Some((provider, account, digest)) = self.resolve_builtin(id)? {
+            return Ok(Some(ConnectionIdentity::Builtin {
+                provider,
+                account,
+                digest,
+            }));
+        }
+        Ok(None)
+    }
+
     pub(super) fn connection_test(&self, params: &Value) -> Result<Value> {
         let id = connection_id(params)?;
         let expected_revision = expected_revision(params)?;
@@ -226,184 +241,210 @@ impl Shared {
         let deadline = crate::platform::OpDeadline::in_seconds(BUDGET.as_secs());
         let started_at = crate::issue::time::now_epoch();
 
-        // The custody-critical-section guard serializes this op with
-        // custody mutation and any sibling check; contention or poison
-        // is fail-fast busy, never a wait or a poisoned-guard read.
         let _custody = self
             .platform_custody_lock
             .try_lock()
             .map_err(|_| Error::busy("connection test is busy"))?;
-        // A previous check's libsecret child could not be provably
-        // killed and reaped — the path stays closed while custody
-        // bytes may still sit with an unobserved process.
         if self.connection_test_fenced.load(Ordering::SeqCst) {
             return Err(Error::busy(
                 "connection test is fenced pending credential cleanup",
             ));
         }
 
-        // The current Connection projection — the fail-fast read only.
-        // A read that fails (contention, poison) keeps the fixed neutral
-        // envelope; a clean "no such row" is a typed receipt — the
-        // absent/incarnation case the caller must distinguish, not an
-        // operator-facing error.
-        let record = self
-            .store
-            .connection_credential_strict(id)
-            .map_err(|_| Error::rejected("connection is unavailable or stale"))?;
-
-        let hosted = self.smtp_internal.is_some() || self.hosted_email.is_some();
-        let Some(record) = record else {
-            // Missing/foreign/built-in: there is no enrolled row, so the
-            // server-side values are both null. A caller expecting a live
-            // revision or digest is stale; one matching the null pair is
-            // unsupported (a hosted daemon is unsupported_deployment).
-            let mut receipt = VerificationReceipt::new(id, started_at);
-            if expected_revision.is_some() || expected_digest.is_some() {
-                return Ok(receipt
-                    .failed("stale", "stale_connection", "admission")
-                    .value());
-            }
-            receipt.status = "unsupported";
-            receipt.failure = Some(Failure {
-                code: if hosted {
-                    "unsupported_deployment"
-                } else {
-                    "unsupported_provider"
-                },
-                step: "admission",
-            });
-            return Ok(receipt.value());
+        let Some(identity) = self.resolve_identity(id)? else {
+            return Err(Error::rejected("connection is unavailable or stale"));
         };
 
-        let registration = self
-            .platforms
-            .get(&record.platform)
-            .and_then(|adapter| adapter.connection_registration())
-            .map(|registration| {
-                crate::platform::connections::registration_digest(&format!(
-                    "{registration}:{}",
-                    serde_json::to_string(&self.connection_descriptor(&record.platform).ok())
-                        .unwrap_or_default()
-                ))
-            });
+        match identity {
+            ConnectionIdentity::Builtin {
+                provider,
+                account,
+                digest,
+            } => {
+                let mut receipt = VerificationReceipt::new(id, started_at);
+                receipt.revision = None;
+                receipt.registration_digest = digest.clone();
+                if expected_revision.is_some() || expected_digest != digest {
+                    return Ok(receipt
+                        .failed(Status::Stale, FailureCode::StaleConnection, Step::Admission)
+                        .value());
+                }
+                let hosted = self.smtp_internal.is_some() || self.hosted_email.is_some();
+                let reason = supported_reason(&provider, None, hosted, self.platform_custody.tag());
+                let code = reason.unwrap_or(FailureCode::UnsupportedProvider);
+                let _ = account;
+                Ok(receipt
+                    .failed(Status::Unsupported, code, Step::Admission)
+                    .value())
+            }
+            ConnectionIdentity::Enrolled(record, registration) => {
+                let mut receipt = VerificationReceipt::new(id, started_at);
+                receipt.revision = Some(record.credential_revision);
+                receipt.registration_digest = registration.clone();
 
-        let mut receipt = VerificationReceipt::new(id, started_at);
-        receipt.revision = Some(record.credential_revision);
-        receipt.registration_digest = registration.clone();
-
-        // The stale-vs-expected compare runs on the server snapshot
-        // alone, before any credential, DNS or socket work.
-        if expected_revision != Some(record.credential_revision) || expected_digest != registration
-        {
-            return Ok(receipt
-                .failed("stale", "stale_connection", "admission")
-                .value());
-        }
-        if let Some(reason) = verification_support(
-            &record.platform,
-            Some(&record),
-            hosted,
-            self.platform_custody.tag(),
-        ) {
-            return Ok(receipt.failed("unsupported", reason, "admission").value());
-        }
-
-        // Secret access: reserve the operation's single resolver slot
-        // before key access, then read custody through the bounded
-        // deadline-aware load — never the unbounded `load` path.
-        if self
-            .connection_test_resolver
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Ok(receipt.failed("failed", "busy", "admission").value());
-        }
-        // From here the slot is owned by this call. If the DNS worker
-        // spawns it takes the slot over — `release_slot` tracks which
-        // of the two still holds it.
-        let mut slot_owned = true;
-
-        let bytes = match self.platform_custody.load_bounded(
-            &record.custody,
-            &crate::platform::Key {
-                platform: &record.platform,
-                account: &record.account,
-            },
-            MATERIAL_CAP,
-            &deadline,
-            &self.connection_test_fenced,
-        ) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                release_slot(&self.connection_test_resolver, &mut slot_owned);
-                return Ok(if e.kind() == "busy" {
-                    receipt.failed("failed", "timeout", "configuration").value()
-                } else {
-                    receipt
-                        .failed("failed", "custody_unavailable", "configuration")
-                        .value()
+                if expected_revision != Some(record.credential_revision)
+                    || expected_digest != registration
+                {
+                    return Ok(receipt
+                        .failed(Status::Stale, FailureCode::StaleConnection, Step::Admission)
+                        .value());
+                }
+                let hosted = self.smtp_internal.is_some() || self.hosted_email.is_some();
+                if let Some(reason) = supported_reason(
+                    &record.platform,
+                    Some(&record),
+                    hosted,
+                    self.platform_custody.tag(),
+                ) {
+                    return Ok(receipt
+                        .failed(Status::Unsupported, reason, Step::Admission)
+                        .value());
+                }
+                if registration.is_none() {
+                    return Ok(receipt
+                        .failed(
+                            Status::Unsupported,
+                            FailureCode::UnsupportedProvider,
+                            Step::Admission,
+                        )
+                        .value());
+                }
+                let manifest_ok = self.platforms.get(&record.platform).is_some_and(|adapter| {
+                    adapter.table().manifest_version.as_deref()
+                        == Some(platform::smtp::MANIFEST_PIN)
+                        && adapter.reported_manifest_version().as_deref()
+                            == Some(platform::smtp::MANIFEST_PIN)
                 });
-            }
-        };
-        if crate::secret::fingerprint(&bytes) != record.fingerprint {
-            release_slot(&self.connection_test_resolver, &mut slot_owned);
-            return Ok(receipt
-                .failed("failed", "custody_unavailable", "configuration")
-                .value());
-        }
-        let envelope = match crate::platform::smtp::custody_decode(&bytes) {
-            Ok((envelope, _)) => envelope,
-            Err(_) => {
-                release_slot(&self.connection_test_resolver, &mut slot_owned);
-                return Ok(receipt
-                    .failed("failed", "configuration_unavailable", "configuration")
-                    .value());
-            }
-        };
-        drop(bytes);
+                if !manifest_ok || self.connection_descriptor(&record.platform).is_err() {
+                    return Ok(receipt
+                        .failed(
+                            Status::Unsupported,
+                            FailureCode::UnsupportedProvider,
+                            Step::Admission,
+                        )
+                        .value());
+                }
 
-        // DNS: the in-flight resolver sees only `(host, port)` — never
-        // credential material, never a socket — and answers or holds
-        // its slot until the syscall actually ends. `network_attempted`
-        // marks the moment the worker spawns, not the reservation.
-        receipt.network_attempted = true;
-        let addresses = match self.resolve_login_host(&envelope.host, envelope.port, &deadline) {
-            Ok(addresses) => addresses,
-            Err(failure) => {
-                return Ok(receipt.failed("failed", failure.code, failure.step).value());
+                if self
+                    .connection_test_resolver
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    return Ok(receipt
+                        .failed(Status::Failed, FailureCode::Busy, Step::Admission)
+                        .value());
+                }
+                let mut slot_owned = true;
+                let bytes = match self.platform_custody.load_bounded(
+                    &record.custody,
+                    &crate::platform::Key {
+                        platform: &record.platform,
+                        account: &record.account,
+                    },
+                    MATERIAL_CAP,
+                    &deadline,
+                    &self.connection_test_fenced,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if self.connection_test_fenced.load(Ordering::SeqCst) {
+                            release_slot(&self.connection_test_resolver, &mut slot_owned);
+                            return Err(Error::busy(
+                                "connection test is fenced pending credential cleanup",
+                            ));
+                        }
+                        release_slot(&self.connection_test_resolver, &mut slot_owned);
+                        return Ok(if e.kind() == "busy" {
+                            receipt
+                                .failed(Status::Failed, FailureCode::Timeout, Step::Configuration)
+                                .value()
+                        } else {
+                            receipt
+                                .failed(
+                                    Status::Failed,
+                                    FailureCode::CustodyUnavailable,
+                                    Step::Configuration,
+                                )
+                                .value()
+                        });
+                    }
+                };
+                if crate::secret::fingerprint(&bytes) != record.fingerprint {
+                    release_slot(&self.connection_test_resolver, &mut slot_owned);
+                    return Ok(receipt
+                        .failed(
+                            Status::Failed,
+                            FailureCode::CustodyUnavailable,
+                            Step::Configuration,
+                        )
+                        .value());
+                }
+                let envelope = match crate::platform::smtp::custody_decode(&bytes) {
+                    Ok((envelope, _)) => envelope,
+                    Err(_) => {
+                        release_slot(&self.connection_test_resolver, &mut slot_owned);
+                        return Ok(receipt
+                            .failed(
+                                Status::Failed,
+                                FailureCode::ConfigurationUnavailable,
+                                Step::Configuration,
+                            )
+                            .value());
+                    }
+                };
+                drop(bytes);
+                if deadline.expired() {
+                    release_slot(&self.connection_test_resolver, &mut slot_owned);
+                    return Ok(receipt
+                        .failed(Status::Failed, FailureCode::Timeout, Step::Configuration)
+                        .value());
+                }
+
+                receipt.network_attempted = true;
+                let addresses =
+                    match self.resolve_login_host(&envelope.host, envelope.port, &deadline) {
+                        Ok(addresses) => addresses,
+                        Err(failure) => {
+                            return Ok(receipt
+                                .failed(Status::Failed, failure.code, failure.step)
+                                .value());
+                        }
+                    };
+                slot_owned = false;
+                if deadline.expired() {
+                    return Ok(receipt
+                        .failed(Status::Failed, FailureCode::Timeout, Step::Dns)
+                        .value());
+                }
+
+                let result = crate::platform::smtp::verify_login(
+                    &envelope,
+                    &addresses,
+                    self.smtp_test_ca.as_deref(),
+                    &deadline,
+                );
+                release_slot(&self.connection_test_resolver, &mut slot_owned);
+                match result {
+                    Ok(()) => {
+                        if deadline.expired() {
+                            return Ok(receipt
+                                .failed(Status::Failed, FailureCode::Timeout, Step::Quit)
+                                .value());
+                        }
+                        let registration_now = registration_digest_for(self, &record.platform);
+                        receipt.registration_digest = registration_now;
+                        receipt.status = Status::Success;
+                        receipt.authentication_verified = true;
+                        Ok(receipt.value())
+                    }
+                    Err(failure) => Ok(receipt
+                        .failed(Status::Failed, failure.code, failure.step)
+                        .value()),
+                }
             }
-        };
-        // The spawned worker owns the slot now and frees the flag when
-        // `to_socket_addrs` actually returns — this call must never
-        // free it again, even on early failure returns below.
-        slot_owned = false;
-        let result = crate::platform::smtp::verify_login(
-            &envelope,
-            &addresses,
-            self.smtp_test_ca.as_deref(),
-            &deadline,
-        );
-        release_slot(&self.connection_test_resolver, &mut slot_owned);
-        match result {
-            Ok(()) => {
-                receipt.status = "success";
-                receipt.authentication_verified = true;
-                Ok(receipt.value())
-            }
-            Err(failure) => Ok(receipt.failed("failed", failure.code, failure.step).value()),
         }
     }
 
-    /// Resolve `host:port` on the operation's resolver slot (already
-    /// reserved by the caller): spawn one short-lived worker carrying
-    /// only the destination pair, then wait the remaining budget for
-    /// its answer. The worker frees the slot when `to_socket_addrs`
-    /// actually returns — including when this caller has long since
-    /// classified `timeout` and dropped everything.
-    ///
-    /// On any return the spawned worker owns the slot; the caller
-    /// must not free it. `Err` carries the classified `dns` failure.
     fn resolve_login_host(
         &self,
         host: &str,
@@ -414,39 +455,38 @@ impl Shared {
         let slot = Arc::clone(&self.connection_test_resolver);
         let target = (host.to_string(), port);
         std::thread::spawn(move || {
-            let answer = target
-                .to_socket_addrs()
-                .map(|resolved| resolved.collect::<Vec<_>>());
+            let answer = std::net::ToSocketAddrs::to_socket_addrs(&target)
+                .map(|resolved| resolved.take(MAX_RESOLVED).collect::<Vec<_>>());
             let _ = tx.send(answer);
             slot.store(false, Ordering::SeqCst);
         });
         loop {
             let Some(left) = deadline.remaining() else {
                 return Err(Failure {
-                    code: "timeout",
-                    step: "dns",
+                    code: FailureCode::Timeout,
+                    step: Step::Dns,
                 });
             };
             match rx.recv_timeout(left.min(RESOLVE_POLL)) {
                 Ok(Ok(addresses)) if !addresses.is_empty() => return Ok(addresses),
                 Ok(_) => {
                     return Err(Failure {
-                        code: "dns_failed",
-                        step: "dns",
+                        code: FailureCode::DnsFailed,
+                        step: Step::Dns,
                     })
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if deadline.expired() {
                         return Err(Failure {
-                            code: "timeout",
-                            step: "dns",
+                            code: FailureCode::Timeout,
+                            step: Step::Dns,
                         });
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(Failure {
-                        code: "dns_failed",
-                        step: "dns",
+                        code: FailureCode::DnsFailed,
+                        step: Step::Dns,
                     });
                 }
             }
@@ -454,9 +494,6 @@ impl Shared {
     }
 }
 
-/// Free the resolver slot only when no spawned worker still owns it:
-/// after `resolve_login_host` runs, `slot_owned` is always false —
-/// the worker's own completion clears the flag.
 fn release_slot(slot: &std::sync::atomic::AtomicBool, slot_owned: &mut bool) {
     if *slot_owned {
         *slot_owned = false;

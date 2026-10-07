@@ -1216,10 +1216,14 @@ impl Store {
             .optional()?)
     }
 
-    /// CAD-1065: the `connection_test` CAS read — same row shape as
-    /// [`connection_credential`] but through the fail-fast
-    /// [`Store::try_conn`] guard, so contention or a poisoned
-    /// connection is `busy`, never forensic recovery.
+    pub fn connection_workspace_id_strict(&self) -> Result<String> {
+        Ok(self.try_conn()?.query_row(
+            "SELECT workspace_id FROM connection_metadata WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn connection_credential_strict(&self, id: &str) -> Result<Option<CredentialRecord>> {
         Ok(self
             .try_conn()?

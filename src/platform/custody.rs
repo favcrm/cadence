@@ -20,6 +20,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -100,17 +101,6 @@ impl Custody {
         }
     }
 
-    /// CAD-1065: the `connection_test` read. Same backend selection as
-    /// [`load`], but bounded: no read may exceed `cap` bytes and the
-    /// whole operation answers inside `deadline` — the file backend
-    /// reads incrementally and never allocates past the cap, and a
-    /// libsecret lookup drains the owned child's pipes under a poll
-    /// deadline, killing and reaping only that child on timeout.
-    ///
-    /// `fenced` is set when a timed-out child could not be provably
-    /// killed and reaped: the verification path stays fenced (every
-    /// later call refuses) rather than leave an unobserved process
-    /// holding credential bytes.
     pub fn load_bounded(
         &self,
         tag: &str,
@@ -216,10 +206,6 @@ fn file_load(dir: &Path, key: &Key) -> Result<Vec<u8>> {
     }
 }
 
-/// CAD-1065's bounded file read: open, then pull bytes through a
-/// capped `Take` so a pathological or torn blob refuses at `cap`
-/// instead of landing whole in memory. The deadline is checked
-/// before open and between reads; a spent budget fails the load.
 fn file_load_bounded(
     dir: &Path,
     key: &Key,
@@ -231,16 +217,27 @@ fn file_load_bounded(
         return Err(Error::busy("connection test budget is spent"));
     }
     let path = file_path(dir, key);
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Error::internal(format!(
-                "custody holds no bytes for '{}/{}' — the record outlived its store",
-                key.platform, key.account
-            )))
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::internal(format!(
+                    "custody holds no bytes for '{}/{}' — the record outlived its store",
+                    key.platform, key.account
+                )))
+            }
+            Err(e) => return Err(Error::internal(format!("custody read: {e}"))),
         }
-        Err(e) => return Err(Error::internal(format!("custody read: {e}"))),
     };
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        _ => return Err(Error::internal("custody entry is not a regular file")),
+    }
     let mut bytes = Vec::new();
     let mut limited = std::io::Read::take(file, cap as u64 + 1);
     loop {
@@ -248,17 +245,21 @@ fn file_load_bounded(
             return Err(Error::busy("connection test budget is spent"));
         }
         let mut chunk = [0u8; 4096];
-        let read = limited
-            .read(&mut chunk)
-            .map_err(|e| Error::internal(format!("custody read: {e}")))?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&chunk[..read]);
-        if bytes.len() > cap {
-            return Err(Error::internal(
-                "custody bytes exceed their supported bounds",
-            ));
+        match limited.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                if bytes.len() + read > cap {
+                    return Err(Error::internal(
+                        "custody bytes exceed their supported bounds",
+                    ));
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(Error::internal(format!("custody read: {e}"))),
         }
     }
     Ok(bytes)
@@ -333,7 +334,6 @@ fn libsecret_lookup(tool: &Path, key: &Key) -> Result<Vec<u8>> {
             key.platform, key.account
         )));
     }
-    // `secret-tool` appends a newline to the secret it prints — it is
     // the tool's framing, never part of the credential; leaving it on
     // would fail the record's fingerprint check.
     let mut bytes = out.stdout;
@@ -343,14 +343,6 @@ fn libsecret_lookup(tool: &Path, key: &Key) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// CAD-1065's bounded libsecret lookup. The owned child is spawned
-/// through [`crate::reaper::spawn`] (registered, never adopted), its
-/// stdin is null and both pipes are drained under `libc::poll` for the
-/// operation deadline — never the unbounded `wait_with_output` of
-/// [`crate::reaper::output`]. More than `cap` bytes of output refuses;
-/// a spent deadline kills and reaps only this child, and a kill or
-/// reap that cannot be observed sets `fenced` so this verification
-/// path stays closed.
 #[cfg(unix)]
 fn libsecret_lookup_bounded(
     tool: &Path,
@@ -372,10 +364,41 @@ fn libsecret_lookup_bounded(
     )?;
     let mut stdout = child.stdout.take().expect("piped");
     let mut stderr = child.stderr.take().expect("piped");
+    for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+    }
     let mut out = Vec::new();
     let mut err = Vec::new();
     let mut open = [true, true];
     let result = 'drain: loop {
+        if !open[0] && !open[1] {
+            break 'drain 'wait: loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        break 'wait if status.success() {
+                            Ok(out)
+                        } else {
+                            Err(Error::internal(format!(
+                                "keychain holds no credential for '{}/{}'",
+                                key.platform, key.account
+                            )))
+                        }
+                    }
+                    Ok(None) => {
+                        let Some(left) = deadline.remaining() else {
+                            break 'wait Err(Error::busy("connection test budget is spent"));
+                        };
+                        std::thread::sleep(left.min(Duration::from_millis(25)));
+                    }
+                    Err(e) => break 'wait Err(Error::internal(format!("secret-tool lookup: {e}"))),
+                }
+            };
+        }
         let mut fds = [
             libc::pollfd {
                 fd: stdout.as_raw_fd(),
@@ -393,7 +416,6 @@ fn libsecret_lookup_bounded(
             None => break 'drain Err(Error::busy("connection test budget is spent")),
         };
         let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
-        // SAFETY: fds point at live pollfd entries for this call only.
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, millis) };
         if ready < 0 {
             let e = std::io::Error::last_os_error();
@@ -423,12 +445,12 @@ fn libsecret_lookup_bounded(
                 match pipe.read(&mut chunk) {
                     Ok(0) => open[i] = false,
                     Ok(n) => {
-                        acc.extend_from_slice(&chunk[..n]);
-                        if acc.len() > cap {
+                        if acc.len() + n > cap {
                             break 'drain Err(Error::internal(
                                 "keychain output exceeds its supported bounds",
                             ));
                         }
+                        acc.extend_from_slice(&chunk[..n]);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -441,24 +463,10 @@ fn libsecret_lookup_bounded(
                 open[i] = false;
             }
         }
-        if !open[0] && !open[1] {
-            break 'drain match child.wait() {
-                Ok(status) if status.success() => Ok(out),
-                Ok(_) => Err(Error::internal(format!(
-                    "keychain holds no credential for '{}/{}'",
-                    key.platform, key.account
-                ))),
-                Err(e) => Err(Error::internal(format!("secret-tool lookup: {e}"))),
-            };
-        }
     };
     let bytes = match result {
         Ok(bytes) => bytes,
         Err(error) => {
-            // The child is dead or unreachable inside the deadline: kill
-            // and reap only this owned process. A kill or reap whose
-            // outcome cannot be observed leaves a process that may still
-            // hold the credential bytes — the verification path fences.
             let killed = child.kill().is_ok() || child.try_wait().ok().flatten().is_some();
             let reaped = killed && child.wait().is_ok();
             if !reaped {
@@ -467,8 +475,6 @@ fn libsecret_lookup_bounded(
             return Err(error);
         }
     };
-    // `secret-tool` appends a newline to the secret it prints — it is
-    // the tool's framing, never part of the credential.
     let mut bytes = bytes;
     while matches!(bytes.last(), Some(b'\n' | b'\r')) {
         bytes.pop();

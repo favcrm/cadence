@@ -188,9 +188,6 @@ impl Shared {
         let allowed: &[&str] = match method {
             "connection_providers" | "connection_list" => &[],
             "connection_show" | "connection_check" | "connection_revoke" => &["connection_id"],
-            // CAD-1065: the login-only check compares both expected
-            // values exactly against the live row before any credential
-            // access — `null` is a required key, never a wildcard.
             "connection_test" => &[
                 "connection_id",
                 "expected_revision",

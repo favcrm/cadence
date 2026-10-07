@@ -1003,3 +1003,181 @@ fn cad1065_actual_short_coincident_password_remains_login_verifiable() {
         "short-password probe changed connection authority or state"
     );
 }
+
+fn bounds_row(fixture: &Fixture) -> Value {
+    fixture.operator(
+        "connection_create",
+        json!({
+            "provider":"smtp", "account":"gate-sender", "shape":"smtp",
+            "host":"localhost", "port":fixture.port, "tls_mode":"implicit",
+            "username":"sender@example.test", "secret":PASSWORD, "sender":"sender@example.test",
+            "scopes":["email:send"], "accept_same_uid_risk":true,
+        }),
+    )["connection"]
+        .clone()
+}
+
+fn bounds_request(row: &Value) -> Value {
+    json!({
+        "connection_id":row["id"], "expected_revision":row["revision"],
+        "expected_registration_digest":row["registration_digest"],
+    })
+}
+
+#[test]
+fn cad1065_unknown_identity_is_not_promoted_to_a_trusted_receipt() {
+    let fixture = Fixture::start();
+    let _row = bounds_row(&fixture);
+    let (cookie, key) = fixture.session();
+    let unknown = "cad1065-unregistered-input-echo-canary";
+    assert!(
+        !fixture.operator("connection_list", json!({}))["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == unknown)
+    );
+    let initial = fixture.state_snapshot();
+    let reads = CredentialReads::watch(&fixture.state().join("custody"));
+    let dials = platform::smtp::direct_dial_count();
+    let error = fixture
+        .rpc(
+            Asserted::Operator,
+            json!({
+                "connection_id":unknown, "expected_revision":null,
+                "expected_registration_digest":null,
+            }),
+        )
+        .expect_err("unregistered request identity was declassified as server-trusted metadata");
+    assert_eq!(error.kind(), "rejected");
+    assert!(!error.to_string().contains(unknown));
+    let (status, result, _) = fixture.http(
+        "operator",
+        &format!("/api/connections/{unknown}/test"),
+        json!({"expected_revision":null,"expected_registration_digest":null}),
+        Some((&cookie, &key)),
+    );
+    assert_eq!(status, 409);
+    assert!(!result.to_string().contains(unknown));
+    assert!(result.get("verification").is_none());
+    reads.assert_no_read();
+    assert_eq!(platform::smtp::direct_dial_count(), dials);
+    assert!(fixture.observed().is_empty());
+    assert!(initial == fixture.state_snapshot());
+}
+
+#[test]
+fn cad1065_reply_total_bound_and_utf8_refusal_leave_verifier_usable() {
+    let greeting = r#"wire.write(b"220 localhost synthetic SMTP\r\n")"#;
+    for replacement in [
+        r#"wire.write((b"220-" + b"x" * 1024 + b"\r\n") * 70 + b"220 ready\r\n")"#,
+        r#"wire.write("\U0001f4a5\r\n".encode("utf-8"))"#,
+    ] {
+        let conditional = format!(
+            "if not (root / \"bad-reply-sent\").exists():\n                    (root / \"bad-reply-sent\").write_text(\"1\")\n                    {replacement}\n                else:\n                    {greeting}"
+        );
+        let script = SMTP_RIG.replace(greeting, &conditional);
+        assert_ne!(script, SMTP_RIG);
+        let fixture = fixture_with_peer(&script);
+        let row = bounds_row(&fixture);
+        let initial = fixture.state_snapshot();
+        let result = fixture
+            .rpc(Asserted::Operator, bounds_request(&row))
+            .expect(
+                "malformed provider reply crashed the request instead of returning a typed failure",
+            );
+        let receipt = &result["verification"];
+        assert_eq!(receipt["status"], "failed");
+        assert_eq!(receipt["network_attempted"], true);
+        assert_eq!(receipt["authentication_verified"], false);
+        assert_eq!(receipt["email_sent"], false);
+        let observed = fixture.observed();
+        assert!(!observed
+            .iter()
+            .any(|command| ["AUTH", "MAIL", "RCPT", "DATA"].contains(&command.as_str())));
+        let successful = fixture
+            .rpc(Asserted::Operator, bounds_request(&row))
+            .expect("malformed reply left the custody guard poisoned");
+        assert_receipt(&successful, &row);
+        let observed = fixture.observed();
+        assert_eq!(
+            observed.iter().filter(|value| *value == "CONNECT").count(),
+            2
+        );
+        assert_eq!(observed.iter().filter(|value| *value == "AUTH").count(), 1);
+        assert_eq!(observed.iter().filter(|value| *value == "QUIT").count(), 1);
+        assert!(!observed
+            .iter()
+            .any(|command| ["MAIL", "RCPT", "DATA"].contains(&command.as_str())));
+        assert!(initial == fixture.state_snapshot());
+    }
+}
+
+#[test]
+fn cad1065_tls_drip_cannot_reset_the_total_operation_budget() {
+    let script = r#"
+import pathlib, socket, ssl, sys, time
+root = pathlib.Path(sys.argv[1])
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(root / "certificate.pem", root / "key.pem")
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+listener.listen(8)
+(root / "port").write_text(str(listener.getsockname()[1]))
+while True:
+    raw, _ = listener.accept()
+    with (root / "observed").open("a") as out:
+        out.write("CONNECT\n")
+    raw.settimeout(5)
+    try:
+        incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+        peer = ctx.wrap_bio(incoming, outgoing, server_side=True)
+        packet = b""
+        while not packet:
+            data = raw.recv(65536)
+            assert data
+            incoming.write(data)
+            try:
+                peer.do_handshake()
+            except ssl.SSLWantReadError:
+                pass
+            packet = outgoing.read()
+        started = time.monotonic()
+        index = 0
+        while time.monotonic() - started < 30:
+            raw.sendall(packet[index:index + 1])
+            index = (index + 1) % len(packet)
+            time.sleep(1)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        raw.close()
+"#;
+    let fixture = fixture_with_peer(script);
+    let row = bounds_row(&fixture);
+    let initial = fixture.state_snapshot();
+    let started = Instant::now();
+    let result = fixture
+        .rpc(Asserted::Operator, bounds_request(&row))
+        .expect("TLS drip did not return an operation timeout receipt");
+    assert!(
+        started.elapsed() < Duration::from_secs(25),
+        "TLS progress reset the fixed twenty-second budget"
+    );
+    let receipt = &result["verification"];
+    assert_eq!(receipt["status"], "failed");
+    assert_eq!(receipt["failure"]["code"], "timeout");
+    assert_eq!(receipt["failure"]["step"], "tls");
+    assert_eq!(receipt["network_attempted"], true);
+    for field in [
+        "authentication_verified",
+        "email_sent",
+        "delivery_verified",
+        "sender_entitlement_verified",
+        "execution_authority",
+    ] {
+        assert_eq!(receipt[field], false);
+    }
+    assert_eq!(fixture.observed(), vec!["CONNECT"]);
+    assert!(initial == fixture.state_snapshot());
+}
