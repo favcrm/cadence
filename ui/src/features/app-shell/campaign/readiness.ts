@@ -63,7 +63,9 @@ export function sendReadiness(input: ReadinessInput): ReadinessItem[] {
     doc !== null &&
     binding !== null &&
     binding !== undefined &&
-    (testEvidence.contentDigest !== doc.contentDigest || testEvidence.linkDigest !== binding.digest)
+    (testEvidence.contentRevision !== doc.revision ||
+      testEvidence.contentDigest !== doc.contentDigest ||
+      testEvidence.linkDigest !== binding.digest)
   ) {
     testReason = "a test send accepted against this exact content revision and binding";
   }
