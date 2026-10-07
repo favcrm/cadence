@@ -341,6 +341,7 @@ impl Shared {
                         .value());
                 }
                 let mut slot_owned = true;
+                let mut pending_child = None;
                 let bytes = match self.platform_custody.load_bounded(
                     &record.custody,
                     &crate::platform::Key {
@@ -350,6 +351,7 @@ impl Shared {
                     MATERIAL_CAP,
                     &deadline,
                     &self.connection_test_fenced,
+                    &mut pending_child,
                 ) {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -357,16 +359,63 @@ impl Shared {
                             release_slot(&self.connection_test_resolver, &mut slot_owned);
                             // The kill-path could not observe the
                             // reap inside the budget: the lookup may
-                            // still be alive, so the exclusive
-                            // custody serialization is retained for
-                            // the process lifetime — every active-use
-                            // user (rotate/revoke/verify) fails busy
-                            // until restart rather than racing an
-                            // unobserved credential child. The child
-                            // registration is kept daemon-owned by
-                            // `load_bounded`; the honest kernel
-                            // residual is a zombie until restart.
-                            std::mem::forget(_custody);
+                            // still be alive. A cleanup owner takes
+                            // the exclusive custody guard and the
+                            // owned Child and keeps polling `try_wait`
+                            // until termination is observed, so no
+                            // custody user (rotate/revoke/verify) can
+                            // race the unobserved child — the lock is
+                            // held, not a flag they do not check. New
+                            // tests are refused by the fence before
+                            // they could queue on the guard. The
+                            // kernel residual stands: a child the OS
+                            // will not let die keeps the lock (and
+                            // blocks custody users) until it exits
+                            // or the daemon restarts — the request
+                            // itself is not held past its budget.
+                            if let Some(child) = pending_child.take() {
+                                // A `MutexGuard` cannot cross a
+                                // thread boundary, so the cleanup
+                                // owner re-acquires the same lock on
+                                // its own thread: it queues on
+                                // `platform_custody_lock` before this
+                                // request's guard is released, then
+                                // holds it — with the owned Child —
+                                // until `try_wait` observes the
+                                // exit. Every other custody user
+                                // (`.lock()`) is serialized behind
+                                // the observed termination; new
+                                // tests are refused by the fence
+                                // before they can queue. `held`
+                                // proves the owner won the lock
+                                // before the busy answer leaves, so
+                                // custody is never un-serialized
+                                // while the child is unobserved.
+                                let lock = self.platform_custody_lock;
+                                let held =
+                                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let held_signal = held.clone();
+                                std::thread::spawn(move || {
+                                    let mut child = child;
+                                    let _custody = lock.lock().unwrap_or_else(|e| e.into_inner());
+                                    held_signal.store(true, Ordering::SeqCst);
+                                    loop {
+                                        match child.try_wait() {
+                                            Ok(Some(_)) => break,
+                                            Ok(None) => {
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_millis(25),
+                                                );
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                });
+                                drop(_custody);
+                                while !held.load(Ordering::SeqCst) {
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                }
+                            }
                             return Err(Error::busy(
                                 "connection test is fenced pending credential cleanup",
                             ));
