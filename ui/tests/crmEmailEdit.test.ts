@@ -315,12 +315,29 @@ async function operator(kind: "blocks" | "html") {
     assert(source && source.classList.contains("srcedit"), "HTML mode is a source editor");
     const htmlNote = q("[data-html-note]")?.textContent ?? "";
     assert(/sanitiz/i.test(htmlNote) && htmlNote.toLowerCase().includes("footer"), "HTML mode explains host sanitization and the protected footer");
-    await type(source, "<p>Pasted <b>body</b></p><script>x()</script>");
+    const fullDocument = '<!doctype html><html><head><title>Campaign</title><style>p { color: red; }</style></head><body><p style="color: blue; position: fixed">Pasted <b>body</b></p><script>x()</script></body></html>';
+    const assertHtmlSaveBoundary = (mode: "HTML" | "Visual") => {
+      const notice = q("[data-html-save-boundary]")?.textContent ?? "";
+      const lower = notice.toLowerCase();
+      assert(notice.trim() !== "", `${mode} mode visibly explains the HTML save boundary`);
+      for (const term of ["body fragment", "document", "head", "title", "style", "inline", "footer"])
+        assert(lower.includes(term), `${mode} boundary notice discloses ${term} behavior`);
+      assert(/strip|remov|drop|not stored|do not store|do not survive/.test(lower), `${mode} boundary notice says document wrappers and style blocks are removed`);
+      assert(/limit|allow|support|safe inline/.test(lower), `${mode} boundary notice limits supported inline CSS`);
+      assert(/protected|cannot be edited|host-appended/.test(lower), `${mode} boundary notice protects the host footer`);
+    };
+    await type(source, fullDocument);
     await settle(() => assert(bar(), "pasting raises the bar"));
+    equal(source.value, fullDocument, "full-document source remains intact as an unsaved draft");
+    assertHtmlSaveBoundary("HTML");
+    await click(byText(t.host, "button", "Visual"));
+    assertHtmlSaveBoundary("Visual");
+    await click(byText(t.host, "button", "HTML"));
+    equal((q("#cmp-html-source") as HTMLTextAreaElement).value, fullDocument, "switching modes preserves the unsaved full-document source byte-for-byte");
     await click(barButton("Save as v4"));
     await settle(() => assert(saves.length === 2, "the html save left"));
     equal(Object.keys(saves[1]).filter((k) => k === "blocks" || k === "html"), ["html"], "an HTML paste saves html and never blocks");
-    equal(saves[1].html, "<p>Pasted <b>body</b></p><script>x()</script>", "the paste goes to the host unmodified (the host sanitises)");
+    equal(saves[1].html, fullDocument, "the full-document paste reaches the host unchanged; the UI discloses host fragment sanitization before explicit save");
     assert(saves[1].expected_revision === 3, "the html save is pinned to v3");
     await settle(() => assert(text().includes("Saved v4"), "html save lands"));
     // After saving an HTML body, Visual explains instead of faking blocks.
