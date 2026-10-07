@@ -5,7 +5,8 @@
 //! tracker) and `sandbox.env`. `up` starts a daemon and a board from the
 //! invoking binary with `CADENCE_PROFILE=sandbox:<name>` exported, and
 //! that profile is the one switch the daemon and the UI read to gate
-//! global side effects: no skill sync into `$HOME`, no tailnet, an
+//! global side effects: no skill sync into `$HOME`, no tailnet unless
+//! the sandbox was started with `CADENCE_SANDBOX_ALLOW_GLOBAL=1`, an
 //! observe-only provider WAL watcher, no Cursor `cli-config.json` merge.
 //! Every verb first refuses a root that overlaps production's state
 //! dir (and so its socket) or tracker.
@@ -64,8 +65,9 @@ pub fn run_cli(action: &SandboxAction) -> Result<i32> {
         SandboxAction::Env { name } => {
             let sb = Sandbox::open(name)?;
             refuse_production(&sb)?;
-            require_marker(&sb)?;
-            print!("{}", env_lines(&sb, persisted_port(&sb.state_dir())));
+            let marker = require_marker(&sb)?;
+            let allow = marker["allow_global"].as_bool() == Some(true);
+            print!("{}", env_lines(&sb, persisted_port(&sb.state_dir()), allow));
             return Ok(0);
         }
         SandboxAction::Down { name } => {
@@ -648,18 +650,28 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-fn env_lines(sb: &Sandbox, port: Option<u16>) -> String {
+fn env_lines(sb: &Sandbox, port: Option<u16>, allow_global: bool) -> String {
+    // A revoked grant must not linger in an eval'd shell: unset it.
+    let unset = if allow_global {
+        "CADENCE_ALIAS CADENCE_ROLLOUT_AS"
+    } else {
+        "CADENCE_ALIAS CADENCE_ROLLOUT_AS CADENCE_SANDBOX_ALLOW_GLOBAL"
+    };
     let mut text = format!(
         "# cadence sandbox {name} — `eval \"$(cadence sandbox env {name})\"`\n\
-         unset CADENCE_ALIAS CADENCE_ROLLOUT_AS\n\
+         unset {unset}\n\
          export CADENCE_STATE_DIR={state}\n\
          export CADENCE_PM_DIR={pm}\n\
          export CADENCE_PROFILE={profile}\n",
         name = sb.name,
+        unset = unset,
         state = sh_quote(&sb.state_dir().to_string_lossy()),
         pm = sh_quote(&sb.pm_dir().to_string_lossy()),
         profile = sh_quote(&sb.profile()),
     );
+    if allow_global {
+        text.push_str(&format!("export {ALLOW_GLOBAL_ENV}=1\n"));
+    }
     if let Some(port) = port {
         text.push_str(&format!(
             "# board: http://127.0.0.1:{port} (persisted in state/ui.json)\n"
@@ -681,6 +693,12 @@ fn child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Command {
         .env_remove("CADENCE_ALIAS")
         .env_remove("CADENCE_ROLLOUT_AS")
         .stdin(Stdio::null());
+    // Children get exactly the grant `up` records: `1` or nothing.
+    if std::env::var(ALLOW_GLOBAL_ENV).is_ok_and(|v| v == "1") {
+        cmd.env(ALLOW_GLOBAL_ENV, "1");
+    } else {
+        cmd.env_remove(ALLOW_GLOBAL_ENV);
+    }
     cmd
 }
 
@@ -707,6 +725,65 @@ fn run_child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Result<Value> {
 /// fails only inside the detached daemon, so `up` checks it first.
 const SOCKET_PATH_MAX: usize = 107;
 
+/// One `up` at a time per sandbox: the grant is recorded before the
+/// children start, and a concurrent caller must wait to see that
+/// marker — an unlocked window let two `up`s with opposite grants both
+/// pass the change check, leaving the winner's live processes under a
+/// marker the loser overwrote.
+fn up_lock(sb: &Sandbox) -> Result<std::fs::File> {
+    std::fs::create_dir_all(&sb.base).map_err(|e| {
+        Error::rejected(format!(
+            "cannot create sandbox base {}: {e}",
+            sb.base.display()
+        ))
+    })?;
+    let path = sb.base.join(format!(".up-{}.lock", sb.name));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| Error::rejected(format!("cannot open {}: {e}", path.display())))?;
+    use std::os::fd::AsRawFd;
+    // SAFETY: plain syscall on a descriptor this function owns; the
+    // returned guard's drop releases it.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(Error::rejected(format!(
+            "cannot lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(lock)
+}
+
+/// The sandbox's persisted `ui.json` still holds a tailnet share — an
+/// ungranted `up` would refuse it at `ui start`, after the daemon is
+/// already running and the marker revoked.
+fn persisted_share(sb: &Sandbox) -> Result<bool> {
+    let path = sb.state_dir().join("ui.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "cannot read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    // Only the `tailscale` key is read — unrelated invalid settings
+    // must not block `up`/`reset`, the recovery path for exactly such
+    // a file.
+    let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
+        Error::rejected(format!(
+            "{} is not valid JSON — fix or delete it by hand: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(value.get("tailscale").is_some_and(|v| !v.is_null()))
+}
+
 fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
     refuse_production(sb)?;
     let socket = client::socket_path(&sb.state_dir());
@@ -718,6 +795,7 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
             socket.display()
         )));
     }
+    let _up_lock = up_lock(sb)?;
     let existing = read_marker(sb)?;
     match std::fs::read_dir(&sb.root) {
         Ok(mut entries) => {
@@ -751,17 +829,54 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
         .as_ref()
         .and_then(|m| m["created_at"].as_str().map(str::to_string))
         .unwrap_or_else(|| crate::issue::time::iso(crate::issue::time::now_epoch()));
+    // The opt-in is granted at `up` and recorded in the marker —
+    // `sandbox env` re-exports exactly what was granted. The grant is
+    // process environment: changing it under a live daemon or board
+    // would lie about what they run with, so it needs a down first.
+    let allow_global = std::env::var(ALLOW_GLOBAL_ENV).is_ok_and(|v| v == "1");
+    let recorded = existing
+        .as_ref()
+        .and_then(|m| m["allow_global"].as_bool())
+        .unwrap_or(false);
+    if recorded != allow_global
+        && (daemon_running(&sb.state_dir()) || crate::ui::detached_pid(&sb.state_dir()).is_some())
+    {
+        return Err(Error::rejected(format!(
+            "sandbox '{}' is running with {ALLOW_GLOBAL_ENV} {}; its processes \
+             keep that environment — `cadence sandbox down {}` first, then `up` \
+             with the grant you want",
+            sb.name,
+            if recorded { "granted" } else { "not granted" },
+            sb.name
+        )));
+    }
+    // Refuse before the marker is written and the daemon started: a
+    // persisted tailnet share under a revoked (or never granted) opt-in
+    // makes `ui start` fail, leaving a half-up sandbox.
+    if !allow_global && persisted_share(sb)? {
+        return Err(Error::rejected(format!(
+            "sandbox '{}' still has a persisted tailnet share — an \
+             ungranted `up` would refuse it at `ui start` with the \
+             daemon already running. Stop sharing under the grant first: \
+             `{ALLOW_GLOBAL_ENV}=1 cadence --state-dir {} ui tailscale \
+             stop`, or `cadence sandbox reset {}` starts over",
+            sb.name,
+            sb.state_dir().display(),
+            sb.name
+        )));
+    }
     let marker = json!({
         "name": sb.name,
         "created_at": created_at,
         "binary": exe,
         "profile": sb.profile(),
+        "allow_global": allow_global,
     });
     std::fs::write(
         sb.marker(),
         serde_json::to_string_pretty(&marker).unwrap_or_default() + "\n",
     )?;
-    std::fs::write(sb.env_file(), env_lines(sb, Some(port)))?;
+    std::fs::write(sb.env_file(), env_lines(sb, Some(port), allow_global))?;
     run_child(sb, &exe, &["issue", "init"])?;
     let daemon = run_child(sb, &exe, &["daemon", "start"])?;
     let port_arg = port.to_string();
@@ -852,6 +967,23 @@ fn reset(sb: &Sandbox) -> Result<Value> {
         )));
     }
     removable(sb)?;
+    // A persisted share outlives `down` — remove it while its record
+    // still exists, or refuse so reset cannot orphan a live mapping
+    // onto a port another service may take.
+    if persisted_share(sb)? {
+        if !std::env::var(ALLOW_GLOBAL_ENV).is_ok_and(|v| v == "1") {
+            return Err(Error::rejected(format!(
+                "sandbox '{}' still has a persisted tailnet share — reset \
+                 would orphan the live mapping. Stop it under the opt-in \
+                 first: `{ALLOW_GLOBAL_ENV}=1 cadence --state-dir {} ui \
+                 tailscale stop`, or re-run reset with `{ALLOW_GLOBAL_ENV}=1`",
+                sb.name,
+                sb.state_dir().display()
+            )));
+        }
+        let exe = std::env::current_exe()?;
+        run_child(sb, &exe, &["ui", "tailscale", "stop"])?;
+    }
     let stopped = down(sb)?;
     removable(sb)?;
     std::fs::remove_dir_all(&sb.root)?;
@@ -1070,7 +1202,7 @@ mod tests {
             base: PathBuf::from("/t/it's"),
             root: PathBuf::from("/t/it's/q"),
         };
-        let text = env_lines(&sb, Some(3111));
+        let text = env_lines(&sb, Some(3111), false);
         assert!(
             text.contains(r"export CADENCE_STATE_DIR='/t/it'\''s/q/state'"),
             "{text}"
@@ -1079,9 +1211,10 @@ mod tests {
             text.contains("export CADENCE_PROFILE='sandbox:q'"),
             "{text}"
         );
-        // Like the sandbox's own children, never a pane or rollout identity.
+        // Like the sandbox's own children, never a pane or rollout
+        // identity — and no grant the marker did not record.
         assert!(
-            text.contains("unset CADENCE_ALIAS CADENCE_ROLLOUT_AS\n"),
+            text.contains("unset CADENCE_ALIAS CADENCE_ROLLOUT_AS CADENCE_SANDBOX_ALLOW_GLOBAL\n"),
             "{text}"
         );
         assert!(text.contains("127.0.0.1:3111"), "{text}");
