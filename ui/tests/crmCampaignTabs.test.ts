@@ -308,6 +308,8 @@ async function mounted(readOnly: boolean) {
     await click(buttonIn(approvalGuard, "Approve r2 (content-only)"));
     await settle(() => assert(host.querySelector("[data-campaign-status]")?.textContent === "Approved", "approval updates the status without implying send readiness"));
     assert(host.querySelector("[data-campaign-overview]")?.textContent?.includes("content approved only"), "summary labels approval as content-only");
+    await click(finalGuard.querySelector("summary"));
+    assert(buttonIn(finalGuard, "Prepare send")?.disabled, "Prepare send stays disabled while sender and exact-revision test prerequisites are missing");
     await openTab("audience");
     assert(host.querySelector('section[aria-label="Frozen audience"]'), "the Audience tab mounts the audience panel");
     assert(!host.querySelector('section[aria-label="Final send"]'), "Audience mounts no send controls");
