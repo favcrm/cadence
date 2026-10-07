@@ -270,14 +270,54 @@ pub(crate) fn write_reply(
             if let Some(route) = out.get("route") {
                 body["route"] = route.clone();
             }
+            // CAD-1180: a hosted write that ran the durability seam
+            // carries `applied:true`, a `durability` disposition and the
+            // originating `receipt` — surface them verbatim so the
+            // caller sees the real outcome, never a fabricated durable
+            // claim. `unconfirmed` (commit landed, store not provably
+            // complete) answers 503: the write applied but is not
+            // confirmed durable, and the client must reconcile rather
+            // than replay. A local/board write has no such keys and is
+            // unchanged.
+            let mut status = if created { 201 } else { 200 };
+            if let Some(d) = out.get("durability").and_then(|d| d.as_str()) {
+                body["applied"] = out.get("applied").cloned().unwrap_or(json!(true));
+                body["durability"] = json!(d);
+                if let Some(receipt) = out.get("receipt") {
+                    body["receipt"] = receipt.clone();
+                }
+                if d == "unconfirmed" {
+                    body["error"] = json!(
+                        "write applied but its durability is unconfirmed — reconcile, do not retry"
+                    );
+                    if let Some(cause) = out["receipt"].get("durability_error") {
+                        body["durability_error"] = cause.clone();
+                        body["code"] = cause["code"].clone();
+                    }
+                    // Even a host refusal named 'conflict' is known-applied
+                    // here: NEVER turn it into the original CAS 409 verdict.
+                    status = 503;
+                }
+            }
             let body = serde_json::to_vec_pretty(&body).unwrap_or_default();
-            let mut resp = Response::from_data(body).with_status_code(StatusCode(if created {
-                201
-            } else {
-                200
-            }));
+            let mut resp = Response::from_data(body).with_status_code(StatusCode(status));
             resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
             resp
+        }
+        Err(e) if out.get("durability").is_some() => {
+            // Never drop known-applied evidence when a post-commit card reload
+            // also fails. In particular, an unconfirmed store failure must
+            // remain the terminal no-replay body the remote CLI recognizes.
+            let mut body = out;
+            if let Some(cause) = body["receipt"].get("durability_error").cloned() {
+                body["code"] = cause["code"].clone();
+                body["durability_error"] = cause;
+            }
+            body["error"] = json!(format!("write committed but reload failed: {e}"));
+            let mut response = Response::from_data(serde_json::to_vec(&body).unwrap_or_default())
+                .with_status_code(StatusCode(503));
+            response.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+            response
         }
         Err(e) => err_response(500, &format!("write committed but reload failed: {e}")),
     }
@@ -403,6 +443,9 @@ pub(crate) fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Val
 /// are 400, internals are 500.
 pub(crate) fn write_err(e: &Error) -> HttpResp {
     match e {
+        Error::Rejected(m) if m.starts_with("capability_unavailable:") => {
+            coded_response(503, "capability_unavailable", m, None)
+        }
         Error::Rejected(m) if m.starts_with("Unknown issue") => err_response(404, m),
         Error::Rejected(m) => err_response(400, m),
         other => err_response(500, &other.to_string()),
@@ -1387,8 +1430,43 @@ pub(crate) fn write_route(
         return;
     };
     let actor = caller.actor().to_string();
+    // This board path uses the same real capability for create/comment.
+    // Other tracker edits have no origin-capture seam yet: refuse Required
+    // mode explicitly, rather than silently applying a legacy mutation.
+    if opts.durability_mode == crate::issue::durability::Mode::Required {
+        if !(id.is_none() || sub == Some("comments")) {
+            send(
+                request,
+                coded_response(
+                    503,
+                    "capability_unavailable",
+                    "this board tracker verb has no tracker-v1 origin seam",
+                    None,
+                ),
+            );
+            return;
+        }
+        let capability = opts
+            .durability
+            .as_ref()
+            .ok_or_else(|| Error::rejected("required tracker backend missing"))
+            .and_then(|h| h.validate_mode(opts.durability_mode));
+        if let Err(e) = capability {
+            send(
+                request,
+                coded_response(503, "capability_unavailable", &e.to_string(), None),
+            );
+            return;
+        }
+    }
     let pm = match Pm::at(pm_dir) {
-        Ok(pm) => pm,
+        Ok(mut pm) => {
+            pm.attach_durability_mode(opts.durability_mode);
+            if let Some(hosted) = opts.durability.clone() {
+                pm.attach_durability(hosted);
+            }
+            pm
+        }
         Err(e) => {
             send(request, err_response(503, &e.to_string()));
             return;

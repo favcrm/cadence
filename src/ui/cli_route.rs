@@ -212,6 +212,32 @@ pub(super) fn post(
             "the envelope's granted scopes do not cover this verb",
         );
     }
+    // Direct authenticated route calls (not only `serve`) bind the real
+    // boot bridge. This occurs after issuer-derived auth/scope and before
+    // replay-state writes, tracker opens or mutation.
+    let configured;
+    let opts = if matches!(verb, Verb::IssueNew | Verb::IssueComment | Verb::IssueSet) {
+        match crate::issue::durability::tracker::runtime_from_env(pm_dir) {
+            Ok(Some((mode, hosted))) => {
+                configured = {
+                    let mut bound = opts.clone();
+                    bound.durability_mode = mode;
+                    bound.durability = hosted;
+                    bound
+                };
+                &configured
+            }
+            Ok(None) => opts,
+            Err(e) => return cli_fail(503, "capability_unavailable", &e.to_string()),
+        }
+    } else {
+        opts
+    };
+    if matches!(verb, Verb::IssueNew | Verb::IssueComment | Verb::IssueSet) {
+        if let Err(response) = durable_gate(opts) {
+            return response;
+        }
+    }
     let args = match read_args(request) {
         Ok(a) => a,
         Err(resp) => return resp,
@@ -316,8 +342,50 @@ fn json_ok(v: Value) -> HttpResp {
     resp
 }
 
-fn pm_at(pm_dir: &Path) -> Result<Pm, HttpResp> {
-    Pm::at(pm_dir).map_err(|e| cli_fail(503, "tracker_unavailable", &e.to_string()))
+fn pm_at(pm_dir: &Path, opts: &ServeOpts) -> Result<Pm, HttpResp> {
+    let mut pm =
+        Pm::at(pm_dir).map_err(|e| cli_fail(503, "tracker_unavailable", &e.to_string()))?;
+    // CAD-1180: attach the hosted durability capability when the board
+    // is configured for it. `None` leaves the Pm exactly as the local
+    // path opens it — the write functions then skip capture/persist.
+    // The pre-write gate (`durable_gate`) has already refused an
+    // unusable capability before this opens the tracker.
+    pm.attach_durability_mode(opts.durability_mode);
+    if let Some(hosted) = opts.durability.clone() {
+        pm.attach_durability(hosted);
+    }
+    Ok(pm)
+}
+
+/// CAD-1180: the pre-write durability gate. When the board declares a
+/// hosted capability (`opts.durability` is `Some`), the write is
+/// refused `capability_unavailable` **before** any mutation if the
+/// capability cannot bind this board's actual company —
+/// `opts.public.company`, the same id the actor envelope's
+/// `organization_id` was verified against, never a caller field. `None`
+/// passes ONLY in explicit Legacy mode; Required without an ordered backend
+/// refuses. Reads never call this. Writes check before replay-state mutation.
+fn durable_gate(opts: &ServeOpts) -> Result<(), HttpResp> {
+    let Some(hosted) = &opts.durability else {
+        return if opts.durability_mode == crate::issue::durability::Mode::Required {
+            Err(cli_fail(
+                503,
+                "capability_unavailable",
+                "required tracker-v1 backend missing",
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    let expected = opts
+        .public
+        .as_ref()
+        .map(|p| p.company.as_str())
+        .unwrap_or_default();
+    hosted
+        .validate_for(expected)
+        .and_then(|()| hosted.validate_mode(opts.durability_mode))
+        .map_err(|e| cli_fail(503, "capability_unavailable", &e.to_string()))
 }
 
 /// The verb → the same call the CLI/board makes for it. `actor` is the
@@ -329,7 +397,7 @@ fn dispatch(
     actor: &CliActor,
     state_dir: &Path,
     pm_dir: &Path,
-    _opts: &ServeOpts,
+    opts: &ServeOpts,
 ) -> HttpResp {
     match verb {
         // ---- cli.read ----
@@ -368,7 +436,7 @@ fn dispatch(
             }
             _ => cli_fail(400, "invalid_request", "agent_show needs arguments.alias"),
         },
-        Verb::IssueLs => match pm_at(pm_dir) {
+        Verb::IssueLs => match pm_at(pm_dir, opts) {
             Err(resp) => resp,
             Ok(pm) => {
                 let filter = board::Filter {
@@ -402,7 +470,7 @@ fn dispatch(
                 let Ok(id) = model::check_id(raw) else {
                     return cli_fail(400, "invalid_request", "bad issue id");
                 };
-                match pm_at(pm_dir) {
+                match pm_at(pm_dir, opts) {
                     Err(resp) => resp,
                     Ok(pm) => {
                         let read = read_model::get(state_dir, pm_dir).board(&pm, None);
@@ -432,7 +500,7 @@ fn dispatch(
                     Ok(None) => 50,
                     Err(resp) => return resp,
                 };
-                match pm_at(pm_dir) {
+                match pm_at(pm_dir, opts) {
                     Err(resp) => resp,
                     Ok(pm) => match board::find_issue(&pm.dir, &id) {
                         Ok(issue) => match history::log(&pm.dir, &issue, limit.max(1)) {
@@ -497,7 +565,7 @@ fn dispatch(
             "team_list has no local counterpart in this build",
         ),
         // ---- cli.write ----
-        Verb::IssueNew => match pm_at(pm_dir) {
+        Verb::IssueNew => match pm_at(pm_dir, opts) {
             Err(resp) => resp,
             Ok(pm) => {
                 #[derive(Deserialize)]
@@ -559,7 +627,7 @@ fn dispatch(
                     Ok(v) => v,
                     Err(resp) => return resp,
                 };
-                match pm_at(pm_dir) {
+                match pm_at(pm_dir, opts) {
                     Err(resp) => resp,
                     Ok(pm) => match issue_write::add_comment(
                         &pm,
@@ -582,61 +650,63 @@ fn dispatch(
                 "issue_comment needs arguments.id and arguments.body",
             ),
         },
-        Verb::IssueSet => match (arg_strs(args, "ids"), arg_strs(args, "set")) {
-            (Ok(ids), Ok(pairs)) => {
-                // Revisions are per-ticket and optimistic: exactly one
-                // issue, and `if_rev` (the `rev` `issue_show` reports)
-                // is mandatory — a remote field edit is never an
-                // unconditional last-writer-wins write. The check runs
-                // inside `set_fields_if_rev` under the tracker lock, at
-                // the point of write; a stale token answers the
-                // contract's conflict payload instead of a 200.
-                if ids.len() != 1 {
-                    return cli_fail(
-                        400,
-                        "invalid_request",
-                        "issue_set edits exactly one issue — revisions are per-ticket",
-                    );
-                }
-                // No remote override of the `status=done` evidence gate:
-                // the verb never accepted `force` — a caller naming one
-                // is refused, never silently dropped, before any write.
-                if args.get("force").is_some() {
-                    return cli_fail(
-                        400,
-                        "invalid_request",
-                        "issue_set does not accept arguments.force",
-                    );
-                }
-                let if_rev = match arg_str(args, "if_rev") {
-                    Ok(Some(rev)) if !rev.trim().is_empty() => rev,
-                    Ok(_) => {
+        Verb::IssueSet => {
+            match (arg_strs(args, "ids"), arg_strs(args, "set")) {
+                (Ok(ids), Ok(pairs)) => {
+                    // Revisions are per-ticket and optimistic: exactly one
+                    // issue, and `if_rev` (the `rev` `issue_show` reports)
+                    // is mandatory — a remote field edit is never an
+                    // unconditional last-writer-wins write. The check runs
+                    // inside `set_fields_if_rev` under the tracker lock, at
+                    // the point of write; a stale token answers the
+                    // contract's conflict payload instead of a 200.
+                    if ids.len() != 1 {
                         return cli_fail(
                             400,
                             "invalid_request",
-                            "issue_set needs a nonempty arguments.if_rev — re-read the \
-                             issue's rev and send it",
+                            "issue_set edits exactly one issue — revisions are per-ticket",
                         );
                     }
-                    Err(resp) => return resp,
-                };
-                match pm_at(pm_dir) {
-                    Err(resp) => resp,
-                    Ok(pm) => match issue_write::set_fields_if_rev(
-                        &pm,
-                        &ids,
-                        &pairs,
-                        &actor.handle,
-                        None,
-                        Some(if_rev),
-                    ) {
-                        Ok(out) => write_reply(&pm, state_dir, &ids[0], out, false),
-                        Err(e) => write_err(&e),
-                    },
+                    // No remote override of the `status=done` evidence gate:
+                    // the verb never accepted `force` — a caller naming one
+                    // is refused, never silently dropped, before any write.
+                    if args.get("force").is_some() {
+                        return cli_fail(
+                            400,
+                            "invalid_request",
+                            "issue_set does not accept arguments.force",
+                        );
+                    }
+                    let if_rev = match arg_str(args, "if_rev") {
+                        Ok(Some(rev)) if !rev.trim().is_empty() => rev,
+                        Ok(_) => {
+                            return cli_fail(
+                                400,
+                                "invalid_request",
+                                "issue_set needs a nonempty arguments.if_rev — re-read the \
+                             issue's rev and send it",
+                            );
+                        }
+                        Err(resp) => return resp,
+                    };
+                    match pm_at(pm_dir, opts) {
+                        Err(resp) => resp,
+                        Ok(pm) => match issue_write::set_fields_if_rev(
+                            &pm,
+                            &ids,
+                            &pairs,
+                            &actor.handle,
+                            None,
+                            Some(if_rev),
+                        ) {
+                            Ok(out) => write_reply(&pm, state_dir, &ids[0], out, false),
+                            Err(e) => write_err(&e),
+                        },
+                    }
                 }
+                (Err(resp), _) | (_, Err(resp)) => resp,
             }
-            (Err(resp), _) | (_, Err(resp)) => resp,
-        },
+        }
         Verb::MessageSend => match (arg_str(args, "alias"), arg_str(args, "text")) {
             (Ok(Some(alias)), Ok(Some(text))) => {
                 if text.trim().is_empty() {
@@ -668,3 +738,9 @@ fn dispatch(
 
 #[cfg(test)]
 mod cad1179_acceptance;
+
+#[cfg(test)]
+mod cad1180_acceptance;
+
+#[cfg(test)]
+mod cad1180_host_fixture;

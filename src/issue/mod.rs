@@ -23,6 +23,7 @@ pub mod context;
 pub mod delivery_policy;
 pub mod dispatch;
 pub mod doctor;
+pub mod durability;
 pub mod edit;
 pub mod finish;
 pub mod groom;
@@ -165,6 +166,11 @@ pub struct Pm {
     /// lease's fence trips, and commits carry a `Lease-Epoch:` trailer.
     /// `None` for CLI/local use — nothing there changes.
     lease: Option<crate::lease::PmLease>,
+    /// CAD-1180: boot-bound durability for the three ticket mutations,
+    /// attached by authenticated routes or hosted native CLI. Ordinary
+    /// explicit Legacy handles carry None and keep their original shape.
+    durability: Option<durability::Hosted>,
+    durability_mode: durability::Mode,
 }
 
 impl Pm {
@@ -185,6 +191,8 @@ impl Pm {
             dir: dir.to_path_buf(),
             config,
             lease: None,
+            durability: None,
+            durability_mode: durability::Mode::Legacy,
         })
     }
 
@@ -196,6 +204,36 @@ impl Pm {
         self.lease = Some(lease);
     }
 
+    /// Attach the boot-bound capability. Capture + reservation run under
+    /// the original PmLock; uploads/complete run only after release.
+    /// Internal app wiring only; no caller JSON can supply this handle.
+    pub(crate) fn attach_durability(&mut self, hosted: durability::Hosted) {
+        self.durability = Some(hosted);
+    }
+
+    pub(crate) fn attach_durability_mode(&mut self, mode: durability::Mode) {
+        self.durability_mode = mode;
+    }
+
+    /// Required is not inferred from a Store handle: absence and unsupported
+    /// backends must refuse before any of the three requested mutations.
+    pub(crate) fn check_durability(&self) -> Result<()> {
+        match &self.durability {
+            Some(hosted) => hosted
+                .validate_mode(self.durability_mode)
+                .map_err(|e| Error::rejected(format!("capability_unavailable: {e}"))),
+            None if self.durability_mode == durability::Mode::Required => Err(Error::rejected(
+                "capability_unavailable: tracker-v1 backend missing",
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The attached hosted durability capability, when any.
+    pub(crate) fn durability(&self) -> Option<&durability::Hosted> {
+        self.durability.as_ref()
+    }
+
     /// The lease gate every tracker write passes: refusal while the
     /// fence is tripped, pass-through otherwise (and always when the
     /// handle carries no lease — CLI, tests, unleased daemons).
@@ -204,6 +242,18 @@ impl Pm {
             Some(lease) => lease.check(),
             None => Ok(()),
         }
+    }
+
+    /// The lease epoch this `Pm` stamps commits with — `None` for a
+    /// CLI/local or unleased daemon `Pm` (CAD-1180: the durability
+    /// receipt binds it). Read live from the shared handle, so a
+    /// renewed lease reports the current epoch, not a stale one.
+    pub fn lease_epoch(&self) -> Option<u64> {
+        self.lease.as_ref().and_then(|lease| lease.epoch())
+    }
+
+    pub(crate) fn lease_attached(&self) -> bool {
+        self.lease.is_some()
     }
 
     pub fn open_default() -> Result<Pm> {

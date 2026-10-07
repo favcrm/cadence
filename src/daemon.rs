@@ -4917,6 +4917,13 @@ pub fn serve(state_dir: &Path) -> Result<()> {
 /// `serve` with per-instance options — in-process test daemons pass
 /// their mock commands here instead of through the shared environment.
 pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
+    // Hosted restore handoff is not itself live proof. Refuse writer startup
+    // before state mutation when native protocol/head/readiness are unavailable.
+    if std::env::var_os("CADENCE_TRACKER_BOOT_FILE").is_some()
+        || std::env::var_os("CADENCE_TRACKER_BOOT_ID").is_some()
+    {
+        crate::issue::durability::configure_from_env(&crate::issue::default_dir()?)?;
+    }
     std::fs::create_dir_all(state_dir)?;
     if opts.agent_uid.is_none() {
         opts.agent_uid = crate::agent_uid::config::configured_uid(state_dir)?;

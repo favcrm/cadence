@@ -78,7 +78,22 @@ pub enum CheckoutAction {
 }
 
 #[derive(Subcommand)]
+pub enum DurabilityAction {
+    /// Verify owned boot handoff, real canonical tracker and live private head
+    /// readiness before starting writers. Never bootstraps or mutates authority.
+    VerifyBoot {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum IssueAction {
+    /// Private hosted tracker capability preflight (not a source election).
+    Durability {
+        #[command(subcommand)]
+        action: DurabilityAction,
+    },
     /// Create the PM dir skeleton (pm.yaml, README, .gitignore, git
     /// init + first commit) and install the pre-commit/post-commit
     /// hooks. Idempotent; a foreign hook is never overwritten.
@@ -769,9 +784,37 @@ fn open_pm() -> Result<Pm> {
     Pm::open_default()
 }
 
+fn open_write_pm() -> Result<Pm> {
+    let root = crate::issue::default_dir()?;
+    // Validate declared capability before Pm::at, then bind the same real
+    // protocol used by the authenticated route. Ordinary local is unchanged.
+    let configured = crate::issue::durability::tracker::runtime_from_env(&root)?;
+    let mut pm = Pm::at(&root)?;
+    if let Some((mode, hosted)) = configured {
+        pm.attach_durability_mode(mode);
+        if let Some(hosted) = hosted {
+            pm.attach_durability(hosted);
+        }
+    }
+    Ok(pm)
+}
+fn write_exit(out: &Value) -> i32 {
+    if out["applied"] == true && out["durability"] == "unconfirmed" {
+        1
+    } else {
+        0
+    }
+}
+
 /// `cadence issue …` — returns the process exit code.
 pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
     match action {
+        IssueAction::Durability {
+            action: DurabilityAction::VerifyBoot { file },
+        } => {
+            print_json(&crate::issue::durability::verify_boot_command(file)?);
+            Ok(0)
+        }
         IssueAction::Init => {
             let dir = crate::issue::default_dir()?;
             let pm = Pm::init(&dir)?;
@@ -988,7 +1031,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 )?),
                 None => None,
             };
-            let pm = open_pm()?;
+            let pm = open_write_pm()?;
             let cwd = std::env::current_dir()?;
             let actor = if caller_is_master {
                 crate::master::ALIAS
@@ -1011,7 +1054,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 actor,
             )?;
             print_json(&out);
-            Ok(0)
+            Ok(write_exit(&out))
         }
         IssueAction::Ls {
             project,
@@ -1536,7 +1579,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                      `cadence issue set CAD-16 CAD-17 status=ready`"
                 )));
             }
-            let pm = open_pm()?;
+            let pm = open_write_pm()?;
             let out =
                 write::set_fields_if_rev(&pm, ids, pairs, "", force.as_deref(), if_rev.as_deref())?;
             print_json(&out);
@@ -1554,7 +1597,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     eprintln!("{id}: worktree open: run cadence issue finish {id}");
                 }
             }
-            Ok(0)
+            Ok(write_exit(&out))
         }
         IssueAction::Tag { args } => {
             let Some(split) = args.iter().position(|a| a == "add" || a == "rm") else {
@@ -1633,17 +1676,11 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     read_stdin_body("issue comment")?
                 }
             };
-            let pm = open_pm()?;
-            print_json(&write::add_comment(
-                &pm,
-                id,
-                &body,
-                author.as_deref(),
-                kind.as_deref(),
-                None,
-                "",
-            )?);
-            Ok(0)
+            let pm = open_write_pm()?;
+            let out =
+                write::add_comment(&pm, id, &body, author.as_deref(), kind.as_deref(), None, "")?;
+            print_json(&out);
+            Ok(write_exit(&out))
         }
         IssueAction::Edit {
             id,

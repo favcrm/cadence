@@ -293,6 +293,9 @@ fn call_once(
 enum Verdict {
     Done(Result<Value>),
     Conflict(Value),
+    /// CAD-1180: known-applied write verdict — preserve its durability
+    /// disposition and receipt, whether confirmed or unconfirmed.
+    Applied(Value),
     Waking(Duration),
 }
 
@@ -300,6 +303,18 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
     match status {
         200..=299 => Verdict::Done(body.ok_or_else(|| reject("remote answer was not JSON"))),
         503 => {
+            // A received post-write verdict is authoritative whether the
+            // host confirmed publication or preserved a known-applied
+            // failure receipt. Keep it terminal and visible; only an
+            // absent/invalid body is an unknown transport outcome.
+            if let Some(b) = &body {
+                if b["applied"].as_bool() == Some(true)
+                    && matches!(b["durability"].as_str(), Some("confirmed" | "unconfirmed"))
+                    && b["receipt"].is_object()
+                {
+                    return Verdict::Applied(b.clone());
+                }
+            }
             let state = body
                 .as_ref()
                 .and_then(|b| b["state"].as_str())
@@ -358,6 +373,9 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
 pub enum RemoteAnswer {
     Ok(Value),
     Conflict(Value),
+    /// CAD-1180: the write is known applied, with its host durability
+    /// disposition and receipt. Preserve the evidence; never replay it.
+    Applied(Value),
 }
 
 pub fn call_verb(
@@ -401,6 +419,7 @@ fn call_verb_in(
         match classify(status, retry_after, body) {
             Verdict::Done(result) => return result.map(RemoteAnswer::Ok),
             Verdict::Conflict(body) => return Ok(RemoteAnswer::Conflict(body)),
+            Verdict::Applied(body) => return Ok(RemoteAnswer::Applied(body)),
             Verdict::Waking(wait) => {
                 let now = Instant::now();
                 if now + wait > deadline {
@@ -700,7 +719,7 @@ mod tests {
         // Tests assert on the verb's JSON body — a conflict answer
         // still carries one, so unwrap it the same way.
         let out = out.map(|a| match a {
-            RemoteAnswer::Ok(b) | RemoteAnswer::Conflict(b) => b,
+            RemoteAnswer::Ok(b) | RemoteAnswer::Conflict(b) | RemoteAnswer::Applied(b) => b,
         });
         (out, calls_out)
     }

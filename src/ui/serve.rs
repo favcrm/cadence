@@ -1798,6 +1798,21 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     }
 }
 pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
+    let mut configured = opts.clone();
+    if let Some((mode, hosted)) = crate::issue::durability::configure_from_env(pm_dir)? {
+        configured.durability_mode = mode;
+        configured.durability = hosted;
+    }
+    if configured.durability_mode == crate::issue::durability::Mode::Required {
+        let hosted = configured.durability.as_ref().ok_or_else(|| {
+            Error::rejected("capability_unavailable: required tracker backend missing")
+        })?;
+        hosted.validate_mode(configured.durability_mode)?;
+        if let Some(public) = &configured.public {
+            hosted.validate_for(&public.company)?;
+        }
+    }
+    let opts = &configured;
     if opts.board_public_only && opts.public.is_none() {
         return Err(Error::rejected(
             "board public-only mode requires a public board identity",
