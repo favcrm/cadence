@@ -460,6 +460,56 @@ impl Fixture {
     }
 }
 
+fn snapshot_state(state: &Path) -> Vec<(String, Vec<String>)> {
+    let connection = Connection::open_with_flags(
+        state.join("cadence.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let mut tables = connection.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    ).unwrap();
+    let names: Vec<String> = tables
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    names
+        .into_iter()
+        .filter(|name| {
+            [
+                "connection",
+                "credential",
+                "grant",
+                "binding",
+                "campaign",
+                "smtp",
+            ]
+            .iter()
+            .any(|part| name.contains(part))
+        })
+        .map(|name| {
+            let quoted = name.replace('"', "\"\"");
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM \"{quoted}\""))
+                .unwrap();
+            let width = statement.column_count();
+            let mut rows: Vec<String> = statement
+                .query_map([], |row| {
+                    let values: Vec<rusqlite::types::Value> = (0..width)
+                        .map(|i| row.get(i))
+                        .collect::<rusqlite::Result<_>>()?;
+                    Ok(format!("{values:?}"))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            rows.sort();
+            (name, rows)
+        })
+        .collect()
+}
+
 fn assert_receipt(value: &Value, row: &Value) {
     let result = &value["verification"];
     assert_eq!(result["schema"], 1);
@@ -1320,6 +1370,7 @@ fn cad1065_libsecret_cleanup_pending_child() {
         "connection_id":row["id"], "expected_revision":row["revision"],
         "expected_registration_digest":row["registration_digest"],
     });
+    let initial = snapshot_state(&state);
     let lookups_before_test = std::fs::read_to_string(tool_dir.join("calls"))
         .unwrap_or_default()
         .lines()
@@ -1437,7 +1488,12 @@ fn cad1065_libsecret_cleanup_pending_child() {
     // start an actual credential revoke while the owned lookup is still
     // held at its exit stop.
     let second = scoped(Asserted::Operator, || {
-        client::rpc_timeout(&state, "connection_test", params, Duration::from_secs(2))
+        client::rpc_timeout(
+            &state,
+            "connection_test",
+            params.clone(),
+            Duration::from_secs(2),
+        )
     })
     .expect_err("cleanup fence allowed a later verifier call");
     assert_eq!(second.kind(), "busy");
@@ -1494,7 +1550,7 @@ fn cad1065_libsecret_cleanup_pending_child() {
         "conflicting revoke reached custody while the lookup was unobserved"
     );
     assert!(
-        initial == fixture.state_snapshot(),
+        initial == snapshot_state(&state),
         "conflicting revoke mutated credential state while cleanup was unobserved"
     );
 
@@ -1547,7 +1603,7 @@ fn cad1065_libsecret_cleanup_pending_child() {
             );
         }
         assert!(
-            initial == fixture.state_snapshot(),
+            initial == snapshot_state(&state),
             "credential state changed before custody serialization was released"
         );
         if refused_while_unobserved {
