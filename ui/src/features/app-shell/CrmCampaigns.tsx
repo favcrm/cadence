@@ -797,7 +797,7 @@ function AudienceSection({
             </button>
           </p>
         ) : suppressions.length === 0 ? (
-          <p className="text-label text-ink-400">No suppressions in this context.</p>
+          <p className="text-label text-ink-400">No suppressions yet.</p>
         ) : (
           <ol className="crm-history">
             {suppressions.slice(0, 10).map((row) => (
@@ -997,7 +997,7 @@ function AudienceSection({
             </button>
           </p>
         ) : suppressions.length === 0 ? (
-          <p className="text-label text-ink-400">No suppressions in this context.</p>
+          <p className="text-label text-ink-400">No suppressions yet.</p>
         ) : (
           <ol className="crm-history">
             {suppressions.slice(0, 10).map((row) => (
