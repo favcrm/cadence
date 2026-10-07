@@ -4,7 +4,7 @@ use super::*;
 
 /// `agent show` lists this many terminal messages by default (CAD-879);
 /// unfinished ones are always listed.
-const DEFAULT_SHOW_MESSAGES: u64 = 20;
+pub(crate) const DEFAULT_SHOW_MESSAGES: u64 = 20;
 
 /// The `agent_show` request for `agent show` (CAD-879): bounded unless
 /// `--all`. A `--since` alone is its own bound; otherwise the recent

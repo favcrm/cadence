@@ -144,7 +144,7 @@ export default function App() {
   const issues = issuesState.data ?? [];
   const projects = projectsState.data ?? [];
   const agents = agentsState.data;
-  const [health, setHealth] = useState<Health | null>(null);
+  const [health, setHealth] = useState<Health | null | "unavailable">(null);
   const [meta, setMeta] = useState<Meta | null>(null);
   const [updateBanner, setUpdateBanner] = useState<UpdateBanner | null>(null);
   // The open drawer's detail, cached per id: reopening a drawer paints
@@ -246,9 +246,18 @@ export default function App() {
   const metaIdentity = useRef<string | null>(null);
   const metaKey = useRef<string | null>(null);
   const metaRequest = useRef(0);
+  const healthRequest = useRef(0);
   const [credentialGeneration, setCredentialGeneration] = useState(0);
   const refresh = useCallback(() => {
-    api.health().then(setHealth).catch(() => setHealth(null));
+    const probe = ++healthRequest.current;
+    api
+      .health()
+      .then((next) => {
+        if (probe === healthRequest.current) setHealth(next);
+      })
+      .catch(() => {
+        if (probe === healthRequest.current) setHealth("unavailable");
+      });
     const request = ++metaRequest.current;
     const sentKey = sessionKey();
     if (sentKey !== metaKey.current) {
