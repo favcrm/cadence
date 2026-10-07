@@ -467,3 +467,34 @@ compiles PR bytes, and those are never promoted. The `release-full` leg of
 artifact. Residual: the artifact crosses jobs of the queue run, which also
 runs the entry's tests; the upload never overwrites, but the main attestation
 vouches for bytes the queue run built.
+
+## Live staging candidate (CAD-833)
+
+The staging deploy candidate polls the **latest successful** `ci.yml` push run
+on main every five minutes, verifies its attested release with
+`scripts/delivery-candidate.py prepare`, then starts the verified binary in the
+`staging` sandbox. It coalesces intermediate green builds; the timer interval
+is a polling cadence, not an end-to-end SLA. `--run-id` pins a run for an
+operator-directed deploy or recovery. The loopback health and `/api/meta`
+`build_commit` must match the selected source SHA. Failed deploys retain and
+record the proven fallback; candidate and fallback executions are re-hashed
+against their receipts. The first successful start seeds a separate fixture
+tracker and registers two inbox agents once. The timer uses a dedicated clone
+checked out at `origin/main`; its state and release cache are under
+`~/.local/share/cadence-staging`.
+
+**Unresolved operator decision — do not install or enable the timer yet.**
+The current source and tests target port 3020, but the standing development
+instance policy allows ports 3110–3199. No exception or migration to another
+port has been authorized. Consequently `:3020`, tailnet `:9460`, the state
+directory and systemd units are not reserved or installed by this source
+refresh. The operator must decide a compliant port and its mapping before
+staging can be enabled; do not infer authorization from this documentation.
+
+The proposed board URL is `http://cadence-3020.localhost:3020`; its proposed
+tailnet URL is `https://ip-172-31-1-32.tail9fcf30.ts.net:9460`. Tailnet
+publishing is through `cadence ui tailscale` under the sandbox opt-in, not
+through sudo or nginx. The deploy code must revalidate an absent/foreign/live
+mapping on ordinary and known-bad healthy ticks, refuse to overwrite foreign
+routes, and keep a healthy loopback board available if a tailnet publish
+restarts it. Tailnet reachability is observed separately from loopback health.
