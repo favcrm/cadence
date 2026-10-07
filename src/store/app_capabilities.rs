@@ -337,14 +337,27 @@ impl Store {
         self.write_tx(|conn| {
 
                     let tx = &mut *conn;
-                    let active: bool = tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id
-                         JOIN messages m ON m.id=s.message_id WHERE s.run_id=? AND s.step_id=?
-                         AND s.message_id=? AND s.state='dispatched' AND r.state='running'
-                         AND r.approved_digest=r.snapshot_digest AND m.state='running' AND m.turn_id=?)",
-                        params![run, step, message, turn],
-                        |r| r.get(0),
-                    )?;
+                    // CAD-1171: a host-execution run records its receipt
+                    // with no message or turn; the dispatched step is the
+                    // proof, exactly as in the claim.
+                    let active: bool = if message.is_empty() && turn.is_empty() {
+                        tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id
+                             WHERE s.run_id=? AND s.step_id=? AND s.state='dispatched'
+                             AND r.state='running' AND r.approved_digest=r.snapshot_digest)",
+                            params![run, step],
+                            |r| r.get(0),
+                        )?
+                    } else {
+                        tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id
+                             JOIN messages m ON m.id=s.message_id WHERE s.run_id=? AND s.step_id=?
+                             AND s.message_id=? AND s.state='dispatched' AND r.state='running'
+                             AND r.approved_digest=r.snapshot_digest AND m.state='running' AND m.turn_id=?)",
+                            params![run, step, message, turn],
+                            |r| r.get(0),
+                        )?
+                    };
                     if !active {
                         return Err(Error::rejected(
                             "app capability turn ended before result was recorded",
