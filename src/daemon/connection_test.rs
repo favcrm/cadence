@@ -239,7 +239,7 @@ impl Shared {
         Ok(None)
     }
 
-    pub(super) fn connection_test(&self, params: &Value) -> Result<Value> {
+    pub(super) fn connection_test(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let id = connection_id(params)?;
         let expected_revision = expected_revision(params)?;
         let expected_digest = expected_registration_digest(params)?;
@@ -252,11 +252,66 @@ impl Shared {
                 "connection test is fenced pending credential cleanup",
             ));
         }
-        let _custody = self
-            .platform_custody_lock
-            .try_lock()
-            .map_err(|_| Error::busy("connection test is busy"))?;
 
+        // The guard is acquired and held by the worker thread for the
+        // whole operation: if a cleanup kill-path cannot observe the
+        // reap inside the budget, the SAME thread keeps holding the
+        // lock (with the owned Child) and polls `try_wait` until exit
+        // is observed — the guard never crosses a thread boundary
+        // (`MutexGuard` is `!Send`) and is never released early, so
+        // no queued custody user can interleave while the child is
+        // unobserved. The result (including the busy/fenced answer)
+        // is sent back over the channel as soon as the verdict is
+        // known; the worker only outlives the request while it still
+        // holds the serialization for cleanup.
+        let shared = Arc::clone(self);
+        let id = id.to_string();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let custody = match shared.platform_custody_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = result_tx.send(Err(Error::busy("connection test is busy")));
+                    return;
+                }
+            };
+            let mut pending = None;
+            let result = shared.connection_test_locked(
+                &id,
+                expected_revision,
+                expected_digest,
+                &deadline,
+                started_at,
+                &mut pending,
+            );
+            let _ = result_tx.send(result);
+            if let Some(mut child) = pending {
+                let _custody = custody;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => {
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        result_rx
+            .recv()
+            .unwrap_or_else(|_| Err(Error::internal("connection test worker exited")))
+    }
+
+    fn connection_test_locked(
+        &self,
+        id: &str,
+        expected_revision: Option<u64>,
+        expected_digest: Option<String>,
+        deadline: &crate::platform::OpDeadline,
+        started_at: i64,
+        pending_child: &mut Option<std::process::Child>,
+    ) -> Result<Value> {
         let Some(identity) = self.resolve_identity(id)? else {
             return Err(Error::rejected("connection is unavailable or stale"));
         };
@@ -341,7 +396,6 @@ impl Shared {
                         .value());
                 }
                 let mut slot_owned = true;
-                let mut pending_child = None;
                 let bytes = match self.platform_custody.load_bounded(
                     &record.custody,
                     &crate::platform::Key {
@@ -349,73 +403,14 @@ impl Shared {
                         account: &record.account,
                     },
                     MATERIAL_CAP,
-                    &deadline,
+                    deadline,
                     &self.connection_test_fenced,
-                    &mut pending_child,
+                    pending_child,
                 ) {
                     Ok(bytes) => bytes,
                     Err(e) => {
                         if self.connection_test_fenced.load(Ordering::SeqCst) {
                             release_slot(&self.connection_test_resolver, &mut slot_owned);
-                            // The kill-path could not observe the
-                            // reap inside the budget: the lookup may
-                            // still be alive. A cleanup owner takes
-                            // the exclusive custody guard and the
-                            // owned Child and keeps polling `try_wait`
-                            // until termination is observed, so no
-                            // custody user (rotate/revoke/verify) can
-                            // race the unobserved child — the lock is
-                            // held, not a flag they do not check. New
-                            // tests are refused by the fence before
-                            // they could queue on the guard. The
-                            // kernel residual stands: a child the OS
-                            // will not let die keeps the lock (and
-                            // blocks custody users) until it exits
-                            // or the daemon restarts — the request
-                            // itself is not held past its budget.
-                            if let Some(child) = pending_child.take() {
-                                // A `MutexGuard` cannot cross a
-                                // thread boundary, so the cleanup
-                                // owner re-acquires the same lock on
-                                // its own thread: it queues on
-                                // `platform_custody_lock` before this
-                                // request's guard is released, then
-                                // holds it — with the owned Child —
-                                // until `try_wait` observes the
-                                // exit. Every other custody user
-                                // (`.lock()`) is serialized behind
-                                // the observed termination; new
-                                // tests are refused by the fence
-                                // before they can queue. `held`
-                                // proves the owner won the lock
-                                // before the busy answer leaves, so
-                                // custody is never un-serialized
-                                // while the child is unobserved.
-                                let lock = self.platform_custody_lock;
-                                let held =
-                                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                let held_signal = held.clone();
-                                std::thread::spawn(move || {
-                                    let mut child = child;
-                                    let _custody = lock.lock().unwrap_or_else(|e| e.into_inner());
-                                    held_signal.store(true, Ordering::SeqCst);
-                                    loop {
-                                        match child.try_wait() {
-                                            Ok(Some(_)) => break,
-                                            Ok(None) => {
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_millis(25),
-                                                );
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                });
-                                drop(_custody);
-                                while !held.load(Ordering::SeqCst) {
-                                    std::thread::sleep(std::time::Duration::from_millis(5));
-                                }
-                            }
                             return Err(Error::busy(
                                 "connection test is fenced pending credential cleanup",
                             ));
@@ -469,7 +464,7 @@ impl Shared {
 
                 receipt.network_attempted = true;
                 let addresses =
-                    match self.resolve_login_host(&envelope.host, envelope.port, &deadline) {
+                    match self.resolve_login_host(&envelope.host, envelope.port, deadline) {
                         Ok(addresses) => addresses,
                         Err(failure) => {
                             return Ok(receipt
@@ -488,7 +483,7 @@ impl Shared {
                     &envelope,
                     &addresses,
                     self.smtp_test_ca.as_deref(),
-                    &deadline,
+                    deadline,
                 );
                 release_slot(&self.connection_test_resolver, &mut slot_owned);
                 match result {
