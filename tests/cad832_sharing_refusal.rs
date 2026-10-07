@@ -19,6 +19,7 @@ use tempfile::{Builder, TempDir};
 const BINARY: &str = env!("CARGO_BIN_EXE_cadence");
 const PORT: u16 = 3117;
 const BIND_TEST_PORT: u16 = 3199;
+const GRANT_TEST_PORT: u16 = 3119;
 const SHARE_PORT: u16 = 19450;
 const TARGET: &str = "http://127.0.0.1:3117";
 const FOREIGN_TARGET: &str = "http://127.0.0.1:3118";
@@ -313,6 +314,13 @@ impl Fixture {
         let map = socket.with_extension("json");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&state).unwrap();
+        let grant_root = root.path().join("sandboxes").join("cad832-acceptance");
+        fs::create_dir_all(&grant_root).unwrap();
+        fs::write(
+            grant_root.join(".cadence-sandbox"),
+            r#"{"name":"cad832-acceptance","allow_global":true}"#,
+        )
+        .unwrap();
         fs::create_dir_all(&fake_bin).unwrap();
         fs::write(fake_bin.join("tailscale"), FAKE_TAILSCALE).unwrap();
         fs::set_permissions(
@@ -1355,20 +1363,23 @@ fn reset_refuses_known_ui_options_decode_failure_without_mutation() {
     ];
     let mut failures = Vec::new();
     for (label, record) in cases {
+        // Keep the CLI name valid so malformed JSON, not name validation,
+        // reaches the reset refusal path. Each case owns a fresh fixture.
         let fixture = Fixture::new(label);
+        let sandbox_name = "malformed";
         let base = fixture._root.path().join("sandboxes");
-        let root = base.join(label);
+        let root = base.join(sandbox_name);
         let state = root.join("state");
         fs::create_dir_all(&state).unwrap();
         fs::write(
             root.join(".cadence-sandbox"),
-            format!(r#"{{"name":"{label}","allow_global":true}}"#),
+            format!(r#"{{"name":"{sandbox_name}","allow_global":true}}"#),
         )
         .unwrap();
         fs::write(state.join("ui.json"), &record).unwrap();
         let config = mapping(SHARE_PORT, TARGET);
         fixture.api.seed(config.clone());
-        let out = fixture.cli(&["sandbox", "reset", label]);
+        let out = fixture.cli(&["sandbox", "reset", sandbox_name]);
         let root_exists = root.is_dir();
         let after = fs::read(state.join("ui.json")).unwrap_or_default();
         let after_config = fixture.api.config();
@@ -1421,6 +1432,13 @@ fn unsupported_localapi_serve_schema_refuses_without_post_or_data_loss() {
         json!({"mode": "preserve-me"});
     cases.push(("future-http-handler-field", future_handler));
 
+    // Go's handler schema permits these individual string types, but the
+    // protocol defines them as mutually exclusive alternatives.
+    let mut mixed_handler = known_free_config();
+    mixed_handler["Web"]["known.example.ts.net:19449"]["Handlers"]["/"] =
+        json!({"Proxy": "http://127.0.0.1:3118", "Text": "not-a-proxy"});
+    cases.push(("mixed-proxy-text-handler", mixed_handler));
+
     let mut failures = Vec::new();
     for (label, original_config) in cases {
         let fixture = Fixture::new(label);
@@ -1457,6 +1475,93 @@ fn unsupported_localapi_serve_schema_refuses_without_post_or_data_loss() {
     assert!(
         failures.is_empty(),
         "unsupported LocalAPI schema cases failed: {failures:#?}"
+    );
+}
+
+#[test]
+fn allow_global_requires_matching_persisted_sandbox_grant_for_ui_sharing() {
+    let sandbox_name = "cad832-acceptance";
+    let mut fixture = Fixture::new("grant-marker-refusal");
+    let sandbox_root = fixture._root.path().join("sandboxes").join(sandbox_name);
+    let state = sandbox_root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    fixture.state = state;
+    let marker_path = sandbox_root.join(".cadence-sandbox");
+    let marker =
+        |allow_global| format!(r#"{{"name":"{sandbox_name}","allow_global":{allow_global}}}"#);
+    let target = format!("http://127.0.0.1:{GRANT_TEST_PORT}");
+    let record = format!(
+        "{{\n  \"port\": {GRANT_TEST_PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{target}\"\n  }}\n}}\n"
+    );
+    fs::write(fixture.state.join("ui.json"), &record).unwrap();
+    let config = mapping(SHARE_PORT, &target);
+    fixture.api.seed(config.clone());
+
+    // Env opt-in alone is not authority: the state dir and profile resolve
+    // to this canonical root, whose recorded grant is explicitly false.
+    fs::write(&marker_path, marker(false)).unwrap();
+    let mut failures = Vec::new();
+    for args in [
+        vec!["ui", "tailscale", "start", "--port", "19450"],
+        vec!["ui", "tailscale", "stop"],
+    ] {
+        let out = fixture.cli(&args);
+        let requests = fixture.api.requests();
+        let record_unchanged =
+            fs::read(fixture.state.join("ui.json")).unwrap() == record.as_bytes();
+        let config_unchanged = fixture.api.config() == config;
+        let no_mutation = fixture.no_cli_mutation();
+        if out.status.success()
+            || !record_unchanged
+            || !config_unchanged
+            || !requests.is_empty()
+            || !no_mutation
+        {
+            failures.push(format!(
+                "ungranted {:?}: status={} record_unchanged={record_unchanged} config_unchanged={config_unchanged} no_tailscale_mutation={no_mutation} requests={requests:?} output={}",
+                args,
+                out.status,
+                output_text(&out)
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "ungranted sharing cases failed: {failures:#?}"
+    );
+    drop(fixture);
+
+    // The identical canonical layout reaches the operation with a true
+    // persisted grant; the positive control prevents name/layout rejection
+    // from masquerading as enforcement.
+    let mut fixture = Fixture::new("grant-marker-positive");
+    let sandbox_root = fixture._root.path().join("sandboxes").join(sandbox_name);
+    let state = sandbox_root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    fixture.state = state;
+    let marker_path = sandbox_root.join(".cadence-sandbox");
+    fs::write(&marker_path, marker(true)).unwrap();
+    fs::write(fixture.state.join("ui.json"), &record).unwrap();
+    fixture.api.seed(config);
+    let started = fixture.cli(&["ui", "tailscale", "start", "--port", "19450"]);
+    assert!(
+        started.status.success(),
+        "recorded grant did not admit sharing start: {}",
+        output_text(&started)
+    );
+    assert!(
+        fixture
+            .api
+            .requests()
+            .iter()
+            .any(|(m, p, _)| m == "GET" && p == "/localapi/v0/serve-config"),
+        "granted start did not reach LocalAPI"
+    );
+    let stopped = fixture.cli(&["ui", "tailscale", "stop"]);
+    assert!(
+        stopped.status.success(),
+        "recorded grant did not admit sharing stop: {}",
+        output_text(&stopped)
     );
 }
 

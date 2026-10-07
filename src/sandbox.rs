@@ -101,11 +101,21 @@ pub fn refuse_global(what: &str) -> Result<()> {
     global_gate(profile().as_deref(), None, what)
 }
 
-/// `refuse_global`, with `CADENCE_SANDBOX_ALLOW_GLOBAL=1` as the
-/// operator's explicit opt-in.
+/// `refuse_global`, with both the exact environment opt-in and the
+/// matching sandbox's persisted grant. A shell override cannot grant
+/// authority that `sandbox up` did not record.
 pub fn refuse_global_unless_allowed(what: &str) -> Result<()> {
-    let allowed = std::env::var(ALLOW_GLOBAL_ENV).is_ok_and(|v| v == "1");
-    global_gate(profile().as_deref(), Some(allowed), what)
+    let profile = profile();
+    let mut allowed = std::env::var(ALLOW_GLOBAL_ENV).is_ok_and(|v| v == "1");
+    if allowed {
+        if let Some(name) = profile.as_deref() {
+            let sb = Sandbox::open(name)?;
+            refuse_production(&sb)?;
+            let marker = require_marker(&sb)?;
+            allowed = marker["allow_global"].as_bool() == Some(true);
+        }
+    }
+    global_gate(profile.as_deref(), Some(allowed), what)
 }
 
 /// `allowed: None` — not overridable.

@@ -519,6 +519,20 @@ fn validate_web_map(value: &Value) -> Result<()> {
                         return Err(api_error(format!("serve-config HTTP {field} is malformed")));
                     }
                 }
+                let kinds = ["Path", "Proxy", "Text", "Redirect"]
+                    .into_iter()
+                    .filter(|field| {
+                        fields
+                            .get(*field)
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| !value.is_empty())
+                    })
+                    .count();
+                if kinds != 1 {
+                    return Err(api_error(
+                        "serve-config HTTP handler must specify exactly one handler kind",
+                    ));
+                }
                 if fields.get("AcceptAppCaps").is_some_and(|value| {
                     value
                         .as_array()
