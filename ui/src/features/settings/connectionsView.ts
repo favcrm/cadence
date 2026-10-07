@@ -411,14 +411,24 @@ export function verificationResult(
   const digest = r.registration_digest as string | null;
   const revision = r.revision as number | null;
 
+  // Identity pinning: every non-stale status is evidence about the
+  // captured tuple — a receipt for the right id but a different current
+  // revision/digest can never pass as a non-stale outcome. `stale` is
+  // the one status allowed to carry a server-current tuple that differs
+  // from the request, because it explicitly reports the change.
+  const sameTuple =
+    revision === expected.revision && digest === expected.registration_digest;
+
   if (status === "success") {
     // Success is pinned to the exact captured tuple — a different
-    // current identity makes the receipt stale, not a success.
+    // current identity makes the receipt stale, not a success. It also
+    // requires a verified authentication, a network attempt and no
+    // failure detail.
     if (
       r.authentication_verified !== true ||
+      r.network_attempted !== true ||
       failure !== null ||
-      revision !== expected.revision ||
-      digest !== expected.registration_digest
+      !sameTuple
     ) {
       return null;
     }
@@ -432,9 +442,11 @@ export function verificationResult(
     };
   }
   if (status === "stale") {
-    // The server reports it is stale relative to the current identity —
-    // refresh and test again; never a success and never the server-
-    // current tuple presented as proof of the request's connection.
+    // Stale carries the server-current tuple, which legitimately
+    // differs — validate its shape and identity (done above), never its
+    // equality to the request, and never let it read as a success or as
+    // replacement-current evidence. It must not carry a failure detail.
+    if (failure !== null) return null;
     return {
       ok: false,
       stale: true,
@@ -443,20 +455,22 @@ export function verificationResult(
         "The connection changed while the check ran — refresh it and test again. This result is not proof of the current connection.",
     };
   }
-  // failed / unsupported: describe the exact captured tuple, closed
-  // code+step mapping only — no provider/request/diagnostic text.
-  if (failure === null) {
-    // unsupported carries no failure detail; failed always does.
-    if (status === "unsupported") {
-      return {
-        ok: false,
-        stale: false,
-        checkedAt: r.completed_at as string,
-        text: "Remote login verification is not supported for this connection.",
-      };
-    }
-    return null;
+  // failed / unsupported: also pinned to the captured tuple — a failure
+  // against a different revision/digest is evidence about the wrong
+  // incarnation, not this one. unsupported carries no failure detail;
+  // failed always does and is never authenticated.
+  if (!sameTuple) return null;
+  if (status === "unsupported") {
+    if (failure !== null) return null;
+    return {
+      ok: false,
+      stale: false,
+      checkedAt: r.completed_at as string,
+      text: "Remote login verification is not supported for this connection.",
+    };
   }
+  // status === "failed"
+  if (failure === null || r.authentication_verified === true) return null;
   const code = (failure as { code: string }).code;
   return {
     ok: false,

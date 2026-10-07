@@ -325,6 +325,57 @@ equal(typeof smtpPortTlsError("LOCALHOST", "40211", "implicit"), "string", "loca
   equal(verificationResult({ verification: { ...okReceipt, failure: { code: "bogus", step: "auth" } } }, want), null, "unknown failure code -> null");
   equal(verificationResult({ verification: { ...okReceipt, completed_at: "not-a-time" } }, want), null, "bad timestamp -> null");
 
+  // Identity pinning: a receipt for the right id but a different
+  // revision/digest is evidence on the wrong tuple — only a stale
+  // receipt may differ; every non-stale status must match the request.
+  const wrongDigest = "sha256:" + "d".repeat(64);
+  equal(
+    verificationResult({ verification: { ...okReceipt, status: "failed", authentication_verified: false, revision: 3, failure: { code: "auth_failed", step: "auth" } } }, want),
+    null,
+    "failed receipt on a different revision -> null",
+  );
+  equal(
+    verificationResult({ verification: { ...okReceipt, status: "failed", authentication_verified: false, registration_digest: wrongDigest, failure: { code: "auth_failed", step: "auth" } } }, want),
+    null,
+    "failed receipt on a different digest -> null",
+  );
+  equal(
+    verificationResult({ verification: { ...okReceipt, status: "unsupported", authentication_verified: false, network_attempted: false, revision: 3 } }, want),
+    null,
+    "unsupported receipt on a different revision -> null",
+  );
+  // Impossible/under-pinned combos are rejected, never shown.
+  equal(
+    verificationResult({ verification: { ...okReceipt, network_attempted: false } }, want),
+    null,
+    "success without a network attempt -> null",
+  );
+  equal(
+    verificationResult({ verification: { ...okReceipt, failure: { code: "auth_failed", step: "auth" } } }, want),
+    null,
+    "success carrying a failure -> null",
+  );
+  equal(
+    verificationResult({ verification: { ...okReceipt, status: "failed", authentication_verified: true, failure: { code: "auth_failed", step: "auth" } } }, want),
+    null,
+    "failed receipt that also claims verified auth -> null",
+  );
+  equal(
+    verificationResult({ verification: { ...okReceipt, status: "failed", authentication_verified: false } }, want),
+    null,
+    "failed with no failure detail -> null",
+  );
+  equal(
+    verificationResult({ verification: { ...okReceipt, status: "unsupported", authentication_verified: false, network_attempted: false, failure: { code: "unsupported_provider", step: "admission" } } }, want),
+    null,
+    "unsupported carrying a failure detail -> null",
+  );
+  equal(
+    verificationResult({ verification: { ...okReceipt, status: "stale", authentication_verified: false, revision: 3, registration_digest: wrongDigest, failure: { code: "stale_connection", step: "admission" } } }, want),
+    null,
+    "stale carrying a failure detail -> null",
+  );
+
   // A closed failure maps to fixed actionable text; a stale receipt is
   // flagged stale and never a success even when its server tuple differs.
   const failed = verificationResult(
