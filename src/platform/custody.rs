@@ -469,35 +469,27 @@ fn libsecret_lookup_bounded(
     let bytes = match result {
         Ok(bytes) => bytes,
         Err(error) => {
-            // Signal once, then reap on the remaining budget — a
-            // blocking `wait` here could hold the custody guard past
-            // the deadline, so `try_wait` polls in bounded slices. A
-            // child not provably reaped before the budget is spent
-            // cannot be safely abandoned: `Child::drop` would release
-            // ownership while it may still run and reaps nothing, so
-            // the registration is retained for the process lifetime
-            // (the daemon remains its owner under the subreaper) and
-            // the whole verification path is fenced until restart.
-            let _ = child.kill();
+            // Signal once — `libc::kill`, not `Child::kill`, whose
+            // cached `Some` status could make it a no-op — then reap
+            // on the remaining budget. A child not provably reaped
+            // before the budget is spent cannot be safely abandoned:
+            // `Child::drop` would release ownership while it may
+            // still run and reaps nothing, so the registration is
+            // retained for the process lifetime (the daemon remains
+            // its owner under the subreaper) and the whole
+            // verification path is fenced until restart.
+            let _ = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
             let reaped = 'reap: loop {
-                // `waitpid` for the reap itself (not `try_wait`,
-                // which caches the first `Some` status and so could
-                // never observe a later exit), then `/proc` presence
-                // as "nothing remains" — a `WIFSTOPPED` report or a
-                // consumed exit can still leave a held task. Only
-                // a fully absent task counts as reaped here; a
-                // live stop, a held zombie, or an uncertain answer
-                // keeps waiting on the remaining budget.
-                let mut status: libc::c_int = 0;
-                let _ = unsafe {
-                    libc::waitpid(
-                        child.id() as libc::pid_t,
-                        &mut status as *mut libc::c_int,
-                        libc::WNOHANG,
-                    )
-                };
+                // Raw `waitpid` via `observe_child_exit` — never
+                // `try_wait`, whose cached `Some` status (a
+                // `WIFSTOPPED` trace stop) would mask the real
+                // later exit. A fresh terminal status or already
+                // reaped releases; a stop report or still-running
+                // child keeps polling; an unqualified wait error
+                // retains and keeps polling on the remaining
+                // budget.
                 match super::observe_child_exit(&child) {
-                    super::ChildExit::Reaped => {
+                    super::ChildExit::Terminated => {
                         break 'reap true;
                     }
                     super::ChildExit::Running | super::ChildExit::Uncertain => {

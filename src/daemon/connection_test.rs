@@ -289,23 +289,36 @@ impl Shared {
             let _ = result_tx.send(result);
 
             if let Some(child) = pending {
+                // The lookup child could not be provably reaped
+                // inside the shared budget, so the fenced request
+                // may outlive the answer. This thread already owns
+                // `custody` and keeps it held while polling a fresh
+                // raw `waitpid` observation (`observe_child_exit`,
+                // never `try_wait` — its cached `Some` status would
+                // mask the real later exit and could suppress
+                // `kill`). Release happens only on a positively
+                // established termination: a fresh terminal status
+                // (`WIFEXITED`/`WIFSIGNALED`, which also reaps it)
+                // or a qualified `ECHILD` (already reaped). A
+                // stopped report or a still-running child keeps
+                // holding, and any unqualified wait error keeps
+                // holding and polling rather than releasing on a
+                // guess — the guard and the `Child` registration
+                // are retained together.
                 let _custody = custody;
                 loop {
                     match crate::platform::observe_child_exit(&child) {
-                        // `ECHILD` — nothing of the child remains to
-                        // wait on, so it is fully reaped and the
-                        // serialization may be released.
-                        crate::platform::ChildExit::Reaped => break,
-                        // Still tracked — alive, a reported stop, or
-                        // a reported exit whose task may still be
-                        // held — or an uncertain answer: keep the
-                        // guard held rather than release on a guess.
+                        crate::platform::ChildExit::Terminated => break,
                         crate::platform::ChildExit::Running
                         | crate::platform::ChildExit::Uncertain => {
                             std::thread::sleep(std::time::Duration::from_millis(25));
                         }
                     }
                 }
+                // Our waitpid already reaped the child — the std
+                // `Child` must never wait on it again. `Child::drop`
+                // does not wait, so dropping after our reap is safe.
+                drop(child);
             }
         });
         result_rx
