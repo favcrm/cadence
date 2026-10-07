@@ -520,6 +520,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("app_content_save", Rule::Handler("operator_connection (CAD-782)")),
     ("app_content_show", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_clone", Rule::Handler("operator_connection (CAD-1182)")),
     ("app_content_list", Rule::Handler("operator_connection (CAD-782)")),
     ("app_content_render", Rule::Handler("operator_connection (CAD-782)")),
     ("app_content_propose", Rule::Handler("operator_connection (CAD-782)")),
