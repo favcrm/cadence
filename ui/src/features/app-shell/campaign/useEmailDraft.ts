@@ -49,6 +49,15 @@ export function newBlock(kind: CampaignBlock["type"]): EditorBlock {
   return { key: editorKey++, kind, text: "", label: "", url: kind === "button" ? "https://" : "" };
 }
 
+export function blocksFromProposal(blocks: CampaignBlock[]): EditorBlock[] {
+  return blocks.map((block) => {
+    const editorBlock = newBlock(block.type);
+    return block.type === "button"
+      ? { ...editorBlock, label: block.label, url: block.url }
+      : { ...editorBlock, text: block.text };
+  });
+}
+
 export function blocksToGrammar(blocks: EditorBlock[]): CampaignBlock[] {
   return blocks.map((block) => {
     if (block.kind === "heading") return { type: "heading", text: block.text };
@@ -119,7 +128,9 @@ export function useEmailDraft(
    *  is UI-local: saves, discards and clean doc syncs reset it. */
   const blockHistory = useRef<EditorBlock[][]>([]);
 
-  const dirty = doc !== null && !sameDraft(draft, baseline);
+  // A proposal can seed the revision-0 draft before any saved document
+  // exists. Changes there are still dirty and must be explicitly saved.
+  const dirty = !sameDraft(draft, baseline);
   const live = useRef({ dirty, doc });
   live.current = { dirty, doc };
 

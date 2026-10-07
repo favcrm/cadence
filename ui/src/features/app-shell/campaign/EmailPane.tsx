@@ -12,27 +12,20 @@ import {
 import { contentClient } from "../contentClient";
 import EmailBlocksCanvas, { AddBlockTools, MAX_BLOCKS } from "./EmailBlocksCanvas";
 import ProposalStrip from "./ProposalStrip";
-import type { EmailDraftApi } from "./useEmailDraft";
+import { blocksFromProposal, blocksToGrammar, type EmailDraftApi } from "./useEmailDraft";
 
-type Mode = "visual" | "html" | "text";
+type Mode = "visual" | "html";
 type Device = "desktop" | "mobile";
 
 const MODES: [Mode, string][] = [
   ["visual", "Visual"],
   ["html", "HTML"],
-  ["text", "Text"],
 ];
 
 /**
- * Email tab: pending assistant proposal strip, preview toolbar
- * (Visual/HTML/Text, Desktop/Mobile, sample recipient), an envelope
- * header and the host-rendered stage. The host render only ever shows
- * preview-only bytes — saved revision or the proposal's own inert
- * draft; unsaved editor text is never rendered as the email.
- * CAD-1057: an operator edits inline — blocks, subject and preheader
- * (Visual), pasted HTML (HTML), an optional plain-text override
- * (Text) — and a sticky bar saves a new version. The host footer is
- * locked. `edit` is null for a read-only viewer.
+ * Email tab: pending assistant proposals and exactly two editing modes.
+ * Visual block edits and HTML source edits share one revision-pinned
+ * draft. Saving is explicit, and the required host footer is protected.
  * CAD-1146: Visual mode is the approved direct-visual canvas — the
  * supported blocks are edited directly on the email with inline
  * move/delete menus and undo; the preheader starts collapsed and the
@@ -48,13 +41,16 @@ export default function EmailPane({
   onRefresh,
   sampleName,
   onSampleName,
+  senderBindings,
+  senderBindingId,
+  onSenderBindingId,
+  senderBindingError,
   dirty,
   proposals,
   proposalsError,
   proposalError,
   proposalNote,
   onRefreshDrafts,
-  onApplied,
   onDiscarded,
   onProposalError,
   edit,
@@ -68,6 +64,10 @@ export default function EmailPane({
   onRefresh: () => void;
   sampleName: string;
   onSampleName: (value: string) => void;
+  senderBindings: { id: string; name: string; address: string }[];
+  senderBindingId: string | null;
+  onSenderBindingId: (value: string | null) => void;
+  senderBindingError: string | null;
   dirty: boolean;
   /** Pending proposals for this campaign only. */
   proposals: ProposalDoc[];
@@ -75,7 +75,6 @@ export default function EmailPane({
   proposalError: string | null;
   proposalNote: string | null;
   onRefreshDrafts: () => void;
-  onApplied: (doc: ContentDoc) => void;
   onDiscarded: (proposalId: string) => void;
   onProposalError: (message: string | null) => void;
   edit: EmailDraftApi | null;
@@ -122,9 +121,9 @@ export default function EmailPane({
   const subject = draft !== null ? draft.subject : (doc?.subject ?? "");
   const preheader = draft !== null ? draft.preheader : (doc?.preheader ?? "");
   const expectedRevision = doc === null ? 0 : doc.revision;
-  // Inline editing is for an operator on a saved email, never while a
-  // proposal draft is on the stage.
-  const editing = edit !== null && doc !== null && draft === null;
+  // A host-attributed suggestion is read-only until Use in editor. The
+  // local editor is available at revision 0 as well as on saved revisions.
+  const editing = edit !== null && draft === null;
   // CAD-1146: the optional preheader starts collapsed; hiding it never
   // discards its value and never makes it required. A saved preheader
   // opens the row on load so its value is never hidden silently.
@@ -135,13 +134,37 @@ export default function EmailPane({
   }, [doc?.campaignId, doc?.revision]);
   const editingBlocks =
     editing && edit !== null && mode === "visual" && edit.draft.html === null;
+  const blockSource = edit === null
+    ? ""
+    : blocksToGrammar(edit.draft.blocks)
+        .map((block) => {
+          const text = block.type === "button" ? block.label : block.text;
+          const escaped = text
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;");
+          if (block.type === "heading") return `<h2>${escaped}</h2>`;
+          if (block.type === "button") {
+            const url = block.url.replaceAll("&", "&amp;").replaceAll('"', "&quot;");
+            return `<p><a href="${url}">${escaped}</a></p>`;
+          }
+          return `<p>${escaped}</p>`;
+        })
+        .join("\n");
+  const htmlSource = edit?.draft.html ?? blockSource;
+  const draftHtmlPreview = (html: string) => {
+    const policy = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src 'none'; form-action 'none'; base-uri 'none'">`;
+    return /<head(?:\s[^>]*)?>/i.test(html)
+      ? html.replace(/<head(?:\s[^>]*)?>/i, (head) => `${head}${policy}`)
+      : `<!doctype html><html><head>${policy}</head><body>${html}</body></html>`;
+  };
 
   const stage = (() => {
-    if (draft === null && doc === null) {
+    if (draft === null && doc === null && !editing) {
       return (
         <p className="text-label text-ink-400" data-preview="unsaved">
           No saved email yet. Ask the assistant in the left chat to draft this campaign&apos;s
-          email, then Apply its verified proposal above to create revision 1.
+          email, then use a verified proposal in the editor and explicitly Save revision 1.
         </p>
       );
     }
@@ -246,12 +269,11 @@ export default function EmailPane({
           )}
           {editing && edit !== null && mode === "visual" && edit.draft.html !== null && (
             <p className="text-label text-ink-400 mt-2" data-state="html-body">
-              This email&apos;s body is HTML — edit it in HTML mode. Blocks return only if
-              you Discard or Apply an assistant draft.
+              This email uses full-document HTML. It stays intact when you switch modes; use HTML mode to edit it.
             </p>
           )}
           {editing && edit !== null && mode === "html" && (
-            <div className="grid gap-1 mt-2">
+            <div className="grid gap-2 mt-2">
               <label className="text-label text-ink-300" htmlFor="cmp-html-source">
                 HTML source
               </label>
@@ -260,54 +282,21 @@ export default function EmailPane({
                 className="field srcedit"
                 rows={12}
                 spellCheck={false}
-                value={edit.draft.html ?? ""}
+                value={htmlSource}
                 placeholder="Paste or edit the email body HTML"
                 disabled={edit.saving}
-                onChange={(e) =>
-                  edit.patch({
-                    html: e.target.value === "" && doc?.mode !== "html" ? null : e.target.value,
-                  })
-                }
+                onChange={(e) => edit.patch({ html: e.target.value })}
               />
               <p className="text-micro text-ink-500" data-html-note>
-                The host sanitises this HTML (scripts, forms, event handlers and tracking pixels
-                are removed) and adds the unsubscribe footer.
-                {edit.draft.html !== null && edit.draft.blocks.length > 0 && doc?.mode !== "html"
-                  ? " Saving it replaces the blocks."
-                  : ""}
+                Sandboxed preview. The host sanitizes on save; required sender and unsubscribe footer are host-appended, protected and not part of this source. Switching modes does not rewrite the HTML.
               </p>
-            </div>
-          )}
-          {editing && edit !== null && mode === "text" && (
-            <div className="grid gap-1 mt-2">
-              <label className="text-label text-ink-300">
-                <input
-                  type="checkbox"
-                  checked={edit.draft.ownText}
-                  disabled={edit.saving}
-                  onChange={(e) =>
-                    edit.patch({
-                      ownText: e.target.checked,
-                      text: edit.draft.text === "" ? (render?.text ?? "") : edit.draft.text,
-                    })
-                  }
-                />{" "}
-                Write my own
-              </label>
-              {edit.draft.ownText ? (
-                <textarea
-                  id="cmp-text-override"
-                  className="field"
-                  rows={8}
-                  value={edit.draft.text}
-                  disabled={edit.saving}
-                  onChange={(e) => edit.patch({ text: e.target.value })}
-                />
-              ) : (
-                <p className="text-micro text-ink-500">
-                  The plain-text version is generated from the email body.
-                </p>
-              )}
+              <iframe
+                title="Live HTML draft preview"
+                sandbox=""
+                srcDoc={draftHtmlPreview(htmlSource)}
+                className="crm-preview-frame"
+                data-preview="draft-html"
+              />
             </div>
           )}
           {editing && (
@@ -320,7 +309,16 @@ export default function EmailPane({
               {draft !== null ? "Rendering the draft preview…" : "Rendering the saved email…"}
             </p>
           )}
-          {shown !== null && mode === "visual" && (
+          {editing && mode === "visual" && edit !== null && edit.draft.html !== null && (
+            <iframe
+              title="Visual preview of HTML draft"
+              sandbox=""
+              srcDoc={draftHtmlPreview(edit.draft.html)}
+              className="crm-preview-frame"
+              data-preview="visual-draft-html"
+            />
+          )}
+          {shown !== null && mode === "visual" && (edit === null || edit.draft.html === null) && (
             <iframe
               title={
                 draft !== null
@@ -333,9 +331,9 @@ export default function EmailPane({
               data-preview="visual"
             />
           )}
-          {shown !== null && mode !== "visual" && (
-            <pre className="crm-preview" data-preview={mode}>
-              {mode === "html" ? shown.html : shown.text}
+          {shown !== null && mode === "html" && !editing && (
+            <pre className="crm-preview" data-preview="html">
+              {shown.html}
             </pre>
           )}
           {draft !== null && draftError !== null && (
@@ -395,8 +393,20 @@ export default function EmailPane({
             canWrite={canWrite}
             replacesHtml={doc?.mode === "html"}
             viewingDraft={draftId === row.proposalId}
+            canUseInEditor={draftId === row.proposalId && draftRender !== null && !draftPending && draftError === null}
             onViewDraft={(view) => setDraftId(view ? row.proposalId : null)}
-            onApplied={onApplied}
+            onUseInEditor={() => {
+              if (edit === null || row.sourceRevision !== expectedRevision) return;
+              edit.patch({
+                subject: row.subject,
+                preheader: row.preheader,
+                blocks: blocksFromProposal(row.blocks),
+                html: null,
+                ownText: false,
+                text: "",
+              });
+              setDraftId(null);
+            }}
             onDiscarded={onDiscarded}
             onError={onProposalError}
           />
@@ -418,7 +428,7 @@ export default function EmailPane({
         )}
         {proposals.length > 0 && canWrite && (
           <p className="text-micro text-ink-500">
-            Only Apply changes the saved version (approval resets); Discard changes nothing.{" "}
+            Use in editor changes only the local draft. Save creates a new revision; Discard changes nothing.{" "}
             <button type="button" className="lnk" onClick={onRefreshDrafts}>
               Refresh drafts
             </button>
@@ -428,7 +438,7 @@ export default function EmailPane({
 
       <section aria-label="Email preview" className="grid gap-3">
         <div className="crm-pvbar">
-          <span className="crm-seg" role="group" aria-label="Preview format">
+          <span className="crm-seg" role="group" aria-label="Email editing mode">
             {MODES.map(([key, label]) => (
               <button key={key} type="button" aria-pressed={mode === key} onClick={() => setMode(key)}>
                 {label}
@@ -453,6 +463,24 @@ export default function EmailPane({
               </button>
             ))}
           </span>
+          <div className="crm-field">
+            <label className="text-label text-ink-300" htmlFor="cmp-sender-preview">
+              Sender preview (not send authorization)
+            </label>
+            <select
+              id="cmp-sender-preview"
+              className="field"
+              disabled={!canWrite}
+              value={senderBindingId ?? ""}
+              onChange={(event) => onSenderBindingId(event.target.value === "" ? null : event.target.value)}
+            >
+              <option value="">Preview placeholder — no sender selected</option>
+              {senderBindings.map((binding) => (
+                <option key={binding.id} value={binding.id}>{binding.name} · {binding.address}</option>
+              ))}
+            </select>
+          </div>
+          {senderBindingError !== null && <p className="text-label text-fail" role="alert">{senderBindingError}</p>}
           <div className="crm-field">
             <label className="text-label text-ink-300" htmlFor="cmp-sample">
               Sample recipient first name (optional)
@@ -489,7 +517,7 @@ export default function EmailPane({
         )}
         {draft !== null ? (
           <p className="text-micro text-ink-500" data-preview="draft-note">
-            Showing the assistant&apos;s draft — nothing is saved until you Apply it.
+            Review this suggestion and use it in the editor; nothing is saved until you choose Save.
           </p>
         ) : (
           dirty && (
