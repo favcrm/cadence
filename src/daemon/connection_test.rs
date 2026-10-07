@@ -1,6 +1,4 @@
 use std::net::SocketAddr;
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -277,6 +275,7 @@ impl Shared {
                     return;
                 }
             };
+
             let mut pending = None;
             let result = shared.connection_test_locked(
                 &id,
@@ -286,18 +285,25 @@ impl Shared {
                 started_at,
                 &mut pending,
             );
+
             let _ = result_tx.send(result);
-            if let Some(mut child) = pending {
+
+            if let Some(child) = pending {
                 let _custody = custody;
                 loop {
-                    match child.try_wait() {
-                        // `WIFSTOPPED` is a trace/job-control stop,
-                        // not an exit — the child is still alive.
-                        Ok(Some(status)) if !libc::WIFSTOPPED(status.into_raw()) => break,
-                        Ok(Some(_)) | Ok(None) => {
+                    match crate::platform::observe_child_exit(&child) {
+                        // `ECHILD` — nothing of the child remains to
+                        // wait on, so it is fully reaped and the
+                        // serialization may be released.
+                        crate::platform::ChildExit::Reaped => break,
+                        // Still tracked — alive, a reported stop, or
+                        // a reported exit whose task may still be
+                        // held — or an uncertain answer: keep the
+                        // guard held rather than release on a guess.
+                        crate::platform::ChildExit::Running
+                        | crate::platform::ChildExit::Uncertain => {
                             std::thread::sleep(std::time::Duration::from_millis(25));
                         }
-                        Err(_) => break,
                     }
                 }
             }
