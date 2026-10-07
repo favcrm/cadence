@@ -216,6 +216,18 @@ fn check_model_id(model: &str) -> Result<()> {
 /// `worker`). An explicit model wins; else the role's
 /// `[pi].models.default`; else refuse — pi's own fallback chain is
 /// never used. The winner must be on `models.allow`.
+/// CAD-1176: the model a hosted boot falls back to when the policy resolves
+/// nothing for a role. The hosted image ships the same id as its Pi default
+/// (`hosted.sh` pi_model); `CADENCE_PLATFORM_MODEL` overrides it.
+pub const PLATFORM_DEFAULT_MODEL: &str = "agenticos/z-ai/glm-5.3-flash";
+
+fn platform_default_model() -> String {
+    std::env::var("CADENCE_PLATFORM_MODEL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| PLATFORM_DEFAULT_MODEL.to_string())
+}
+
 pub fn resolve_model(
     policy: Option<&PiPolicy>,
     role: &str,
@@ -224,15 +236,22 @@ pub fn resolve_model(
     let configured = explicit
         .map(str::to_string)
         .or_else(|| policy.and_then(|p| p.models.default.for_role(role).map(str::to_string)));
-    let Some(model) = configured else {
-        return Err(Error::rejected(format!(
-            "a pi {role} has no model — pass --model <provider/id> or set \
-             pi.models.default.{role} in pm.yaml; pi's own provider fallback \
-             is never used (CAD-559)"
-        )));
+    // CAD-1176: a policy that resolves nothing must not brick a boot. The
+    // platform default is used and its provenance is recorded by the caller.
+    let model = match configured {
+        Some(model) => model,
+        None => platform_default_model(),
     };
-    require_allowed(policy, role, &model)?;
-    Ok(model)
+    match require_allowed(policy, role, &model) {
+        Ok(()) => Ok(model),
+        // CAD-1176: an empty applicable allow list bounds operator choices;
+        // it must not refuse the platform default a hosted boot needs.
+        // CAD-1176: the platform default is the platform's own model; the
+        // allow list bounds operator/agent choices, it must never brick a
+        // hosted boot that has no other model to resolve.
+        Err(_err) if model == platform_default_model() => Ok(model),
+        Err(err) => Err(err),
+    }
 }
 
 /// `model` must be on the allowlist `role` launches under — the role's
@@ -752,12 +771,19 @@ mod tests {
         assert!(err.contains("a/m3") && err.contains("a/m1"), "{err}");
         // No explicit and no default for the role… worker has one here —
         // use a policy without defaults for the refuse leg.
+        // CAD-1176: no default for the role resolves to the platform
+        // default instead of refusing — the allow list does not brick it.
         let (_d2, pm2) = pm_with("pi:\n  models:\n    allow: [\"a/m1\"]\n");
         let p2 = read(&pm2).unwrap();
-        let err = resolve_model(p2.as_ref(), "worker", None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("models.default.worker"), "{err}");
+        assert_eq!(
+            resolve_model(p2.as_ref(), "worker", None).unwrap(),
+            PLATFORM_DEFAULT_MODEL
+        );
+        // No [pi] at all resolves the same way.
+        assert_eq!(
+            resolve_model(None, "master", None).unwrap(),
+            PLATFORM_DEFAULT_MODEL
+        );
         // No [pi] at all: nothing is allowed — not even an explicit id.
         let err = resolve_model(None, "worker", Some("a/m1"))
             .unwrap_err()
