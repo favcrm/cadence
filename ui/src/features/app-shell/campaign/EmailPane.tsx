@@ -298,13 +298,22 @@ export default function EmailPane({
               </p>
             </>
           )}
-          {editing && edit !== null && mode === "visual" && edit.draft.html !== null && (
-            <p className="text-label text-ink-400 mt-2" data-state="html-body">
-              This email uses full-document HTML. It stays intact when you switch modes; use HTML mode to edit it.
-            </p>
-          )}
           {editing && edit !== null && mode === "html" && (
             <div className="grid gap-2 mt-2">
+              <p
+                className="card border-warn/40 bg-warn/10 px-3 py-2 text-label text-warn"
+                role="note"
+                data-html-note
+                data-html-save-boundary
+              >
+                <strong>Save keeps a sanitized body fragment, not a full document.</strong> The host
+                removes the doctype and document wrappers (&lt;html&gt;, &lt;head&gt; and &lt;body&gt;),
+                including head content such as the title and stylesheet &lt;style&gt; blocks. Only
+                selected supported inline style attributes may persist; unsupported or unsafe
+                content is stripped. The protected sender and unsubscribe footer are appended
+                separately by the host. Switching modes preserves your unsaved source, but Save
+                does not save a full document or stylesheet verbatim.
+              </p>
               <label className="text-label text-ink-300" htmlFor="cmp-html-source">
                 HTML source
               </label>
@@ -318,9 +327,6 @@ export default function EmailPane({
                 disabled={edit.saving || edit.reloading}
                 onChange={(e) => edit.patch({ html: e.target.value })}
               />
-              <p className="text-micro text-ink-500" data-html-note>
-                Sandboxed preview. The host sanitizes on save; required sender and unsubscribe footer are host-appended, protected and not part of this source. Switching modes does not rewrite the HTML.
-              </p>
               <iframe
                 title="Live HTML draft preview"
                 sandbox=""
@@ -624,6 +630,22 @@ export default function EmailPane({
             </Button>
           )}
         </div>
+        {editing && edit !== null && mode === "visual" && edit.draft.html !== null && (
+          <p
+            className="card border-warn/40 bg-warn/10 px-3 py-2 text-label text-warn"
+            role="note"
+            data-state="html-body"
+            data-html-save-boundary
+          >
+            <strong>Save keeps a sanitized body fragment, not this full document.</strong> The host
+            removes the doctype and document wrappers (&lt;html&gt;, &lt;head&gt; and &lt;body&gt;),
+            including head content such as the title and stylesheet &lt;style&gt; blocks. Only
+            selected supported inline style attributes may persist; unsupported or unsafe content
+            is stripped. The protected sender and unsubscribe footer are appended separately by
+            the host. Switching modes preserves your unsaved source, but Save does not save a full
+            document or stylesheet verbatim.
+          </p>
+        )}
         {renderError !== null && !renderPending && draft === null && (
           <p className="text-label text-fail" role="alert">
             {renderError}{" "}
