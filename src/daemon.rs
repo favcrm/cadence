@@ -33,6 +33,8 @@ mod app_screens_rpc;
 mod app_teams_rpc;
 mod approvals_rpc;
 mod area_rpc;
+#[cfg(test)]
+mod cad1180_durability_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1184_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
@@ -334,6 +336,14 @@ impl Drop for StopReservation<'_> {
 /// generation, pane pid, native session — one row per live PTY alias.
 type ShutdownFacts = HashMap<String, (String, u32, String)>;
 
+/// Startup-verified tracker durability for this daemon's trusted PM root.
+/// This is daemon-owned configuration, never derived from an RPC request.
+struct TrackerDurabilityConfig {
+    mode: crate::issue::durability::Mode,
+    hosted: Option<crate::issue::durability::Hosted>,
+    pm_root: PathBuf,
+}
+
 pub struct Shared {
     pub store: Store,
     /// Broadcast on any queue/event change.
@@ -370,6 +380,8 @@ pub struct Shared {
     open_attach: Mutex<HashMap<String, &'static str>>,
     /// Provider launch overrides for this daemon instance.
     provider_env: ProviderEnv,
+    /// Startup-verified tracker durability bound to this daemon's PM root.
+    tracker_durability: Option<TrackerDurabilityConfig>,
     /// Unix epoch seconds when this daemon process came up — the
     /// `started_at` half of `daemon_info`'s build/uptime report.
     started_at: f64,
@@ -587,6 +599,7 @@ impl Shared {
     /// `new` with the consumed hot-restart context: the adoption
     /// candidates the marker carried plus this run's instance id.
     pub fn new_hot(state_dir: &Path, opts: &ServeOptions, hot: HotStart) -> Result<Arc<Self>> {
+        let tracker_durability = resolve_tracker_durability(&opts.provider_env)?;
         // CAD-482: the seam check runs before the lease is taken or
         // the store opens — a fixture that arms on the production dir
         // or outside the temp root refuses here, before anything is
@@ -601,7 +614,7 @@ impl Shared {
         // store opens — `recover` writes at open. A daemon that cannot
         // take the lease refuses here having written nothing.
         let lease = crate::lease::acquire(state_dir, &hosted_config(opts)?)?;
-        Self::new_leased(state_dir, opts, hot, lease, seam)
+        Self::new_leased(state_dir, opts, hot, lease, seam, tracker_durability)
     }
 
     /// `new_hot` over an already-resolved lease and seam — `serve`
@@ -613,6 +626,7 @@ impl Shared {
         hot: HotStart,
         lease: Option<Arc<crate::lease::LeaseCtl>>,
         seam: Option<crate::test_seam::Seam>,
+        tracker_durability: Option<TrackerDurabilityConfig>,
     ) -> Result<Arc<Self>> {
         let HotStart { instance, marker } = hot;
         let daemon_id = instance.clone();
@@ -693,6 +707,7 @@ impl Shared {
             agent_uid: opts.agent_uid,
             open_attach: Mutex::new(HashMap::new()),
             provider_env: opts.provider_env.clone(),
+            tracker_durability,
             started_at: epoch_secs(),
             stall_sample_secs: Arc::clone(&opts.stall_sample_secs),
             stall_clock_offset: Arc::clone(&opts.stall_clock_offset),
@@ -3508,7 +3523,43 @@ impl Shared {
     /// already carries the tracker path (checkup's dispatch seam,
     /// `route_answer`'s test calls).
     fn pm_at(&self, pm_dir: &Path) -> Result<crate::issue::Pm> {
-        let mut pm = crate::issue::Pm::at(pm_dir)?;
+        let pm_root = if let Some(config) = &self.tracker_durability {
+            let requested_root = std::fs::canonicalize(pm_dir).map_err(|err| {
+                Error::rejected(format!(
+                    "capability_unavailable: requested tracker root is unavailable: {err}"
+                ))
+            })?;
+            if requested_root != config.pm_root {
+                return Err(Error::rejected(
+                    "capability_unavailable: requested tracker root differs from the verified daemon root",
+                ));
+            }
+
+            let active_root = self
+                .pm_dir()
+                .and_then(|root| std::fs::canonicalize(root).map_err(Error::from))
+                .map_err(|err| {
+                    Error::rejected(format!(
+                        "capability_unavailable: daemon tracker root is unavailable: {err}"
+                    ))
+                })?;
+            if active_root != config.pm_root {
+                return Err(Error::rejected(
+                    "capability_unavailable: daemon tracker root changed after verification",
+                ));
+            }
+            config.pm_root.as_path()
+        } else {
+            pm_dir
+        };
+
+        let mut pm = crate::issue::Pm::at(pm_root)?;
+        if let Some(config) = &self.tracker_durability {
+            pm.attach_durability_mode(config.mode);
+            if let Some(hosted) = &config.hosted {
+                pm.attach_durability(hosted.clone());
+            }
+        }
         if let Some(lease) = &self.lease {
             pm.attach_lease(lease.pm_lease());
         }
@@ -3744,6 +3795,30 @@ fn pm_dir_of(provider_env: &ProviderEnv) -> Result<PathBuf> {
         Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
         _ => crate::issue::default_dir(),
     }
+}
+
+/// Resolve hosted durability once at daemon startup, before startup writes,
+/// against the tracker root this daemon actually uses. Local daemons without
+/// a declared boot handoff do not need a PM root just to start.
+fn resolve_tracker_durability(
+    provider_env: &ProviderEnv,
+) -> Result<Option<TrackerDurabilityConfig>> {
+    if std::env::var_os("CADENCE_TRACKER_BOOT_FILE").is_none()
+        && std::env::var_os("CADENCE_TRACKER_BOOT_ID").is_none()
+    {
+        return Ok(None);
+    }
+
+    let root = pm_dir_of(provider_env)?;
+    let Some((mode, hosted)) = crate::issue::durability::configure_from_env(&root)? else {
+        return Ok(None);
+    };
+    let pm_root = std::fs::canonicalize(&root)?;
+    Ok(Some(TrackerDurabilityConfig {
+        mode,
+        hosted,
+        pm_root,
+    }))
 }
 
 /// Content hash for spec-drift detection — the same value the CLI
@@ -4917,13 +4992,10 @@ pub fn serve(state_dir: &Path) -> Result<()> {
 /// `serve` with per-instance options — in-process test daemons pass
 /// their mock commands here instead of through the shared environment.
 pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
-    // Hosted restore handoff is not itself live proof. Refuse writer startup
-    // before state mutation when native protocol/head/readiness are unavailable.
-    if std::env::var_os("CADENCE_TRACKER_BOOT_FILE").is_some()
-        || std::env::var_os("CADENCE_TRACKER_BOOT_ID").is_some()
-    {
-        crate::issue::durability::configure_from_env(&crate::issue::default_dir()?)?;
-    }
+    // Hosted restore handoff is not itself live proof. Resolve it against this
+    // daemon's actual tracker root and retain the verified capability before
+    // any state mutation or startup marker writes.
+    let tracker_durability = resolve_tracker_durability(&opts.provider_env)?;
     std::fs::create_dir_all(state_dir)?;
     if opts.agent_uid.is_none() {
         opts.agent_uid = crate::agent_uid::config::configured_uid(state_dir)?;
@@ -4985,7 +5057,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         .as_ref()
         .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease));
     let hot = hot_restart_begin(state_dir);
-    let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam)?;
+    let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam, tracker_durability)?;
     if let Some(heartbeat) = &lease_heartbeat {
         heartbeat.attach(&shared);
     }
