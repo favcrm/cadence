@@ -14,6 +14,9 @@ const socialContentWorkflows = new Map<string, readonly string[]>([
   // CAD-1123 (operator decision Q4): the interim simple-UX package keeps the
   // same five workflows and the `?screen=native` back door until H4.
   ["0.5.4", fiveWorkflows],
+  // CAD-1173: the independent package's 0.6.0 ships the same five names with
+  // one writer step each (no reviewer), so content runs need one worker.
+  ["0.6.0", fiveWorkflows],
 ]);
 
 export function supportsSocialContentWorkspace(installation: Pick<Installation, "name" | "version" | "files">): boolean {
