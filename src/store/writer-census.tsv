@@ -187,4 +187,5 @@ daemon/cad1184_revision_acceptance.rs	independent-daemon-acceptance-fixtures	exe
 daemon/cad1184_revision_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	execute	3
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	open	2
+daemon/campaign_clone_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 store/social_publish.rs	guarded-store-and-read-queries	prepare	2
