@@ -11,6 +11,7 @@ import type {
   ConnectionPayload,
   ConnectionProvidersPayload,
   ConnectionsPayload,
+  ConnectionVerificationPayload,
   Health,
   IssueCard,
   IssueDetail,
@@ -629,6 +630,27 @@ export const api = {
    */
   connectionCheck: (id: string) =>
     post<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}/status`, {}),
+  /**
+   * `POST /api/connections/<id>/test` — the approved SMTP no-send login
+   * verification (CAD-1065/CAD-1085). Operator-only. Sends exactly the
+   * two required expected keys, explicitly including null — no token,
+   * secret, host, provider, actor, timeout or recipient. The returned
+   * receipt is typed evidence only: a success proves an authenticated
+   * login and clean close, never a delivery, sender entitlement or
+   * execution authority, and a `stale` receipt is not
+   * replacement-current evidence.
+   */
+  connectionTest: (
+    id: string,
+    expected: {
+      expected_revision: number | null;
+      expected_registration_digest: string | null;
+    },
+  ) =>
+    post<ConnectionVerificationPayload>(
+      `/api/connections/${encodeURIComponent(id)}/test`,
+      expected,
+    ),
   /**
    * `GET /api/projects/<key>/workflows/<name>/preview?inputs=<json>` —
    * what `plan propose --workflow` renders for these inputs. The query

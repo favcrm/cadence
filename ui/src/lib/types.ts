@@ -1372,6 +1372,20 @@ export interface ConnectionProviderDescriptor {
   capabilities: ConnectionCapability[];
 }
 
+/**
+ * CAD-1065/CAD-1085: the provider's broker-computed, non-authorizing
+ * declaration of whether the approved no-send login verification is
+ * offered for it. Optional and untrusted until trusted — absent,
+ * unknown, `supported:false` or an inconsistent entry means the
+ * operation is unavailable; it is never inferred from the provider
+ * name, descriptor shape or a successful local configuration read.
+ */
+export interface ConnectionVerificationSupport {
+  operation: "smtp-login-no-send-v1" | null;
+  supported: boolean;
+  reason_code: string | null;
+}
+
 /** `GET /api/connection-providers` row — one registered provider. */
 export interface ConnectionProvider {
   provider: string;
@@ -1383,6 +1397,7 @@ export interface ConnectionProvider {
   /** Always false: listing providers never checks the network. */
   network_checked: boolean;
   registration_digest: string | null;
+  verification_support?: ConnectionVerificationSupport | null;
 }
 
 export interface ConnectionProvidersPayload {
@@ -1445,4 +1460,72 @@ export interface ConnectionsPayload {
 
 export interface ConnectionPayload {
   connection: Connection;
+}
+
+/**
+ * CAD-1065/CAD-1085: the approved SMTP no-send login check's closed
+ * failure code — the stage the check stopped at, never provider or
+ * credential text.
+ */
+export type ConnectionVerificationFailureCode =
+  | "unsupported_provider"
+  | "unsupported_deployment"
+  | "unsupported_custody"
+  | "stale_connection"
+  | "configuration_unavailable"
+  | "custody_unavailable"
+  | "busy"
+  | "dns_failed"
+  | "destination_refused"
+  | "connect_failed"
+  | "tls_failed"
+  | "auth_failed"
+  | "timeout"
+  | "quit_failed"
+  | "verification_failed";
+
+/** The step the verification was in when it stopped. */
+export type ConnectionVerificationFailureStep =
+  | "admission"
+  | "configuration"
+  | "dns"
+  | "connect"
+  | "tls"
+  | "auth"
+  | "quit";
+
+/**
+ * `POST /api/connections/<id>/test` receipt (CAD-1065/CAD-1085). All
+ * fields are required; the email/delivery/sender-entitlement/execution
+ * flags are always exactly `false` — a verification proves only an
+ * authenticated login, never a delivery, sender entitlement or
+ * execution authority. Timestamps are daemon UTC RFC3339 diagnostics,
+ * not a lease/TTL. A `stale` result describes the request's identity,
+ * not the current connection; `revision`/`registration_digest` carry
+ * the SERVER-current tuple so the UI can tell it is stale.
+ */
+export interface ConnectionVerificationReceipt {
+  schema: 1;
+  operation: "smtp-login-no-send-v1";
+  connection_id: string;
+  revision: number | null;
+  registration_digest: string | null;
+  started_at: string;
+  completed_at: string;
+  status: "success" | "failed" | "unsupported" | "stale";
+  network_attempted: boolean;
+  authentication_verified: boolean;
+  email_sent: false;
+  delivery_verified: false;
+  sender_entitlement_verified: false;
+  execution_authority: false;
+  failure: {
+    code: ConnectionVerificationFailureCode;
+    step: ConnectionVerificationFailureStep;
+  } | null;
+}
+
+/** The typed envelope `POST /api/connections/<id>/test` returns. */
+export interface ConnectionVerificationPayload {
+  verification: ConnectionVerificationReceipt;
 }

@@ -24,7 +24,9 @@ import {
   smtpUnreadable,
   smtpErrorMessage,
   verificationSupport,
+  verificationResult,
   type ServiceGroup,
+  type VerificationOutcome,
 } from "./connectionsView";
 import { PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
 import { connectionLabel } from "../../lib/connections";
@@ -382,22 +384,46 @@ export function ConnectionDetail({
   const [rotating, setRotating] = useState(false);
   const [revoking, setRevoking] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [testing, setTesting] = useState(false);
   const [note, setNote] = useState<{ ok: boolean; warn?: boolean; text: string } | null>(null);
+  const [verifyNote, setVerifyNote] = useState<VerificationOutcome | null>(null);
   const managed = canManage(row);
   const verify = verificationSupport(provider ?? null);
-  // Each check is bound to a monotonically increasing generation and the
-  // exact identity it was issued against (id + credential revision +
-  // registration digest). A rotation, provider re-registration or a
+  // The broker's test is admissible only for a writable operator on an
+  // enrolled SMTP sender whose provider advertises the reviewed
+  // smtp-login-no-send-v1 operation and whose live row is available — a
+  // built-in, a read-only viewer, an unadvertised provider or a
+  // manifest-mismatched/unreadable sender never sees an enabled Test.
+  const testable =
+    canWrite &&
+    managed &&
+    isSmtpSender(row) &&
+    verify.supported &&
+    isAvailable(row) &&
+    row.status.manifest_status === "matched";
+  // Each check/test is bound to a monotonically increasing generation and
+  // the exact live context it was issued against — the connection's id,
+  // credential revision and registration digest, plus the caller's
+  // authority and the provider's advertised support. A rotation,
+  // provider re-registration, a registry/support change, a sign-out or a
   // disconnect/selection change produces a new context: it bumps the
-  // generation and clears the note so a late response can never overwrite
-  // newer state, and a response that does not match the live context is
-  // treated as stale, not as evidence about the current account.
+  // generation and clears the note so a late response can never
+  // overwrite newer state, and a response that does not match the live
+  // context is treated as stale, not as evidence about the current
+  // account.
   const checkGen = useRef(0);
-  const context = `${row.id}:${row.revision ?? "x"}:${row.registration_digest ?? "x"}`;
+  const latestCtx = useRef("");
+  const context = `${row.id}:${row.revision ?? "x"}:${row.registration_digest ?? "x"}:${provider?.registration_digest ?? "x"}:${canWrite}:${verify.supported}:${isAvailable(row)}:${row.status.manifest_status}`;
+  useEffect(() => {
+    latestCtx.current = context;
+  }, [context]);
   useEffect(() => {
     checkGen.current += 1;
+    latestCtx.current = context;
     setNote(null);
+    setVerifyNote(null);
     setChecking(false);
+    setTesting(false);
   }, [context]);
   useEffect(() => {
     return () => {
@@ -466,6 +492,55 @@ export function ConnectionDetail({
       })
       .finally(() => {
         if (gen === checkGen.current) setChecking(false);
+      });
+  };
+
+  // The approved broker no-send login test (CAD-1065/CAD-1085): it sends
+  // only the connection's id and the captured revision+registration
+  // digest, and renders only the typed receipt's fixed safe text. A
+  // stale/malformed/late response never becomes a positive result.
+  const test = () => {
+    if (testing) return;
+    const gen = ++checkGen.current;
+    const ctx = context;
+    const want = {
+      id: row.id,
+      revision: row.revision ?? null,
+      registration_digest: row.registration_digest ?? null,
+    };
+    setTesting(true);
+    setVerifyNote(null);
+    api
+      .connectionTest(row.id, {
+        expected_revision: want.revision,
+        expected_registration_digest: want.registration_digest,
+      })
+      .then((out) => {
+        if (gen !== checkGen.current || latestCtx.current !== ctx) return;
+        const res = verificationResult(out, want);
+        if (res === null) {
+          setVerifyNote({
+            ok: false,
+            stale: false,
+            checkedAt: null,
+            text: "The check did not return a readable result — treat this as a configuration problem, not a connection that works.",
+          });
+        } else {
+          setVerifyNote(res);
+          if (res.stale) onChanged(); // a stale result re-reads the live identity
+        }
+      })
+      .catch(() => {
+        if (gen !== checkGen.current || latestCtx.current !== ctx) return;
+        setVerifyNote({
+          ok: false,
+          stale: false,
+          checkedAt: null,
+          text: "The verification could not be run — try again, or check the connection's configuration first.",
+        });
+      })
+      .finally(() => {
+        if (gen === checkGen.current) setTesting(false);
       });
   };
 
@@ -557,10 +632,10 @@ export function ConnectionDetail({
             </dd>
           </div>
           <p className="text-micro text-ink-500 pt-1 break-words">
-            The network was {row.status.network_checked ? "checked" : "never checked"} for
-            this account. A local configuration read verifies only the named identity — it
-            grants no execution permission and proves no message delivery or sender
-            entitlement.
+            Listing and local configuration reads never contact this account&apos;s
+            network; a remote login test (when offered) is a separate explicit check.
+            Either way the result is evidence only — it grants no execution permission
+            and proves no message delivery or sender entitlement.
           </p>
         </dl>
       </details>
@@ -570,11 +645,31 @@ export function ConnectionDetail({
           {note.text}
         </p>
       )}
+      {verifyNote && (
+        <p
+          className={`text-label mt-2 break-words ${verifyNote.ok ? "text-ink-300" : "text-fail"}`}
+          role={verifyNote.ok ? "status" : "alert"}
+          data-verify-status={verifyNote.ok ? "success" : verifyNote.stale ? "stale" : "failed"}
+        >
+          {verifyNote.text}
+        </p>
+      )}
       {canWrite && (
         <div className="flex flex-wrap items-center gap-2 mt-3">
           <Button variant="secondary" size="sm" onClick={check} loading={checking}>
             {checking ? "Checking…" : "Check configuration"}
           </Button>
+          {testable && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={test}
+              loading={testing}
+              disabled={testing || checking}
+            >
+              {testing ? "Testing…" : "Test connection"}
+            </Button>
+          )}
           {managed && (
             <>
               <Button

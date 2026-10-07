@@ -16,6 +16,7 @@ import {
   serviceLabel,
   smtpPortTlsError,
   smtpSummary,
+  verificationResult,
   verificationSupport,
 } from "../src/features/settings/connectionsView";
 import { connectionLabel, isLocalOutbox } from "../src/lib/connections";
@@ -266,13 +267,83 @@ equal(typeof smtpPortTlsError("LOCALHOST", "40211", "implicit"), "string", "loca
   assert(enrollmentSupport(localP).reason.length > 0, "no-enrollment reason is stated");
   assert(enrollmentSupport(null).reason.length > 0, "unregistered names a reason");
 
-  // Remote verification is never simulated: every provider reports
-  // unsupported with an honest reason until the reviewed broker
-  // operation exists.
-  equal(verificationSupport(smtpP).supported, false, "smtp has no remote verify op yet");
-  equal(verificationSupport(tokenP).supported, false, "token provider unsupported");
+  // Remote verification (CAD-1065/CAD-1085) is advertised ONLY by the
+  // trusted `verification_support` metadata — never inferred from the
+  // provider name or descriptor. Absent/unknown/refused stays
+  // unavailable with a fixed safe reason, never the raw reason_code.
+  equal(verificationSupport(smtpP).supported, false, "no verification_support -> unavailable");
   equal(verificationSupport(null).supported, false, "unknown provider unsupported");
-  assert(verificationSupport(smtpP).reason.length > 0, "unsupported names why");
+  const vs = { operation: "smtp-login-no-send-v1" as const, supported: true, reason_code: null };
+  equal(
+    verificationSupport(provider({ provider: "smtp", verification_support: vs })).supported,
+    true,
+    "advertised smtp-login-no-send-v1 is supported",
+  );
+  equal(
+    verificationSupport(provider({ provider: "smtp", verification_support: { ...vs, supported: false, reason_code: "unsupported_provider" } })).supported,
+    false,
+    "supported:false stays unavailable",
+  );
+  assert(
+    verificationSupport(provider({ provider: "smtp", verification_support: { operation: "other-op" as never, supported: true, reason_code: null } })).supported === false,
+    "an unlisted operation is not trusted",
+  );
+  assert(
+    !verificationSupport(provider({ provider: "smtp", verification_support: { ...vs, supported: false, reason_code: "some_raw_reason" } })).reason.includes("some_raw_reason"),
+    "a raw reason_code is never echoed",
+  );
+
+  // verificationResult: only an exact reviewed receipt for the captured
+  // tuple can be a shown success. Malformed/partial/extra/
+  // non-false-flag responses return null; a stale receipt is never a
+  // success and never presents server-current values as proof.
+  const want = { id: "c-smtp", revision: 2, registration_digest: "sha256:" + "a".repeat(64) };
+  const okReceipt = {
+    schema: 1, operation: "smtp-login-no-send-v1", connection_id: "c-smtp",
+    revision: 2, registration_digest: want.registration_digest,
+    started_at: "2026-10-07T01:00:00Z", completed_at: "2026-10-07T01:00:02Z",
+    status: "success", network_attempted: true, authentication_verified: true,
+    email_sent: false, delivery_verified: false, sender_entitlement_verified: false,
+    execution_authority: false, failure: null,
+  };
+  const ok = verificationResult({ verification: okReceipt }, want);
+  assert(ok !== null && ok.ok === true && ok.stale === false, "exact success receipt parses");
+  assert((ok!.text).includes("Login verified") && (ok!.text).includes("no email"), "success says login verified, no email sent");
+  assert(ok!.checkedAt === "2026-10-07T01:00:02Z", "checkedAt carried");
+
+  equal(verificationResult({}, want), null, "no verification key -> null");
+  equal(verificationResult({ verification: null }, want), null, "null verification -> null");
+  equal(verificationResult({ verification: { ...okReceipt, schema: 2 } }, want), null, "wrong schema -> null");
+  equal(verificationResult({ verification: { ...okReceipt, operation: "other" } }, want), null, "wrong operation -> null");
+  equal(verificationResult({ verification: { ...okReceipt, connection_id: "c-other" } }, want), null, "wrong id -> null");
+  equal(verificationResult({ verification: { ...okReceipt, revision: 3 } }, want), null, "mismatched success revision -> null");
+  equal(verificationResult({ verification: { ...okReceipt, registration_digest: "sha256:" + "b".repeat(64) } }, want), null, "mismatched success digest -> null");
+  equal(verificationResult({ verification: { ...okReceipt, email_sent: true } }, want), null, "email_sent true -> null");
+  equal(verificationResult({ verification: { ...okReceipt, delivery_verified: true } }, want), null, "delivery flag true -> null");
+  equal(verificationResult({ verification: { ...okReceipt, extra: 1 } }, want), null, "extra field -> null");
+  equal(verificationResult({ verification: { ...okReceipt, status: "mystery" } }, want), null, "unknown status -> null");
+  equal(verificationResult({ verification: { ...okReceipt, failure: { code: "bogus", step: "auth" } } }, want), null, "unknown failure code -> null");
+  equal(verificationResult({ verification: { ...okReceipt, completed_at: "not-a-time" } }, want), null, "bad timestamp -> null");
+
+  // A closed failure maps to fixed actionable text; a stale receipt is
+  // flagged stale and never a success even when its server tuple differs.
+  const failed = verificationResult(
+    { verification: { ...okReceipt, status: "failed", authentication_verified: false, failure: { code: "auth_failed", step: "auth" } } },
+    want,
+  );
+  assert(failed !== null && failed.ok === false && failed.stale === false, "closed failure parses");
+  assert((failed!.text).includes("login was refused") || (failed!.text).includes("credentials"), "auth_failed gives actionable text");
+  const staleRes = verificationResult(
+    { verification: { ...okReceipt, status: "stale", authentication_verified: false, revision: 3, registration_digest: "sha256:" + "c".repeat(64) } },
+    want,
+  );
+  assert(staleRes !== null && staleRes.stale === true && staleRes.ok === false, "stale receipt is stale, not success");
+  assert((staleRes!.text).includes("refresh"), "stale result asks for a refresh");
+  const unsupported = verificationResult(
+    { verification: { ...okReceipt, status: "unsupported", authentication_verified: false, revision: 2 } },
+    want,
+  );
+  assert(unsupported !== null && unsupported.ok === false && unsupported.stale === false, "unsupported parses");
 }
 
 // The Settings Connections route survives refresh and paste.
