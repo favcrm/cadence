@@ -772,4 +772,6 @@ pub(crate) fn release_host_frame_until(frame: &[u8], until: Instant) -> Result<(
 }
 
 #[cfg(test)]
+mod grant_keyring_check;
+#[cfg(test)]
 mod tests;

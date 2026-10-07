@@ -11,7 +11,7 @@ struct Transport {
     channel: channel::Duplex,
     metadata: wire::ChildContext,
     receipt_keys: Vec<receipt::TrustedKey>,
-    grant_keys: Vec<[u8; 32]>,
+    grant_keys: Vec<Vec<u8>>,
     deadline: Deadline,
 }
 impl Transport {

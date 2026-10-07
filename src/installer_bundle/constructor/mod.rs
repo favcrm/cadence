@@ -407,11 +407,16 @@ impl QualifiedBootstrap {
             })
             .collect()
     }
-    fn grant_public_keys(&self) -> Result<Vec<[u8; 32]>> {
+    fn grant_public_keys(&self) -> Result<Vec<Vec<u8>>> {
         self.manifest
             .grant_trust
             .iter()
-            .map(|k| decode(&k.public_key, 32)?.try_into().map_err(|_| refused()))
+            .map(|k| {
+                let public: [u8; 32] = decode(&k.public_key, 32)?
+                    .try_into()
+                    .map_err(|_| refused())?;
+                Ok(format!("{}:{}", k.kid, URL_SAFE_NO_PAD.encode(public)).into_bytes())
+            })
             .collect()
     }
 }
@@ -427,5 +432,7 @@ fn pin(value: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+#[cfg(test)]
+pub(crate) mod grant_keyring_probe;
 #[cfg(test)]
 mod guard;
