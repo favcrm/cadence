@@ -84,7 +84,41 @@ pub const RECORDS_DIR: &str = "app-records";
 pub const FILE_SCHEMA: i64 = 1;
 
 pub const RECORD_BODY_BYTES: usize = 16 * 1024;
-pub const RECORD_LIMIT: i64 = 100;
+/// The per-context customer ceiling (CAD-1172). The pilot's 100 refused
+/// real customer lists — a 340-row import dropped 240 rows at commit.
+/// 100_000 fits any SME list while still bounding the workspace database
+/// and its snapshots; the CSV preview marks rows beyond the remaining
+/// capacity and the commit refusal names the cause.
+pub const RECORD_LIMIT: i64 = 100_000;
+/// The list page bound — `limit`'s default and maximum. Independent of
+/// the record ceiling so one page never returns a whole large context.
+pub const RECORD_PAGE_MAX: i64 = 100;
+
+/// Split planned creates against the context's remaining capacity
+/// (CAD-1172): `live` rows already hold room, the first `accepted`
+/// creates fit and every later one is refused. Pure so the rule is
+/// testable without building a full context.
+pub(crate) fn capacity_split(live: i64, creates: i64) -> (i64, i64) {
+    let room = (RECORD_LIMIT - live).max(0);
+    let accepted = creates.min(room);
+    (accepted, creates - accepted)
+}
+
+/// Map a per-row refusal to its operator-visible reason (CAD-1172: a
+/// context's ceiling names itself, never the generic bucket).
+pub(crate) fn refusal_reason(text: &str) -> &'static str {
+    if text.contains("stale") {
+        "stale revision"
+    } else if text.contains("another record") {
+        "duplicate email"
+    } else if text.contains("already holds") {
+        "record conflict"
+    } else if text.contains("record limit") {
+        "context record limit reached"
+    } else {
+        "record refused"
+    }
+}
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS record_schema(version INTEGER NOT NULL);
@@ -1089,14 +1123,15 @@ impl RecordStore {
     }
 
     pub fn app_record_list(&self, context: &str) -> Result<Value> {
-        self.app_record_list_paged(context, None, RECORD_LIMIT, None)
+        self.app_record_list_paged(context, None, RECORD_PAGE_MAX, None)
     }
 
     /// Bounded search and pagination over one context's customers.
     /// `query` is a bounded substring matched against the record ID
-    /// and body; `limit` is 1..=100; `cursor` pages after a record ID.
-    /// The response carries `records`, `truncated` and `next_cursor`
-    /// (null when complete) alongside each record's show receipt.
+    /// and body; `limit` is 1..=RECORD_PAGE_MAX; `cursor` pages after
+    /// a record ID. The response carries `records`, `truncated` and
+    /// `next_cursor` (null when complete) alongside each record's show
+    /// receipt.
     pub fn app_record_list_paged(
         &self,
         context: &str,
@@ -1105,7 +1140,7 @@ impl RecordStore {
         cursor: Option<&str>,
     ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
-        if !(1..=RECORD_LIMIT).contains(&limit) {
+        if !(1..=RECORD_PAGE_MAX).contains(&limit) {
             return Err(Error::rejected("record page limit is out of bounds"));
         }
         let like = match query {
@@ -2108,6 +2143,24 @@ impl RecordStore {
                 duplicate_of,
             });
         }
+        // CAD-1172: the preview tells the truth about the context's
+        // remaining capacity. Creates beyond it are marked here, so an
+        // operator never commits bytes that could not apply, and the
+        // reason names the ceiling instead of a generic refusal.
+        let creates = plan.iter().filter(|row| row.decision == "create").count() as i64;
+        let (mut room, _) = capacity_split(by_id.len() as i64, creates);
+        for row in plan.iter_mut() {
+            if row.decision != "create" {
+                continue;
+            }
+            if room > 0 {
+                room -= 1;
+            } else {
+                row.decision = "error";
+                row.errors.push("context record limit");
+                row.reason = Some("context record limit");
+            }
+        }
         let token = material_digest(
             &json!({"domain":"cadence-app-record-csv-preview-v1","install_id":self.install_id,"context_id":context,"csv":csv_text}),
         );
@@ -2388,7 +2441,7 @@ impl RecordStore {
                         row.expected_revision
                             .ok_or_else(|| Error::internal("customer CSV plan diverged"))?,
                     ),
-                    _ if row.decision == "error" => Apply::Skip("row error"),
+                    _ if row.decision == "error" => Apply::Skip(row.reason.unwrap_or("row error")),
                     _ => Apply::Skip(row.reason.unwrap_or("skipped")),
                 },
                 Some(item) => {
@@ -2503,18 +2556,7 @@ impl RecordStore {
             tx.commit().map_err(|e| Error::internal(e.to_string()))?;
         }
         // Per-row transactions: a failure records its row, never the file.
-        let refused = |error: &Error| -> &'static str {
-            let text = error.to_string();
-            if text.contains("stale") {
-                "stale revision"
-            } else if text.contains("another record") {
-                "duplicate email"
-            } else if text.contains("already holds") {
-                "record conflict"
-            } else {
-                "record refused"
-            }
-        };
+        let refused = |error: &Error| refusal_reason(&error.to_string());
         let mut applied = 0;
         let mut skipped = 0;
         let mut failed = 0;
