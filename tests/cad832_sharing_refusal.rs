@@ -10,7 +10,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use tempfile::{Builder, TempDir};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_cadence");
@@ -94,6 +94,32 @@ impl Fixture {
             .env("CADENCE_PROFILE", "sandbox:cad832-acceptance")
             .env("CADENCE_SANDBOX_ALLOW_GLOBAL", "1")
             .env("CADENCE_PM_DIR", self._root.path().join("pm"))
+            .env("CADENCE_SANDBOX_ROOT", self._root.path().join("sandboxes"))
+            .env("TS_LOG", &self.log)
+            .env("TS_MAP", &self.map)
+            .env("PATH", prefixed_path(&self.fake_bin))
+            .env_remove("CADENCE_ALIAS")
+            .env_remove("CADENCE_ROLLOUT_AS")
+            .env_remove("CADENCE_STATE_DIR")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE");
+        cadence_agent::reaper::output(&mut cmd).expect("invoke real cadence CLI")
+    }
+
+    fn cli_without_home_or_pm(&self, args: &[&str]) -> Output {
+        let mut cmd = Command::new(BINARY);
+        cmd.args(["--state-dir"])
+            .arg(&self.state)
+            .args(args)
+            .current_dir(self._root.path())
+            .env_remove("HOME")
+            .env("XDG_STATE_HOME", self._root.path().join("xdg-state"))
+            .env("XDG_CONFIG_HOME", self._root.path().join("xdg-config"))
+            .env("XDG_DATA_HOME", self._root.path().join("xdg-data"))
+            .env("XDG_CACHE_HOME", self._root.path().join("xdg-cache"))
+            .env("CADENCE_PROFILE", "sandbox:cad832-acceptance")
+            .env("CADENCE_SANDBOX_ALLOW_GLOBAL", "1")
+            .env_remove("CADENCE_PM_DIR")
             .env("CADENCE_SANDBOX_ROOT", self._root.path().join("sandboxes"))
             .env("TS_LOG", &self.log)
             .env("TS_MAP", &self.map)
@@ -284,6 +310,135 @@ fn persisted_production_target_refuses_before_mapping_and_honest_target_reaches_
          ui tailscale start: {}",
         output_text(&start_with_flag_honest.output),
         output_text(&tailscale_start_honest.output)
+    );
+
+    // Reset must take the same per-sandbox flock as `up`. Hold that exact
+    // private lock while starting the real reset CLI, then release it and
+    // verify cleanup completes. On the pre-fix path reset exits/deletes the
+    // root while the lock is still held (the baseline RED).
+    let serialized = Fixture::new("reset-up-serialization");
+    let sandbox_base = serialized._root.path().join("sandboxes");
+    let sandbox_name = "serialized";
+    let sandbox_root = sandbox_base.join(sandbox_name);
+    fs::create_dir_all(sandbox_root.join("state")).unwrap();
+    fs::write(
+        sandbox_root.join(".cadence-sandbox"),
+        r#"{"name":"serialized","allow_global":true}"#,
+    )
+    .unwrap();
+    let marker_before = fs::read(sandbox_root.join(".cadence-sandbox")).unwrap();
+    let lock_path = sandbox_base.join(format!(".up-{sandbox_name}.lock"));
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    use std::os::fd::AsRawFd;
+    assert_eq!(
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) },
+        0,
+        "hold the actual sandbox up lock"
+    );
+    let mut reset_cmd = Command::new(BINARY);
+    reset_cmd
+        .args(["--state-dir"])
+        .arg(&serialized.state)
+        .args(["sandbox", "reset", sandbox_name])
+        .current_dir(serialized._root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("HOME", &serialized.home)
+        .env("XDG_STATE_HOME", serialized._root.path().join("xdg-state"))
+        .env(
+            "XDG_CONFIG_HOME",
+            serialized._root.path().join("xdg-config"),
+        )
+        .env("XDG_DATA_HOME", serialized._root.path().join("xdg-data"))
+        .env("XDG_CACHE_HOME", serialized._root.path().join("xdg-cache"))
+        .env("CADENCE_PROFILE", "sandbox:cad832-acceptance")
+        .env("CADENCE_SANDBOX_ALLOW_GLOBAL", "1")
+        .env("CADENCE_PM_DIR", serialized._root.path().join("pm"))
+        .env("CADENCE_SANDBOX_ROOT", &sandbox_base)
+        .env("TS_LOG", &serialized.log)
+        .env("TS_MAP", &serialized.map)
+        .env("PATH", prefixed_path(&serialized.fake_bin))
+        .env_remove("CADENCE_ALIAS")
+        .env_remove("CADENCE_ROLLOUT_AS")
+        .env_remove("CADENCE_STATE_DIR")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE");
+    let mut reset_child = cadence_agent::reaper::spawn(&mut reset_cmd)
+        .expect("start real reset while the sandbox up lock is held");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut reset_exited_while_held = false;
+    while std::time::Instant::now() < deadline {
+        if reset_child.try_wait().unwrap().is_some() {
+            reset_exited_while_held = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let root_preserved_while_held = sandbox_root.is_dir()
+        && fs::read(sandbox_root.join(".cadence-sandbox")).unwrap_or_default() == marker_before;
+    assert_eq!(
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) },
+        0,
+        "release the sandbox up lock for the positive control"
+    );
+    let release_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut reset_timed_out_after_release = false;
+    while std::time::Instant::now() < release_deadline {
+        if reset_child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if reset_child.try_wait().unwrap().is_none() {
+        reset_timed_out_after_release = true;
+        reset_child
+            .kill()
+            .expect("stop only the reset child started here");
+        let _ = reset_child.wait();
+    }
+    let reset_output = reset_child
+        .wait_with_output()
+        .expect("collect reset child output after it exits");
+    let reset_released_successfully =
+        !reset_timed_out_after_release && reset_output.status.success() && !sandbox_root.exists();
+
+    // Foreground `ui run --tailscale` cannot establish host-global sharing
+    // in a sandbox: it has no durable ownership record. Removing HOME and
+    // CADENCE_PM_DIR makes the currently reachable foreground preflight fail
+    // promptly after the attempted command, without starting a blocking board.
+    // Refusal must happen before invoking tailscale or changing ui.json.
+    let foreground = Fixture::new("foreground-sandbox");
+    let foreground_original = foreground.write_unshared_opts();
+    let foreground_output =
+        foreground.cli_without_home_or_pm(&["ui", "run", "--tailscale", "19450"]);
+    let foreground_calls = foreground.tailscale_calls();
+    let foreground_persisted = fs::read(foreground.state.join("ui.json")).unwrap();
+    let foreground_refused_cleanly = !foreground_output.status.success()
+        && foreground_persisted == foreground_original
+        && foreground_calls.is_empty();
+    assert!(
+        !reset_exited_while_held
+            && root_preserved_while_held
+            && reset_released_successfully
+            && foreground_refused_cleanly,
+        "acceptance failures: reset must wait for the shared sandbox lock and clean up after \
+         release (exited_while_held={reset_exited_while_held}, \
+         preserved_while_held={root_preserved_while_held}, \
+         released_cleanup_success={reset_released_successfully}, reset_output={}); \
+         sandbox foreground run must refuse explicit host-global sharing before side effects \
+         (status={:?}, output={}, unchanged={}, tailscale calls={:?})",
+        output_text(&reset_output),
+        foreground_output.status,
+        output_text(&foreground_output),
+        foreground_persisted == foreground_original,
+        foreground_calls,
     );
 
     // Honest control uses the ordinary `ui start` CLI command and sandbox

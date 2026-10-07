@@ -959,6 +959,9 @@ fn down(sb: &Sandbox) -> Result<Value> {
 /// checked again after the stop: nothing may swap it in between.
 fn reset(sb: &Sandbox) -> Result<Value> {
     refuse_production(sb)?;
+    // Serialize the entire inspection/stop/delete sequence with `up`:
+    // startup must not continue in a root reset has already removed.
+    let _up_lock = up_lock(sb)?;
     if std::fs::symlink_metadata(&sb.root).is_err() {
         return Err(Error::rejected(format!(
             "no sandbox '{}' at {} — `cadence sandbox ls` lists them",

@@ -1310,6 +1310,13 @@ pub(crate) fn http_get(
 /// `ui run` — foreground. Flags merge over the persisted options but
 /// never rewrite them: `ui start` owns persistence.
 pub(crate) fn run(state_dir: &Path, flags: &UiFlags) -> Result<i32> {
+    if flags.tailscale.is_some() {
+        // Foreground sandbox runs have no durable sharing custody. Only
+        // the recorded start paths may publish a host-wide mapping.
+        crate::sandbox::refuse_global(
+            "foreground `ui run --tailscale`; use `ui start --tailscale` for recorded sandbox sharing",
+        )?;
+    }
     let persisted = load_opts_strict(state_dir)?;
     let (eff, mut so) = resolve_opts(flags, &persisted)?;
     // CAD-841: `--device-login-*` is a thin client — resolve now so a
