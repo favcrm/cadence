@@ -59,6 +59,7 @@ mod setup;
 mod social_publish;
 mod stages;
 mod stream;
+mod tailscale_serve;
 mod threads;
 mod updates;
 mod wiki;
@@ -1332,14 +1333,14 @@ pub(crate) fn run(state_dir: &Path, flags: &UiFlags) -> Result<i32> {
     // the shared resolver.
     let created = if flags.tailscale.is_some() {
         let ts = eff.tailscale.as_ref().expect("resolved above");
-        ensure_mapping(ts.https_port, &ts.target)?
+        ensure_mapping(&ts.dns_name, ts.https_port, &ts.target)?
     } else {
         false
     };
     if let Err(e) = serve(state_dir, &crate::issue::default_dir()?, &so) {
         if created {
             if let Some(ts) = &eff.tailscale {
-                let _ = remove_mapping(ts.https_port, &ts.target);
+                let _ = remove_mapping(&ts.dns_name, ts.https_port, &ts.target);
             }
         }
         return Err(e);
@@ -1450,7 +1451,7 @@ pub(crate) fn start_inner(
     // Re-ensure a persisted mapping so `ui stop && ui start` keeps the
     // board shared — best effort when tailscaled itself is unreachable.
     if let Some(ts) = &eff.tailscale {
-        match ensure_mapping(ts.https_port, &ts.target) {
+        match ensure_mapping(&ts.dns_name, ts.https_port, &ts.target) {
             Ok(_) => {}
             Err(e) if is_ts_offline(&e) => {
                 eprintln!("warning: {e} — serving loopback only this run");
@@ -1646,7 +1647,7 @@ pub(crate) fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
     if tailscale_off {
         let mut opts = load_opts_strict(state_dir)?;
         if let Some(ts) = opts.tailscale.take() {
-            ts_result = match remove_mapping(ts.https_port, &ts.target) {
+            ts_result = match remove_mapping(&ts.dns_name, ts.https_port, &ts.target) {
                 Ok(true) => json!({"removed": ts.https_port}),
                 Ok(false) => json!({"left_alone": ts.https_port, "why": "mapping already absent"}),
                 Err(e) => {
@@ -1721,10 +1722,14 @@ pub(crate) fn status(state_dir: &Path) -> Result<i32> {
 
 // ---------- tailscale (serve only — never funnel) ----------
 
-/// One bounded `tailscale` invocation — the only way cadence talks to
-/// it, and `funnel` is never among the args.
+/// One bounded, read-only `tailscale` CLI invocation. Serve mutations use
+/// the conditional LocalAPI transport in `tailscale_serve`; `funnel` is never among the args.
 pub(crate) fn ts(args: &[&str]) -> Result<std::process::Output> {
+    tailscale_serve::validate_socket_override()?;
     let mut cmd = Command::new("tailscale");
+    if let Some(socket) = std::env::var_os("CADENCE_TAILSCALE_SOCKET") {
+        cmd.arg("--socket").arg(socket);
+    }
     cmd.args(args);
     proc::run_bounded(&mut cmd, Duration::from_secs(15)).map_err(|e| match e {
         BoundedError::Spawn(_) => Error::rejected("tailscale is not installed or not on PATH"),
@@ -1735,7 +1740,10 @@ pub(crate) fn ts(args: &[&str]) -> Result<std::process::Output> {
 /// The error a dead/logged-out tailscaled produces — `ui start` warns
 /// and serves loopback rather than refuse outright.
 fn is_ts_offline(e: &Error) -> bool {
-    matches!(e, Error::Rejected(m) if m.contains("tailscale"))
+    // Only an actual LocalAPI transport outage retains the historical
+    // loopback-only start fallback. CAS conflicts, missing ETags, malformed
+    // responses, unsupported sockets and ownership refusals are not offline.
+    matches!(e, Error::Rejected(m) if m.contains("tailscale LocalAPI offline:"))
 }
 
 struct TsSelf {
@@ -1818,53 +1826,21 @@ fn serve_map() -> Result<HashMap<u16, String>> {
 /// Ensure `https:<port>` proxies to `target`: identical mapping is
 /// left alone (returns false), a different one on that port is a hard
 /// refusal — cadence never overwrites somebody else's serve config.
-fn mapping_matches(port: u16, target: &str) -> Result<bool> {
-    match serve_map()?.get(&port) {
-        Some(existing) if existing == target => Ok(true),
-        Some(other) => Err(Error::rejected(format!(
-            "tailscale serve :{port} already targets {other} — refusing to \
-             overwrite it; pick another port or free that mapping first"
-        ))),
-        None => Ok(false),
-    }
+fn mapping_matches(dns: &str, port: u16, target: &str) -> Result<bool> {
+    tailscale_serve::matches(dns, port, target)
 }
 
-fn ensure_mapping(port: u16, target: &str) -> Result<bool> {
-    // The tailnet is host-wide: a sandbox board needs the explicit opt-in.
+fn ensure_mapping(dns: &str, port: u16, target: &str) -> Result<bool> {
+    // Preserve the exact caller hard gate before any LocalAPI connection.
     crate::sandbox::refuse_global_unless_allowed("`tailscale serve`")?;
-    if mapping_matches(port, target)? {
-        return Ok(false);
-    }
-    let out = ts(&["serve", "--bg", &format!("--https={port}"), target])?;
-    if !out.status.success() {
-        return Err(Error::rejected(format!(
-            "tailscale serve --https={port} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(true)
+    tailscale_serve::ensure(dns, port, target)
 }
 
 /// Remove the mapping only while it still targets what cadence
 /// recorded — a foreign or absent mapping returns false.
-fn remove_mapping(port: u16, expected: &str) -> Result<bool> {
+fn remove_mapping(dns: &str, port: u16, expected: &str) -> Result<bool> {
     crate::sandbox::refuse_global_unless_allowed("`tailscale serve off`")?;
-    match serve_map()?.get(&port) {
-        Some(existing) if existing == expected => {
-            let out = ts(&["serve", &format!("--https={port}"), "off"])?;
-            if !out.status.success() {
-                return Err(Error::rejected(format!(
-                    "tailscale serve --https={port} off failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )));
-            }
-            Ok(true)
-        }
-        Some(other) => Err(Error::rejected(format!(
-            "tailscale serve :{port} now targets {other}, not the recorded {expected} — refusing to remove a foreign mapping; the tailnet record is kept"
-        ))),
-        None => Ok(false),
-    }
+    tailscale_serve::remove(dns, port, expected)
 }
 
 // ---------- `ui tailscale …` ----------
@@ -1900,7 +1876,7 @@ fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: boo
     crate::sandbox::refuse_production_port(ui_port)?;
     let target = format!("http://127.0.0.1:{ui_port}");
     opts.tailscale = Some(TailscaleOpts {
-        dns_name: me.dns_name,
+        dns_name: me.dns_name.clone(),
         https_port,
         target: target.clone(),
     });
@@ -1911,7 +1887,7 @@ fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: boo
     // publishing a map, or stopping a running board.
     let _ = serve_opts(&opts)?;
     resolve_device_login(&UiFlags::default())?;
-    let mapping_created = !mapping_matches(https_port, &target)?;
+    let mapping_created = !mapping_matches(&me.dns_name, https_port, &target)?;
     save_opts(state_dir, &opts)?;
     let was_running = read_pid(state_dir).is_some();
     if was_running {
@@ -1951,7 +1927,7 @@ fn ts_stop(state_dir: &Path) -> Result<i32> {
         );
         return Ok(0);
     };
-    let removed = remove_mapping(ts.https_port, &ts.target).map_err(|e| {
+    let removed = remove_mapping(&ts.dns_name, ts.https_port, &ts.target).map_err(|e| {
         Error::rejected(format!(
             "{e} — the tailnet record is kept; fix the failure and retry"
         ))
