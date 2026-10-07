@@ -101,7 +101,10 @@ struct Create {
     workflow: String,
     inputs: BTreeMap<String, String>,
     request_id: String,
-    owner_pm: String,
+    /// CAD-1171: required for an agent run; omitted for a host-execution
+    /// run, which the operator's own click executes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_pm: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     project_link: Option<String>,
     #[serde(

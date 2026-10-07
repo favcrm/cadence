@@ -11,7 +11,7 @@ export interface SourceImportValues {
   writer: string;
 }
 
-export function SourceImport({ installId, contextId, bindingDigest, workers, managers, busy, error, onDenied, onClose, onCreate }: {
+export function SourceImport({ installId, contextId, bindingDigest, workers, managers, busy, error, host, onDenied, onClose, onCreate }: {
   installId: string;
   contextId?: string;
   bindingDigest: string;
@@ -19,6 +19,8 @@ export function SourceImport({ installId, contextId, bindingDigest, workers, man
   managers: SelectOption[];
   busy: boolean;
   error: string | null;
+  /** CAD-1171: a host-executed workflow runs for the operator's own click — no PM/reader team. */
+  host?: boolean;
   onDenied: () => void;
   onClose: () => void;
   onCreate: (values: SourceImportValues) => void;
@@ -51,17 +53,21 @@ export function SourceImport({ installId, contextId, bindingDigest, workers, man
     const handle = profileHandle.trim().replace(/^@/, "");
     const invalid = !/^[A-Za-z0-9][A-Za-z0-9_.]{0,29}$/.test(handle)
       ? "Enter an Instagram handle with letters, numbers, dots or underscores."
-      : !managers.some(manager => manager.value === ownerPm)
-        ? "Choose the responsible PM."
-        : !eligibleWorkers.some(worker => worker.value === writer)
-          ? "Choose a registered reader from that PM’s team."
-          : null;
+      : host
+        ? null
+        : !managers.some(manager => manager.value === ownerPm)
+          ? "Choose the responsible PM."
+          : !eligibleWorkers.some(worker => worker.value === writer)
+            ? "Choose a registered reader from that PM’s team."
+            : null;
     setValidation(invalid);
     if (!invalid && !busy && quote) onCreate({ profileHandle: handle, ownerPm, writer });
   };
   return <WorkspaceDialog title="Find Instagram source" onClose={onClose}>
     <form className="wa-stack" onSubmit={submit}>
-      <p className="wa-muted">Read recent public posts through this app’s Instagram source connection. Cadence shows the current provider charge below; you approve the exact frozen price and plan before a worker starts.</p>
+      <p className="wa-muted">{host
+        ? "Read recent public posts through this app’s Instagram source connection. Cadence shows the current provider charge below; this click approves the exact frozen price and starts the read — no team and no separate plan approval."
+        : "Read recent public posts through this app’s Instagram source connection. Cadence shows the current provider charge below; you approve the exact frozen price and plan before a worker starts."}</p>
       {quote ? <p className="wa-alert">Current provider charge for one read: <strong>USD {(quote.quote.total_price_micros / 1_000_000).toFixed(6)}</strong>. The plan will freeze this price; a change before execution stops the call.</p> : !quoteError && <p className="wa-muted" role="status">Checking provider price…</p>}
       {quoteError && <p className="wa-alert" data-tone="fail" role="alert">{quoteError}</p>}
       {(error || validation) && <p className="wa-alert" data-tone="fail" role="alert">{error || validation}</p>}
@@ -69,7 +75,7 @@ export function SourceImport({ installId, contextId, bindingDigest, workers, man
         <label htmlFor="wa-profile-handle">Public Instagram handle</label>
         <input id="wa-profile-handle" className="wa-input" value={profileHandle} onChange={event => setProfileHandle(event.target.value)} placeholder="juicysuite_crm" maxLength={31} required disabled={busy} />
       </div>
-      <div className="wa-fields">
+      {!host && <div className="wa-fields">
         <div className="wa-field">
           <label htmlFor="wa-source-owner">Responsible PM</label>
           <Select id="wa-source-owner" value={ownerPm} onChange={value => { setOwnerPm(value); setWriter(""); }} options={managers} placeholder="Choose PM" disabled={busy} full />
@@ -78,7 +84,7 @@ export function SourceImport({ installId, contextId, bindingDigest, workers, man
           <label htmlFor="wa-source-reader">Reader</label>
           <Select id="wa-source-reader" value={writer} onChange={setWriter} options={eligibleWorkers} placeholder={ownerPm ? "Choose reader" : "Choose a PM first"} disabled={busy || !ownerPm} full />
         </div>
-      </div>
+      </div>}
       <Button type="submit" variant="primary" disabled={!quote} loading={busy}>Create source plan</Button>
     </form>
   </WorkspaceDialog>;

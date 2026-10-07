@@ -1,7 +1,7 @@
 //! Operator-owned local app lifecycle and turn-bound dependency artifacts.
 use super::*;
 use crate::issue::app_catalog::workspace;
-use crate::store::app_runs::{LocalRunProvenance, LocalRunRequest, LocalWorkflow};
+use crate::store::app_runs::{self, LocalRunProvenance, LocalRunRequest, LocalWorkflow};
 use std::collections::BTreeMap;
 
 /// Resolve app, context and per-run content in that order. A blank prompt
@@ -156,9 +156,12 @@ impl Shared {
         team: Option<&super::app_teams_rpc::Team>,
         expected: Option<&Value>,
     ) -> Result<Value> {
+        // CAD-1171: a host-execution run names no owner PM — the operator's
+        // own click executes its capability steps. An agent run still needs
+        // one, from the caller or the install's default team.
         let owner_pm = match team {
-            Some(team) => team.owner_pm.clone(),
-            None => required_str(params, "owner_pm")?.to_string(),
+            Some(team) => Some(team.owner_pm.clone()),
+            None => optional_str(params, "owner_pm").map(str::to_string),
         };
         if params.get("source_receipt_id").is_some() != params.get("selected_post_id").is_some() {
             return Err(Error::rejected(
@@ -359,7 +362,7 @@ impl Shared {
                     workflow: &workflow,
                     inputs: &inputs,
                     request_id: required_str(params, "request_id")?,
-                    owner_pm: owner_pm.as_str(),
+                    owner_pm: owner_pm.as_deref(),
                     project_link: optional_str(params, "project_link"),
                 },
                 context.as_ref().map(|(_, proof)| proof),
@@ -628,11 +631,156 @@ impl Shared {
     pub(super) fn dispatch_app_run(&self, id: &str) -> Result<Value> {
         let result =
             self.with_app_run_current(id, |digest| self.store.app_run_dispatch(id, digest))?;
+        if result["snapshot"]["workflow"]["execution"].as_str() == Some("host") {
+            // CAD-1171: the operator's own click executes the capability;
+            // no worker is kicked and no message is created.
+            self.execute_host_run(&result)?;
+            return self.store.app_run_show(id);
+        }
         for step in result["snapshot"]["workflow"]["steps"].as_array().unwrap() {
             self.notify_agent(step["assignee"].as_str().unwrap());
         }
         self.wake();
         Ok(result)
+    }
+
+    /// CAD-1171: run a host-execution run's capability slots in-process.
+    /// Mirrors the worker path (`app_run_capability_call`) minus the
+    /// message/turn proof: the approved, dispatched step is the proof,
+    /// the frozen quote is re-checked, and the provider response is
+    /// retained through the same claim/record store calls.
+    fn execute_host_run(&self, run: &Value) -> Result<()> {
+        use crate::contract_fixture::{classify_call, Effect};
+        let install = required_str(run, "install_id")?;
+        let run_id = required_str(run, "id")?;
+        let step_id = required_str(&run["snapshot"]["workflow"]["steps"][0], "id")?.to_string();
+        let slots: Vec<String> = run["snapshot"]["workflow"]["capability_slots"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.app_run_binding_current(run, bundle, files)?;
+            for slot in &slots {
+                let proof = self
+                    .app_binding_live(install, run["context_id"].as_str(), slot, bundle, files)?
+                    .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
+                let quote = self.app_capability_quote(&proof)?;
+                if run["snapshot"]["quotes"][slot] != json!(quote) {
+                    return Err(Error::rejected(
+                        "capability price changed since run approval",
+                    ));
+                }
+                let config = &proof.config;
+                let provider = required_str(config, "provider")?;
+                let tool = required_str(&config["mapping"], "tool")?;
+                let effect = required_str(&config["mapping"], "effect")?;
+                let adapter = self
+                    .platforms
+                    .get(provider)
+                    .ok_or_else(|| Error::rejected("bound capability adapter unavailable"))?;
+                if !matches!(effect, "read" | "draft")
+                    || classify_call(
+                        adapter.table(),
+                        adapter.reported_manifest_version().as_deref(),
+                        tool,
+                    ) != if effect == "read" {
+                        Effect::Read
+                    } else {
+                        Effect::Draft
+                    }
+                {
+                    return Err(Error::rejected(
+                        "bound app capability is not a current read/draft action",
+                    ));
+                }
+                let input = json!({});
+                let input_digest = app_runs::material_digest(&input);
+                let request = format!("host-{run_id}-{slot}");
+                let call_id = format!(
+                    "app-call-{}",
+                    uuid::Uuid::new_v5(
+                        &uuid::Uuid::NAMESPACE_OID,
+                        format!("{run_id}:{slot}").as_bytes(),
+                    )
+                    .simple()
+                );
+                self.store.app_capability_claim(
+                    crate::store::app_capabilities::AppCapabilityClaim {
+                        run: run_id,
+                        step: &step_id,
+                        message: "",
+                        turn: "",
+                        slot,
+                        request: &request,
+                        binding_digest: &proof.digest,
+                        input_digest: &input_digest,
+                        call_id: &call_id,
+                    },
+                )?;
+                let authority = json!({
+                    "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
+                    "install_id":install,"context_id":run["context_id"],
+                    "step_id":step_id,"slot":slot,"binding":proof,
+                    "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
+                    "quote":run["snapshot"]["quotes"][slot],
+                    "call_id":call_id,
+                });
+                let credential = self.app_capability_credential(config)?;
+                let output = adapter
+                    .execute_app_capability(&credential, &authority, &input, &call_id)
+                    .map_err(Error::rejected)?;
+                crate::platform::refuse_leak(
+                    "app capability result",
+                    &output.result.to_string(),
+                    &credential,
+                )?;
+                if let Some(asset) = &output.asset {
+                    crate::platform::refuse_leak(
+                        "app capability asset",
+                        &String::from_utf8_lossy(&asset.bytes),
+                        &credential,
+                    )?;
+                }
+                let receipt = self.store.app_capability_record(
+                    crate::store::app_capabilities::AppCapabilityRecord {
+                        id: &call_id,
+                        run: run_id,
+                        step: &step_id,
+                        message: "",
+                        turn: "",
+                        slot,
+                        request: &request,
+                        binding_digest: &proof.digest,
+                        input_digest: &input_digest,
+                        result: &output.result,
+                        asset: output
+                            .asset
+                            .as_ref()
+                            .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
+                    },
+                )?;
+                self.store.app_run_host_step_succeeded(
+                    run_id,
+                    &step_id,
+                    required_str(&receipt, "digest")?,
+                )?;
+            }
+            Ok(())
+        })
     }
     pub(super) fn advance_app_runs(&self) {
         if self.draining() {

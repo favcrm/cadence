@@ -12,7 +12,13 @@ export interface Installation {
   capabilities: Record<string, SlotDeclaration> | null;
   /** Untyped legacy slots from `needs.connections`, kept working as before. */
   connection_slots: string[];
-  workflows?: { name: string; source_digest?: string; label?: string | null; capability_slots?: string[]; distinct?: string[]; inputs: { name: string; default?: string | null; context_default?: boolean }[] }[];
+  /**
+   * CAD-1171: `execution: "host"` runs the workflow's capability step
+   * in-process for the operator's own click — no worker, no owner PM and
+   * no separate approve round. `"agent"` (the default, and what an older
+   * daemon that omits the field means) keeps the worker path.
+   */
+  workflows?: { name: string; source_digest?: string; label?: string | null; capability_slots?: string[]; distinct?: string[]; execution?: "agent" | "host"; inputs: { name: string; default?: string | null; context_default?: boolean }[] }[];
 }
 /** One declared `needs.capabilities` slot: the result the app needs. Reviewed providers own the matching tools. */
 export interface SlotDeclaration {
@@ -64,7 +70,7 @@ export interface WorkspaceRun {
   id: string; install_id: string; context_id: string | null; state: string;
   snapshot_digest: string; approved_digest: string | null;
   snapshot: {
-    workflow: { title: string; source_digest?: string; steps: { id: string; kind: string; assignee: string; dependencies: string[]; instruction: string }[]; publication_slot?: string | null }; inputs: Record<string, string>; owner_pm: string;
+    workflow: { title: string; source_digest?: string; execution?: "agent" | "host"; steps: { id: string; kind: string; assignee: string; dependencies: string[]; instruction: string }[]; publication_slot?: string | null }; inputs: Record<string, string>; owner_pm: string;
     context?: { id: string; revision: number; digest: string } | null;
     publication?: { slot: string; binding: { id: string; revision: number; digest: string } | null };
     capabilities?: Record<string, { id: string; revision: number; digest: string }>;
@@ -128,7 +134,10 @@ export interface AppEffect {
 }
 export interface CreateRun {
   install_id: string; workflow: string; inputs: Record<string, string>;
-  request_id: string; owner_pm: string; context_id?: string;
+  request_id: string;
+  /** CAD-1171: required for an agent run; omitted for a host workflow, which has no owner PM. */
+  owner_pm?: string;
+  context_id?: string;
   source_receipt_id?: string; selected_post_id?: string;
 }
 /** CAD-1123 HP2: one operator gesture. Owner PM and worker roles come from the install team. */

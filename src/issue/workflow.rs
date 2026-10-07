@@ -67,6 +67,7 @@ const META_KEYS: &[&str] = &[
     "publication_slot",
     "capability_slots",
     "required_asset_slot",
+    "execution",
 ];
 
 /// Workflow-only frontmatter keys: pulled out at parse and removed
@@ -78,6 +79,7 @@ const WORKFLOW_ONLY_KEYS: &[&str] = &[
     "publication_slot",
     "capability_slots",
     "required_asset_slot",
+    "execution",
 ];
 
 /// Ticket metadata lines a workflow recognises: the plan's own plus
@@ -183,6 +185,26 @@ fn check_shape(kind: InputKind, name: &str, value: &str) -> Result<()> {
 /// run form shows the inputs as the author wrote them; the map is
 /// sorted). The plan structure itself is checked by rendering and
 /// running [`plan::parse_plan`].
+/// CAD-1171: who executes a run of this workflow. `Agent` (the default)
+/// routes every step through its assigned worker; `Host` executes the
+/// declared capability slots in-process for the operator's own click —
+/// no worker, no owner PM — and is refused for any workflow that would
+/// produce text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Execution {
+    Agent,
+    Host,
+}
+
+impl Execution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Execution::Agent => "agent",
+            Execution::Host => "host",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Template {
     pub inputs: BTreeMap<String, InputSpec>,
@@ -193,6 +215,7 @@ pub struct Template {
     pub publication_slot: Option<String>,
     pub capability_slots: Vec<String>,
     pub required_asset_slot: Option<String>,
+    pub execution: Execution,
 }
 
 /// The declared inputs as the board renders them — file order, each
@@ -303,6 +326,7 @@ struct Front {
     publication_slot: Option<String>,
     capability_slots: Vec<String>,
     required_asset_slot: Option<String>,
+    execution: Execution,
 }
 
 fn parse_front(yaml: &str) -> Result<Front> {
@@ -397,6 +421,26 @@ fn parse_front(yaml: &str) -> Result<Front> {
                 ))
             }
         };
+    // CAD-1171: `execution: host` runs the declared capability slots
+    // in-process for the operator's own click — no worker, no owner PM.
+    // It needs at least one capability slot and, because a host step
+    // cannot produce text, every rendered step must omit `agent:` (the
+    // run gate refuses an assigned host step).
+    let execution = match map.remove(serde_yaml::Value::String("execution".into())) {
+        None => Execution::Agent,
+        Some(serde_yaml::Value::String(value)) if value == "host" => Execution::Host,
+        Some(serde_yaml::Value::String(value)) if value == "agent" => Execution::Agent,
+        Some(_) => {
+            return Err(Error::rejected(
+                "workflow execution must be `host` or `agent`",
+            ))
+        }
+    };
+    if execution == Execution::Host && capability_slots.is_empty() {
+        return Err(Error::rejected(
+            "a host-execution workflow must declare at least one capability slot",
+        ));
+    }
     let inputs_val = map.remove(serde_yaml::Value::String("inputs".to_string()));
     let mut inputs = BTreeMap::new();
     let mut input_order: Vec<String> = Vec::new();
@@ -561,6 +605,7 @@ fn parse_front(yaml: &str) -> Result<Front> {
         publication_slot,
         capability_slots,
         required_asset_slot,
+        execution,
     })
 }
 
@@ -734,6 +779,7 @@ pub fn parse_template(text: &str) -> Result<Template> {
         publication_slot: front.publication_slot,
         capability_slots: front.capability_slots,
         required_asset_slot: front.required_asset_slot,
+        execution: front.execution,
     })
 }
 
