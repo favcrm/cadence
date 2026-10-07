@@ -276,6 +276,18 @@ impl Store {
         }
     }
 
+    /// CAD-1065's admission read: the same DISARMED read surface
+    /// [`Self::conn`] returns, but fail-fast — contention or a poisoned
+    /// connection is `busy`, never the forensic-recovery path `conn()`
+    /// runs (that may write a `store_poisoned` event). The disarmed
+    /// authorizer still denies every write the guard would attempt, so
+    /// a `connection_test` read cannot mutate state.
+    pub(crate) fn try_conn(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.conn
+            .try_lock()
+            .map_err(|_| Error::busy("store is busy"))
+    }
+
     /// CAD-1011: the ONLY producer write lane. `f` runs inside
     /// `BEGIN IMMEDIATE` on the held conn mutex after the durable
     /// closure latch and the hosted-lease fence are both re-checked

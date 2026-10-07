@@ -100,6 +100,41 @@ impl Custody {
         }
     }
 
+    /// CAD-1065: the `connection_test` read. Same backend selection as
+    /// [`load`], but bounded: no read may exceed `cap` bytes and the
+    /// whole operation answers inside `deadline` — the file backend
+    /// reads incrementally and never allocates past the cap, and a
+    /// libsecret lookup drains the owned child's pipes under a poll
+    /// deadline, killing and reaping only that child on timeout.
+    ///
+    /// `fenced` is set when a timed-out child could not be provably
+    /// killed and reaped: the verification path stays fenced (every
+    /// later call refuses) rather than leave an unobserved process
+    /// holding credential bytes.
+    pub fn load_bounded(
+        &self,
+        tag: &str,
+        key: &Key,
+        cap: usize,
+        deadline: &super::OpDeadline,
+        fenced: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<u8>> {
+        match (tag, self) {
+            (FILE_TAG, Custody::File(dir)) => file_load_bounded(dir, key, cap, deadline),
+            (FILE_TAG, _) => Err(Error::internal(
+                "custody record names the file store but this daemon picked the keychain",
+            )),
+            (LIBSECRET_TAG, Custody::Libsecret(tool)) => {
+                libsecret_lookup_bounded(tool, key, cap, deadline, fenced)
+            }
+            (LIBSECRET_TAG, _) => Err(Error::rejected(format!(
+                "credential for '{}/{}' lives in a keychain this host no longer offers",
+                key.platform, key.account
+            ))),
+            (other, _) => Err(Error::internal(format!("unknown custody tag '{other}'"))),
+        }
+    }
+
     /// Drop `key`'s bytes from the `tag` backend. Idempotent — a
     /// retry after a crash between the custody delete and the record
     /// delete finds nothing and proceeds.
@@ -181,6 +216,54 @@ fn file_load(dir: &Path, key: &Key) -> Result<Vec<u8>> {
     }
 }
 
+/// CAD-1065's bounded file read: open, then pull bytes through a
+/// capped `Take` so a pathological or torn blob refuses at `cap`
+/// instead of landing whole in memory. The deadline is checked
+/// before open and between reads; a spent budget fails the load.
+fn file_load_bounded(
+    dir: &Path,
+    key: &Key,
+    cap: usize,
+    deadline: &super::OpDeadline,
+) -> Result<Vec<u8>> {
+    use std::io::Read;
+    if deadline.expired() {
+        return Err(Error::busy("connection test budget is spent"));
+    }
+    let path = file_path(dir, key);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::internal(format!(
+                "custody holds no bytes for '{}/{}' — the record outlived its store",
+                key.platform, key.account
+            )))
+        }
+        Err(e) => return Err(Error::internal(format!("custody read: {e}"))),
+    };
+    let mut bytes = Vec::new();
+    let mut limited = std::io::Read::take(file, cap as u64 + 1);
+    loop {
+        if deadline.expired() {
+            return Err(Error::busy("connection test budget is spent"));
+        }
+        let mut chunk = [0u8; 4096];
+        let read = limited
+            .read(&mut chunk)
+            .map_err(|e| Error::internal(format!("custody read: {e}")))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > cap {
+            return Err(Error::internal(
+                "custody bytes exceed their supported bounds",
+            ));
+        }
+    }
+    Ok(bytes)
+}
+
 fn file_remove(dir: &Path, key: &Key) -> Result<()> {
     match std::fs::remove_file(file_path(dir, key)) {
         Ok(()) => Ok(()),
@@ -258,6 +341,150 @@ fn libsecret_lookup(tool: &Path, key: &Key) -> Result<Vec<u8>> {
         bytes.pop();
     }
     Ok(bytes)
+}
+
+/// CAD-1065's bounded libsecret lookup. The owned child is spawned
+/// through [`crate::reaper::spawn`] (registered, never adopted), its
+/// stdin is null and both pipes are drained under `libc::poll` for the
+/// operation deadline — never the unbounded `wait_with_output` of
+/// [`crate::reaper::output`]. More than `cap` bytes of output refuses;
+/// a spent deadline kills and reaps only this child, and a kill or
+/// reap that cannot be observed sets `fenced` so this verification
+/// path stays closed.
+#[cfg(unix)]
+fn libsecret_lookup_bounded(
+    tool: &Path,
+    key: &Key,
+    cap: usize,
+    deadline: &super::OpDeadline,
+    fenced: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+
+    let mut child = crate::reaper::spawn(
+        std::process::Command::new(tool)
+            .arg("lookup")
+            .args(libsecret_args(key))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut stderr = child.stderr.take().expect("piped");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut open = [true, true];
+    let result = 'drain: loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let remaining = match deadline.remaining() {
+            Some(left) => left,
+            None => break 'drain Err(Error::busy("connection test budget is spent")),
+        };
+        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: fds point at live pollfd entries for this call only.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, millis) };
+        if ready < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break 'drain Err(Error::internal(format!("secret-tool lookup: {e}")));
+        }
+        if ready == 0 {
+            break 'drain Err(Error::busy("connection test budget is spent"));
+        }
+        for i in 0..2usize {
+            if !open[i] {
+                continue;
+            }
+            let revents = fds[i].revents;
+            if revents == 0 {
+                continue;
+            }
+            let (pipe, acc): (&mut dyn Read, &mut Vec<u8>) = if i == 0 {
+                (&mut stdout, &mut out)
+            } else {
+                (&mut stderr, &mut err)
+            };
+            if revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                let mut chunk = [0u8; 4096];
+                match pipe.read(&mut chunk) {
+                    Ok(0) => open[i] = false,
+                    Ok(n) => {
+                        acc.extend_from_slice(&chunk[..n]);
+                        if acc.len() > cap {
+                            break 'drain Err(Error::internal(
+                                "keychain output exceeds its supported bounds",
+                            ));
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        break 'drain Err(Error::internal(format!("secret-tool lookup: {e}")))
+                    }
+                }
+            }
+            if revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                open[i] = false;
+            }
+        }
+        if !open[0] && !open[1] {
+            break 'drain match child.wait() {
+                Ok(status) if status.success() => Ok(out),
+                Ok(_) => Err(Error::internal(format!(
+                    "keychain holds no credential for '{}/{}'",
+                    key.platform, key.account
+                ))),
+                Err(e) => Err(Error::internal(format!("secret-tool lookup: {e}"))),
+            };
+        }
+    };
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            // The child is dead or unreachable inside the deadline: kill
+            // and reap only this owned process. A kill or reap whose
+            // outcome cannot be observed leaves a process that may still
+            // hold the credential bytes — the verification path fences.
+            let killed = child.kill().is_ok() || child.try_wait().ok().flatten().is_some();
+            let reaped = killed && child.wait().is_ok();
+            if !reaped {
+                fenced.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            return Err(error);
+        }
+    };
+    // `secret-tool` appends a newline to the secret it prints — it is
+    // the tool's framing, never part of the credential.
+    let mut bytes = bytes;
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn libsecret_lookup_bounded(
+    _tool: &Path,
+    _key: &Key,
+    _cap: usize,
+    _deadline: &super::OpDeadline,
+    _fenced: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u8>> {
+    Err(Error::internal("the bounded keychain lookup is unix-only"))
 }
 
 fn libsecret_clear(tool: &Path, key: &Key) -> Result<()> {

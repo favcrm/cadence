@@ -1215,4 +1215,19 @@ impl Store {
             )
             .optional()?)
     }
+
+    /// CAD-1065: the `connection_test` CAS read — same row shape as
+    /// [`connection_credential`] but through the fail-fast
+    /// [`Store::try_conn`] guard, so contention or a poisoned
+    /// connection is `busy`, never forensic recovery.
+    pub fn connection_credential_strict(&self, id: &str) -> Result<Option<CredentialRecord>> {
+        Ok(self
+            .try_conn()?
+            .query_row(
+                "SELECT * FROM platform_credentials WHERE connection_id=?",
+                [id],
+                credential_row,
+            )
+            .optional()?)
+    }
 }

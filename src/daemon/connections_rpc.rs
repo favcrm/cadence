@@ -77,8 +77,9 @@ impl Shared {
             ),
             _ => (None, None),
         };
+        let verification_support = self.connection_verification_support(provider, record);
         Ok(
-            json!({"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"smtp":smtp,"smtp_sender":smtp_sender,"smtp_error":smtp_error,"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
+            json!({"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"smtp":smtp,"smtp_sender":smtp_sender,"smtp_error":smtp_error,"verification_support":verification_support,"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
         )
     }
     /// The id of a built-in (credential-less) connection row.
@@ -187,6 +188,14 @@ impl Shared {
         let allowed: &[&str] = match method {
             "connection_providers" | "connection_list" => &[],
             "connection_show" | "connection_check" | "connection_revoke" => &["connection_id"],
+            // CAD-1065: the login-only check compares both expected
+            // values exactly against the live row before any credential
+            // access — `null` is a required key, never a wildcard.
+            "connection_test" => &[
+                "connection_id",
+                "expected_revision",
+                "expected_registration_digest",
+            ],
             // CAD-785: the `smtp` shape carries typed host, port,
             // TLS mode, username, secret and sender fields instead of
             // an opaque token. Both shapes share one allowlist; each
@@ -238,10 +247,11 @@ impl Shared {
                 let mut rows = Vec::new();
                 for (provider, adapter) in &self.platforms {
                     let descriptor = self.connection_descriptor(provider).ok();
-                    rows.push(json!({"provider":provider,"descriptor":descriptor,"descriptor_available":descriptor.is_some(),"manifest_status":match (adapter.table().manifest_version.as_deref(),adapter.reported_manifest_version()) {(Some(a),Some(b)) if a==b=>"matched",(_,None)=>"missing",_=>"mismatched"},"reviewed_pin":adapter.table().manifest_version,"reported_pin":adapter.reported_manifest_version(),"network_checked":false,"registration_digest":adapter.connection_registration().map(|r|crate::platform::connections::registration_digest(&format!("{r}:{}",serde_json::to_string(&descriptor).unwrap_or_default())))}));
+                    let verification_support = self.connection_verification_support(provider, None);
+                    rows.push(json!({"provider":provider,"descriptor":descriptor,"descriptor_available":descriptor.is_some(),"manifest_status":match (adapter.table().manifest_version.as_deref(),adapter.reported_manifest_version()) {(Some(a),Some(b)) if a==b=>"matched",(_,None)=>"missing",_=>"mismatched"},"reviewed_pin":adapter.table().manifest_version,"reported_pin":adapter.reported_manifest_version(),"network_checked":false,"registration_digest":adapter.connection_registration().map(|r|crate::platform::connections::registration_digest(&format!("{r}:{}",serde_json::to_string(&descriptor).unwrap_or_default()))),"verification_support":verification_support}));
                 }
                 if !self.platforms.contains_key("local") {
-                    rows.push(json!({"provider":"local","descriptor":Value::Null,"descriptor_available":false,"manifest_status":"missing","reviewed_pin":Value::Null,"reported_pin":Value::Null,"network_checked":false,"registration_digest":Value::Null}));
+                    rows.push(json!({"provider":"local","descriptor":Value::Null,"descriptor_available":false,"manifest_status":"missing","reviewed_pin":Value::Null,"reported_pin":Value::Null,"network_checked":false,"registration_digest":Value::Null,"verification_support":self.connection_verification_support("local",None)}));
                 }
                 rows.sort_by(|a, b| a["provider"].as_str().cmp(&b["provider"].as_str()));
                 Ok(json!({"providers":rows}))
@@ -266,6 +276,7 @@ impl Shared {
                     .ok_or_else(|| Error::rejected("connection is unavailable or stale"))?;
                 Ok(json!({"connection":row}))
             }
+            "connection_test" => self.connection_test(params),
             "connection_create" => {
                 let provider = platform::connections::provider_identifier(
                     required_str(params, "provider")?,
@@ -579,7 +590,7 @@ fn connection_error(error: Error, token: &str) -> Error {
     }
 }
 
-fn connection_id(params: &Value) -> Result<&str> {
+pub(super) fn connection_id(params: &Value) -> Result<&str> {
     let id = required_str(params, "connection_id")?;
     if id.is_empty()
         || id.len() > 128

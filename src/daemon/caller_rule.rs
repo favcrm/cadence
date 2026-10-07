@@ -789,6 +789,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("connection_create", Rule::Handler("rpc_connection")),
     ("connection_rotate", Rule::Handler("rpc_connection")),
     ("connection_revoke", Rule::Handler("rpc_connection")),
+    (
+        "connection_test",
+        Rule::Handler("rpc_connection: operator_connection (CAD-1065)"),
+    ),
     ("crm_smtp_bind", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_rebind", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_revoke", Rule::Handler("rpc_crm_smtp")),

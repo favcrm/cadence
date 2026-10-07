@@ -16,6 +16,7 @@ pub(super) enum Route<'a> {
     Rotate(&'a str),
     Revoke(&'a str),
     Check(&'a str),
+    Test(&'a str),
 }
 fn segment(id: &str) -> bool {
     !id.is_empty()
@@ -40,6 +41,7 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
             "rotate" => Some(Route::Rotate(id)),
             "revoke" => Some(Route::Revoke(id)),
             "status" => Some(Route::Check(id)),
+            "test" => Some(Route::Test(id)),
             _ => None,
         };
     }
@@ -126,6 +128,32 @@ where
 {
     T::deserialize(de).map(Some)
 }
+/// CAD-1065: the `POST /api/connections/:id/test` body. Both expected
+/// values are required keys — each is `null` or a value; `null` is an
+/// exact compare at the daemon, never a wildcard, and a missing key
+/// is a schema refusal here. `deny_unknown_fields` closes the body.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Test {
+    #[serde(deserialize_with = "required_nullable")]
+    expected_revision: Option<u64>,
+    #[serde(deserialize_with = "required_nullable")]
+    expected_registration_digest: Option<String>,
+}
+
+/// A field the client must send but may null: `Option` alone treats an
+/// absent key as `None`, which would accept a body that simply forgot
+/// the field — the daemon's required-key rule could then never see
+/// the omission. Presence is enforced by the missing-field error, and
+/// an explicit `null` parses as `None`.
+fn required_nullable<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Empty {}
@@ -181,6 +209,20 @@ pub(super) fn handle(
                     "connection_check"
                 },
                 json!({"connection_id":id}),
+            )
+        }
+        Route::Test(id) => {
+            let body: Test = match typed(request) {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            (
+                "connection_test",
+                json!({
+                    "connection_id": id,
+                    "expected_revision": body.expected_revision,
+                    "expected_registration_digest": body.expected_registration_digest,
+                }),
             )
         }
     };
