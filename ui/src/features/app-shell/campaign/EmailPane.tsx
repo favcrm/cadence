@@ -125,7 +125,7 @@ export default function EmailPane({
   const expectedRevision = doc === null ? 0 : doc.revision;
   // A host-attributed suggestion is read-only until Use in editor. The
   // local editor is available at revision 0 as well as on saved revisions.
-  const editing = edit !== null && draft === null;
+  const editing = canWrite && edit !== null && draft === null;
   // CAD-1146: the optional preheader starts collapsed; hiding it never
   // discards its value and never makes it required. A saved preheader
   // opens the row on load so its value is never hidden silently.
@@ -366,6 +366,75 @@ export default function EmailPane({
             <pre className="crm-preview" data-preview="html">
               {shown.html}
             </pre>
+          )}
+          {mode === "html" && (
+            <details className="crm-diag" data-advanced-text>
+              <summary className="text-label text-ink-300">Advanced: plain-text version</summary>
+              <div className="grid gap-2 mt-2">
+                {editing && edit !== null && (
+                  <>
+                    <label className="text-label text-ink-300" htmlFor="cmp-own-text">
+                      <input
+                        id="cmp-own-text"
+                        type="checkbox"
+                        checked={edit.draft.ownText}
+                        disabled={edit.saving || edit.reloading}
+                        onChange={(event) =>
+                          edit.patch(
+                            event.target.checked
+                              ? {
+                                  ownText: true,
+                                  text: edit.draft.text === "" ? (render?.text ?? "") : edit.draft.text,
+                                }
+                              : { ownText: false, text: "" },
+                          )
+                        }
+                      />{" "}
+                      Write my own
+                    </label>
+                    {edit.draft.ownText ? (
+                      <div className="crm-field">
+                        <label className="text-label text-ink-300" htmlFor="cmp-text-override">
+                          Custom plain-text override
+                        </label>
+                        <textarea
+                          id="cmp-text-override"
+                          className="field"
+                          rows={8}
+                          value={edit.draft.text}
+                          disabled={edit.saving || edit.reloading}
+                          onChange={(event) => edit.patch({ text: event.target.value })}
+                        />
+                        <p className="text-micro text-ink-500">
+                          Unsaved custom text is saved only when you choose Save.
+                        </p>
+                      </div>
+                    ) : (
+                      <p className="text-micro text-ink-500">
+                        The host generates plain text from the email body unless you write an override.
+                      </p>
+                    )}
+                  </>
+                )}
+                {shown !== null && (
+                  <div className="crm-field" data-preview="plain-text">
+                    <span className="text-label text-ink-300">
+                      {draft !== null
+                        ? "Suggested plain-text render (not saved)"
+                        : doc?.textOverride != null
+                          ? `Saved custom plain-text render (v${doc.revision})`
+                          : doc !== null
+                            ? `Saved host-generated plain text (v${doc.revision})`
+                            : "Host-rendered plain text"}
+                    </span>
+                    <pre className="crm-preview">{shown.text}</pre>
+                  </div>
+                )}
+                <p className="text-micro text-ink-500" data-host-footer-note>
+                  The required sender and unsubscribe footer is appended by the host and cannot be edited here.
+                </p>
+              </div>
+            </details>
           )}
           {draft !== null && draftError !== null && (
             <div className="grid gap-1 mt-2">
