@@ -194,12 +194,15 @@ Things that do **not** exist today and a tier would require:
   the lease *as the machine identity* and the lease row names the
   window grant, so `rollout status` and the audit both show why the
   machine held it. Deliberately NOT refused: the changeset's trigger
-  classes. Content judgment lives at merge approval and promote
-  approval — both human, both already happened for any installable
-  candidate — so a promoted security fix (trigger 3) is precisely what
-  the window is for. The window authorizes *timing* only; it never
-  substitutes for review, and every auto-installed changeset was twice
-  human-approved before the window opened.
+  classes. Content judgment lives in merge review (per-class: auto
+  needs independent review plus green CI, human and delegated need
+  their approvals) and in mandatory human promotion — both already
+  happened for any installable candidate — so a promoted security fix
+  (trigger 3) is precisely what the window is for. The window
+  authorizes *timing* only; it never substitutes for review.
+  Promotion may land during an open window; what matters is ordering,
+  not precedence: install runs only against an already-promoted
+  candidate, never ahead of promotion.
 - **M3 — health-check-gated auto-rollback: mostly exists.** The
   pipeline already repoints + restarts + re-checks on health failure.
   The delta is *detection width*: health today = "daemon and board
