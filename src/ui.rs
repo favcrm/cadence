@@ -721,8 +721,8 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
 
 /// Merge flags over the persisted options: a given flag wins, an
 /// absent one inherits. `--tailscale` resolves the tailnet identity
-/// and ensures the serve mapping; a persisted tailscale block is kept
-/// (the detached server never re-ensures — only operator verbs do).
+/// but does not mutate the serve mapping; callers publish it only after
+/// their own remaining validation. A persisted tailscale block is kept.
 pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpts)> {
     let env_public_only = match std::env::var("CADENCE_BOARD_PUBLIC_ONLY") {
         Ok(v) if v == "1" => true,
@@ -773,20 +773,9 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
             "`ui start` with persisted tailscale sharing",
         )?;
     }
-    if flags.tailscale.is_none() {
-        if let Some(ts) = &eff.tailscale {
-            let bind_host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
-            let bind_port = eff.port.unwrap_or(3010);
-            let expected = format!("http://127.0.0.1:{bind_port}");
-            if ts.target != expected {
-                return Err(Error::rejected(format!(
-                    "the persisted tailnet target {} does not match the effective bind {bind_host}:{bind_port} — refusing to re-publish a forged or stale record",
-                    ts.target
-                )));
-            }
-        }
-    }
+    validate_share_target(&eff)?;
     if let Some(https_port) = flags.tailscale {
+        refuse_share_port_change(persisted.tailscale.as_ref(), https_port)?;
         crate::sandbox::refuse_global_unless_allowed("`ui start --tailscale`")?;
         let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
         if !is_loopback_host(&host) {
@@ -799,7 +788,6 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
         crate::sandbox::refuse_production_port(ui_port)?;
         let target = format!("http://127.0.0.1:{ui_port}");
         let me = ts_self()?;
-        ensure_mapping(https_port, &target)?;
         eff.tailscale = Some(TailscaleOpts {
             dns_name: me.dns_name,
             https_port,
@@ -808,6 +796,36 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
     }
     let serve = serve_opts(&eff)?;
     Ok((eff, serve))
+}
+
+/// Refuse every recorded sharing target that does not match the
+/// effective loopback bind. This runs even when a new `--tailscale`
+/// flag would replace the record: invalid custody is never repaired by
+/// overwriting it.
+fn refuse_share_port_change(existing: Option<&TailscaleOpts>, requested_port: u16) -> Result<()> {
+    if let Some(existing) = existing.filter(|share| share.https_port != requested_port) {
+        return Err(Error::rejected(format!(
+            "the persisted tailnet share uses HTTPS port {} — stop sharing before changing it to {requested_port}",
+            existing.https_port
+        )));
+    }
+    Ok(())
+}
+
+fn validate_share_target(eff: &UiOpts) -> Result<()> {
+    let Some(ts) = &eff.tailscale else {
+        return Ok(());
+    };
+    let bind_host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+    let bind_port = eff.port.unwrap_or(3010);
+    let expected = format!("http://127.0.0.1:{bind_port}");
+    if ts.target != expected {
+        return Err(Error::rejected(format!(
+            "the persisted tailnet target {} does not match the effective bind {bind_host}:{bind_port} — refusing to re-publish a forged or stale record",
+            ts.target
+        )));
+    }
+    Ok(())
 }
 
 /// CAD-841: the `--device-login-*` flags (and their
@@ -1293,7 +1311,7 @@ pub(crate) fn http_get(
 /// never rewrite them: `ui start` owns persistence.
 pub(crate) fn run(state_dir: &Path, flags: &UiFlags) -> Result<i32> {
     let persisted = load_opts_strict(state_dir)?;
-    let (_eff, mut so) = resolve_opts(flags, &persisted)?;
+    let (eff, mut so) = resolve_opts(flags, &persisted)?;
     // CAD-841: `--device-login-*` is a thin client — resolve now so a
     // partial triple still fails before any bind, but push only once
     // `serve` owns the port: a failed start must not have already
@@ -1301,7 +1319,24 @@ pub(crate) fn run(state_dir: &Path, flags: &UiFlags) -> Result<i32> {
     // detached `ui start` child resolves no flags and a scrubbed env,
     // so it never re-pushes.
     so.device_login_push = resolve_device_login(flags)?;
-    serve(state_dir, &crate::issue::default_dir()?, &so)?;
+    // `ui run --tailscale` is the foreground opt-in path. Resolution
+    // above validates all configuration first; preserve its historical
+    // explicit-sharing behavior without moving map effects back into
+    // the shared resolver.
+    let created = if flags.tailscale.is_some() {
+        let ts = eff.tailscale.as_ref().expect("resolved above");
+        ensure_mapping(ts.https_port, &ts.target)?
+    } else {
+        false
+    };
+    if let Err(e) = serve(state_dir, &crate::issue::default_dir()?, &so) {
+        if created {
+            if let Some(ts) = &eff.tailscale {
+                let _ = remove_mapping(ts.https_port, &ts.target);
+            }
+        }
+        return Err(e);
+    }
     Ok(0)
 }
 
@@ -1338,6 +1373,23 @@ pub(crate) fn start_inner(
         recorded.clone()
     };
     let (eff, so) = resolve_opts(flags, &persisted)?;
+    if let Some(existing) = recorded.tailscale.as_ref() {
+        let mut recorded_bind = UiOpts {
+            host: eff.host.clone(),
+            port: eff.port,
+            ..UiOpts::default()
+        };
+        recorded_bind.tailscale = Some(existing.clone());
+        validate_share_target(&recorded_bind)?;
+        if reset && flags.tailscale.is_none() {
+            return Err(Error::rejected(
+                "`ui start --reset` cannot discard a persisted tailnet share — stop sharing first",
+            ));
+        }
+        if let Some(requested_port) = flags.tailscale {
+            refuse_share_port_change(Some(existing), requested_port)?;
+        }
+    }
     // CAD-841 r2: resolve the device-login triple up front — a partial
     // or invalid triple fails before any side effect (a saved ui.json,
     // a spawned child). The push it feeds stays late: post-spawn on
@@ -1384,20 +1436,21 @@ pub(crate) fn start_inner(
             }
         }
     }
+    // Persist matching sharing custody before the host-wide mapping is
+    // published. Every config/device-login/running-transition refusal
+    // above therefore precedes both effects.
+    save_opts(state_dir, &eff)?;
     // Re-ensure a persisted mapping so `ui stop && ui start` keeps the
     // board shared — best effort when tailscaled itself is unreachable.
-    if flags.tailscale.is_none() {
-        if let Some(ts) = &eff.tailscale {
-            match ensure_mapping(ts.https_port, &ts.target) {
-                Ok(_) => {}
-                Err(e) if is_ts_offline(&e) => {
-                    eprintln!("warning: {e} — serving loopback only this run");
-                }
-                Err(e) => return Err(e),
+    if let Some(ts) = &eff.tailscale {
+        match ensure_mapping(ts.https_port, &ts.target) {
+            Ok(_) => {}
+            Err(e) if is_ts_offline(&e) => {
+                eprintln!("warning: {e} — serving loopback only this run");
             }
+            Err(e) => return Err(e),
         }
     }
-    save_opts(state_dir, &eff)?;
     let (host, port) = (so.host.clone(), so.port);
     // A previous start's marker must not satisfy this one's wait —
     // clear it before any `running`/`spawn` path can read it.
@@ -1758,26 +1811,31 @@ fn serve_map() -> Result<HashMap<u16, String>> {
 /// Ensure `https:<port>` proxies to `target`: identical mapping is
 /// left alone (returns false), a different one on that port is a hard
 /// refusal — cadence never overwrites somebody else's serve config.
-fn ensure_mapping(port: u16, target: &str) -> Result<bool> {
-    // The tailnet is host-wide: a sandbox board needs the explicit opt-in.
-    crate::sandbox::refuse_global_unless_allowed("`tailscale serve`")?;
+fn mapping_matches(port: u16, target: &str) -> Result<bool> {
     match serve_map()?.get(&port) {
-        Some(existing) if existing == target => Ok(false),
+        Some(existing) if existing == target => Ok(true),
         Some(other) => Err(Error::rejected(format!(
             "tailscale serve :{port} already targets {other} — refusing to \
              overwrite it; pick another port or free that mapping first"
         ))),
-        None => {
-            let out = ts(&["serve", "--bg", &format!("--https={port}"), target])?;
-            if !out.status.success() {
-                return Err(Error::rejected(format!(
-                    "tailscale serve --https={port} failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )));
-            }
-            Ok(true)
-        }
+        None => Ok(false),
     }
+}
+
+fn ensure_mapping(port: u16, target: &str) -> Result<bool> {
+    // The tailnet is host-wide: a sandbox board needs the explicit opt-in.
+    crate::sandbox::refuse_global_unless_allowed("`tailscale serve`")?;
+    if mapping_matches(port, target)? {
+        return Ok(false);
+    }
+    let out = ts(&["serve", "--bg", &format!("--https={port}"), target])?;
+    if !out.status.success() {
+        return Err(Error::rejected(format!(
+            "tailscale serve --https={port} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(true)
 }
 
 /// Remove the mapping only while it still targets what cadence
@@ -1827,25 +1885,27 @@ pub(crate) fn ts_start_quiet(state_dir: &Path, https_port: u16, read_only: bool)
 
 fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: bool) -> Result<i32> {
     crate::sandbox::refuse_global_unless_allowed("`ui tailscale start`")?;
-    let me = ts_self()?;
     let mut opts = load_opts_strict(state_dir)?;
+    validate_share_target(&opts)?;
+    refuse_share_port_change(opts.tailscale.as_ref(), https_port)?;
+    let me = ts_self()?;
     let ui_port = opts.port.unwrap_or(3010);
     crate::sandbox::refuse_production_port(ui_port)?;
     let target = format!("http://127.0.0.1:{ui_port}");
-    let created = ensure_mapping(https_port, &target)?;
     opts.tailscale = Some(TailscaleOpts {
         dns_name: me.dns_name,
         https_port,
-        target,
+        target: target.clone(),
     });
     if read_only {
         opts.read_only = true;
     }
-    save_opts(state_dir, &opts)?;
-    // Validate before touching a running board — a persisted
-    // non-loopback host must not kill it for a sharing mode that can
-    // never come up.
+    // Validate configuration and device-login inputs before saving,
+    // publishing a map, or stopping a running board.
     let _ = serve_opts(&opts)?;
+    resolve_device_login(&UiFlags::default())?;
+    let mapping_created = !mapping_matches(https_port, &target)?;
+    save_opts(state_dir, &opts)?;
     let was_running = read_pid(state_dir).is_some();
     if was_running {
         eprintln!("restarting the board so the tailnet allowlists take effect — brief outage");
@@ -1860,7 +1920,7 @@ fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: boo
                 "state": "sharing",
                 "tailnet_url": ts.url(),
                 "mapping": format!("https:{} → {}", ts.https_port, ts.target),
-                "mapping_created": created,
+                "mapping_created": mapping_created,
                 "board": if was_running { "restarted" } else { "started" },
                 "read_only": opts.read_only,
             }))
