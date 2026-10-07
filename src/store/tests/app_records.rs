@@ -1,5 +1,6 @@
 use super::super::app_records::{
-    record_db_path, ConsentProvenance, CsvAction, CsvDecision, CustomerProfile, RecordStore,
+    capacity_split, record_db_path, refusal_reason, ConsentProvenance, CsvAction, CsvDecision,
+    CustomerProfile, RecordStore, RECORD_LIMIT, RECORD_PAGE_MAX,
 };
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -823,4 +824,80 @@ fn cad1072_create_refuses_provenance_without_a_grant() {
         // Nothing was written.
         assert!(store.app_record_show("ctx-1", "c1").is_err());
     }
+}
+
+#[test]
+fn cad1172_records_are_not_capped_at_the_pilot_hundred() {
+    // The pilot refused a real customer list at 100 live rows per
+    // context; the ceiling must not bite anywhere near real lists.
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    for index in 0..150 {
+        store
+            .app_record_create(
+                "ctx-1",
+                &format!("customer-{index:03}"),
+                &customer(
+                    &format!("Customer {index}"),
+                    &format!("c{index}@example.com"),
+                ),
+            )
+            .unwrap_or_else(|error| panic!("create {index} refused: {error}"));
+    }
+    let listed = store.app_record_list("ctx-1").unwrap();
+    assert_eq!(
+        listed["records"].as_array().unwrap().len(),
+        RECORD_PAGE_MAX as usize,
+        "one page holds the page bound"
+    );
+    assert_eq!(listed["truncated"], json!(true), "150 rows page");
+    // The context really holds all 150: page past the bound.
+    let cursor = listed["next_cursor"].as_str().unwrap().to_string();
+    let second = store
+        .app_record_list_paged("ctx-1", None, RECORD_PAGE_MAX, Some(&cursor))
+        .unwrap();
+    assert_eq!(second["records"].as_array().unwrap().len(), 50);
+    assert_eq!(second["truncated"], json!(false));
+}
+
+#[test]
+fn cad1172_capacity_split_counts_room_before_the_ceiling() {
+    assert_eq!(capacity_split(0, 3), (3, 0), "empty context admits creates");
+    assert_eq!(capacity_split(1, 0), (0, 0), "no creates consume no room");
+    assert_eq!(
+        capacity_split(RECORD_LIMIT - 1, 3),
+        (1, 2),
+        "the ceiling admits only the remaining room"
+    );
+    assert_eq!(
+        capacity_split(RECORD_LIMIT, 2),
+        (0, 2),
+        "a full context refuses"
+    );
+    assert_eq!(
+        capacity_split(RECORD_LIMIT + 10, 1),
+        (0, 1),
+        "an over-full context still refuses rather than wrapping"
+    );
+}
+
+#[test]
+fn cad1172_commit_reason_names_the_record_limit() {
+    assert_eq!(
+        refusal_reason("context has reached its record limit"),
+        "context record limit reached"
+    );
+    assert_eq!(
+        refusal_reason("record email is already used by another record"),
+        "duplicate email"
+    );
+    assert_eq!(
+        refusal_reason("record ID already holds different content"),
+        "record conflict"
+    );
+    assert_eq!(
+        refusal_reason("expected revision is stale"),
+        "stale revision"
+    );
+    assert_eq!(refusal_reason("anything else"), "record refused");
 }

@@ -50,11 +50,11 @@ fn record_list_scope(params: &Value) -> Result<(Option<String>, i64, Option<Stri
         Some(_) => return Err(Error::rejected("record search query must be a string")),
     };
     let limit = match params.get("limit") {
-        None => crate::store::app_records::RECORD_LIMIT,
+        None => crate::store::app_records::RECORD_PAGE_MAX,
         Some(Value::Number(number)) => number
             .as_u64()
             .and_then(|value| i64::try_from(value).ok())
-            .filter(|value| (1..=crate::store::app_records::RECORD_LIMIT).contains(value))
+            .filter(|value| (1..=crate::store::app_records::RECORD_PAGE_MAX).contains(value))
             .ok_or_else(|| Error::rejected("record page limit is out of bounds"))?,
         Some(_) => return Err(Error::rejected("record page limit is out of bounds")),
     };
