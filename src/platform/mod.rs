@@ -167,16 +167,56 @@ pub fn observe_child_exit(child: &std::process::Child) -> ChildExit {
         // consumed — it terminated and is reaped — but a recycled
         // pid in a foreign `/proc` view could still list a live
         // task under that id, so a still-present task keeps the
-        // serialization held rather than releasing on it.
+        // serialization held rather than releasing on it. An
+        // unvalidated procfs view or an unanswerable presence
+        // check is not an established termination either.
         #[cfg(target_os = "linux")]
         {
-            if std::fs::metadata(format!("/proc/{}", child.id())).is_ok() {
-                return ChildExit::Running;
+            match procfs_task_present(child.id()) {
+                Some(true) => return ChildExit::Running,
+                Some(false) => {}
+                None => return ChildExit::Uncertain,
             }
         }
         ChildExit::Terminated
     } else {
         ChildExit::Uncertain
+    }
+}
+
+/// Whether `/proc` can be trusted to reflect this process's PID
+/// namespace: `/proc/self/status` `Pid` must equal our own
+/// `getpid()`. A missing or unreadable procfs, or a foreign
+/// namespace view whose `Pid` field does not match, cannot prove
+/// any `/proc` answer — custody answers sourced there are
+/// `Unknown`/`Uncertain` rather than trusted.
+#[cfg(target_os = "linux")]
+fn procfs_view_valid() -> bool {
+    match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Pid:"))
+                .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+                == Some(unsafe { libc::getpid() })
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether `/proc` lists a task for `pid`: `Some(true)` present,
+/// `Some(false)` provably absent under a validated procfs view,
+/// `None` when the answer cannot be trusted (absent/foreign
+/// procfs, or an unqualified metadata error).
+#[cfg(target_os = "linux")]
+fn procfs_task_present(pid: u32) -> Option<bool> {
+    if !procfs_view_valid() {
+        return None;
+    }
+    match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -229,15 +269,20 @@ enum TracerCustody {
 /// process still traces the task, which keeps even a dead
 /// (`WIFSIGNALED`) task present as a zombie that other processes
 /// can still observe; its custody serialization must stay held
-/// until the tracer releases it. An absent task path is trusted
-/// only when procfs itself is proven mounted (`/proc/self`
-/// present); an absent or foreign procfs view makes the answer
-/// `Unknown` rather than `Unheld` (fail closed). A status whose
-/// `TracerPid` field is missing or unreadable counts as held.
+/// until the tracer releases it. `/proc` answers are trusted
+/// only when the procfs view is validated (`/proc/self/status`
+/// `Pid` == `getpid()`); an absent or foreign procfs view makes
+/// the answer `Unknown` rather than `Unheld` (fail closed). A
+/// status whose `TracerPid` field is missing or unreadable
+/// counts as held, and an unanswerable read of the task's status
+/// counts as held too — only a provably `TracerPid: 0` task
+/// under a validated view is `Unheld`.
 #[cfg(target_os = "linux")]
 fn task_held_by_tracer(pid: u32) -> TracerCustody {
-    let procpath = format!("/proc/{pid}/status");
-    match std::fs::read_to_string(&procpath) {
+    if !procfs_view_valid() {
+        return TracerCustody::Unknown;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/status")) {
         Ok(status) => match status
             .lines()
             .find_map(|line| line.strip_prefix("TracerPid:"))
@@ -250,14 +295,9 @@ fn task_held_by_tracer(pid: u32) -> TracerCustody {
             None => TracerCustody::Held,
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Absent only counts when procfs itself is proven
-            // present — `/proc/self` must exist in this same
-            // view or the missing child path proves nothing.
-            if std::path::Path::new("/proc/self").exists() {
-                TracerCustody::Unheld
-            } else {
-                TracerCustody::Unknown
-            }
+            // The task path is provably absent under a validated
+            // procfs view — nothing remains for a tracer to hold.
+            TracerCustody::Unheld
         }
         Err(_) => TracerCustody::Held,
     }
