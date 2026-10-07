@@ -467,8 +467,24 @@ fn libsecret_lookup_bounded(
     let bytes = match result {
         Ok(bytes) => bytes,
         Err(error) => {
-            let killed = child.kill().is_ok() || child.try_wait().ok().flatten().is_some();
-            let reaped = killed && child.wait().is_ok();
+            // Signal once, then reap on the remaining budget — a
+            // blocking `wait` here could hold the custody guard past
+            // the deadline, so `try_wait` polls in bounded slices and
+            // a child not provably reaped before the budget is spent
+            // fences the whole verification path.
+            let _ = child.kill();
+            let reaped = 'reap: loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break 'reap true,
+                    Ok(None) => {
+                        let Some(left) = deadline.remaining() else {
+                            break 'reap false;
+                        };
+                        std::thread::sleep(left.min(Duration::from_millis(25)));
+                    }
+                    Err(_) => break 'reap false,
+                }
+            };
             if !reaped {
                 fenced.store(true, std::sync::atomic::Ordering::SeqCst);
             }

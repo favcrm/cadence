@@ -1228,7 +1228,8 @@ esac
         tools.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut isolated = std::process::Command::new(std::env::current_exe().unwrap());
+    isolated
         .args([
             "--exact",
             "cad1065_libsecret_cleanup_pending_is_bounded_and_fences_verification",
@@ -1238,9 +1239,9 @@ esac
         .env(CHILD, "1")
         .env("CAD1065_CLEANUP_TOOL_DIR", tools.path())
         .env("PATH", path)
-        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/cad1065-test-bus")
-        .status()
-        .expect("could not start isolated cleanup-gate process");
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/cad1065-test-bus");
+    let output =
+        reaper::status(&mut isolated).expect("could not start isolated cleanup-gate process");
     assert!(
         output.success(),
         "isolated libsecret cleanup gate failed: {output}"
