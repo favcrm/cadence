@@ -469,9 +469,13 @@ fn libsecret_lookup_bounded(
         Err(error) => {
             // Signal once, then reap on the remaining budget — a
             // blocking `wait` here could hold the custody guard past
-            // the deadline, so `try_wait` polls in bounded slices and
-            // a child not provably reaped before the budget is spent
-            // fences the whole verification path.
+            // the deadline, so `try_wait` polls in bounded slices. A
+            // child not provably reaped before the budget is spent
+            // cannot be safely abandoned: `Child::drop` would release
+            // ownership while it may still run and reaps nothing, so
+            // the registration is retained for the process lifetime
+            // (the daemon remains its owner under the subreaper) and
+            // the whole verification path is fenced until restart.
             let _ = child.kill();
             let reaped = 'reap: loop {
                 match child.try_wait() {
@@ -487,6 +491,7 @@ fn libsecret_lookup_bounded(
             };
             if !reaped {
                 fenced.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::mem::forget(child);
             }
             return Err(error);
         }

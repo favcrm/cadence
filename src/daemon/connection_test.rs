@@ -208,13 +208,19 @@ impl Shared {
             }
         }
         for (provider, account) in candidates {
-            let candidate = self.builtin_connection_id(&provider, &account)?;
+            let candidate = format!(
+                "builtin-{}",
+                uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_OID,
+                    format!("{}:{provider}:{account}", workspace).as_bytes()
+                )
+                .simple()
+            );
             if candidate == id {
                 let digest = registration_digest_for(self, &provider);
                 return Ok(Some((provider, account, digest)));
             }
         }
-        let _ = workspace;
         Ok(None)
     }
 
