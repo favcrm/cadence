@@ -129,29 +129,65 @@ where
     T::deserialize(de).map(Some)
 }
 /// CAD-1065: the `POST /api/connections/:id/test` body. Both expected
-/// values are required keys — each is `null` or a value; `null` is an
-/// exact compare at the daemon, never a wildcard, and a missing key
-/// is a schema refusal here. `deny_unknown_fields` closes the body.
+/// values are required keys — each is `null` or a well-formed value;
+/// `null` is an exact compare at the daemon, never a wildcard, and a
+/// missing key or a malformed value is a schema refusal here
+/// (`invalid connection request schema`, never a relayed daemon
+/// diagnostic — the request body never reaches the daemon).
+/// `deny_unknown_fields` closes the body.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Test {
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(deserialize_with = "required_nullable_revision")]
     expected_revision: Option<u64>,
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(deserialize_with = "required_nullable_digest")]
     expected_registration_digest: Option<String>,
 }
 
-/// A field the client must send but may null: `Option` alone treats an
-/// absent key as `None`, which would accept a body that simply forgot
-/// the field — the daemon's required-key rule could then never see
-/// the omission. Presence is enforced by the missing-field error, and
-/// an explicit `null` parses as `None`.
-fn required_nullable<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
+/// `expected_revision`: present, `null`, or a positive integer —
+/// `0`, a negative, a float, a non-number all refuse the body.
+fn required_nullable_revision<'de, D>(de: D) -> Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
 {
-    Option::<T>::deserialize(de)
+    match Option::<serde_json::Value>::deserialize(de)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .filter(|value| *value > 0)
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("invalid expected_revision")),
+        Some(_) => Err(serde::de::Error::custom("invalid expected_revision")),
+    }
+}
+
+/// `expected_registration_digest`: present, `null`, or the canonical
+/// `sha256:` + 64 lowercase-hex form — anything else refuses the body.
+fn required_nullable_digest<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<serde_json::Value>::deserialize(de)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            let rest = s
+                .strip_prefix("sha256:")
+                .ok_or_else(|| serde::de::Error::custom("invalid expected_registration_digest"))?;
+            if rest.len() != 64
+                || !rest
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err(serde::de::Error::custom(
+                    "invalid expected_registration_digest",
+                ));
+            }
+            Ok(Some(s))
+        }
+        Some(_) => Err(serde::de::Error::custom(
+            "invalid expected_registration_digest",
+        )),
+    }
 }
 
 #[derive(Deserialize)]

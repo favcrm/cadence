@@ -584,3 +584,422 @@ fn cad1065_actual_rpc_and_http_refuse_nonoperator_before_credentials_or_traffic(
         "verification mutated connection authority/state"
     );
 }
+
+fn assert_admission_receipt(value: &Value, row: &Value, status: &str, code: &str) {
+    assert_eq!(
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["verification"].into_iter().collect(),
+        "verification response has extension fields"
+    );
+    let receipt = &value["verification"];
+    let expected: std::collections::BTreeSet<&str> = [
+        "schema",
+        "operation",
+        "connection_id",
+        "revision",
+        "registration_digest",
+        "started_at",
+        "completed_at",
+        "status",
+        "network_attempted",
+        "authentication_verified",
+        "email_sent",
+        "delivery_verified",
+        "sender_entitlement_verified",
+        "execution_authority",
+        "failure",
+    ]
+    .into_iter()
+    .collect();
+    let actual: std::collections::BTreeSet<&str> = receipt
+        .as_object()
+        .expect("typed receipt is absent")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(actual, expected, "receipt has missing or extension fields");
+    assert_eq!(receipt["schema"], 1);
+    assert_eq!(receipt["operation"], "smtp-login-no-send-v1");
+    assert_eq!(receipt["connection_id"], row["id"]);
+    assert_eq!(receipt["revision"], row["revision"]);
+    assert_eq!(receipt["registration_digest"], row["registration_digest"]);
+    assert_eq!(receipt["status"], status);
+    assert_eq!(receipt["failure"]["code"], code);
+    assert!(
+        ["admission", "configuration"]
+            .contains(&receipt["failure"]["step"].as_str().unwrap_or_default()),
+        "wrong pre-network failure stage"
+    );
+    assert_eq!(
+        receipt["failure"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["code", "step"].into_iter().collect()
+    );
+    for key in ["started_at", "completed_at"] {
+        assert!(
+            receipt[key].as_str().is_some_and(|value| !value.is_empty()),
+            "required daemon timestamp is missing"
+        );
+    }
+    for key in [
+        "network_attempted",
+        "authentication_verified",
+        "email_sent",
+        "delivery_verified",
+        "sender_entitlement_verified",
+        "execution_authority",
+    ] {
+        assert_eq!(receipt[key], false, "admission failure made a false claim");
+    }
+    assert!(
+        !value.to_string().contains(PASSWORD),
+        "admission receipt published the synthetic credential"
+    );
+}
+
+#[test]
+fn cad1065_actual_rpc_http_strict_request_and_exact_cas_before_secret_or_traffic() {
+    let fixture = Fixture::start();
+    let row = fixture.operator(
+        "connection_create",
+        json!({
+            "provider":"smtp", "account":"gate-sender", "shape":"smtp",
+            "host":"localhost", "port":fixture.port, "tls_mode":"implicit",
+            "username":"sender@example.test", "secret":PASSWORD, "sender":"sender@example.test",
+            "scopes":["email:send"], "accept_same_uid_risk":true,
+        }),
+    )["connection"]
+        .clone();
+    let builtin = fixture.operator("connection_list", json!({}))["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["provider"] == "local" && row["kind"] == "builtin")
+        .expect("credentialless positive-control row is absent")
+        .clone();
+    let (cookie, key) = fixture.session();
+    let initial = fixture.state_snapshot();
+    let reads = CredentialReads::watch(&fixture.state().join("custody"));
+    let dials = platform::smtp::direct_dial_count();
+    let route = format!("/api/connections/{}/test", row["id"].as_str().unwrap());
+    let current = json!({
+        "connection_id":row["id"], "expected_revision":row["revision"],
+        "expected_registration_digest":row["registration_digest"],
+    });
+    let malformed = [
+        ("expected_revision", None),
+        ("expected_registration_digest", None),
+        ("expected_revision", Some(json!(0))),
+        ("expected_revision", Some(json!(-1))),
+        ("expected_revision", Some(json!(1.0))),
+        (
+            "expected_revision",
+            Some(json!("cad1065-input-echo-canary")),
+        ),
+        ("expected_revision", Some(json!(true))),
+        ("expected_registration_digest", Some(json!([]))),
+        (
+            "expected_registration_digest",
+            Some(json!("cad1065-input-echo-canary")),
+        ),
+        (
+            "cad1065-field-echo-canary",
+            Some(json!("cad1065-input-echo-canary")),
+        ),
+    ];
+    for (field, replacement) in malformed {
+        let mut request = current.clone();
+        match replacement {
+            Some(value) => request[field] = value,
+            None => {
+                request.as_object_mut().unwrap().remove(field);
+            }
+        }
+        let error = fixture
+            .rpc(Asserted::Operator, request.clone())
+            .expect_err("malformed request reached verification");
+        assert_eq!(error.kind(), "rejected");
+        let diagnostic = error.to_string();
+        assert!(
+            !diagnostic.contains("cad1065-input-echo-canary")
+                && !diagnostic.contains("cad1065-field-echo-canary"),
+            "RPC malformed diagnostic reflected request data"
+        );
+        request.as_object_mut().unwrap().remove("connection_id");
+        let (status, diagnostic, _) =
+            fixture.http("operator", &route, request, Some((&cookie, &key)));
+        assert_eq!(status, 400, "HTTP admitted a malformed verification body");
+        let diagnostic = diagnostic.to_string();
+        assert!(
+            !diagnostic.contains("cad1065-input-echo-canary")
+                && !diagnostic.contains("cad1065-field-echo-canary"),
+            "HTTP malformed diagnostic reflected request data"
+        );
+        reads.assert_no_read();
+        assert_eq!(platform::smtp::direct_dial_count(), dials);
+        assert!(fixture.observed().is_empty());
+    }
+    let (status, _, _) = fixture.http(
+        "operator",
+        &format!("{route}?cad1065-query-echo-canary=1"),
+        json!({
+            "expected_revision":row["revision"],
+            "expected_registration_digest":row["registration_digest"],
+        }),
+        Some((&cookie, &key)),
+    );
+    assert_eq!(status, 400, "HTTP admitted an unapproved query option");
+    reads.assert_no_read();
+    assert_eq!(platform::smtp::direct_dial_count(), dials);
+    assert!(fixture.observed().is_empty());
+    let wrong_digest = json!(format!("sha256:{}", "0".repeat(64)));
+    assert_ne!(wrong_digest, row["registration_digest"]);
+    let stale = [
+        (
+            json!(row["revision"].as_u64().unwrap().checked_add(1).unwrap()),
+            row["registration_digest"].clone(),
+        ),
+        (Value::Null, row["registration_digest"].clone()),
+        (row["revision"].clone(), Value::Null),
+        (row["revision"].clone(), wrong_digest.clone()),
+        (Value::Null, Value::Null),
+    ];
+    for (revision, digest) in stale {
+        let request = json!({
+            "connection_id":row["id"], "expected_revision":revision,
+            "expected_registration_digest":digest,
+        });
+        let result = fixture.rpc(Asserted::Operator, request).unwrap();
+        assert_admission_receipt(&result, &row, "stale", "stale_connection");
+        let (status, result, _) = fixture.http(
+            "operator",
+            &route,
+            json!({"expected_revision":revision,"expected_registration_digest":digest}),
+            Some((&cookie, &key)),
+        );
+        assert_eq!(status, 200);
+        assert_admission_receipt(&result, &row, "stale", "stale_connection");
+        reads.assert_no_read();
+        assert_eq!(platform::smtp::direct_dial_count(), dials);
+        assert!(fixture.observed().is_empty());
+    }
+    for (revision, expected_status, expected_code) in [
+        (
+            builtin["revision"].clone(),
+            "unsupported",
+            "unsupported_provider",
+        ),
+        (json!(1), "stale", "stale_connection"),
+    ] {
+        let result = fixture
+            .rpc(
+                Asserted::Operator,
+                json!({
+                    "connection_id":builtin["id"], "expected_revision":revision,
+                    "expected_registration_digest":builtin["registration_digest"],
+                }),
+            )
+            .unwrap();
+        assert_admission_receipt(&result, &builtin, expected_status, expected_code);
+        let builtin_route = format!("/api/connections/{}/test", builtin["id"].as_str().unwrap());
+        let (status, result, _) = fixture.http(
+            "operator",
+            &builtin_route,
+            json!({
+                "expected_revision":revision,
+                "expected_registration_digest":builtin["registration_digest"],
+            }),
+            Some((&cookie, &key)),
+        );
+        assert_eq!(status, 200);
+        assert_admission_receipt(&result, &builtin, expected_status, expected_code);
+        reads.assert_no_read();
+        assert_eq!(platform::smtp::direct_dial_count(), dials);
+        assert!(fixture.observed().is_empty());
+    }
+    assert!(
+        initial == fixture.state_snapshot(),
+        "pre-admission calls changed connection authority or state"
+    );
+    let successful = fixture.rpc(Asserted::Operator, current).unwrap();
+    assert_receipt(&successful, &row);
+    reads.assert_read_observed();
+    let observed = fixture.observed();
+    assert_eq!(
+        observed.iter().filter(|value| *value == "CONNECT").count(),
+        1
+    );
+    assert_eq!(observed.iter().filter(|value| *value == "AUTH").count(), 1);
+    assert_eq!(observed.iter().filter(|value| *value == "QUIT").count(), 1);
+    assert!(!observed
+        .iter()
+        .any(|value| ["MAIL", "RCPT", "DATA", "RIG_FAILURE"].contains(&value.as_str())));
+    assert!(
+        initial == fixture.state_snapshot(),
+        "positive verification changed connection authority or state"
+    );
+}
+
+fn fixture_with_peer(script: &str) -> Fixture {
+    let mut fixture = Fixture::start();
+    fixture._rig.0.kill().unwrap();
+    fixture._rig.0.wait().unwrap();
+    std::fs::remove_file(fixture.root.path().join("port")).unwrap();
+    fixture._rig = OwnedChild(
+        reaper::spawn(
+            Command::new("python3")
+                .args(["-c", script])
+                .arg(fixture.root.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !fixture.root.path().join("port").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "controlled SMTP peer did not start"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    fixture.port = std::fs::read_to_string(fixture.root.path().join("port"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    fixture
+}
+
+#[test]
+fn cad1065_actual_secure_probe_checks_quit_and_does_not_publish_peer_echo() {
+    for (script, code, step) in [
+        (
+            SMTP_RIG.replace(
+                r#"wire.write(b"221 2.0.0 goodbye\r\n")"#,
+                r#"wire.write(b"500 cad1065-synthetic-only-password only-password peer-echo-canary\r\n")"#,
+            ),
+            "quit_failed",
+            "quit",
+        ),
+        (
+            SMTP_RIG.replace(
+                r#"wire.write(b"235 2.7.0 authenticated\r\n")"#,
+                r#"wire.write(b"535 cad1065-synthetic-only-password only-password peer-echo-canary\r\n")"#,
+            ),
+            "auth_failed",
+            "auth",
+        ),
+    ] {
+        assert_ne!(script, SMTP_RIG, "controlled peer variant was not applied");
+        let fixture = fixture_with_peer(&script);
+        let row = fixture.operator(
+            "connection_create",
+            json!({
+                "provider":"smtp", "account":"gate-sender", "shape":"smtp",
+                "host":"localhost", "port":fixture.port, "tls_mode":"implicit",
+                "username":"sender@example.test", "secret":PASSWORD, "sender":"sender@example.test",
+                "scopes":["email:send"], "accept_same_uid_risk":true,
+            }),
+        )["connection"]
+            .clone();
+        let initial = fixture.state_snapshot();
+        let reads = CredentialReads::watch(&fixture.state().join("custody"));
+        let result = fixture
+            .rpc(
+                Asserted::Operator,
+                json!({
+                    "connection_id":row["id"], "expected_revision":row["revision"],
+                    "expected_registration_digest":row["registration_digest"],
+                }),
+            )
+            .unwrap();
+        let receipt = &result["verification"];
+        assert_eq!(receipt["schema"], 1);
+        assert_eq!(receipt["operation"], "smtp-login-no-send-v1");
+        assert_eq!(receipt["connection_id"], row["id"]);
+        assert_eq!(receipt["revision"], row["revision"]);
+        assert_eq!(receipt["registration_digest"], row["registration_digest"]);
+        assert_eq!(receipt["status"], "failed");
+        assert_eq!(receipt["network_attempted"], true);
+        assert_eq!(receipt["failure"]["code"], code);
+        assert_eq!(receipt["failure"]["step"], step);
+        for field in [
+            "authentication_verified",
+            "email_sent",
+            "delivery_verified",
+            "sender_entitlement_verified",
+            "execution_authority",
+        ] {
+            assert_eq!(receipt[field], false);
+        }
+        let public = result.to_string();
+        for canary in [PASSWORD, "only-password", "peer-echo-canary"] {
+            assert!(!public.contains(canary), "provider bytes escaped the probe");
+        }
+        reads.assert_read_observed();
+        let observed = fixture.observed();
+        assert!(observed.iter().any(|command| command == "CONNECT"));
+        assert!(observed.iter().any(|command| command == "AUTH"));
+        if step == "quit" {
+            assert!(observed.iter().any(|command| command == "QUIT"));
+        }
+        assert!(!observed
+            .iter()
+            .any(|value| ["MAIL", "RCPT", "DATA", "RIG_FAILURE"].contains(&value.as_str())));
+        assert!(
+            initial == fixture.state_snapshot(),
+            "failed probe changed connection authority or state"
+        );
+    }
+}
+
+#[test]
+fn cad1065_actual_short_coincident_password_remains_login_verifiable() {
+    let script = SMTP_RIG.replace(PASSWORD, "success");
+    assert_ne!(script, SMTP_RIG);
+    let fixture = fixture_with_peer(&script);
+    let row = fixture.operator(
+        "connection_create",
+        json!({
+            "provider":"smtp", "account":"gate-sender", "shape":"smtp",
+            "host":"localhost", "port":fixture.port, "tls_mode":"implicit",
+            "username":"sender@example.test", "secret":"success", "sender":"sender@example.test",
+            "scopes":["email:send"], "accept_same_uid_risk":true,
+        }),
+    )["connection"]
+        .clone();
+    let initial = fixture.state_snapshot();
+    let result = fixture
+        .rpc(
+            Asserted::Operator,
+            json!({
+                "connection_id":row["id"], "expected_revision":row["revision"],
+                "expected_registration_digest":row["registration_digest"],
+            }),
+        )
+        .unwrap();
+    assert_receipt(&result, &row);
+    let observed = fixture.observed();
+    assert_eq!(
+        observed.iter().filter(|value| *value == "CONNECT").count(),
+        1
+    );
+    assert_eq!(observed.iter().filter(|value| *value == "AUTH").count(), 1);
+    assert_eq!(observed.iter().filter(|value| *value == "QUIT").count(), 1);
+    assert!(!observed
+        .iter()
+        .any(|value| ["MAIL", "RCPT", "DATA", "RIG_FAILURE"].contains(&value.as_str())));
+    assert!(
+        initial == fixture.state_snapshot(),
+        "short-password probe changed connection authority or state"
+    );
+}

@@ -243,11 +243,38 @@ impl Shared {
         }
 
         // The current Connection projection — the fail-fast read only.
+        // A read that fails (contention, poison) keeps the fixed neutral
+        // envelope; a clean "no such row" is a typed receipt — the
+        // absent/incarnation case the caller must distinguish, not an
+        // operator-facing error.
         let record = self
             .store
             .connection_credential_strict(id)
-            .map_err(|_| Error::rejected("connection is unavailable or stale"))?
-            .ok_or_else(|| Error::rejected("connection is unavailable or stale"))?;
+            .map_err(|_| Error::rejected("connection is unavailable or stale"))?;
+
+        let hosted = self.smtp_internal.is_some() || self.hosted_email.is_some();
+        let Some(record) = record else {
+            // Missing/foreign/built-in: there is no enrolled row, so the
+            // server-side values are both null. A caller expecting a live
+            // revision or digest is stale; one matching the null pair is
+            // unsupported (a hosted daemon is unsupported_deployment).
+            let mut receipt = VerificationReceipt::new(id, started_at);
+            if expected_revision.is_some() || expected_digest.is_some() {
+                return Ok(receipt
+                    .failed("stale", "stale_connection", "admission")
+                    .value());
+            }
+            receipt.status = "unsupported";
+            receipt.failure = Some(Failure {
+                code: if hosted {
+                    "unsupported_deployment"
+                } else {
+                    "unsupported_provider"
+                },
+                step: "admission",
+            });
+            return Ok(receipt.value());
+        };
 
         let registration = self
             .platforms
@@ -273,7 +300,6 @@ impl Shared {
                 .failed("stale", "stale_connection", "admission")
                 .value());
         }
-        let hosted = self.smtp_internal.is_some() || self.hosted_email.is_some();
         if let Some(reason) = verification_support(
             &record.platform,
             Some(&record),
