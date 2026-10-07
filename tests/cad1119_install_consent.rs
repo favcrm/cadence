@@ -10,7 +10,7 @@ use cadence_agent::contract_fixture::{ToolTable, Verified};
 use cadence_agent::platform::connections::{
     BoundActionMapping, CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor,
 };
-use cadence_agent::platform::{AppCapabilityQuote, PlatformAdapter};
+use cadence_agent::platform::{AppCapabilityOutput, AppCapabilityQuote, PlatformAdapter};
 use cadence_agent::test_seam::{scoped, Asserted, Seam, AS_HEADER, TOKEN_HEADER};
 use cadence_agent::{client, daemon, store::Store};
 use serde_json::{json, Value};
@@ -30,6 +30,7 @@ struct Shape {
     pin: &'static str,
     scopes: Vec<&'static str>,
     effect: &'static str,
+    price_micros: u64,
 }
 
 impl Shape {
@@ -40,6 +41,7 @@ impl Shape {
             pin: "probe-tools@2",
             scopes: vec!["provider.read"],
             effect: "read",
+            price_micros: 2000,
         }
     }
     fn table(&self) -> ToolTable {
@@ -55,6 +57,9 @@ impl Shape {
 struct Moving {
     shape: Mutex<Shape>,
     table: Mutex<&'static ToolTable>,
+    /// CAD-1171 reviewer seam: counts fake provider executions so the
+    /// host-run acceptance proves one tap is one provider call.
+    calls: Mutex<u64>,
 }
 
 impl Moving {
@@ -64,6 +69,7 @@ impl Moving {
         Arc::new(Self {
             shape: Mutex::new(shape),
             table: Mutex::new(table),
+            calls: Mutex::new(0),
         })
     }
     fn shift(&self, change: impl FnOnce(&mut Shape)) {
@@ -120,16 +126,37 @@ impl PlatformAdapter for Moving {
         _credential: &[u8],
         binding: &Value,
     ) -> Result<AppCapabilityQuote, String> {
-        if binding["config"]["mapping"]["tool"] != self.shape.lock().unwrap().tool {
-            return Err("not_allowlisted".into());
-        }
+        let micros = {
+            let shape = self.shape.lock().unwrap();
+            if binding["config"]["mapping"]["tool"] != shape.tool {
+                return Err("not_allowlisted".into());
+            }
+            shape.price_micros
+        };
         Ok(AppCapabilityQuote {
             schema: 1,
             currency: "USD".into(),
-            unit_price_micros: 2000,
+            unit_price_micros: micros,
             units: 1,
-            total_price_micros: 2000,
+            total_price_micros: micros,
             price_revision: "probe-price/1".into(),
+        })
+    }
+    /// CAD-1171 reviewer seam: the smallest fake read adapter that can
+    /// execute a host run — one bounded receipt per call. The worker
+    /// `execute` above keeps refusing; only the run-bound capability
+    /// path answers, and every call is counted.
+    fn execute_app_capability(
+        &self,
+        _credential: &[u8],
+        _authority: &Value,
+        _input: &Value,
+        _idempotency_key: &str,
+    ) -> Result<AppCapabilityOutput, String> {
+        *self.calls.lock().unwrap() += 1;
+        Ok(AppCapabilityOutput {
+            result: json!({"schema": 1, "posts": [], "profile": "probe"}),
+            asset: None,
         })
     }
     fn reported_manifest_version(&self) -> Option<String> {
@@ -832,4 +859,153 @@ fn r3_rotated_credential_needs_the_operator_before_runs_resume() {
     fx.quote(Asserted::Operator, &install).unwrap();
     let run = fx.run(Asserted::Operator, &install, "run-rot-b").unwrap();
     assert_eq!(run["state"], "awaiting_approval", "{run}");
+}
+
+/// CAD-1171 reviewer-authored acceptance (the implementer did not write
+/// this): the host path through the real daemon. A host run is created
+/// with no owner PM and no worker input, approved, and dispatched; the
+/// daemon executes the bound capability in-process, retains the receipt,
+/// and completes the run — with exactly one provider call and zero agents
+/// anywhere (no owner, no assignments, no worker notify).
+///
+/// Harness note: the suggested `cad1123_hp4_acceptance.rs` board harness
+/// is social-publish-only (a counting `PublishSender` door; no
+/// install/bindings/app-run path), so this uses the `cad1119` Fx, which
+/// is the harness that actually sets up an install, bindings, a fake
+/// app-capability adapter, and an operator connection.
+const HOST_WORKFLOW: &str = r#"---
+title: "Read listing: {{handle}}"
+goal: "Retain one bounded provider receipt"
+label: Read listing host
+capability_slots: [source]
+execution: host
+inputs:
+  handle: { ask: "Listing handle", example: "probe" }
+---
+Read the selected listing through the bound `source` capability.
+
+## Read listing: {{handle}}
+size: S
+action: local.capability.call
+
+Call `source` once and report the receipt identity.
+
+### Acceptance
+- [ ] the receipt identity is reported
+"#;
+
+impl Fx {
+    /// CAD-1171: add the host-execution workflow to the package before
+    /// install, then install and bind the `source` slot exactly like r5.
+    fn host_install(&self) -> String {
+        std::fs::write(self.source().join("workflows/hostread.md"), HOST_WORKFLOW).unwrap();
+        let install = self.install()["install_id"].as_str().unwrap().to_string();
+        self.bind(&install);
+        install
+    }
+    /// CAD-1171: create a host run — no owner PM, no worker input.
+    fn host_run(&self, install: &str, request: &str) -> cadence_agent::Result<Value> {
+        let params = json!({"install_id": install, "workflow": "hostread",
+            "inputs": {"handle": "probe"}, "request_id": request});
+        self.rpc(Asserted::Operator, "app_run_create", params)
+    }
+    fn host_calls(&self) -> u64 {
+        *self.provider.calls.lock().unwrap()
+    }
+    fn host_approve_dispatch(&self, id: &str, digest: Value) -> Value {
+        let approved = self.op("app_run_approve", json!({"run_id": id, "digest": digest}));
+        assert_eq!(approved["state"], "approved", "{approved}");
+        self.op("app_run_dispatch", json!({"run_id": id}))
+    }
+}
+
+#[test]
+fn cad1171_host_run_executes_in_process_with_no_agents() {
+    let fx = Fx::start();
+    let install = fx.host_install();
+    let run = fx.host_run(&install, "host-e2e-1").unwrap();
+    let id = run["id"].as_str().unwrap().to_string();
+    let digest = run["snapshot_digest"].clone();
+    assert_eq!(run["state"], "awaiting_approval", "{run}");
+    assert_eq!(run["snapshot"]["owner_pm"], Value::Null, "{run}");
+    assert_eq!(run["snapshot"]["assignments"], json!({}), "{run}");
+    let done = fx.host_approve_dispatch(&id, digest);
+    assert_eq!(done["state"], "succeeded", "{done}");
+    assert_eq!(fx.host_calls(), 1, "one tap is one provider call");
+    let completed = fx.audit("app_run_completed");
+    let event = completed.last().expect("completion event");
+    assert_eq!(event["run_id"], id.as_str());
+    assert_eq!(event["host"], true);
+    let shown = fx.op("app_run_show", json!({"run_id": id}));
+    assert_eq!(shown["state"], "succeeded", "{shown}");
+    assert_eq!(shown["snapshot"]["assignments"], json!({}), "{shown}");
+}
+
+#[test]
+fn cad1171_host_run_refuses_changed_quote_before_any_provider_call() {
+    let fx = Fx::start();
+    let install = fx.host_install();
+    let run = fx.host_run(&install, "host-quote-1").unwrap();
+    let id = run["id"].as_str().unwrap().to_string();
+    let digest = run["snapshot_digest"].clone();
+    let approved = fx.op("app_run_approve", json!({"run_id": id, "digest": digest}));
+    assert_eq!(approved["state"], "approved", "{approved}");
+    // The provider reprices between approval and dispatch. The firing
+    // gate is the dispatch entry-guard re-quote ("since run creation");
+    // the execute-time comparison one layer down guards the same values
+    // against read skew — defense-in-depth over an identical check.
+    fx.provider.shift(|s| s.price_micros = 3000);
+    let error = fx
+        .rpc(
+            Asserted::Operator,
+            "app_run_dispatch",
+            json!({"run_id": id}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("capability price changed since run creation"),
+        "{error}"
+    );
+    assert_eq!(fx.host_calls(), 0, "no provider call before the refusal");
+    let shown = fx.op("app_run_show", json!({"run_id": id}));
+    assert_ne!(shown["state"], "succeeded", "{shown}");
+}
+
+#[test]
+fn cad1171_host_run_refuses_send_effect_before_any_provider_call() {
+    let fx = Fx::start();
+    // A send-effect slot is not installable at all (install refuses the
+    // capability contract up front), so the escalation below is the honest
+    // way to put a send effect in front of the execution gate: the
+    // reviewed descriptor moves read -> send after approval, and dispatch
+    // must refuse before any provider call. The firing gate is the
+    // execute-time config re-derivation ("effect differs from app
+    // contract"); behind it stand the drift guard (`effect` is slot
+    // contract, only `tool` may migrate) and the read/draft
+    // classification — four layers, all refusing send effects, with the
+    // install-time contract check having already refused a send slot at
+    // bind. This test proves the execute-time layer.
+    let install = fx.host_install();
+    let run = fx.host_run(&install, "host-effect-1").unwrap();
+    let id = run["id"].as_str().unwrap().to_string();
+    let digest = run["snapshot_digest"].clone();
+    let approved = fx.op("app_run_approve", json!({"run_id": id, "digest": digest}));
+    assert_eq!(approved["state"], "approved", "{approved}");
+    fx.provider.shift(|s| s.effect = "send");
+    let error = fx
+        .rpc(
+            Asserted::Operator,
+            "app_run_dispatch",
+            json!({"run_id": id}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("effect differs from app contract"),
+        "{error}"
+    );
+    assert_eq!(fx.host_calls(), 0, "no provider call before the refusal");
+    let shown = fx.op("app_run_show", json!({"run_id": id}));
+    assert_ne!(shown["state"], "succeeded", "{shown}");
 }
