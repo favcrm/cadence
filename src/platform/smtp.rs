@@ -1352,15 +1352,20 @@ impl<'d> LoginSession<'d> {
         let mut text = String::new();
         let mut code = 0u16;
         let mut lines = 0usize;
+        let mut wire_bytes = 0usize;
         loop {
             if lines >= Self::REPLY_MAX_LINES {
                 return Err(LoginFault::Io);
             }
-            if text.len() >= Self::REPLY_TOTAL_CAP {
+            if wire_bytes >= Self::REPLY_TOTAL_CAP {
                 return Err(LoginFault::Io);
             }
             let line = self.read_line_capped()?;
             lines += 1;
+            wire_bytes += line.len();
+            if wire_bytes > Self::REPLY_TOTAL_CAP {
+                return Err(LoginFault::Io);
+            }
             if line.len() < 4 || !line.as_bytes().iter().take(3).all(|b| b.is_ascii_digit()) {
                 return Err(LoginFault::Io);
             }
@@ -1373,9 +1378,6 @@ impl<'d> LoginSession<'d> {
             let payload = line[3..]
                 .trim_end_matches(['\r', '\n'])
                 .trim_start_matches(['-', ' ']);
-            if text.len() + payload.len() + 1 > Self::REPLY_TOTAL_CAP {
-                return Err(LoginFault::Io);
-            }
             text.push_str(payload);
             match line.as_bytes().get(3) {
                 Some(b' ') => return Ok(SmtpLine { code, text }),

@@ -467,10 +467,31 @@ fn libsecret_lookup_bounded(
     let bytes = match result {
         Ok(bytes) => bytes,
         Err(error) => {
-            let killed = child.kill().is_ok() || child.try_wait().ok().flatten().is_some();
-            let reaped = killed && child.wait().is_ok();
+            // Signal once, then reap on the remaining budget — a
+            // blocking `wait` here could hold the custody guard past
+            // the deadline, so `try_wait` polls in bounded slices. A
+            // child not provably reaped before the budget is spent
+            // cannot be safely abandoned: `Child::drop` would release
+            // ownership while it may still run and reaps nothing, so
+            // the registration is retained for the process lifetime
+            // (the daemon remains its owner under the subreaper) and
+            // the whole verification path is fenced until restart.
+            let _ = child.kill();
+            let reaped = 'reap: loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break 'reap true,
+                    Ok(None) => {
+                        let Some(left) = deadline.remaining() else {
+                            break 'reap false;
+                        };
+                        std::thread::sleep(left.min(Duration::from_millis(25)));
+                    }
+                    Err(_) => break 'reap false,
+                }
+            };
             if !reaped {
                 fenced.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::mem::forget(child);
             }
             return Err(error);
         }
