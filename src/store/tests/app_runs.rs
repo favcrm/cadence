@@ -19,6 +19,69 @@ fn cad631_explicit_local_schema_refuses_unsupported_execution_and_self_review() 
     }
 }
 
+/// CAD-1171: a host-execution capability run needs no agent at all — the
+/// operator's own click executes it — while an agent run still refuses a
+/// missing owner, and a capability step outside a host workflow refuses.
+#[test]
+fn cad1171_host_capability_run_needs_no_agents() {
+    use crate::store::app_runs::{LocalRunRequest, LocalWorkflow};
+    let (_dir, s) = store();
+    let host_text = "---\ntitle: Read\ngoal: Retain a bounded provider receipt\nlabel: Find source\ncapability_slots: [source]\nexecution: host\ninputs:\n  profile_handle: { ask: Handle }\n---\n## Acquire: {{profile_handle}}\nsize: S\naction: local.capability.call\n\nCall the frozen source binding.\n\n### Acceptance\n- [ ] receipt retained\n";
+    let mut inputs = std::collections::BTreeMap::new();
+    inputs.insert("profile_handle".into(), "juicysuite_crm".into());
+    let workflow = LocalWorkflow::parse(host_text, &inputs).unwrap();
+    assert_eq!(workflow.execution, "host");
+    assert_eq!(workflow.steps.len(), 1);
+    assert_eq!(workflow.steps[0].kind, "capability");
+    assert_eq!(workflow.steps[0].assignee, "");
+    // A host workflow may not carry an agent step, a capability step may
+    // not appear outside a host workflow, and host needs a capability slot.
+    for refused in [
+        host_text.replace(
+            "action: local.capability.call",
+            "agent: writer\naction: local.capability.call",
+        ),
+        host_text.replace("execution: host\n", ""),
+        host_text.replace("capability_slots: [source]\n", ""),
+    ] {
+        assert!(
+            LocalWorkflow::parse(&refused, &inputs).is_err(),
+            "{refused}"
+        );
+    }
+    // An agent run still needs its owner PM.
+    let agent_text = "---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n";
+    let no_inputs = std::collections::BTreeMap::new();
+    let agent = LocalWorkflow::parse(agent_text, &no_inputs).unwrap();
+    s.app_capability_decide("install-1", "sha256:bundle", true)
+        .unwrap();
+    // The relaxation is host-only: an agent run still needs its owner PM.
+    assert!(s
+        .app_run_create(LocalRunRequest {
+            install_id: "install-1",
+            bundle_digest: "sha256:bundle",
+            workflow: &agent,
+            inputs: &no_inputs,
+            request_id: "agent-without-owner",
+            owner_pm: None,
+            project_link: None,
+        })
+        .is_err());
+    // A host run still freezes its bound, priced capability: without the
+    // live binding proof the run is refused, owner or not.
+    assert!(s
+        .app_run_create(LocalRunRequest {
+            install_id: "install-1",
+            bundle_digest: "sha256:bundle",
+            workflow: &workflow,
+            inputs: &inputs,
+            request_id: "host-request-1",
+            owner_pm: None,
+            project_link: None,
+        })
+        .is_err());
+}
+
 #[test]
 fn cad631_material_digests_are_canonical_and_never_git_shas() {
     use crate::store::app_runs::{artifact_digest, material_digest};
@@ -66,7 +129,7 @@ pub(super) fn runtime_fixture() -> (TempDir, Store, Value) {
             workflow: &workflow,
             inputs: &inputs,
             request_id: "request-1",
-            owner_pm: "lead",
+            owner_pm: Some("lead"),
             project_link: None,
         })
         .unwrap();
@@ -670,7 +733,7 @@ fn cad631_pm_in_owner_group_is_not_an_execution_worker() {
             workflow: &workflow,
             inputs: &inputs,
             request_id: "pm-is-not-worker",
-            owner_pm: "lead",
+            owner_pm: Some("lead"),
             project_link: None,
         })
         .is_err());
@@ -690,7 +753,7 @@ fn cad631_generic_job_reads_do_not_reveal_private_rendered_title() {
             workflow: &workflow,
             inputs: &inputs,
             request_id: "private-title",
-            owner_pm: "lead",
+            owner_pm: Some("lead"),
             project_link: None,
         })
         .unwrap();
@@ -756,7 +819,7 @@ fn cad631_pty_team_is_explicitly_unsupported_and_transcript_history_is_private()
             workflow: &workflow,
             inputs: &inputs,
             request_id: "unsupported-pty",
-            owner_pm: "lead",
+            owner_pm: Some("lead"),
             project_link: None,
         })
         .is_err());
@@ -1121,7 +1184,7 @@ fn cad778_frozen_run_with_float_identity_approves() {
             workflow: &workflow,
             inputs: &inputs,
             request_id: "request-1",
-            owner_pm: "lead",
+            owner_pm: Some("lead"),
             project_link: None,
         })
         .unwrap();

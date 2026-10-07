@@ -1374,9 +1374,10 @@ pub(crate) enum RunAction {
         /// Idempotency key; reuse with different inputs is refused.
         #[arg(long)]
         request_id: String,
-        /// Registered PM whose workers execute this run.
+        /// Registered PM whose workers execute this run. Omitted for a
+        /// host-execution workflow (CAD-1171), which runs no worker.
         #[arg(long)]
-        owner_pm: String,
+        owner_pm: Option<String>,
         /// Optional discovery link; confers no authority.
         #[arg(long)]
         project_link: Option<String>,
@@ -1489,8 +1490,10 @@ fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
                 "workflow": workflow,
                 "inputs": read_run_inputs(inputs)?,
                 "request_id": request_id,
-                "owner_pm": owner_pm,
             });
+            if let Some(owner) = owner_pm {
+                params["owner_pm"] = json!(owner);
+            }
             if let Some(link) = project_link {
                 params["project_link"] = json!(link);
             }

@@ -335,7 +335,7 @@ impl Fx {
                     workflow: &workflow,
                     inputs: &inputs,
                     request_id: &format!("run-{tag}"),
-                    owner_pm: "lead",
+                    owner_pm: Some("lead"),
                     project_link: None,
                 },
                 None,

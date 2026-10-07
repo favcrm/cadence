@@ -1069,7 +1069,13 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
             // workflow `source_digest`, so a reader can name the run's
             // workflow without the snapshot carrying the file name.
             let source_digest = crate::store::app_runs::artifact_digest(text.as_bytes());
-            json!({"name":name,"inputs":inputs,"source_digest":source_digest,"label":label,"capability_slots":capability_slots,"distinct":distinct})
+            // CAD-1171: the run form reads `execution` — a host workflow
+            // runs in-process for the operator's click (no PM/worker).
+            let execution = template
+                .as_ref()
+                .map(|t| t.execution.as_str())
+                .unwrap_or("agent");
+            json!({"name":name,"inputs":inputs,"source_digest":source_digest,"label":label,"capability_slots":capability_slots,"distinct":distinct,"execution":execution})
         })
         .collect::<Vec<_>>();
     Ok(
