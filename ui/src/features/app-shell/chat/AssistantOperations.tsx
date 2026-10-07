@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../../lib/api";
 import Button from "../../../ui/Button";
 import Link from "../../../ui/Link";
+import { resourceHref, type ResourceRef } from "../assistantResourceNavigation";
 
 interface Action {
   id: string;
@@ -10,7 +11,6 @@ interface Action {
   confirmation: string;
   availability: string;
 }
-interface ResourceRef { kind: string; id: string; label: string }
 interface TagPreview {
   customer_label: string;
   before_tags: string[];
@@ -138,19 +138,6 @@ function parsePermission(value: unknown): Permission | null {
     scope_label: v.scope_label as string,
     semantics_digest: v.semantics_digest as string,
   };
-}
-
-const RESOURCE_SECTIONS = new Map<string, string>([
-  ["customer", "customers"], ["customers", "customers"],
-  ["segment", "segments"], ["segments", "segments"],
-  ["campaign", "campaigns"], ["campaigns", "campaigns"],
-]);
-function resourceHref(installId: string, contextId: string, ref: ResourceRef): string | null {
-  const section = RESOURCE_SECTIONS.get(ref.kind);
-  if (!section || !/^[A-Za-z0-9_-]{1,128}$/.test(ref.id) ||
-      !/^[A-Za-z0-9_-]{1,128}$/.test(installId) || !/^[A-Za-z0-9_-]{1,128}$/.test(contextId)) return null;
-  const query = new URLSearchParams({ ctx: contextId, crm: section, record: ref.id });
-  return `/app-installations/${encodeURIComponent(installId)}?${query.toString()}`;
 }
 
 function availabilityLabel(value: string): { label: string; available: boolean; detail: string | null } {
@@ -307,7 +294,7 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
       } else {
         setData((previous) => ({
           ...(previous.scopeKey === expectedScope ? previous : emptyData(expectedScope)),
-          error: e instanceof Error ? e.message : String(e),
+          error: "Assistant activity could not be loaded. Please retry.",
         }));
       }
     }
@@ -333,8 +320,8 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
     try {
       await api.assistantDecision(installId, operation.id, { decision, expected_revision: operation.revision });
       if (isCurrent()) await query();
-    } catch (e) {
-      if (isCurrent()) setData((previous) => ({ ...(previous.scopeKey === expectedScope ? previous : emptyData(expectedScope)), error: e instanceof Error ? e.message : String(e) }));
+    } catch {
+      if (isCurrent()) setData((previous) => ({ ...(previous.scopeKey === expectedScope ? previous : emptyData(expectedScope)), error: "The permission decision could not be saved. Reload and try again." }));
     } finally {
       if (isCurrent()) setBusyState({ scopeKey: expectedScope, id: null });
     }
@@ -347,8 +334,8 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
     try {
       await api.assistantRevoke(installId, permission.id, { expected_revision: permission.revision });
       if (isCurrent()) await query();
-    } catch (e) {
-      if (isCurrent()) setData((previous) => ({ ...(previous.scopeKey === expectedScope ? previous : emptyData(expectedScope)), error: e instanceof Error ? e.message : String(e) }));
+    } catch {
+      if (isCurrent()) setData((previous) => ({ ...(previous.scopeKey === expectedScope ? previous : emptyData(expectedScope)), error: "The permission could not be revoked. Reload and try again." }));
     } finally {
       if (isCurrent()) setBusyState({ scopeKey: expectedScope, id: null });
     }
@@ -361,8 +348,8 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
     try {
       await api.assistantBlock(installId, contextId, { action_id: permission.action_id, resource_id: permission.resource_id });
       if (isCurrent()) await query();
-    } catch (e) {
-      if (isCurrent()) setData((previous) => ({ ...(previous.scopeKey === expectedScope ? previous : emptyData(expectedScope)), error: e instanceof Error ? e.message : String(e) }));
+    } catch {
+      if (isCurrent()) setData((previous) => ({ ...(previous.scopeKey === expectedScope ? previous : emptyData(expectedScope)), error: "The action could not be blocked. Reload and try again." }));
     } finally {
       if (isCurrent()) setBusyState({ scopeKey: expectedScope, id: null });
     }
