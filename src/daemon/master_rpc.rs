@@ -717,14 +717,17 @@ impl Shared {
         let model = if provider == "pi" {
             let policy = crate::pi_policy::read(&pm.dir)?;
             let chosen = model.as_deref();
-            let resolved = crate::pi_policy::resolve_model(policy.as_ref(), "master", chosen)?;
+            let (resolved, fallback) =
+                crate::pi_policy::resolve_model_with_source(policy.as_ref(), "master", chosen)?;
             if chosen.is_none() {
                 // pm.yaml's role default filled the slot — `register_agent`
                 // will label it `explicit`, so restamp the real
                 // provenance after the row lands.
-                pi_selection = Some(crate::model_defaults::pi_policy_default_selection(
-                    "master", &resolved,
-                ));
+                pi_selection = Some(if fallback {
+                    crate::model_defaults::platform_default_selection("master", &resolved)
+                } else {
+                    crate::model_defaults::pi_policy_default_selection("master", &resolved)
+                });
             }
             Some(resolved)
         } else {

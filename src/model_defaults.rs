@@ -851,6 +851,21 @@ pub fn resolve(request: ResolveRequest<'_>) -> Result<ResolvedRegistration> {
 /// model (CAD-559): `register_agent` re-derives `explicit` from the
 /// merged params, so the caller stamps this over it. `revision` is
 /// null — the operator's pm.yaml is not a revisioned document.
+/// CAD-1176: provenance when the platform default filled the slot because
+/// the policy resolved nothing for the role.
+pub const SOURCE_PLATFORM_DEFAULT: &str = "platform_default";
+
+/// Provenance for that fallback (`revision` null: it is not a revisioned
+/// document).
+pub fn platform_default_selection(lookup_role: &str, model: &str) -> Value {
+    selection(
+        SOURCE_PLATFORM_DEFAULT,
+        lookup_role,
+        None,
+        Some(model.to_string()),
+    )
+}
+
 pub fn pi_policy_default_selection(lookup_role: &str, model: &str) -> Value {
     selection(
         SOURCE_PI_POLICY_DEFAULT,
