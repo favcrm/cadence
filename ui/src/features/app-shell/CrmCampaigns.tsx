@@ -436,6 +436,26 @@ export interface AudiencePick {
   exclusionListId: string | null;
 }
 
+/** CAD-1178: the freeze id is derived from the audience, never typed. The
+ *  same base + exclusions maps to the same freeze (stable across reloads);
+ *  a changed audience maps to a new id — exactly when a refreeze is due —
+ *  and re-freezing the same audience replays the same id server-side. */
+export function audienceFreezeId(campaignId: string, pick: AudiencePick): string {
+  const base =
+    pick.base.mode === "segment"
+      ? `segment:${pick.base.segmentId}`
+      : pick.base.mode === "custom"
+        ? `custom:${[...pick.base.customerIds].sort().join(",")}`
+        : "all";
+  const key = `${base}|${pick.exclusionListId ?? ""}`;
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < key.length; i += 1) {
+    hash ^= key.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `${campaignId}-freeze-${hash.toString(16).padStart(8, "0")}`;
+}
+
 function parseIds(raw: string): string[] {
   return [...new Set(raw.split(/[\s,]+/).map((id) => id.trim()).filter((id) => id !== ""))];
 }
@@ -2667,7 +2687,10 @@ function CampaignDetail({
   });
   const [audiencePreview, setAudiencePreview] = useState<AudiencePreview | null>(null);
   const [tab, setTab] = useState<CampaignTab>(() => peekLanding(campaignId)?.tab ?? "overview");
-  const [freezeId, setFreezeId] = useState(`${campaignId}-freeze-1`);
+  // CAD-1178: derived, never typed — the operator's audience choice *is*
+  // the freeze identity. A changed audience is a new id, so the status line
+  // reads "not frozen yet" until the operator freezes it.
+  const freezeId = audienceFreezeId(campaignId, pick);
   const [freeze, setFreeze] = useState<{
     finalCount: number;
     digest: string;
@@ -2677,6 +2700,9 @@ function CampaignDetail({
   } | null>(null);
   const [freezePending, setFreezePending] = useState(false);
   const [freezeError, setFreezeError] = useState<string | null>(null);
+  // No freeze row for this derived id yet — the honest "not frozen" state,
+  // distinct from an error.
+  const [freezeMissing, setFreezeMissing] = useState(false);
 
   useEffect(() => {
     headRef.current?.focus();
@@ -2726,17 +2752,14 @@ function CampaignDetail({
   }, [reloadToken]);
 
   const checkFreeze = () => {
-    if (freezeId.trim() === "") {
-      setFreezeError("a freeze ID is required to recheck validity");
-      return;
-    }
     setFreezePending(true);
     setFreezeError(null);
     void audienceClient
-      .freezeShow(scope, freezeId.trim())
+      .freezeShow(scope, freezeId)
       .then((value) => {
         const root = (value as Record<string, unknown> | null) ?? {};
         const row = (root.freeze as Record<string, unknown> | null) ?? {};
+        setFreezeMissing(false);
         setFreeze({
           finalCount: typeof row.final_count === "number" ? row.final_count : -1,
           digest: typeof row.digest === "string" ? row.digest : "",
@@ -2745,6 +2768,42 @@ function CampaignDetail({
           currentCount: typeof root.current_final_count === "number" ? root.current_final_count : null,
         });
       })
+      .catch((err: unknown) => {
+        // CAD-1178: a missing freeze is the normal "not frozen yet" state,
+        // not an error the operator has to decode.
+        if (err instanceof ApiError && err.status === 404) {
+          setFreeze(null);
+          setFreezeMissing(true);
+          return;
+        }
+        setFreezeError(friendlyAudienceError(err));
+      })
+      .finally(() => setFreezePending(false));
+  };
+
+  // Auto-recheck on load and whenever the derived id changes (the audience
+  // base, the exclusions, or the campaign itself): the status line is always
+  // the current truth, never a stale click's memory.
+  useEffect(() => {
+    checkFreeze();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [freezeId]);
+
+  const freezeAudience = () => {
+    setFreezePending(true);
+    setFreezeError(null);
+    // The ceiling is derived from the previewed size with headroom, never
+    // typed: it bounds an unexpected growth spurt without constraining the
+    // audience the operator just previewed.
+    const ceiling = Math.max(10, Math.ceil((audiencePreview?.finalCount ?? 0) * 1.25) + 10);
+    void audienceClient
+      .prepare(scope, {
+        freezeId,
+        base: pick.base,
+        exclusionListId: pick.exclusionListId ?? undefined,
+        maxRecipients: ceiling,
+      })
+      .then(() => checkFreeze())
       .catch((err: unknown) => setFreezeError(friendlyAudienceError(err)))
       .finally(() => setFreezePending(false));
   };
@@ -2831,38 +2890,41 @@ function CampaignDetail({
                   <h4 className="text-cardtitle font-medium text-ink-100">Freeze</h4>
                   <p className="text-label text-ink-400">
                     A freeze snapshots exactly who receives this campaign, so later customer
-                    changes do not affect it. Name the freeze this campaign sends to and recheck
-                    that it is still valid before sending.
+                    changes cannot alter it. The audience above is the freeze — no ids to
+                    handle: freeze it, and recheck whenever the audience changes.
                   </p>
-                  <div className="crm-field-row">
-                    <div className="crm-field">
-                      <label className="text-label text-ink-300" htmlFor="cmp-detail-freeze">
-                        Freeze ID to recheck
-                      </label>
-                      <input
-                        id="cmp-detail-freeze"
-                        className="field"
-                        value={freezeId}
-                        onChange={(e) => setFreezeId(e.target.value)}
-                        maxLength={128}
-                        autoComplete="off"
-                        disabled={freezePending}
-                      />
-                    </div>
-                    <div>
-                      <span className="text-label text-ink-300">Validity</span>
-                      <div className="mt-1">
-                        <Button size="sm" loading={freezePending} disabled={freezePending} onClick={checkFreeze}>
-                          Recheck freeze
-                        </Button>
-                      </div>
-                    </div>
-                  </div>
                   {freezeError && (
                     <p className="text-label text-fail" role="alert">
                       {freezeError}
                     </p>
                   )}
+                  <p className="text-label text-ink-100" data-freeze-state={
+                    freeze === null ? "unfrozen" : freeze.valid === true ? "valid" : "drifted"
+                  }>
+                    {freeze === null
+                      ? freezeMissing
+                        ? "This audience is not frozen yet. Freezing snapshots exactly who receives the campaign, so later customer changes cannot alter it."
+                        : "Checking the freeze…"
+                      : freeze.valid === true
+                        ? `Audience frozen · ${freeze.finalCount} recipient${freeze.finalCount === 1 ? "" : "s"} · checked just now`
+                        : `Audience changed since you froze it (was ${freeze.finalCount}, now ${freeze.currentCount ?? "—"}) — refreeze to continue.`}
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      loading={freezePending}
+                      disabled={freezePending}
+                      onClick={freezeAudience}
+                    >
+                      {freeze !== null && freeze.valid === false ? "Refreeze" : freeze === null ? "Freeze this audience" : "Refreeze"}
+                    </Button>
+                    {freeze !== null && (
+                      <Button size="sm" loading={freezePending} disabled={freezePending} onClick={checkFreeze}>
+                        Recheck
+                      </Button>
+                    )}
+                  </div>
                   {freeze && (
                     <>
                       <dl className="crm-detail" aria-label="Freeze validity">
@@ -2888,6 +2950,9 @@ function CampaignDetail({
                       </dl>
                       <details className="crm-diag">
                         <summary className="text-micro text-ink-500">Technical details</summary>
+                        <p className="num text-micro text-ink-500 mt-1" title="Freeze ID (derived from the audience)">
+                          Freeze {freezeId}
+                        </p>
                         <p className="num text-micro text-ink-500 mt-1" title="Frozen audience digest">
                           Digest {freeze.digest}
                         </p>

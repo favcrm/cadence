@@ -281,20 +281,27 @@ async function mounted(readOnly: boolean) {
   const unmet = items().filter((li) => !li.hasAttribute("data-done")).length;
   await settle(() => assert(host.querySelector('[data-prerequisites="missing"]'), "Final send names what is missing"));
   equal(host.querySelectorAll('[data-prerequisites="missing"] li').length, unmet, "the checklist and the Prepare gate list the same unmet items");
-  assert(text().includes("1 of 5"), "progress counts done rows");
+  const done = items().filter((li) => li.hasAttribute("data-done")).length;
+  assert(text().includes(`${done} of 5`), "progress counts done rows");
   if (!readOnly) {
     assert((byText(host, "button", "Prepare send") as HTMLButtonElement).disabled, "Prepare send stays disabled while items are unmet");
     // Fix links go to the owning tab or panel.
     await click(buttonIn(item("approval"), "Approve"));
     assert((document.activeElement as HTMLElement | null)?.id === "cmp-approval-section", "Approve focuses the approval panel");
-    await click(buttonIn(item("freeze"), "Fix"));
-    await settle(() => assert(tabEl("audience")!.getAttribute("aria-selected") === "true", "the freeze fix opens the Audience tab"));
+    assert(item("freeze")?.hasAttribute("data-done"), "the freeze item is satisfied by the automatic check");
+    await openTab("audience");
     assert(host.querySelector('section[aria-label="Frozen audience"]'), "the Audience tab mounts the audience panel");
     assert(!host.querySelector('section[aria-label="Final send"]'), "Audience mounts no send controls");
     await openTab("overview");
     // Approval is content-only and relocated, not removed.
     await click(byText(host, "button", "Approve r2 (content-only)"));
-    await settle(() => assert(item("approval")?.hasAttribute("data-done") && text().includes("2 of 5"), "approving ticks the checklist"));
+    await settle(() => {
+      const done = items().filter((li) => li.hasAttribute("data-done")).length;
+      assert(
+        item("approval")?.hasAttribute("data-done") && text().includes(`${done} of 5`),
+        "approving ticks the checklist",
+      );
+    });
     assert(host.querySelector("[data-campaign-status]")?.textContent === "Approved", "the header says Approved");
   } else {
     assert(!byText(host, "button", "Prepare send"), "a read-only viewer gets no send controls");
@@ -393,10 +400,8 @@ async function mounted(readOnly: boolean) {
   assert(advanced && !advanced.open, "Advanced is a closed disclosure");
   assert(advanced!.querySelector("#aud-exclusion") && advanced!.querySelector('section[aria-label="Suppressions"]'), "exclusions and suppressions live inside Advanced");
   assert(!Array.from(host.querySelectorAll("#aud-exclusion, section[aria-label=\"Suppressions\"]")).some((el) => !advanced!.contains(el)), "nothing from Advanced leaks onto the main path");
-  assert(!(host.querySelector('section[aria-label="Frozen audience"]')?.textContent ?? "").includes("audience-digest-frozen"), "the freeze digest is hidden until recheck");
   if (!readOnly) {
-    await click(byText(host, "button", "Recheck freeze"));
-    await settle(() => assert((host.querySelector('[aria-label="Freeze validity"]')?.textContent ?? "").includes("Valid"), "freeze recheck still reports validity"));
+    await settle(() => assert((host.querySelector('[aria-label="Freeze validity"]')?.textContent ?? "").includes("Valid"), "the automatic freeze check reports validity"));
     const freezeDetails = host.querySelector('section[aria-label="Frozen audience"] details') as HTMLDetailsElement;
     assert(freezeDetails && !freezeDetails.open && (freezeDetails.textContent ?? "").includes("audience-digest-frozen-0001"), "the freeze digest sits behind Technical details");
   }

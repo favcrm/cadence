@@ -317,7 +317,15 @@ async function mountedFlow() {
       const body = wireBodies.at(-1)!.body;
       const doc = contents[body.campaign_id];
       if (!doc || !doc.approval.valid) return refused("email content is not approved at its current revision");
-      if (body.audience_freeze_id !== "launch-1-freeze-1" && body.audience_freeze_id !== "freeze-1") return refused("audience freeze is unavailable");
+      // CAD-1178: the freeze id is derived from the audience; accept the
+      // campaign's derived family (and the legacy explicit ids the client
+      // helpers still pass in the direct-API cases above).
+      if (typeof body.audience_freeze_id !== "string") return refused("audience freeze is unavailable");
+      if (
+        !body.audience_freeze_id.startsWith("launch-1-freeze-") &&
+        body.audience_freeze_id !== "freeze-1"
+      )
+        return refused("audience freeze is unavailable");
       if (bindings.current === null) return refused("no SMTP sender is bound to this installation and context");
       if (!testAccepted) return refused("an SMTP-accepted test send of this exact content and binding is required first");
       const sendId = `send-${body.request_id}`;
@@ -503,15 +511,13 @@ async function mountedFlow() {
   assert(!text().includes("locked until"), "no locked-until copy remains");
   assert(!text().includes("locked"), "nothing is described as locked");
 
-  // Prepare is gated on a valid-rechecked freeze — none has been
-  // rechecked yet, so the missing list names it.
+  // Prepare is gated on the remaining prerequisites. CAD-1178: the freeze
+  // check runs automatically, so the audience item is already satisfied and
+  // the missing list names what is still owed.
   const prepareButton = () => byText("button", "Prepare send") as HTMLButtonElement | null;
   assert(prepareButton(), "the prepare control renders");
-  await settle(() => assert(prepareButton()!.disabled, "prepare stays gated until the freeze rechecks"));
-  assert(
-    text().includes("rechecked") && text().includes("missing"),
-    "the missing prerequisite is named",
-  );
+  await settle(() => assert(prepareButton()!.disabled, "prepare stays gated until the remaining prerequisites are met"));
+  assert(text().includes("missing"), "the missing prerequisites are named");
 
   // An accepted test send of this exact content+binding is required
   // before prepare — run one through the bound sender.
@@ -524,7 +530,8 @@ async function mountedFlow() {
 
   // Recheck the freeze — validity lands, prepare unlocks.
   await openTab("audience");
-  await click(byText("button", "Recheck freeze"));
+  await settle(() => assert(byText("button", "Recheck"), "the recheck control appears once the freeze is checked"));
+  await click(byText("button", "Recheck"));
   await settle(() => assert(text().includes("Valid"), "freeze validity reports"));
   await openTab("overview");
   await settle(() => {
@@ -540,7 +547,7 @@ async function mountedFlow() {
   await settle(() => assert(host.querySelector("[data-prepared]"), "the prepared view paints"));
   assert(text().includes("3 / ceiling 50"), "the final count paints against its ceiling");
   assert(text().includes("a***@example.com"), "the sample stays masked");
-  assert(text().includes("freeze-1"), "the frozen audience id paints");
+  assert(text().includes("launch-1-freeze-"), "the derived frozen audience id paints");
   assert(text().includes("conn-1"), "the sender connection paints");
   const prepareBody = wireBodies.find((row) => row.path === "/api/crm-send/prepare")?.body;
   equal(

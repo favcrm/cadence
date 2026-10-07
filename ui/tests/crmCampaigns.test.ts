@@ -749,8 +749,15 @@ async function mountedFlow() {
   await click(Array.from(firstLi!.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === "Discard"));
   await settle(() => assert(!host.querySelector('[data-proposal^="prop-asst-"]'), "the discarded draft leaves"));
   await openTab("audience");
-  await settle(() => assert(host.querySelector('input[value$="-freeze-1"]'), "the detail renders its freeze default"));
-  equal((host.querySelector("#cmp-detail-freeze") as HTMLInputElement).value, `${unsavedCampaignId}-freeze-1`, "the Freeze ID default derives from the saved campaign id");
+  // CAD-1178: no freeze id to type — the audience is the freeze. The status
+  // line renders from the automatic check and the derived id stays behind
+  // Technical details.
+  await settle(() => assert(host.querySelector("[data-freeze-state]"), "the freeze status renders from the automatic check"));
+  equal(host.querySelector("#cmp-detail-freeze"), null, "no freeze id input remains");
+  assert(
+    (host.querySelector('section[aria-label="Frozen audience"] details')?.textContent ?? "").includes(`${unsavedCampaignId}-freeze-`),
+    "the derived freeze id names the saved campaign",
+  );
   // Audience tab keeps the suppression and freeze workflows the old page had.
   await settle(() => assert(host.querySelector("#aud-suppress-email"), "suppressions live on the Audience tab"));
   await fillInput("#aud-suppress-email", "gone@example.com");
@@ -993,7 +1000,8 @@ async function mountedFlow() {
     assert(activity.includes("Campaign sends"), "Activity carries the sends history");
     await openTab("audience");
   }
-  await click(byText("button", "Recheck freeze"));
+  await settle(() => assert(byText("button", "Recheck"), "the recheck control appears once the freeze is checked"));
+  await click(byText("button", "Recheck"));
   await settle(() => assert(text().includes("Valid"), "freeze validity rechecks live"));
 
   // CAD-1008 stale-render guard: a slow saved-render answer that lands
