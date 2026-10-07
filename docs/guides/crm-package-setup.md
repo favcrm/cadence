@@ -28,6 +28,26 @@ that digest, which permits the bundle's bounded local text capability
 only. It creates no run, dispatch, binding,
 customer record, SMTP connection or send authority.
 
+## Generic app assistant declaration
+
+`workspace-apps/crm/app-assistant.json` declares the CRM action IDs and their
+input schemas as data in `app-assistant/v1`. It is not executable code and
+cannot add host handlers, commands, URLs, identity or scope. The host serves
+actions only for the selected installation and context, and its reviewed
+registry remains authoritative for handler, scope, effect and minimum
+permission. An unknown action or invalid input is refused.
+
+Reads and bounded drafts run on explicit request without a standing
+permission prompt. `customer.tags.update` is the permission-required pilot:
+the exact proposed tags-only change is shown for one customer. Allow once is
+for that operation; Always allow, when offered, is limited to this
+installation/action/customer and can be revoked. Deny this request does not
+create a standing block; Block this action is a separate visible setting.
+No assistant action can edit consent, email or other customer fields, apply
+campaign content, freeze an audience or send. Those critical operations stay
+on their existing operator approval routes. Result cards use typed host
+resource references; descriptor text is never treated as markup or a URL.
+
 ## Optional context
 
 A context groups content defaults and run history inside one installation.

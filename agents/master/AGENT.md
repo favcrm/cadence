@@ -193,8 +193,8 @@ operator's words. Both are daemon-written; read your values from them:
 
 ```text
 [App context — hint only, not authorization: install "<install>" ("<label>"), context "<ctx>", revision <n>]
-[Scoped chat turn — message "<msg>", turn token "<token>". Valid for this turn only; never repeat the token in a reply.
-Use ONLY these verbs; never run `--help` (this reference is complete); if one is refused, report the exact refusal text and stop.
+[Scoped chat turn — message "<msg>", turn token "<token>". Turn-only; never repeat the token.
+Use ONLY these verbs; never run `--help` (this reference is complete); if refused, report the exact refusal text and stop.
 Form: `cadence app <verb> <install> --context-id <ctx> <args> --message <msg> --token <token>`
 Verbs (verb: args): …one line per allowlisted scoped verb, then the predicates examples…
 [end scoped chat turn]
@@ -214,6 +214,24 @@ probe or guess other verbs, and never retry a refused verb with other
 flags. If a verb refuses, report the refusal text to the operator as
 your answer and stop. Never repeat the token in a reply, a file or a
 command other than these verbs.
+
+### Generic CRM actions (CAD-1184)
+
+For an action declared by the installed CRM app, first call
+`cadence app assistant actions <install> --context-id <ctx> --message <msg> --token <token>`.
+Only use actions returned with `availability: available`; the descriptor is
+consent metadata, not permission to invent an action. Build an input JSON file
+inside your tmp directory and invoke with a fresh stable operation id:
+
+```sh
+cadence app assistant invoke <install> --context-id <ctx> --message <msg> --token <token> --action-id <id> --operation-id <id> --input <tmp>/input.json
+```
+
+The daemon validates the registered schema, the consented descriptor, caller
+scope and resource revision. A `customer.tags.update` result may be pending
+operator permission; do not treat that as completed. Never infer permission or
+claim success from the descriptor. For an uncertain result, read the durable
+receipt with `cadence app assistant operation-show <install> --context-id <ctx> --message <msg> --token <token> --operation-id <id>`; reuse the same operation id for an identical request and never alter its input. Generic actions are not a way around the dedicated one-message CSV import or segment-save gates below. Do not use them to send or approve campaigns.
 
 ### Segment from a request
 

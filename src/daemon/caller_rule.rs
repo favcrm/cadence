@@ -434,6 +434,16 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("app_workspace_migration_recover", Rule::Handler("operator_connection (CAD-667)")),
     ("app_chat_descriptor", Rule::Handler("operator_connection (CAD-1110)")),
+    ("app_assistant_actions", Rule::Handler("scoped_chat_assistant: connection-derived agent and live turn (CAD-1184)")),
+    ("app_assistant_invoke", Rule::Handler("scoped_chat_assistant: connection-derived agent and live turn (CAD-1184)")),
+    ("app_assistant_operation_show", Rule::Handler("scoped_chat_assistant: connection-derived agent and live turn (CAD-1184)")),
+    ("app_assistant_actions_operator", Rule::Handler("operator_connection (CAD-1184)")),
+    ("app_assistant_operations", Rule::Handler("operator_connection (CAD-1184)")),
+    ("app_assistant_operation_operator_show", Rule::Handler("operator_connection (CAD-1184)")),
+    ("app_assistant_decision", Rule::Handler("operator_connection (CAD-1184)")),
+    ("app_assistant_permissions", Rule::Handler("operator_connection (CAD-1184)")),
+    ("app_assistant_permission_revoke", Rule::Handler("operator_connection (CAD-1184)")),
+    ("app_assistant_permission_block", Rule::Handler("operator_connection (CAD-1184)")),
     ("app_screen_mint", Rule::Handler("operator_connection (CAD-1006)")),
     // The frame-GET peer: authority is the burned one-use nonce, not a
     // connection class — the handler binds it to the consuming session.

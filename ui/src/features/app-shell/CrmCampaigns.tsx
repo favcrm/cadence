@@ -126,6 +126,7 @@ export default function CrmCampaigns({
     <div className="crm-list" data-section="campaigns">
       {recordId !== null ? (
         <CampaignDetail
+          key={`${scope.installId}:${scope.contextId}:${recordId}`}
           scope={scope}
           viewer={viewer}
           campaignId={recordId}
@@ -2679,13 +2680,12 @@ function CampaignDetail({
   // CAD-1058: a campaign just created from the dialog lands on its Email
   // tab, with the segment the operator picked there (if any). Peeked on
   // mount and cleared in an effect, so the hand-off is one-shot.
-  const [pick, setPick] = useState<AudiencePick>(() => {
-    const segmentId = peekLanding(campaignId)?.segmentId ?? null;
-    return {
-      base: segmentId !== null ? { mode: "segment", segmentId } : { mode: "all" },
-      exclusionListId: null,
-    };
-  });
+  const [landingSegmentId] = useState(() => peekLanding(campaignId)?.segmentId ?? null);
+  const pickEdited = useRef(false);
+  const [pick, setPick] = useState<AudiencePick>(() => ({
+    base: landingSegmentId !== null ? { mode: "segment", segmentId: landingSegmentId } : { mode: "all" },
+    exclusionListId: null,
+  }));
   const [audiencePreview, setAudiencePreview] = useState<AudiencePreview | null>(null);
   const [tab, setTab] = useState<CampaignTab>(() => peekLanding(campaignId)?.tab ?? "overview");
   // CAD-1178: derived, never typed — the operator's audience choice *is*
@@ -2720,7 +2720,19 @@ function CampaignDetail({
     contentClient
       .show(scope, campaignId)
       .then((value) => {
-        if (!controller.signal.aborted) setDoc(parseContentDoc(value));
+        if (controller.signal.aborted) return;
+        const nextDoc = parseContentDoc(value);
+        const draftAudience = nextDoc.draftAudience;
+        setDoc(nextDoc);
+        if (landingSegmentId === null && !pickEdited.current && draftAudience?.mode === "segment") {
+          setPick((current) => {
+            if (pickEdited.current) return current;
+            return {
+              ...current,
+              base: { mode: "segment", segmentId: draftAudience.segmentId },
+            };
+          });
+        }
       })
       .catch((e: unknown) => {
         if (controller.signal.aborted) return;
@@ -2892,6 +2904,7 @@ function CampaignDetail({
                   viewer={viewer}
                   pick={pick}
                   onPick={(next) => {
+                    pickEdited.current = true;
                     setPick(next);
                     setAudiencePreview(null);
                   }}

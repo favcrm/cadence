@@ -123,6 +123,21 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     ),
     route(
         "POST",
+        "/api/app-installations/*/assistant/operations/*/decision",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/assistant/permissions/*/revoke",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/assistant/permissions/block",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
         "/api/app-installations/*/contexts",
         RouteClass::OperatorOnly,
     ),

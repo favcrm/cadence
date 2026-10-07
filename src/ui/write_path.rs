@@ -14,9 +14,9 @@ use tiny_http::{Header, Method, Request, Response, StatusCode};
 use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
-    app_audiences, app_content, app_contexts, app_records, app_release, app_runs, app_screens,
-    apps, connections, crm_send, crm_smtp, home, lane, operator, read_model, social_publish,
-    stages, threads, updates, wiki, workflows,
+    app_assistant, app_audiences, app_content, app_contexts, app_records, app_release, app_runs,
+    app_screens, apps, connections, crm_send, crm_smtp, home, lane, operator, read_model,
+    social_publish, stages, threads, updates, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -966,6 +966,18 @@ pub(crate) fn write_route(
         }
         let resp = workflows::propose(&mut request, state_dir, key, name);
         send(request, resp);
+        return;
+    }
+    if let Some(route) = app_assistant::route(path) {
+        if route.is_read() {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let context = query("context_id")
+            .map(|value| format!("context_id={value}"))
+            .unwrap_or_default();
+        let response = app_assistant::handle(&mut request, state_dir, route, &context);
+        send(request, response);
         return;
     }
     if let Some(route) = app_contexts::route(path) {

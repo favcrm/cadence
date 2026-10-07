@@ -176,6 +176,11 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     // the operator will confirm a campaign against; never a freeze/send.
     "Bash(cadence app audience segment-assistant-preview *)",
     "Bash(cadence app record csv-assistant-preview *)",
+    // Generic CRM actions use the descriptor-discovered, operation-ledger
+    // path; these wrappers retain the daemon's live-turn proof on every call.
+    "Bash(cadence app assistant actions *)",
+    "Bash(cadence app assistant invoke *)",
+    "Bash(cadence app assistant operation-show *)",
     // The composer-free scoped-chat email draft — the turn IS the
     // request; one turn one inert pending proposal, never a send/
     // approve/edit. The operator applies or discards it.
@@ -260,6 +265,12 @@ pub const SCOPED_VERB_SHAPES: &[(&str, &str)] = &[
         "--request-id R --confirm-token C",
     ),
     ("record csv-assistant-preview", "--csv F"),
+    ("assistant actions", ""),
+    (
+        "assistant invoke",
+        "--action-id A --operation-id O --input F",
+    ),
+    ("assistant operation-show", "--operation-id O"),
     (
         "content assistant-draft",
         "--campaign-id C --proposal-id P --draft F",
@@ -300,8 +311,8 @@ pub fn scoped_verb_reference(
 ) -> String {
     let mut out = format!(
         "[Scoped chat turn — message \"{message_id}\", turn token \"{token}\". \
-         Valid for this turn only; never repeat the token in a reply.\n\
-         Use ONLY these verbs; never run `--help` (this reference is complete); if one is refused, report the exact refusal text and stop.\n\
+         Turn-only; never repeat the token.\n\
+         Use ONLY these verbs; never run `--help` (this reference is complete); if refused, report the exact refusal text and stop.\n\
          Form: `cadence app <verb> {install} --context-id {context} <args> --message {message_id} --token {token}`\n\
          Verbs (verb: args):\n"
     );
@@ -313,7 +324,7 @@ pub fn scoped_verb_reference(
         out.push_str(&format!("{stem}: {args}\n"));
     }
     out.push_str(&format!(
-        "Predicates P: write {}/preds.json, a JSON array of rules, all ANDed, op eq|ne, one per field:\n",
+        "Predicates P: {}/preds.json; JSON rules array, AND, op eq|ne per field:\n",
         tmp.display()
     ));
     for (field, value) in PREDICATE_EXAMPLES {

@@ -19,6 +19,7 @@
 mod agent_wait;
 mod agents_rpc;
 mod answer_rpc;
+mod app_assistant_rpc;
 mod app_audiences_rpc;
 mod app_bindings_rpc;
 mod app_capabilities_rpc;
@@ -32,6 +33,8 @@ mod app_screens_rpc;
 mod app_teams_rpc;
 mod approvals_rpc;
 mod area_rpc;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1184_acceptance;
 mod caller_rule;
 mod checkup;
 mod connection_test;
@@ -535,6 +538,9 @@ pub struct Shared {
     /// Serializes an app's checked execution claim through bounded Local
     /// commit/readback against binding/context/custody mutations.
     app_release_lock: Mutex<()>,
+    /// Serializes local CRM assistant permission checks and their bounded
+    /// mutation/receipt writes. Never spans a network operation.
+    app_assistant_lock: Mutex<()>,
     app_release_claim_gate: Option<effect_rpc::EffectExecuteGate>,
     /// CAD-546: the `local` platform's outbox root — what
     /// `platform_outbox` lists. Set by `platform::local::register`
@@ -756,6 +762,7 @@ impl Shared {
             screen_caps: Mutex::new(HashMap::new()),
             screen_mint_rate: Mutex::new(HashMap::new()),
             app_release_lock: Mutex::new(()),
+            app_assistant_lock: Mutex::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
             smtp_test_ca: opts.smtp_test_ca_pem.clone(),
@@ -3339,6 +3346,28 @@ impl Shared {
             "app_workspace_recover" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_migration_recover" => self.rpc_app_workspace(method, params, peer_pid),
             "app_chat_descriptor" => self.rpc_app_chat_descriptor(params, peer_pid),
+            "app_assistant_actions" => self.rpc_app_assistant_agent(method, params, peer_pid),
+            "app_assistant_invoke" => self.rpc_app_assistant_agent(method, params, peer_pid),
+            "app_assistant_operation_show" => {
+                self.rpc_app_assistant_agent(method, params, peer_pid)
+            }
+            "app_assistant_actions_operator" => {
+                self.rpc_app_assistant_operator(method, params, peer_pid)
+            }
+            "app_assistant_operations" => self.rpc_app_assistant_operator(method, params, peer_pid),
+            "app_assistant_operation_operator_show" => {
+                self.rpc_app_assistant_operator(method, params, peer_pid)
+            }
+            "app_assistant_decision" => self.rpc_app_assistant_operator(method, params, peer_pid),
+            "app_assistant_permissions" => {
+                self.rpc_app_assistant_operator(method, params, peer_pid)
+            }
+            "app_assistant_permission_revoke" => {
+                self.rpc_app_assistant_operator(method, params, peer_pid)
+            }
+            "app_assistant_permission_block" => {
+                self.rpc_app_assistant_operator(method, params, peer_pid)
+            }
             "app_screen_mint" => self.rpc_app_screen_mint(params, peer_pid),
             "app_screen_consume" => self.rpc_app_screen_consume(params, peer_pid),
             "app_approve" => self.rpc_app_approve(params, peer_pid),
