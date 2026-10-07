@@ -1206,7 +1206,7 @@ case "$1" in
     ;;
   lookup)
     echo lookup >> "$CAD1065_CLEANUP_TOOL_DIR/calls"
-    if [ ! -e "$CAD1065_CLEANUP_TOOL_DIR/start-test" ]; then
+    if [ ! -e "$CAD1065_CLEANUP_TOOL_DIR/start-test" ] || [ -e "$CAD1065_CLEANUP_TOOL_DIR/allow-custody-conflict" ]; then
       cat "$CAD1065_CLEANUP_TOOL_DIR/stored"
       exit 0
     fi
@@ -1214,6 +1214,10 @@ case "$1" in
     while [ ! -e "$CAD1065_CLEANUP_TOOL_DIR/release" ]; do /bin/sleep 0.01; done
     /usr/bin/head -c 20000 /dev/zero
     /bin/sleep 60
+    ;;
+  clear)
+    rm -f "$CAD1065_CLEANUP_TOOL_DIR/stored"
+    exit 0
     ;;
   *) exit 1 ;;
 esac
@@ -1395,25 +1399,14 @@ fn cad1065_libsecret_cleanup_pending_child() {
         let _ = request.join();
         panic!("cleanup-pending verification did not return within the shared budget");
     }
-    let tracee_alive = Path::new("/proc").join(pid.to_string()).exists();
-    if tracee_alive {
-        let continued = unsafe {
-            libc::ptrace(
-                libc::PTRACE_CONT,
-                pid,
-                std::ptr::null_mut::<libc::c_void>(),
-                std::ptr::null_mut::<libc::c_void>(),
-            )
-        };
-        assert_eq!(continued, 0, "could not release the cleanup-held child");
-    }
+    let tracee_path = Path::new("/proc").join(pid.to_string());
+    assert!(
+        tracee_path.exists(),
+        "cleanup returned without observing the held child"
+    );
     assert!(
         elapsed < Duration::from_secs(23),
         "cleanup-pending verification exceeded the shared deadline"
-    );
-    assert!(
-        tracee_alive,
-        "cleanup returned without observing the held child"
     );
     assert!(request.join().is_ok());
     let first = result
@@ -1439,8 +1432,10 @@ fn cad1065_libsecret_cleanup_pending_child() {
         "cleanup-pending result exposed a typed receipt"
     );
 
-    // The fence persists: subsequent verification is refused without another
-    // secret-tool lookup and cannot manufacture a typed receipt.
+    // The fence persists: a second verifier is refused without another
+    // lookup. This alone does not prove custody serialization, so also
+    // start an actual credential revoke while the owned lookup is still
+    // held at its exit stop.
     let second = scoped(Asserted::Operator, || {
         client::rpc_timeout(&state, "connection_test", params, Duration::from_secs(2))
     })
@@ -1449,8 +1444,9 @@ fn cad1065_libsecret_cleanup_pending_child() {
     assert!(second
         .to_string()
         .contains("connection test is fenced pending credential cleanup"));
+    let calls_path = tool_dir.join("calls");
     assert_eq!(
-        std::fs::read_to_string(tool_dir.join("calls"))
+        std::fs::read_to_string(&calls_path)
             .unwrap()
             .lines()
             .count(),
@@ -1458,9 +1454,133 @@ fn cad1065_libsecret_cleanup_pending_child() {
         "fenced follow-up spawned another secret-tool lookup"
     );
 
-    // The held child was continued above; teardown can now join the daemon
-    // without leaving a tracer or subprocess behind.
+    // If revoke bypasses the retained serialization, its lookup can return
+    // promptly and the test observes completion while cleanup is unobserved.
+    // Allow that lookup only after this point; the over-cap child remains
+    // independently ptrace-held until the explicit continue below.
+    std::fs::write(tool_dir.join("allow-custody-conflict"), b"go").unwrap();
+    let conflict_state = state.clone();
+    let conflict_id = params["connection_id"].clone();
+    let (conflict_started_tx, conflict_started_rx) = std::sync::mpsc::channel();
+    let (conflict_tx, conflict_rx) = std::sync::mpsc::channel();
+    let conflict = std::thread::spawn(move || {
+        let _ = conflict_started_tx.send(());
+        let result = scoped(Asserted::Operator, || {
+            client::rpc_timeout(
+                &conflict_state,
+                "connection_revoke",
+                json!({"connection_id": conflict_id}),
+                Duration::from_secs(8),
+            )
+        });
+        let _ = conflict_tx.send(result);
+    });
+    conflict_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("conflicting revoke thread did not start");
+    let refused_while_unobserved = match conflict_rx.recv_timeout(Duration::from_millis(500)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+        Ok(Err(error)) if error.kind() == "busy" => true,
+        other => panic!(
+            "conflicting credential revoke completed or failed open before cleanup was observed: {other:?}"
+        ),
+    };
+    assert_eq!(
+        std::fs::read_to_string(&calls_path)
+            .unwrap()
+            .lines()
+            .count(),
+        lookups_before_test + 1,
+        "conflicting revoke reached custody while the lookup was unobserved"
+    );
+    assert!(
+        initial == fixture.state_snapshot(),
+        "conflicting revoke mutated credential state while cleanup was unobserved"
+    );
+
+    // Release the ptrace-held exit. If the daemon observes/reaps the child,
+    // the serialized revoke may proceed now; if it remains an unobserved
+    // daemon-owned zombie, the fail-closed contract keeps that operation
+    // excluded. Either way it must not have completed before this release.
+    let continued = unsafe {
+        libc::ptrace(
+            libc::PTRACE_CONT,
+            pid,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
+    assert_eq!(continued, 0, "could not release the cleanup-held child");
     trace_guard.armed = false;
+
+    let reap_deadline = Instant::now() + Duration::from_secs(5);
+    let reaped = loop {
+        if !tracee_path.exists() {
+            break true;
+        }
+        let stat = std::fs::read_to_string(tracee_path.join("stat")).unwrap_or_default();
+        let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+        if state == Some(Some('Z')) {
+            break false;
+        }
+        assert!(
+            Instant::now() < reap_deadline,
+            "released cleanup child neither exited nor was reaped"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if reaped && !refused_while_unobserved {
+        let revoked = conflict_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("custody revoke stayed blocked after cleanup reap was observed")
+            .expect("credential revoke failed after cleanup reap");
+        assert_eq!(revoked["revoked"], true);
+        assert!(conflict.join().is_ok());
+    } else {
+        if !refused_while_unobserved {
+            assert!(
+                matches!(
+                    conflict_rx.recv_timeout(Duration::from_millis(250)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "custody revoke completed while the child remained an unreaped zombie"
+            );
+        }
+        assert!(
+            initial == fixture.state_snapshot(),
+            "credential state changed before custody serialization was released"
+        );
+        if refused_while_unobserved {
+            assert!(conflict.join().is_ok());
+        }
+    }
+
+    // Even after the cleanup child is released, the timed-out verification
+    // is fenced and cannot manufacture a typed receipt or spawn another
+    // secret-tool lookup.
+    let fenced_followup = scoped(Asserted::Operator, || {
+        client::rpc_timeout(&state, "connection_test", params, Duration::from_secs(2))
+    })
+    .expect_err("cleanup fence allowed a later verifier call");
+    assert_eq!(fenced_followup.kind(), "busy");
+    assert!(fenced_followup
+        .to_string()
+        .contains("connection test is fenced pending credential cleanup"));
+    let expected_lookups = lookups_before_test
+        + 1
+        + if reaped && !refused_while_unobserved {
+            1
+        } else {
+            0
+        };
+    assert_eq!(
+        std::fs::read_to_string(&calls_path)
+            .unwrap()
+            .lines()
+            .count(),
+        expected_lookups,
+        "fenced follow-up or excluded custody operation spawned an unexpected lookup"
+    );
 }
 
 struct CleanupGateTrace {
