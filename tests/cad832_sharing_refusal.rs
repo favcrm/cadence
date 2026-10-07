@@ -19,6 +19,13 @@ const SHARE_PORT: u16 = 19450;
 const TARGET: &str = "http://127.0.0.1:3117";
 const FORGED_TARGET: &str = "http://127.0.0.1:3010";
 
+struct Attempt {
+    original: Vec<u8>,
+    persisted: Vec<u8>,
+    output: Output,
+    tailscale_calls: String,
+}
+
 struct Fixture {
     _root: TempDir,
     home: PathBuf,
@@ -63,6 +70,12 @@ impl Fixture {
             "{{\n  \"port\": {PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{target}\"\n  }}\n}}\n"
         )
         .into_bytes();
+        fs::write(self.state.join("ui.json"), &bytes).unwrap();
+        bytes
+    }
+
+    fn write_unshared_opts(&self) -> Vec<u8> {
+        let bytes = format!("{{\n  \"port\": {PORT}\n}}\n").into_bytes();
         fs::write(self.state.join("ui.json"), &bytes).unwrap();
         bytes
     }
@@ -117,6 +130,37 @@ fn prefixed_path(bin: &Path) -> String {
     )
 }
 
+fn attempt(label: &str, args: &[&str], target: &str) -> Attempt {
+    let fixture = Fixture::new(label);
+    let original = fixture.write_opts(target);
+    capture_attempt(fixture, args, original)
+}
+
+fn attempt_unshared(label: &str, args: &[&str]) -> Attempt {
+    let fixture = Fixture::new(label);
+    let original = fixture.write_unshared_opts();
+    capture_attempt(fixture, args, original)
+}
+
+fn capture_attempt(fixture: Fixture, args: &[&str], original: Vec<u8>) -> Attempt {
+    let output = fixture.cli(args);
+    let persisted = fs::read(fixture.state.join("ui.json")).unwrap();
+    let tailscale_calls = fixture.tailscale_calls();
+    Attempt {
+        original,
+        persisted,
+        output,
+        tailscale_calls,
+    }
+}
+
+fn has_mapping_write(attempt: &Attempt) -> bool {
+    attempt
+        .tailscale_calls
+        .lines()
+        .any(|line| line.starts_with("serve --bg") || line.ends_with(" off"))
+}
+
 fn output_text(out: &Output) -> String {
     format!(
         "{}{}",
@@ -153,9 +197,97 @@ fn persisted_production_target_refuses_before_mapping_and_honest_target_reaches_
         "forged target reached tailscale serve --bg"
     );
 
-    // Honest control uses the same CLI command and sandbox profile. It
-    // must start the loopback board and reach the recording `serve --bg`
-    // command, proving the refusal fixture did not fail before the guard.
+    // Both public mutation routes must validate the pre-existing record,
+    // even when the command also supplies a replacement share setting.
+    // Keep each route's state, recorder, and any spawned board isolated.
+    let start_with_flag = attempt(
+        "start-flag-forged",
+        &["ui", "start", "--tailscale", "19450"],
+        FORGED_TARGET,
+    );
+    let tailscale_start = attempt(
+        "tailscale-start-forged",
+        &["ui", "tailscale", "start", "--port", "19450"],
+        FORGED_TARGET,
+    );
+    // A partial device-login tuple must be rejected before the explicit
+    // --tailscale option writes a mapping. This fixture has a loopback
+    // sandbox port but no persisted share record to mask the ordering bug.
+    let partial_device_login = attempt_unshared(
+        "partial-device-login",
+        &[
+            "ui",
+            "start",
+            "--tailscale",
+            "19450",
+            "--device-login-issuer",
+            "https://issuer.example",
+        ],
+    );
+    // Honest controls prove both commands reach their real mapping path.
+    let start_with_flag_honest = attempt(
+        "start-flag-honest",
+        &["ui", "start", "--tailscale", "19450"],
+        TARGET,
+    );
+    let tailscale_start_honest = attempt(
+        "tailscale-start-honest",
+        &["ui", "tailscale", "start", "--port", "19450"],
+        TARGET,
+    );
+    let mismatch_refusal = |a: &Attempt| {
+        let text = output_text(&a.output).to_ascii_lowercase();
+        !a.output.status.success()
+            && text.contains("persisted tailnet target")
+            && text.contains("effective bind")
+            && a.persisted == a.original
+            && !has_mapping_write(a)
+    };
+    let honest_route_reached = |a: &Attempt| {
+        a.output.status.success()
+            && a.tailscale_calls
+                .lines()
+                .any(|line| line == "serve --bg --https=19450 http://127.0.0.1:3117")
+    };
+    let partial_device_refusal = {
+        let text = output_text(&partial_device_login.output).to_ascii_lowercase();
+        !partial_device_login.output.status.success()
+            && text.contains("device login needs issuer, org and at least one subject")
+            && partial_device_login.persisted == partial_device_login.original
+            && !has_mapping_write(&partial_device_login)
+    };
+    assert!(
+        mismatch_refusal(&start_with_flag)
+            && mismatch_refusal(&tailscale_start)
+            && partial_device_refusal,
+        "mutation routes must refuse before mapping writes; ui start --tailscale forged: \
+         status={:?}, output={}, unchanged={}, calls={:?}; ui tailscale start forged: \
+         status={:?}, output={}, unchanged={}, calls={:?}; partial device-login: \
+         status={:?}, output={}, unchanged={}, calls={:?}",
+        start_with_flag.output.status,
+        output_text(&start_with_flag.output),
+        start_with_flag.persisted == start_with_flag.original,
+        start_with_flag.tailscale_calls,
+        tailscale_start.output.status,
+        output_text(&tailscale_start.output),
+        tailscale_start.persisted == tailscale_start.original,
+        tailscale_start.tailscale_calls,
+        partial_device_login.output.status,
+        output_text(&partial_device_login.output),
+        partial_device_login.persisted == partial_device_login.original,
+        partial_device_login.tailscale_calls,
+    );
+    assert!(
+        honest_route_reached(&start_with_flag_honest)
+            && honest_route_reached(&tailscale_start_honest),
+        "honest targets must reach each real CLI mapping route; ui start --tailscale: {}; \
+         ui tailscale start: {}",
+        output_text(&start_with_flag_honest.output),
+        output_text(&tailscale_start_honest.output)
+    );
+
+    // Honest control uses the ordinary `ui start` CLI command and sandbox
+    // profile. It must start the loopback board and reach the recorder too.
     let honest = Fixture::new("honest");
     honest.write_opts(TARGET);
     let accepted = honest.cli(&["ui", "start"]);
