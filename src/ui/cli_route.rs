@@ -583,16 +583,58 @@ fn dispatch(
             ),
         },
         Verb::IssueSet => match (arg_strs(args, "ids"), arg_strs(args, "set")) {
-            (Ok(ids), Ok(pairs)) => match pm_at(pm_dir) {
-                Err(resp) => resp,
-                Ok(pm) => match issue_write::set_fields(&pm, &ids, &pairs, &actor.handle, None) {
-                    Ok(out) => {
-                        let first = ids.first().cloned().unwrap_or_default();
-                        write_reply(&pm, state_dir, &first, out, false)
+            (Ok(ids), Ok(pairs)) => {
+                // Revisions are per-ticket and optimistic: exactly one
+                // issue, and `if_rev` (the `rev` `issue_show` reports)
+                // is mandatory — a remote field edit is never an
+                // unconditional last-writer-wins write. The check runs
+                // inside `set_fields_if_rev` under the tracker lock, at
+                // the point of write; a stale token answers the
+                // contract's conflict payload instead of a 200.
+                if ids.len() != 1 {
+                    return cli_fail(
+                        400,
+                        "invalid_request",
+                        "issue_set edits exactly one issue — revisions are per-ticket",
+                    );
+                }
+                // No remote override of the `status=done` evidence gate:
+                // the verb never accepted `force` — a caller naming one
+                // is refused, never silently dropped, before any write.
+                if args.get("force").is_some() {
+                    return cli_fail(
+                        400,
+                        "invalid_request",
+                        "issue_set does not accept arguments.force",
+                    );
+                }
+                let if_rev = match arg_str(args, "if_rev") {
+                    Ok(Some(rev)) if !rev.trim().is_empty() => rev,
+                    Ok(_) => {
+                        return cli_fail(
+                            400,
+                            "invalid_request",
+                            "issue_set needs a nonempty arguments.if_rev — re-read the \
+                             issue's rev and send it",
+                        );
                     }
-                    Err(e) => write_err(&e),
-                },
-            },
+                    Err(resp) => return resp,
+                };
+                match pm_at(pm_dir) {
+                    Err(resp) => resp,
+                    Ok(pm) => match issue_write::set_fields_if_rev(
+                        &pm,
+                        &ids,
+                        &pairs,
+                        &actor.handle,
+                        None,
+                        Some(if_rev),
+                    ) {
+                        Ok(out) => write_reply(&pm, state_dir, &ids[0], out, false),
+                        Err(e) => write_err(&e),
+                    },
+                }
+            }
             (Err(resp), _) | (_, Err(resp)) => resp,
         },
         Verb::MessageSend => match (arg_str(args, "alias"), arg_str(args, "text")) {
@@ -623,3 +665,6 @@ fn dispatch(
         },
     }
 }
+
+#[cfg(test)]
+mod cad1179_acceptance;

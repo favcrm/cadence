@@ -58,9 +58,18 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 
 /// The allowlisted remote verbs this build can send — the CAD-1019 contract
 /// ∩ AOS-128's `HOSTED_CADENCE_CLI_VERBS`, minus `team_list` (no local
-/// `team` command exists to map to it) and the write verbs, which land with
-/// the write slice: a command not listed here is refused *locally* and its
-/// bytes never leave the process.
+/// `team` command exists to map to it) and `message_send` (an agent-to-agent
+/// channel the remote milestone does not expose): a command not listed here
+/// is refused *locally* and its bytes never leave the process.
+///
+/// The cli.write half (`issue_new`/`issue_comment`/`issue_set`) rides the
+/// same envelope — the caller's authority never travels as a request field,
+/// only inside the verified, single-use envelope. A failed or ambiguous
+/// call is never retried by the client: the wake retry is the only loop,
+/// and it fires only on a pre-forward `waking` verdict. Anything else — a
+/// timeout, a dropped connection, a 5xx after forward — stays explicitly
+/// unresolved: the mutation may or may not have landed, so reconcile with
+/// `issue show`/`issue log` first rather than blindly re-issuing.
 pub const REMOTE_VERBS: &[&str] = &[
     // cli.read
     "status",
@@ -71,6 +80,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_history",
     "message_read",
     "message_inbox",
+    // cli.write
+    "issue_new",
+    "issue_comment",
+    "issue_set",
 ];
 
 /// A resolved remote org destination — pinned once per invocation from the
@@ -273,10 +286,13 @@ fn call_once(
     )
 }
 
-/// Outcome of one call attempt: either the answer is final, or the remote
-/// is waking and `wait` is how long to sleep before the next attempt.
+/// Outcome of one call attempt: either the answer is final, the remote
+/// answered a checked write conflict (HTTP 409 + `{conflict,…}` — the
+/// caller resyncs, never a retry), or the remote is waking and `wait`
+/// is how long to sleep before the next attempt.
 enum Verdict {
     Done(Result<Value>),
+    Conflict(Value),
     Waking(Duration),
 }
 
@@ -310,6 +326,19 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
             "the remote refused the credential — run `cadence login` again",
         ))),
         s if (300..400).contains(&s) => Verdict::Done(Err(reject("remote redirect refused"))),
+        409 => {
+            // A checked conflict (`{conflict, current_rev, card, error}`
+            // — the payload `write_reply` maps a stale `if_rev` to) is a
+            // definite "not written" verdict, never a refusal of the
+            // call itself and never retried. The body rides up so the
+            // CLI can print `current_rev`/`card` for the caller to
+            // resync on the spot. A 409 without that shape is the same
+            // generic refusal as any other unhandled status.
+            match body {
+                Some(b) if b.get("conflict").is_some() => Verdict::Conflict(b),
+                _ => Verdict::Done(Err(reject("remote call refused"))),
+            }
+        }
         _ => Verdict::Done(Err(reject("remote call refused"))),
     }
 }
@@ -320,13 +349,24 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
 /// the first byte is sent; wake retries re-mint the envelope per attempt
 /// and are bounded by `wake_timeout` seconds. Progress goes to `note`
 /// (stderr at the call site); the returned Value is the remote's JSON body.
+/// What one remote verb answered: `Ok` — the verb's JSON body (a read
+/// result or a confirmed write), or `Conflict` — the checked write
+/// conflict body (`{conflict, current_rev, card, error}`) the remote
+/// answered instead of writing. A conflict is a verdict, not an
+/// error: the call itself succeeded and proved nothing was written.
+#[derive(Debug)]
+pub enum RemoteAnswer {
+    Ok(Value),
+    Conflict(Value),
+}
+
 pub fn call_verb(
     target: &RemoteTarget,
     verb: &str,
     arguments: Map<String, Value>,
     wake_timeout: u64,
     note: impl Fn(&str),
-) -> Result<Value> {
+) -> Result<RemoteAnswer> {
     let dir = auth_dir(None).map_err(|_| {
         reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
     })?;
@@ -347,7 +387,7 @@ fn call_verb_in(
     dir: &Path,
     note: impl Fn(&str),
     sleep: impl Fn(Duration),
-) -> Result<Value> {
+) -> Result<RemoteAnswer> {
     // I2: an unlisted verb is refused before a credential is even loaded.
     if !REMOTE_VERBS.contains(&verb) {
         return Err(reject(format!(
@@ -359,7 +399,8 @@ fn call_verb_in(
     loop {
         let (status, retry_after, body) = call_once(target, &cred, verb, &arguments)?;
         match classify(status, retry_after, body) {
-            Verdict::Done(result) => return result,
+            Verdict::Done(result) => return result.map(RemoteAnswer::Ok),
+            Verdict::Conflict(body) => return Ok(RemoteAnswer::Conflict(body)),
             Verdict::Waking(wait) => {
                 let now = Instant::now();
                 if now + wait > deadline {
@@ -625,6 +666,7 @@ mod tests {
                         302 => "302 Found",
                         401 => "401 Unauthorized",
                         403 => "403 Forbidden",
+                        409 => "409 Conflict",
                         503 => "503 Service Unavailable",
                         _ => "400 Bad Request",
                     };
@@ -655,6 +697,11 @@ mod tests {
         store_credential(&dir, &target.endpoint);
         let out = call_verb_in(&target, verb, args, wake_timeout, &dir, |_| {}, |_| {});
         let calls_out = calls.lock().unwrap().clone();
+        // Tests assert on the verb's JSON body — a conflict answer
+        // still carries one, so unwrap it the same way.
+        let out = out.map(|a| match a {
+            RemoteAnswer::Ok(b) | RemoteAnswer::Conflict(b) => b,
+        });
         (out, calls_out)
     }
 
@@ -736,5 +783,50 @@ mod tests {
         let envs = envelopes(&requests);
         assert_eq!(envs.len(), 2);
         assert_ne!(envs[0], envs[1], "a wake retry reused the envelope");
+    }
+
+    #[test]
+    fn a_checked_conflict_rides_up_as_the_conflict_answer() {
+        // A 409 `{conflict, current_rev, card}` is the remote's checked
+        // "not written" verdict — the body must reach the caller (the
+        // CLI prints it and exits 5), not collapse into a generic
+        // refusal. One attempt only: a conflict is never retried.
+        let body = json!({"conflict": "if_rev",
+            "current_rev": "fnv1a:829ba77079943a03",
+            "card": {"id": "CAD-1"},
+            "error": "if_rev does not match issue.md — re-read and retry"});
+        let (listener, requests, _s) = fake_worker(vec![(409, "", body)]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let out = call_verb_in(&target, "issue_set", Map::new(), 10, &dir, |_| {}, |_| {}).unwrap();
+        let RemoteAnswer::Conflict(body) = out else {
+            panic!("a 409 conflict answer must surface as Conflict, got {out:?}");
+        };
+        assert_eq!(body["current_rev"], json!("fnv1a:829ba77079943a03"));
+        assert_eq!(body["card"]["id"], json!("CAD-1"));
+        assert_eq!(
+            hits(&requests.lock().unwrap(), "/__platform/cli/call"),
+            1,
+            "a conflict was retried"
+        );
+    }
+
+    #[test]
+    fn a_bare_409_without_the_conflict_shape_is_a_generic_refusal() {
+        // Only the contract's `{conflict: …}` payload is a verdict; a
+        // 409 carrying anything else stays the generic refusal.
+        let (out, requests) = run(
+            vec![(409, "", json!({"error": "midway collision"}))],
+            "issue_set",
+            Map::new(),
+            10,
+        );
+        assert!(out.unwrap_err().to_string().contains("remote call refused"));
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
     }
 }
