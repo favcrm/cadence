@@ -578,7 +578,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     // unrelated service settings survive the replacement.
     let honest = Fixture::new("honest-create");
     let seed = json!({
-        "Web": {"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9042","Text":"existing","AcceptAppCaps":["peer-cap:opaque-one","peer-cap:opaque-two"]}}}},
+        "Web": {"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9042","AcceptAppCaps":["peer-cap:opaque-one","peer-cap:opaque-two"]},"/text":{"Text":"existing"}}}},
         "TCP":{"19451":{"TCPForward":"127.0.0.1:9040","TerminateTLS":"service.example.com","ProxyProtocol":1},"19449":{"HTTPS":true}},
         "AllowFunnel":{"acceptance.example.ts.net:19447":true},
         "Foreground":{"session":{"TCP":{"19448":{"HTTPS":true}},"Web":{"acceptance.example.ts.net:19448":{"Handlers":{"/":{"Text":"keep"}}}}}}
@@ -615,16 +615,19 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     let after = honest.api.config();
     assert_eq!(after["TCP"]["19451"], seed["TCP"]["19451"]);
     assert_eq!(
-        after["Web"]["acceptance.example.ts.net:19449"]["Handlers"]["/"],
-        seed["Web"]["acceptance.example.ts.net:19449"]["Handlers"]["/"]
+        after["Web"]["acceptance.example.ts.net:19449"],
+        seed["Web"]["acceptance.example.ts.net:19449"]
     );
     assert_eq!(after["TCP"]["19449"], seed["TCP"]["19449"]);
     assert_eq!(after["TCP"]["19450"], json!({"HTTPS":true}));
     assert_eq!(after["AllowFunnel"], seed["AllowFunnel"]);
     assert_eq!(after["Foreground"], seed["Foreground"]);
-    assert_eq!(after["Web"][HOSTPORT]["Handlers"]["/"]["Proxy"], TARGET);
     assert_eq!(
-        after["Web"]["acceptance.example.ts.net:19449"]["Handlers"]["/"]["Text"],
+        after["Web"][HOSTPORT]["Handlers"]["/"],
+        json!({"Proxy": TARGET})
+    );
+    assert_eq!(
+        after["Web"]["acceptance.example.ts.net:19449"]["Handlers"]["/text"]["Text"],
         "existing"
     );
     let honest_stopped = honest.cli(&["ui", "stop"]);
@@ -677,7 +680,7 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
 
     let honest_remove = Fixture::new("honest-remove");
     let remove_seed = json!({
-        "Web": {HOSTPORT:{"Handlers":{"/":{"Proxy":TARGET}}},"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9042","Text":"keep","AcceptAppCaps":["peer-cap:opaque-one","peer-cap:opaque-two"]}}}},
+        "Web": {HOSTPORT:{"Handlers":{"/":{"Proxy":TARGET}}},"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9042","AcceptAppCaps":["peer-cap:opaque-one","peer-cap:opaque-two"]},"/text":{"Text":"keep"}}}},
         "TCP":{"19450":{"HTTPS":true},"19451":{"TCPForward":"127.0.0.1:9040","TerminateTLS":"service.example.com","ProxyProtocol":1},"19449":{"HTTPS":true}},
         "Services":{"svc:acceptance":{"TCP":{"19452":{"TCPForward":"127.0.0.1:9041"}}}},
         "AllowFunnel":{"acceptance.example.ts.net:19447":true},
@@ -717,8 +720,8 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     );
     assert_eq!(remove_after["TCP"]["19451"], remove_seed["TCP"]["19451"]);
     assert_eq!(
-        remove_after["Web"]["acceptance.example.ts.net:19449"]["Handlers"]["/"],
-        remove_seed["Web"]["acceptance.example.ts.net:19449"]["Handlers"]["/"]
+        remove_after["Web"]["acceptance.example.ts.net:19449"],
+        remove_seed["Web"]["acceptance.example.ts.net:19449"]
     );
     assert_eq!(remove_after["TCP"]["19449"], remove_seed["TCP"]["19449"]);
     assert_eq!(remove_after["Services"], remove_seed["Services"]);
@@ -1290,14 +1293,14 @@ fn stop_refuses_forged_or_production_target_before_api_mutation() {
             "tailscale-stop-production-port",
             vec!["ui", "tailscale", "stop"],
             "http://127.0.0.1:3010",
-            3010,
+            SHARE_PORT,
             3010,
         ),
         (
             "stop-off-production-port",
             vec!["ui", "stop", "--tailscale-off"],
             "http://127.0.0.1:3010",
-            3010,
+            SHARE_PORT,
             3010,
         ),
     ] {
