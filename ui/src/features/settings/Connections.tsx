@@ -1,10 +1,10 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import type { Connection, ConnectionProvider } from "../../lib/types";
 import Button from "../../ui/Button";
-import { ResourceGate } from "../../ui/ResourceStatus";
+import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconRefresh } from "../../ui/icons";
 import {
   acceptsSmtp,
@@ -12,17 +12,23 @@ import {
   canManage,
   capabilityWords,
   connectionCapabilities,
-  enrollmentShapes,
+  enrollmentSupport,
   isAvailable,
   pinWord,
   readinessText,
   scopeHint,
+  serviceGroups,
   smtpPortTlsError,
   smtpSummary,
   isSmtpSender,
   smtpUnreadable,
   smtpErrorMessage,
+  verificationSupport,
+  verificationResult,
+  type ServiceGroup,
+  type VerificationOutcome,
 } from "./connectionsView";
+import { PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
 import { connectionLabel } from "../../lib/connections";
 
 /**
@@ -104,15 +110,19 @@ export default function Connections({
     if (providersRes) void providersRes.revalidate();
   }, [providersRes]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [adding, setAdding] = useState(false);
+  // The provider an open Add flow is pinned to, or "" for the pick list;
+  // null = closed.
+  const [adding, setAdding] = useState<string | null>(null);
   const canWrite = viewer.operator && !viewer.readOnly;
   const rows = listState?.data ?? [];
   const providers = providersState?.data ?? [];
-  const current = rows.find((r) => r.id === selected) ?? null;
   const refresh = () => {
     if (listRes) void listRes.revalidate();
     if (providersRes) void providersRes.revalidate();
   };
+  const groups = serviceGroups(providers, rows);
+  const addProviders = providers.filter((p) => p.provider !== "local");
+  const addBusy = adding !== null;
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connections-title">
@@ -127,7 +137,9 @@ export default function Connections({
           </p>
         </div>
         {viewer.operator && (
-          <div className="flex flex-wrap gap-2 shrink-0">
+          <div className="flex flex-wrap gap-2 shrink-0 items-center">
+            <StaleChip state={listState ?? { data: null, status: "loading", error: null, asOf: null, inFlight: false }} />
+            <StaleChip state={providersState ?? { data: null, status: "loading", error: null, asOf: null, inFlight: false }} />
             <Button
               variant="ghost"
               icon={<IconRefresh />}
@@ -137,7 +149,11 @@ export default function Connections({
               Refresh
             </Button>
             {canWrite && (
-              <Button variant="primary" onClick={() => setAdding(true)} disabled={adding}>
+              <Button
+                variant="primary"
+                onClick={() => setAdding("")}
+                disabled={addBusy}
+              >
                 Add connection
               </Button>
             )}
@@ -165,107 +181,60 @@ export default function Connections({
             failed="could not load connections"
             onRetry={refresh}
           />
-          {listState?.data && providersState?.data && (
+          <ResourceGate
+            state={
+              providersState ?? { data: null, status: "loading", error: null, asOf: null, inFlight: false }
+            }
+            loading="loading services…"
+            failed="could not load the registered services"
+            onRetry={refresh}
+          />
+          {listState?.data && (
             <div className="space-y-3 min-w-0">
-              {adding && (
+              {adding !== null && (
                 <AddConnection
-                  providers={providers}
+                  // The draft (secret + consent) lives only in this
+                  // component; keying on the preset means a different
+                  // group Setup can never reuse it.
+                  key={adding}
+                  providers={addProviders}
                   existing={rows}
-                  onClose={() => setAdding(false)}
+                  preset={adding === "" ? null : adding}
+                  onClose={() => setAdding(null)}
                   onAdded={(id) => {
-                    setAdding(false);
+                    setAdding(null);
                     setSelected(id);
                     refresh();
                   }}
                 />
               )}
-              <section className="card px-4 py-3.5 min-w-0" aria-label="connections">
-                <h2 className="slabel mb-2">Connections</h2>
-                {rows.length === 0 ? (
-                  <p className="text-label text-ink-500">No connections.</p>
-                ) : (
-                  <ul className="space-y-1.5">
-                    {rows.map((row) => (
-                      <li key={row.id}>
-                        <button
-                          type="button"
-                          onClick={() => setSelected((cur) => (cur === row.id ? null : row.id))}
-                          aria-pressed={selected === row.id}
-                          aria-label={`${connectionLabel(row)} — ${readinessText(row)}`}
-                          className={`w-full text-left px-3 py-2 rounded border min-w-0 ${
-                            selected === row.id
-                              ? "border-accent/60 bg-accent/10"
-                              : "border-ink-700 bg-ink-850 hover:border-edge-hover"
-                          }`}
-                        >
-                          <span className="flex flex-wrap items-center gap-2 min-w-0">
-                            <span className="text-label font-medium text-ink-100 min-w-0 break-words flex-1">
-                              {connectionLabel(row)}
-                            </span>
-                            <span
-                              className={`chip ${row.kind === "builtin" ? "bg-ink-800 text-ink-300" : "bg-accent/15 text-accent"}`}
-                            >
-                              {row.kind === "builtin" ? "built-in" : "enrolled"}
-                            </span>
-                            {!isAvailable(row) && (
-                              <span className="chip bg-warn/10 text-warn">unavailable</span>
-                            )}
-                          </span>
-                          <span className="block text-micro text-ink-500 mt-0.5 break-words">
-                            {readinessText(row)}
-                          </span>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </section>
-              {current && (
-                <ConnectionDetail
-                  key={current.id}
-                  row={current}
-                  capabilities={connectionCapabilities(providers, current.provider)}
-                  canWrite={canWrite}
-                  onChanged={refresh}
-                  onRevoked={() => {
-                    setSelected(null);
-                    refresh();
-                  }}
-                />
+              {groups.length === 0 ? (
+                <section className="card px-4 py-3.5 min-w-0" aria-label="connections">
+                  <p className="text-label text-ink-500">
+                    No services are registered and no accounts are connected.
+                  </p>
+                </section>
+              ) : (
+                groups.map((group) => (
+                  <ServiceSection
+                    key={group.provider}
+                    group={group}
+                    canWrite={canWrite}
+                    addBusy={addBusy}
+                    selected={selected}
+                    providers={providers}
+                    onSelect={(id) =>
+                      setSelected((cur) => (cur === id ? null : id))
+                    }
+                    onSetup={() => canWrite && setAdding(group.provider)}
+                    onChanged={refresh}
+                    onRevoked={() => {
+                      setSelected(null);
+                      refresh();
+                    }}
+                  />
+                ))
               )}
-              <section className="card px-4 py-3.5 min-w-0" aria-label="providers">
-                <h2 className="slabel mb-2">Providers</h2>
-                {providers.length === 0 ? (
-                  <p className="text-label text-ink-500">No providers registered.</p>
-                ) : (
-                  <ul className="space-y-2">
-                    {providers.map((p) => (
-                      <li key={p.provider} className="text-label min-w-0">
-                        <span className="text-ink-100 font-medium">{p.provider}</span>
-                        <span className="text-ink-500">
-                          {" — "}
-                          {!p.descriptor_available
-                            ? "no reviewed descriptor — unavailable"
-                            : (capabilityWords(p) ?? "no reviewed capabilities")}
-                          {p.descriptor_available &&
-                            ` · ${enrollmentText(p)}`}
-                        </span>
-                        <span className="block text-micro text-ink-500 mt-0.5 break-words">
-                          {pinWord({ manifest_status: p.manifest_status })} ·{" "}
-                          {p.network_checked
-                            ? "network checked"
-                            : "never checked over the network"}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                <p className="text-micro text-ink-500 mt-3 break-words">
-                  A declaration is not proof that the deployed service holds the reviewed
-                  contract. Capability names describe compatible purposes; each provider keeps
-                  its exact reviewed tools, scopes and effect classification.
-                </p>
-              </section>
             </div>
           )}
         </>
@@ -274,15 +243,139 @@ export default function Connections({
   );
 }
 
+/**
+ * One service group: the provider heading, its account rows and the
+ * contextual setup action (or the explicit unsupported state when this
+ * service declares no reviewed enrollment).
+ */
+function ServiceSection({
+  group,
+  canWrite,
+  addBusy,
+  selected,
+  providers,
+  onSelect,
+  onSetup,
+  onChanged,
+  onRevoked,
+}: {
+  group: ServiceGroup;
+  canWrite: boolean;
+  addBusy: boolean;
+  selected: string | null;
+  providers: ConnectionProvider[];
+  onSelect: (id: string) => void;
+  onSetup: () => void;
+  onChanged: () => void;
+  onRevoked: () => void;
+}) {
+  const support = enrollmentSupport(group.info);
+  return (
+    <section
+      className="card px-4 py-3.5 min-w-0"
+      aria-label={`${group.label} connections`}
+    >
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-2">
+        <h2 className="slabel">{group.label}</h2>
+        <span className="text-micro text-ink-500">
+          {group.connections.length === 0
+            ? "nothing connected"
+            : `${group.connections.length} connected`}
+        </span>
+        {!group.builtin && canWrite && support.shapes.length > 0 && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="ml-auto"
+            onClick={onSetup}
+            disabled={addBusy}
+          >
+            Set up {group.label}
+          </Button>
+        )}
+      </div>
+      {group.connections.length === 0 ? (
+        <p className="text-label text-ink-500 break-words">
+          {group.builtin
+            ? "No built-in accounts."
+            : support.shapes.length === 0
+              ? support.reason
+              : `No ${group.label} account connected yet.`}
+        </p>
+      ) : (
+        <ul className="space-y-1.5">
+          {group.connections.map((row) => (
+            <li key={row.id}>
+              <button
+                type="button"
+                onClick={() => onSelect(row.id)}
+                aria-pressed={selected === row.id}
+                aria-label={`${connectionLabel(row)} — ${readinessText(row)}`}
+                className={`w-full text-left px-3 py-2 rounded border min-w-0 ${
+                  selected === row.id
+                    ? "border-accent/60 bg-accent/10"
+                    : "border-ink-700 bg-ink-850 hover:border-edge-hover"
+                }`}
+              >
+                <span className="flex flex-wrap items-center gap-2 min-w-0">
+                  <span className="text-label font-medium text-ink-100 min-w-0 break-words flex-1">
+                    {connectionLabel(row)}
+                  </span>
+                  <span
+                    className={`chip ${row.kind === "builtin" ? "bg-ink-800 text-ink-300" : "bg-accent/15 text-accent"}`}
+                  >
+                    {row.kind === "builtin" ? "built-in" : "enrolled"}
+                  </span>
+                  {!isAvailable(row) && (
+                    <span className="chip bg-warn/10 text-warn">unavailable</span>
+                  )}
+                </span>
+                <span className="block text-micro text-ink-500 mt-0.5 break-words">
+                  {readinessText(row)}
+                </span>
+              </button>
+              {selected === row.id && (
+                <ConnectionDetail
+                  row={row}
+                  provider={providers.find((p) => p.provider === row.provider) ?? null}
+                  capabilities={connectionCapabilities(providers, row.provider)}
+                  canWrite={canWrite}
+                  onChanged={onChanged}
+                  onRevoked={onRevoked}
+                />
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {group.builtin && (
+        <p className="text-micro text-ink-500 mt-2 break-words">
+          Built-in accounts are always present — they carry no credential and cannot be
+          edited or disconnected here.
+        </p>
+      )}
+      {!group.builtin && !group.info && (
+        <p className="text-micro text-ink-500 mt-2 break-words">
+          This provider&apos;s service metadata could not be loaded — the account stays
+          under its recorded name. Refresh services; a failed load is not proof the
+          provider was removed.
+        </p>
+      )}
+    </section>
+  );
+}
+
 /** One connection's detail: metadata, local check, rotate and revoke. */
 export function ConnectionDetail({
   row,
+  provider,
   capabilities,
   canWrite,
   onChanged,
   onRevoked,
 }: {
   row: Connection;
+  provider?: ConnectionProvider | null;
   capabilities: string | null;
   canWrite: boolean;
   onChanged: () => void;
@@ -291,24 +384,164 @@ export function ConnectionDetail({
   const [rotating, setRotating] = useState(false);
   const [revoking, setRevoking] = useState(false);
   const [checking, setChecking] = useState(false);
-  const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [note, setNote] = useState<{ ok: boolean; warn?: boolean; text: string } | null>(null);
+  const [verifyNote, setVerifyNote] = useState<VerificationOutcome | null>(null);
   const managed = canManage(row);
+  const verify = verificationSupport(provider ?? null);
+  // The broker's test is admissible only for a writable operator on an
+  // enrolled SMTP sender whose provider advertises the reviewed
+  // smtp-login-no-send-v1 operation and whose live row is available — a
+  // built-in, a read-only viewer, an unadvertised provider or a
+  // manifest-mismatched/unreadable sender never sees an enabled Test.
+  const testable =
+    canWrite &&
+    managed &&
+    isSmtpSender(row) &&
+    verify.supported &&
+    isAvailable(row) &&
+    row.status.manifest_status === "matched";
+  // Each check/test is bound to a monotonically increasing generation and
+  // the exact live context it was issued against — the connection's id,
+  // credential revision and registration digest, plus the caller's
+  // authority and the provider's advertised support. A rotation,
+  // provider re-registration, a registry/support change, a sign-out or a
+  // disconnect/selection change produces a new context: it bumps the
+  // generation and clears the note so a late response can never
+  // overwrite newer state, and a response that does not match the live
+  // context is treated as stale, not as evidence about the current
+  // account.
+  const checkGen = useRef(0);
+  const latestCtx = useRef("");
+  const context = `${row.id}:${row.revision ?? "x"}:${row.registration_digest ?? "x"}:${provider?.registration_digest ?? "x"}:${canWrite}:${verify.supported}:${isAvailable(row)}:${row.status.manifest_status}`;
+  useEffect(() => {
+    latestCtx.current = context;
+  }, [context]);
+  useEffect(() => {
+    checkGen.current += 1;
+    latestCtx.current = context;
+    setNote(null);
+    setVerifyNote(null);
+    setChecking(false);
+    setTesting(false);
+  }, [context]);
+  useEffect(() => {
+    return () => {
+      checkGen.current += 1; // unmount invalidates any in-flight check
+    };
+  }, []);
 
   const check = () => {
     if (checking) return;
+    const gen = ++checkGen.current;
+    const want = { id: row.id, revision: row.revision ?? null, registration_digest: row.registration_digest ?? null };
     setChecking(true);
     setNote(null);
     api
       .connectionCheck(row.id)
-      .then(() => {
-        setNote({
-          ok: true,
-          text: "Configuration checked — local inspection only. No provider effect was sent and this proves no upstream connectivity.",
-        });
+      .then((out) => {
+        if (gen !== checkGen.current) return; // a newer context superseded this
+        // No fallback to the request's row: an absent or malformed
+        // connection, or one whose identity/revision/registration no
+        // longer matches what was checked, is a fixed secret-safe
+        // configuration error — never the old row re-shown as healthy.
+        const c = out && typeof out === "object" ? out.connection : null;
+        const identityMatches =
+          c !== null &&
+          c.id === want.id &&
+          (c.revision ?? null) === want.revision &&
+          (c.registration_digest ?? null) === want.registration_digest;
+        if (c == null || typeof c !== "object" || !identityMatches) {
+          setNote({
+            ok: false,
+            text: "The check did not return this connection's current state — treat this as a configuration problem, not a connection that works.",
+          });
+          return;
+        }
+        const smtpErr = smtpErrorMessage(c);
+        if (!isAvailable(c) || smtpErr !== null) {
+          setNote({
+            ok: false,
+            text:
+              readinessText(c) +
+              (smtpErr ? " " + smtpErr : "") +
+              " Fix the configuration, then check again.",
+          });
+        } else if (c.status.manifest_status !== "matched") {
+          setNote({
+            ok: false,
+            warn: true,
+            text:
+              pinWord(c.status) +
+              " — the local configuration is present but its deployment does not match the reviewed contract, so this is not a verified connection.",
+          });
+        } else {
+          setNote({
+            ok: true,
+            text: "Configuration available — local inspection only. No provider effect was sent and this proves no upstream connectivity.",
+          });
+        }
         onChanged();
       })
-      .catch((e: ApiError) => setNote({ ok: false, text: e.message ?? String(e) }))
-      .finally(() => setChecking(false));
+      .catch(() => {
+        if (gen !== checkGen.current) return;
+        setNote({
+          ok: false,
+          text: "The local configuration could not be read — treat this as a configuration problem, not a connection that works.",
+        });
+      })
+      .finally(() => {
+        if (gen === checkGen.current) setChecking(false);
+      });
+  };
+
+  // The approved broker no-send login test (CAD-1065/CAD-1085): it sends
+  // only the connection's id and the captured revision+registration
+  // digest, and renders only the typed receipt's fixed safe text. A
+  // stale/malformed/late response never becomes a positive result.
+  const test = () => {
+    if (testing) return;
+    const gen = ++checkGen.current;
+    const ctx = context;
+    const want = {
+      id: row.id,
+      revision: row.revision ?? null,
+      registration_digest: row.registration_digest ?? null,
+    };
+    setTesting(true);
+    setVerifyNote(null);
+    api
+      .connectionTest(row.id, {
+        expected_revision: want.revision,
+        expected_registration_digest: want.registration_digest,
+      })
+      .then((out) => {
+        if (gen !== checkGen.current || latestCtx.current !== ctx) return;
+        const res = verificationResult(out, want);
+        if (res === null) {
+          setVerifyNote({
+            ok: false,
+            stale: false,
+            checkedAt: null,
+            text: "The check did not return a readable result — treat this as a configuration problem, not a connection that works.",
+          });
+        } else {
+          setVerifyNote(res);
+          if (res.stale) onChanged(); // a stale result re-reads the live identity
+        }
+      })
+      .catch(() => {
+        if (gen !== checkGen.current || latestCtx.current !== ctx) return;
+        setVerifyNote({
+          ok: false,
+          stale: false,
+          checkedAt: null,
+          text: "The verification could not be run — try again, or check the connection's configuration first.",
+        });
+      })
+      .finally(() => {
+        if (gen === checkGen.current) setTesting(false);
+      });
   };
 
   return (
@@ -317,30 +550,12 @@ export function ConnectionDetail({
         {connectionLabel(row)}
       </h2>
       <dl className="mt-2 space-y-1 text-label min-w-0">
-        <div className="flex flex-wrap gap-x-2 min-w-0">
-          <dt className="text-ink-500">ID</dt>
-          <dd className="num text-ink-200 break-all">{row.id}</dd>
-        </div>
         <div className="flex flex-wrap gap-x-2">
           <dt className="text-ink-500">Account</dt>
           <dd className="text-ink-200 break-words">
             {row.provider} · {row.account}
           </dd>
         </div>
-        <div className="flex flex-wrap gap-x-2">
-          <dt className="text-ink-500">Credential</dt>
-          <dd className="text-ink-200">
-            {row.kind === "builtin"
-              ? "none — built-in"
-              : `revision ${row.revision ?? "?"}`}
-          </dd>
-        </div>
-        {row.scopes.length > 0 && (
-          <div className="flex flex-wrap gap-x-2 min-w-0">
-            <dt className="text-ink-500">Scopes</dt>
-            <dd className="num text-ink-200 break-words">{row.scopes.join(", ")}</dd>
-          </div>
-        )}
         {smtpSummary(row) && (
           <div className="flex flex-wrap gap-x-2 min-w-0">
             <dt className="text-ink-500">Sender</dt>
@@ -361,14 +576,82 @@ export function ConnectionDetail({
             <dd className="text-ink-200 break-words">{capabilities}</dd>
           </div>
         )}
-        <div className="flex flex-wrap gap-x-2 min-w-0">
-          <dt className="text-ink-500">Deployment</dt>
-          <dd className="text-ink-200 break-words">{pinWord(row.status)}</dd>
-        </div>
       </dl>
+
+      <details className="mt-2 text-label min-w-0">
+        <summary className="cursor-pointer select-none text-ink-400">
+          Technical details
+        </summary>
+        <dl className="mt-2 space-y-1 min-w-0">
+          <div className="flex flex-wrap gap-x-2 min-w-0">
+            <dt className="text-ink-500">Connection ID</dt>
+            <dd className="num text-ink-200 break-all">{row.id}</dd>
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            <dt className="text-ink-500">Credential</dt>
+            <dd className="text-ink-200">
+              {row.kind === "builtin"
+                ? "none — built-in"
+                : `revision ${row.revision ?? "?"}`}
+            </dd>
+          </div>
+          {row.scopes.length > 0 && (
+            <div className="flex flex-wrap gap-x-2 min-w-0">
+              <dt className="text-ink-500">Scopes</dt>
+              <dd className="num text-ink-200 break-words">{row.scopes.join(", ")}</dd>
+            </div>
+          )}
+          {row.registration_digest && (
+            <div className="flex flex-wrap gap-x-2 min-w-0">
+              <dt className="text-ink-500">Registration</dt>
+              <dd className="num text-ink-200 break-all">{row.registration_digest}</dd>
+            </div>
+          )}
+          {row.status.reviewed_pin && (
+            <div className="flex flex-wrap gap-x-2 min-w-0">
+              <dt className="text-ink-500">Reviewed pin</dt>
+              <dd className="num text-ink-200 break-all">{row.status.reviewed_pin}</dd>
+            </div>
+          )}
+          {row.status.reported_pin && (
+            <div className="flex flex-wrap gap-x-2 min-w-0">
+              <dt className="text-ink-500">Reported pin</dt>
+              <dd className="num text-ink-200 break-all">{row.status.reported_pin}</dd>
+            </div>
+          )}
+          <div className="flex flex-wrap gap-x-2 min-w-0">
+            <dt className="text-ink-500">Deployment</dt>
+            <dd className="text-ink-200 break-words">{pinWord(row.status)}</dd>
+          </div>
+          <div className="flex flex-wrap gap-x-2 min-w-0">
+            <dt className="text-ink-500">Remote verification</dt>
+            <dd className="text-ink-200 break-words">
+              {verify.supported
+                ? "available"
+                : `unsupported — ${verify.reason}`}
+            </dd>
+          </div>
+          <p className="text-micro text-ink-500 pt-1 break-words">
+            Listing and local configuration reads never contact this account&apos;s
+            network; a remote login test (when offered) is a separate explicit check.
+            Either way the result is evidence only — it grants no execution permission
+            and proves no message delivery or sender entitlement.
+          </p>
+        </dl>
+      </details>
+
       {note && (
-        <p className={`text-label mt-2 break-words ${note.ok ? "text-ink-300" : "text-fail"}`} role={note.ok ? "status" : "alert"}>
+        <p className={`text-label mt-2 break-words ${note.ok ? "text-ink-300" : note.warn ? "text-warn" : "text-fail"}`} role={note.ok ? "status" : "alert"}>
           {note.text}
+        </p>
+      )}
+      {verifyNote && (
+        <p
+          className={`text-label mt-2 break-words ${verifyNote.ok ? "text-ink-300" : "text-fail"}`}
+          role={verifyNote.ok ? "status" : "alert"}
+          data-verify-status={verifyNote.ok ? "success" : verifyNote.stale ? "stale" : "failed"}
+        >
+          {verifyNote.text}
         </p>
       )}
       {canWrite && (
@@ -376,6 +659,17 @@ export function ConnectionDetail({
           <Button variant="secondary" size="sm" onClick={check} loading={checking}>
             {checking ? "Checking…" : "Check configuration"}
           </Button>
+          {testable && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={test}
+              loading={testing}
+              disabled={testing || checking}
+            >
+              {testing ? "Testing…" : "Test connection"}
+            </Button>
+          )}
           {managed && (
             <>
               <Button
@@ -386,7 +680,7 @@ export function ConnectionDetail({
                   setRotating((v) => !v);
                 }}
               >
-                Rotate…
+                Update credentials…
               </Button>
               <Button
                 variant="danger"
@@ -396,7 +690,7 @@ export function ConnectionDetail({
                   setRevoking((v) => !v);
                 }}
               >
-                Revoke…
+                Disconnect…
               </Button>
             </>
           )}
@@ -404,7 +698,8 @@ export function ConnectionDetail({
       )}
       {!canWrite && managed && (
         <p className="text-micro text-ink-500 mt-2">
-          Rotation and revocation are the operator&apos;s on an editable board.
+          Updating credentials and disconnecting are the operator&apos;s on an editable
+          board.
         </p>
       )}
       {managed && rotating && (
@@ -415,21 +710,12 @@ export function ConnectionDetail({
       )}
       {!managed && (
         <p className="text-micro text-ink-500 mt-2 break-words">
-          Built-in connections are always present — they cannot be rotated or revoked through
-          credential management.
+          Built-in connections are always present — they carry no credential and cannot be
+          edited or disconnected through credential management.
         </p>
       )}
     </section>
   );
-}
-
-/** Plain words for one provider's reviewed enrollment shapes. */
-function enrollmentText(p: ConnectionProvider): string {
-  const shapes = enrollmentShapes(p);
-  if (shapes.length === 0) return "no enrollment";
-  return shapes
-    .map((s) => (s === "smtp" ? "SMTP sender enrollment" : "token enrollment"))
-    .join(" + ");
 }
 
 /** Replace an enrolled credential. The token clears the moment the request settles. */
@@ -732,11 +1018,11 @@ function RevokeConfirm({
   };
 
   return (
-    <div className="mt-3 space-y-2 border-t border-ink-700 pt-3" aria-label={`revoke ${connectionLabel(row)}`}>
+    <div className="mt-3 space-y-2 border-t border-ink-700 pt-3" aria-label={`disconnect ${connectionLabel(row)}`}>
       <p className="text-label text-ink-200 break-words">
-        Revoking removes this connection&apos;s grants and defaults and closes its pending
-        effects. This cannot be undone — re-enrolling the same account creates a new
-        connection.
+        Disconnecting removes this connection&apos;s grants and its bindings and defaults,
+        and closes its pending effects. This cannot be undone — re-enrolling the same
+        account creates a new connection.
       </p>
       <label className="flex items-start gap-2 text-label text-ink-300">
         <input
@@ -747,8 +1033,8 @@ function RevokeConfirm({
           className="mt-0.5"
         />
         <span>
-          I understand revoking {connectionLabel(row)} removes its grants and closes pending
-          effects.
+          I understand disconnecting {connectionLabel(row)} removes its grants and bindings
+          and closes pending effects.
         </span>
       </label>
       {error && (
@@ -758,7 +1044,7 @@ function RevokeConfirm({
       )}
       <div className="flex flex-wrap gap-2">
         <Button variant="danger" size="sm" onClick={submit} loading={busy} disabled={!armed}>
-          {busy ? "Revoking…" : "Revoke connection"}
+          {busy ? "Disconnecting…" : "Disconnect"}
         </Button>
         <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
           Cancel
@@ -772,27 +1058,30 @@ function RevokeConfirm({
 export function AddConnection({
   providers,
   existing,
+  preset,
   onClose,
   onAdded,
 }: {
   providers: ConnectionProvider[];
   existing: Connection[];
+  preset?: string | null;
   onClose: () => void;
   onAdded: (id: string) => void;
 }) {
   const providerId = useId();
   const accountId = useId();
-  const scopesId = useId();
   const tokenId = useId();
   const candidates = providers.filter(
     (p) => p.descriptor_available && (acceptsToken(p) || acceptsSmtp(p)),
   );
-  // The providers load behind the resource: the selection follows the
-  // first candidate until the operator picks one explicitly.
-  const [explicit, setExplicit] = useState<string | null>(null);
-  const provider = explicit ?? candidates[0]?.provider ?? "";
+  // The providers load behind the resource: the canonical selection is
+  // captured ONCE at mount — the preset, else the first candidate, else
+  // "" (choose-service). It never re-reads a later candidate as a
+  // fallback, so a refresh that removes the default can never silently
+  // retarget a typed credential at a different provider.
+  const [explicit, setExplicit] = useState<string>(preset ?? candidates[0]?.provider ?? "");
+  const provider = explicit;
   const [account, setAccount] = useState("");
-  const [scopes, setScopes] = useState("");
   const [token, setToken] = useState("");
   const [acceptRisk, setAcceptRisk] = useState(false);
   const [riskNeeded, setRiskNeeded] = useState(false);
@@ -800,22 +1089,110 @@ export function AddConnection({
   const [error, setError] = useState<string | null>(null);
   const chosen = providers.find((p) => p.provider === provider) ?? null;
   const hint = chosen ? scopeHint(chosen) : [];
+  // Token setup is an explicit per-scope choice, never the union.
+  const [scopePicks, setScopePicks] = useState<Set<string>>(new Set());
+  // When a provider offers both shapes the method is an explicit choice;
+  // there is no automatic combination.
+  const bothShapes = chosen !== null && acceptsToken(chosen) && acceptsSmtp(chosen);
+  const [method, setMethod] = useState<"token" | "smtp" | null>(null);
+  const smtpShape =
+    chosen !== null &&
+    acceptsSmtp(chosen) &&
+    (!acceptsToken(chosen) || (bothShapes && method === "smtp"));
+  const methodPending = bothShapes && method === null;
   // SMTP senders enroll typed transport material instead of an
   // opaque token; the shape follows the chosen provider.
-  const smtpShape = (chosen && acceptsSmtp(chosen) && !acceptsToken(chosen)) || false;
-  const [smtp, setSmtp] = useState({ host: "", port: "465", tls_mode: "implicit", username: "", sender: "", sender_name: "" });
+  const [smtpPreset, setSmtpPreset] = useState<Preset>(PRESETS[0]);
+  const [smtp, setSmtp] = useState({
+    host: PRESETS[0].host,
+    port: "465",
+    tls_mode: "implicit" as TlsMode,
+    username: "",
+    sender: "",
+    sender_name: "",
+  });
+
+  const resetDraft = () => {
+    setToken("");
+    setScopePicks(new Set());
+    setAccount("");
+    setAcceptRisk(false);
+    setRiskNeeded(false);
+    setError(null);
+    setMethod(null);
+    setSmtpPreset(PRESETS[0]);
+    setSmtp({
+      host: PRESETS[0].host,
+      port: "465",
+      tls_mode: "implicit",
+      username: "",
+      sender: "",
+      sender_name: "",
+    });
+  };
+
+  // The selection's semantic fingerprint: provider + registration digest
+  // + descriptor revision + enrollment shapes. A refresh that changes any
+  // of them (registration rolled, descriptor re-reviewed, shapes gained
+  // or lost) invalidates the in-flight draft — secret, method, account
+  // and consent reset — while the canonical provider stays selected.
+  const fingerprint = chosen
+    ? `${chosen.provider}:${chosen.registration_digest ?? "x"}:${chosen.descriptor?.revision ?? "x"}:${(chosen.descriptor?.enrollment_shapes ?? []).join(",")}`
+    : provider === "" ? "none" : `gone:${provider}`;
+  const prevFingerprint = useRef<string | null>(null);
+  useEffect(() => {
+    if (prevFingerprint.current !== null && prevFingerprint.current !== fingerprint) {
+      resetDraft();
+    }
+    prevFingerprint.current = fingerprint;
+  }, [fingerprint]);
+
+  const chooseProvider = (next: string) => {
+    setExplicit(next);
+    resetDraft();
+  };
+
+  const chooseMethod = (next: "token" | "smtp") => {
+    // A method change discards the whole prior draft — the SMTP
+    // transport/login/sender, the token, the account hint and the
+    // consent never carry across.
+    resetDraft();
+    setMethod(next);
+  };
+
+  const choosePreset = (next: Preset) => {
+    setSmtpPreset(next);
+    // A preset change retargets the SMTP service: the password and the
+    // custody consent never carry into a different mail server. The
+    // non-secret account/sender fields may stay; transport follows the
+    // new preset's paired host/port/TLS.
+    setToken("");
+    setAcceptRisk(false);
+    setRiskNeeded(false);
+    setSmtp((cur) => ({ ...cur, host: next.host, tls_mode: next.tls, port: String(next.port) }));
+    setError(null);
+  };
+
+  const toggleScope = (scope: string) => {
+    setScopePicks((cur) => {
+      const next = new Set(cur);
+      if (next.has(scope)) next.delete(scope);
+      else next.add(scope);
+      return next;
+    });
+  };
 
   const submit = () => {
-    if (busy) return;
+    if (busy || provider === "" || unavailable || methodPending) return;
     setRiskNeeded(false);
     const cleanedAccount = account.trim();
     // CAD-1013 SMTP simplification: an SMTP sender enrolls exactly the
     // send capability's reviewed scope — not operator-typed, and never
-    // the union of every provider permission. Token providers still take
-    // an explicit scope list.
+    // the union of every provider permission. Token providers take the
+    // operator's explicit per-scope choice, not a typed union.
     const wanted = smtpShape
       ? smtpRequiredScopes(chosen)
-      : scopes.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+      : hint.filter((s) => scopePicks.has(s));
     if (smtpShape && wanted.length === 0) {
       // No reviewed send capability on this provider — SMTP enrollment is
       // unsupported here; do not widen the grant to unrelated permissions.
@@ -828,7 +1205,7 @@ export function AddConnection({
       setError(
         smtpShape
           ? "Name this email account and fill in the SMTP details below."
-          : "Choose a provider and fill in the account and at least one scope.",
+          : "Choose a provider, fill in the account and tick at least one permission.",
       );
       return;
     }
@@ -880,8 +1257,12 @@ export function AddConnection({
         });
       return;
     }
+    if (methodPending) {
+      setError("Choose how to connect this service — token or SMTP.");
+      return;
+    }
     if (token.trim() === "") {
-      setError("Choose a provider and fill in the account, at least one scope and the token.");
+      setError("Fill in the account, tick at least one permission and enter the token.");
       return;
     }
     setBusy(true);
@@ -909,9 +1290,18 @@ export function AddConnection({
       });
   };
 
+  // provider === "" is the choose-service placeholder; a selected
+  // provider that is not currently enrollable (removed from the
+  // registry, or its descriptor/shapes gone) is `unavailable`. Either
+  // disables submission and never sends a draft.
+  const unavailable = provider !== "" && !candidates.some((p) => p.provider === provider);
+  const cannotSubmit = busy || provider === "" || unavailable || methodPending;
+
   return (
     <section className="card px-4 py-3.5 min-w-0" aria-label="add connection">
-      <h2 className="text-cardtitle font-medium text-ink-100">Add connection</h2>
+      <h2 className="text-cardtitle font-medium text-ink-100">
+        {chosen ? `Set up ${chosen.provider}` : "Add connection"}
+      </h2>
       {candidates.length === 0 ? (
         <p className="text-label text-ink-400 mt-2 break-words">
           No provider currently offers enrollment. {existing.length > 0 && (
@@ -928,15 +1318,23 @@ export function AddConnection({
         >
           <div>
             <label htmlFor={providerId} className="text-label font-medium text-ink-200">
-              Provider
+              Service
             </label>
             <select
               id={providerId}
               value={provider}
-              onChange={(e) => setExplicit(e.target.value)}
+              onChange={(e) => chooseProvider(e.target.value)}
               className="field w-full mt-1"
               disabled={busy}
             >
+              {provider === "" && (
+                <option value="" disabled>
+                  Choose a service…
+                </option>
+              )}
+              {unavailable && (
+                <option value={provider}>{provider} — unavailable now</option>
+              )}
               {candidates.map((p) => (
                 <option key={p.provider} value={p.provider}>
                   {p.provider}
@@ -944,7 +1342,49 @@ export function AddConnection({
                 </option>
               ))}
             </select>
+            {provider === "" && (
+              <p className="text-micro text-ink-500 mt-1 break-words">
+                Choose a service to connect.
+              </p>
+            )}
+            {unavailable && (
+              <p className="text-micro text-warn mt-1 break-words" role="alert">
+                That service is no longer available — pick another service to connect, or
+                cancel. Nothing typed here can go to a different service.
+              </p>
+            )}
           </div>
+          {provider === "" || unavailable ? null : (
+          <>
+          {bothShapes && (
+            <div role="group" aria-label="How to connect" className="flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                variant={method === "token" ? "primary" : "secondary"}
+                aria-pressed={method === "token"}
+                disabled={busy}
+                onClick={() => chooseMethod("token")}
+              >
+                API token
+              </Button>
+              <Button
+                size="sm"
+                variant={method === "smtp" ? "primary" : "secondary"}
+                aria-pressed={method === "smtp"}
+                disabled={busy}
+                onClick={() => chooseMethod("smtp")}
+              >
+                Email (SMTP)
+              </Button>
+            </div>
+          )}
+          {methodPending && (
+            <p className="text-micro text-ink-500 break-words">
+              Choose how to connect {provider} — a scoped API token, or an SMTP sender.
+            </p>
+          )}
+          {!methodPending && (
+          <>
           <div>
             <label htmlFor={accountId} className="text-label font-medium text-ink-200">
               {smtpShape ? "Email account name" : "Account"}
@@ -974,77 +1414,62 @@ export function AddConnection({
             )}
           </div>
           {!smtpShape && (
-            <div>
-              <label htmlFor={scopesId} className="text-label font-medium text-ink-200">
-                Scopes
-              </label>
-              <input
-                id={scopesId}
-                type="text"
-                autoComplete="off"
-                spellCheck={false}
-                value={scopes}
-                onChange={(e) => setScopes(e.target.value)}
-                placeholder={hint.length > 0 ? hint.join(", ") : "scope names"}
-                className="field w-full mt-1"
-                disabled={busy}
-              />
-              {hint.length > 0 && (
+            <fieldset>
+              <legend className="text-label font-medium text-ink-200">
+                Permissions <span className="text-ink-500 font-normal">(declare only what the provider granted)</span>
+              </legend>
+              {hint.length === 0 ? (
                 <p className="text-micro text-ink-500 mt-1 break-words">
-                  Reviewed scopes for this provider: <span className="num">{hint.join(", ")}</span>.
-                  Declare only the scopes granted at the provider&apos;s consent screen.
+                  This provider declares no reviewed permission scopes — there is nothing to
+                  enroll safely.
                 </p>
+              ) : (
+                <div className="mt-1 space-y-1">
+                  {hint.map((s) => (
+                    <label key={s} className="flex items-start gap-2 text-label text-ink-300">
+                      <input
+                        type="checkbox"
+                        checked={scopePicks.has(s)}
+                        onChange={() => toggleScope(s)}
+                        disabled={busy}
+                        className="mt-0.5"
+                      />
+                      <span className="num">{s}</span>
+                    </label>
+                  ))}
+                </div>
               )}
-            </div>
+              <p className="text-micro text-ink-500 mt-1 break-words">
+                These declarations select which reviewed capabilities the account enrolls —
+                they do not grant new upstream scopes.
+              </p>
+            </fieldset>
           )}
           {smtpShape ? (
             <fieldset className="space-y-2">
               <legend className="text-label font-medium text-ink-200">
                 SMTP server — encrypted submission only
               </legend>
-              <p className="text-micro text-ink-500 break-words">
-                The daemon verifies the server certificate and refuses plaintext, downgrades
-                and unverifiable hosts before sending. Choose the security your provider
-                expects — port and TLS move together.
+              <div role="group" aria-label="Email provider" className="flex flex-wrap gap-2">
+                {PRESETS.map((p) => (
+                  <Button
+                    key={p.id}
+                    size="sm"
+                    variant={p.id === smtpPreset.id ? "primary" : "secondary"}
+                    aria-pressed={p.id === smtpPreset.id}
+                    disabled={busy}
+                    onClick={() => choosePreset(p)}
+                  >
+                    {p.label}
+                  </Button>
+                ))}
+              </div>
+              <p className="text-micro text-ink-500 break-words" data-hint={smtpPreset.id}>
+                {smtpPreset.hint}
               </p>
               <div>
-                <label htmlFor={`${tokenId}-host`} className="text-label text-ink-300">
-                  Server host
-                </label>
-                <input
-                  id={`${tokenId}-host`}
-                  type="text"
-                  autoComplete="off"
-                  spellCheck={false}
-                  value={smtp.host}
-                  onChange={(e) => setSmtp((cur) => ({ ...cur, host: e.target.value }))}
-                  placeholder="mail.example.com"
-                  className="field w-full mt-1"
-                  disabled={busy}
-                />
-              </div>
-              <div>
-                <label htmlFor={`${tokenId}-tls`} className="text-label text-ink-300">
-                  Port &amp; security
-                </label>
-                <select
-                  id={`${tokenId}-tls`}
-                  value={smtp.tls_mode}
-                  onChange={(e) => setSmtp((cur) => ({
-                    ...cur,
-                    tls_mode: e.target.value,
-                    port: e.target.value === "implicit" ? "465" : "587",
-                  }))}
-                  className="field w-full mt-1"
-                  disabled={busy}
-                >
-                  <option value="implicit">465 — implicit TLS</option>
-                  <option value="starttls">587 — STARTTLS</option>
-                </select>
-              </div>
-              <div>
                 <label htmlFor={`${tokenId}-username`} className="text-label text-ink-300">
-                  Username
+                  Your email address
                 </label>
                 <input
                   id={`${tokenId}-username`}
@@ -1053,13 +1478,14 @@ export function AddConnection({
                   spellCheck={false}
                   value={smtp.username}
                   onChange={(e) => setSmtp((cur) => ({ ...cur, username: e.target.value }))}
+                  placeholder="you@yourcompany.com"
                   className="field w-full mt-1"
                   disabled={busy}
                 />
               </div>
               <div>
                 <label htmlFor={tokenId} className="text-label font-medium text-ink-200">
-                  Password
+                  App password
                 </label>
                 <input
                   id={tokenId}
@@ -1108,6 +1534,53 @@ export function AddConnection({
                   disabled={busy}
                 />
               </div>
+              {smtpPreset.id !== "other" && (
+                <p className="text-micro text-ink-500 num break-words" data-server>
+                  {smtp.host} · port {portFor(smtp.tls_mode)} ·{" "}
+                  {smtp.tls_mode === "implicit" ? "SSL/TLS" : "STARTTLS"}
+                </p>
+              )}
+              {smtpPreset.id === "other" && (
+                <>
+                  <div>
+                    <label htmlFor={`${tokenId}-host`} className="text-label text-ink-300">
+                      Mail server
+                    </label>
+                    <input
+                      id={`${tokenId}-host`}
+                      type="text"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={smtp.host}
+                      onChange={(e) => setSmtp((cur) => ({ ...cur, host: e.target.value }))}
+                      placeholder="mail.example.com"
+                      className="field w-full mt-1"
+                      disabled={busy}
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor={`${tokenId}-tls`} className="text-label text-ink-300">
+                      Port &amp; security
+                    </label>
+                    <select
+                      id={`${tokenId}-tls`}
+                      value={smtp.tls_mode}
+                      onChange={(e) =>
+                        setSmtp((cur) => ({
+                          ...cur,
+                          tls_mode: e.target.value as TlsMode,
+                          port: String(portFor(e.target.value as TlsMode)),
+                        }))
+                      }
+                      className="field w-full mt-1"
+                      disabled={busy}
+                    >
+                      <option value="implicit">465 — SSL/TLS</option>
+                      <option value="starttls">587 — STARTTLS</option>
+                    </select>
+                  </div>
+                </>
+              )}
             </fieldset>
           ) : (
             <div>
@@ -1129,6 +1602,10 @@ export function AddConnection({
                 this form afterwards. Never paste a credential anywhere else on this board.
               </p>
             </div>
+          )}
+          </>
+          )}
+          </>
           )}
           {/* CAD-1013: the storage consent stays collapsed while it is
              optional. When the daemon reports custody_unprotected it
@@ -1180,7 +1657,7 @@ export function AddConnection({
             </label>
           )}
           <div className="flex flex-wrap gap-2">
-            <Button variant="primary" size="sm" type="submit" loading={busy}>
+            <Button variant="primary" size="sm" type="submit" loading={busy} disabled={cannotSubmit}>
               {busy ? "Adding…" : "Add connection"}
             </Button>
             <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>

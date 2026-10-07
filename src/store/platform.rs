@@ -1215,4 +1215,23 @@ impl Store {
             )
             .optional()?)
     }
+
+    pub fn connection_workspace_id_strict(&self) -> Result<String> {
+        Ok(self.try_conn()?.query_row(
+            "SELECT workspace_id FROM connection_metadata WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn connection_credential_strict(&self, id: &str) -> Result<Option<CredentialRecord>> {
+        Ok(self
+            .try_conn()?
+            .query_row(
+                "SELECT * FROM platform_credentials WHERE connection_id=?",
+                [id],
+                credential_row,
+            )
+            .optional()?)
+    }
 }

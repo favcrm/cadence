@@ -16,6 +16,7 @@ pub(super) enum Route<'a> {
     Rotate(&'a str),
     Revoke(&'a str),
     Check(&'a str),
+    Test(&'a str),
 }
 fn segment(id: &str) -> bool {
     !id.is_empty()
@@ -40,6 +41,7 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
             "rotate" => Some(Route::Rotate(id)),
             "revoke" => Some(Route::Revoke(id)),
             "status" => Some(Route::Check(id)),
+            "test" => Some(Route::Test(id)),
             _ => None,
         };
     }
@@ -126,6 +128,57 @@ where
 {
     T::deserialize(de).map(Some)
 }
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Test {
+    #[serde(deserialize_with = "required_nullable_revision")]
+    expected_revision: Option<u64>,
+    #[serde(deserialize_with = "required_nullable_digest")]
+    expected_registration_digest: Option<String>,
+}
+
+fn required_nullable_revision<'de, D>(de: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<serde_json::Value>::deserialize(de)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .filter(|value| *value > 0)
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("invalid expected_revision")),
+        Some(_) => Err(serde::de::Error::custom("invalid expected_revision")),
+    }
+}
+
+fn required_nullable_digest<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<serde_json::Value>::deserialize(de)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            let rest = s
+                .strip_prefix("sha256:")
+                .ok_or_else(|| serde::de::Error::custom("invalid expected_registration_digest"))?;
+            if rest.len() != 64
+                || !rest
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err(serde::de::Error::custom(
+                    "invalid expected_registration_digest",
+                ));
+            }
+            Ok(Some(s))
+        }
+        Some(_) => Err(serde::de::Error::custom(
+            "invalid expected_registration_digest",
+        )),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Empty {}
@@ -181,6 +234,20 @@ pub(super) fn handle(
                     "connection_check"
                 },
                 json!({"connection_id":id}),
+            )
+        }
+        Route::Test(id) => {
+            let body: Test = match typed(request) {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            (
+                "connection_test",
+                json!({
+                    "connection_id": id,
+                    "expected_revision": body.expected_revision,
+                    "expected_registration_digest": body.expected_registration_digest,
+                }),
             )
         }
     };

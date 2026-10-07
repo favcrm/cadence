@@ -276,6 +276,12 @@ impl Store {
         }
     }
 
+    pub(crate) fn try_conn(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.conn
+            .try_lock()
+            .map_err(|_| Error::busy("store is busy"))
+    }
+
     /// CAD-1011: the ONLY producer write lane. `f` runs inside
     /// `BEGIN IMMEDIATE` on the held conn mutex after the durable
     /// closure latch and the hosted-lease fence are both re-checked
