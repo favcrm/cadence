@@ -183,7 +183,10 @@ export default function AppShell({
               request_id: `general-${installId}`,
             })
             .then((created) => {
-              if (!controller.signal.aborted) {
+              // A conforming daemon always answers with the row (a refusal
+              // rejects); the guard keeps a malformed resolution from
+              // planting `undefined` into the render's context filter.
+              if (!controller.signal.aborted && created) {
                 setContexts((previous) => [...previous, created]);
               }
             })
