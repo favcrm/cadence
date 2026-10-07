@@ -1498,3 +1498,65 @@ impl Drop for CleanupGateDaemon {
         }
     }
 }
+
+#[test]
+fn cad1065_reply_wire_framing_counts_toward_total_bound() {
+    let greeting = r#"wire.write(b"220 localhost synthetic SMTP\r\n")"#;
+    let oversized = r#"wire.write((b"220-" + b" " * 4090 + b"\r\n") * 99 + b"220 ready\r\n")"#;
+    let conditional = format!(
+        "if not (root / \"oversized-greeting-sent\").exists():\n                    (root / \"oversized-greeting-sent\").write_text(\"1\")\n                    {oversized}\n                else:\n                    {greeting}"
+    );
+    let script = SMTP_RIG.replace(greeting, &conditional);
+    assert_ne!(
+        script, SMTP_RIG,
+        "oversized greeting variant was not applied"
+    );
+    let fixture = fixture_with_peer(&script);
+    let row = bounds_row(&fixture);
+    let initial = fixture.state_snapshot();
+
+    // 99 individually legal 4096-byte continuation lines plus a short final
+    // line exceed the 64 KiB wire-reply cap. Leading spaces are framing that
+    // normalization removes, so the guard must count raw bytes before parsing
+    // or trimming the SMTP payload.
+    let refused = fixture
+        .rpc(Asserted::Operator, bounds_request(&row))
+        .expect("framing-only oversized greeting was accepted");
+    let receipt = &refused["verification"];
+    assert_eq!(receipt["status"], "failed");
+    assert_eq!(receipt["network_attempted"], true);
+    assert_eq!(receipt["authentication_verified"], false);
+    assert_eq!(receipt["failure"]["code"], "tls_failed");
+    assert_eq!(receipt["failure"]["step"], "tls");
+    for field in [
+        "email_sent",
+        "delivery_verified",
+        "sender_entitlement_verified",
+        "execution_authority",
+    ] {
+        assert_eq!(receipt[field], false);
+    }
+    assert_eq!(
+        fixture.observed(),
+        vec!["CONNECT"],
+        "oversized greeting was accepted far enough to send EHLO/AUTH"
+    );
+
+    // The malformed greeting is refused without poisoning subsequent checks.
+    let successful = fixture
+        .rpc(Asserted::Operator, bounds_request(&row))
+        .expect("oversized reply left the verifier unusable");
+    assert_receipt(&successful, &row);
+    let observed = fixture.observed();
+    assert_eq!(
+        observed.iter().filter(|value| *value == "CONNECT").count(),
+        2
+    );
+    assert_eq!(observed.iter().filter(|value| *value == "EHLO").count(), 1);
+    assert_eq!(observed.iter().filter(|value| *value == "AUTH").count(), 1);
+    assert_eq!(observed.iter().filter(|value| *value == "QUIT").count(), 1);
+    assert!(!observed
+        .iter()
+        .any(|command| ["MAIL", "RCPT", "DATA"].contains(&command.as_str())));
+    assert!(initial == fixture.state_snapshot());
+}
