@@ -233,23 +233,31 @@ pub fn resolve_model(
     role: &str,
     explicit: Option<&str>,
 ) -> Result<String> {
+    resolve_model_with_source(policy, role, explicit).map(|(model, _)| model)
+}
+
+/// CAD-1176: `resolve_model` plus the fallback flag — `true` when the
+/// platform default filled the slot because neither the caller nor the
+/// policy named a model, so the caller can stamp the real provenance.
+pub fn resolve_model_with_source(
+    policy: Option<&PiPolicy>,
+    role: &str,
+    explicit: Option<&str>,
+) -> Result<(String, bool)> {
     let configured = explicit
         .map(str::to_string)
         .or_else(|| policy.and_then(|p| p.models.default.for_role(role).map(str::to_string)));
-    // CAD-1176: a policy that resolves nothing must not brick a boot. The
-    // platform default is used and its provenance is recorded by the caller.
-    let model = match configured {
-        Some(model) => model,
-        None => platform_default_model(),
+    // CAD-1176: a policy that resolves nothing must not brick a boot.
+    let (model, fallback) = match configured {
+        Some(model) => (model, false),
+        None => (platform_default_model(), true),
     };
     match require_allowed(policy, role, &model) {
-        Ok(()) => Ok(model),
-        // CAD-1176: an empty applicable allow list bounds operator choices;
-        // it must not refuse the platform default a hosted boot needs.
-        // CAD-1176: the platform default is the platform's own model; the
-        // allow list bounds operator/agent choices, it must never brick a
-        // hosted boot that has no other model to resolve.
-        Err(_err) if model == platform_default_model() => Ok(model),
+        Ok(()) => Ok((model, fallback)),
+        // CAD-1176: only the fallback may bypass the allow list. A model the
+        // caller passed explicitly or the policy named still takes the strict
+        // path, so "an explicit model that is not allowed" stays refused.
+        Err(_err) if fallback => Ok((model, true)),
         Err(err) => Err(err),
     }
 }
@@ -784,6 +792,14 @@ mod tests {
             resolve_model(None, "master", None).unwrap(),
             PLATFORM_DEFAULT_MODEL
         );
+        // CAD-1176: an EXPLICIT model equal to the platform default is still
+        // refused when the allow list omits it — only the fallback bypasses.
+        let err = resolve_model(p2.as_ref(), "worker", Some(PLATFORM_DEFAULT_MODEL))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(PLATFORM_DEFAULT_MODEL), "{err}");
+        // And the fallback flag reports the origin.
+        assert!(resolve_model_with_source(None, "master", None).unwrap().1);
         // No [pi] at all: nothing is allowed — not even an explicit id.
         let err = resolve_model(None, "worker", Some("a/m1"))
             .unwrap_err()
