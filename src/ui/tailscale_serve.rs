@@ -150,7 +150,9 @@ fn socket_path() -> std::io::Result<PathBuf> {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            format!("explicit Tailscale Unix socket paths are supported only on Linux/macOS; {SOCKET_ENV} cannot be used on this platform"),
+            format!(
+                "explicit Tailscale Unix socket paths are supported only on Linux/macOS; {SOCKET_ENV} cannot be used on this platform"
+            ),
         ));
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -161,9 +163,11 @@ fn socket_path() -> std::io::Result<PathBuf> {
                 .len();
             if !path.is_absolute() || bytes.is_empty() || bytes.len() >= max || bytes.contains(&0) {
                 return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{SOCKET_ENV} must be a non-empty, absolute Unix socket path within the platform length limit"),
-            ));
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{SOCKET_ENV} must be a non-empty, absolute Unix socket path within the platform length limit"
+                    ),
+                ));
             }
             return Ok(path);
         }
@@ -174,11 +178,21 @@ fn socket_path() -> std::io::Result<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("Tailscale LocalAPI has no configured default socket path on macOS; set {SOCKET_ENV} to an explicit absolute Unix socket path")))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "Tailscale LocalAPI has no configured default socket path on macOS; set {SOCKET_ENV} to an explicit absolute Unix socket path"
+            ),
+        ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("Tailscale LocalAPI socket is unsupported on this platform; supported: Linux default socket, or Linux/macOS with {SOCKET_ENV} set to an explicit absolute Unix socket path")))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "Tailscale LocalAPI socket is unsupported on this platform; supported: Linux default socket, or Linux/macOS with {SOCKET_ENV} set to an explicit absolute Unix socket path"
+            ),
+        ))
     }
 }
 
@@ -363,9 +377,7 @@ fn snapshot() -> Result<(Value, String)> {
     if value.is_null() {
         return Ok((json!({}), etag));
     }
-    if !value.is_object() {
-        return Err(api_error("serve-config JSON is not an object"));
-    }
+    validate_serve_config(&value, false)?;
     Ok((value, etag))
 }
 
@@ -418,6 +430,159 @@ fn web_key_port(key: &str) -> Option<u16> {
         return None;
     }
     port.parse().ok()
+}
+
+fn reject_unknown_fields(value: &Value, allowed: &[&str], context: &str) -> Result<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| api_error(format!("serve-config {context} is malformed")))?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(api_error(format!(
+            "serve-config {context} contains unsupported field {field:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_tcp_map(value: &Value) -> Result<()> {
+    let entries = value
+        .as_object()
+        .ok_or_else(|| api_error("serve-config TCP field is malformed"))?;
+    for (port, handler) in entries {
+        port.parse::<u16>()
+            .map_err(|_| api_error("serve-config TCP contains a malformed port key"))?;
+        if handler.is_null() {
+            continue;
+        }
+        reject_unknown_fields(
+            handler,
+            &[
+                "HTTPS",
+                "HTTP",
+                "TCPForward",
+                "TerminateTLS",
+                "ProxyProtocol",
+            ],
+            "TCP port handler",
+        )?;
+        let fields = handler.as_object().expect("validated object");
+        for field in ["HTTPS", "HTTP"] {
+            if fields.get(field).is_some_and(|value| !value.is_boolean()) {
+                return Err(api_error(format!("serve-config TCP {field} is malformed")));
+            }
+        }
+        for field in ["TCPForward", "TerminateTLS"] {
+            if fields.get(field).is_some_and(|value| !value.is_string()) {
+                return Err(api_error(format!("serve-config TCP {field} is malformed")));
+            }
+        }
+        if fields
+            .get("ProxyProtocol")
+            .is_some_and(|value| value.as_i64().is_none())
+        {
+            return Err(api_error("serve-config TCP ProxyProtocol is malformed"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_web_map(value: &Value) -> Result<()> {
+    let entries = value
+        .as_object()
+        .ok_or_else(|| api_error("serve-config Web field is malformed"))?;
+    for (key, server) in entries {
+        if web_key_port(key).is_none() {
+            return Err(api_error(
+                "serve-config Web contains a malformed HostPort key",
+            ));
+        }
+        if server.is_null() {
+            continue;
+        }
+        reject_unknown_fields(server, &["Handlers"], "web server config")?;
+        if let Some(handlers) = server.get("Handlers") {
+            let handlers = handlers
+                .as_object()
+                .ok_or_else(|| api_error("serve-config Web Handlers field is malformed"))?;
+            for handler in handlers.values().filter(|handler| !handler.is_null()) {
+                reject_unknown_fields(
+                    handler,
+                    &["Path", "Proxy", "Text", "AcceptAppCaps", "Redirect"],
+                    "HTTP handler",
+                )?;
+                let fields = handler.as_object().expect("validated object");
+                for field in ["Path", "Proxy", "Text", "Redirect"] {
+                    if fields.get(field).is_some_and(|value| !value.is_string()) {
+                        return Err(api_error(format!("serve-config HTTP {field} is malformed")));
+                    }
+                }
+                if fields.get("AcceptAppCaps").is_some_and(|value| {
+                    value
+                        .as_array()
+                        .is_none_or(|caps| caps.iter().any(|cap| !cap.is_string()))
+                }) {
+                    return Err(api_error("serve-config HTTP AcceptAppCaps is malformed"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_serve_config(cfg: &Value, foreground: bool) -> Result<()> {
+    reject_unknown_fields(
+        cfg,
+        &["TCP", "Web", "Services", "AllowFunnel", "Foreground"],
+        "root config",
+    )?;
+    if let Some(tcp) = cfg.get("TCP") {
+        validate_tcp_map(tcp)?;
+    }
+    if let Some(web) = cfg.get("Web") {
+        validate_web_map(web)?;
+    }
+    if let Some(funnel) = cfg.get("AllowFunnel") {
+        let entries = funnel
+            .as_object()
+            .ok_or_else(|| api_error("serve-config AllowFunnel field is malformed"))?;
+        for (key, enabled) in entries {
+            if web_key_port(key).is_none() || !enabled.is_boolean() {
+                return Err(api_error("serve-config AllowFunnel entries are malformed"));
+            }
+        }
+    }
+    if let Some(services) = cfg.get("Services") {
+        let entries = services
+            .as_object()
+            .ok_or_else(|| api_error("serve-config Services field is malformed"))?;
+        for service in entries.values().filter(|service| !service.is_null()) {
+            reject_unknown_fields(service, &["TCP", "Web", "Tun"], "service config")?;
+            if let Some(tcp) = service.get("TCP") {
+                validate_tcp_map(tcp)?;
+            }
+            if let Some(web) = service.get("Web") {
+                validate_web_map(web)?;
+            }
+            if service.get("Tun").is_some_and(|value| !value.is_boolean()) {
+                return Err(api_error("serve-config service Tun field is malformed"));
+            }
+        }
+    }
+    if let Some(foreground_config) = cfg.get("Foreground") {
+        if foreground {
+            return Err(api_error("nested serve-config Foreground is unsupported"));
+        }
+        let entries = foreground_config
+            .as_object()
+            .ok_or_else(|| api_error("serve-config Foreground field is malformed"))?;
+        for config in entries.values().filter(|config| !config.is_null()) {
+            validate_serve_config(config, true)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_host_port_keys(cfg: &Value) -> Result<()> {
@@ -551,7 +716,9 @@ fn own_state(cfg: &Value, dns: &str, port: u16, expected: &str) -> Result<bool> 
     if canonical_tcp && canonical_web {
         return Ok(true);
     }
-    Err(api_error(format!("port {port} is occupied by a foreign, noncanonical, or incomplete serve-config entry; refusing to alter it")))
+    Err(api_error(format!(
+        "port {port} is occupied by a foreign, noncanonical, or incomplete serve-config entry; refusing to alter it"
+    )))
 }
 
 pub(crate) fn matches(dns: &str, port: u16, target: &str) -> Result<bool> {
@@ -559,10 +726,25 @@ pub(crate) fn matches(dns: &str, port: u16, target: &str) -> Result<bool> {
     own_state(&cfg, dns, port, target)
 }
 
-pub(crate) fn ensure(dns: &str, port: u16, target: &str) -> Result<bool> {
+pub(crate) struct PreparedUpdate {
+    value: Option<Value>,
+    etag: String,
+}
+
+impl PreparedUpdate {
+    pub(crate) fn apply(self) -> Result<bool> {
+        let Some(value) = self.value else {
+            return Ok(false);
+        };
+        post(&value, &self.etag)?;
+        Ok(true)
+    }
+}
+
+pub(crate) fn prepare_ensure(dns: &str, port: u16, target: &str) -> Result<PreparedUpdate> {
     let (mut cfg, etag) = snapshot()?;
     if own_state(&cfg, dns, port, target)? {
-        return Ok(false);
+        return Ok(PreparedUpdate { value: None, etag });
     }
     if !target.starts_with("http://127.0.0.1:") {
         return Err(api_error(
@@ -582,8 +764,10 @@ pub(crate) fn ensure(dns: &str, port: u16, target: &str) -> Result<bool> {
         .as_object_mut()
         .ok_or_else(|| api_error("Web is not an object"))?
         .insert(host, json!({"Handlers": {"/": {"Proxy": target}}}));
-    post(&cfg, &etag)?;
-    Ok(true)
+    Ok(PreparedUpdate {
+        value: Some(cfg),
+        etag,
+    })
 }
 
 pub(crate) fn remove(dns: &str, port: u16, expected: &str) -> Result<bool> {

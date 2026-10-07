@@ -638,7 +638,7 @@ fn try_load_opts(state_dir: &Path, strict: bool) -> Result<UiOpts> {
             return Err(Error::rejected(format!(
                 "cannot read {} — cannot prove it records no tailnet share: {e}",
                 opts_file(state_dir).display()
-            )))
+            )));
         }
         Err(e) => {
             eprintln!("warning: cannot read ui.json: {e}");
@@ -651,7 +651,7 @@ fn try_load_opts(state_dir: &Path, strict: bool) -> Result<UiOpts> {
             return Err(Error::rejected(format!(
                 "{} is not valid JSON — cannot prove it records no tailnet share; fix or delete it by hand: {e}",
                 opts_file(state_dir).display()
-            )))
+            )));
         }
         Err(e) => {
             eprintln!("warning: ignoring unreadable ui.json: {e}");
@@ -666,7 +666,7 @@ fn try_load_opts(state_dir: &Path, strict: bool) -> Result<UiOpts> {
                 return Err(Error::rejected(format!(
                     "{} tailscale block is unreadable — fix or delete it by hand: {e}; the record is kept so its live mapping cannot be orphaned",
                     opts_file(state_dir).display()
-                )))
+                )));
             }
             Err(e) => {
                 eprintln!("warning: ignoring unreadable ui.json tailscale block: {e}");
@@ -674,10 +674,19 @@ fn try_load_opts(state_dir: &Path, strict: bool) -> Result<UiOpts> {
             }
         },
     };
-    let mut opts: UiOpts = serde_json::from_value(value).unwrap_or_else(|e| {
-        eprintln!("warning: ignoring unreadable ui.json: {e}");
-        UiOpts::default()
-    });
+    let mut opts: UiOpts = match serde_json::from_value(value) {
+        Ok(opts) => opts,
+        Err(e) if strict && tailscale.is_some() => {
+            return Err(Error::rejected(format!(
+                "{} has unreadable UI options alongside a tailnet share — fix or delete it by hand; the record is kept so its live mapping cannot be orphaned: {e}",
+                opts_file(state_dir).display()
+            )));
+        }
+        Err(e) => {
+            eprintln!("warning: ignoring unreadable ui.json: {e}");
+            UiOpts::default()
+        }
+    };
     if tailscale.is_some() {
         opts.tailscale = tailscale;
     }
@@ -715,11 +724,6 @@ fn clear_persisted_share(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn is_loopback_host(host: &str) -> bool {
-    let h = host.trim().to_ascii_lowercase();
-    matches!(h.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]")
-}
-
 /// Merge flags over the persisted options: a given flag wins, an
 /// absent one inherits. `--tailscale` resolves the tailnet identity
 /// but does not mutate the serve mapping; callers publish it only after
@@ -733,7 +737,7 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
         Err(_) => {
             return Err(Error::rejected(
                 "CADENCE_BOARD_PUBLIC_ONLY is not valid UTF-8",
-            ))
+            ));
         }
     };
     let mut eff = UiOpts {
@@ -779,10 +783,10 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
         refuse_share_port_change(persisted.tailscale.as_ref(), https_port)?;
         crate::sandbox::refuse_global_unless_allowed("`ui start --tailscale`")?;
         let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
-        if !is_loopback_host(&host) {
+        if host != "127.0.0.1" {
             return Err(Error::rejected(format!(
                 "--tailscale shares the board through a proxy on this host, \
-                 but --host '{host}' is not loopback — bind 127.0.0.1"
+                 but --host '{host}' is not the required literal IPv4 loopback bind — bind 127.0.0.1"
             )));
         }
         let ui_port = eff.port.unwrap_or(3010);
@@ -819,8 +823,9 @@ fn validate_share_target(eff: &UiOpts) -> Result<()> {
     };
     let bind_host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
     let bind_port = eff.port.unwrap_or(3010);
+    crate::sandbox::refuse_production_port(bind_port)?;
     let expected = format!("http://127.0.0.1:{bind_port}");
-    if ts.target != expected {
+    if bind_host != "127.0.0.1" || ts.target != expected {
         return Err(Error::rejected(format!(
             "the persisted tailnet target {} does not match the effective bind {bind_host}:{bind_port} — refusing to re-publish a forged or stale record",
             ts.target
@@ -1002,12 +1007,7 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
     let port = eff.port.unwrap_or(3010);
     // A sandbox board never takes production's port (CAD-310).
     crate::sandbox::refuse_production_port(port)?;
-    if eff.tailscale.is_some() && !is_loopback_host(&host) {
-        return Err(Error::rejected(format!(
-            "--tailscale shares the board through a proxy on this host, \
-             but --host '{host}' is not loopback — bind 127.0.0.1"
-        )));
-    }
+    validate_share_target(eff)?;
     let mut allow_hosts = eff.allow_hosts.clone();
     let mut allow_origins = eff.allow_origins.clone();
     let mut tailnet = None;
@@ -1444,20 +1444,26 @@ pub(crate) fn start_inner(
             }
         }
     }
-    // Persist matching sharing custody before the host-wide mapping is
-    // published. Every config/device-login/running-transition refusal
-    // above therefore precedes both effects.
-    save_opts(state_dir, &eff)?;
-    // Re-ensure a persisted mapping so `ui stop && ui start` keeps the
-    // board shared — best effort when tailscaled itself is unreachable.
-    if let Some(ts) = &eff.tailscale {
-        match ensure_mapping(&ts.dns_name, ts.https_port, &ts.target) {
-            Ok(_) => {}
+    // Validate the exact LocalAPI snapshot and prepare its conditional
+    // update before changing local custody. A genuinely offline GET can
+    // still allow local startup, without claiming the share is verified.
+    let prepared_mapping = if let Some(ts) = &eff.tailscale {
+        match prepare_mapping(&ts.dns_name, ts.https_port, &ts.target) {
+            Ok(plan) => Some(plan),
             Err(e) if is_ts_offline(&e) => {
-                eprintln!("warning: {e} — serving loopback only this run");
+                eprintln!("warning: {e} — tailnet state is unverified; continuing local startup with recorded sharing settings");
+                None
             }
             Err(e) => return Err(e),
         }
+    } else {
+        None
+    };
+    // Persist matching sharing custody before the conditional update.
+    // Once a POST is attempted, failures are never treated as offline.
+    save_opts(state_dir, &eff)?;
+    if let Some(plan) = prepared_mapping {
+        plan.apply()?;
     }
     let (host, port) = (so.host.clone(), so.port);
     // A previous start's marker must not satisfy this one's wait —
@@ -1632,9 +1638,22 @@ pub(crate) fn kill_detached(state_dir: &Path) -> Option<i32> {
 }
 
 pub(crate) fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
-    if tailscale_off && load_opts_strict(state_dir)?.tailscale.is_some() {
-        crate::sandbox::refuse_global_unless_allowed("`ui stop --tailscale-off`")?;
-    }
+    let recorded = if tailscale_off {
+        let opts = load_opts_strict(state_dir)?;
+        if let Some(share) = opts.tailscale.as_ref() {
+            let mut bind = UiOpts {
+                host: opts.host.clone(),
+                port: opts.port,
+                ..UiOpts::default()
+            };
+            bind.tailscale = Some(share.clone());
+            validate_share_target(&bind)?;
+            crate::sandbox::refuse_global_unless_allowed("`ui stop --tailscale-off`")?;
+        }
+        Some(opts)
+    } else {
+        None
+    };
     let pid = kill_detached(state_dir);
     if pid.is_none() {
         let _ = std::fs::remove_file(pid_file(state_dir));
@@ -1645,7 +1664,7 @@ pub(crate) fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
     // result.
     let mut ts_result = Value::Null;
     if tailscale_off {
-        let mut opts = load_opts_strict(state_dir)?;
+        let mut opts = recorded.expect("loaded before stop effects");
         if let Some(ts) = opts.tailscale.take() {
             ts_result = match remove_mapping(&ts.dns_name, ts.https_port, &ts.target) {
                 Ok(true) => json!({"removed": ts.https_port}),
@@ -1653,7 +1672,7 @@ pub(crate) fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
                 Err(e) => {
                     return Err(Error::rejected(format!(
                         "{e} — the tailnet record is kept; fix the failure and retry"
-                    )))
+                    )));
                 }
             };
             clear_persisted_share(state_dir)?;
@@ -1830,10 +1849,14 @@ fn mapping_matches(dns: &str, port: u16, target: &str) -> Result<bool> {
     tailscale_serve::matches(dns, port, target)
 }
 
-fn ensure_mapping(dns: &str, port: u16, target: &str) -> Result<bool> {
+fn prepare_mapping(dns: &str, port: u16, target: &str) -> Result<tailscale_serve::PreparedUpdate> {
     // Preserve the exact caller hard gate before any LocalAPI connection.
     crate::sandbox::refuse_global_unless_allowed("`tailscale serve`")?;
-    tailscale_serve::ensure(dns, port, target)
+    tailscale_serve::prepare_ensure(dns, port, target)
+}
+
+fn ensure_mapping(dns: &str, port: u16, target: &str) -> Result<bool> {
+    prepare_mapping(dns, port, target)?.apply()
 }
 
 /// Remove the mapping only while it still targets what cadence
@@ -1917,7 +1940,14 @@ fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: boo
 /// tailnet options, restart the board local-only when it runs.
 fn ts_stop(state_dir: &Path) -> Result<i32> {
     let mut opts = load_opts_strict(state_dir)?;
-    if opts.tailscale.is_some() {
+    if let Some(share) = opts.tailscale.as_ref() {
+        let mut bind = UiOpts {
+            host: opts.host.clone(),
+            port: opts.port,
+            ..UiOpts::default()
+        };
+        bind.tailscale = Some(share.clone());
+        validate_share_target(&bind)?;
         crate::sandbox::refuse_global_unless_allowed("`ui tailscale stop`")?;
     }
     let Some(ts) = opts.tailscale.take() else {

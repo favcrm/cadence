@@ -18,6 +18,7 @@ use tempfile::{Builder, TempDir};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_cadence");
 const PORT: u16 = 3117;
+const BIND_TEST_PORT: u16 = 3199;
 const SHARE_PORT: u16 = 19450;
 const TARGET: &str = "http://127.0.0.1:3117";
 const FOREIGN_TARGET: &str = "http://127.0.0.1:3118";
@@ -577,8 +578,8 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     // unrelated service settings survive the replacement.
     let honest = Fixture::new("honest-create");
     let seed = json!({
-        "Web": {"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Text":"existing"}}}},
-        "TCP":{"19451":{"TCPForward":"127.0.0.1:9040"},"19449":{"HTTPS":true}},
+        "Web": {"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9042","Text":"existing","AcceptAppCaps":["peer-cap:opaque-one","peer-cap:opaque-two"]}}}},
+        "TCP":{"19451":{"TCPForward":"127.0.0.1:9040","TerminateTLS":"service.example.com","ProxyProtocol":1},"19449":{"HTTPS":true}},
         "AllowFunnel":{"acceptance.example.ts.net:19447":true},
         "Foreground":{"session":{"TCP":{"19448":{"HTTPS":true}},"Web":{"acceptance.example.ts.net:19448":{"Handlers":{"/":{"Text":"keep"}}}}}}
     });
@@ -613,6 +614,10 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
     );
     let after = honest.api.config();
     assert_eq!(after["TCP"]["19451"], seed["TCP"]["19451"]);
+    assert_eq!(
+        after["Web"]["acceptance.example.ts.net:19449"]["Handlers"]["/"],
+        seed["Web"]["acceptance.example.ts.net:19449"]["Handlers"]["/"]
+    );
     assert_eq!(after["TCP"]["19449"], seed["TCP"]["19449"]);
     assert_eq!(after["TCP"]["19450"], json!({"HTTPS":true}));
     assert_eq!(after["AllowFunnel"], seed["AllowFunnel"]);
@@ -672,8 +677,8 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
 
     let honest_remove = Fixture::new("honest-remove");
     let remove_seed = json!({
-        "Web": {HOSTPORT:{"Handlers":{"/":{"Proxy":TARGET}}},"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Text":"keep"}}}},
-        "TCP":{"19450":{"HTTPS":true},"19451":{"TCPForward":"127.0.0.1:9040"},"19449":{"HTTPS":true}},
+        "Web": {HOSTPORT:{"Handlers":{"/":{"Proxy":TARGET}}},"acceptance.example.ts.net:19449":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9042","Text":"keep","AcceptAppCaps":["peer-cap:opaque-one","peer-cap:opaque-two"]}}}},
+        "TCP":{"19450":{"HTTPS":true},"19451":{"TCPForward":"127.0.0.1:9040","TerminateTLS":"service.example.com","ProxyProtocol":1},"19449":{"HTTPS":true}},
         "Services":{"svc:acceptance":{"TCP":{"19452":{"TCPForward":"127.0.0.1:9041"}}}},
         "AllowFunnel":{"acceptance.example.ts.net:19447":true},
         "Foreground":{"session":{"TCP":{"19448":{"HTTPS":true}},"Web":{"acceptance.example.ts.net:19448":{"Handlers":{"/":{"Text":"keep"}}}}}}
@@ -711,6 +716,10 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
         remove_seed["Web"]["acceptance.example.ts.net:19449"]
     );
     assert_eq!(remove_after["TCP"]["19451"], remove_seed["TCP"]["19451"]);
+    assert_eq!(
+        remove_after["Web"]["acceptance.example.ts.net:19449"]["Handlers"]["/"],
+        remove_seed["Web"]["acceptance.example.ts.net:19449"]["Handlers"]["/"]
+    );
     assert_eq!(remove_after["TCP"]["19449"], remove_seed["TCP"]["19449"]);
     assert_eq!(remove_after["Services"], remove_seed["Services"]);
     assert_eq!(remove_after["AllowFunnel"], remove_seed["AllowFunnel"]);
@@ -1131,8 +1140,299 @@ fn persisted_sharing_refuses_foreign_changes_and_uses_conditional_owned_mutation
         let _ = child.wait();
     }
     let reset_output = child.wait_with_output().expect("collect reset output");
-    assert!(!exited_held && preserved_held && !timed_out && reset_output.status.success() && !sandbox_root.exists(),
-        "reset serialization failed (exited={exited_held}, preserved={preserved_held}, timeout={timed_out}): {}", output_text(&reset_output));
+    assert!(
+        !exited_held
+            && preserved_held
+            && !timed_out
+            && reset_output.status.success()
+            && !sandbox_root.exists(),
+        "reset serialization failed (exited={exited_held}, preserved={preserved_held}, timeout={timed_out}): {}",
+        output_text(&reset_output)
+    );
+}
+
+#[test]
+fn sharing_requires_literal_ipv4_loopback_and_a_matching_bind() {
+    // Persisted host mismatch: only the literal 127.0.0.1 proxy target is
+    // safe, and the listener must actually bind that same host and port.
+    let persisted = Fixture::new("persisted-ipv6-bind");
+    let original = format!(
+        "{{\n  \"host\": \"::1\",\n  \"port\": {PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{TARGET}\"\n  }}\n}}\n"
+    );
+    fs::write(persisted.state.join("ui.json"), &original).unwrap();
+    let config = mapping(SHARE_PORT, TARGET);
+    persisted.api.seed(config.clone());
+    let mut failures = Vec::new();
+    let out = persisted.cli(&["ui", "start"]);
+    let after = fs::read(persisted.state.join("ui.json")).unwrap();
+    let after_config = persisted.api.config();
+    let requests = persisted.api.requests();
+    if out.status.success()
+        || after != original.as_bytes()
+        || after_config != config
+        || requests.iter().any(|(m, _, _)| m == "POST")
+    {
+        failures.push(format!(
+            "persisted IPv6 bind: status={} output={} options_unchanged={} api_unchanged={} requests={requests:?}",
+            out.status,
+            output_text(&out),
+            after == original.as_bytes(),
+            after_config == config,
+        ));
+    }
+
+    // A start-time bind override must be checked too, not only persisted
+    // options. Try ::1 and localhost separately so aliases never become
+    // an accidental IPv4 assumption.
+    for (label, host) in [
+        ("flag-ipv6-bind", "::1"),
+        ("flag-localhost-bind", "localhost"),
+    ] {
+        let fixture = Fixture::new(label);
+        let original = format!("{{\n  \"port\": {BIND_TEST_PORT}\n}}\n").into_bytes();
+        fs::write(fixture.state.join("ui.json"), &original).unwrap();
+        let out = fixture.cli(&["ui", "start", "--host", host, "--tailscale", "19450"]);
+        let after = fs::read(fixture.state.join("ui.json")).unwrap();
+        let after_config = fixture.api.config();
+        let requests = fixture.api.requests();
+        if out.status.success()
+            || after != original
+            || after_config != Value::Null
+            || requests.iter().any(|(m, _, _)| m == "POST")
+        {
+            failures.push(format!(
+                "{label}: status={} output={} options_unchanged={} api_unchanged={} requests={requests:?}",
+                out.status,
+                output_text(&out),
+                after == original,
+                after_config == Value::Null,
+            ));
+        }
+    }
+
+    // Explicit Tailscale start derives the bind from persisted UI options;
+    // reject aliases there before either API mutation or options persistence.
+    for (label, host) in [
+        ("tailscale-start-ipv6-bind", "::1"),
+        ("tailscale-start-localhost-bind", "localhost"),
+    ] {
+        let fixture = Fixture::new(label);
+        let original =
+            format!("{{\n  \"host\": \"{host}\",\n  \"port\": {BIND_TEST_PORT}\n}}\n").into_bytes();
+        fs::write(fixture.state.join("ui.json"), &original).unwrap();
+        let out = fixture.cli(&["ui", "tailscale", "start", "--port", "19450"]);
+        let after = fs::read(fixture.state.join("ui.json")).unwrap();
+        let after_config = fixture.api.config();
+        let requests = fixture.api.requests();
+        if out.status.success()
+            || after != original
+            || after_config != Value::Null
+            || requests.iter().any(|(m, _, _)| m == "POST")
+        {
+            failures.push(format!(
+                "{label}: status={} output={} options_unchanged={} api_unchanged={} requests={requests:?}",
+                out.status,
+                output_text(&out),
+                after == original,
+                after_config == Value::Null,
+            ));
+        }
+    }
+
+    // Preserve the positive control: explicitly bound IPv4 loopback can
+    // create a new share and persist exactly the API-owned target.
+    let ipv4 = Fixture::new("flag-ipv4-bind-control");
+    fs::write(
+        ipv4.state.join("ui.json"),
+        format!("{{\n  \"port\": {BIND_TEST_PORT}\n}}\n"),
+    )
+    .unwrap();
+    let out = ipv4.cli(&["ui", "start", "--host", "127.0.0.1", "--tailscale", "19450"]);
+    assert!(
+        out.status.success(),
+        "IPv4 loopback control failed: {}",
+        output_text(&out)
+    );
+    assert_eq!(
+        ipv4.api.config()["Web"][HOSTPORT]["Handlers"]["/"]["Proxy"],
+        format!("http://127.0.0.1:{BIND_TEST_PORT}")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(ipv4.state.join("ui.json")).unwrap()).unwrap()
+            ["tailscale"]["target"],
+        format!("http://127.0.0.1:{BIND_TEST_PORT}")
+    );
+    assert!(
+        failures.is_empty(),
+        "unsafe sharing cases failed: {failures:#?}"
+    );
+}
+
+#[test]
+fn stop_refuses_forged_or_production_target_before_api_mutation() {
+    let mut failures = Vec::new();
+    for (label, args, target, port, ui_port) in [
+        (
+            "tailscale-stop-forged",
+            vec!["ui", "tailscale", "stop"],
+            FORGED_TARGET,
+            SHARE_PORT,
+            PORT,
+        ),
+        (
+            "stop-off-forged",
+            vec!["ui", "stop", "--tailscale-off"],
+            FORGED_TARGET,
+            SHARE_PORT,
+            PORT,
+        ),
+        (
+            "tailscale-stop-production-port",
+            vec!["ui", "tailscale", "stop"],
+            "http://127.0.0.1:3010",
+            3010,
+            3010,
+        ),
+        (
+            "stop-off-production-port",
+            vec!["ui", "stop", "--tailscale-off"],
+            "http://127.0.0.1:3010",
+            3010,
+            3010,
+        ),
+    ] {
+        let fixture = Fixture::new(label);
+        let record = format!(
+            "{{\n  \"port\": {ui_port},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {port},\n    \"target\": \"{target}\"\n  }}\n}}\n"
+        );
+        fs::write(fixture.state.join("ui.json"), &record).unwrap();
+        let config = mapping(port, target);
+        fixture.api.seed(config.clone());
+        let out = fixture.cli(&args);
+        let after = fs::read(fixture.state.join("ui.json")).unwrap();
+        let after_config = fixture.api.config();
+        let requests = fixture.api.requests();
+        if out.status.success()
+            || after != record.as_bytes()
+            || after_config != config
+            || requests.iter().any(|(m, _, _)| m == "POST")
+        {
+            failures.push(format!(
+                "{label}: status={} output={} record_unchanged={} api_unchanged={} requests={requests:?}",
+                out.status,
+                output_text(&out),
+                after == record.as_bytes(),
+                after_config == config,
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "unsafe stop cases failed: {failures:#?}"
+    );
+}
+
+#[test]
+fn reset_refuses_known_ui_options_decode_failure_without_mutation() {
+    let fixture = Fixture::new("reset-malformed-known-option");
+    let base = fixture._root.path().join("sandboxes");
+    let root = base.join("malformed");
+    let state = root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        root.join(".cadence-sandbox"),
+        r#"{"name":"malformed","allow_global":true}"#,
+    )
+    .unwrap();
+    let record = format!(
+        "{{\n  \"dist\": false,\n  \"port\": {PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{TARGET}\"\n  }}\n}}\n"
+    );
+    fs::write(state.join("ui.json"), &record).unwrap();
+    let config = mapping(SHARE_PORT, TARGET);
+    fixture.api.seed(config.clone());
+    let out = fixture.cli(&["sandbox", "reset", "malformed"]);
+    let root_exists = root.is_dir();
+    let after = fs::read(state.join("ui.json")).unwrap_or_default();
+    let after_config = fixture.api.config();
+    let requests = fixture.api.requests();
+    assert!(
+        !out.status.success()
+            && root_exists
+            && after == record.as_bytes()
+            && after_config == config
+            && requests.iter().all(|(m, _, _)| m != "POST"),
+        "malformed reset case failed: status={} output={} root_exists={root_exists} record_unchanged={} api_unchanged={} requests={requests:?}",
+        out.status,
+        output_text(&out),
+        after == record.as_bytes(),
+        after_config == config,
+    );
+}
+
+#[test]
+fn unsupported_localapi_serve_schema_refuses_without_post_or_data_loss() {
+    let known_free_config = || {
+        json!({
+            "Web": {
+                "known.example.ts.net:19449": {"Handlers": {"/": {"Text": "keep"}}}
+            },
+            "TCP": {
+                "19449": {"HTTPS": true},
+                "19451": {"TCPForward": "127.0.0.1:9040"}
+            },
+            "AllowFunnel": {"known.example.ts.net:19447": true}
+        })
+    };
+    let mut cases = Vec::new();
+
+    let mut future_root = known_free_config();
+    future_root["FutureServe"] = json!({
+        "TCP": {"19450": {"TCPForward": "127.0.0.1:3118"}}
+    });
+    cases.push(("future-root-field", future_root));
+
+    let mut future_handler = known_free_config();
+    future_handler["Web"]["known.example.ts.net:19449"]["Handlers"]["/"]["FutureHandler"] =
+        json!({"mode": "preserve-me"});
+    cases.push(("future-http-handler-field", future_handler));
+
+    let mut failures = Vec::new();
+    for (label, original_config) in cases {
+        let fixture = Fixture::new(label);
+        let target = format!("http://127.0.0.1:{BIND_TEST_PORT}");
+        let record = format!(
+            "{{\n  \"port\": {BIND_TEST_PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{target}\"\n  }}\n}}\n"
+        );
+        fs::write(fixture.state.join("ui.json"), &record).unwrap();
+        fixture.api.seed(original_config.clone());
+        let out = fixture.cli(&["ui", "start"]);
+        let after_record = fs::read(fixture.state.join("ui.json")).unwrap();
+        let after_config = fixture.api.config();
+        let requests = fixture.api.requests();
+        let got_snapshot = requests
+            .iter()
+            .any(|(method, path, _)| method == "GET" && path == "/localapi/v0/serve-config");
+        if out.status.success()
+            || !got_snapshot
+            || requests
+                .iter()
+                .any(|(method, path, _)| method == "POST" && path == "/localapi/v0/serve-config")
+            || after_record != record.as_bytes()
+            || after_config != original_config
+        {
+            failures.push(format!(
+                "{label}: status={} output={} reached_snapshot={got_snapshot} record_unchanged={} config_unchanged={} requests={requests:?}",
+                out.status,
+                output_text(&out),
+                after_record == record.as_bytes(),
+                after_config == original_config,
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "unsupported LocalAPI schema cases failed: {failures:#?}"
+    );
 }
 
 const FAKE_TAILSCALE: &str = r##"#!/bin/sh
