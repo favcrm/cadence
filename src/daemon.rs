@@ -35,6 +35,8 @@ mod approvals_rpc;
 mod area_rpc;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1184_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1184_revision_acceptance;
 mod caller_rule;
 mod checkup;
 mod connection_test;

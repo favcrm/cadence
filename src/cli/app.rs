@@ -1516,15 +1516,10 @@ fn read_run_inputs(path: &Path) -> Result<serde_json::Value> {
     Ok(json!(inputs))
 }
 
-fn read_assistant_input(path: &Path) -> Result<serde_json::Value> {
+fn read_assistant_input(state_dir: &Path, path: &Path) -> Result<serde_json::Value> {
     use std::io::Read;
     const MAX_INPUT_BYTES: usize = 32 * 1024;
-    let file = std::fs::File::open(path).map_err(|e| {
-        Error::invalid(
-            "app_assistant_input",
-            format!("cannot open assistant input: {e}"),
-        )
-    })?;
+    let file = cadence_agent::master::open_command_file(state_dir, path)?;
     let mut bytes = Vec::new();
     file.take((MAX_INPUT_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -1876,7 +1871,7 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     input,
                 } => (
                     "app_assistant_invoke",
-                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token,"action_id":action_id,"operation_id":operation_id,"input":read_assistant_input(input)?}),
+                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token,"action_id":action_id,"operation_id":operation_id,"input":read_assistant_input(state_dir, input)?}),
                 ),
                 AssistantAction::OperationShow {
                     install_id,

@@ -337,13 +337,21 @@ impl Shared {
                 "segments.preview" => {
                     records.app_segment_preview(&scoped.context, required_str(input, "segment_id")?)
                 }
-                "segments.save" => records.app_segment_save(
-                    &scoped.context,
-                    required_str(input, "segment_id")?,
-                    super::app_audiences_rpc::audience_expected(input)?,
-                    &super::app_audiences_rpc::audience_name(input)?,
-                    &super::app_audiences_rpc::audience_predicates(input)?,
-                ),
+                "segments.save" => {
+                    let mut segment_params = json!({
+                        "install_id": &scoped.install,
+                        "context_id": &scoped.context,
+                        "segment_id": required_str(input, "segment_id")?,
+                        "name": super::app_audiences_rpc::audience_name(input)?,
+                        "predicates": input.get("predicates").cloned().unwrap_or(Value::Null),
+                        "message": required_str(params, "message")?,
+                        "token": required_str(params, "token")?,
+                    });
+                    if let Some(expected_revision) = input.get("expected_revision") {
+                        segment_params["expected_revision"] = expected_revision.clone();
+                    }
+                    self.rpc_app_segment_assistant_save(&segment_params, peer_pid)
+                }
                 "campaigns.list" => records.app_content_list(&scoped.context),
                 "campaigns.show" => {
                     records.app_content_show(&scoped.context, required_str(input, "campaign_id")?)

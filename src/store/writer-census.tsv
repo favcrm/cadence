@@ -183,6 +183,8 @@ wiki/index.rs	separate-wiki-index-db	transaction	2
 audit.rs	inline-test-store-fixtures	open	1
 daemon/cad1184_acceptance.rs	independent-daemon-acceptance-fixtures	execute	3
 daemon/cad1184_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
+daemon/cad1184_revision_acceptance.rs	independent-daemon-acceptance-fixtures	execute	2
+daemon/cad1184_revision_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	execute	3
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	open	2
 store/social_publish.rs	guarded-store-and-read-queries	prepare	2

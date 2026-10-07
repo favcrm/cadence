@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const PASSWORD: &str = "cad1065-synthetic-only-password";
@@ -124,6 +124,19 @@ impl CredentialReads {
     }
 }
 
+/// `platform::smtp::direct_dial_count` is a process-global counter shared
+/// by every fixture daemon this binary runs in parallel under
+/// `--test-threads 2`. A test that snapshots the counter must own its
+/// observation window: while its fixture lives, no sibling fixture's
+/// legitimate `verify_login`/send dial may interleave, or the snapshot
+/// assertion observes a dial it did not cause. This witness serializes
+/// fixture lifetimes (never the requests inside them), holding from
+/// before any setup until after the daemon and board threads are joined
+/// and the owned rig child is reaped. The lock carries no shared state,
+/// so a poisoned guard from a panicking fixture test is still safe to
+/// take: `Drop` always runs its teardown before releasing.
+static SMTP_COUNTER_WITNESS: Mutex<()> = Mutex::new(());
+
 struct Fixture {
     _rig: OwnedChild,
     root: tempfile::TempDir,
@@ -131,6 +144,11 @@ struct Fixture {
     threads: Vec<std::thread::JoinHandle<()>>,
     port: u16,
     board_port: u16,
+    // LAST field: after `Drop::drop` joins the server threads, fields are
+    // dropped in declaration order, so the witness is released only once
+    // every owned thread and the rig child are gone — no late daemon dial
+    // can leak into the next fixture's counter snapshot.
+    _smtp_counter_witness: MutexGuard<'static, ()>,
 }
 
 impl Drop for Fixture {
@@ -144,6 +162,12 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn start() -> Self {
+        // Acquire the witness before any setup or dial: counter snapshots
+        // in this process are only meaningful while no other fixture's
+        // server can run.
+        let smtp_counter_witness = SMTP_COUNTER_WITNESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = tempfile::Builder::new().prefix("c1065-").tempdir().unwrap();
         let certificate = root.path().join("certificate.pem");
         let key = root.path().join("key.pem");
@@ -237,6 +261,7 @@ impl Fixture {
             _rig: rig,
             port,
             board_port: 0,
+            _smtp_counter_witness: smtp_counter_witness,
         };
         issue::Pm::init(&fixture.pm()).unwrap();
         assert!(
