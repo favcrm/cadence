@@ -642,6 +642,11 @@ export default function WorkspaceApp({
       {data && (
         <>
           <div className="wa-toolbar">
+            {/* CAD-1174: one active context is not a choice — the shell
+                auto-selects it (contextSelection.initialContext) and the
+                picker, including the "No brand context" option, stays
+                hidden. Two or more keep the explicit picker. */}
+            {data.contexts.filter((value) => value.state === "active").length > 1 && (
             <div className="wa-context">
               <Select
                 value={contextId}
@@ -668,6 +673,7 @@ export default function WorkspaceApp({
                 full
               />
             </div>
+            )}
             <Button
               variant="primary"
               onClick={() => {

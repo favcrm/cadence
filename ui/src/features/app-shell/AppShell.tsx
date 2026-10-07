@@ -168,6 +168,30 @@ export default function AppShell({
         if (controller.signal.aborted) return;
         setInstallation(next);
         setContexts(nextContexts);
+        // CAD-1174: a CRM installation without a scope is unusable — the
+        // record lists, the segments and the email sender all need one,
+        // and asking the operator to invent a scope is the friction this
+        // removes. Create the single `General` scope on first load;
+        // `request_id` is stable, so a second load or a race resolves to
+        // the same row instead of minting another. Apps that run without
+        // a brand context by design (Social) are untouched.
+        if (next.name === "crm" && !nextContexts.some((value) => value.state === "active")) {
+          workspaceApps
+            .createContext(installId, {
+              label: "General",
+              input_defaults: {},
+              request_id: `general-${installId}`,
+            })
+            .then((created) => {
+              if (!controller.signal.aborted) {
+                setContexts((previous) => [...previous, created]);
+              }
+            })
+            .catch(() => {
+              // The scope-entry notice below already tells the operator
+              // what to do; a failed default never blocks the app.
+            });
+        }
       })
       .catch((e: unknown) => {
         if (!controller.signal.aborted) {
@@ -398,6 +422,12 @@ export default function AppShell({
   // The chat's descriptor comes from the installation's own approved package
   // (served pinned to its digest); with none, the pane is plain shared chat.
   const verified = installation !== null && installation.install_id === installId;
+  // CAD-1174: with a single active scope the context concept is not a
+  // choice — the operator never sees it. `General` is the one scope a
+  // CRM installation gets (created below when it has none); every
+  // other app keeps the surfaces it has today.
+  const activeContexts = contexts.filter((value) => value.state === "active");
+  const singleScope = verified && installation.name === "crm" && activeContexts.length <= 1;
   const chatDescriptor = useAppChat(
     installId,
     verified ? installation.digest : null,
@@ -480,7 +510,7 @@ export default function AppShell({
               contextId: binding.scope?.context_id ?? "",
               screen: chatScreen,
               recordOpen: recordId !== null,
-              contextName: contextLabel(contexts, contextId),
+              contextName: singleScope ? null : contextLabel(contexts, contextId),
               descriptor: chatDescriptor,
             }}
             density="compact"
