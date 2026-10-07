@@ -256,7 +256,7 @@ impl Shared {
         // The guard is acquired and held by the worker thread for the
         // whole operation: if a cleanup kill-path cannot observe the
         // reap inside the budget, the SAME thread keeps holding the
-        // lock (with the owned Child) and polls `try_wait` until exit
+        // lock (with the owned Child) and polls raw `waitpid` until exit
         // is observed — the guard never crosses a thread boundary
         // (`MutexGuard` is `!Send`) and is never released early, so
         // no queued custody user can interleave while the child is

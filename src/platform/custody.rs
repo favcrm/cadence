@@ -380,16 +380,21 @@ fn libsecret_lookup_bounded(
     let result = 'drain: loop {
         if !open[0] && !open[1] {
             break 'drain 'wait: loop {
-                match child.try_wait() {
+                // Raw `waitpid` — never `try_wait`: its cached
+                // `Some` status (a `WIFSTOPPED` trace report) could
+                // mask the real later exit here and make the
+                // `libc::kill` below a no-op through `Child::kill`'s
+                // own cache check.
+                match super::waitpid_terminal(&child) {
                     Ok(Some(status)) => {
-                        break 'wait if status.success() {
+                        break 'wait if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
                             Ok(out)
                         } else {
                             Err(Error::internal(format!(
                                 "keychain holds no credential for '{}/{}'",
                                 key.platform, key.account
                             )))
-                        }
+                        };
                     }
                     Ok(None) => {
                         let Some(left) = deadline.remaining() else {

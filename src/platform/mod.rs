@@ -150,6 +150,11 @@ pub fn observe_child_exit(child: &std::process::Child) -> ChildExit {
         )
     };
     if rc == child.id() as libc::pid_t {
+        // `waitpid` only ever reports an un-reaped child of this
+        // process — a recycled pid cannot surface here unless the
+        // kernel still owes us its status, so a terminal report is
+        // a positively established termination of our own child,
+        // never another task's stolen status.
         if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
             ChildExit::Terminated
         } else {
@@ -159,9 +164,10 @@ pub fn observe_child_exit(child: &std::process::Child) -> ChildExit {
         ChildExit::Running
     } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
         // `ECHILD` proves the owned child's status was already
-        // consumed — it terminated and is reaped — but a foreign
-        // `/proc` view could still list a live task under that id,
-        // so a still-present task keeps the serialization held.
+        // consumed — it terminated and is reaped — but a recycled
+        // pid in a foreign `/proc` view could still list a live
+        // task under that id, so a still-present task keeps the
+        // serialization held rather than releasing on it.
         #[cfg(target_os = "linux")]
         {
             if std::fs::metadata(format!("/proc/{}", child.id())).is_ok() {
@@ -171,6 +177,36 @@ pub fn observe_child_exit(child: &std::process::Child) -> ChildExit {
         ChildExit::Terminated
     } else {
         ChildExit::Uncertain
+    }
+}
+
+/// Raw `waitpid(WNOHANG)` for `child` returning the fresh wait
+/// status when the task is terminal (`WIFEXITED`/`WIFSIGNALED`),
+/// `Ok(None)` while it is still running or only stopped, and the
+/// `waitpid` error otherwise. Unlike `Child::try_wait` nothing is
+/// cached — a `WIFSTOPPED` report can never mask the later real
+/// exit — and the caller must not call `Child::try_wait`/`wait`
+/// after a terminal status has been consumed here.
+#[cfg(unix)]
+pub fn waitpid_terminal(child: &std::process::Child) -> std::io::Result<Option<libc::c_int>> {
+    let mut status: libc::c_int = 0;
+    let rc = unsafe {
+        libc::waitpid(
+            child.id() as libc::pid_t,
+            &mut status as *mut libc::c_int,
+            libc::WNOHANG,
+        )
+    };
+    if rc == child.id() as libc::pid_t {
+        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            Ok(Some(status))
+        } else {
+            Ok(None)
+        }
+    } else if rc == 0 {
+        Ok(None)
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
