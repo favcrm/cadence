@@ -46,7 +46,7 @@ function readinessRules() {
   });
   equal(missingReasons(none), [
     "content approved at the current revision",
-    "freeze f rechecked below (its validity is unverified)",
+    "the audience frozen and rechecked (its validity is unverified)",
     "the sender binding read (still loading)",
     "an accepted test send of this content and binding",
   ], "unmet reasons keep their order and text");
@@ -57,7 +57,7 @@ function readinessRules() {
   });
   equal(missingReasons(stale), [
     "content approved at the current revision",
-    "freeze f reporting valid",
+    "the audience frozen and reporting valid",
     "a live SMTP sender binding",
   ], "stale approval, invalid freeze and no sender are unmet");
   const drifted = sendReadiness({ doc, freezeId: "f", freeze: { valid: true }, binding, testEvidence: { ...test, contentDigest: "old" } });

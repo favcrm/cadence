@@ -1440,8 +1440,8 @@ function FinalSendPanel({
         </div>
       ) : (
         <p className="text-label text-ok" data-prerequisites="met">
-          Every prerequisite is in place — approved r{doc.revision}, freeze {freezeId.trim()},
-          sender {binding?.sender.address}, accepted test send of this content.
+          Every prerequisite is in place — approved r{doc.revision}, the frozen audience
+          (checked just now), sender {binding?.sender.address}, accepted test send of this content.
         </p>
       )}
       {error && (
@@ -2666,6 +2666,7 @@ function CampaignDetail({
   campaignId: string;
   onBack: () => void;
 }) {
+  const canWrite = viewer.operator && !viewer.readOnly;
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const [doc, setDoc] = useState<ContentDoc | null>(null);
   const [loading, setLoading] = useState(true);
@@ -2751,12 +2752,18 @@ function CampaignDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadToken]);
 
+  // Every check carries a generation: an older lookup resolving after a
+  // newer one (audience changed mid-flight) can never paint its row.
+  const freezeGeneration = useRef(0);
+
   const checkFreeze = () => {
+    const generation = (freezeGeneration.current += 1);
     setFreezePending(true);
     setFreezeError(null);
     void audienceClient
       .freezeShow(scope, freezeId)
       .then((value) => {
+        if (generation !== freezeGeneration.current) return;
         const root = (value as Record<string, unknown> | null) ?? {};
         const row = (root.freeze as Record<string, unknown> | null) ?? {};
         setFreezeMissing(false);
@@ -2769,8 +2776,9 @@ function CampaignDetail({
         });
       })
       .catch((err: unknown) => {
+        if (generation !== freezeGeneration.current) return;
         // CAD-1178: a missing freeze is the normal "not frozen yet" state,
-        // not an error the operator has to decode.
+        // not an error the operator has to decode (the board maps it to 404).
         if (err instanceof ApiError && err.status === 404) {
           setFreeze(null);
           setFreezeMissing(true);
@@ -2790,6 +2798,7 @@ function CampaignDetail({
   }, [freezeId]);
 
   const freezeAudience = () => {
+    if (!canWrite) return;
     setFreezePending(true);
     setFreezeError(null);
     // The ceiling is derived from the previewed size with headroom, never
@@ -2882,7 +2891,10 @@ function CampaignDetail({
                   scope={scope}
                   viewer={viewer}
                   pick={pick}
-                  onPick={setPick}
+                  onPick={(next) => {
+                    setPick(next);
+                    setAudiencePreview(null);
+                  }}
                   onPreview={setAudiencePreview}
                   layout="detail"
                 />
@@ -2914,7 +2926,7 @@ function CampaignDetail({
                       size="sm"
                       variant="primary"
                       loading={freezePending}
-                      disabled={freezePending}
+                      disabled={freezePending || !canWrite || audiencePreview === null}
                       onClick={freezeAudience}
                     >
                       {freeze !== null && freeze.valid === false ? "Refreeze" : freeze === null ? "Freeze this audience" : "Refreeze"}
