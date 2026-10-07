@@ -55,6 +55,40 @@ impl std::fmt::Display for AppArtifactError {
 
 impl std::error::Error for AppArtifactError {}
 
+/// A run-bound read/draft operation distinguishes a refusal known not to
+/// have executed from a request whose execution may have reached the provider.
+/// Refusal includes local preflight rejection and explicit provider refusal;
+/// callers must not retry an uncertain call without the original idempotency
+/// proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppCapabilityError {
+    Refused(String),
+    Uncertain(String),
+}
+
+impl AppCapabilityError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Refused(_) => "refused",
+            Self::Uncertain(_) => "uncertain",
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Refused(reason) | Self::Uncertain(reason) => reason,
+        }
+    }
+}
+
+impl std::fmt::Display for AppCapabilityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.reason())
+    }
+}
+
+impl std::error::Error for AppCapabilityError {}
+
 /// One platform's adapter — the proxy's outward leg.
 pub trait PlatformAdapter: Send + Sync {
     /// The adapter's declared tool table, reviewed like code and pinned
@@ -109,6 +143,21 @@ pub trait PlatformAdapter: Send + Sync {
         _idempotency_key: &str,
     ) -> std::result::Result<super::AppCapabilityOutput, String> {
         Err("provider does not support run-bound app capabilities".into())
+    }
+
+    /// Typed execution result for callers that must distinguish a confirmed
+    /// refusal from uncertainty. Legacy adapters expose only a string, so the
+    /// default treats their errors conservatively as uncertain rather than
+    /// assuming the provider did not execute.
+    fn execute_app_capability_outcome(
+        &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        idempotency_key: &str,
+    ) -> std::result::Result<super::AppCapabilityOutput, AppCapabilityError> {
+        self.execute_app_capability(credential, authority, input, idempotency_key)
+            .map_err(AppCapabilityError::Uncertain)
     }
 
     /// Quote the exact reviewed mapping and credential account in a frozen

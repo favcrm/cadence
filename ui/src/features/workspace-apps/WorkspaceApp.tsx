@@ -1117,6 +1117,7 @@ export default function WorkspaceApp({
           <div className="wa-stack">
             {actionError && <p className="wa-alert" data-tone="fail" role="alert">{actionError}</p>}
             <div className="wa-row"><span className="wa-status" data-tone={statusTone(run.state)}>{statusText(run.state)}</span><span className="wa-kicker">{run.id}</span></div>
+            {run.failure && !actionError && <p className="wa-alert" data-tone="fail" role="status">{run.failure.kind === "uncertain" ? "The provider outcome is uncertain; no automatic retry was made." : "This source read was refused."} {run.failure.reason}</p>}
             <p className="wa-muted">This run reads public posts from the frozen @{run.snapshot.inputs.profile_handle} profile. It cannot publish or generate an image.</p>
             {run.snapshot.quotes?.source?.currency === "USD" && Number.isSafeInteger(run.snapshot.quotes.source.total_price_micros) ? <p className="wa-alert">Frozen provider charge: <strong>USD {(run.snapshot.quotes.source.total_price_micros / 1_000_000).toFixed(6)}</strong> for one read. Binding {run.snapshot.capabilities?.source?.digest || "unavailable"}. A changed quote or binding stops dispatch.</p> : <p className="wa-alert" data-tone="fail">This source plan has no verified provider quote. It cannot be approved.</p>}
             <details className="wa-details"><summary>Inspect the exact source plan</summary><pre>{JSON.stringify(run.snapshot, null, 2)}</pre><p className="wa-digest">{run.snapshot_digest}</p></details>
@@ -1149,6 +1150,7 @@ export default function WorkspaceApp({
               </span>
               <span className="wa-kicker">{run.id}</span>
             </div>
+            {run.failure && !actionError && <p className="wa-alert" data-tone="fail" role="status">{run.failure.kind === "uncertain" ? "The provider outcome is uncertain; no automatic retry was made." : "This capability was refused."} {run.failure.reason}</p>}
             <p className="wa-muted">{run.snapshot.inputs.source}</p>
             {isImageRun(run) && (imagePlanPriced
               ? <p className="wa-alert">Current rate at approval: <strong>USD {(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}</strong> per image — billed at the provider's actual charge. This covers one square image draft from {run.snapshot.source ? "the selected post" : "pasted facts"}. Binding {run.snapshot.capabilities?.image?.digest}. A changed rate or binding stops dispatch.</p>

@@ -80,6 +80,7 @@ export interface WorkspaceRun {
     input_origins?: Record<string, "app_default" | "context_default" | "run_override">;
   };
   steps: { step_id: string; task_id: string; state: string; message_id: string | null }[];
+  failure?: { kind: "refused" | "uncertain"; reason: string; step_id: string };
   /** Run epochs in seconds (CAD-1123). */
   created?: number; updated?: number;
   /** The recorded execution approval, when there is one (CAD-1123 R4). */

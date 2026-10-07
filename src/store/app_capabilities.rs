@@ -136,7 +136,7 @@ pub(crate) struct AppCapabilityClaim<'a> {
 impl Store {
     /// Reserve the one paid operation for this run slot before provider I/O.
     /// A failed/uncertain result can only retry the same operation and key.
-    pub(crate) fn app_capability_claim(&self, claim: AppCapabilityClaim<'_>) -> Result<()> {
+    pub(crate) fn app_capability_claim(&self, claim: AppCapabilityClaim<'_>) -> Result<bool> {
         let AppCapabilityClaim {
             run,
             step,
@@ -176,7 +176,7 @@ impl Store {
                             "app capability needs its active assigned turn",
                         ));
                     }
-                    tx.execute(
+                    let inserted = tx.execute(
                         "INSERT OR IGNORE INTO app_capability_claims VALUES(?,?,?,?,?,?,?,?)",
                         params![
                             run,
@@ -188,7 +188,7 @@ impl Store {
                             call_id,
                             now()
                         ],
-                    )?;
+                    )? != 0;
                     let existing: (String, String, String, String, String) = tx.query_row(
                         "SELECT step_id,request_id,binding_digest,input_digest,call_id
                          FROM app_capability_claims WHERE run_id=? AND slot=?",
@@ -208,7 +208,7 @@ impl Store {
                             "approved run capability slot already claimed another operation",
                         ));
                     }
-                    Ok(())
+                    Ok(inserted)
         })
     }
 

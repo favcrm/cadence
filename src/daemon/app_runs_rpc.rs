@@ -718,7 +718,23 @@ impl Shared {
                     )
                     .simple()
                 );
-                self.store.app_capability_claim(
+                let authority = json!({
+                    "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
+                    "install_id":install,"context_id":run["context_id"],
+                    "step_id":step_id,"slot":slot,"binding":proof,
+                    "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
+                    "quote":run["snapshot"]["quotes"][slot],
+                    "call_id":call_id,
+                });
+                if self
+                    .store
+                    .app_capability_result_for_slot(run_id, slot)?
+                    .is_some()
+                {
+                    continue;
+                }
+                let credential = self.app_capability_credential(config)?;
+                let newly_claimed = self.store.app_capability_claim(
                     crate::store::app_capabilities::AppCapabilityClaim {
                         run: run_id,
                         step: &step_id,
@@ -731,31 +747,68 @@ impl Shared {
                         call_id: &call_id,
                     },
                 )?;
-                let authority = json!({
-                    "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
-                    "install_id":install,"context_id":run["context_id"],
-                    "step_id":step_id,"slot":slot,"binding":proof,
-                    "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
-                    "quote":run["snapshot"]["quotes"][slot],
-                    "call_id":call_id,
-                });
-                let credential = self.app_capability_credential(config)?;
-                let output = adapter
-                    .execute_app_capability(&credential, &authority, &input, &call_id)
-                    .map_err(Error::rejected)?;
-                crate::platform::refuse_leak(
+                if !newly_claimed {
+                    let reason = "A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made.";
+                    self.store
+                        .app_run_host_step_failed(run_id, &step_id, "uncertain", reason)?;
+                    return Err(Error::unknown(reason));
+                }
+                let output = match adapter.execute_app_capability_outcome(
+                    &credential,
+                    &authority,
+                    &input,
+                    &call_id,
+                ) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let message = if crate::platform::refuse_leak(
+                            "app capability failure",
+                            error.reason(),
+                            &credential,
+                        )
+                        .is_ok()
+                        {
+                            error.reason().chars().take(250).collect::<String>()
+                        } else {
+                            "Provider failure details were withheld because they matched credential custody.".into()
+                        };
+                        self.store.app_run_host_step_failed(
+                            run_id,
+                            &step_id,
+                            error.kind(),
+                            &message,
+                        )?;
+                        return Err(match error {
+                            crate::platform::AppCapabilityError::Refused(_) => {
+                                Error::provider(message)
+                            }
+                            crate::platform::AppCapabilityError::Uncertain(_) => {
+                                Error::unknown(message)
+                            }
+                        });
+                    }
+                };
+                if crate::platform::refuse_leak(
                     "app capability result",
                     &output.result.to_string(),
                     &credential,
-                )?;
-                if let Some(asset) = &output.asset {
-                    crate::platform::refuse_leak(
-                        "app capability asset",
-                        &String::from_utf8_lossy(&asset.bytes),
-                        &credential,
-                    )?;
+                )
+                .is_err()
+                    || output.asset.as_ref().is_some_and(|asset| {
+                        crate::platform::refuse_leak(
+                            "app capability asset",
+                            &String::from_utf8_lossy(&asset.bytes),
+                            &credential,
+                        )
+                        .is_err()
+                    })
+                {
+                    let reason = "Provider output could not be safely retained; the outcome is uncertain and no automatic retry was made.";
+                    self.store
+                        .app_run_host_step_failed(run_id, &step_id, "uncertain", reason)?;
+                    return Err(Error::unknown(reason));
                 }
-                let receipt = self.store.app_capability_record(
+                if let Err(_error) = self.store.app_capability_record(
                     crate::store::app_capabilities::AppCapabilityRecord {
                         id: &call_id,
                         run: run_id,
@@ -772,13 +825,14 @@ impl Shared {
                             .as_ref()
                             .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
                     },
-                )?;
-                self.store.app_run_host_step_succeeded(
-                    run_id,
-                    &step_id,
-                    required_str(&receipt, "digest")?,
-                )?;
+                ) {
+                    let reason = "Provider returned a result that could not be durably retained; the outcome is uncertain and no automatic retry was made.";
+                    self.store
+                        .app_run_host_step_failed(run_id, &step_id, "uncertain", reason)?;
+                    return Err(Error::unknown(reason));
+                }
             }
+            self.store.app_run_host_step_succeeded(run_id, &step_id)?;
             Ok(())
         })
     }

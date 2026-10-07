@@ -210,7 +210,7 @@ fn cad1060_hosted_source_unavailable_gateway_and_bad_receipts_return_nothing() {
         .execute_app_capability(b"", &proof(), &json!({}), "app-call-1060")
         .err()
         .unwrap();
-    assert!(error.contains("could not reach"), "{error}");
+    assert!(error.contains("outcome is uncertain"), "{error}");
     assert!(host.quote_app_capability(b"", &proof()["binding"]).is_err());
 }
 

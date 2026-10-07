@@ -10,10 +10,13 @@ use cadence_agent::contract_fixture::{ToolTable, Verified};
 use cadence_agent::platform::connections::{
     BoundActionMapping, CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor,
 };
-use cadence_agent::platform::{AppCapabilityOutput, AppCapabilityQuote, PlatformAdapter};
+use cadence_agent::platform::{
+    AppCapabilityError, AppCapabilityOutput, AppCapabilityQuote, PlatformAdapter,
+};
 use cadence_agent::test_seam::{scoped, Asserted, Seam, AS_HEADER, TOKEN_HEADER};
 use cadence_agent::{client, daemon, store::Store};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -57,9 +60,10 @@ impl Shape {
 struct Moving {
     shape: Mutex<Shape>,
     table: Mutex<&'static ToolTable>,
-    /// CAD-1171 reviewer seam: counts fake provider executions so the
-    /// host-run acceptance proves one tap is one provider call.
-    calls: Mutex<u64>,
+    /// CAD-1171 reviewer fixture: records each actual provider invocation,
+    /// including which frozen slot began execution.
+    calls: Mutex<Vec<String>>,
+    outcomes: Mutex<BTreeMap<String, AppCapabilityError>>,
 }
 
 impl Moving {
@@ -69,7 +73,8 @@ impl Moving {
         Arc::new(Self {
             shape: Mutex::new(shape),
             table: Mutex::new(table),
-            calls: Mutex::new(0),
+            calls: Mutex::new(Vec::new()),
+            outcomes: Mutex::new(BTreeMap::new()),
         })
     }
     fn shift(&self, change: impl FnOnce(&mut Shape)) {
@@ -142,18 +147,32 @@ impl PlatformAdapter for Moving {
             price_revision: "probe-price/1".into(),
         })
     }
-    /// CAD-1171 reviewer seam: the smallest fake read adapter that can
-    /// execute a host run — one bounded receipt per call. The worker
-    /// `execute` above keeps refusing; only the run-bound capability
-    /// path answers, and every call is counted.
+    /// CAD-1171 reviewer fixture: count the real daemon's call into the
+    /// provider door, then return the configured confirmed refusal or
+    /// transport uncertainty for that bound slot.
     fn execute_app_capability(
         &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        idempotency_key: &str,
+    ) -> Result<AppCapabilityOutput, String> {
+        self.execute_app_capability_outcome(credential, authority, input, idempotency_key)
+            .map_err(|error| error.to_string())
+    }
+
+    fn execute_app_capability_outcome(
+        &self,
         _credential: &[u8],
-        _authority: &Value,
+        authority: &Value,
         _input: &Value,
         _idempotency_key: &str,
-    ) -> Result<AppCapabilityOutput, String> {
-        *self.calls.lock().unwrap() += 1;
+    ) -> Result<AppCapabilityOutput, AppCapabilityError> {
+        let slot = authority["slot"].as_str().unwrap_or("unknown").to_string();
+        self.calls.lock().unwrap().push(slot.clone());
+        if let Some(error) = self.outcomes.lock().unwrap().get(&slot).cloned() {
+            return Err(error);
+        }
         Ok(AppCapabilityOutput {
             result: json!({"schema": 1, "posts": [], "profile": "probe"}),
             asset: None,
@@ -364,8 +383,11 @@ impl Fx {
             .into()
     }
     fn bind(&self, install: &str) -> Value {
-        let params = json!({"install_id": install, "slot": "source",
-            "connection_id": self.hosted(), "request_id": "bind-1119"});
+        self.bind_slot(install, "source", "bind-1119")
+    }
+    fn bind_slot(&self, install: &str, slot: &str, request_id: &str) -> Value {
+        let params = json!({"install_id": install, "slot": slot,
+            "connection_id": self.hosted(), "request_id": request_id});
         self.op("app_binding_create", params)["binding"].clone()
     }
     fn quote(&self, who: Asserted, install: &str) -> cadence_agent::Result<Value> {
@@ -894,6 +916,56 @@ Call `source` once and report the receipt identity.
 - [ ] the receipt identity is reported
 "#;
 
+const TWO_SLOT_MANIFEST: &str = r#"---
+app: probe-reader
+title: Probe Reader
+version: '1.0.0'
+summary: Read two bounded listings through bound source capabilities.
+needs:
+  connections: []
+  capabilities:
+    source:
+      schema: 1
+      capability: probe.read
+      version: 1
+      action: list_items
+      resource_kind: connection_account
+      effect: read
+    secondary:
+      schema: 1
+      capability: probe.read
+      version: 1
+      action: list_items
+      resource_kind: connection_account
+      effect: read
+---
+
+# Probe Reader
+
+Reads two bounded listings through the bound `source` and `secondary` capabilities.
+"#;
+
+const TWO_SLOT_HOST_WORKFLOW: &str = r#"---
+title: "Read listing: {{handle}}"
+goal: "Retain two bounded provider receipts"
+label: Read two listings host
+capability_slots: [source, secondary]
+execution: host
+inputs:
+  handle: { ask: "Listing handle", example: "probe" }
+---
+Read the selected listings through their bound capabilities.
+
+## Read listings: {{handle}}
+size: S
+action: local.capability.call
+
+Call both declared slots once and retain each receipt.
+
+### Acceptance
+- [ ] both receipt identities are retained
+"#;
+
 impl Fx {
     /// CAD-1171: add the host-execution workflow to the package before
     /// install, then install and bind the `source` slot exactly like r5.
@@ -903,14 +975,54 @@ impl Fx {
         self.bind(&install);
         install
     }
+    fn host_install_two_slots(&self) -> String {
+        std::fs::write(self.source().join("app.md"), TWO_SLOT_MANIFEST).unwrap();
+        std::fs::write(
+            self.source().join("workflows/hostread.md"),
+            TWO_SLOT_HOST_WORKFLOW,
+        )
+        .unwrap();
+        let install = self.install()["install_id"].as_str().unwrap().to_string();
+        self.bind_slot(&install, "source", "bind-host-source");
+        self.bind_slot(&install, "secondary", "bind-host-secondary");
+        install
+    }
     /// CAD-1171: create a host run — no owner PM, no worker input.
     fn host_run(&self, install: &str, request: &str) -> cadence_agent::Result<Value> {
         let params = json!({"install_id": install, "workflow": "hostread",
             "inputs": {"handle": "probe"}, "request_id": request});
         self.rpc(Asserted::Operator, "app_run_create", params)
     }
-    fn host_calls(&self) -> u64 {
-        *self.provider.calls.lock().unwrap()
+    fn host_calls(&self) -> usize {
+        self.provider.calls.lock().unwrap().len()
+    }
+    fn host_call_slots(&self) -> Vec<String> {
+        self.provider.calls.lock().unwrap().clone()
+    }
+    fn set_host_outcome(&self, slot: &str, error: AppCapabilityError) {
+        self.provider
+            .outcomes
+            .lock()
+            .unwrap()
+            .insert(slot.to_string(), error);
+    }
+    fn host_receipts(&self, run_id: &str) -> Value {
+        self.op("app_run_capability_results", json!({"run_id": run_id}))
+    }
+    fn wait_for_host_advance_ticks(&self, run_id: &str) -> Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let mut run = self.op("app_run_show", json!({"run_id": run_id}));
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            run = self.op("app_run_show", json!({"run_id": run_id}));
+            if run["state"] == "failed" {
+                // Ensure two one-second run-monitor intervals elapse after
+                // failure, not just a direct re-dispatch.
+                std::thread::sleep(Duration::from_millis(2300));
+                return self.op("app_run_show", json!({"run_id": run_id}));
+            }
+        }
+        run
     }
     fn host_approve_dispatch(&self, id: &str, digest: Value) -> Value {
         let approved = self.op("app_run_approve", json!({"run_id": id, "digest": digest}));
@@ -1008,4 +1120,296 @@ fn cad1171_host_run_refuses_send_effect_before_any_provider_call() {
     assert_eq!(fx.host_calls(), 0, "no provider call before the refusal");
     let shown = fx.op("app_run_show", json!({"run_id": id}));
     assert_ne!(shown["state"], "succeeded", "{shown}");
+}
+
+/// CAD-1171 independent bad-case acceptance: the genuine host provider call
+/// returns a typed refusal after entry. A non-operator cannot dispatch it;
+/// the operator-visible failure retains the safe cause; the real daemon's
+/// one-second run-monitor/advance thread and an explicit re-entry both leave
+/// the counting provider at one call.
+#[test]
+fn cad1171_host_provider_refusal_is_durable_and_not_retried() {
+    let mut fx = Fx::start();
+    let install = fx.host_install();
+    let run = fx.host_run(&install, "host-refusal-1").unwrap();
+    let id = run["id"].as_str().unwrap().to_string();
+    let denied = fx
+        .rpc(
+            Asserted::Operator,
+            "app_run_dispatch",
+            json!({"run_id": id}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(denied.contains("approval"), "{denied}");
+    assert_eq!(fx.host_calls(), 0, "approval precedes provider I/O");
+    let digest = run["snapshot_digest"].clone();
+    let approved = fx.op("app_run_approve", json!({"run_id": id, "digest": digest}));
+    assert_eq!(approved["state"], "approved", "{approved}");
+    fx.set_host_outcome(
+        "source",
+        AppCapabilityError::Refused("probe refused after provider entry".into()),
+    );
+
+    for caller in [Asserted::Agent("writer".into()), Asserted::Unproven] {
+        assert!(fx
+            .rpc(caller, "app_run_dispatch", json!({"run_id": id}),)
+            .is_err());
+        assert_eq!(
+            fx.host_calls(),
+            0,
+            "only the operator may reach the provider"
+        );
+    }
+
+    // The board's HTTP dispatch route must enforce the same operator proof
+    // as the daemon RPC it relays.
+    let (base, host, cookie, key) = fx.board();
+    let path = format!("/api/app-runs/{id}/dispatch");
+    let (status, reply, _) = fx.http(
+        &base,
+        &host,
+        "agent:writer",
+        None,
+        "POST",
+        &path,
+        Some(json!({})),
+    );
+    assert!(status >= 400, "agent HTTP dispatch: {status} {reply}");
+    assert_eq!(
+        fx.host_calls(),
+        0,
+        "agent HTTP dispatch made no provider call"
+    );
+    let (status, reply, _) = fx.http(
+        &base,
+        &host,
+        "operator",
+        None,
+        "POST",
+        &path,
+        Some(json!({})),
+    );
+    assert!(status >= 400, "operator without session: {status} {reply}");
+    assert_eq!(fx.host_calls(), 0, "missing session made no provider call");
+    let (status, reply, _) = fx.http(
+        &base,
+        &host,
+        "operator",
+        Some((&cookie, &key)),
+        "POST",
+        &path,
+        Some(json!({})),
+    );
+    assert!(status >= 400, "provider refusal: {status} {reply}");
+
+    let failed = fx.wait_for_host_advance_ticks(&id);
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert_eq!(failed["failure"]["kind"], "refused", "{failed}");
+    assert_eq!(
+        failed["failure"]["reason"], "probe refused after provider entry",
+        "{failed}"
+    );
+    assert_eq!(fx.host_receipts(&id)["results"], json!([]));
+    assert_eq!(fx.host_call_slots(), vec!["source".to_string()]);
+
+    let (status, reply, _) = fx.http(
+        &base,
+        &host,
+        "operator",
+        Some((&cookie, &key)),
+        "POST",
+        &path,
+        Some(json!({})),
+    );
+    assert!(status >= 400, "terminal re-entry: {status} {reply}");
+    assert_eq!(fx.host_call_slots(), vec!["source".to_string()]);
+}
+
+/// The adapter's `Uncertain` classification must survive the daemon and
+/// remain distinct from a confirmed refusal. Neither the background advance
+/// tick nor explicit re-entry may turn uncertainty into a new provider call.
+#[test]
+fn cad1171_host_uncertain_outcome_is_not_retried_or_misreported() {
+    let fx = Fx::start();
+    let install = fx.host_install();
+    let run = fx.host_run(&install, "host-uncertain-1").unwrap();
+    let id = run["id"].as_str().unwrap().to_string();
+    let digest = run["snapshot_digest"].clone();
+    let approved = fx.op("app_run_approve", json!({"run_id": id, "digest": digest}));
+    assert_eq!(approved["state"], "approved", "{approved}");
+    fx.set_host_outcome(
+        "source",
+        AppCapabilityError::Uncertain("probe transport outcome is uncertain".into()),
+    );
+
+    assert!(fx
+        .rpc(
+            Asserted::Operator,
+            "app_run_dispatch",
+            json!({"run_id": id}),
+        )
+        .is_err());
+    let failed = fx.wait_for_host_advance_ticks(&id);
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert_eq!(failed["failure"]["kind"], "uncertain", "{failed}");
+    assert_eq!(
+        failed["failure"]["reason"], "probe transport outcome is uncertain",
+        "{failed}"
+    );
+    assert_ne!(failed["failure"]["kind"], "refused", "{failed}");
+    assert_ne!(failed["state"], "succeeded", "{failed}");
+    assert_eq!(fx.host_call_slots(), vec!["source".to_string()]);
+
+    assert!(fx
+        .rpc(
+            Asserted::Operator,
+            "app_run_dispatch",
+            json!({"run_id": id}),
+        )
+        .is_err());
+    assert_eq!(fx.host_call_slots(), vec!["source".to_string()]);
+}
+
+#[test]
+fn cad1171_host_two_bound_slots_complete_once_with_both_receipts() {
+    let fx = Fx::start();
+    let install = fx.host_install_two_slots();
+    let run = fx.host_run(&install, "host-two-success-1").unwrap();
+    let id = run["id"].as_str().unwrap().to_string();
+    assert_eq!(run["state"], "awaiting_approval", "{run}");
+    assert!(
+        run["snapshot"]["capabilities"]["source"]["digest"].is_string(),
+        "{run}"
+    );
+    assert!(
+        run["snapshot"]["capabilities"]["secondary"]["digest"].is_string(),
+        "{run}"
+    );
+    assert!(
+        run["snapshot"]["quotes"]["source"]["total_price_micros"].is_number(),
+        "{run}"
+    );
+    assert!(
+        run["snapshot"]["quotes"]["secondary"]["total_price_micros"].is_number(),
+        "{run}"
+    );
+    assert_eq!(run["snapshot"]["owner_pm"], Value::Null, "{run}");
+    assert_eq!(run["snapshot"]["assignments"], json!({}), "{run}");
+
+    let done = fx.host_approve_dispatch(&id, run["snapshot_digest"].clone());
+    assert_eq!(done["state"], "succeeded", "{done}");
+    assert_eq!(
+        fx.host_call_slots(),
+        vec!["source".to_string(), "secondary".to_string()]
+    );
+    let receipts = fx.host_receipts(&id)["results"].as_array().unwrap().clone();
+    assert_eq!(receipts.len(), 2, "{receipts:?}");
+    let mut receipt_slots: Vec<_> = receipts
+        .iter()
+        .map(|receipt| receipt["slot"].as_str().unwrap().to_string())
+        .collect();
+    receipt_slots.sort();
+    assert_eq!(
+        receipt_slots,
+        vec!["secondary".to_string(), "source".to_string()]
+    );
+    let completions: Vec<_> = fx
+        .audit("app_run_completed")
+        .into_iter()
+        .filter(|event| event["run_id"] == id)
+        .collect();
+    assert_eq!(completions.len(), 1, "{completions:?}");
+}
+
+fn assert_host_two_slot_second_failure(
+    request: &str,
+    outcome: AppCapabilityError,
+    expected_kind: &str,
+    expected_reason: &str,
+) {
+    let fx = Fx::start();
+    let install = fx.host_install_two_slots();
+    let run = fx.host_run(&install, request).unwrap();
+    let id = run["id"].as_str().unwrap().to_string();
+    assert!(
+        run["snapshot"]["capabilities"]["source"]["digest"].is_string(),
+        "{run}"
+    );
+    assert!(
+        run["snapshot"]["capabilities"]["secondary"]["digest"].is_string(),
+        "{run}"
+    );
+    assert!(
+        run["snapshot"]["quotes"]["source"]["total_price_micros"].is_number(),
+        "{run}"
+    );
+    assert!(
+        run["snapshot"]["quotes"]["secondary"]["total_price_micros"].is_number(),
+        "{run}"
+    );
+    let digest = run["snapshot_digest"].clone();
+    let approved = fx.op("app_run_approve", json!({"run_id": id, "digest": digest}));
+    assert_eq!(approved["state"], "approved", "{approved}");
+    fx.set_host_outcome("secondary", outcome);
+
+    assert!(fx
+        .rpc(
+            Asserted::Operator,
+            "app_run_dispatch",
+            json!({"run_id": id}),
+        )
+        .is_err());
+    let failed = fx.wait_for_host_advance_ticks(&id);
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert_eq!(failed["failure"]["kind"], expected_kind, "{failed}");
+    assert_eq!(failed["failure"]["reason"], expected_reason, "{failed}");
+    assert_ne!(failed["state"], "succeeded", "{failed}");
+    assert_eq!(
+        fx.host_call_slots(),
+        vec!["source".to_string(), "secondary".to_string()]
+    );
+
+    let receipts_before = fx.host_receipts(&id)["results"].as_array().unwrap().clone();
+    assert_eq!(receipts_before.len(), 1, "{receipts_before:?}");
+    assert_eq!(receipts_before[0]["slot"], "source", "{receipts_before:?}");
+    assert_eq!(
+        receipts_before[0]["result"]["profile"], "probe",
+        "{receipts_before:?}"
+    );
+    let first_receipt_id = receipts_before[0]["id"].clone();
+    assert!(fx
+        .rpc(
+            Asserted::Operator,
+            "app_run_dispatch",
+            json!({"run_id": id}),
+        )
+        .is_err());
+    let receipts_after = fx.host_receipts(&id)["results"].as_array().unwrap().clone();
+    assert_eq!(receipts_after, receipts_before);
+    assert_eq!(receipts_after[0]["id"], first_receipt_id);
+    assert_eq!(
+        fx.host_call_slots(),
+        vec!["source".to_string(), "secondary".to_string()]
+    );
+}
+
+#[test]
+fn cad1171_host_two_slot_second_refusal_keeps_first_receipt_without_replay() {
+    assert_host_two_slot_second_failure(
+        "host-two-refusal-1",
+        AppCapabilityError::Refused("secondary refused after provider entry".into()),
+        "refused",
+        "secondary refused after provider entry",
+    );
+}
+
+#[test]
+fn cad1171_host_two_slot_second_uncertainty_keeps_first_receipt_without_replay() {
+    assert_host_two_slot_second_failure(
+        "host-two-uncertain-1",
+        AppCapabilityError::Uncertain("secondary transport outcome is uncertain".into()),
+        "uncertain",
+        "secondary transport outcome is uncertain",
+    );
 }
