@@ -1181,3 +1181,320 @@ while True:
     assert_eq!(fixture.observed(), vec!["CONNECT"]);
     assert!(initial == fixture.state_snapshot());
 }
+
+// Keep process-environment changes out of the rest of this integration-test
+// binary: the outer invocation re-execs only this test with an isolated
+// secret-tool and D-Bus marker in its environment.
+#[test]
+fn cad1065_libsecret_cleanup_pending_is_bounded_and_fences_verification() {
+    const CHILD: &str = "CAD1065_CLEANUP_GATE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        cad1065_libsecret_cleanup_pending_child();
+        return;
+    }
+
+    let tools = tempfile::Builder::new()
+        .prefix("c1065-cleanup-tool-")
+        .tempdir()
+        .unwrap();
+    let tool = tools.path().join("secret-tool");
+    let script = r#"#!/bin/sh
+case "$1" in
+  store)
+    /usr/bin/python3 -c 'import os; open(os.environ["CAD1065_CLEANUP_TOOL_DIR"] + "/stored", "wb").write(os.read(0, 4096))'
+    exit 0
+    ;;
+  lookup)
+    echo lookup >> "$CAD1065_CLEANUP_TOOL_DIR/calls"
+    if [ ! -e "$CAD1065_CLEANUP_TOOL_DIR/start-test" ]; then
+      cat "$CAD1065_CLEANUP_TOOL_DIR/stored"
+      exit 0
+    fi
+    echo "$$" > "$CAD1065_CLEANUP_TOOL_DIR/lookup.pid"
+    while [ ! -e "$CAD1065_CLEANUP_TOOL_DIR/release" ]; do /bin/sleep 0.01; done
+    /usr/bin/head -c 20000 /dev/zero
+    /bin/sleep 60
+    ;;
+  *) exit 1 ;;
+esac
+"#;
+    std::fs::write(&tool, script).unwrap();
+    std::fs::write(tools.path().join("calls"), "").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tool, PermissionsExt::from_mode(0o755)).unwrap();
+
+    let path = format!(
+        "{}:{}",
+        tools.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cad1065_libsecret_cleanup_pending_is_bounded_and_fences_verification",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .env("CAD1065_CLEANUP_TOOL_DIR", tools.path())
+        .env("PATH", path)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/cad1065-test-bus")
+        .status()
+        .expect("could not start isolated cleanup-gate process");
+    assert!(
+        output.success(),
+        "isolated libsecret cleanup gate failed: {output}"
+    );
+}
+
+fn cad1065_libsecret_cleanup_pending_child() {
+    let tool_dir = PathBuf::from(std::env::var_os("CAD1065_CLEANUP_TOOL_DIR").unwrap());
+    let root = tempfile::Builder::new()
+        .prefix("c1065-cleanup-")
+        .tempdir()
+        .unwrap();
+    let state = root.path().join("state");
+    let pm = root.path().join("pm");
+    issue::Pm::init(&pm).unwrap();
+    assert!(matches!(
+        platform::custody::Custody::open(&state).unwrap(),
+        platform::custody::Custody::Libsecret(_)
+    ));
+
+    let provider_env = cadence_agent::adapter::ProviderEnv::refusing_providers();
+    provider_env.set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut opts = daemon::ServeOptions {
+        provider_env,
+        stop: Some(stop.clone()),
+        test_seam: true,
+        slots: Some(Default::default()),
+        lease: Some(Default::default()),
+        auto_stop: Some(daemon::AutoStopSetting::off()),
+        agent_gc: Some(Default::default()),
+        report_router: Some(0),
+        checkup: Some(0),
+        ..Default::default()
+    };
+    platform::smtp::attach(&mut opts);
+    let daemon_state = state.clone();
+    let daemon_thread = std::thread::spawn(move || {
+        daemon::serve_with(&daemon_state, opts).unwrap();
+    });
+    let _daemon_guard = CleanupGateDaemon {
+        stop,
+        thread: Some(daemon_thread),
+    };
+    let startup_deadline = Instant::now() + Duration::from_secs(30);
+    while client::rpc_timeout(&state, "health", json!({}), Duration::from_secs(2)).is_err()
+        || Seam::token_at(&state).is_none()
+    {
+        assert!(
+            Instant::now() < startup_deadline,
+            "cleanup-gate daemon did not start"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    let row = scoped(Asserted::Operator, || {
+        client::rpc(
+            &state,
+            "connection_create",
+            json!({
+                "provider":"smtp", "account":"cleanup-gate-sender", "shape":"smtp",
+                "host":"mail.example.com", "port":465, "tls_mode":"implicit",
+                "username":"sender@example.test", "secret":PASSWORD,
+                "sender":"sender@example.test", "scopes":["email:send"],
+                "accept_same_uid_risk":true,
+            }),
+        )
+    })
+    .unwrap()["connection"]
+        .clone();
+    let params = json!({
+        "connection_id":row["id"], "expected_revision":row["revision"],
+        "expected_registration_digest":row["registration_digest"],
+    });
+    let lookups_before_test = std::fs::read_to_string(tool_dir.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert!(
+        lookups_before_test > 0,
+        "connection projection never read libsecret"
+    );
+    let request_state = state.clone();
+    let request_params = params.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let request_started = Instant::now();
+    std::fs::write(tool_dir.join("start-test"), b"go").unwrap();
+    let request = std::thread::spawn(move || {
+        let answer = scoped(Asserted::Operator, || {
+            client::rpc_timeout(
+                &request_state,
+                "connection_test",
+                request_params,
+                Duration::from_secs(30),
+            )
+        });
+        let _ = tx.send(answer);
+    });
+
+    let pid_path = tool_dir.join("lookup.pid");
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    while !pid_path.exists() {
+        assert!(
+            Instant::now() < startup_deadline,
+            "secret-tool lookup did not start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(pid > 0, "secret-tool published an invalid pid");
+    let mut trace_guard = CleanupGateTrace {
+        pid,
+        tool_dir: tool_dir.clone(),
+        armed: true,
+    };
+    let seized = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SEIZE,
+            pid,
+            std::ptr::null_mut::<libc::c_void>(),
+            libc::PTRACE_O_TRACEEXIT as usize as *mut libc::c_void,
+        )
+    };
+    assert_eq!(
+        seized, 0,
+        "could not hold the owned secret-tool child for cleanup"
+    );
+    std::fs::write(tool_dir.join("release"), b"go").unwrap();
+
+    // The stand-in emits more than the bounded material cap and then stays
+    // alive. ptrace holds its SIGKILL exit stop so cleanup cannot be observed
+    // until this test releases it; this exercises the actual owned-child path.
+    let result = rx.recv_timeout(Duration::from_secs(23));
+    let elapsed = request_started.elapsed();
+    if result.is_err() {
+        // Let a broken/unbounded implementation finish so the test process
+        // does not strand the daemon request or its child.
+        unsafe {
+            libc::ptrace(
+                libc::PTRACE_CONT,
+                pid,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            );
+        }
+        let _ = rx.recv_timeout(Duration::from_secs(5));
+        let _ = request.join();
+        panic!("cleanup-pending verification did not return within the shared budget");
+    }
+    let tracee_alive = Path::new("/proc").join(pid.to_string()).exists();
+    if tracee_alive {
+        let continued = unsafe {
+            libc::ptrace(
+                libc::PTRACE_CONT,
+                pid,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        assert_eq!(continued, 0, "could not release the cleanup-held child");
+    }
+    assert!(
+        elapsed < Duration::from_secs(23),
+        "cleanup-pending verification exceeded the shared deadline"
+    );
+    assert!(
+        tracee_alive,
+        "cleanup returned without observing the held child"
+    );
+    assert!(request.join().is_ok());
+    let first = result
+        .unwrap()
+        .expect_err("cleanup-pending lookup returned a typed receipt");
+    assert_eq!(
+        first.kind(),
+        "busy",
+        "cleanup-pending result was not fixed busy"
+    );
+    assert!(
+        first
+            .to_string()
+            .contains("connection test is fenced pending credential cleanup"),
+        "cleanup-pending error was not the fixed fence refusal"
+    );
+    assert!(
+        !first.to_string().contains(PASSWORD),
+        "busy refusal echoed the credential"
+    );
+    assert!(
+        !first.to_string().contains("verification"),
+        "cleanup-pending result exposed a typed receipt"
+    );
+
+    // The fence persists: subsequent verification is refused without another
+    // secret-tool lookup and cannot manufacture a typed receipt.
+    let second = scoped(Asserted::Operator, || {
+        client::rpc_timeout(&state, "connection_test", params, Duration::from_secs(2))
+    })
+    .expect_err("cleanup fence allowed a later verifier call");
+    assert_eq!(second.kind(), "busy");
+    assert!(second
+        .to_string()
+        .contains("connection test is fenced pending credential cleanup"));
+    assert_eq!(
+        std::fs::read_to_string(tool_dir.join("calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        lookups_before_test + 1,
+        "fenced follow-up spawned another secret-tool lookup"
+    );
+
+    // The held child was continued above; teardown can now join the daemon
+    // without leaving a tracer or subprocess behind.
+    trace_guard.armed = false;
+}
+
+struct CleanupGateTrace {
+    pid: libc::pid_t,
+    tool_dir: PathBuf,
+    armed: bool,
+}
+
+impl Drop for CleanupGateTrace {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = std::fs::write(self.tool_dir.join("release"), b"go");
+        unsafe {
+            let _ = libc::ptrace(
+                libc::PTRACE_CONT,
+                self.pid,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            );
+        }
+    }
+}
+
+struct CleanupGateDaemon {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for CleanupGateDaemon {
+    fn drop(&mut self) {
+        self.stop.store(true, SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
