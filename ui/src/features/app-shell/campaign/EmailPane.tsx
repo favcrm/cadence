@@ -187,7 +187,7 @@ export default function EmailPane({
                     onChange={(e) => edit.patch({ subject: e.target.value })}
                     maxLength={150}
                     autoComplete="off"
-                    disabled={edit.saving}
+                    disabled={edit.saving || edit.reloading}
                   />
                 </label>
                 {preheaderOpen ? (
@@ -201,7 +201,7 @@ export default function EmailPane({
                       maxLength={200}
                       autoComplete="off"
                       placeholder="Optional inbox preview text"
-                      disabled={edit.saving}
+                      disabled={edit.saving || edit.reloading}
                     />
                   </label>
                 ) : null}
@@ -211,7 +211,7 @@ export default function EmailPane({
                   className="lnk crm-preheader-toggle"
                   aria-expanded={preheaderOpen}
                   aria-controls="cmp-preheader"
-                  disabled={edit.saving}
+                  disabled={edit.saving || edit.reloading}
                   onClick={() => setPreheaderOpen((open) => !open)}
                 >
                   {preheaderOpen ? "− Hide preheader" : "+ Add preheader"}{" "}
@@ -245,7 +245,7 @@ export default function EmailPane({
             <>
               <EmailBlocksCanvas
                 blocks={edit.draft.blocks}
-                disabled={edit.saving}
+                disabled={edit.saving || edit.reloading}
                 brandName={shown !== null ? shown.sender.name : "Email"}
                 device={device}
                 canUndo={edit.canUndo}
@@ -284,7 +284,7 @@ export default function EmailPane({
                 spellCheck={false}
                 value={htmlSource}
                 placeholder="Paste or edit the email body HTML"
-                disabled={edit.saving}
+                disabled={edit.saving || edit.reloading}
                 onChange={(e) => edit.patch({ html: e.target.value })}
               />
               <p className="text-micro text-ink-500" data-html-note>
@@ -447,7 +447,7 @@ export default function EmailPane({
           </span>
           {editingBlocks && edit !== null && (
             <AddBlockTools
-              disabled={edit.saving || edit.draft.blocks.length >= MAX_BLOCKS}
+              disabled={edit.saving || edit.reloading || edit.draft.blocks.length >= MAX_BLOCKS}
               full
               onAdd={(block) => {
                 if (edit.draft.blocks.length < MAX_BLOCKS) {
@@ -560,10 +560,10 @@ export default function EmailPane({
                   )}
                 </div>
                 <span className="flex-1" />
-                <Button size="sm" variant="ghost" disabled={edit.saving} onClick={edit.discard}>
-                  Discard
+                <Button size="sm" variant="ghost" loading={edit.reloading} disabled={edit.saving || edit.reloading} onClick={edit.discard}>
+                  {edit.reloading ? "Reloading latest…" : "Discard"}
                 </Button>
-                <Button size="sm" variant="primary" loading={edit.saving} disabled={edit.saving} onClick={edit.save}>
+                <Button size="sm" variant="primary" loading={edit.saving} disabled={edit.saving || edit.reloading} onClick={edit.save}>
                   {`Save as v${edit.source + 1}`}
                 </Button>
               </div>
