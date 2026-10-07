@@ -81,8 +81,8 @@ store/app_records.rs	separate-app-records-db-and-guarded-store	guarded_write	4
 store/app_records.rs	separate-app-records-db-and-guarded-store	open	2
 store/app_records.rs	separate-app-records-db-and-guarded-store	prepare	8
 store/app_records.rs	separate-app-records-db-and-guarded-store	transaction	4
-store/app_runs.rs	guarded-store-and-read-queries	execute	30
-store/app_runs.rs	guarded-store-and-read-queries	guarded_write	6
+store/app_runs.rs	guarded-store-and-read-queries	execute	36
+store/app_runs.rs	guarded-store-and-read-queries	guarded_write	7
 store/app_runs.rs	guarded-store-and-read-queries	prepare	2
 store/app_sends.rs	guarded-store-and-read-queries	execute	11
 store/app_sends.rs	guarded-store-and-read-queries	guarded_write	6
