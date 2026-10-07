@@ -377,6 +377,13 @@ fn libsecret_lookup_bounded(
     let mut out = Vec::new();
     let mut err = Vec::new();
     let mut open = [true, true];
+    // Set when the child's terminal status has already been
+    // consumed by our `waitpid` in this function — a nonzero or
+    // signalled exit we reaped ourselves. The `Err` arm below must
+    // never `kill` or `wait` again on such a child: the pid may
+    // already be recycled to an unrelated task or another daemon
+    // child, whose status we must neither signal nor steal.
+    let mut status_consumed = false;
     let result = 'drain: loop {
         if !open[0] && !open[1] {
             break 'drain 'wait: loop {
@@ -387,6 +394,7 @@ fn libsecret_lookup_bounded(
                 // own cache check.
                 match super::waitpid_terminal(&child) {
                     Ok(Some(status)) => {
+                        status_consumed = true;
                         break 'wait if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
                             Ok(out)
                         } else {
@@ -483,6 +491,14 @@ fn libsecret_lookup_bounded(
             // retained for the process lifetime (the daemon remains
             // its owner under the subreaper) and the whole
             // verification path is fenced until restart.
+            //
+            // When our `waitpid` already consumed the child's
+            // terminal status the pid may be recycled — never
+            // signal or wait on it again; the child is already
+            // reaped and needs no cleanup.
+            if status_consumed {
+                return Err(error);
+            }
             let _ = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
             let reaped = 'reap: loop {
                 // Raw `waitpid` via `observe_child_exit` — never
