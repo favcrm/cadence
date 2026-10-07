@@ -96,6 +96,54 @@ pub struct OpDeadline {
     end: std::time::Instant,
 }
 
+/// Whether an owned child has provably terminated. `Child::try_wait`
+/// caches the first `Some` status forever — a `WIFSTOPPED` trace stop
+/// reported once would mask the real later exit and hold custody
+/// open indefinitely, so callers that must wait for a fresh terminal
+/// observation poll `waitpid` directly.
+#[cfg(unix)]
+pub enum ChildExit {
+    /// The task is still present under `/proc` in any state —
+    /// alive, a reported stop, or a zombie whose task object has
+    /// not fully left the system (a tracer can hold a zombie's
+    /// kernel task after its wait status is consumed).
+    Running,
+    /// The task is gone — `/proc/<pid>` no longer exists, so the
+    /// child is fully reaped and the serialization may be
+    /// released.
+    Reaped,
+    /// The presence check itself could not be answered —
+    /// unobservable; the custody serialization is retained and
+    /// polling continues rather than released on a guess.
+    Uncertain,
+}
+
+/// `/proc` presence of `child`'s task — the "nothing remains"
+/// observation: `Child::try_wait` caches the first `Some` status
+/// (a `WIFSTOPPED` trace stop would mask the real later exit and
+/// could also suppress `kill`), and a `waitpid` report can be
+/// consumed while the kernel still holds the task as a zombie
+/// under a tracer — so wait-status alone cannot prove nothing is
+/// left. On Linux `/proc` is the authority; on other unix
+/// targets it cannot be observed and `Uncertain` retains the
+/// serialization rather than guessing.
+#[cfg(unix)]
+pub fn observe_child_exit(child: &std::process::Child) -> ChildExit {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::metadata(format!("/proc/{}", child.id())) {
+            Ok(_) => ChildExit::Running,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ChildExit::Reaped,
+            Err(_) => ChildExit::Uncertain,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = child;
+        ChildExit::Uncertain
+    }
+}
+
 impl OpDeadline {
     pub fn in_seconds(seconds: u64) -> Self {
         Self {

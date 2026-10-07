@@ -355,7 +355,6 @@ fn libsecret_lookup_bounded(
 ) -> Result<Vec<u8>> {
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
-    use std::os::unix::process::ExitStatusExt;
 
     let mut child = crate::reaper::spawn(
         std::process::Command::new(tool)
@@ -481,22 +480,32 @@ fn libsecret_lookup_bounded(
             // the whole verification path is fenced until restart.
             let _ = child.kill();
             let reaped = 'reap: loop {
-                match child.try_wait() {
-                    // A real termination, not a ptrace/job-control
-                    // stop: `try_wait` can report a `WIFSTOPPED`
-                    // state — the raw status still marks the child
-                    // stopped (alive under the tracer), so that reap
-                    // is NOT observed.
-                    Ok(Some(status)) if !libc::WIFSTOPPED(status.into_raw()) => {
+                // `waitpid` for the reap itself (not `try_wait`,
+                // which caches the first `Some` status and so could
+                // never observe a later exit), then `/proc` presence
+                // as "nothing remains" — a `WIFSTOPPED` report or a
+                // consumed exit can still leave a held task. Only
+                // a fully absent task counts as reaped here; a
+                // live stop, a held zombie, or an uncertain answer
+                // keeps waiting on the remaining budget.
+                let mut status: libc::c_int = 0;
+                let _ = unsafe {
+                    libc::waitpid(
+                        child.id() as libc::pid_t,
+                        &mut status as *mut libc::c_int,
+                        libc::WNOHANG,
+                    )
+                };
+                match super::observe_child_exit(&child) {
+                    super::ChildExit::Reaped => {
                         break 'reap true;
                     }
-                    Ok(Some(_)) | Ok(None) => {
+                    super::ChildExit::Running | super::ChildExit::Uncertain => {
                         let Some(left) = deadline.remaining() else {
                             break 'reap false;
                         };
                         std::thread::sleep(left.min(Duration::from_millis(25)));
                     }
-                    Err(_) => break 'reap false,
                 }
             };
             if !reaped {
