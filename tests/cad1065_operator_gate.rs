@@ -1534,13 +1534,13 @@ fn cad1065_libsecret_cleanup_pending_child() {
     conflict_started_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("conflicting revoke thread did not start");
-    let refused_while_unobserved = match conflict_rx.recv_timeout(Duration::from_millis(500)) {
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
-        Ok(Err(error)) if error.kind() == "busy" => true,
-        other => panic!(
-            "conflicting credential revoke completed or failed open before cleanup was observed: {other:?}"
+    match conflict_rx.recv_timeout(Duration::from_millis(500)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(result) => panic!(
+            "queued credential revoke completed or failed before cleanup was observed: {result:?}"
         ),
-    };
+        Err(error) => panic!("queued credential revoke disconnected before release: {error}"),
+    }
     assert_eq!(
         std::fs::read_to_string(&calls_path)
             .unwrap()
@@ -1554,62 +1554,53 @@ fn cad1065_libsecret_cleanup_pending_child() {
         "conflicting revoke mutated credential state while cleanup was unobserved"
     );
 
-    // Release the ptrace-held exit. If the daemon observes/reaps the child,
-    // the serialized revoke may proceed now; if it remains an unobserved
-    // daemon-owned zombie, the fail-closed contract keeps that operation
-    // excluded. Either way it must not have completed before this release.
+    // Continue and detach from the ptrace-held exit. Releasing the tracer
+    // lets the cleanup owner observe the terminal wait status, reap this
+    // child, and release custody serialization.
     let continued = unsafe {
         libc::ptrace(
-            libc::PTRACE_CONT,
+            libc::PTRACE_DETACH,
             pid,
             std::ptr::null_mut::<libc::c_void>(),
             std::ptr::null_mut::<libc::c_void>(),
         )
     };
-    assert_eq!(continued, 0, "could not release the cleanup-held child");
+    assert_eq!(
+        continued, 0,
+        "could not detach and release the cleanup-held child"
+    );
     trace_guard.armed = false;
 
     let reap_deadline = Instant::now() + Duration::from_secs(5);
-    let reaped = loop {
-        if !tracee_path.exists() {
-            break true;
-        }
-        let stat = std::fs::read_to_string(tracee_path.join("stat")).unwrap_or_default();
-        let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
-        if state == Some(Some('Z')) {
-            break false;
-        }
-        assert!(
-            Instant::now() < reap_deadline,
-            "released cleanup child neither exited nor was reaped"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    if reaped && !refused_while_unobserved {
-        let revoked = conflict_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("custody revoke stayed blocked after cleanup reap was observed")
-            .expect("credential revoke failed after cleanup reap");
-        assert_eq!(revoked["revoked"], true);
-        assert!(conflict.join().is_ok());
-    } else {
-        if !refused_while_unobserved {
-            assert!(
-                matches!(
-                    conflict_rx.recv_timeout(Duration::from_millis(250)),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                ),
-                "custody revoke completed while the child remained an unreaped zombie"
-            );
-        }
-        assert!(
-            initial == snapshot_state(&state),
-            "credential state changed before custody serialization was released"
-        );
-        if refused_while_unobserved {
-            assert!(conflict.join().is_ok());
+    loop {
+        match std::fs::metadata(&tracee_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Ok(_) => {
+                let stat = std::fs::read_to_string(tracee_path.join("stat")).unwrap_or_default();
+                let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+                assert!(
+                    Instant::now() < reap_deadline,
+                    "cleanup owner did not reap the released child; /proc state: {state:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("could not observe cleanup child in procfs: {error}"),
         }
     }
+
+    // The same revoke that was queued during cleanup must now acquire custody
+    // and finish, proving serialization is released after positive reaping.
+    let revoked = conflict_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("queued custody revoke stayed blocked after cleanup reap")
+        .expect("credential revoke failed after cleanup reap");
+    assert_eq!(revoked["revoked"], true);
+    assert!(conflict.join().is_ok());
+    assert_ne!(
+        initial,
+        snapshot_state(&state),
+        "completed revoke did not mutate connection/credential state"
+    );
 
     // Even after the cleanup child is released, the timed-out verification
     // is fenced and cannot manufacture a typed receipt or spawn another
@@ -1622,20 +1613,13 @@ fn cad1065_libsecret_cleanup_pending_child() {
     assert!(fenced_followup
         .to_string()
         .contains("connection test is fenced pending credential cleanup"));
-    let expected_lookups = lookups_before_test
-        + 1
-        + if reaped && !refused_while_unobserved {
-            1
-        } else {
-            0
-        };
     assert_eq!(
         std::fs::read_to_string(&calls_path)
             .unwrap()
             .lines()
             .count(),
-        expected_lookups,
-        "fenced follow-up or excluded custody operation spawned an unexpected lookup"
+        lookups_before_test + 2,
+        "queued revoke or fenced follow-up spawned an unexpected secret-tool lookup"
     );
 }
 
