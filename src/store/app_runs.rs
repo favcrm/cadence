@@ -2041,7 +2041,10 @@ impl Store {
 
 impl LocalWorkflow {
     pub fn validate_template(text: &str) -> Result<()> {
-        workflow::parse_template(text)?;
+        let template = workflow::parse_template(text)?;
+        // CAD-1171: a host-execution workflow's one step is the host's own
+        // capability call; agent workflows keep the text actions.
+        let host = template.execution == crate::issue::workflow::Execution::Host;
         let (_, body) = parse::split_front(text).map_err(|e| Error::rejected(e.to_string()))?;
         let metadata = workflow::ticket_meta(body)?;
         if metadata.is_empty() || metadata.len() > 16 {
@@ -2051,13 +2054,21 @@ impl LocalWorkflow {
         }
         for step in metadata {
             let fields: BTreeMap<_, _> = step.into_iter().collect();
-            if fields.contains_key("uses")
-                || fields.contains_key("tries")
-                || fields.contains_key("reviewer")
-                || !matches!(
+            let supported = if host {
+                matches!(
+                    fields.get("action").map(String::as_str),
+                    Some("local.capability.call")
+                )
+            } else {
+                matches!(
                     fields.get("action").map(String::as_str),
                     Some("local.text.produce" | "local.text.review")
                 )
+            };
+            if fields.contains_key("uses")
+                || fields.contains_key("tries")
+                || fields.contains_key("reviewer")
+                || !supported
             {
                 return Err(Error::rejected("local capability approval requires explicit supported action steps; uses, tries and implicit reviewer are unsupported"));
             }
