@@ -247,15 +247,15 @@ impl Shared {
         let deadline = crate::platform::OpDeadline::in_seconds(BUDGET.as_secs());
         let started_at = crate::issue::time::now_epoch();
 
-        let _custody = self
-            .platform_custody_lock
-            .try_lock()
-            .map_err(|_| Error::busy("connection test is busy"))?;
         if self.connection_test_fenced.load(Ordering::SeqCst) {
             return Err(Error::busy(
                 "connection test is fenced pending credential cleanup",
             ));
         }
+        let _custody = self
+            .platform_custody_lock
+            .try_lock()
+            .map_err(|_| Error::busy("connection test is busy"))?;
 
         let Some(identity) = self.resolve_identity(id)? else {
             return Err(Error::rejected("connection is unavailable or stale"));
@@ -355,6 +355,18 @@ impl Shared {
                     Err(e) => {
                         if self.connection_test_fenced.load(Ordering::SeqCst) {
                             release_slot(&self.connection_test_resolver, &mut slot_owned);
+                            // The kill-path could not observe the
+                            // reap inside the budget: the lookup may
+                            // still be alive, so the exclusive
+                            // custody serialization is retained for
+                            // the process lifetime — every active-use
+                            // user (rotate/revoke/verify) fails busy
+                            // until restart rather than racing an
+                            // unobserved credential child. The child
+                            // registration is kept daemon-owned by
+                            // `load_bounded`; the honest kernel
+                            // residual is a zombie until restart.
+                            std::mem::forget(_custody);
                             return Err(Error::busy(
                                 "connection test is fenced pending credential cleanup",
                             ));
