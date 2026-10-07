@@ -1,4 +1,6 @@
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -289,8 +291,10 @@ impl Shared {
                 let _custody = custody;
                 loop {
                     match child.try_wait() {
-                        Ok(Some(_)) => break,
-                        Ok(None) => {
+                        // `WIFSTOPPED` is a trace/job-control stop,
+                        // not an exit — the child is still alive.
+                        Ok(Some(status)) if !libc::WIFSTOPPED(status.into_raw()) => break,
+                        Ok(Some(_)) | Ok(None) => {
                             std::thread::sleep(std::time::Duration::from_millis(25));
                         }
                         Err(_) => break,

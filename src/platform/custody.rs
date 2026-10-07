@@ -355,6 +355,7 @@ fn libsecret_lookup_bounded(
 ) -> Result<Vec<u8>> {
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::ExitStatusExt;
 
     let mut child = crate::reaper::spawn(
         std::process::Command::new(tool)
@@ -481,8 +482,15 @@ fn libsecret_lookup_bounded(
             let _ = child.kill();
             let reaped = 'reap: loop {
                 match child.try_wait() {
-                    Ok(Some(_)) => break 'reap true,
-                    Ok(None) => {
+                    // A real termination, not a ptrace/job-control
+                    // stop: `try_wait` can report a `WIFSTOPPED`
+                    // state — the raw status still marks the child
+                    // stopped (alive under the tracer), so that reap
+                    // is NOT observed.
+                    Ok(Some(status)) if !libc::WIFSTOPPED(status.into_raw()) => {
+                        break 'reap true;
+                    }
+                    Ok(Some(_)) | Ok(None) => {
                         let Some(left) = deadline.remaining() else {
                             break 'reap false;
                         };
