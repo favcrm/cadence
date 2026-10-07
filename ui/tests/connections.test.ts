@@ -340,7 +340,7 @@ equal(typeof smtpPortTlsError("LOCALHOST", "40211", "implicit"), "string", "loca
     "failed receipt on a different digest -> null",
   );
   equal(
-    verificationResult({ verification: { ...okReceipt, status: "unsupported", authentication_verified: false, network_attempted: false, revision: 3 } }, want),
+    verificationResult({ verification: { ...okReceipt, status: "unsupported", authentication_verified: false, network_attempted: false, revision: 3, failure: { code: "unsupported_provider", step: "admission" } } }, want),
     null,
     "unsupported receipt on a different revision -> null",
   );
@@ -366,14 +366,36 @@ equal(typeof smtpPortTlsError("LOCALHOST", "40211", "implicit"), "string", "loca
     "failed with no failure detail -> null",
   );
   equal(
-    verificationResult({ verification: { ...okReceipt, status: "unsupported", authentication_verified: false, network_attempted: false, failure: { code: "unsupported_provider", step: "admission" } } }, want),
+    verificationResult({ verification: { ...okReceipt, status: "failed", authentication_verified: false, network_attempted: false, failure: { code: "auth_failed", step: "auth" } } }, want),
     null,
-    "unsupported carrying a failure detail -> null",
+    "failed at a network step without a network attempt -> null",
   );
   equal(
-    verificationResult({ verification: { ...okReceipt, status: "stale", authentication_verified: false, revision: 3, registration_digest: wrongDigest, failure: { code: "stale_connection", step: "admission" } } }, want),
+    verificationResult({ verification: { ...okReceipt, status: "failed", authentication_verified: false, network_attempted: true, failure: { code: "custody_unavailable", step: "configuration" } } }, want),
     null,
-    "stale carrying a failure detail -> null",
+    "failed at a local step after a network attempt -> null",
+  );
+  // Every real non-success status carries a closed failure — a
+  // null-failure stale/unsupported is not the reviewed wire shape.
+  equal(
+    verificationResult({ verification: { ...okReceipt, status: "unsupported", authentication_verified: false, network_attempted: false } }, want),
+    null,
+    "unsupported with no failure detail -> null",
+  );
+  equal(
+    verificationResult({ verification: { ...okReceipt, status: "stale", authentication_verified: false, network_attempted: false, revision: 3, registration_digest: wrongDigest } }, want),
+    null,
+    "stale with no failure detail -> null",
+  );
+  equal(
+    verificationResult({ verification: { ...okReceipt, status: "stale", authentication_verified: true, network_attempted: false, revision: 3, registration_digest: wrongDigest, failure: { code: "stale_connection", step: "admission" } } }, want),
+    null,
+    "stale claiming verified auth -> null",
+  );
+  equal(
+    verificationResult({ verification: { ...okReceipt, status: "stale", authentication_verified: false, network_attempted: true, revision: 3, registration_digest: wrongDigest, failure: { code: "stale_connection", step: "admission" } } }, want),
+    null,
+    "stale claiming a network attempt -> null",
   );
 
   // A closed failure maps to fixed actionable text; a stale receipt is
@@ -385,16 +407,17 @@ equal(typeof smtpPortTlsError("LOCALHOST", "40211", "implicit"), "string", "loca
   assert(failed !== null && failed.ok === false && failed.stale === false, "closed failure parses");
   assert((failed!.text).includes("login was refused") || (failed!.text).includes("credentials"), "auth_failed gives actionable text");
   const staleRes = verificationResult(
-    { verification: { ...okReceipt, status: "stale", authentication_verified: false, revision: 3, registration_digest: "sha256:" + "c".repeat(64) } },
+    { verification: { ...okReceipt, status: "stale", authentication_verified: false, network_attempted: false, revision: 3, registration_digest: "sha256:" + "c".repeat(64), failure: { code: "stale_connection", step: "admission" } } },
     want,
   );
   assert(staleRes !== null && staleRes.stale === true && staleRes.ok === false, "stale receipt is stale, not success");
   assert((staleRes!.text).includes("refresh"), "stale result asks for a refresh");
   const unsupported = verificationResult(
-    { verification: { ...okReceipt, status: "unsupported", authentication_verified: false, revision: 2 } },
+    { verification: { ...okReceipt, status: "unsupported", authentication_verified: false, network_attempted: false, revision: 2, failure: { code: "unsupported_custody", step: "admission" } } },
     want,
   );
   assert(unsupported !== null && unsupported.ok === false && unsupported.stale === false, "unsupported parses");
+  assert((unsupported!.text).includes("credential") && (unsupported!.text).includes("storage"), "unsupported maps its closed reason to actionable text");
 }
 
 // The Settings Connections route survives refresh and paste.

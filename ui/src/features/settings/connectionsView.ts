@@ -441,12 +441,25 @@ export function verificationResult(
         "This does not confirm delivery, sender entitlement or execution authority.",
     };
   }
+  const step = (failure as { step: string } | null)?.step ?? null;
+  const code = (failure as { code: string } | null)?.code ?? null;
+
   if (status === "stale") {
     // Stale carries the server-current tuple, which legitimately
     // differs — validate its shape and identity (done above), never its
     // equality to the request, and never let it read as a success or as
-    // replacement-current evidence. It must not carry a failure detail.
-    if (failure !== null) return null;
+    // replacement-current evidence. The real receipt always reports the
+    // admission-stage stale_connection failure, never touches the
+    // network and is never authenticated.
+    if (
+      failure === null ||
+      code !== "stale_connection" ||
+      step !== "admission" ||
+      r.authentication_verified !== false ||
+      r.network_attempted !== false
+    ) {
+      return null;
+    }
     return {
       ok: false,
       stale: true,
@@ -457,27 +470,34 @@ export function verificationResult(
   }
   // failed / unsupported: also pinned to the captured tuple — a failure
   // against a different revision/digest is evidence about the wrong
-  // incarnation, not this one. unsupported carries no failure detail;
-  // failed always does and is never authenticated.
-  if (!sameTuple) return null;
+  // incarnation, not this one. Every non-success status carries a closed
+  // failure detail and is never authenticated.
+  if (!sameTuple || failure === null || r.authentication_verified !== false) {
+    return null;
+  }
   if (status === "unsupported") {
-    if (failure !== null) return null;
+    // Unsupported is refused at admission — the closed reason maps to
+    // its reviewed, actionable line and no network is ever attempted.
+    if (step !== "admission" || r.network_attempted !== false) return null;
     return {
       ok: false,
       stale: false,
       checkedAt: r.completed_at as string,
-      text: "Remote login verification is not supported for this connection.",
+      text:
+        VERIFY_FAILURE_TEXT[code as string] ??
+        "Remote login verification is not supported for this connection.",
     };
   }
-  // status === "failed"
-  if (failure === null || r.authentication_verified === true) return null;
-  const code = (failure as { code: string }).code;
+  // status === "failed": network_attempted correlates with the stage —
+  // admission/configuration failures never reach the wire; dns..quit do.
+  const attempted = !(step === "admission" || step === "configuration");
+  if (r.network_attempted !== attempted) return null;
   return {
     ok: false,
     stale: false,
     checkedAt: r.completed_at as string,
     text:
-      VERIFY_FAILURE_TEXT[code] ??
+      VERIFY_FAILURE_TEXT[code as string] ??
       "The connection could not be verified — an unexpected error stopped the check. Try the test again.",
   };
 }
