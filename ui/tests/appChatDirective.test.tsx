@@ -141,6 +141,7 @@ assert(host.querySelector("#app-shell-chat-box"), "the composer is intact");
 // The control is not vacuous: its declared button navigates, once, to the declared view.
 await React.act(async () => { rows[0].querySelector("button")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 equal(opened, ["customers"], "the declared button opens its declared view");
+await React.act(async () => { root.unmount(); });
 console.log("app chat directive acceptance passed");
 }
 void main();

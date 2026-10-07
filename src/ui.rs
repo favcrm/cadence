@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 use crate::proc::{self, BoundedError};
 
+mod app_assistant;
 mod app_audiences;
 mod app_chat;
 mod app_content;

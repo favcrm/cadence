@@ -12,19 +12,28 @@ needs:
 This bundle installs the `crm` app the host-compiled CRM screens key on:
 Customers, Segments, Campaigns, content review and bounded send controls
 are daemon/UI features for an installation whose app is named `crm`.
-They are not granted or described by this bundle — this package is
-metadata plus one local-only workflow, not the CRM UI or domain code.
-The bundle's only runnable content is `email-brief`, which turns pasted
-facts into a single reviewed email brief text artifact.
+They are not implemented by this bundle — this package is metadata plus
+one local-only workflow, not the CRM UI or domain code. The bundle's only
+runnable workflow is `email-brief`, which turns pasted facts into a single
+reviewed email brief text artifact. The separate `app-assistant.json`
+declares data-only `app-assistant/v1` action IDs for the host's generic
+assistant. It provides no handlers, commands, URLs, actor authority or UI
+code: the host registry owns each implementation and scope, and unknown
+actions are refused.
 
 An approved brief is text for a person to read. It is not campaign
 content: applying content to a campaign, approving it, freezing an
 audience, binding an SMTP connection, running a test send and approving
 a send are separate operator verbs on the installation, each with its
-own digest and approval. The workflow never requests customer, content,
-SMTP or send mutations, and the manifest declares no capability that
-could carry one; host authorization governs every actual action on the
-installation regardless of what any bundle text asks for.
+own digest and approval. Assistant reads and drafts do not ask for
+standing permission. The `customer.tags.update` action is limited to tags
+on one customer and requires an explicit permission decision; consent,
+email and other profile fields are outside that action. Persistent
+permission is installation/action/customer scoped. Applying campaign
+content, freezing an audience and sending remain separate operator
+approval paths and are not assistant actions. Host authorization governs
+every actual action on the installation regardless of what any bundle
+text asks for.
 
 ## Set up once
 

@@ -808,6 +808,7 @@ pub struct AssistantClaim<'a> {
 
 struct ContentRow {
     name: Option<String>,
+    draft_segment_id: Option<String>,
     revision: i64,
     subject: String,
     preheader: String,
@@ -945,7 +946,7 @@ impl RecordStore {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(campaign, "campaign ID")?;
         conn.query_row(
-            "SELECT revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,html,text_override,name FROM app_content_docs WHERE context_id=? AND campaign_id=?",
+            "SELECT revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,html,text_override,name,draft_segment_id FROM app_content_docs WHERE context_id=? AND campaign_id=?",
             params![context, campaign],
             |r| {
                 let blocks: String = r.get(3)?;
@@ -961,6 +962,7 @@ impl RecordStore {
                     html: r.get(7)?,
                     text: r.get(8)?,
                     name: r.get(9)?,
+                    draft_segment_id: r.get(10)?,
                 })
             },
         )
@@ -971,9 +973,14 @@ impl RecordStore {
     fn content_doc_json(&self, context: &str, campaign: &str, row: ContentRow) -> Value {
         let valid = row.approval_revision == Some(row.revision)
             && row.approval_digest.as_deref() == Some(row.digest.as_str());
+        let draft_audience = row.draft_segment_id.as_ref().map_or(
+            Value::Null,
+            |segment_id| json!({"mode":"segment","segment_id":segment_id}),
+        );
         json!({
             "campaign_id": campaign,
             "name": row.name,
+            "draft_audience": draft_audience,
             "install_id": self.install(),
             "context_id": context,
             "revision": row.revision,
@@ -1065,6 +1072,55 @@ impl RecordStore {
             Ok(())
         })?;
         Ok(json!({"content": self.app_content_show(context, campaign)?["content"]}))
+    }
+
+    /// Create an assistant-attributed, unsent campaign draft. The
+    /// campaign must be new; the write stores the connection-derived
+    /// agent attribution and never creates an approval or send receipt.
+    pub fn app_content_create_assistant(
+        &self,
+        context: &str,
+        campaign: &str,
+        actor: &str,
+        operation_id: &str,
+        draft: &Draft,
+        segment_id: Option<&str>,
+    ) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(campaign, "campaign ID")?;
+        crate::proto::identifier(actor, "assistant identity")?;
+        crate::proto::identifier(operation_id, "operation ID")?;
+        if let Some(segment_id) = segment_id {
+            crate::proto::identifier(segment_id, "segment ID")?;
+        }
+        let blocks_text = serde_json::to_string(&draft.canonical_blocks())
+            .map_err(|e| Error::internal(e.to_string()))?;
+        self.write_tx(|tx| {
+            let existing: Option<String> = tx.query_row(
+                "SELECT content_digest FROM app_content_docs WHERE context_id=? AND campaign_id=?",
+                params![context,campaign], |row| row.get(0),
+            ).optional().map_err(|e| Error::internal(e.to_string()))?;
+            if existing.is_some() { return Err(Error::rejected("campaign already exists; assistant create is fresh-draft only")); }
+            if let Some(segment_id) = segment_id {
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM app_segments WHERE context_id=? AND id=?)",
+                    params![context,segment_id], |row| row.get(0),
+                ).map_err(|e| Error::internal(e.to_string()))?;
+                if !exists { return Err(Error::rejected("segment is unavailable in this context")); }
+            }
+            let revision = 1;
+            let digest = content_digest(self.install(), context, campaign, revision, draft);
+            tx.execute(
+                "INSERT INTO app_content_docs(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,actor,created,updated,html,text_override,name,draft_segment_id) VALUES(?,?,?,?,?,?,?,NULL,NULL,?,?,?,?,?,?,?)",
+                params![context,campaign,revision,draft.subject,draft.preheader,blocks_text,digest,actor,now(),now(),draft.html,draft.text,draft.name,segment_id],
+            ).map_err(|e| Error::internal(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO app_content_revisions(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,actor,origin,proposal_id,at,html,text_override) VALUES(?,?,?,?,?,?,?,?,'proposal',?,?,?,?)",
+                params![context,campaign,revision,draft.subject,draft.preheader,blocks_text,digest,actor,operation_id,now(),draft.html,draft.text],
+            ).map_err(|e| Error::internal(e.to_string()))?;
+            Ok(())
+        })?;
+        Ok(json!({"content":self.app_content_show(context,campaign)?["content"]}))
     }
 
     pub fn app_content_show(&self, context: &str, campaign: &str) -> Result<Value> {

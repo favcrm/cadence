@@ -191,7 +191,7 @@ CREATE TABLE IF NOT EXISTS app_content_docs(
  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
  approval_revision INTEGER, approval_digest TEXT,
  actor TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
- html TEXT, text_override TEXT, name TEXT,
+ html TEXT, text_override TEXT, name TEXT, draft_segment_id TEXT,
  PRIMARY KEY(context_id, campaign_id));
 CREATE TABLE IF NOT EXISTS app_content_revisions(
  context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
@@ -274,6 +274,18 @@ CREATE TABLE IF NOT EXISTS app_assistant_claims(
  agent TEXT NOT NULL,
  created REAL NOT NULL,
  PRIMARY KEY(context_id, message_id));
+CREATE TABLE IF NOT EXISTS app_assistant_operations(
+ operation_id TEXT PRIMARY KEY, context_id TEXT NOT NULL, action_id TEXT NOT NULL,
+ operation_digest TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0),
+ status TEXT NOT NULL, payload TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS app_assistant_operations_context ON app_assistant_operations(context_id, created);
+CREATE TABLE IF NOT EXISTS app_assistant_permissions(
+ permission_id TEXT PRIMARY KEY, context_id TEXT NOT NULL, action_id TEXT NOT NULL,
+ resource_id TEXT NOT NULL, effect TEXT NOT NULL CHECK(effect IN ('allow','deny')),
+ semantics_digest TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0),
+ state TEXT NOT NULL CHECK(state IN ('active','revoked')), scope_label TEXT NOT NULL,
+ created REAL NOT NULL, updated REAL NOT NULL,
+ UNIQUE(context_id, action_id, resource_id, effect));
 CREATE TABLE IF NOT EXISTS app_csv_confirms(
  context_id TEXT NOT NULL, request_id TEXT NOT NULL,
  preview_token TEXT NOT NULL, decisions_digest TEXT NOT NULL,
@@ -353,6 +365,47 @@ const CORRUPT_RECORD_FILE: &str = "record file is corrupt or foreign; restore th
 pub struct RecordStore {
     install_id: String,
     conn: Mutex<Connection>,
+}
+
+pub(crate) struct AssistantOperationUpdate<'a> {
+    pub operation_id: &'a str,
+    pub context: &'a str,
+    pub expected_revision: i64,
+    pub status: &'a str,
+    pub summary: &'a str,
+    pub result: &'a Value,
+    pub resource_refs: &'a Value,
+    pub permission_request: &'a Value,
+    pub error: Option<&'a str>,
+}
+
+pub(crate) struct AssistantPermissionWrite<'a> {
+    pub permission_id: &'a str,
+    pub context: &'a str,
+    pub action_id: &'a str,
+    pub resource_id: &'a str,
+    pub effect: &'a str,
+    pub semantics_digest: &'a str,
+    pub scope_label: &'a str,
+}
+
+type AssistantPermissionRow = (String, String, String, String, String, i64, String, String);
+
+fn read_assistant_operation(
+    conn: &impl super::StoreConn,
+    operation_id: &str,
+    context: &str,
+) -> Result<Value> {
+    let raw: String = conn
+        .query_row(
+            "SELECT payload FROM app_assistant_operations WHERE operation_id=? AND context_id=?",
+            params![operation_id, context],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| Error::internal(e.to_string()))?
+        .ok_or_else(|| Error::rejected("assistant operation is unavailable in this context"))?;
+    serde_json::from_str(&raw).map_err(|e| Error::internal(e.to_string()))
 }
 
 impl RecordStore {
@@ -625,7 +678,7 @@ impl RecordStore {
                  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
                  approval_revision INTEGER, approval_digest TEXT,
                  actor TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
-                 html TEXT, text_override TEXT, name TEXT,
+                 html TEXT, text_override TEXT, name TEXT, draft_segment_id TEXT,
                  PRIMARY KEY(context_id, campaign_id));
                  CREATE TABLE IF NOT EXISTS app_content_revisions(
                  context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
@@ -750,6 +803,21 @@ impl RecordStore {
             };
             if needs_name {
                 conn.execute_batch("ALTER TABLE app_content_docs ADD COLUMN name TEXT")
+                    .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            }
+            // CAD-1184: an unsent assistant-created draft may retain a
+            // bounded segment selection. Existing docs migrate to NULL;
+            // content saves and proposal application leave this column untouched.
+            let needs_draft_segment =
+                match conn.prepare("SELECT draft_segment_id FROM app_content_docs LIMIT 0") {
+                    Ok(_) => false,
+                    Err(error) if is_contention(&error) => {
+                        return Err(Error::internal("record file is busy"));
+                    }
+                    Err(_) => true,
+                };
+            if needs_draft_segment {
+                conn.execute_batch("ALTER TABLE app_content_docs ADD COLUMN draft_segment_id TEXT")
                     .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
             }
             conn.execute_batch(
@@ -2167,6 +2235,123 @@ impl RecordStore {
         Ok((token, plan))
     }
 
+    /// Create or replay one operation-level receipt. The separate
+    /// operation ledger permits bounded multi-action turns without
+    /// weakening the legacy one-message special-verb claim table.
+    pub fn app_assistant_operation_create(
+        &self,
+        operation_id: &str,
+        context: &str,
+        action_id: &str,
+        operation_digest: &str,
+        payload: &Value,
+    ) -> Result<(Value, bool)> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(operation_id, "operation ID")?;
+        if action_id.is_empty()
+            || action_id.len() > 64
+            || !operation_digest.starts_with("sha256:")
+            || operation_digest.len() != 71
+        {
+            return Err(Error::rejected("assistant operation identity is malformed"));
+        }
+        let conn = self.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| Error::internal(e.to_string()))?;
+        let existing: Option<(String, String)> = tx.query_row(
+            "SELECT operation_digest,payload FROM app_assistant_operations WHERE operation_id=? AND context_id=?",
+            params![operation_id, context], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|e| Error::internal(e.to_string()))?;
+        if let Some((digest, stored)) = existing {
+            let stored: Value =
+                serde_json::from_str(&stored).map_err(|e| Error::internal(e.to_string()))?;
+            if digest != operation_digest || stored.get("_input") != Some(payload) {
+                return Err(Error::rejected(
+                    "operation ID is already bound to different action semantics or input",
+                ));
+            }
+            let payload = read_assistant_operation(&tx, operation_id, context)?;
+            tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+            return Ok((payload, false));
+        }
+        let response = json!({"id":operation_id,"action_id":action_id,"status":"running","revision":1,"summary":"Action accepted","result":null,"resource_refs":[],"permission_request":null,"error":null,"_input":payload,"_operation_digest":operation_digest});
+        let stored =
+            serde_json::to_string(&response).map_err(|e| Error::internal(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO app_assistant_operations(operation_id,context_id,action_id,operation_digest,revision,status,payload,created,updated) VALUES(?,?,?,?,1,'running',?,?,?)",
+            params![operation_id, context, action_id, operation_digest, stored, now(), now()],
+        ).map_err(|e| Error::internal(e.to_string()))?;
+        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+        Ok((response, true))
+    }
+
+    /// Return the public operation receipt plus its private normalized
+    /// input for daemon dispatch. Callers must strip `_input` at the RPC.
+    pub fn app_assistant_operation_get(&self, operation_id: &str, context: &str) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(operation_id, "operation ID")?;
+        let conn = self.conn();
+        read_assistant_operation(&conn, operation_id, context)
+    }
+
+    pub(crate) fn app_assistant_operation_set(
+        &self,
+        update: AssistantOperationUpdate<'_>,
+    ) -> Result<Value> {
+        let AssistantOperationUpdate {
+            operation_id,
+            context,
+            expected_revision,
+            status,
+            summary,
+            result,
+            resource_refs,
+            permission_request,
+            error,
+        } = update;
+        if !matches!(
+            status,
+            "pending_permission" | "running" | "succeeded" | "denied" | "failed" | "unknown"
+        ) {
+            return Err(Error::rejected("unsupported assistant operation status"));
+        }
+        if summary.len() > 500 || summary.chars().any(char::is_control) {
+            return Err(Error::rejected("assistant operation summary is invalid"));
+        }
+        let mut public = self.app_assistant_operation_get(operation_id, context)?;
+        let current = public
+            .get("revision")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| Error::rejected("assistant operation revision is unavailable"))?;
+        if current != expected_revision {
+            return Err(Error::rejected("assistant operation revision is stale"));
+        }
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| Error::rejected("assistant operation revision exhausted"))?;
+        public["revision"] = json!(next);
+        public["status"] = json!(status);
+        public["summary"] = json!(summary);
+        public["result"] = result.clone();
+        public["resource_refs"] = resource_refs.clone();
+        public["permission_request"] = permission_request.clone();
+        public["error"] = error.map_or(Value::Null, |message| json!(message));
+        let mut private = public.clone();
+        let input = private.get("_input").cloned().unwrap_or(Value::Null);
+        public.as_object_mut().unwrap().remove("_input");
+        public.as_object_mut().unwrap().remove("_operation_digest");
+        private["_input"] = input;
+        let conn = self.conn();
+        let changed = conn.execute("UPDATE app_assistant_operations SET revision=?,status=?,payload=?,updated=? WHERE operation_id=? AND context_id=? AND revision=?",
+            params![next, status, serde_json::to_string(&private).map_err(|e| Error::internal(e.to_string()))?, now(), operation_id, context, current])
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if changed != 1 {
+            return Err(Error::rejected("assistant operation revision is stale"));
+        }
+        Ok(public)
+    }
+
     /// CAD-1014: claim a scoped chat message for exactly one delegated
     /// assistant action in this context. `PRIMARY KEY(context_id,
     /// message_id)` makes the claim atomic — a second action on the
@@ -2254,6 +2439,126 @@ impl RecordStore {
             }
         })?;
         tx.commit().map_err(|e| Error::internal(e.to_string()))
+    }
+
+    pub fn app_assistant_operation_context(&self, operation_id: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT context_id FROM app_assistant_operations WHERE operation_id=?",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| Error::internal(e.to_string()))
+    }
+
+    pub fn app_assistant_permission_context(&self, permission_id: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT context_id FROM app_assistant_permissions WHERE permission_id=?",
+            [permission_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| Error::internal(e.to_string()))
+    }
+
+    pub fn app_assistant_operations_list(&self, context: &str, limit: i64) -> Result<Vec<Value>> {
+        crate::proto::identifier(context, "context ID")?;
+        let limit = limit.clamp(1, 100);
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT payload FROM app_assistant_operations WHERE context_id=? ORDER BY created DESC LIMIT ?").map_err(|e| Error::internal(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![context, limit], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let mut value: Value =
+                serde_json::from_str(&row.map_err(|e| Error::internal(e.to_string()))?)
+                    .map_err(|e| Error::internal(e.to_string()))?;
+            if let Some(fields) = value.as_object_mut() {
+                fields.remove("_input");
+                fields.remove("_operation_digest");
+            }
+            out.push(value);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn app_assistant_permission_save(
+        &self,
+        permission: AssistantPermissionWrite<'_>,
+    ) -> Result<Value> {
+        let AssistantPermissionWrite {
+            permission_id,
+            context,
+            action_id,
+            resource_id,
+            effect,
+            semantics_digest,
+            scope_label,
+        } = permission;
+        crate::proto::identifier(permission_id, "permission ID")?;
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(resource_id, "resource ID")?;
+        if !matches!(effect, "allow" | "deny")
+            || !semantics_digest.starts_with("sha256:")
+            || semantics_digest.len() != 71
+            || scope_label.len() > 200
+        {
+            return Err(Error::rejected("assistant permission is malformed"));
+        }
+        let conn = self.conn();
+        conn.execute("INSERT INTO app_assistant_permissions(permission_id,context_id,action_id,resource_id,effect,semantics_digest,revision,state,scope_label,created,updated) VALUES(?,?,?,?,?,?,1,'active',?,?,?) ON CONFLICT(context_id,action_id,resource_id,effect) DO UPDATE SET permission_id=excluded.permission_id,semantics_digest=excluded.semantics_digest,revision=app_assistant_permissions.revision+1,state='active',scope_label=excluded.scope_label,updated=excluded.updated",
+            params![permission_id, context, action_id, resource_id, effect, semantics_digest, scope_label, now(), now()]).map_err(|e| Error::internal(e.to_string()))?;
+        drop(conn);
+        self.app_assistant_permission_find(context, action_id, resource_id, effect)?
+            .ok_or_else(|| Error::internal("assistant permission save did not persist"))
+    }
+
+    pub fn app_assistant_permission_find(
+        &self,
+        context: &str,
+        action_id: &str,
+        resource_id: &str,
+        effect: &str,
+    ) -> Result<Option<Value>> {
+        let conn = self.conn();
+        let row: Option<AssistantPermissionRow> = conn.query_row("SELECT permission_id,action_id,resource_id,effect,semantics_digest,revision,state,scope_label FROM app_assistant_permissions WHERE context_id=? AND action_id=? AND resource_id=? AND effect=?", params![context,action_id,resource_id,effect], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional().map_err(|e| Error::internal(e.to_string()))?;
+        Ok(row.map(|(id,action,resource,effect,digest,revision,state,label)| json!({"id":id,"action_id":action,"resource_id":resource,"effect":effect,"semantics_digest":digest,"revision":revision,"state":state,"scope_label":label})))
+    }
+
+    pub fn app_assistant_permissions_list(&self, context: &str) -> Result<Vec<Value>> {
+        crate::proto::identifier(context, "context ID")?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT permission_id,action_id,resource_id,effect,semantics_digest,revision,state,scope_label FROM app_assistant_permissions WHERE context_id=? ORDER BY created DESC LIMIT 100").map_err(|e| Error::internal(e.to_string()))?;
+        let rows = stmt.query_map([context], |r| Ok(json!({"id":r.get::<_,String>(0)?,"action_id":r.get::<_,String>(1)?,"resource_id":r.get::<_,String>(2)?,"effect":r.get::<_,String>(3)?,"semantics_digest":r.get::<_,String>(4)?,"revision":r.get::<_,i64>(5)?,"state":r.get::<_,String>(6)?,"scope_label":r.get::<_,String>(7)?}))).map_err(|e| Error::internal(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| Error::internal(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    pub fn app_assistant_permission_revoke(
+        &self,
+        context: &str,
+        permission_id: &str,
+        expected_revision: i64,
+    ) -> Result<Value> {
+        let conn = self.conn();
+        let changed = conn.execute("UPDATE app_assistant_permissions SET state='revoked',revision=revision+1,updated=? WHERE context_id=? AND permission_id=? AND revision=? AND state='active'", params![now(),context,permission_id,expected_revision]).map_err(|e| Error::internal(e.to_string()))?;
+        if changed != 1 {
+            return Err(Error::rejected(
+                "assistant permission revision is stale or permission is already revoked",
+            ));
+        }
+        drop(conn);
+        let permissions = self.app_assistant_permissions_list(context)?;
+        permissions
+            .into_iter()
+            .find(|p| p["id"].as_str() == Some(permission_id))
+            .ok_or_else(|| Error::rejected("assistant permission is unavailable"))
     }
 
     /// Read-only plan of bounded CSV text: per-row decisions plus the

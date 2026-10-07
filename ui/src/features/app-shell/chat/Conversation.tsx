@@ -39,6 +39,7 @@ import { renderCapability } from "./capabilities";
 import type { AppChat } from "./contract";
 import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
+import AssistantOperations from "./AssistantOperations";
 import { hideIds, matchDirective, type Directive } from "./directive";
 import { planFrames, type FrameRow } from "./frames";
 import type { ChatBinding } from "./types";
@@ -480,6 +481,7 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
           </li>
         ))}
       </ol>
+      <AssistantOperations key={`${installId}\u0000${mode.contextId}`} installId={installId} contextId={mode.contextId} canDecide={viewer.operator && !viewer.readOnly} />
       {sendError && (
         <p className="text-label text-fail" role="alert">
           {sendError}

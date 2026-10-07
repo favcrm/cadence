@@ -41,6 +41,11 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: ContentAction,
     },
+    /// CRM app assistant discovery, consented action invocation, and durable receipt reads.
+    Assistant {
+        #[command(subcommand)]
+        action: AssistantAction,
+    },
     /// Stable workspace installation IDs; execution and approval are separate.
     Catalog {
         #[command(subcommand)]
@@ -1300,6 +1305,45 @@ fn effect_params(action: &EffectAction) -> (&'static str, serde_json::Value) {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum AssistantAction {
+    Actions {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        token: String,
+    },
+    Invoke {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        action_id: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        input: PathBuf,
+    },
+    OperationShow {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        operation_id: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum CatalogAction {
     /// Approve the exact installed digest for supported local artifact steps.
     Approve {
@@ -1470,6 +1514,36 @@ fn read_run_inputs(path: &Path) -> Result<serde_json::Value> {
     let inputs: std::collections::BTreeMap<String, String> = serde_json::from_slice(&bytes)
         .map_err(|_| Error::invalid("app_run_inputs", "inputs must be a JSON object of strings"))?;
     Ok(json!(inputs))
+}
+
+fn read_assistant_input(state_dir: &Path, path: &Path) -> Result<serde_json::Value> {
+    use std::io::Read;
+    const MAX_INPUT_BYTES: usize = 32 * 1024;
+    let file = cadence_agent::master::open_command_file(state_dir, path)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            Error::invalid(
+                "app_assistant_input",
+                format!("cannot read assistant input: {e}"),
+            )
+        })?;
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::invalid(
+            "app_assistant_input",
+            "assistant input JSON exceeds 32KiB",
+        ));
+    }
+    let input: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| Error::invalid("app_assistant_input", "input must be a JSON object"))?;
+    if !input.is_object() {
+        return Err(Error::invalid(
+            "app_assistant_input",
+            "input must be a JSON object",
+        ));
+    }
+    Ok(input)
 }
 
 fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
@@ -1774,6 +1848,42 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
         }
         AppAction::Content { action } => {
             let (method, params) = content_params(action)?;
+            client::rpc(state_dir, method, params)?
+        }
+        AppAction::Assistant { action } => {
+            let (method, params) = match action {
+                AssistantAction::Actions {
+                    install_id,
+                    context_id,
+                    message,
+                    token,
+                } => (
+                    "app_assistant_actions",
+                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token}),
+                ),
+                AssistantAction::Invoke {
+                    install_id,
+                    context_id,
+                    message,
+                    token,
+                    action_id,
+                    operation_id,
+                    input,
+                } => (
+                    "app_assistant_invoke",
+                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token,"action_id":action_id,"operation_id":operation_id,"input":read_assistant_input(state_dir, input)?}),
+                ),
+                AssistantAction::OperationShow {
+                    install_id,
+                    context_id,
+                    message,
+                    token,
+                    operation_id,
+                } => (
+                    "app_assistant_operation_show",
+                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token,"operation_id":operation_id}),
+                ),
+            };
             client::rpc(state_dir, method, params)?
         }
         AppAction::Dev {

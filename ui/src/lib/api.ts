@@ -397,6 +397,38 @@ export const api = {
     get<{ descriptor: unknown; digest: unknown; app: unknown }>(
       `/api/app-installations/${encodeURIComponent(installId)}/chat-descriptor`,
     ),
+  /** Generic app-assistant/v1 discovery, durable operations and scoped permissions. */
+  assistantActions: (installId: string, contextId: string) =>
+    get<{ contract: "app-assistant/v1"; actions: unknown[]; descriptor_digest: string }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/actions?context_id=${encodeURIComponent(contextId)}`,
+    ),
+  assistantOperations: (installId: string, contextId: string) =>
+    get<{ operations: unknown[] }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/operations?context_id=${encodeURIComponent(contextId)}`,
+    ),
+  assistantOperation: (installId: string, operationId: string) =>
+    get<{ operation: unknown }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/operations/${encodeURIComponent(operationId)}`,
+    ),
+  assistantDecision: (installId: string, operationId: string, body: { decision: "allow_once" | "allow_always" | "deny"; expected_revision: number }) =>
+    post<{ operation: unknown }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/operations/${encodeURIComponent(operationId)}/decision`,
+      body,
+    ),
+  assistantPermissions: (installId: string, contextId: string) =>
+    get<{ permissions: unknown[] }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/permissions?context_id=${encodeURIComponent(contextId)}`,
+    ),
+  assistantRevoke: (installId: string, permissionId: string, body: { expected_revision: number }) =>
+    post<{ permission: unknown }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/permissions/${encodeURIComponent(permissionId)}/revoke`,
+      body,
+    ),
+  assistantBlock: (installId: string, contextId: string, body: { action_id: string; resource_id: string }) =>
+    post<{ permission: unknown }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/permissions/block?context_id=${encodeURIComponent(contextId)}`,
+      body,
+    ),
   /** `GET /api/app-installations/<id>/conversations` (CAD-1098; wire shape owned by conversationClient). */
   conversationList: (installId: string) =>
     get<Record<string, unknown>>(`/api/app-installations/${encodeURIComponent(installId)}/conversations`),

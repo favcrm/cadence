@@ -544,7 +544,7 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             continue;
         }
         // CAD-1110: the data-only chat descriptor sits beside app.md.
-        if name == crate::issue::app_chat::FILE {
+        if name == crate::issue::app_chat::FILE || name == crate::issue::app_assistant::FILE {
             if !ft.is_file() {
                 return Err(entry_err(name, "app-chat.json is a regular file"));
             }
@@ -887,6 +887,23 @@ fn validate_contents(
     {
         if let Err(e) = crate::issue::app_chat::validate(text, &manifest.app) {
             errors.push(e.to_string());
+        }
+    }
+    if let Some((_, text)) = files
+        .iter()
+        .find(|(rel, _)| rel == crate::issue::app_assistant::FILE)
+    {
+        match crate::issue::app_assistant::validate(text) {
+            Ok(descriptor)
+                if descriptor
+                    .app
+                    .as_deref()
+                    .is_none_or(|app| app == manifest.app) => {}
+            Ok(_) => errors.push(format!(
+                "{} declares a different app name",
+                crate::issue::app_assistant::FILE
+            )),
+            Err(e) => errors.push(format!("{}: {e}", crate::issue::app_assistant::FILE)),
         }
     }
     // CAD-864: the descriptor and its manifest declaration pair up —
