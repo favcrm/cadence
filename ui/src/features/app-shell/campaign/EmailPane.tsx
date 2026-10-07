@@ -12,6 +12,7 @@ import {
 import { contentClient } from "../contentClient";
 import EmailBlocksCanvas, { AddBlockTools, MAX_BLOCKS } from "./EmailBlocksCanvas";
 import ProposalStrip from "./ProposalStrip";
+import ConfirmDialog from "../shared/ConfirmDialog";
 import { blocksFromProposal, blocksToGrammar, type EmailDraftApi } from "./useEmailDraft";
 
 type Mode = "visual" | "html";
@@ -85,6 +86,7 @@ export default function EmailPane({
   const [draftRender, setDraftRender] = useState<ProposalRenderDoc | null>(null);
   const [draftPending, setDraftPending] = useState(false);
   const [draftError, setDraftError] = useState<string | null>(null);
+  const [replacementConfirmationId, setReplacementConfirmationId] = useState<string | null>(null);
 
   const draft = draftId === null ? null : (proposals.find((p) => p.proposalId === draftId) ?? null);
   // A decided/applied proposal leaves the list: fall back to the saved view.
@@ -157,6 +159,35 @@ export default function EmailPane({
     return /<head(?:\s[^>]*)?>/i.test(html)
       ? html.replace(/<head(?:\s[^>]*)?>/i, (head) => `${head}${policy}`)
       : `<!doctype html><html><head>${policy}</head><body>${html}</body></html>`;
+  };
+
+  const useProposalInEditor = (row: ProposalDoc, confirmed = false) => {
+    if (
+      edit === null ||
+      edit.saving ||
+      edit.reloading ||
+      row.sourceRevision !== expectedRevision ||
+      draftId !== row.proposalId ||
+      draftRender === null ||
+      draftPending ||
+      draftError !== null
+    ) return;
+    if (edit.dirty && !confirmed) {
+      setReplacementConfirmationId(row.proposalId);
+      return;
+    }
+    if (confirmed && replacementConfirmationId !== row.proposalId) return;
+
+    setReplacementConfirmationId(null);
+    edit.patch({
+      subject: row.subject,
+      preheader: row.preheader,
+      blocks: blocksFromProposal(row.blocks),
+      html: null,
+      ownText: false,
+      text: "",
+    });
+    setDraftId(null);
   };
 
   const stage = (() => {
@@ -385,31 +416,48 @@ export default function EmailPane({
           </p>
         )}
         {proposals.map((row) => (
-          <ProposalStrip
-            key={row.proposalId}
-            scope={scope}
-            proposal={row}
-            expectedRevision={expectedRevision}
-            canWrite={canWrite}
-            replacesHtml={doc?.mode === "html"}
-            viewingDraft={draftId === row.proposalId}
-            canUseInEditor={draftId === row.proposalId && draftRender !== null && !draftPending && draftError === null}
-            onViewDraft={(view) => setDraftId(view ? row.proposalId : null)}
-            onUseInEditor={() => {
-              if (edit === null || row.sourceRevision !== expectedRevision) return;
-              edit.patch({
-                subject: row.subject,
-                preheader: row.preheader,
-                blocks: blocksFromProposal(row.blocks),
-                html: null,
-                ownText: false,
-                text: "",
-              });
-              setDraftId(null);
-            }}
-            onDiscarded={onDiscarded}
-            onError={onProposalError}
-          />
+          <div key={row.proposalId}>
+            <ProposalStrip
+              scope={scope}
+              proposal={row}
+              expectedRevision={expectedRevision}
+              canWrite={canWrite}
+              replacesHtml={doc?.mode === "html"}
+              viewingDraft={draftId === row.proposalId}
+              canUseInEditor={
+                draftId === row.proposalId &&
+                draftRender !== null &&
+                !draftPending &&
+                draftError === null &&
+                edit !== null &&
+                !edit.saving &&
+                !edit.reloading
+              }
+              onViewDraft={(view) => {
+                setReplacementConfirmationId(null);
+                setDraftId(view ? row.proposalId : null);
+              }}
+              onUseInEditor={() => useProposalInEditor(row)}
+              onDiscarded={onDiscarded}
+              onError={onProposalError}
+            />
+            {replacementConfirmationId === row.proposalId && edit?.dirty && (
+              <ConfirmDialog
+                title="Replace unsaved email changes?"
+                body={
+                  <p>
+                    Using this proposal replaces your unsaved subject, preheader, body, and text override.
+                    Saved content stays unchanged until you choose Save.
+                  </p>
+                }
+                confirmLabel="Replace local draft"
+                pending={edit.saving || edit.reloading}
+                error={null}
+                onConfirm={() => useProposalInEditor(row, true)}
+                onCancel={() => setReplacementConfirmationId(null)}
+              />
+            )}
+          </div>
         ))}
         {proposals.length === 0 && (
           <p className="text-label text-ink-400" data-empty="proposals">
