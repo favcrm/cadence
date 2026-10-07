@@ -70,7 +70,10 @@ the board reads (`read_run_log`).
   proof (`src/rollout.rs:1249-1260`). A *pane alias* may claim only
   under a live `rollout grant` (CAD-384); a `delegate:<alias>` only
   under a `staging delegate` grant scoped to a registered staging dir
-  (CAD-1024). Production has no agent path to the lease.
+  (CAD-1024). A live operator-issued grant DOES let a pane hold the
+  production lease and stop the daemon (recorded, expirable) — agent
+  lease-holding exists, but no grant authorizes update-install or
+  drain, and no unattended install path exists.
 - **Drain**: `update_drain` requires `operator_connection` on the RPC —
   the connection-level proof, not a label. `shutdown` admits the
   operator or the lease-holding granted pane (`granted_lease_holder`).
@@ -187,10 +190,16 @@ Things that do **not** exist today and a tier would require:
   record (in the store or a signed file) naming: window start/end (or
   cron), allowed target set (latest promoted candidate only), a hard
   refusal list (schema crossings, fleet not drained within bound, lease
-  held by another identity, a `human`-trigger PR in the changeset),
-  TTL, and revocation. The installer claims the lease *as the machine
-  identity* and the lease row names the window grant, so
-  `rollout status` and the audit both show why the machine held it.
+  held by another identity), TTL, and revocation. The installer claims
+  the lease *as the machine identity* and the lease row names the
+  window grant, so `rollout status` and the audit both show why the
+  machine held it. Deliberately NOT refused: the changeset's trigger
+  classes. Content judgment lives at merge approval and promote
+  approval — both human, both already happened for any installable
+  candidate — so a promoted security fix (trigger 3) is precisely what
+  the window is for. The window authorizes *timing* only; it never
+  substitutes for review, and every auto-installed changeset was twice
+  human-approved before the window opened.
 - **M3 — health-check-gated auto-rollback: mostly exists.** The
   pipeline already repoints + restarts + re-checks on health failure.
   The delta is *detection width*: health today = "daemon and board
