@@ -40,7 +40,7 @@ use super::app_audiences_rpc::{audience_expected, audience_name, audience_predic
 use super::app_records_rpc::{csv_decisions, csv_text};
 use super::*;
 use crate::issue::app_catalog::workspace;
-use crate::store::app_content::Draft;
+use crate::store::app_content::{CloneOptions, Draft};
 use crate::store::app_records::RecordStore;
 
 fn content_draft(params: &Value) -> Result<Draft> {
@@ -366,12 +366,14 @@ impl Shared {
                 records.app_content_clone(
                     context,
                     required_str(params, "campaign_id")?,
-                    content_revision(params)?,
-                    required_str(params, "name")?,
-                    copy_audience,
-                    optional_id("source_freeze_id")?,
-                    copy_sender,
-                    optional_id("source_binding_id")?,
+                    &CloneOptions {
+                        expected_revision: content_revision(params)?,
+                        name: required_str(params, "name")?,
+                        copy_audience,
+                        source_freeze_id: optional_id("source_freeze_id")?,
+                        copy_sender,
+                        source_binding_id: optional_id("source_binding_id")?,
+                    },
                 )
             }
             "app_content_list" => records.app_content_list(context),

@@ -871,6 +871,17 @@ pub struct BindingDraft<'a> {
     pub connection_id: Option<&'a str>,
 }
 
+/// Validated clone selection inputs; authority remains in the URL scope.
+#[derive(Clone, Copy)]
+pub struct CloneOptions<'a> {
+    pub expected_revision: i64,
+    pub name: &'a str,
+    pub copy_audience: bool,
+    pub source_freeze_id: Option<&'a str>,
+    pub copy_sender: bool,
+    pub source_binding_id: Option<&'a str>,
+}
+
 /// One saved binding row.
 struct BindingRecord {
     binding_id: String,
@@ -1131,13 +1142,16 @@ impl RecordStore {
         &self,
         context: &str,
         source_campaign: &str,
-        expected_revision: i64,
-        name: &str,
-        copy_audience: bool,
-        source_freeze_id: Option<&str>,
-        copy_sender: bool,
-        source_binding_id: Option<&str>,
+        options: &CloneOptions<'_>,
     ) -> Result<Value> {
+        let CloneOptions {
+            expected_revision,
+            name,
+            copy_audience,
+            source_freeze_id,
+            copy_sender,
+            source_binding_id,
+        } = *options;
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(source_campaign, "campaign ID")?;
         if expected_revision <= 0 {
