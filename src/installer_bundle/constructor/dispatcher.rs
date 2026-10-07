@@ -1180,7 +1180,7 @@ impl PiSession {
                     running.helper.interrupt(until)?
                 }
                 if retire {
-                    running.helper.retire(until)?
+                    running.retire(until)?
                 }
                 let phase = if running.helper.exited(until)? {
                     ProcessPhase::Exited
@@ -1371,7 +1371,7 @@ pub(super) fn run(layout: Layout) -> Result<()> {
                     // adapter EOF/result/close or a daemon-reported retired bit.
                     for session in &pi {
                         if let Some(run) = &session.running {
-                            run.helper.retire(until)?
+                            run.retire(until)?
                         }
                     }
                     r.task
@@ -1497,12 +1497,13 @@ pub(super) fn run(layout: Layout) -> Result<()> {
             if ready(&pi[i].stream)? && pi[i].handle(&profile, &mut stores, until).is_err() {
                 // Losing control BEFORE owned retirement is UNKNOWN. Expected
                 // closure is admitted only by THIS session's private non-Clone
-                // namespace-init retirement evidence + actual kernel pidfd exit,
-                // not the CURRENT task's phase (which may already be a new one).
+                // namespace-init retirement evidence + actual kernel pidfd exit
+                // AND the original held view's completed isolation proof, not
+                // the CURRENT task's phase (which may already be a new one).
                 if pi[i]
                     .running
                     .as_ref()
-                    .is_none_or(|r| r.helper.retirement_verified(until).ok() != Some(true))
+                    .is_none_or(|r| r.require_retired(until).is_err())
                 {
                     return Err(refused());
                 }
