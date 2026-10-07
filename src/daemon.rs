@@ -38,6 +38,8 @@ mod cad1184_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1184_revision_acceptance;
 mod caller_rule;
+#[cfg(all(test, feature = "test-seam"))]
+mod campaign_clone_acceptance;
 mod checkup;
 mod connection_test;
 mod connections_rpc;
@@ -3322,6 +3324,7 @@ impl Shared {
             "app_sender_binding_list" => self.rpc_app_content(method, params, peer_pid),
             "app_content_save" => self.rpc_app_content(method, params, peer_pid),
             "app_content_show" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_clone" => self.rpc_app_content(method, params, peer_pid),
             "app_content_list" => self.rpc_app_content(method, params, peer_pid),
             "app_content_render" => self.rpc_app_content(method, params, peer_pid),
             "app_content_propose" => self.rpc_app_content(method, params, peer_pid),

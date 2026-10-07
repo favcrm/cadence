@@ -202,6 +202,17 @@ impl Shared {
                 "expected_revision",
             ],
             "app_content_show" => &["install_id", "context_id", "campaign_id"],
+            "app_content_clone" => &[
+                "install_id",
+                "context_id",
+                "campaign_id",
+                "expected_revision",
+                "name",
+                "copy_audience",
+                "source_freeze_id",
+                "copy_sender",
+                "source_binding_id",
+            ],
             "app_content_list" => &["install_id", "context_id"],
             "app_content_render" => &[
                 "install_id",
@@ -323,6 +334,45 @@ impl Shared {
             }
             "app_content_show" => {
                 records.app_content_show(context, required_str(params, "campaign_id")?)
+            }
+            "app_content_clone" => {
+                let copy_audience = match params.get("copy_audience") {
+                    None => false,
+                    Some(Value::Bool(value)) => *value,
+                    Some(_) => {
+                        return Err(Error::rejected(
+                            "campaign clone audience flag must be boolean",
+                        ));
+                    }
+                };
+                let copy_sender = match params.get("copy_sender") {
+                    None => false,
+                    Some(Value::Bool(value)) => *value,
+                    Some(_) => {
+                        return Err(Error::rejected(
+                            "campaign clone sender flag must be boolean",
+                        ));
+                    }
+                };
+                let optional_id = |key: &str| -> Result<Option<&str>> {
+                    match params.get(key) {
+                        None => Ok(None),
+                        Some(Value::String(id)) => Ok(Some(id)),
+                        Some(_) => {
+                            Err(Error::rejected("campaign clone reference must be a string"))
+                        }
+                    }
+                };
+                records.app_content_clone(
+                    context,
+                    required_str(params, "campaign_id")?,
+                    content_revision(params)?,
+                    required_str(params, "name")?,
+                    copy_audience,
+                    optional_id("source_freeze_id")?,
+                    copy_sender,
+                    optional_id("source_binding_id")?,
+                )
             }
             "app_content_list" => records.app_content_list(context),
             "app_sender_binding_save" => {

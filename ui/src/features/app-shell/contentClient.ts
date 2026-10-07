@@ -42,6 +42,14 @@ const SAVE_KEYS = [
   "text",
   "expected_revision",
 ] as const;
+const CLONE_KEYS = [
+  "expected_revision",
+  "name",
+  "copy_audience",
+  "source_freeze_id",
+  "copy_sender",
+  "source_binding_id",
+] as const;
 const RENDER_KEYS = ["revision", "sample_first_name", "binding_id"] as const;
 const APPROVE_KEYS = ["expected_revision"] as const;
 const TEST_PREPARE_KEYS = ["to_email", "binding_id"] as const;
@@ -114,6 +122,8 @@ export const contentPaths = {
   listPath: (scope: ContentScope) => `${scopePath(scope)}/campaigns/list`,
   showPath: (scope: ContentScope, campaignId: string) =>
     `${scopePath(scope)}/campaigns/${campaignId}`,
+  clonePath: (scope: ContentScope, sourceCampaignId: string) =>
+    `${scopePath(scope)}/campaigns/${sourceCampaignId}/clone`,
   renderPath: (scope: ContentScope, campaignId: string) =>
     `${scopePath(scope)}/campaigns/${campaignId}/render`,
   approvePath: (scope: ContentScope, campaignId: string) =>
@@ -199,6 +209,47 @@ export type ContentDraftInput = {
   | { html: string; blocks?: never }
 );
 
+export interface CloneInput {
+  expectedRevision: number;
+  name: string;
+  copyAudience?: { sourceFreezeId: string };
+  copySender?: { sourceBindingId: string };
+}
+
+export interface ClonedContent {
+  campaign_id: string;
+  name: string;
+  revision: number;
+  subject: string;
+  preheader: string;
+  blocks: ContentBlock[];
+  mode: "blocks" | "html";
+  html: string | null;
+  text_override: string | null;
+  approval: { revision: number | null; digest: string | null; valid: false; scope: "content-only" };
+}
+
+export type AudienceSelectionBase =
+  | { mode: "all" }
+  | { mode: "segment"; segment_id: string }
+  | { mode: "custom"; customer_ids: string[] };
+
+export interface CloneResult {
+  content: ClonedContent;
+  starterSelection: {
+    audience: { base: AudienceSelectionBase; exclusionListId: string | null } | null;
+    senderBindingId: string | null;
+  };
+}
+
+interface CloneResponse {
+  content: ClonedContent;
+  starter_selection: {
+    audience: { base: AudienceSelectionBase; exclusion_list_id: string | null } | null;
+    sender_binding_id: string | null;
+  };
+}
+
 export interface ProposalInput {
   campaignId: string;
   proposalId: string;
@@ -234,6 +285,37 @@ export const contentClient = {
   },
   show(scope: ContentScope, campaignId: string): Promise<unknown> {
     return get(contentPaths.showPath(scope, campaignId));
+  },
+  clone(scope: ContentScope, sourceCampaignId: string, input: CloneInput): Promise<CloneResult> {
+    const allowed = ["expectedRevision", "name", "copyAudience", "copySender"] as const;
+    assertInputClean(input as unknown as Record<string, unknown>, allowed, "clone");
+    const body: Record<string, unknown> = {
+      expected_revision: input.expectedRevision,
+      name: input.name,
+      copy_audience: input.copyAudience !== undefined,
+      copy_sender: input.copySender !== undefined,
+    };
+    if (input.copyAudience !== undefined) {
+      assertInputClean(input.copyAudience, ["sourceFreezeId"], "clone audience selection");
+      body.source_freeze_id = input.copyAudience.sourceFreezeId;
+    }
+    if (input.copySender !== undefined) {
+      assertInputClean(input.copySender, ["sourceBindingId"], "clone sender selection");
+      body.source_binding_id = input.copySender.sourceBindingId;
+    }
+    assertClean(body, CLONE_KEYS, "clone");
+    return post<CloneResponse>(contentPaths.clonePath(scope, sourceCampaignId), body).then((response) => ({
+      content: response.content,
+      starterSelection: {
+        audience: response.starter_selection.audience
+          ? {
+              base: response.starter_selection.audience.base,
+              exclusionListId: response.starter_selection.audience.exclusion_list_id,
+            }
+          : null,
+        senderBindingId: response.starter_selection.sender_binding_id,
+      },
+    }));
   },
   list(scope: ContentScope): Promise<unknown> {
     return get(contentPaths.listPath(scope));
