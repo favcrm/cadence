@@ -62,7 +62,7 @@ fn signed_grant(kid: &str, challenge: serde_json::Value, key: &Ed25519KeyPair) -
 
 fn fresh_key() -> Ed25519KeyPair {
     let rng = ring::rand::SystemRandom::new();
-    Ed25519KeyPair::from_pkcs8(&Ed25519KeyPair::generate_pkcs8(&rng).unwrap().as_ref()).unwrap()
+    Ed25519KeyPair::from_pkcs8(Ed25519KeyPair::generate_pkcs8(&rng).unwrap().as_ref()).unwrap()
 }
 
 /// The real producer output must feed the real verifier — the end-to-end
