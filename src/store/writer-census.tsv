@@ -59,7 +59,7 @@ rollout.rs	legacy-rollout-owner-and-inline-tests	transaction	1
 store/agents.rs	guarded-store-and-read-queries	execute	20
 store/agents.rs	guarded-store-and-read-queries	guarded_write	14
 store/agents.rs	guarded-store-and-read-queries	prepare	4
-store/app_audiences.rs	guarded-store-and-read-queries	execute	9
+store/app_audiences.rs	guarded-store-and-read-queries	execute	10
 store/app_audiences.rs	guarded-store-and-read-queries	guarded_write	3
 store/app_audiences.rs	guarded-store-and-read-queries	prepare	3
 store/app_bindings.rs	guarded-store-and-read-queries	execute	7

@@ -332,8 +332,17 @@ pub(super) fn handle(
         Err(error) => {
             let denied = error.to_string().contains("operator action")
                 || error.to_string().contains("not provably the operator");
+            // CAD-1178: a freeze that does not exist yet is a state, not a
+            // refusal — the audience screen renders "not frozen yet" off a
+            // 404. Narrow match on the exact missing-freeze text; every
+            // other rejection keeps its 409.
+            let missing = error
+                .to_string()
+                .contains("audience freeze is unavailable for this installation and context");
             let code = if denied {
                 403
+            } else if missing {
+                404
             } else {
                 match error {
                     Error::Rejected(_) | Error::Structured(_) => 409,
