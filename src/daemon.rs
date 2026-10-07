@@ -466,7 +466,7 @@ pub struct Shared {
     /// custody bytes disagreeing. One lock for every custody mutation:
     /// these verbs are operator-paced and rare, so a per-key map buys
     /// nothing here.
-    platform_custody_lock: Mutex<()>,
+    platform_custody_lock: &'static Mutex<()>,
     /// CAD-786: live send workers keyed `install/context/send` — at
     /// most one runner drains one send's queue.
     crm_send_workers: Mutex<std::collections::HashSet<String>>,
@@ -728,7 +728,7 @@ impl Shared {
                 .unwrap_or_else(|| Arc::new(crate::issue::time::now_epoch)),
             board_jwks: Mutex::new(crate::board_identity::JwksCache::default()),
             platform_custody: crate::platform::Custody::open(state_dir)?,
-            platform_custody_lock: Mutex::new(()),
+            platform_custody_lock: Box::leak(Box::new(Mutex::new(()))),
             crm_send_workers: Mutex::new(std::collections::HashSet::new()),
             crm_send_interval: Duration::from_millis(if opts.crm_send_interval_ms == 0 {
                 1000

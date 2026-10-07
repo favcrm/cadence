@@ -1,4 +1,6 @@
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -239,7 +241,7 @@ impl Shared {
         Ok(None)
     }
 
-    pub(super) fn connection_test(&self, params: &Value) -> Result<Value> {
+    pub(super) fn connection_test(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let id = connection_id(params)?;
         let expected_revision = expected_revision(params)?;
         let expected_digest = expected_registration_digest(params)?;
@@ -247,16 +249,73 @@ impl Shared {
         let deadline = crate::platform::OpDeadline::in_seconds(BUDGET.as_secs());
         let started_at = crate::issue::time::now_epoch();
 
-        let _custody = self
-            .platform_custody_lock
-            .try_lock()
-            .map_err(|_| Error::busy("connection test is busy"))?;
         if self.connection_test_fenced.load(Ordering::SeqCst) {
             return Err(Error::busy(
                 "connection test is fenced pending credential cleanup",
             ));
         }
 
+        // The guard is acquired and held by the worker thread for the
+        // whole operation: if a cleanup kill-path cannot observe the
+        // reap inside the budget, the SAME thread keeps holding the
+        // lock (with the owned Child) and polls `try_wait` until exit
+        // is observed — the guard never crosses a thread boundary
+        // (`MutexGuard` is `!Send`) and is never released early, so
+        // no queued custody user can interleave while the child is
+        // unobserved. The result (including the busy/fenced answer)
+        // is sent back over the channel as soon as the verdict is
+        // known; the worker only outlives the request while it still
+        // holds the serialization for cleanup.
+        let shared = Arc::clone(self);
+        let id = id.to_string();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let custody = match shared.platform_custody_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = result_tx.send(Err(Error::busy("connection test is busy")));
+                    return;
+                }
+            };
+            let mut pending = None;
+            let result = shared.connection_test_locked(
+                &id,
+                expected_revision,
+                expected_digest,
+                &deadline,
+                started_at,
+                &mut pending,
+            );
+            let _ = result_tx.send(result);
+            if let Some(mut child) = pending {
+                let _custody = custody;
+                loop {
+                    match child.try_wait() {
+                        // `WIFSTOPPED` is a trace/job-control stop,
+                        // not an exit — the child is still alive.
+                        Ok(Some(status)) if !libc::WIFSTOPPED(status.into_raw()) => break,
+                        Ok(Some(_)) | Ok(None) => {
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        result_rx
+            .recv()
+            .unwrap_or_else(|_| Err(Error::internal("connection test worker exited")))
+    }
+
+    fn connection_test_locked(
+        &self,
+        id: &str,
+        expected_revision: Option<u64>,
+        expected_digest: Option<String>,
+        deadline: &crate::platform::OpDeadline,
+        started_at: i64,
+        pending_child: &mut Option<std::process::Child>,
+    ) -> Result<Value> {
         let Some(identity) = self.resolve_identity(id)? else {
             return Err(Error::rejected("connection is unavailable or stale"));
         };
@@ -348,8 +407,9 @@ impl Shared {
                         account: &record.account,
                     },
                     MATERIAL_CAP,
-                    &deadline,
+                    deadline,
                     &self.connection_test_fenced,
+                    pending_child,
                 ) {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -408,7 +468,7 @@ impl Shared {
 
                 receipt.network_attempted = true;
                 let addresses =
-                    match self.resolve_login_host(&envelope.host, envelope.port, &deadline) {
+                    match self.resolve_login_host(&envelope.host, envelope.port, deadline) {
                         Ok(addresses) => addresses,
                         Err(failure) => {
                             return Ok(receipt
@@ -427,7 +487,7 @@ impl Shared {
                     &envelope,
                     &addresses,
                     self.smtp_test_ca.as_deref(),
-                    &deadline,
+                    deadline,
                 );
                 release_slot(&self.connection_test_resolver, &mut slot_owned);
                 match result {

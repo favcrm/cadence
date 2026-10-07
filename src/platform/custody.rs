@@ -19,7 +19,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -108,6 +108,7 @@ impl Custody {
         cap: usize,
         deadline: &super::OpDeadline,
         fenced: &std::sync::atomic::AtomicBool,
+        pending: &mut Option<std::process::Child>,
     ) -> Result<Vec<u8>> {
         match (tag, self) {
             (FILE_TAG, Custody::File(dir)) => file_load_bounded(dir, key, cap, deadline),
@@ -115,7 +116,7 @@ impl Custody {
                 "custody record names the file store but this daemon picked the keychain",
             )),
             (LIBSECRET_TAG, Custody::Libsecret(tool)) => {
-                libsecret_lookup_bounded(tool, key, cap, deadline, fenced)
+                libsecret_lookup_bounded(tool, key, cap, deadline, fenced, pending)
             }
             (LIBSECRET_TAG, _) => Err(Error::rejected(format!(
                 "credential for '{}/{}' lives in a keychain this host no longer offers",
@@ -350,9 +351,11 @@ fn libsecret_lookup_bounded(
     cap: usize,
     deadline: &super::OpDeadline,
     fenced: &std::sync::atomic::AtomicBool,
+    pending: &mut Option<Child>,
 ) -> Result<Vec<u8>> {
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::ExitStatusExt;
 
     let mut child = crate::reaper::spawn(
         std::process::Command::new(tool)
@@ -479,8 +482,15 @@ fn libsecret_lookup_bounded(
             let _ = child.kill();
             let reaped = 'reap: loop {
                 match child.try_wait() {
-                    Ok(Some(_)) => break 'reap true,
-                    Ok(None) => {
+                    // A real termination, not a ptrace/job-control
+                    // stop: `try_wait` can report a `WIFSTOPPED`
+                    // state — the raw status still marks the child
+                    // stopped (alive under the tracer), so that reap
+                    // is NOT observed.
+                    Ok(Some(status)) if !libc::WIFSTOPPED(status.into_raw()) => {
+                        break 'reap true;
+                    }
+                    Ok(Some(_)) | Ok(None) => {
                         let Some(left) = deadline.remaining() else {
                             break 'reap false;
                         };
@@ -491,7 +501,12 @@ fn libsecret_lookup_bounded(
             };
             if !reaped {
                 fenced.store(true, std::sync::atomic::Ordering::SeqCst);
-                std::mem::forget(child);
+                // Ownership is handed back to the caller, never
+                // released: the caller retains the Child (and the
+                // custody serialization) until a cleanup owner
+                // observes the exit, so an unobserved lookup cannot
+                // outlive its ownership.
+                *pending = Some(child);
             }
             return Err(error);
         }
@@ -510,6 +525,7 @@ fn libsecret_lookup_bounded(
     _cap: usize,
     _deadline: &super::OpDeadline,
     _fenced: &std::sync::atomic::AtomicBool,
+    _pending: &mut Option<Child>,
 ) -> Result<Vec<u8>> {
     Err(Error::internal("the bounded keychain lookup is unix-only"))
 }
