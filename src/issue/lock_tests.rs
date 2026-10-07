@@ -60,6 +60,29 @@ fn lock_helper() {
         std::fs::write(dir.join("issue.md"), "half a write\n").unwrap();
         git(&pm.dir, &["add", "--", "crashed/issue.md"]).unwrap();
     }
+    if role == "hold_rename" {
+        let dir = pm.dir.join("renamed");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("victim.txt"), "rename me\n").unwrap();
+        git(&pm.dir, &["add", "--", "renamed/victim.txt"]).unwrap();
+        git(
+            &pm.dir,
+            &[
+                "-c",
+                "user.name=cadence",
+                "-c",
+                "user.email=cadence@localhost",
+                "commit",
+                "-q",
+                "-m",
+                "rename victim",
+                "--",
+                "renamed/victim.txt",
+            ],
+        )
+        .unwrap();
+        git(&pm.dir, &["mv", "renamed/victim.txt", "renamed/moved.txt"]).unwrap();
+    }
     std::fs::write(std::env::var("CAD852_READY").unwrap(), "ready").unwrap();
     std::thread::sleep(Duration::from_secs(600));
 }
@@ -362,14 +385,14 @@ fn lock_state_tells_held_free_legacy_and_io_unknown_apart() {
     let (_tmp, pm) = tracker();
     assert_eq!(pm.lock_state(), LockState::Free);
     let held = pm.lock().unwrap();
-    assert_eq!(pm.lock_state(), LockState::Held);
+    assert!(matches!(pm.lock_state(), LockState::Held { .. }));
     drop(held);
     assert_eq!(pm.lock_state(), LockState::Free);
     std::fs::write(pm.dir.join(".write.lock"), "").unwrap();
-    assert_eq!(pm.lock_state(), LockState::LegacyUnknown);
+    assert!(matches!(pm.lock_state(), LockState::LegacyUnknown { .. }));
     // Forged "owner" content in a legacy file is still unknown.
     std::fs::write(pm.dir.join(".write.lock"), "pid 1 age 999999\n").unwrap();
-    assert_eq!(pm.lock_state(), LockState::LegacyUnknown);
+    assert!(matches!(pm.lock_state(), LockState::LegacyUnknown { .. }));
     std::fs::remove_file(pm.dir.join(".write.lock")).unwrap();
     std::fs::remove_file(pm.dir.join(".git/cadence-write.flock")).ok();
     std::os::unix::fs::symlink("/nonexistent", pm.dir.join(".git/cadence-write.flock")).unwrap();
@@ -663,7 +686,10 @@ fn a_fifo_or_symlink_at_the_fence_path_is_legacy_unknown_and_never_blocks() {
             std::os::unix::fs::symlink(tmp.path().join("t"), &legacy).unwrap();
         }
         let start = Instant::now();
-        assert_eq!(pm.lock_state(), LockState::LegacyUnknown, "{kind}");
+        assert!(
+            matches!(pm.lock_state(), LockState::LegacyUnknown { .. }),
+            "{kind}"
+        );
         assert!(pm.try_lock().unwrap().is_none(), "{kind}");
         assert!(start.elapsed() < Duration::from_secs(5), "{kind} hung");
         assert!(legacy.symlink_metadata().is_ok(), "{kind} was removed");
@@ -765,4 +791,465 @@ fn a_forked_child_does_not_keep_the_lock_after_the_guard_drops() {
     unsafe { libc::write(go[1], (&b as *const u8).cast(), 1) };
     assert!(spawner.join().unwrap().success());
     assert_eq!(pm.lock_state(), LockState::Free);
+}
+
+// ---- CAD-1167: holder diagnostics + path-scoped admission -----------
+
+/// A live holder's refusal names it: the holder pid appears whether it
+/// comes from the /proc scan or the marker trailer.
+#[test]
+fn a_live_holders_refusal_names_its_pid() {
+    let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold", false);
+    let pid = child.id().to_string();
+    let e = pm
+        .lock_for(Duration::from_millis(200))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        e.contains(&pid),
+        "a live holder's refusal names its pid: {e}"
+    );
+    // The `holder: pid N (comm)` shape is only produced by the live
+    // /proc scan: a trailer-only report would say "no live holder
+    // found" instead, so this proves the scan ran, not just the file.
+    // Off Linux the scan deliberately reports unavailable while the
+    // trailer still names the holder pid.
+    #[cfg(target_os = "linux")]
+    assert!(e.contains("holder: pid"), "no scan attribution: {e}");
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert!(e.contains("holder scan unavailable"), "{e}");
+        assert!(e.contains(&format!("pid={pid}")), "{e}");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let comm = std::fs::read_to_string("/proc/self/comm")
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            e.contains(&comm),
+            "a live holder's refusal names its command ({comm}): {e}"
+        );
+    }
+    sigkill(child);
+}
+
+/// Our own fence file carries a diagnostic trailer while held: the
+/// exact MARKER prefix plus well-formed key=value lines, ours included.
+#[test]
+fn a_held_fence_file_carries_a_parseable_trailer() {
+    let (_tmp, pm) = tracker();
+    let _held = pm.lock().unwrap();
+    let content = std::fs::read(pm.dir.join(".write.lock")).unwrap();
+    let marker = crate::issue::pmlock::MARKER;
+    assert!(
+        content.starts_with(marker.as_bytes()),
+        "fence file lost its marker"
+    );
+    let tail = std::str::from_utf8(&content[marker.len()..]).unwrap();
+    assert!(
+        tail.contains(&format!("pid={}\n", std::process::id())),
+        "trailer names no holder pid: {tail}"
+    );
+    assert!(
+        tail.contains("cmd="),
+        "trailer names no holder command: {tail}"
+    );
+    assert!(
+        tail.contains(&format!("version={}\n", env!("CARGO_PKG_VERSION"))),
+        "trailer names no build version: {tail}"
+    );
+}
+
+/// A legacy fence left beside a killed holder refuses as the
+/// non-retryable gate and says positively that nobody holds it — the
+/// CAD-999 production shape: a legacy file appears, its writer is
+/// dead, and the next write must diagnose, not wait.
+#[test]
+fn a_killed_holders_legacy_lock_states_no_live_holder() {
+    let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold", false);
+    std::fs::write(pm.dir.join(".write.lock"), "").unwrap();
+    sigkill(child);
+    let e = pm.lock_for(Duration::from_millis(100)).err().unwrap();
+    assert_eq!(e.code(), Some("legacy_write_lock"), "{e}");
+    let text = e.to_string();
+    #[cfg(target_os = "linux")]
+    assert!(text.contains("no live holder found"), "{text}");
+    #[cfg(not(target_os = "linux"))]
+    assert!(text.contains("holder scan unavailable"), "{text}");
+    std::fs::remove_file(pm.dir.join(".write.lock")).unwrap();
+}
+
+/// MARKER plus a malformed tail is a legacy lock of unknown owner:
+/// never reused, never removed. A well-formed trailer still admits.
+#[test]
+fn a_malformed_marker_tail_is_legacy_unknown() {
+    let marker = crate::issue::pmlock::MARKER;
+    for tail in [
+        "bogus\n",
+        "pid=1\npid=2\n",
+        "pid=abc\n",
+        "pid=\n",
+        "unexpected=1\n",
+        "==",
+    ] {
+        let (_tmp, pm) = tracker();
+        std::fs::write(pm.dir.join(".write.lock"), format!("{marker}{tail}")).unwrap();
+        assert!(
+            matches!(pm.lock_state(), LockState::LegacyUnknown { .. }),
+            "malformed tail admitted: {tail:?}"
+        );
+        assert!(
+            pm.try_lock().unwrap().is_none(),
+            "malformed tail admitted: {tail:?}"
+        );
+        assert!(
+            pm.dir.join(".write.lock").exists(),
+            "malformed tail removed: {tail:?}"
+        );
+    }
+    let (_tmp, pm) = tracker();
+    std::fs::write(
+        pm.dir.join(".write.lock"),
+        format!("{marker}pid=1\nhost=h\nversion=9.9\nstarted_at=1\ncmd=cadence\n"),
+    )
+    .unwrap();
+    assert!(
+        pm.try_lock().unwrap().is_some(),
+        "a well-formed trailer must not break reuse"
+    );
+}
+
+/// Path-scoped admission: after a crash that staged `crashed/issue.md`,
+/// a write scoped to an unrelated issue is admitted and commits, while
+/// an overlapping scoped write — and every unscoped one — is refused.
+#[test]
+fn a_disjoint_write_is_admitted_beside_an_interrupted_one() {
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    let other = pm.dir.join("cadence").join("CAD-1");
+    let head = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+    let (child, _) = spawn_writer(&pm, "hold_dirty", false);
+    sigkill(child);
+    // Unscoped: refused, as before.
+    let e = pm.try_lock().err().unwrap().to_string();
+    assert!(e.contains("interrupted"), "{e}");
+    // Scoped to the unrelated issue: admitted, and the commit lands.
+    let lock = pm
+        .lock_for_paths(std::slice::from_ref(&other))
+        .expect("a disjoint write must be admitted");
+    let file = other.join("issue.md");
+    let mut text = std::fs::read_to_string(&file).unwrap();
+    text.push_str("\nscoped write\n");
+    std::fs::write(&file, text).unwrap();
+    pm.commit_scoped(&lock, std::slice::from_ref(&file), "scoped test commit")
+        .unwrap();
+    // A commit through the same scoped lock that touches the crash's
+    // paths is refused before any staging: HEAD, index bytes and the
+    // crashed file itself are byte-identical afterwards.
+    let head_before = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+    let index_before = git(&pm.dir, &["diff", "--cached"]).unwrap();
+    let crashed = pm.dir.join("crashed").join("issue.md");
+    let file_before = std::fs::read(&crashed).unwrap();
+    let e = pm
+        .commit_scoped(&lock, std::slice::from_ref(&crashed), "overlap the crash")
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("overlaps"), "{e}");
+    assert!(e.contains("crashed/issue.md"), "{e}");
+    assert_eq!(
+        git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+        head_before,
+        "a refused commit moved HEAD"
+    );
+    assert_eq!(
+        git(&pm.dir, &["diff", "--cached"]).unwrap(),
+        index_before,
+        "a refused commit touched the index"
+    );
+    assert_eq!(
+        std::fs::read(&crashed).unwrap(),
+        file_before,
+        "a refused commit touched the crashed file"
+    );
+    drop(lock);
+    assert_ne!(git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(), head);
+    // The scoped admission must not consume the tripwire: the stale
+    // marker stays, and an unscoped write is still refused.
+    assert!(pm.dir.join(".write.lock").exists());
+    let e = pm.try_lock().err().unwrap().to_string();
+    assert!(e.contains("interrupted"), "tripwire consumed: {e}");
+    // The crash's own leftovers are untouched by that commit.
+    assert!(git(&pm.dir, &["diff", "--cached", "--name-only"])
+        .unwrap()
+        .contains("crashed/issue.md"));
+    // Scoped to the crash: refused, naming it.
+    let e = pm
+        .lock_for_paths(std::slice::from_ref(&pm.dir.join("crashed")))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("crashed/issue.md"), "{e}");
+}
+
+/// A commit outside the admitted set refuses even on a clean tracker:
+/// scoped admission is enforced at commit time, not just at acquire —
+/// and the refusal stages nothing.
+#[test]
+fn a_scoped_lock_refuses_a_commit_outside_its_paths() {
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    let a = pm.dir.join("cadence").join("CAD-1");
+    let lock = pm.lock_for_paths(std::slice::from_ref(&a)).unwrap();
+    let elsewhere = pm.dir.join("elsewhere.md");
+    std::fs::write(&elsewhere, "x\n").unwrap();
+    let e = pm
+        .commit_scoped(&lock, std::slice::from_ref(&elsewhere), "out of scope")
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("outside"), "{e}");
+    drop(lock);
+    assert!(
+        git(&pm.dir, &["status", "--porcelain"])
+            .unwrap()
+            .contains("elsewhere.md"),
+        "the refused commit must leave the file uncommitted"
+    );
+}
+
+/// Git-level markers still refuse every write, disjoint or not — and
+/// clearing the marker restores disjoint admission.
+#[test]
+fn a_merge_marker_refuses_even_disjoint_writes() {
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    let (child, _) = spawn_writer(&pm, "hold_dirty", false);
+    sigkill(child);
+    std::fs::write(pm.dir.join(".git").join("MERGE_HEAD"), "deadbeef\n").unwrap();
+    let other = pm.dir.join("cadence").join("CAD-1");
+    let e = pm
+        .lock_for_paths(std::slice::from_ref(&other))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("MERGE_HEAD"), "{e}");
+    std::fs::remove_file(pm.dir.join(".git").join("MERGE_HEAD")).unwrap();
+    // A stale index lock is the same class of global marker: it
+    // refuses disjoint writes until git itself clears it.
+    std::fs::write(pm.dir.join(".git").join("index.lock"), "").unwrap();
+    let e = pm
+        .lock_for_paths(std::slice::from_ref(&other))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("index.lock"), "{e}");
+    std::fs::remove_file(pm.dir.join(".git").join("index.lock")).unwrap();
+    assert!(
+        pm.lock_for_paths(std::slice::from_ref(&other)).is_ok(),
+        "disjoint writes resume once the global marker clears"
+    );
+}
+
+/// A tripped lease stops a scoped waiter too: the fence points are
+/// shared with the unscoped path, not reimplemented beside it.
+#[test]
+fn a_tripped_lease_stops_a_scoped_writer_waiting_for_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let mut pm = Pm::init(&dir.path().join("pm")).unwrap();
+    let ctl = crate::lease::acquire(
+        &state,
+        &crate::lease::Hosted {
+            lease: Some(format!("file:{}", dir.path().join("l").display())),
+            lease_ttl_secs: Some(30),
+            lease_renew_secs: Some(5),
+            flush_timeout_secs: None,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    pm.attach_lease(ctl.pm_lease());
+    let held = pm.lock().unwrap();
+    let start = Instant::now();
+    let scope = pm.dir.clone();
+    let e = std::thread::scope(|s| {
+        let w = s.spawn(|| {
+            pm.lock_for_paths(std::slice::from_ref(&scope))
+                .err()
+                .map(|e| e.to_string())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        ctl.fence().trip("lease lost while waiting");
+        w.join().unwrap()
+    });
+    drop(held);
+    let e = e.expect("a revoked scoped waiter must not be admitted");
+    assert!(e.contains("lease"), "{e}");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "waited out the lock"
+    );
+}
+
+/// A `..` component is refused as a caller bug in both admission and
+/// commit: git would resolve `dir/../../x` to `x`, letting a scoped
+/// write pass the checks as one path and commit another.
+#[test]
+fn dotdot_paths_are_refused_as_caller_bugs() {
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    let evil: PathBuf = pm.dir.join("cadence").join("..").join("elsewhere.md");
+    let e = pm
+        .lock_for_paths(std::slice::from_ref(&evil))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("escapes"), "{e}");
+    let lock = pm.lock().unwrap();
+    let e = pm
+        .commit_scoped(&lock, std::slice::from_ref(&evil), "escape")
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("escapes"), "{e}");
+}
+
+/// The tracker root is the whole tracker: it admits and commits
+/// ordinary files on a clean tree, and overlaps every leftover
+/// beside a crash — never silently disjoint.
+#[test]
+fn tracker_root_scope_covers_the_whole_tracker() {
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    let file = pm.dir.join("cadence").join("CAD-1").join("issue.md");
+    let lock = pm.lock_for_paths(std::slice::from_ref(&pm.dir)).unwrap();
+    let mut text = std::fs::read_to_string(&file).unwrap();
+    text.push_str("\nroot scoped\n");
+    std::fs::write(&file, text).unwrap();
+    pm.commit_scoped(&lock, std::slice::from_ref(&file), "root scoped commit")
+        .unwrap();
+    drop(lock);
+    let (child, _) = spawn_writer(&pm, "hold_dirty", false);
+    sigkill(child);
+    let e = pm
+        .lock_for_paths(std::slice::from_ref(&pm.dir))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("interrupted"), "root wrongly disjoint: {e}");
+}
+
+/// Guard against API misuse: every write.rs function that takes a
+/// scoped lock must commit only through the scoped wrappers. Plain
+/// commit never checks scope, so an unscoped call beside
+/// `lock_for_paths` would silently write outside the admitted set.
+/// This test reads the source it guards and fails the build on drift.
+#[test]
+fn write_rs_pairs_scoped_locks_with_scoped_commits() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/issue/write.rs"),
+    )
+    .unwrap();
+    let lines: Vec<&str> = src.lines().collect();
+    let mut bounds = vec![0usize];
+    for (i, l) in lines.iter().enumerate() {
+        if l.starts_with("pub fn ") || l.starts_with("pub(crate) fn ") || l.starts_with("fn ") {
+            bounds.push(i);
+        }
+    }
+    bounds.push(lines.len());
+    let mut bad = Vec::new();
+    for w in bounds.windows(2) {
+        let body = lines[w[0]..w[1]].join("\n");
+        if !body.contains("lock_for_paths") {
+            continue;
+        }
+        for pat in ["commit(", "commit_who(", "commit_staged("] {
+            let mut search = body.as_str();
+            while let Some(pos) = search.find(pat) {
+                // `fn commit...(` definitions are the wrappers themselves.
+                if search[..pos].ends_with("fn ") {
+                    search = &search[pos + pat.len()..];
+                    continue;
+                }
+                bad.push(format!(
+                    "{}: unscoped {pat} beside lock_for_paths",
+                    lines[w[0]]
+                ));
+                break;
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "scoped locks must pair with scoped commits:\n{}",
+        bad.join("\n")
+    );
+}
+
+/// A staged rename blocks BOTH ends: the destination is classified,
+/// and so is the source the crashed writer deleted. A scoped write to
+/// either is refused; an unrelated path is still admitted.
+#[test]
+fn a_staged_rename_blocks_both_ends() {
+    let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold_rename", false);
+    sigkill(child);
+    for end in ["renamed/victim.txt", "renamed/moved.txt"] {
+        let e = pm
+            .lock_for_paths(std::slice::from_ref(&pm.dir.join(end)))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains(end), "rename end not blocked ({end}): {e}");
+    }
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    let other = pm.dir.join("cadence").join("CAD-1");
+    assert!(
+        pm.lock_for_paths(std::slice::from_ref(&other)).is_ok(),
+        "an unrelated path must stay admitted beside a staged rename"
+    );
+}
+
+/// Git pathspec syntax is refused as a caller bug in both admission
+/// and commit: git would expand the pattern beyond the literal string
+/// the scope checked.
+#[test]
+fn pathspec_syntax_is_refused_as_caller_bug() {
+    let (_tmp, pm) = tracker();
+    mk(&pm, pm.dir.parent().unwrap(), "first");
+    for evil in [
+        "cadence/*.md",
+        "cadence/CAD-?/issue.md",
+        "cadence/[C]AD-1/issue.md",
+        ":(top)cadence",
+        ":!cadence/CAD-1/issue.md",
+        "back\\slash.md",
+    ] {
+        let p = pm.dir.join(evil);
+        let e = pm
+            .lock_for_paths(std::slice::from_ref(&p))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("pathspec"), "{evil}: {e}");
+    }
+    let lock = pm.lock().unwrap();
+    let e = pm
+        .commit_scoped(
+            &lock,
+            std::slice::from_ref(&pm.dir.join("cadence/*.md")),
+            "expand",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("pathspec"), "{e}");
 }

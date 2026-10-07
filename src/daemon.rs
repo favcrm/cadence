@@ -34,6 +34,7 @@ mod approvals_rpc;
 mod area_rpc;
 mod caller_rule;
 mod checkup;
+mod connection_test;
 mod connections_rpc;
 #[cfg(all(test, feature = "test-seam"))]
 mod conversations_acceptance;
@@ -488,6 +489,8 @@ pub struct Shared {
     /// `test-seam`: parks the send worker between recipient rows.
     #[cfg(feature = "test-seam")]
     crm_send_row_gate: Option<Arc<crate::test_seam::SendRowGate>>,
+    connection_test_resolver: Arc<AtomicBool>,
+    connection_test_fenced: AtomicBool,
     /// CAD-506: the registered platform adapters the effect gate drives
     /// (`platform` name → adapter). A platform with none fails closed —
     /// no reviewed table means no classification, so no call.
@@ -742,6 +745,8 @@ impl Shared {
             unsubscribe_origin: opts.unsubscribe_origin.clone(),
             #[cfg(feature = "test-seam")]
             crm_send_row_gate: opts.crm_send_row_gate.clone(),
+            connection_test_resolver: Arc::new(AtomicBool::new(false)),
+            connection_test_fenced: AtomicBool::new(false),
             platforms: opts.platforms.clone(),
             effect_execute_gate: opts.effect_execute_gate.clone(),
             social_publish_sender: opts.social_publish_sender.clone(),
@@ -3395,6 +3400,7 @@ impl Shared {
             "connection_create" => self.rpc_connection(method, params, peer_pid),
             "connection_rotate" => self.rpc_connection(method, params, peer_pid),
             "connection_revoke" => self.rpc_connection(method, params, peer_pid),
+            "connection_test" => self.rpc_connection(method, params, peer_pid),
             "crm_smtp_bind" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_rebind" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_revoke" => self.rpc_crm_smtp(method, params, peer_pid),

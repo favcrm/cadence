@@ -462,12 +462,30 @@ impl Shared {
         match issue::reclaim::run(pm, &self.state_dir, "daemon") {
             Ok(out) => {
                 let reclaimed = out["reclaimed"].as_array().map(Vec::len).unwrap_or(0);
+                let skipped = out["skipped"].as_array().map(Vec::len).unwrap_or(0);
                 if reclaimed > 0 {
                     tracing::info!(
                         event = "reclaim",
                         swept = out["swept"].as_u64().unwrap_or(0),
                         reclaimed
                     );
+                }
+                if skipped > 0 {
+                    let reasons: Vec<String> = out["skipped"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .take(20)
+                        .map(|row| {
+                            format!(
+                                "{} {}: {}",
+                                row["issue"].as_str().unwrap_or("?"),
+                                row["lane"].as_str().unwrap_or("?"),
+                                row["reason"].as_str().unwrap_or("unknown refusal")
+                            )
+                        })
+                        .collect();
+                    tracing::warn!(event = "reclaim_refused", skipped, reasons = ?reasons);
                 }
             }
             Err(e) => tracing::warn!(event = "reclaim_failed", error = e.to_string()),

@@ -92,6 +92,26 @@ use crate::store::{Grant, Store};
 
 pub use custody::{Custody, Key};
 
+pub struct OpDeadline {
+    end: std::time::Instant,
+}
+
+impl OpDeadline {
+    pub fn in_seconds(seconds: u64) -> Self {
+        Self {
+            end: std::time::Instant::now() + std::time::Duration::from_secs(seconds),
+        }
+    }
+
+    pub fn remaining(&self) -> Option<std::time::Duration> {
+        self.end.checked_duration_since(std::time::Instant::now())
+    }
+
+    pub fn expired(&self) -> bool {
+        self.remaining().is_none()
+    }
+}
+
 /// The built-in account the `local` platform always exposes — no
 /// enrollment, no custody, no `--accept-same-uid-risk` (CAD-577). The
 /// local outbox is always available, so a fresh app install is runnable

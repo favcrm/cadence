@@ -9,14 +9,73 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::{
-    blocked, board, claim, doctor, finish, groom, history, hooks, lint, model, project, reconcile,
-    retro, sprint, start, sync, work, write, Pm,
+    blocked, board, claim, doctor, finish, groom, history, hooks, lint, model, project, reclaim,
+    reconcile, retro, sprint, start, sync, work, write, Pm,
 };
 
 mod epic;
 mod milestone;
 pub use epic::{run_epic, EpicAction};
 pub use milestone::{run_milestone, MilestoneAction};
+
+#[derive(Subcommand)]
+pub enum CheckoutAction {
+    /// Read-only, structured inventory for one repository.
+    Inventory {
+        #[arg(long)]
+        repo: PathBuf,
+    },
+    /// Explicitly adopt a pre-existing linked checkout; no cleanup is run.
+    Adopt {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, value_parser = ["development", "review", "validation", "agent", "staging"])]
+        purpose: String,
+        #[arg(long)]
+        tool: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        pinned_sha: String,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long = "release-artifact")]
+        release_artifacts: Vec<String>,
+        #[arg(long = "rollback-artifact")]
+        rollback_artifacts: Vec<String>,
+    },
+    /// Explicitly release or resolve an interrupted release without deleting checkout data.
+    Release {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Explicitly resume a released checkout at its exact current HEAD.
+    Resume {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        pinned_sha: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Explicitly retain an active checkout for investigation.
+    Retain {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        reason: String,
+    },
+}
 
 #[derive(Subcommand)]
 pub enum IssueAction {
@@ -206,6 +265,11 @@ pub enum IssueAction {
     /// agents and hooks append it to code commits without guessing
     /// the format. Refuses an id that does not exist.
     Trailer { id: String },
+    /// Inspect and explicitly manage checkout ownership/release records.
+    Checkout {
+        #[command(subcommand)]
+        action: CheckoutAction,
+    },
     /// Start work on an issue: mint `.cadence/wt/<id>-<slug>` on
     /// `cadence/<id>-<slug>` in the project repo, record both refs,
     /// move backlog|ready to doing, print the commit trailer. `--job`
@@ -219,8 +283,8 @@ pub enum IssueAction {
         /// Worktree slug — default: the slugified title (≤32 chars).
         #[arg(long)]
         name: Option<String>,
-        /// Base ref — else the repo's origin/HEAD, else its current
-        /// branch. No fetch.
+        /// Base ref — else refresh and use the repo's origin/HEAD;
+        /// repositories without a remote default use the current branch.
         #[arg(long)]
         base: Option<String>,
         /// Owner to record when the issue has none — default: the
@@ -302,12 +366,26 @@ pub enum IssueAction {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Plan or explicitly run the scheduled safe cleanup policy. Without
+    /// --apply this is a read-only inventory; --apply revalidates before every
+    /// existing target-cache reclaim and merged checkout finish.
+    Reclaim {
+        #[arg(long)]
+        apply: bool,
+        /// Override the configured idle window for lane target caches.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        idle_secs: Option<u64>,
+    },
     /// Finish an issue's worktree: refuse while the worktree is in use
     /// (a live message recorded against it, a pane tree or any process
-    /// with cwd inside it, any file modified in the last 30 minutes),
+    /// with cwd/open FD inside it, any file modified in the last 30 minutes),
     /// while the worktree is dirty, while the branch has not started
     /// (no commits beyond where it was cut) or while it is neither
-    /// merged nor pushed — `--force` overrides each (recorded). Then `git worktree remove`, delete the branch
+    /// merged nor pushed — `--force` records ordinary overrides, never failed
+    /// safety enumeration. Before deletion, require issue-bound declared-repo
+    /// ownership and an exact registered worktree; present lifecycle metadata
+    /// must match. `--force` cannot bypass these checks.
+    /// Then `git worktree remove`, delete the branch
     /// (`--keep-branch` keeps it, `--remote` deletes the remote one
     /// too) and mark both refs `closed: true` in one commit. The
     /// issue's status is untouched. `--merged` instead sweeps every
@@ -317,13 +395,14 @@ pub enum IssueAction {
         /// Issue id — required unless --merged.
         id: Option<String>,
         /// Finish exactly this worktree ref — required when the issue
-        /// has several open. A directory already gone only closes its
-        /// worktree/branch refs (one tracker commit); no git state is
-        /// touched and the branch, if any, is kept.
+        /// has several open. A directory already gone closes only the
+        /// worktree ref unless its branch is also missing; no git state is
+        /// touched and a surviving branch ref remains open.
         #[arg(long, conflicts_with = "merged")]
         worktree: Option<PathBuf>,
-        /// Override the in-use, dirty, not-started and unmerged refusals —
-        /// recorded on the finish commit and in the output. A branch
+        /// Override ordinary in-use, dirty, not-started and unmerged refusals —
+        /// recorded on the finish commit and in the output. Failed process,
+        /// daemon-binding, dirty-tree and activity probes are never forceable. A branch
         /// whose tip no merge/push evidence covers is still kept, and
         /// a probe made stale mid-finish refuses with "retry" — force
         /// never retargets a stale probe or deletes uncovered work.
@@ -795,6 +874,73 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 Ok(0)
             }
         },
+        IssueAction::Checkout { action } => match action {
+            CheckoutAction::Inventory { repo } => {
+                let pm = open_pm()?;
+                let mut out = crate::worktree::lifecycle::inventory(repo)?;
+                out["cleanup_plan"] =
+                    reclaim::plan_for_repo(&pm, state_dir, reclaim::idle_secs(&pm.dir), repo)?;
+                print_json(&out);
+                Ok(0)
+            }
+            CheckoutAction::Adopt {
+                repo,
+                path,
+                purpose,
+                tool,
+                owner,
+                pinned_sha,
+                branch,
+                release_artifacts,
+                rollback_artifacts,
+            } => {
+                let mut record = crate::worktree::lifecycle::new_record(
+                    crate::worktree::lifecycle::CheckoutSpec {
+                        repo,
+                        purpose,
+                        tool,
+                        owner,
+                        path,
+                        branch: branch.as_deref(),
+                        pinned_sha,
+                        issue: None,
+                    },
+                );
+                record.release_artifacts = release_artifacts.clone();
+                record.rollback_artifacts = rollback_artifacts.clone();
+                crate::worktree::lifecycle::adopt(repo, record)?;
+                print_json(
+                    &json!({"adopted": true, "repo": repo, "path": path, "purpose": purpose,
+                    "owner": owner, "pinned_sha": pinned_sha, "deletion": "not-performed"}),
+                );
+                Ok(0)
+            }
+            CheckoutAction::Release { repo, path, reason } => {
+                crate::worktree::lifecycle::release(repo, path, reason)?;
+                print_json(&json!({"path": path, "state": "released", "reason": reason,
+                    "deletion": "not-performed"}));
+                Ok(0)
+            }
+            CheckoutAction::Resume {
+                repo,
+                path,
+                pinned_sha,
+                reason,
+            } => {
+                crate::worktree::lifecycle::resume(repo, path, pinned_sha, reason)?;
+                print_json(
+                    &json!({"path": path, "state": "active", "pinned_sha": pinned_sha,
+                    "reason": reason, "deletion": "not-performed"}),
+                );
+                Ok(0)
+            }
+            CheckoutAction::Retain { repo, path, reason } => {
+                crate::worktree::lifecycle::transition(repo, path, "retained", Some(reason))?;
+                print_json(&json!({"path": path, "state": "retained", "reason": reason,
+                    "deletion": "not-performed"}));
+                Ok(0)
+            }
+        },
         IssueAction::New {
             title,
             project,
@@ -1233,6 +1379,17 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 note.as_deref(),
                 "",
             )?);
+            Ok(0)
+        }
+        IssueAction::Reclaim { apply, idle_secs } => {
+            let pm = open_pm()?;
+            let idle = idle_secs.unwrap_or_else(|| reclaim::idle_secs(&pm.dir));
+            let out = if *apply {
+                reclaim::run_with_idle(&pm, state_dir, "", idle)?
+            } else {
+                reclaim::plan(&pm, state_dir, idle)?
+            };
+            print_json(&out);
             Ok(0)
         }
         IssueAction::Finish {
