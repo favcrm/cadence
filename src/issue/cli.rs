@@ -465,6 +465,13 @@ pub enum IssueAction {
         /// owner/component/tags, `tags=a,b` replaces the tag list.
         #[arg(required = true)]
         args: Vec<String>,
+        /// Only write when every id's `rev` (the `fnv1a:…` hash `issue
+        /// show`/`ls --json` reports) still equals this token —
+        /// optimistic concurrency against a write that landed since
+        /// the read. A mismatch answers a `conflict` payload and
+        /// changes nothing.
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<String>,
         /// Override the `status=done` evidence gate (CAD-756) — the
         /// reason is recorded on the commit, never silent.
         #[arg(long, value_name = "REASON")]
@@ -1512,7 +1519,11 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             print_json(&write::set_acceptance(&pm, id, from, "")?);
             Ok(0)
         }
-        IssueAction::Set { args, force } => {
+        IssueAction::Set {
+            args,
+            if_rev,
+            force,
+        } => {
             // Ids never contain `=`, pairs always do.
             let split = args
                 .iter()
@@ -1526,8 +1537,15 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 )));
             }
             let pm = open_pm()?;
-            let out = write::set_fields(&pm, ids, pairs, "", force.as_deref())?;
+            let out =
+                write::set_fields_if_rev(&pm, ids, pairs, "", force.as_deref(), if_rev.as_deref())?;
             print_json(&out);
+            // A checked conflict is "not written", not a failure — but
+            // the caller needs a nonzero exit to branch on, the same
+            // `conflict` code the daemon write API uses.
+            if out.get("conflict").is_some() {
+                return Ok(5);
+            }
             // The post-merge reminder: a done issue with an open
             // worktree ref still holds the tree — finish it (or sweep
             // every merged one with `issue finish --merged`).

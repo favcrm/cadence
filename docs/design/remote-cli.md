@@ -116,9 +116,22 @@ login. Two consequences:
 
 Reads: `issue ls`, `issue show`, `issue history`, `agent list`,
 `agent show`, `message read`, `message inbox`, `team list`, `status`.
-Writes: `issue new`, `issue comment`, `issue set` (fields only), and
-`message send` (to a named alias — lands as the cli actor's derived handle,
-never "operator").
+Writes shipped by CAD-1179: `issue new`, `issue comment`, `issue set`
+(frontmatter fields only — status/priority/owner/component/title/tags/
+type/milestone/size; body edits are not part of the field vocabulary).
+`message send` (to a named alias — lands as the cli actor's derived
+handle, never "operator") stays in the server verb table but has no
+client mapping in this build — the milestone sends the three `issue_*`
+write verbs only.
+
+Client-side refusals (CAD-1179 — refused before any bytes leave the
+process): `issue new` without `--project`, or with `--id`/`--status`;
+`issue comment` with `--author`/`--kind` (authorship is the envelope
+actor); `issue set` without a nonempty `--if-rev`, with `--force` (the hosted
+route accepts no force field), or naming more than
+one ticket (revisions are per-ticket — the hosted route checks it under
+the tracker lock via `set_fields_if_rev`, and a stale token answers the
+conflict payload rather than writing).
 
 Refused remotely (default-deny): every operator-only daemon verb
 (`agent join/stop/resume`, `daemon *`, `operator_*`, `rollout`, `master/*`,
