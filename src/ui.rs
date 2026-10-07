@@ -658,6 +658,12 @@ fn try_load_opts(state_dir: &Path, strict: bool) -> Result<UiOpts> {
             return Ok(UiOpts::default());
         }
     };
+    if strict && !value.is_object() {
+        return Err(Error::rejected(format!(
+            "{} must contain a UI options object — cannot establish tailnet share ownership; the document is kept",
+            opts_file(state_dir).display()
+        )));
+    }
     let tailscale = match value.get("tailscale") {
         None | Some(Value::Null) => None,
         Some(v) => match serde_json::from_value::<TailscaleOpts>(v.clone()) {
@@ -676,9 +682,9 @@ fn try_load_opts(state_dir: &Path, strict: bool) -> Result<UiOpts> {
     };
     let mut opts: UiOpts = match serde_json::from_value(value) {
         Ok(opts) => opts,
-        Err(e) if strict && tailscale.is_some() => {
+        Err(e) if strict => {
             return Err(Error::rejected(format!(
-                "{} has unreadable UI options alongside a tailnet share — fix or delete it by hand; the record is kept so its live mapping cannot be orphaned: {e}",
+                "{} has unreadable UI options — cannot establish tailnet share ownership; fix it by hand; the document is kept: {e}",
                 opts_file(state_dir).display()
             )));
         }
@@ -695,6 +701,12 @@ fn try_load_opts(state_dir: &Path, strict: bool) -> Result<UiOpts> {
 
 fn load_opts_strict(state_dir: &Path) -> Result<UiOpts> {
     try_load_opts(state_dir, true)
+}
+
+/// A mutation may infer absence of sharing only from a valid options
+/// document (or a missing file), never from lenient display defaults.
+pub(crate) fn has_persisted_share(state_dir: &Path) -> Result<bool> {
+    Ok(load_opts_strict(state_dir)?.tailscale.is_some())
 }
 
 pub(crate) fn save_opts(state_dir: &Path, opts: &UiOpts) -> Result<()> {

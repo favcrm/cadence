@@ -1337,38 +1337,60 @@ fn stop_refuses_forged_or_production_target_before_api_mutation() {
 
 #[test]
 fn reset_refuses_known_ui_options_decode_failure_without_mutation() {
-    let fixture = Fixture::new("reset-malformed-known-option");
-    let base = fixture._root.path().join("sandboxes");
-    let root = base.join("malformed");
-    let state = root.join("state");
-    fs::create_dir_all(&state).unwrap();
-    fs::write(
-        root.join(".cadence-sandbox"),
-        r#"{"name":"malformed","allow_global":true}"#,
-    )
-    .unwrap();
-    let record = format!(
-        "{{\n  \"dist\": false,\n  \"port\": {PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{TARGET}\"\n  }}\n}}\n"
-    );
-    fs::write(state.join("ui.json"), &record).unwrap();
-    let config = mapping(SHARE_PORT, TARGET);
-    fixture.api.seed(config.clone());
-    let out = fixture.cli(&["sandbox", "reset", "malformed"]);
-    let root_exists = root.is_dir();
-    let after = fs::read(state.join("ui.json")).unwrap_or_default();
-    let after_config = fixture.api.config();
-    let requests = fixture.api.requests();
+    let cases = [
+        (
+            "reset-malformed-known-option-with-share",
+            format!(
+                "{{\n  \"dist\": false,\n  \"port\": {PORT},\n  \"tailscale\": {{\n    \"dns_name\": \"acceptance.example.ts.net\",\n    \"https_port\": {SHARE_PORT},\n    \"target\": \"{TARGET}\"\n  }}\n}}\n"
+            )
+            .into_bytes(),
+        ),
+        ("reset-array-root", b"[]\n".to_vec()),
+        ("reset-null-root", b"null\n".to_vec()),
+        ("reset-scalar-root", b"17\n".to_vec()),
+        (
+            "reset-malformed-options-without-share",
+            format!("{{\n  \"dist\": false,\n  \"port\": {PORT}\n}}\n").into_bytes(),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, record) in cases {
+        let fixture = Fixture::new(label);
+        let base = fixture._root.path().join("sandboxes");
+        let root = base.join(label);
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            root.join(".cadence-sandbox"),
+            format!(r#"{{"name":"{label}","allow_global":true}}"#),
+        )
+        .unwrap();
+        fs::write(state.join("ui.json"), &record).unwrap();
+        let config = mapping(SHARE_PORT, TARGET);
+        fixture.api.seed(config.clone());
+        let out = fixture.cli(&["sandbox", "reset", label]);
+        let root_exists = root.is_dir();
+        let after = fs::read(state.join("ui.json")).unwrap_or_default();
+        let after_config = fixture.api.config();
+        let requests = fixture.api.requests();
+        if out.status.success()
+            || !root_exists
+            || after != record
+            || after_config != config
+            || requests.iter().any(|(m, _, _)| m == "POST")
+        {
+            failures.push(format!(
+                "{label}: status={} output={} root_exists={root_exists} record_unchanged={} api_unchanged={} requests={requests:?}",
+                out.status,
+                output_text(&out),
+                after == record,
+                after_config == config,
+            ));
+        }
+    }
     assert!(
-        !out.status.success()
-            && root_exists
-            && after == record.as_bytes()
-            && after_config == config
-            && requests.iter().all(|(m, _, _)| m != "POST"),
-        "malformed reset case failed: status={} output={} root_exists={root_exists} record_unchanged={} api_unchanged={} requests={requests:?}",
-        out.status,
-        output_text(&out),
-        after == record.as_bytes(),
-        after_config == config,
+        failures.is_empty(),
+        "malformed reset ownership cases failed: {failures:#?}"
     );
 }
 

@@ -761,27 +761,9 @@ fn up_lock(sb: &Sandbox) -> Result<std::fs::File> {
 /// ungranted `up` would refuse it at `ui start`, after the daemon is
 /// already running and the marker revoked.
 fn persisted_share(sb: &Sandbox) -> Result<bool> {
-    let path = sb.state_dir().join("ui.json");
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => {
-            return Err(Error::rejected(format!(
-                "cannot read {}: {e}",
-                path.display()
-            )))
-        }
-    };
-    // Only the `tailscale` key is read — unrelated invalid settings
-    // must not block `up`/`reset`, the recovery path for exactly such
-    // a file.
-    let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
-        Error::rejected(format!(
-            "{} is not valid JSON — fix or delete it by hand: {e}",
-            path.display()
-        ))
-    })?;
-    Ok(value.get("tailscale").is_some_and(|v| !v.is_null()))
+    // Share absence is a mutation prerequisite, not a lenient status
+    // lookup: malformed roots or options must preserve the sandbox.
+    crate::ui::has_persisted_share(&sb.state_dir())
 }
 
 fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
