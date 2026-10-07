@@ -4,8 +4,9 @@ export {};
  * against a stateful fake host: operators edit supported blocks
  * directly on the visual email (plain-text only, never user HTML),
  * reorder/delete blocks with inline menus and undo, collapse the
- * optional preheader without losing its value, paste raw HTML, and
- * save through `app_content_save` with exactly one body kind, pinned
+ * optional preheader without losing its value, edit Visual/HTML with
+ * an Advanced plain-text override, paste raw HTML, and save through
+ * `app_content_save` with exactly one body kind, pinned
  * to the revision the edits began on; a CAS conflict keeps the local
  * edits; read-only viewers get no editor; the host footer is never
  * editable.
@@ -92,6 +93,8 @@ async function mount(readOnly: boolean, htmlDoc: boolean, preheader: string) {
   };
   const saves: any[] = [];
   const renders: number[] = [];
+  let deferNextSaveResponse = false;
+  let releaseDeferredSave: (() => void) | null = null;
   const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
@@ -133,7 +136,14 @@ async function mount(readOnly: boolean, htmlDoc: boolean, preheader: string) {
       doc.text_override = body.text ?? null;
       doc.content_digest = `content-digest-${doc.revision}`;
       doc.approval = { revision: null, digest: null, valid: false, scope: "content-only" };
-      return json({ content: doc });
+      const response = json({ content: doc });
+      if (deferNextSaveResponse) {
+        deferNextSaveResponse = false;
+        return new Promise<Response>((resolve) => {
+          releaseDeferredSave = () => resolve(response);
+        });
+      }
+      return response;
     }
     if (method === "POST" && url.pathname.endsWith("/render")) {
       renders.push(doc.revision);
@@ -214,19 +224,31 @@ async function mount(readOnly: boolean, htmlDoc: boolean, preheader: string) {
   });
   await settle(() => assert(q('[data-tab="email"]'), "the tabbed detail renders"));
   await click(q('[data-tab="email"]'));
-  await settle(() => assert(q('iframe[data-preview="visual"]'), "the Email tab renders the host preview"));
+  await settle(() => assert(q('iframe[data-preview="visual"], iframe[data-preview="visual-draft-html"]'), "the Email tab renders the host preview"));
   const finish = async () => {
     await React.act(async () => { root.unmount(); });
     globalThis.fetch = realFetch;
     loader.prototype.require = originalRequire;
     host.remove();
   };
-  return { React, doc, saves, renders, settle, click, type, typeVisual, q, byText, visualOrder, bar, barButton, text, flush, finish, host };
+  return {
+    React, doc, saves, renders, settle, click, type, typeVisual, q, byText, visualOrder,
+    bar, barButton, text, flush, finish, host,
+    deferNextSave: () => { deferNextSaveResponse = true; },
+    saveResponsePending: () => releaseDeferredSave !== null,
+    releaseSaveResponse: () => {
+      const release = releaseDeferredSave;
+      assert(release, "a deferred save response is pending");
+      releaseDeferredSave = null;
+      release();
+    },
+  };
 }
 
 async function operator(kind: "blocks" | "html") {
   const t = await mount(false, kind === "html", kind === "html" ? "" : "We are glad you are here");
-  const { doc, saves, renders, settle, click, type, typeVisual, q, byText, visualOrder, bar, barButton, text } = t;
+  const { doc, saves, renders, settle, click, type, typeVisual, q, byText, visualOrder, bar, barButton, text,
+    deferNextSave, saveResponsePending, releaseSaveResponse } = t;
   const bodyKinds = () => saves.map((s) => [("blocks" in s), ("html" in s)]);
 
   // The host footer is locked: shown, never an input.
@@ -291,7 +313,8 @@ async function operator(kind: "blocks" | "html") {
     await click(byText(t.host, "button", "HTML"));
     const source = q("#cmp-html-source") as HTMLTextAreaElement;
     assert(source && source.classList.contains("srcedit"), "HTML mode is a source editor");
-    assert((q("[data-html-note]")?.textContent ?? "").includes("sanitises") && (q("[data-html-note]")?.textContent ?? "").includes("footer"), "HTML mode says the host sanitises and adds the footer");
+    const htmlNote = q("[data-html-note]")?.textContent ?? "";
+    assert(/sanitiz/i.test(htmlNote) && htmlNote.toLowerCase().includes("footer"), "HTML mode explains host sanitization and the protected footer");
     await type(source, "<p>Pasted <b>body</b></p><script>x()</script>");
     await settle(() => assert(bar(), "pasting raises the bar"));
     await click(barButton("Save as v4"));
@@ -304,20 +327,43 @@ async function operator(kind: "blocks" | "html") {
     await click(byText(t.host, "button", "Visual"));
     assert(q('[data-state="html-body"]') && !q("[data-visual-text]"), "an HTML body is not editable as blocks");
 
-    // Text override: generated by default, Write my own enables it.
-    await click(byText(t.host, "button", "Text"));
+    // Text override remains available only in Advanced while HTML is the
+    // active editing mode; the editing-mode selector remains Visual | HTML.
+    await click(byText(t.host, "button", "HTML"));
+    equal(Array.from(t.host.querySelectorAll('[aria-label="Email editing mode"] button')).map((b) => b.textContent?.trim()), ["Visual", "HTML"], "text override does not add a third editing mode");
+    const htmlAdvanced = Array.from(t.host.querySelectorAll('section[aria-label="Email preview"] details'))
+      .find((details) => (details.querySelector("summary")?.textContent ?? "").trim() === "Advanced: plain-text version");
+    assert(htmlAdvanced && !(htmlAdvanced as HTMLDetailsElement).open, "HTML text override controls start inside a closed Advanced disclosure");
+    await click(htmlAdvanced.querySelector("summary"));
+    const ownTextLabel = () => Array.from(htmlAdvanced.querySelectorAll("label")).find((label) => (label.textContent ?? "").includes("Write my own")) ?? null;
+    assert(ownTextLabel(), "Advanced keeps the Write my own control");
+    const ownTextToggle = () => ownTextLabel()?.querySelector("#cmp-own-text") as HTMLInputElement | null;
+    assert(ownTextToggle() && !ownTextToggle()!.checked, "generated host text remains the default");
     assert(!q("#cmp-text-override"), "no override textarea until Write my own is ticked");
-    assert((q('pre[data-preview="text"]')?.textContent ?? "").includes("GENERATED"), "the generated text is the default");
-    await click(Array.from(t.host.querySelectorAll("label")).find((l) => (l.textContent ?? "").includes("Write my own"))!.querySelector("input"));
-    await type(q("#cmp-text-override"), "My own plain text");
+    const generatedPreview = q('[data-preview="plain-text"]');
+    assert((generatedPreview?.textContent ?? "").includes("GENERATED"), "generated text is displayed by default in Advanced");
+    assert((generatedPreview?.textContent ?? "").includes("Saved host-generated plain text (v4)"), "the generated render is attributed to the saved revision");
+    await click(ownTextToggle());
+    const customText = q("#cmp-text-override") as HTMLTextAreaElement;
+    assert(customText && customText.value.includes("GENERATED"), "enabling Write my own seeds the current saved host-rendered text");
+    await type(customText, "My own plain text");
+    deferNextSave();
     await click(barButton("Save as v5"));
-    await settle(() => assert(saves.length === 3, "the text-override save left"));
-    equal([saves[2].text, "html" in saves[2], "blocks" in saves[2]], ["My own plain text", true, false], "the override rides with exactly one body kind");
-    await settle(() => assert((q('pre[data-preview="text"]')?.textContent ?? "").includes("My own plain text"), "the host text render shows the override"));
+    await settle(() => assert(saveResponsePending(), "text override save is still awaiting its host response"));
+    assert(ownTextToggle()!.disabled && (q("#cmp-text-override") as HTMLTextAreaElement).disabled, "override controls are disabled while saving");
+    releaseSaveResponse();
+    await settle(() => assert(saves.length === 3 && text().includes("Saved v5"), "the text-override save completes"));
+    equal([saves[2].text, "html" in saves[2], "blocks" in saves[2]], ["My own plain text", true, false], "the override rides with exactly one HTML body kind");
+    equal(doc.text_override, "My own plain text", "the saved server DTO records the text override");
+    const savedCustomPreview = q('[data-preview="plain-text"]');
+    await settle(() => assert((savedCustomPreview?.textContent ?? "").includes("My own plain text"), "the host text render shows the saved override"));
+    assert((savedCustomPreview?.textContent ?? "").includes("Saved custom plain-text render (v5)"), "the custom render is attributed to the saved revision");
     // Untick: the override is cleared on the next save (no text key).
-    await click(Array.from(t.host.querySelectorAll("label")).find((l) => (l.textContent ?? "").includes("Write my own"))!.querySelector("input"));
+    await click(ownTextToggle());
+    assert(!ownTextToggle()!.checked, "unticking clears the local override selection");
     await click(barButton("Save as v6"));
     await settle(() => assert(saves.length === 4 && !("text" in saves[3]), "unticking Write my own saves without an override"));
+    equal(doc.text_override, null, "the saved server DTO clears the text override when disabled");
     assert(bodyKinds().every(([b, h]) => b !== h), "every save carries exactly one of blocks or html");
 
     // CAS conflict keeps local edits and says why.
@@ -325,7 +371,7 @@ async function operator(kind: "blocks" | "html") {
     doc.revision += 1; // a concurrent writer saved v8 behind the editor's back
     await type(q("#cmp-subject"), "My unsaved subject");
     await click(barButton("Save as v7"));
-    await settle(() => assert(text().includes("since you started editing"), "the conflict says the email moved"));
+    await settle(() => assert(text().includes("saved email is now v7"), "the conflict reports the latest saved revision"));
     equal((q("#cmp-subject") as HTMLInputElement).value, "My unsaved subject", "a refused save keeps the local edit");
     assert(bar(), "the bar stays so the operator can decide");
     equal(saves.at(-1).expected_revision, 6, "the refused save was pinned to the source revision");
@@ -333,9 +379,24 @@ async function operator(kind: "blocks" | "html") {
     await settle(() => assert(!bar(), "Discard clears the edits"));
   } else {
     // An HTML-bodied email: Visual is read-only text, HTML is the editor,
-    // and Apply warns that it replaces the HTML body.
+    // and Use warns that replacing its body remains an unsaved draft change.
     assert(q('[data-state="html-body"]') && !q("[data-visual-text]"), "Visual does not pretend an HTML body is blocks");
-    assert((q('[data-proposal="prop-1"] [data-state="replaces-html"]')?.textContent ?? "").includes("replaces this email's HTML body"), "Apply warns it replaces an HTML body with blocks");
+    const replacementWarning = q('[data-proposal="prop-1"] [data-state="replaces-html"]')?.textContent ?? "";
+    assert(replacementWarning.includes("unsaved draft body format") && replacementWarning.includes("does not save until you choose Save"), "Use warns that the body format changes only in the unsaved draft");
+    // Reviewing a proposal never exposes the saved email's editable plain-text controls.
+    const proposalRow = q('[data-proposal="prop-1"]')!;
+    await click(proposalRow.querySelector('[data-proposal-preview="prop-1"]'));
+    await settle(() => assert(q('[data-proposal-body="prop-1"]'), "the proposal review opens"));
+    await click(byText(t.host, "button", "HTML"));
+    const proposalAdvanced = q("details[data-advanced-text]") as HTMLDetailsElement | null;
+    assert(proposalAdvanced && !proposalAdvanced.open, "proposal plain-text preview remains behind Advanced");
+    await click(proposalAdvanced.querySelector("summary"));
+    assert(!q("#cmp-text-override") && !proposalAdvanced.querySelector('input[type="checkbox"]'), "proposal review offers no text override editor");
+    const proposalText = q('[data-preview="plain-text"]')?.textContent ?? "";
+    assert(proposalText.includes("Suggested plain-text render (not saved)") && proposalText.includes("draft"), "proposal text is clearly an unsaved suggestion");
+    assert(proposalAdvanced.querySelector("[data-host-footer-note]")?.textContent?.includes("cannot be edited"), "proposal preview states the required footer is host-appended and protected");
+    await click(proposalRow.querySelector('[data-version="saved"]'));
+    await click(byText(t.host, "button", "Visual"));
     // An empty preheader starts collapsed and can be shown without loss.
     assert(!q("#cmp-preheader") && (q("#cmp-preheader-toggle")?.textContent ?? "").includes("+ Add preheader"), "an empty preheader starts collapsed");
     await click(q("#cmp-preheader-toggle"));
@@ -356,6 +417,16 @@ async function readOnlyViewer() {
   const { q, text, host } = t;
   assert(!q("#cmp-subject") && !q("#cmp-preheader"), "a read-only viewer gets no subject editor");
   assert(!q('[aria-label="Add block"]') && !q('[aria-label="Email canvas — edit directly"]') && !q('section[aria-label="Email preview"] textarea'), "a read-only viewer gets no block, canvas or text editor");
+  equal(Array.from(host.querySelectorAll('[aria-label="Email editing mode"] button')).map((b) => b.textContent?.trim()), ["Visual", "HTML"], "read-only mode also offers only Visual and HTML");
+  await t.click(t.byText(host, "button", "HTML"));
+  assert(!q("#cmp-html-source") && !q("#cmp-text-override"), "a read-only viewer cannot edit HTML source or text override");
+  const advancedText = q("details[data-advanced-text]") as HTMLDetailsElement | null;
+  assert(advancedText && !advancedText.open, "read-only plain-text render starts behind Advanced");
+  await t.click(advancedText.querySelector("summary"));
+  assert(!advancedText.querySelector("#cmp-own-text, #cmp-text-override"), "a read-only viewer gets no plain-text override control");
+  const readonlyText = advancedText.querySelector('[data-preview="plain-text"]')?.textContent ?? "";
+  assert(readonlyText.includes("Saved host-generated plain text (v2)") && readonlyText.includes("GENERATED v2"), "read-only view identifies the saved generated render and version");
+  assert(advancedText.querySelector("[data-host-footer-note]")?.textContent?.includes("cannot be edited"), "read-only view states the host footer is protected");
   assert(!q("[data-unsaved-bar]"), "a read-only viewer never sees the save bar");
   assert(text().includes("Read-only view"), "a read-only viewer is told so");
   assert((q('[aria-label="Email envelope"]')?.textContent ?? "").includes("Welcome aboard"), "the envelope still shows the subject");
