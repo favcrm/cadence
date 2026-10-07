@@ -184,10 +184,16 @@ export default function AppShell({
             })
             .then((created) => {
               // A conforming daemon always answers with the row (a refusal
-              // rejects); the guard keeps a malformed resolution from
-              // planting `undefined` into the render's context filter.
-              if (!controller.signal.aborted && created) {
-                setContexts((previous) => [...previous, created]);
+              // rejects); anything else — a method-blind mock, a proxy
+              // error page parsed as JSON — must never reach the render's
+              // `value.state` filter, so validate the shape, not just
+              // truthiness.
+              const row =
+                created && typeof created.id === "string" && typeof created.state === "string"
+                  ? created
+                  : null;
+              if (!controller.signal.aborted && row !== null) {
+                setContexts((previous) => [...previous, row]);
               }
             })
             .catch(() => {
