@@ -67,11 +67,30 @@ where
     }
 }
 
+/// The reviewed hosted media manifest pins: @3 (media + source, text stays
+/// refused) and @4 (adds `generate_text`). Anything else is not a pin.
+fn reviewed_media_pin(pin: &str) -> Option<&'static str> {
+    [
+        crate::platform::agenticos_external::MANIFEST_PIN,
+        crate::platform::agenticos_external::TEXT_MANIFEST_PIN,
+    ]
+    .into_iter()
+    .find(|reviewed| *reviewed == pin)
+}
+
 /// Only validated image metadata can produce this construction proof. It
 /// authorizes one fixed internal media door, not arbitrary HTTP or a lease.
 #[derive(Clone, Debug)]
 pub(crate) struct HostedMediaAdmission {
-    _private: (),
+    /// The reviewed manifest pin the image metadata asserted — only
+    /// `MANIFEST_PIN` (@3) or `TEXT_MANIFEST_PIN` (@4), never a free string.
+    pin: &'static str,
+}
+
+impl HostedMediaAdmission {
+    pub(crate) fn pin(&self) -> &'static str {
+        self.pin
+    }
 }
 
 /// CAD-1158: only validated image metadata carrying the exact SMTP tuple
@@ -145,8 +164,7 @@ impl DeploymentMetadata {
                         DeploymentTransport::HostedMediaLease => {
                             entry.provider != crate::platform::agenticos_external::PLATFORM
                                 || entry.origin != "http://api.internal"
-                                || entry.manifest_pin
-                                    != crate::platform::agenticos_external::MANIFEST_PIN
+                                || reviewed_media_pin(&entry.manifest_pin).is_none()
                         }
                         DeploymentTransport::HostedSmtpRelay => {
                             entry.provider != SMTP_PROVIDER
@@ -174,7 +192,8 @@ impl DeploymentMetadata {
         self.providers
             .iter()
             .find(|entry| matches!(entry.transport, Some(DeploymentTransport::HostedMediaLease)))
-            .map(|_| HostedMediaAdmission { _private: () })
+            .and_then(|entry| reviewed_media_pin(&entry.manifest_pin))
+            .map(|pin| HostedMediaAdmission { pin })
     }
 
     /// CAD-1158: the dedicated SMTP admission. `Some` only for the exact

@@ -28,7 +28,7 @@ use image::{image_mime, image_prompt, ASSET_LIMIT};
 
 pub const PLATFORM: &str = "agenticos_external";
 pub const MANIFEST_PIN: &str = "agenticos-external-provider-tools@3";
-const TEXT_MANIFEST_PIN: &str = "agenticos-external-provider-tools@4";
+pub(crate) const TEXT_MANIFEST_PIN: &str = "agenticos-external-provider-tools@4";
 /// CAD-1096: the generic workspace-visible source tool (AOS-140). The raw
 /// provider slug stays hidden from workspaces (AOS-103).
 const POSTS_TOOL: &str = "read_instagram_posts";
@@ -104,11 +104,11 @@ impl AgenticosExternalAdapter {
     }
 
     pub(crate) fn hosted_media(
-        _admission: super::deployments::HostedMediaAdmission,
+        admission: super::deployments::HostedMediaAdmission,
     ) -> Result<Self> {
         Self::new(
             "http://api.internal".into(),
-            Some(MANIFEST_PIN),
+            Some(admission.pin()),
             Transport::HostedMediaLease,
         )
     }
@@ -1731,6 +1731,82 @@ mod tests {
     fn hosted_adapter() -> AgenticosExternalAdapter {
         let metadata = super::super::deployments::DeploymentMetadata::parse(br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#).unwrap();
         AgenticosExternalAdapter::hosted_media(metadata.hosted_media().unwrap()).unwrap()
+    }
+
+    fn hosted_with_pin(pin: &str) -> Result<AgenticosExternalAdapter> {
+        let metadata = super::super::deployments::DeploymentMetadata::parse(
+            format!(r#"{{"schema":1,"providers":[{{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"{pin}","transport":"hosted-media-lease@1"}}]}}"#).as_bytes(),
+        )?;
+        AgenticosExternalAdapter::hosted_media(metadata.hosted_media().unwrap())
+    }
+
+    fn hosted_text_proof() -> Value {
+        let mut proof = authority();
+        proof["slot"] = json!("text");
+        proof["quote"] = media_quote();
+        proof["binding"]["config"]["account"] = json!("hosted");
+        proof["binding"]["config"]["connection_kind"] = json!("builtin");
+        proof
+    }
+
+    #[test]
+    fn hosted_text_is_refused_under_manifest_3_and_callable_under_manifest_4() {
+        let input = json!({"messages":[{"role":"user","content":"Draft a caption."}]});
+        let has_text = |adapter: &AgenticosExternalAdapter| {
+            adapter
+                .connection_descriptor()
+                .unwrap()
+                .capabilities
+                .iter()
+                .any(|capability| capability.id == "text.generate")
+        };
+        // @3: text is not advertised and a call is refused before any HTTP.
+        let v3 = hosted_with_pin(MANIFEST_PIN).unwrap();
+        assert!(!has_text(&v3));
+        let refused = v3
+            .execute_app_capability_outcome(b"", &hosted_text_proof(), &input, "app-call-1177")
+            .err()
+            .expect("@3 refuses text");
+        assert!(
+            matches!(&refused, AppCapabilityError::Refused(reason) if reason.contains("manifest v4")),
+            "{refused:?}"
+        );
+        // @4: advertised, and a call goes through the same guards to the door
+        // with no bearer.
+        let (base, seen, worker) = media_door(|_| {
+            json_response(
+                200,
+                json!({"ok":true,"data":{"result":{"text":"A grounded social caption.","finishReason":"stop","usage":{"inputTokens":9,"outputTokens":5,"totalTokens":14,"cachedInputTokens":null,"reasoningOutputTokens":null}}}}),
+            )
+        });
+        let mut v4 = hosted_with_pin(TEXT_MANIFEST_PIN).unwrap();
+        v4.base = base;
+        assert!(has_text(&v4));
+        let Ok(out) =
+            v4.execute_app_capability_outcome(b"", &hosted_text_proof(), &input, "app-call-1177")
+        else {
+            panic!("@4 allows text");
+        };
+        assert_eq!(out.result["text"], "A grounded social caption.");
+        worker.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].auth.is_none(), "the hosted door carries no bearer");
+        assert_eq!(seen[0].url, CALL_PATH);
+        // The guards still hold under @4: a credentialed account is refused.
+        let mut forged = hosted_text_proof();
+        forged["binding"]["config"]["account"] = json!("company1");
+        assert!(v4
+            .execute_app_capability_outcome(b"", &forged, &input, "app-call-1177")
+            .is_err());
+        // Only reviewed pins parse as a hosted media transport.
+        for bad in [
+            "agenticos-external-provider-tools@5",
+            "agenticos-external-provider-tools@4x",
+            "agenticos-external-provider-tools@2",
+        ] {
+            assert!(hosted_with_pin(bad).is_err(), "{bad}");
+        }
     }
 
     fn hosted_image_proof() -> Value {
