@@ -6,8 +6,6 @@
 //! in argv/env or arbitrary inherited descriptors. Absent service/custody/image
 //! authorization remains UNKNOWN, not a guest-selected enablement flag.
 
-#![allow(dead_code)]
-
 use super::ProviderEnv;
 use crate::error::{Error, Result};
 use crate::store::Agent;
@@ -15,6 +13,8 @@ use crate::{helper_image_trust, HelperImageTrust};
 
 #[path = "helper_authentication.rs"]
 mod authentication;
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 mod envp;
 pub(crate) mod execfd;
 pub(crate) mod owner;
@@ -126,6 +126,8 @@ fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// Which slot a launch occupies — the durable per-alias layer (session,
 /// history) or the per-generation scratch layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +162,8 @@ pub(crate) struct GuestCtx {
     topo: ProtectedTopology,
     segs: Segments,
     role: Role,
+    #[allow(dead_code)]
+    // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
     /// The agent's routing alias — carried verbatim to `CADENCE_ALIAS` (it is
     /// routing text, never a path segment or a principal proof).
     alias: String,
@@ -171,6 +175,8 @@ pub(crate) struct GuestCtx {
     proof: authentication::HelperAuthorization,
 }
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// Legacy unbound/unsupported-host probe. No operation/alias/model means no
 /// authority can be returned. Linux production uses authenticated provisioning
 /// in `establish`, never this context-free gate.
@@ -279,17 +285,22 @@ impl GuestCtx {
         Ok(launched)
     }
 
+    #[allow(dead_code)]
+    // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
     /// The verified per-launch view dirfd for `layer`.
     pub(crate) fn view(&self, layer: Layer) -> Result<std::os::unix::io::OwnedFd> {
         self.topo.view_dir(&self.segs, layer)
     }
 
+    #[allow(dead_code)] // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
     pub(crate) fn role(&self) -> Role {
         self.role
     }
     pub(crate) fn segments(&self) -> &Segments {
         &self.segs
     }
+    #[allow(dead_code)]
+    // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
     /// The routing alias for `CADENCE_ALIAS`.
     pub(crate) fn alias(&self) -> &str {
         &self.alias

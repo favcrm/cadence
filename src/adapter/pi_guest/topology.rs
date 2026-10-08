@@ -134,7 +134,6 @@ where
                 // open before `fstat` can reject it — `O_RDONLY` alone would
                 // wait for a writer forever.
                 OpenKind::ExecFile => flags |= libc::O_NONBLOCK as u64,
-                OpenKind::DataInherit => flags &= !(libc::O_CLOEXEC as u64),
             }
         } else {
             flags |= libc::O_DIRECTORY as u64;
@@ -640,6 +639,8 @@ impl ProtectedTopology {
         )
     }
 
+    #[allow(dead_code)]
+    // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
     /// Open the per-launch view dirfd for `layer` — verified, not created.
     pub(crate) fn view_dir(&self, segs: &Segments, layer: Layer) -> Result<OwnedFd> {
         let path = match layer {

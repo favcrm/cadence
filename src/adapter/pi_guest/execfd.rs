@@ -17,27 +17,40 @@
 //! refuses rather than pinning a file observed mid-mutation.
 
 use std::ffi::CString;
+use std::os::unix::io::OwnedFd;
 #[cfg(test)]
-use std::os::unix::io::RawFd;
-use std::os::unix::io::{AsRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// ELF e_ident class byte — only a 64-bit object may be an exec'd ELF here.
 const ELFCLASS64: u8 = 2;
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// ELF e_ident data byte — little-endian.
 const ELFDATA2LSB: u8 = 1;
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// `e_machine` for x86-64 (the host arch this build runs on).
 #[cfg(target_arch = "x86_64")]
 const EM_HOST: u16 = 62;
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// `e_machine` for AArch64.
 #[cfg(target_arch = "aarch64")]
 const EM_HOST: u16 = 183;
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// `e_type` for an executable (`ET_EXEC`, 2) or a PIE DSO (`ET_DYN`, 3).
 const ET_EXEC: u16 = 2;
+#[allow(dead_code)] // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 const ET_DYN: u16 = 3;
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// A source-owned executable pin. `sha256` is compiled in and bound to the
 /// measured release artifact — never caller-supplied argv/env, never a
 /// placeholder, never the target's self-attestation. `canon` is the canonical
@@ -55,6 +68,8 @@ pub(crate) struct ExecPin {
     pub sha256: Option<[u8; 32]>,
 }
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// The compiled pin table. Digests are bound to the release artifacts; `None`
 /// means the pin is not provisioned for this build and the bound open must
 /// refuse — a missing pin is never a pass.
@@ -77,6 +92,8 @@ pub(crate) const EXEC_PINS: &[ExecPin] = &[
     },
 ];
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// An opened, verified executable: the fd plus the digest actually measured.
 /// The `OwnedFd` is the custody object — it is moved into the `PreparedExec`
 /// and from there into the `pre_exec` closure, so the fd can never be closed
@@ -89,6 +106,8 @@ pub(crate) struct BoundExec {
     pub canon: PathBuf,
 }
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// The ELF header bytes we must see for the bound object to be an *executed*
 /// ELF — magic, class, data encoding, `e_type` and host `e_machine`. Reads
 /// are `pread` at absolute offsets, so they never move the shared offset.
@@ -111,6 +130,8 @@ fn fd_is_host_elf(file: &std::fs::File) -> bool {
     (e_type == ET_EXEC || e_type == ET_DYN) && e_machine == EM_HOST
 }
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// `pread` a window of `len` bytes starting at `off` — used for the magic
 /// probe without disturbing the shared offset.
 fn read_at(file: &std::fs::File, off: u64, buf: &mut [u8]) -> bool {
@@ -189,6 +210,8 @@ pub(crate) fn sha256_fd(file: &std::fs::File, size: u64) -> Result<[u8; 32]> {
     Ok(h.finalize().into())
 }
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// Open `pin.canon` and verify it *on the fd*: openat2-relative to a pinned
 /// `/`, `RESOLVE_NO_SYMLINKS`, then `fstat` (regular file, owner, exact mode
 /// bits, `nlink == 1`) and a host-ELF header probe plus a whole-file sha256
@@ -293,12 +316,10 @@ pub(crate) enum OpenKind {
     /// A regular file to be executed — `O_RDONLY | O_CLOEXEC`. `fstat` in the
     /// caller proves it is not a fifo/socket/dir before exec.
     ExecFile,
-    /// A regular file that must stay open across the *next* exec — opened
-    /// `O_RDONLY` **without** `O_CLOEXEC` so `execveat` preserves it for the
-    /// interpreter to read via `/proc/self/fd/<n>`.
-    DataInherit,
 }
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// A fully-materialized exec plan for `Command::pre_exec`. Every `CString`,
 /// pointer array and fd lifetime is resolved before `fork` — the `pre_exec`
 /// closure is async-signal-safe: it calls `setsid` then `execveat`, reads
@@ -323,6 +344,8 @@ pub(crate) struct PreparedExec {
     envp_p: Vec<*const libc::c_char>,
 }
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// Materialized strings without executable custody: cannot attach or spawn.
 pub(crate) struct ExecDraft {
     argv_c: Box<[CString]>,
@@ -331,6 +354,8 @@ pub(crate) struct ExecDraft {
     envp_p: Vec<*const libc::c_char>,
 }
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// A `Send`/`Sync`-able carrier for the whole spawn plan handed to `pre_exec`.
 /// It owns the `OwnedFd` and both `Box<[CString]>` backings, so the raw
 /// pointers in `argv_p`/`envp_p` and the fd stay valid for the life of the
@@ -355,15 +380,10 @@ pub(crate) struct ExecDraft {
 ///     `execveat`. No mutation, no aliasing with another thread, no access
 ///     from the parent while the child runs (the values are copy-on-write
 ///     snapshots the kernel took at fork).
-///
-/// `empty_path` points at the `static EMPTY_PATH_NUL` — `'static`, immortal,
-/// shared safely across threads.
 struct ExecArgs {
     helper_fd: OwnedFd,
     argv_c: Box<[CString]>,
     envp_c: Box<[CString]>,
-    /// `execveat`'s empty-path operand — a stable pointer to a static NUL.
-    empty_path: *const libc::c_char,
     argv_p: Vec<*const libc::c_char>,
     envp_p: Vec<*const libc::c_char>,
 }
@@ -375,9 +395,7 @@ struct ExecArgs {
 unsafe impl Send for ExecArgs {}
 unsafe impl Sync for ExecArgs {}
 
-/// A static NUL byte for `execveat`'s `path=""` operand.
-static EMPTY_PATH_NUL: u8 = 0;
-
+#[allow(dead_code)] // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 impl PreparedExec {
     /// Materialize the argv/envp for `execveat(helper_fd, …)`.
     /// The strict shared routing suffix follows the fixed profile tokens;
@@ -438,14 +456,6 @@ impl PreparedExec {
         })
     }
 
-    /// Attach the async-signal-safe `pre_exec` to `cmd`, consuming the plan.
-    /// The `OwnedFd`, `CString` backings and pointer arrays all move *into*
-    /// the closure, so the child reads live descriptors and stable pointers
-    /// after fork — there is no window where a dropped/reused fd or freed
-    /// `CString` could leave the child a stale argument.
-    ///
-    /// `setsid` runs first and is error-checked; `execveat` `-1` maps to
-    /// `last_os_error` immediately (the return value is not the errno).
     /// Consume the plan into the owned `ExecArgs` carrier — the single
     /// canonical "move every backing + the fd into the closure" step. The
     /// `PreparedExec` is destructured *into* `args`, so no owner is dropped
@@ -455,39 +465,8 @@ impl PreparedExec {
             helper_fd: self.helper_fd,
             argv_c: self.argv_c,
             envp_c: self.envp_c,
-            empty_path: &EMPTY_PATH_NUL as *const u8 as *const libc::c_char,
             argv_p: self.argv_p,
             envp_p: self.envp_p,
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn attach(self, cmd: &mut std::process::Command) {
-        use std::os::unix::process::CommandExt;
-        let args = self.into_exec_args();
-        unsafe {
-            // `move` on the whole `ExecArgs` forces whole-struct capture so the
-            // closure is Send/Sync (Edition-2021 disjoint field capture would
-            // pull `empty_path` out as a bare `*const i8`, which is not Send).
-            let captured = args;
-            cmd.pre_exec(move || {
-                let a = &captured;
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let rc = libc::syscall(
-                    libc::SYS_execveat,
-                    a.helper_fd.as_raw_fd(),
-                    a.empty_path,
-                    a.argv_p.as_ptr(),
-                    a.envp_p.as_ptr(),
-                    libc::AT_EMPTY_PATH,
-                );
-                if rc == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
         }
     }
 
@@ -507,16 +486,9 @@ impl PreparedExec {
             .map(|c| c.to_string_lossy().into_owned())
             .collect()
     }
-
-    #[cfg(test)]
-    pub(crate) fn envp_strings(&self) -> Vec<String> {
-        self.envp_c
-            .iter()
-            .map(|c| c.to_string_lossy().into_owned())
-            .collect()
-    }
 }
 
+#[allow(dead_code)] // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 impl ExecDraft {
     /// Only moving an owned binding creates the attachable transport plan.
     pub(crate) fn with_bound(self, bound: BoundExec) -> PreparedExec {
