@@ -25,6 +25,7 @@
 //! board and `memory ls --stale` read freshness the same way
 //! (`evidence_json`).
 
+mod body;
 pub mod cli;
 mod matching;
 mod rendering;
@@ -40,8 +41,10 @@ use crate::error::{Error, Result};
 use crate::issue::{board, git, history, parse, project, time, write, Pm};
 use crate::proc;
 
+use body::body_parts;
 use matching::{current_verify, iso_epoch};
 
+pub use body::{apply_line, fact_line};
 pub use matching::{
     evidence_json, evidence_label, glob_match, last_verified, match_memories, stale_reason,
     Freshness, MatchCtx, Matched, DEFAULT_STALE_DAYS,
@@ -256,65 +259,6 @@ pub fn parse_memory(text: &str) -> Result<(Front, String)> {
     let front: Front = serde_yaml::from_str(yaml)
         .map_err(|e| Error::rejected(format!("memory frontmatter is not valid YAML: {e}")))?;
     Ok((front, body.to_string()))
-}
-
-/// The body contract: a fact block (≤5 non-empty lines) followed by
-/// `**Why:**` and `**How to apply:**` markers. Returns
-/// `(fact_lines, why, how)`; sections may span multiple lines.
-fn body_parts(body: &str) -> (Vec<String>, String, String) {
-    let mut fact = Vec::new();
-    let mut why = Vec::new();
-    let mut how = Vec::new();
-    let mut section = 0; // 0 = fact, 1 = why, 2 = how
-    for line in body.lines() {
-        let t = line.trim();
-        if let Some(rest) = t.strip_prefix("**Why:**") {
-            section = 1;
-            if !rest.trim().is_empty() {
-                why.push(rest.trim().to_string());
-            }
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix("**How to apply:**") {
-            section = 2;
-            if !rest.trim().is_empty() {
-                how.push(rest.trim().to_string());
-            }
-            continue;
-        }
-        match section {
-            0 => {
-                if !t.is_empty() || !fact.is_empty() {
-                    fact.push(line.to_string());
-                }
-            }
-            1 => why.push(line.to_string()),
-            _ => how.push(line.to_string()),
-        }
-    }
-    let trim = |v: &mut Vec<String>| {
-        while v.first().is_some_and(|l| l.trim().is_empty()) {
-            v.remove(0);
-        }
-        while v.last().is_some_and(|l| l.trim().is_empty()) {
-            v.pop();
-        }
-    };
-    trim(&mut fact);
-    trim(&mut why);
-    trim(&mut how);
-    (fact, why.join("\n"), how.join("\n"))
-}
-
-/// The one-line fact used in lessons files and list views.
-pub fn fact_line(body: &str) -> String {
-    body_parts(body).0.first().cloned().unwrap_or_default()
-}
-
-/// The first `**How to apply:**` line — briefings and lessons carry it.
-pub fn apply_line(body: &str) -> String {
-    let (_, _, how) = body_parts(body);
-    how.lines().next().unwrap_or_default().trim().to_string()
 }
 
 /// Body-contract errors — shared by `propose`/`accept --edit` and lint.
