@@ -134,7 +134,6 @@ where
                 // open before `fstat` can reject it — `O_RDONLY` alone would
                 // wait for a writer forever.
                 OpenKind::ExecFile => flags |= libc::O_NONBLOCK as u64,
-                OpenKind::DataInherit => flags &= !(libc::O_CLOEXEC as u64),
             }
         } else {
             flags |= libc::O_DIRECTORY as u64;
@@ -294,9 +293,56 @@ impl ProtectedTopology {
     fn verify_skeleton(&self) -> Result<()> {
         let nodes = self.node_table();
         for n in &nodes {
-            self.check_node(n)?;
+            if n.path == "/workspace/company/pm" {
+                // PM is mutable workspace DATA, never a protected executable,
+                // view ancestor or authority carrier. Keep its existing exact
+                // metadata check, relative to a verified held workspace leaf.
+                self.check_workspace_pm()?;
+            } else {
+                self.check_node(n)?;
+            }
         }
         Ok(())
+    }
+
+    fn check_workspace_pm(&self) -> Result<OwnedFd> {
+        let company = self.check_with(
+            "/workspace/company",
+            self.guest,
+            self.shared,
+            0o770,
+            true,
+            &self.skeleton_policy(),
+        )?;
+        #[cfg(target_os = "linux")]
+        {
+            let name = CString::new("pm").unwrap();
+            let fd = sys_openat2(
+                company.as_raw_fd(),
+                &name,
+                &OpenHow {
+                    flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                        as u64,
+                    mode: 0,
+                    resolve: RESOLVE | libc::RESOLVE_NO_XDEV,
+                },
+            )?;
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let meta = fd_metadata(&fd)?;
+            if !meta.is_dir()
+                || meta.uid() != self.guest
+                || meta.gid() != self.shared
+                || meta.mode() & 0o7777 != 0o770
+            {
+                return Err(Error::rejected("mutable PM data leaf metadata refused"));
+            }
+            Ok(fd)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = company;
+            Err(Error::rejected("protected managed-Pi launch is Linux-only"))
+        }
     }
 
     /// The static node table — every protected ancestor is listed so the
@@ -319,7 +365,14 @@ impl ProtectedTopology {
                 is_dir: true,
             },
             Node {
-                path: "/opt/cadence/libexec",
+                path: "/opt/protected",
+                owner: 0,
+                group: 0,
+                mode: 0o755,
+                is_dir: true,
+            },
+            Node {
+                path: "/opt/protected/bin",
                 owner: 0,
                 group: 0,
                 mode: 0o755,
@@ -573,6 +626,21 @@ impl ProtectedTopology {
         }
     }
 
+    /// Root provisioner anchor. Exact protected metadata and every immutable
+    /// ancestor are still verified; this does not accept a caller-selected path.
+    pub(crate) fn view_anchor(&self) -> Result<OwnedFd> {
+        self.check_with(
+            "/srv/cadence/guest-views",
+            self.supervisor,
+            self.shared,
+            0o750,
+            true,
+            &self.skeleton_policy(),
+        )
+    }
+
+    #[allow(dead_code)]
+    // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
     /// Open the per-launch view dirfd for `layer` — verified, not created.
     pub(crate) fn view_dir(&self, segs: &Segments, layer: Layer) -> Result<OwnedFd> {
         let path = match layer {
@@ -678,7 +746,7 @@ fn resolve_gid(name: &str) -> Result<u32> {
     Ok(unsafe { (*gr).gr_gid })
 }
 
-fn resolve_primary_gid(user: &str) -> Result<u32> {
+pub(crate) fn resolve_primary_gid(user: &str) -> Result<u32> {
     let c = CString::new(user).map_err(|_| Error::rejected("account name NUL"))?;
     let pw = unsafe { libc::getpwnam(c.as_ptr()) };
     if pw.is_null() {

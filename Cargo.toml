@@ -34,6 +34,16 @@ path = "src/bin/cadence-installer-client/main.rs"
 name = "cadence-installer-observer"
 path = "src/bin/cadence-installer-observer/main.rs"
 
+# CAD-1159: fixed provider-stream root constructor. Draft activation stays
+# closed; independently elected public image roots are never caller supplied.
+[[bin]]
+name = "cadence-root-constructor"
+path = "src/bin/cadence-root-constructor/main.rs"
+
+[[bin]]
+name = "cadence-enrolled-recipient"
+path = "src/bin/cadence-enrolled-recipient/main.rs"
+
 [features]
 # Embed the built `ui/` SPA into the binary. Requires `pnpm build` inside
 # `ui/` first; without the feature `cadence ui run --dist <dir>` serves

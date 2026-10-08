@@ -58,7 +58,11 @@ mod idea_rpc;
 mod identity;
 #[cfg(target_os = "linux")]
 mod installer_client;
-mod installer_enrollment_wire;
+pub(crate) mod installer_enrollment_wire;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod native_task;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod protected_runtime;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -84,7 +88,7 @@ mod slots_rpc;
 mod social_publish_driver;
 mod social_publish_rpc;
 mod social_publish_start;
-mod supervisor_grant;
+pub(crate) mod supervisor_grant;
 mod test_queue_rpc;
 mod threads_rpc;
 mod timers;
@@ -626,8 +630,20 @@ impl Shared {
         // read-write and migrates. A direct `daemon run` whose identity
         // does not hold the lease refuses here and leaves the database
         // unchanged. `open_adopting` repeats the same check.
-        crate::rollout::authorize_migration(&db_path)?;
-        let (mut store, recovered) = Store::open_adopting(&db_path, marker)?;
+        let (mut store, recovered) = if state_dir == Path::new("/srv/cadence/protected/store") {
+            // This path only requests protected startup; it is NOT permission.
+            // Authentic fixed-owner issuance selects mode/binding BEFORE SQL,
+            // and unavailable/invalid ownership never falls back to Legacy.
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            let grant = crate::installer_bundle::constructor::StoreOwnerGrant::startup()?;
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+            let grant = crate::store::StoreOwnerGrant::startup()?;
+            crate::rollout::authorize_migration(Path::new(&grant.binding().path))?;
+            Store::open_owned(grant)?
+        } else {
+            crate::rollout::authorize_migration(&db_path)?;
+            Store::open_adopting(&db_path, marker)?
+        };
         store.set_shutdown_entries_hook(opts.shutdown_entries_hook.clone())?;
         if let Some(ms) = opts.shutdown_backoff_ms_for_test {
             store.shutdown_backoff_ms = ms;
@@ -786,6 +802,25 @@ impl Shared {
                 wiki_pm_lease,
             ),
         });
+        #[cfg(all(
+            debug_assertions,
+            feature = "test-seam",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        if state_dir == Path::new("/srv/cadence/protected/store") {
+            // Only the genuine protected opening can reach this window; path
+            // equality requests it, never admits a caller. The fixed Client
+            // controller additionally requires its original inherited Root FD3.
+            // No hosted lease heartbeat or seam worker may overlap comparison.
+            if shared.lease.is_some() || shared.seam.is_some() {
+                return Err(Error::unknown("retained Store replay window UNKNOWN"));
+            }
+            return crate::installer_bundle::constructor::runtime_child::retained_opening_replay(
+                &shared.store,
+            )
+            .and_then(|never| match never {});
+        }
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
         shared.emit_slot_events(boot_events);
@@ -5003,6 +5038,8 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease));
     let hot = hot_restart_begin(state_dir);
     let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam)?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let protected = protected_runtime::Maintenance::start(&shared);
     if let Some(heartbeat) = &lease_heartbeat {
         heartbeat.attach(&shared);
     }
@@ -5019,7 +5056,16 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     crate::device_login::migrate(state_dir);
     let shared_socket = if opts.agent_uid.is_some() {
         let (path, gid, fixture) = match &opts.shared_socket {
-            Some((path, gid)) => (path.clone(), *gid, true),
+            Some((path, gid)) => {
+                // The actual fixed runtime entry never uses the fixture's
+                // relaxed parent-group/mode check for its shared socket.
+                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                let fixture =
+                    crate::installer_bundle::constructor::runtime_child::control().is_none();
+                #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+                let fixture = true;
+                (path.clone(), *gid, fixture)
+            }
             None => (
                 crate::agent_uid::config::shared_socket_path().to_path_buf(),
                 crate::agent_uid::config::shared_gid()?,
@@ -5042,6 +5088,11 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if protected.is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+    }
     // Signal-driven shutdown: set the same flag as the rpc. Installed
     // before actors launch so a signal during relaunch — or a relaunch
     // failure — still reaches `shutdown` below rather than exiting
@@ -5175,6 +5226,18 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // A loop error is a stop, never a skip: `serve_error` is returned
     // only after the shutdown below has run — the refusals and the
     // marker it writes are the next start's adoption evidence.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let protected_serving = if protected.is_some() {
+        Some(protected_runtime::publish_serving(
+            &listener,
+            &shared_socket
+                .as_ref()
+                .ok_or_else(|| Error::rejected("protected shared listener unavailable"))?
+                .listener,
+        )?)
+    } else {
+        None
+    };
     let mut serve_error: Option<Error> = None;
     let mut accept_backoff = Duration::ZERO;
     // Persistent pressure (EMFILE) retries every ACCEPT_BACKOFF_MAX:
@@ -5254,10 +5317,12 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             }
         }
     }
-    // A loop that ended on error never observed `closing`: set it now
-    // so the watches and actors drain through the normal stop below.
-    // `begin_closing` is idempotent — a clean exit keeps the facts
-    // snapshot taken when its stop was requested.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    drop(protected_serving); // invalidate serving BEFORE drain/flush; not FINAL
+                             // A loop that ended on error never observed `closing`: set it now
+                             // so the watches and actors drain through the normal stop below.
+                             // `begin_closing` is idempotent — a clean exit keeps the facts
+                             // snapshot taken when its stop was requested.
     shared.begin_closing();
     // Former facts snapshot lived in `shutdown`. A test holds this
     // barrier until it has observed idle actors detach, which is the
@@ -5296,7 +5361,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // now is it stopped and joined, so there is never a window with
     // zero posters (heartbeat dead, flush still running) or two (a
     // late renew racing the release and rewriting a removed lease).
-    release_lease_tail(
+    let _flushed = release_lease_tail(
         &shared,
         &hosted,
         &opts,
@@ -5304,6 +5369,12 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         &socket_path,
         shared_socket,
     );
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if serve_error.is_none() && _flushed {
+        if let Some(protected) = protected {
+            protected.quiesced()?;
+        }
+    }
     match serve_error {
         Some(error) => Err(error),
         None => Ok(()),
@@ -5334,7 +5405,7 @@ fn release_lease_tail(
     mut heartbeat: Option<serve::LeaseHeartbeat>,
     socket_path: &Path,
     shared_socket: Option<serve::SharedSocket>,
-) {
+) -> bool {
     let flushed = lease_flush(
         shared,
         opts.flush_budget_for_test
@@ -5360,6 +5431,7 @@ fn release_lease_tail(
     }
     let _ = std::fs::remove_file(socket_path);
     drop(shared_socket);
+    flushed
 }
 
 /// Fallback detail when an unknown fence has no provider account.

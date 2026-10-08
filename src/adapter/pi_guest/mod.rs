@@ -1,45 +1,62 @@
-//! CAD-1012 — the protected managed-Pi launch seam (verify-only first batch).
-//!
-//! This module implements the *construction and refusal* half of a split
-//! (`agent_uid.is_some()`) managed-Pi launch: the verified FD-exec spawn plan,
-//! the openat2 verify-only walk of the pre-provisioned protected topology, and
-//! the post-drop guest environment vector. **It enables nothing on its own** —
-//! [`protected_prereqs_satisfied`] returns `Err(UNKNOWN)` until the external
-//! restore-lineage, sealed-helper and namespace-policy pins exist, so a
-//! production launch can never pass through here yet.
-//!
-//! Custody: the daemon binds only the helper ELF. The helper first closes
-//! every inherited descriptor, then privately opens/verifies Node and owns it
-//! through the identity/capability seal and `execveat(AT_EMPTY_PATH)`. A parent
-//! Node fd is neither transferred nor claimed as execution custody.
-//! The reviewed immutable Pi graph/CLI and out-of-tree filesystem policy are
-//! unavailable. No obsolete cli-runtime layout or local candidate observation
-//! elects them; scripts remain canonical immutable paths, never fd-exec targets.
-//!
-//! No guest caller boolean, restored marker, refreshed local flag, or `params`
-//! field is ever an eligibility input: the only inputs are `agent_uid`, the
-//! verified topology, and the source-owned [`EXEC_PINS`].
-//!
-//! First-batch note: the launch path is gated by `protected_prereqs_satisfied`
-//! which is always `Err` until external authority exists, so `establish` and
-//! the spawn plan are exercised only by this module's tests. The items are
-//! real, not dead — the lint is held pending the enablement that the external
-//! prerequisites gate.
-
-#![allow(dead_code)]
-
-use std::os::unix::io::AsRawFd;
+//! Owner-authorized protected managed-Pi launch. The fixed private supervisor
+//! service provisions one fresh generation before verify-only topology access.
+//! Its authenticated image profile binds the helper; the helper independently
+//! arms the exact operation after close_fds, verifies Node/full Pi graph and
+//! consumes current authority immediately before FD exec. No authority survives
+//! in argv/env or arbitrary inherited descriptors. Absent service/custody/image
+//! authorization remains UNKNOWN, not a guest-selected enablement flag.
 
 use super::ProviderEnv;
 use crate::error::{Error, Result};
 use crate::store::Agent;
+use crate::{helper_image_trust, HelperImageTrust};
 
+#[path = "helper_authentication.rs"]
+mod authentication;
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+pub(crate) mod diag_seam;
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 mod envp;
 pub(crate) mod execfd;
+pub(crate) mod owner;
+pub(crate) mod service;
 pub(crate) mod topology;
 
-use execfd::{PreparedExec, EXEC_PINS};
+use crate::protected_pi_profile::authority;
 use topology::ProtectedTopology;
+
+/// Finite debug acceptance observation of the SAME helper/client trust gate.
+/// Public DTOs are data only: no keys, clock, callback, path, FD or kernel proof.
+/// Success discards the private math proof and grants no launch/current/custody.
+/// Actual execution must still enter through the owned service and retained
+/// Channel; helper trust passes BEFORE private_view/Graph/Node/seal effects.
+#[cfg(all(
+    debug_assertions,
+    feature = "test-seam",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub(crate) fn launch_trust_before_effects(frame: &[u8]) -> std::io::Result<()> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Frame {
+        version: u32,
+        selection: authority::Selection,
+        launch: authority::Authorized,
+        signed: authority::SignedOperation,
+    }
+    if frame.is_empty() || frame.len() > authority::MAX_FRAME {
+        return Err(authority::refused());
+    }
+    let frame: Frame = serde_json::from_slice(frame).map_err(|_| authority::refused())?;
+    if frame.version != 1 {
+        return Err(authority::refused());
+    }
+    authentication::QualifiedImage::load()?
+        .authenticate(&frame.selection, &frame.launch, &frame.signed)?
+        .recheck()
+}
 
 /// The four image-local accounts/groups the protected layout is built on —
 /// resolved by NSS name, never hardcoded to a uid and never taken from a
@@ -111,6 +128,8 @@ fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 /// Which slot a launch occupies — the durable per-alias layer (session,
 /// history) or the per-generation scratch layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,21 +164,24 @@ pub(crate) struct GuestCtx {
     topo: ProtectedTopology,
     segs: Segments,
     role: Role,
+    #[allow(dead_code)]
+    // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
     /// The agent's routing alias — carried verbatim to `CADENCE_ALIAS` (it is
     /// routing text, never a path segment or a principal proof).
     alias: String,
-    /// Daemon owns only the helper; Node is reopened privately AFTER close_fds.
-    helper: execfd::BoundExec,
+    selection: authority::Selection,
+    /// SAME authenticated supervisor control channel; actual root creates and
+    /// retains the helper. Daemon receives stdio only, never executable custody.
+    channel: authority::Channel,
+    launch: authority::Authorized,
+    proof: authentication::HelperAuthorization,
 }
 
-/// The mandatory fail-closed gate for production eligibility. The external
-/// prerequisite factory — sealed-helper pin record, namespace policy and the
-/// pre-start restore-lineage pin — is external authority this source does not
-/// mint. Until it is supplied and verified, this is `Err`, permanently UNKNOWN:
-/// no guest boolean, restored marker or refreshed flag can satisfy it.
-///
-/// This batch ships the constructor and refusal path only; the real factory
-/// arrives with the external provisioning work.
+#[allow(dead_code)]
+// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
+/// Legacy unbound/unsupported-host probe. No operation/alias/model means no
+/// authority can be returned. Linux production uses authenticated provisioning
+/// in `establish`, never this context-free gate.
 pub(crate) fn protected_prereqs_satisfied() -> Result<()> {
     Err(Error::rejected(
         "protected managed-Pi prerequisites unavailable — external \
@@ -173,72 +195,114 @@ impl GuestCtx {
     /// closed on any missing pre-requisite, any mis-owned or symlinked
     /// topology component, or any exec digest that does not match the
     /// compiled pin. Returns the context only when construction — not
-    /// enablement — is sound. `protected_prereqs_satisfied` is consulted
-    /// by the caller before any spawn; it stays `Err` this batch.
+    /// selector parsing — is sound. The owner provisions a fresh generation
+    /// only after authenticating supervisor custody and current launch policy.
     pub(crate) fn establish(
         agent: &Agent,
         _env: &ProviderEnv,
         agent_uid: u32,
         generation: &str,
     ) -> Result<Self> {
-        protected_prereqs_satisfied()?;
-        // The split gate already proved agent_uid.is_some() upstream; assert
-        // the resolved uid is the guest account, never 0 or the supervisor.
         let segs = Segments::new(&agent.alias, generation)?;
-        let topo = ProtectedTopology::verify(agent_uid)?;
         let role = Role::of(agent);
+        let model = agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::rejected("protected Pi requires explicit model"))?;
+        let selection = authority::Selection {
+            alias_sha256: segs.alias_hex(),
+            generation: segs.generation_hex(),
+            role: if role == Role::Master {
+                authority::Role::Master
+            } else {
+                authority::Role::Worker
+            },
+            model: model.to_owned(),
+        };
+        selection.validate()?;
+        if agent_uid != authority::GUEST_UID
+            || unsafe { libc::geteuid() } != authority::SUPERVISOR_UID
+        {
+            return Err(Error::rejected(
+                "protected Pi must be provisioned by the fixed supervisor",
+            ));
+        }
+        // Provision is authenticated by the service against retained supervisor
+        // custody and current owner policy before it creates ANY generation leaf.
+        let qualified = authentication::QualifiedImage::load()?;
+        let mut channel = authority::Channel::connect()?;
+        let (launch, signed) = channel.authorize_signed(
+            &authority::Request::Provision {
+                version: 1,
+                selection: selection.clone(),
+                alias: agent.alias.clone(),
+            },
+            &selection,
+        )?;
+        let proof = qualified.authenticate(&selection, &launch, &signed)?;
+        channel.bound_until(proof.deadline())?;
+        proof.recheck()?;
+        let topo = ProtectedTopology::verify(agent_uid)?;
         // Verify the durable + generation slot dirs exist and are exactly the
         // pre-provisioned shape; a missing slot refuses (never creates).
         topo.verify_view(&segs, role)?;
-        // Bind only the helper here. No parent Node fd survives helper close_fds.
-        let helper = execfd::open_bound(&EXEC_PINS[0])?;
+        proof.recheck()?;
+        // No local setuid exec: NNP/NOSUID cannot regain root. The constructor
+        // selects the measured helper for this retained owner operation and
+        // creates it realUID21000/effective0, retaining actual kernel custody.
         Ok(Self {
             topo,
             segs,
             role,
             alias: agent.alias.clone(),
-            helper,
+            selection,
+            channel,
+            launch,
+            proof,
         })
     }
 
-    /// The verified helper fd for the `pre_exec` `execveat` — the daemon
-    /// executes this inode (kernel applies setuid to it), never a path.
-    pub(crate) fn helper_fd(&self) -> std::os::unix::io::RawFd {
-        self.helper.fd.as_raw_fd()
-    }
-
-    /// Build the spawn plan handed to `StdioAdapter::launch`: the materialized
-    /// argv/envp for `pre_exec`+`execveat`. Only the shared finite routing grammar
-    /// follows the profile tokens; the helper derives Node/CLI/env/cwd itself.
-    /// The plan takes
-    /// ownership of the bound helper fd's `OwnedFd` — custody moves with the
-    /// spawn, so no closed/reused descriptor can be exec'd in the child.
-    ///
-    /// This consumes the helper binding: a `GuestCtx` produces at most one
-    /// spawn plan, which is correct — one open, one launch, one fd.
-    pub(crate) fn spawn_plan(
+    /// Request the root-created exact helper and receive ONLY its three stdio
+    /// pipes plus the retained finite control channel. No PID/FD/executable
+    /// adoption, local SUID fallback, helper authority env or inherited FD.
+    pub(crate) fn launch(
         self,
         routing: &crate::protected_pi_profile::Routing,
-    ) -> Result<PreparedExec> {
-        // Recheck the actual unavailable private prerequisites at transport handoff;
-        // construction and routing text never substitute for current authority.
-        protected_prereqs_satisfied()?;
+    ) -> Result<authority::RemoteLaunch> {
+        // Routing must exactly echo the provisioned selectors. Only the helper's
+        // separately authenticated arm/consume may authorize actual Node exec.
+        if routing.model() != Some(self.selection.model.as_str())
+            || routing.no_session() != (self.selection.role == authority::Role::Master)
+        {
+            return Err(Error::rejected(
+                "protected Pi routing differs from owner provisioning",
+            ));
+        }
+        self.proof.recheck()?;
         self.topo.verify_view(&self.segs, self.role)?;
-        let draft = PreparedExec::assemble(&self.segs, &routing.tokens(), Vec::new())?;
-        Ok(draft.with_bound(self.helper))
+        let launched = self.channel.launch(&self.launch)?;
+        self.proof.recheck()?;
+        Ok(launched)
     }
 
+    #[allow(dead_code)]
+    // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
     /// The verified per-launch view dirfd for `layer`.
     pub(crate) fn view(&self, layer: Layer) -> Result<std::os::unix::io::OwnedFd> {
         self.topo.view_dir(&self.segs, layer)
     }
 
+    #[allow(dead_code)] // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
     pub(crate) fn role(&self) -> Role {
         self.role
     }
     pub(crate) fn segments(&self) -> &Segments {
         &self.segs
     }
+    #[allow(dead_code)]
+    // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
     /// The routing alias for `CADENCE_ALIAS`.
     pub(crate) fn alias(&self) -> &str {
         &self.alias

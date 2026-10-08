@@ -1,6 +1,13 @@
 //! Helper-private protected profile: all inherited FDs have already been closed.
 //! Only this module opens Node, and only its owned descriptor crosses the seal.
-use crate::protected_pi_profile::{Profile, NODE_DIGEST, NODE_PATH};
+use crate::protected_pi_profile::{authority, Profile, IMAGE_ROOT, NODE_PATH};
+use cadence_agent::{helper_image_trust, HelperImageTrust};
+#[path = "../../adapter/pi_guest/helper_authentication.rs"]
+mod authentication;
+#[path = "../../adapter/pi_guest/graph.rs"]
+mod graph;
+#[path = "../../adapter/pi_guest/namespace.rs"]
+mod namespace;
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::File;
@@ -8,43 +15,41 @@ use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
-/// No observed candidate CLI layout elects a reviewed immutable JS graph.
-const PRIVATE_PI_CLI: Option<&str> = None;
-
 /// Kept inside the helper; no public constructor, argv field or inherited fd.
 struct PrivateView {
     cwd: OwnedFd,
     env: Vec<CString>,
     session: Option<String>,
 }
-#[derive(PartialEq, Eq)]
-#[allow(dead_code)] // Only unavailable private authority may select the role.
-enum PrivateRole {
-    Master,
-    Worker,
+fn private_authority(
+    profile: &Profile,
+) -> io::Result<(
+    authority::Channel,
+    authority::Authorized,
+    authentication::HelperAuthorization,
+)> {
+    let selection = profile.selection().map_err(|_| authority::refused())?;
+    // Kernel caller identity is necessary, not sufficient: the service also
+    // authenticates retained child custody, never a submitted pid/uid/hash.
+    if unsafe { libc::getuid() } != authority::SUPERVISOR_UID || unsafe { libc::geteuid() } != 0 {
+        return Err(authority::refused());
+    }
+    let qualified = authentication::QualifiedImage::load()?;
+    let mut channel = authority::Channel::connect()?;
+    let (authorized, signed) = channel.authorize_signed(
+        &authority::Request::Arm {
+            version: 1,
+            selection: selection.clone(),
+        },
+        &selection,
+    )?;
+    let proof = qualified.authenticate(&selection, &authorized, &signed)?;
+    channel.bound_until(proof.deadline())?;
+    Ok((channel, authorized, proof))
 }
-struct ViewAuthority {
-    supervisor: u32,
-    guest: u32,
-    guest_gid: u32,
-    shared: u32,
-    alias: String,
-    role: PrivateRole,
-    model: String,
-}
-fn private_authority(profile: &Profile) -> io::Result<ViewAuthority> {
-    // Selectors are never proof. No release/namespace/current-grant backend
-    // exists here, and VerifiedGrant alone is explicitly NOT launch authority.
-    let _ = (profile.alias_sha256(), profile.generation());
-    Err(io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        "protected private graph/view/namespace/grant/current authority unavailable",
-    ))
-}
-fn private_view(profile: &Profile) -> io::Result<PrivateView> {
-    let authority = private_authority(profile)?;
-    if profile.routing().no_session() != (authority.role == PrivateRole::Master)
-        || profile.routing().model() != Some(authority.model.as_str())
+fn private_view(profile: &Profile, authority: &authority::Authorized) -> io::Result<PrivateView> {
+    if profile.routing().no_session() != (authority.selection.role == authority::Role::Master)
+        || profile.routing().model() != Some(authority.selection.model.as_str())
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -63,9 +68,9 @@ fn private_view(profile: &Profile) -> io::Result<PrivateView> {
     if guest.uid != authority.guest
         || guest.gid != authority.guest_gid
         || supervisor.uid != authority.supervisor
-        || super::group_named(super::policy::SHARED_GROUP) != Some(authority.shared)
+        || super::group_named(super::policy::SHARED_GROUP) != Some(authority.shared_gid)
         || authority.guest_gid == 0
-        || authority.shared == 0
+        || authority.shared_gid == 0
         || authority.supervisor == 0
     {
         return Err(io::Error::new(
@@ -90,17 +95,27 @@ fn private_view(profile: &Profile) -> io::Result<PrivateView> {
         (
             "/srv/cadence/guest-views".to_owned(),
             authority.supervisor,
-            authority.shared,
+            authority.shared_gid,
             0o750,
         ),
-        (base.clone(), authority.supervisor, authority.shared, 0o750),
+        (
+            base.clone(),
+            authority.supervisor,
+            authority.shared_gid,
+            0o750,
+        ),
         (
             format!("{base}/durable"),
             authority.supervisor,
-            authority.shared,
+            authority.shared_gid,
             0o750,
         ),
-        (view.clone(), authority.supervisor, authority.shared, 0o750),
+        (
+            view.clone(),
+            authority.supervisor,
+            authority.shared_gid,
+            0o750,
+        ),
         (
             format!("{base}/durable/sessions"),
             authority.guest,
@@ -110,16 +125,22 @@ fn private_view(profile: &Profile) -> io::Result<PrivateView> {
         (
             "/workspace".to_owned(),
             authority.supervisor,
-            authority.shared,
+            authority.shared_gid,
             0o750,
         ),
         (
             "/workspace/company".to_owned(),
             authority.guest,
-            authority.shared,
+            authority.shared_gid,
             0o770,
         ),
     ];
+    policy.push((
+        format!("{view}/briefing"),
+        authority.supervisor,
+        authority.shared_gid,
+        0o750,
+    ));
     for leaf in ["home", "config", "cache", "tmp", "no-forge"] {
         policy.push((
             format!("{view}/{leaf}"),
@@ -132,12 +153,17 @@ fn private_view(profile: &Profile) -> io::Result<PrivateView> {
         let _verified = open_view_dir(&format!("{view}/{leaf}"), &policy)?;
     }
     let _sessions = open_view_dir(&format!("{base}/durable/sessions"), &policy)?;
+    let _briefing = open_view_dir(&format!("{view}/briefing"), &policy)?;
     let cwd = open_view_dir("/workspace/company", &policy)?;
     let env = derived_env(&view, &authority.alias)?;
     Ok(PrivateView {
         cwd,
         env,
-        session: Some(format!("{base}/durable/sessions/session.json")),
+        // A fresh Pi generation on the SAME runtime must not implicitly reopen
+        // the previous task's chat/session. Home was privately create-new and
+        // is guest:primary0700; no durable-session or credential-copy fallback.
+        // Authorized durable restore is a separate owner operation/milestone.
+        session: (!profile.routing().no_session()).then(|| format!("{view}/home/session.json")),
     })
 }
 fn derived_env(view: &str, alias: &str) -> io::Result<Vec<CString>> {
@@ -145,6 +171,9 @@ fn derived_env(view: &str, alias: &str) -> io::Result<Vec<CString>> {
     [
         format!("HOME={view}/home"),
         format!("PI_CODING_AGENT_DIR={view}/config"),
+        format!("XDG_CONFIG_HOME={view}/config"),
+        format!("CADENCE_BRIEFING_DIR={view}/briefing"),
+        "PI_SKIP_VERSION_CHECK=1".into(),
         format!("XDG_CACHE_HOME={view}/cache"),
         format!("TMPDIR={view}/tmp"),
         format!("GH_CONFIG_DIR={view}/no-forge"),
@@ -200,28 +229,27 @@ fn open_view_dir(path: &str, policy: &[(String, u32, u32, u32)]) -> io::Result<O
 /// Real production preparation used by run, also called by the independent check.
 /// There is no test override, marker, signer, boolean or caller-chosen pin port.
 pub(super) fn prepare(profile: Profile) -> io::Result<OwnedLaunch> {
-    let cli = PRIVATE_PI_CLI.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "protected release/immutable Pi graph pin unavailable",
-        )
-    })?;
-    if NODE_DIGEST.is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "protected Node pin unavailable",
-        ));
-    }
-    let view = private_view(&profile)?;
-    super::protected_effect(); // Actual privately-owned Node-open attempt site.
-    let node = open_node()?;
-    // Disable writable/config-discovered extensions. Any future approved
-    // immutable extension set is private graph policy, never caller -e paths.
+    let (channel, authorized, proof) = private_authority(&profile)?;
+    proof.recheck()?;
+    let view = private_view(&profile, &authorized)?;
+    proof.recheck()?;
+    super::protected_effect(); // Actual privately-owned graph/Node-open site.
+    let graph = graph::Graph::open(&authorized.image)?;
+    let node = verify_file(graph.node()?, 0, 0o755, authorized.image.node_sha256)?;
+    // Disable only discovery of writable/config extensions. Required approved
+    // platform extensions are explicitly loaded from the complete elected graph.
     let mut argv = vec![
         NODE_PATH.to_owned(),
-        cli.to_owned(),
+        format!("{IMAGE_ROOT}/{}", authorized.image.cli),
         "--no-extensions".into(),
+        "--no-approve".into(),
+        "--no-skills".into(),
+        "--no-prompt-templates".into(),
+        "--no-themes".into(),
     ];
+    for extension in &authorized.image.extensions {
+        argv.extend(["--extension".into(), format!("{IMAGE_ROOT}/{extension}")]);
+    }
     argv.extend(profile.routing().tokens());
     // Workers' session paths are private policy-derived, never caller argv.
     if !profile.routing().no_session() {
@@ -238,7 +266,15 @@ pub(super) fn prepare(profile: Profile) -> io::Result<OwnedLaunch> {
                 .clone(),
         ]);
     }
-    OwnedLaunch::new(profile, node, view.cwd, argv, view.env)
+    proof.recheck()?;
+    let mut launch = OwnedLaunch::new(profile, node, view.cwd, argv, view.env)?;
+    launch.authorization = Some(Box::new(PrivateAuthorization {
+        channel,
+        authorized,
+        graph,
+        proof,
+    }));
+    Ok(launch)
 }
 #[repr(C)]
 struct OpenHow {
@@ -274,55 +310,6 @@ fn open_child(parent: i32, name: &str, directory: bool) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
-}
-fn open_node() -> io::Result<File> {
-    let expected = NODE_DIGEST.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Node release pin unavailable",
-        )
-    })?;
-    let root = CString::new("/").unwrap();
-    let fd = unsafe {
-        libc::open(
-            root.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut directory = unsafe { OwnedFd::from_raw_fd(fd) };
-    let parts: Vec<_> = NODE_PATH
-        .strip_prefix('/')
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Node path not fixed absolute"))?
-        .split('/')
-        .collect();
-    for (i, part) in parts.iter().enumerate() {
-        let m = File::from(directory.try_clone()?).metadata()?;
-        if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "mutable/non-root Node ancestor",
-            ));
-        }
-        if part.is_empty() || *part == "." || *part == ".." {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "noncanonical fixed Node path",
-            ));
-        }
-        let leaf = i + 1 == parts.len();
-        let child = open_child(directory.as_raw_fd(), part, !leaf)?;
-        if leaf {
-            return verify_file(File::from(child), 0, 0o755, expected);
-        }
-        directory = child;
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "empty Node path",
-    ))
 }
 #[derive(PartialEq, Eq)]
 struct FileIdentity {
@@ -408,6 +395,12 @@ fn verify_file(file: File, owner: u32, mode: u32, expected: [u8; 32]) -> io::Res
     }
     Ok(file)
 }
+struct PrivateAuthorization {
+    channel: authority::Channel,
+    authorized: authority::Authorized,
+    graph: graph::Graph,
+    proof: authentication::HelperAuthorization,
+}
 /// Owning all CString backing/pointers and private fds, built before the seal.
 /// Never an arbitrary descriptor supplied through the helper CLI.
 pub(super) struct OwnedLaunch {
@@ -418,6 +411,7 @@ pub(super) struct OwnedLaunch {
     env: Box<[CString]>,
     argv_p: Vec<*const libc::c_char>,
     env_p: Vec<*const libc::c_char>,
+    authorization: Option<Box<PrivateAuthorization>>,
 }
 impl OwnedLaunch {
     fn new(
@@ -451,15 +445,30 @@ impl OwnedLaunch {
             env,
             argv_p,
             env_p,
+            authorization: None,
         })
     }
     /// Called ONLY after run proves UID/GID/groups and the capability/NNP seal.
     /// The CLOEXEC Node fd stays open until execveat consumes the inode; no
     /// broad inherited fd survives. Error captures errno before RAII cleanup.
-    pub(super) fn exec(self) -> io::Result<()> {
-        // Recheck the real private current gate immediately after the seal;
-        // a stale preparation fact never authorizes descriptor execution.
-        let _current = private_authority(&self.profile)?;
+    pub(super) fn exec(mut self) -> io::Result<()> {
+        let PrivateAuthorization {
+            channel,
+            authorized,
+            graph,
+            proof,
+        } = *self.authorization.take().ok_or_else(authority::refused)?;
+        authorized.validate(&self.profile.selection().map_err(|_| authority::refused())?)?;
+        proof.recheck()?;
+        // Empty caps + NNP alone do not prevent namespace cap reacquisition.
+        namespace::install()?;
+        graph.recheck()?;
+        proof.recheck()?;
+        // SAME privately opened CLOEXEC channel, not a reconnect after sealing.
+        // Owner verifies current and burns one-use operation before its ACK.
+        // ACK loss is UNKNOWN. Final authority boundary immediately before exec.
+        channel.consume(&authorized)?;
+        proof.recheck()?;
         self.exec_inode()
     }
     fn exec_inode(self) -> io::Result<()> {

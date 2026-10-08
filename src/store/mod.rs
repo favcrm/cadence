@@ -83,9 +83,12 @@ pub mod social_publish;
 pub use plans::{current_verdict, Job, Task, Verdict, JOB_STATES};
 mod quota;
 mod schema;
-mod seal;
+pub(crate) mod seal;
 pub(crate) use schema::open_read_only;
 pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
+pub(crate) use seal::owner::StoreOwnerGrant;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use seal::owner::{Binding, Purpose};
 pub use seal::OpenMode;
 // `WriteTxn` is `pub` so the `ShutdownEntriesHook` test seam (a `pub`
 // `ServeOptions` field) can name it — it is an opaque facade to external

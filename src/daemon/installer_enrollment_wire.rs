@@ -121,16 +121,42 @@ impl TrustedKey {
     }
 }
 
-/// The private production trust-set factory — permanently `Err` until the
-/// operator approves a public-key manifest, an initial trusted version and a
-/// rotation/revocation policy. No live caller may supply trust.
+/// Private qualified-constructor trust-set factory. Missing authentic Root
+/// context remains unavailable; no caller manifest/key or format-valid receipt
+/// may elect public trust. Source integration is not image qualification.
 pub(crate) fn production_trust_set() -> Result<&'static [TrustedKey]> {
-    let _ = PRODUCTION_TRUST_KEYS; // empty — nothing immutable to pin
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        crate::installer_bundle::constructor::receipt_keys().map_err(|error| {
+            Error::rejected(format!(
+                "qualified constructor receipt trust unavailable: {error}"
+            ))
+        })
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     Err(Error::rejected(
-        "production installer-enrollment trust unavailable — no approved \
-         public-key manifest, trusted keyVersion or rotation policy; a \
-         receipt can never mint launch eligibility (UNKNOWN, stays refused)",
+        "qualified constructor receipt trust unavailable",
     ))
+}
+
+/// Only the signature-authenticated private bootstrap token can supply public
+/// receipt pins. No raw key/caller/JWKS factory is exposed.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn keys_from_qualified(
+    bootstrap: &crate::installer_bundle::constructor::QualifiedBootstrap,
+) -> Result<Vec<TrustedKey>> {
+    bootstrap
+        .receipt_records()?
+        .into_iter()
+        .map(|(issuer, kid, key_version, public_key)| {
+            Ok(TrustedKey {
+                issuer,
+                kid,
+                key_version,
+                public_key,
+            })
+        })
+        .collect()
 }
 
 // ─────────────────────── typed receipt evidence shapes ────────────────────

@@ -2343,28 +2343,15 @@ impl ProviderAdapter for PiAdapter {
     /// Pi silently falls back on an unsupported level.
     fn open(&self, agent: &Agent) -> Result<Identity> {
         refuse_confined_devin_agent(agent)?;
-        // CAD-1012: a split daemon (`agent_uid.is_some()`) launches Pi through
-        // the protected seam. The external prerequisites — sealed-helper pin,
-        // namespace policy, pre-start restore lineage — are unavailable this
-        // batch, so this refuses closed before any spawn is constructed. No
-        // guest boolean, restored marker, or refreshed flag satisfies it.
-        #[cfg(not(all(unix, target_os = "linux")))]
+        // A split launch requires the fixed private owner service. Unsupported
+        // hosts refuse before provisioning; selectors never establish authority.
+        #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
         if self.agent_uid.is_some() {
             super::pi_guest::protected_prereqs_satisfied()?;
-            return Err(Error::rejected("protected managed-Pi launch is Linux-only"));
+            return Err(Error::rejected(
+                "protected managed-Pi launch requires Linux x86_64",
+            ));
         }
-        #[cfg(all(unix, target_os = "linux"))]
-        let protected = if let Some(uid) = self.agent_uid {
-            let generation = Uuid::new_v4().simple().to_string();
-            Some(super::pi_guest::GuestCtx::establish(
-                agent,
-                &self.env,
-                uid,
-                &generation,
-            )?)
-        } else {
-            None
-        }; // No caller flag/marker/command can construct this context.
         let master = crate::master::is_master(&agent.alias);
         let params = agent.params.clone().unwrap_or(Value::Null);
         // CAD-559: pi launches only on an explicit model the operator
@@ -2393,6 +2380,18 @@ impl ProviderAdapter for PiAdapter {
             if master { "master" } else { "worker" },
             want,
         )?;
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+        let protected = if let Some(uid) = self.agent_uid {
+            let generation = Uuid::new_v4().simple().to_string();
+            Some(super::pi_guest::GuestCtx::establish(
+                agent,
+                &self.env,
+                uid,
+                &generation,
+            )?)
+        } else {
+            None
+        }; // Real owner provisions BEFORE verify-only topology walk.
         self.shared.master.store(master, Ordering::SeqCst);
         if master && self.agent_uid.is_none() {
             let agenticos_reads = agenticos_read_extension(&self.env)?.is_some();
@@ -2417,12 +2416,12 @@ impl ProviderAdapter for PiAdapter {
             let role = if master { "master" } else { "worker" };
             self.log_confinement(role, policy)?;
         }
-        #[cfg(all(unix, target_os = "linux"))]
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
         let generation = protected
             .as_ref()
             .map(|ctx| ctx.segments().generation_hex())
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string()[..12].to_string());
-        #[cfg(not(all(unix, target_os = "linux")))]
+        #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
         let generation = Uuid::new_v4().simple().to_string()[..12].to_string();
         *self.shared.generation.lock().unwrap() = generation.clone();
         self.shared.dead.store(false, Ordering::SeqCst);
@@ -2571,16 +2570,19 @@ impl ProviderAdapter for PiAdapter {
         // Keep all fallible post-launch work inside one cleanup boundary.
         *self.transport.write().unwrap() = Arc::clone(&transport);
         let initialized = (|| {
-            #[cfg(all(unix, target_os = "linux"))]
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
             let pid = match protected {
                 Some(ctx) => {
                     let routing = crate::protected_pi_profile::Routing::for_agent(master, want)
                         .map_err(Error::rejected)?;
-                    transport.launch_protected(ctx, &routing, &self.log_path)?
+                    let launch = ctx.launch(&routing)?;
+                    // Root alone owns creation/retirement. Adopt ONLY its exact
+                    // stdio pipes/control channel, never a returned PID as custody.
+                    transport.adopt_protected(launch, &self.log_path)?
                 }
                 None => transport.launch(&agent.cwd, &self.log_path, &env)?,
             };
-            #[cfg(not(all(unix, target_os = "linux")))]
+            #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
             let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
             // Effort: validate against the model's real levels, then verify
             // what stuck — Pi answers success even on a silent fallback.

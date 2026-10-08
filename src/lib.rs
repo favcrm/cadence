@@ -35,6 +35,8 @@ pub mod home;
 pub mod inbox;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_bundle;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use installer_bundle::constructor::{helper_image_trust, HelperImageTrust};
 pub mod issue;
 pub mod lease;
 pub mod master;
@@ -79,6 +81,31 @@ pub mod wiki;
 pub mod worktree;
 
 pub use error::{Error, Result};
+
+/// Fixed public-bootstrap entry. Activation remains closed in the CAD-1159
+/// draft; never a configurable exec/sign/credential or diagnostic-authority API.
+pub fn root_constructor_entry() -> Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        installer_bundle::constructor_entry()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        Err(Error::rejected("root constructor requires Linux x86_64"))
+    }
+}
+
+/// Fixed sealed recipient transport; root-owned custody alone may consume.
+pub fn enrolled_recipient_entry() -> Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        installer_bundle::constructor::recipient_entry()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        Err(Error::rejected("enrolled recipient requires Linux x86_64"))
+    }
+}
 
 /// Fixed no-argument non-setuid carrier entry, never a configurable exec API.
 pub fn installer_carrier_entry() -> Result<()> {

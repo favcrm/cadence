@@ -53,22 +53,21 @@ pub mod codex;
 pub mod fake;
 pub mod link;
 pub mod pi;
-// The protected managed-Pi launch seam is Linux-only (openat2 + fd-exec +
-// NSS account topology). On other targets the whole module is a stub whose
-// `protected_prereqs_satisfied` still fails closed — a non-Linux build never
-// reaches a spawn through the split path.
-#[cfg(all(unix, target_os = "linux"))]
+// The protected managed-Pi launch seam requires the Linux x86_64 constructor
+// (held exec, kernel custody and NSS topology). Other targets retain only the
+// fail-closed prerequisite probe; they never reach a protected spawn.
+#[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod pi_guest;
 
-#[cfg(not(all(unix, target_os = "linux")))]
+#[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
 pub(crate) mod pi_guest {
     use crate::error::{Error, Result};
-    /// Non-Linux builds fail closed: the protected launch seam does not exist
-    /// off Linux, so eligibility is permanently UNKNOWN.
+    /// Unsupported builds fail closed: no constructor means eligibility is
+    /// permanently UNKNOWN.
     pub(crate) fn protected_prereqs_satisfied() -> Result<()> {
         Err(Error::rejected(
-            "protected managed-Pi launch is Linux-only — openat2/fd-exec \
-             unavailable; eligibility UNKNOWN and refused",
+            "protected managed-Pi launch requires Linux x86_64 constructor \
+             custody; eligibility UNKNOWN and refused",
         ))
     }
 }
@@ -859,6 +858,11 @@ mod split_launch_tests {
     /// prerequisites. Construction is not launch authority.
     #[test]
     fn managed_pi_constructs_but_open_fails_closed_on_prereqs() {
+        const MODEL: &str = "openai-codex/gpt-6.1-sol";
+        let pm = tempfile::tempdir().unwrap();
+        let env = ProviderEnv::refusing_providers();
+        // Per-instance override: neither case may read an ambient operator PM.
+        env.set("CADENCE_PM_DIR", pm.path().to_string_lossy().into_owned());
         let agent = Agent {
             alias: "fixture-worker".into(),
             provider: "pi".into(),
@@ -875,7 +879,7 @@ mod split_launch_tests {
             pid: None,
             pid_start: None,
             endpoint: None,
-            params: Some(serde_json::json!({"model":"devin/swe-2-high"})),
+            params: Some(serde_json::json!({"model":MODEL})),
             model_selection: None,
             quota: None,
             generation: None,
@@ -886,23 +890,51 @@ mod split_launch_tests {
             updated: 0.0,
         };
         let hooks = AdapterHooks {
-            on_event: Box::new(|_, _| {}),
-            on_request: Box::new(|_| {}),
+            on_event: Box::new(|_, _| panic!("refused Pi open emitted traffic")),
+            on_request: Box::new(|_| panic!("refused Pi open requested authority")),
         };
         let adapter = build(
             &agent,
             hooks,
             std::path::Path::new("/nonexistent/fixture.log"),
-            &ProviderEnv::refusing_providers(),
+            &env,
             Some(21001),
         )
         .unwrap_or_else(|e| panic!("managed/pi constructs under split: {e}"));
-        // open() must fail closed — the protected prerequisites are absent.
-        let e = match adapter.open(&agent) {
-            Err(e) => e,
+        // Preserve actual model-policy refusal before establishing the isolated,
+        // explicitly user-approved policy. Missing policy must still allow nothing.
+        assert!(crate::pi_policy::read(pm.path()).unwrap().is_none());
+        match adapter.open(&agent) {
+            Err(crate::Error::Rejected(message)) => assert_eq!(
+                message,
+                format!(
+                    "pi worker model '{MODEL}' is not on the operator's allowlist (allowed: \
+                     nothing — pm.yaml has no [pi].models.allow entries) — the operator pins \
+                     the pi model set in pm.yaml [pi].models.allow (CAD-559, CAD-575)"
+                )
+            ),
+            Err(e) => panic!("open did not reach the absent-model-policy guard: {e}"),
+            Ok(_) => panic!("open succeeded without a model policy"),
+        }
+        std::fs::write(
+            pm.path().join("pm.yaml"),
+            format!("pi:\n  models:\n    allow: [{MODEL}]\n"),
+        )
+        .unwrap();
+        let policy = crate::pi_policy::read(pm.path()).unwrap();
+        assert!(policy.is_some());
+        crate::pi_policy::require_allowed(policy.as_ref(), "worker", MODEL).unwrap();
+        // Policy approval is not protected authority. This ordinary caller lacks
+        // the fixed supervisor prerequisite; no UID switch, key or permit is supplied.
+        // This is caller refusal only, not crypto/kernel/current qualification.
+        match adapter.open(&agent) {
+            Err(crate::Error::Rejected(message)) => assert_eq!(
+                message,
+                "protected Pi must be provisioned by the fixed supervisor"
+            ),
+            Err(e) => panic!("open did not reach the protected supervisor-caller guard: {e}"),
             Ok(_) => panic!("open succeeded with the prerequisites unavailable"),
-        };
-        assert!(e.to_string().contains("UNKNOWN"), "{e}");
+        }
     }
     #[test]
     fn split_managed_and_remote_paths_refuse_before_constructors() {

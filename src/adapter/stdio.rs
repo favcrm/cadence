@@ -10,9 +10,12 @@
 //! flips `disconnected` and resolves every pending request with
 //! `OutcomeUnknown` — callers must not retry blindly.
 
-use std::io::{BufRead, BufReader, Write};
+#[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -103,15 +106,47 @@ pub struct StdioAdapter {
     /// The child's stdin, locked apart from [`Inner`]: a write blocked
     /// on a full pipe must never hold up a signal, an exit poll or the
     /// close that would unblock it (CAD-323).
-    stdin: Mutex<Option<ChildStdin>>,
+    stdin: Mutex<Option<PipeInput>>,
     pending: Pending,
     disconnected: AtomicBool,
     /// Raw newline-delimited event stream (no JSON-RPC framing).
     raw_lines: bool,
 }
 
+enum PipeInput {
+    Local(ChildStdin),
+    #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+    Protected(File),
+}
+impl Write for PipeInput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Local(pipe) => pipe.write(bytes),
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+            Self::Protected(pipe) => pipe.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Local(pipe) => pipe.flush(),
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+            Self::Protected(pipe) => pipe.flush(),
+        }
+    }
+}
+impl AsRawFd for PipeInput {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Self::Local(pipe) => pipe.as_raw_fd(),
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+            Self::Protected(pipe) => pipe.as_raw_fd(),
+        }
+    }
+}
 struct Inner {
     child: Option<Child>,
+    #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+    remote: Option<Arc<crate::protected_pi_profile::authority::RemoteControl>>,
 }
 
 impl StdioAdapter {
@@ -148,7 +183,11 @@ impl StdioAdapter {
             env_scrub,
             on_message,
             on_disconnect,
-            inner: Mutex::new(Inner { child: None }),
+            inner: Mutex::new(Inner {
+                child: None,
+                #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+                remote: None,
+            }),
             stdin: Mutex::new(None),
             pending: Pending::new(),
             disconnected: AtomicBool::new(false),
@@ -220,33 +259,33 @@ impl StdioAdapter {
         self.adopt_child(crate::reaper::spawn(&mut command)?)
     }
 
-    /// Typed protected transport. No command/env/cwd from agent params enters
-    /// this path; only the owned context can yield a bound helper exec plan.
-    #[cfg(all(unix, target_os = "linux"))]
-    pub(crate) fn launch_protected(
+    /// Adopt ONLY the fixed root-created helper's validated stdio and retained
+    /// finite control channel. No local SUID exec, PID adoption or signal path.
+    #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn adopt_protected(
         self: &Arc<Self>,
-        context: super::pi_guest::GuestCtx,
-        routing: &crate::protected_pi_profile::Routing,
+        launch: crate::protected_pi_profile::authority::RemoteLaunch,
         stderr_log: &std::path::Path,
     ) -> Result<u32> {
-        let plan = context.spawn_plan(routing)?;
-        {
-            let log = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(stderr_log)?;
-            // Not a pathname fallback: pre_exec must consume the verified fd.
-            // This deliberately nonexistent target refuses if fd-exec cannot run.
-            let mut command = Command::new("/cadence-protected-fd-exec-only");
-            command
-                .env_clear()
-                .current_dir("/")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::from(log));
-            plan.attach(&mut command);
-            self.adopt_child(crate::reaper::spawn(&mut command)?)
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(stderr_log)?;
+        let (stdin, stdout, mut stderr, control) = launch.into_parts();
+        let pid = control.pid(); // observation ONLY, never local ownership
+        let mut inner = self.inner.lock().unwrap();
+        if inner.child.is_some() || inner.remote.is_some() {
+            return Err(Error::rejected("provider already owns a transport"));
         }
+        *self.stdin.lock().unwrap() = Some(PipeInput::Protected(stdin));
+        inner.remote = Some(Arc::new(control));
+        drop(inner);
+        thread::spawn(move || {
+            let _ = std::io::copy(&mut stderr, &mut log);
+        });
+        let adapter = Arc::clone(self);
+        thread::spawn(move || adapter.read_loop(stdout));
+        Ok(pid)
     }
 
     fn adopt_child(self: &Arc<Self>, mut child: std::process::Child) -> Result<u32> {
@@ -260,7 +299,7 @@ impl StdioAdapter {
             .take()
             .ok_or_else(|| Error::internal("provider stdout unavailable"))?;
         {
-            *self.stdin.lock().unwrap() = Some(stdin);
+            *self.stdin.lock().unwrap() = Some(PipeInput::Local(stdin));
             self.inner.lock().unwrap().child = Some(child);
         }
         let adapter = Arc::clone(self);
@@ -268,7 +307,7 @@ impl StdioAdapter {
         Ok(pid)
     }
 
-    fn read_loop(self: Arc<Self>, stdout: ChildStdout) {
+    fn read_loop(self: Arc<Self>, stdout: impl Read) {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
@@ -399,7 +438,12 @@ impl StdioAdapter {
     }
 
     pub fn pid(&self) -> Option<u32> {
-        self.inner.lock().unwrap().child.as_ref().map(Child::id)
+        let inner = self.inner.lock().unwrap();
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+        if let Some(remote) = &inner.remote {
+            return Some(remote.pid());
+        }
+        inner.child.as_ref().map(Child::id)
     }
 
     pub fn disconnected(&self) -> bool {
@@ -422,6 +466,18 @@ impl StdioAdapter {
     /// Interrupt the running turn without killing the process (SIGINT
     /// to the provider's own process group).
     pub fn interrupt(&self) {
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+        {
+            let remote = self.inner.lock().unwrap().remote.clone();
+            if let Some(remote) = remote {
+                if remote.interrupt().is_err() {
+                    self.disconnected.store(true, Ordering::SeqCst);
+                    self.pending
+                        .fail_all("Protected provider interrupt UNKNOWN");
+                }
+                return; // NEVER signal its observed PID locally
+            }
+        }
         self.signal_group(libc::SIGINT);
     }
 
@@ -447,6 +503,25 @@ impl StdioAdapter {
     /// Poll for child exit up to `timeout`; true when the process ended.
     pub fn wait_exit(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+        {
+            let remote = self.inner.lock().unwrap().remote.clone();
+            if let Some(remote) = remote {
+                loop {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    match remote.status_until(deadline) {
+                        Ok(crate::protected_pi_profile::authority::ProcessPhase::Exited) => {
+                            return true
+                        }
+                        Ok(crate::protected_pi_profile::authority::ProcessPhase::Running) => {}
+                        _ => return false, // lost authority/IO is UNKNOWN, NOT exit
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
         loop {
             {
                 let mut inner = self.inner.lock().unwrap();
@@ -466,6 +541,25 @@ impl StdioAdapter {
     /// Graceful terminate, then kill — scoped to this adapter's own process
     /// group only.
     pub fn close(&self) {
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+        {
+            let remote = self.inner.lock().unwrap().remote.clone();
+            if let Some(remote) = remote {
+                if remote.retire().is_ok() {
+                    self.inner.lock().unwrap().remote.take();
+                } else {
+                    // Keep the UNKNOWN control state; no-child must not become
+                    // false physical exit evidence and no guessed PID is killed.
+                    self.disconnected.store(true, Ordering::SeqCst);
+                    self.pending
+                        .fail_all("Protected provider retirement UNKNOWN");
+                }
+                if let Ok(mut stdin) = self.stdin.try_lock() {
+                    stdin.take();
+                }
+                return;
+            }
+        }
         let mut inner = self.inner.lock().unwrap();
         if let Some(mut child) = inner.child.take() {
             if child.try_wait().ok().flatten().is_none() {
