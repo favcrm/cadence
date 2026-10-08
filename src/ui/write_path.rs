@@ -41,7 +41,7 @@ pub(crate) fn header_value(request: &Request, name: &'static str) -> Option<Stri
     request
         .headers()
         .iter()
-        .find(|h| h.field.equiv(name))
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
         .map(|h| h.value.as_str().to_string())
 }
 
@@ -577,6 +577,26 @@ pub(crate) fn coded_response(
     let mut resp = Response::from_data(body).with_status_code(StatusCode(status));
     resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
     resp
+}
+
+/// Seconds a client should wait before retrying a busy daemon.
+pub(crate) const BUSY_RETRY_AFTER_SECS: u32 = 2;
+
+/// A daemon `busy` refusal (`resource_busy`: another writer holds the PM
+/// lock) is transient, not a bad request: 503 with `Retry-After`, the
+/// daemon's own code kept in the body. `None` for every other error.
+pub(crate) fn busy_response(e: &Error) -> Option<HttpResp> {
+    if e.kind() != "busy" {
+        return None;
+    }
+    let mut resp = coded_response(
+        503,
+        e.code().unwrap_or("resource_busy"),
+        &e.to_string(),
+        None,
+    );
+    resp.add_header(Header::from_bytes("Retry-After", BUSY_RETRY_AFTER_SECS.to_string()).unwrap());
+    Some(resp)
 }
 
 pub(crate) fn health_supports_model_defaults(health: &Value) -> bool {
@@ -1670,4 +1690,32 @@ pub(crate) fn with_agents(mut payload: Value, by_issue: &Value, id: &str) -> Val
         payload["agents"] = agents.clone();
     }
     payload
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+
+    fn header<'a>(resp: &'a HttpResp, name: &str) -> Option<&'a str> {
+        resp.headers()
+            .iter()
+            .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_str())
+    }
+
+    #[test]
+    fn busy_is_503_retry_after_with_code() {
+        let resp = busy_response(&Error::busy("another live writer holds the lock")).unwrap();
+        assert_eq!(resp.status_code().0, 503);
+        assert_eq!(header(&resp, "Retry-After"), Some("2"));
+        let mut body = String::new();
+        resp.into_reader().read_to_string(&mut body).unwrap();
+        assert!(body.contains("\"code\": \"resource_busy\""), "{body}");
+    }
+
+    #[test]
+    fn other_errors_are_not_busy() {
+        assert!(busy_response(&Error::Rejected("no".into())).is_none());
+        assert!(busy_response(&Error::gate_coded("x", "standing")).is_none());
+    }
 }

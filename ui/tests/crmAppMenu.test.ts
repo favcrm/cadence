@@ -100,6 +100,8 @@ globalThis.fetch = (async (input: unknown) => {
   if (path === "/api/health") return json({ ok: true, pm_present: false, projects: 0, issues: 0, daemon: "stub", embedded: true });
   if (path === "/api/update/banner") return json(null);
   if (path.startsWith("/api/threads/master")) return json({ thread: null, entries: [], more_before: false });
+  // The board lists installations on every screen; a missing route is now a visible error, so serve the list.
+  if (path === "/api/app-installations") return json([crmInstall, notesInstall]);
   if (path === "/api/app-installations/install-crm") return json(crmInstall);
   if (path === "/api/app-installations/install-crm/contexts") return json({ contexts: [
     { id: "ctx-a", install_id: "install-crm", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
