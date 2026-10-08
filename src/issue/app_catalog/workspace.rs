@@ -917,6 +917,16 @@ pub(crate) fn upgrade_recover(pm: &Pm, id: &str, request_id: &str) -> Result<Val
                 "retained upgrade journal is not safe to resume",
             ));
         }
+        let (agents, agent_sources) = workflow::known_agents(&pm.dir, None, &[]);
+        app::validate_texts(
+            journal
+                .files
+                .iter()
+                .map(|(name, text)| (name.clone(), text.clone()))
+                .collect(),
+            &agents,
+            &agent_sources,
+        )?;
         root.put(
             pending_path,
             &yaml(&json!({"install_id":&*id,"request_id":request_id}))?,
@@ -1782,6 +1792,14 @@ pub(crate) fn restore(pm: &Pm, install_id: &str) -> Result<Value> {
             "the restore window closed — this install can only be removed",
         ));
     }
+    let (bundle, _) = entry.paths(&id);
+    let files = snapshot(&root, &bundle, false)?;
+    let manifest = app::parse_manifest(
+        files
+            .get("app.md")
+            .ok_or_else(|| Error::rejected("installed bundle has no manifest"))?,
+    )?;
+    manifest.requires.check(&app::compat_host()?)?;
     record.removed = None;
     record.restore_after = None;
     let record_path = Path::new(".apps/installations")
