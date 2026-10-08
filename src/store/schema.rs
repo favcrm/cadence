@@ -987,84 +987,97 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=35", [])?;
                 tx.commit()?;
             }
-            if version < 36 {
-                // CAD-1143: persist a host-owned five-second post-queue
-                // maturity floor. Historical rows default to mature; every
-                // newly queued row records its own server-derived floor.
-                // Column add skipped when present (the same half-applied
-                // converge as v14/v15/v16): a store that already carries
-                // the column but rolled the version back converges instead
-                // of failing on a duplicate column — but only when the
-                // existing column is the migration's own shape. A column
-                // that merely shares the name (nullable, wrong type, no
-                // CHECK) is schema drift, not an applied migration:
-                // refuse rather than certify it current.
-                if migration_column_present(&conn, "social_publish_intents", "claim_after_epoch")?
-                    && !column_is_shape(
-                        &conn,
-                        "social_publish_intents",
-                        "claim_after_epoch",
-                        true,
-                        "0",
-                        "claim_after_epoch>=0",
-                    )?
-                {
-                    return Err(Error::rejected(
-                        "social_publish_intents.claim_after_epoch exists but is not the v36 \
-                         column (expected INTEGER NOT NULL DEFAULT 0 CHECK(claim_after_epoch>=0)) \
-                         — refusing to mark the store current",
-                    ));
-                }
-                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
-                if !migration_column_present(&conn, "social_publish_intents", "claim_after_epoch")?
-                {
-                    tx.execute_batch(
-                        "ALTER TABLE social_publish_intents ADD COLUMN claim_after_epoch INTEGER NOT NULL DEFAULT 0 CHECK(claim_after_epoch>=0)",
-                    )?;
-                }
-                tx.execute_batch(
-                    "DROP INDEX IF EXISTS social_publish_due;\n\
-                     CREATE INDEX social_publish_due ON social_publish_intents(state,due_epoch,claim_after_epoch,intent_id);",
-                )?;
-                tx.execute("UPDATE schema_version SET version=36", [])?;
-                tx.commit()?;
-            }
             if version < 37 {
-                // CAD-1143: a queue row created by owner attach stays
-                // nondispatchable until a second, post-commit transaction
-                // installs its undo floor and arms claims. Historical rows
-                // were already dispatchable and therefore default armed.
-                // The column add is skipped when present, as v36's is —
-                // with the same verified-shape check: a `claim_armed` that
-                // is not the v37 INTEGER NOT NULL DEFAULT 1 binary CHECK
-                // column is drift, and the open refuses it rather than
-                // marking the store current.
-                if migration_column_present(&conn, "social_publish_intents", "claim_armed")?
-                    && !column_is_shape(
-                        &conn,
-                        "social_publish_intents",
-                        "claim_armed",
-                        true,
-                        "1",
-                        "claim_armed IN (0,1)",
-                    )?
-                {
-                    return Err(Error::rejected(
-                        "social_publish_intents.claim_armed exists but is not the v37 \
-                         column (expected INTEGER NOT NULL DEFAULT 1 CHECK(claim_armed IN (0,1))) \
-                         — refusing to mark the store current",
-                    ));
+                // CAD-1143: v36 recorded a host-owned five-second
+                // post-queue maturity floor (`claim_after_epoch`); v37
+                // kept an owner-attached queue row nondispatchable until
+                // a second, post-commit transaction armed claims
+                // (`claim_armed`). Both land together as one validating
+                // rebuild of `social_publish_intents` — there is no
+                // released store between the two numbers. The rebuild is
+                // unconditional (idempotent: an already-converted table
+                // rebuilds to itself) and, like v38's, it VALIDATES the
+                // existing shape instead of parsing CREATE SQL: the copy
+                // names every column explicitly, so a missing or
+                // differently-named column fails `no such column`, a
+                // column carried in a different physical order maps by
+                // name, and a same-named column whose values violate the
+                // canonical CHECK refuses the copy. Either way the
+                // transaction rolls back and the open refuses rather
+                // than certifying drift. `claim_after_epoch` defaults
+                // every historical row mature; `claim_armed` defaults
+                // them armed (only owner-attach rows ever carry 0, and
+                // none existed before v37). A half-applied/WIP store
+                // that already carries either claim column has its
+                // values copied by name — detected through `PRAGMA
+                // table_info`, never by parsing CREATE text — so a
+                // recorded undo floor or pending arm is never lost. Every
+                // v29 column is required on the old table — a missing one
+                // fails the copy with `no such column` inside this
+                // transaction and the open refuses.
+                let existing = table_column_names(&conn, "social_publish_intents")?;
+                let mut copy: Vec<&str> = vec![
+                    "intent_id",
+                    "request",
+                    "install_id",
+                    "context_id",
+                    "run_id",
+                    "effect_id",
+                    "connection_id",
+                    "destination_id",
+                    "toolkit",
+                    "caption_digest",
+                    "image_digest",
+                    "media_key",
+                    "grant_id",
+                    "approval_id",
+                    "due_epoch",
+                ];
+                // The claim columns ride the copy only when the old table
+                // really carries them; otherwise the canonical DEFAULTs
+                // apply on insert.
+                for claim in ["claim_after_epoch", "claim_armed"] {
+                    if existing.iter().any(|c| c == claim) {
+                        copy.push(claim);
+                    }
                 }
+                copy.extend([
+                    "timezone",
+                    "state",
+                    "frozen",
+                    "frozen_digest",
+                    "receipt",
+                    "upstream",
+                    "created",
+                    "updated",
+                ]);
+                let list = copy.join(",");
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
-                if !migration_column_present(&conn, "social_publish_intents", "claim_armed")? {
-                    tx.execute_batch(
-                        "ALTER TABLE social_publish_intents ADD COLUMN claim_armed INTEGER NOT NULL DEFAULT 1 CHECK(claim_armed IN (0,1))",
-                    )?;
-                }
-                tx.execute_batch(
+                tx.execute_batch(&format!(
                     "DROP INDEX IF EXISTS social_publish_due;\n\
-                     CREATE INDEX social_publish_due ON social_publish_intents(state,claim_armed,due_epoch,claim_after_epoch,intent_id);",
-                )?;
+                     ALTER TABLE social_publish_intents RENAME TO social_publish_intents_v35;\n\
+                     CREATE TABLE social_publish_intents(\n\
+                      intent_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,\n\
+                      install_id TEXT NOT NULL, context_id TEXT, run_id TEXT NOT NULL,\n\
+                      effect_id TEXT NOT NULL, connection_id TEXT NOT NULL,\n\
+                      destination_id TEXT NOT NULL, toolkit TEXT NOT NULL\n\
+                        CHECK(toolkit IN ('instagram','facebook')),\n\
+                      caption_digest TEXT NOT NULL, image_digest TEXT, media_key TEXT,\n\
+                      grant_id TEXT NOT NULL, approval_id TEXT NOT NULL,\n\
+                      due_epoch INTEGER NOT NULL CHECK(due_epoch>0),\n\
+                      claim_after_epoch INTEGER NOT NULL DEFAULT 0 CHECK(claim_after_epoch>=0),\n\
+                      claim_armed INTEGER NOT NULL DEFAULT 1 CHECK(claim_armed IN (0,1)),\n\
+                      timezone TEXT NOT NULL,\n\
+                      state TEXT NOT NULL\n\
+                        CHECK(state IN ('queued','cancelled','processing','posted','refused','held')),\n\
+                      frozen TEXT NOT NULL, frozen_digest TEXT NOT NULL,\n\
+                      receipt TEXT, upstream TEXT, created REAL NOT NULL, updated REAL NOT NULL);\n\
+                     INSERT INTO social_publish_intents({list})\n\
+                     SELECT {list} FROM social_publish_intents_v35;\n\
+                     DROP TABLE social_publish_intents_v35;\n\
+                     CREATE INDEX social_publish_due\n\
+                      ON social_publish_intents(state,claim_armed,due_epoch,claim_after_epoch,intent_id);",
+                ))?;
                 tx.execute("UPDATE schema_version SET version=37", [])?;
                 tx.commit()?;
             }
@@ -1079,7 +1092,10 @@ impl Store {
                 // position still gets the correct lifecycle CHECK; a
                 // table whose own state CHECK excludes the new state set
                 // fails the INSERT INTO SELECT, rolls back and refuses
-                // the open rather than being marked current.
+                // the open rather than being marked current. The copy
+                // names every column on BOTH sides, so a predecessor
+                // whose columns sit in a different physical order maps
+                // by name instead of silently swapping fields.
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(
                     "DROP INDEX IF EXISTS social_publish_prepared_scope;\n\
@@ -1094,7 +1110,19 @@ impl Store {
                       due_epoch INTEGER NOT NULL CHECK(due_epoch>0), not_before_epoch INTEGER NOT NULL, expires_epoch INTEGER NOT NULL,\n\
                       state TEXT NOT NULL CHECK(state IN ('prepared','authorized','cancelled','superseded','refused')),\n\
                       grant_id TEXT, descriptor TEXT NOT NULL, descriptor_digest TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);\n\
-                     INSERT INTO social_publish_prepared SELECT * FROM social_publish_prepared_v37;\n\
+                     INSERT INTO social_publish_prepared(\n\
+                      prepared_id,request,install_id,context_id,run_id,effect_id,connection_id,\n\
+                      aos_connection_id,destination_id,destination_label,toolkit,timezone,\n\
+                      caption_digest,image_digest,media_key,approval_id,mode,due_epoch,\n\
+                      not_before_epoch,expires_epoch,state,grant_id,descriptor,descriptor_digest,\n\
+                      created,updated)\n\
+                     SELECT\n\
+                      prepared_id,request,install_id,context_id,run_id,effect_id,connection_id,\n\
+                      aos_connection_id,destination_id,destination_label,toolkit,timezone,\n\
+                      caption_digest,image_digest,media_key,approval_id,mode,due_epoch,\n\
+                      not_before_epoch,expires_epoch,state,grant_id,descriptor,descriptor_digest,\n\
+                      created,updated\n\
+                     FROM social_publish_prepared_v37;\n\
                      DROP TABLE social_publish_prepared_v37;",
                 )?;
                 tx.execute_batch(
@@ -1735,190 +1763,19 @@ impl std::fmt::Display for ShutdownDrainError {
     }
 }
 
-/// One `PRAGMA table_info` row — enough of the column's definition to
-/// verify an already-applied migration shape instead of trusting that a
-/// shared name means the migration ran (CAD-1143 review).
-struct TableColumn {
-    name: String,
-    declared_type: String,
-    notnull: bool,
-    dflt_value: String,
-}
-
-impl TableColumn {
-    /// The column declares an integer affinity — SQLite's type-name
-    /// rule: a declared type containing `INT` (the migrations declare
-    /// `INTEGER`). `BLOB`/`TEXT`/`REAL` affinities would accept values
-    /// the migration's column refuses.
-    fn integer_affinity(&self) -> bool {
-        self.declared_type.to_ascii_uppercase().contains("INT")
-    }
-}
-
-/// Every `PRAGMA table_info` row for `table`, or an empty list when the
-/// table does not exist. `dflt_value` is the raw SQL default text — a
-/// plain `0`/`1` for the guard columns these migrations add.
-fn table_columns(conn: &Connection, table: &str) -> Result<Vec<TableColumn>> {
+/// The column names `table` declares, in physical order — the
+/// `PRAGMA table_info` field a rebuild migration uses to decide whether
+/// an already-present (half-applied) claim column's values ride the
+/// row copy or the canonical DEFAULT applies. No CREATE-SQL text is
+/// ever parsed: shape is enforced by the named-column copy into the
+/// canonical table.
+fn table_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
     let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = statement
-        .query_map([], |row| {
-            Ok(TableColumn {
-                name: row.get::<_, String>(1)?,
-                declared_type: row.get::<_, String>(2)?,
-                notnull: row.get::<_, i64>(3)? != 0,
-                dflt_value: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-            })
-        })?
+        .query_map([], |row| row.get::<_, String>(1))?
         .filter_map(std::result::Result::ok)
         .collect();
     Ok(columns)
-}
-
-/// A pre-existing `name` column on `table` is the exact column an
-/// `ADD COLUMN` migration would install — declared type, NOT NULL and
-/// default from PRAGMA, plus the column's CHECK parsed off the table's
-/// CREATE SQL (PRAGMA table_info never reports CHECKs). Anything weaker
-/// or different is drift the open must refuse, not an applied step the
-/// version may skip.
-fn column_is_shape(
-    conn: &Connection,
-    table: &str,
-    name: &str,
-    notnull: bool,
-    dflt_value: &str,
-    check: &str,
-) -> Result<bool> {
-    let Some(column) = table_columns(conn, table)?
-        .into_iter()
-        .find(|c| c.name == name)
-    else {
-        return Ok(false);
-    };
-    if !column.integer_affinity() || column.notnull != notnull || column.dflt_value != dflt_value {
-        return Ok(false);
-    }
-    let check = format!("({check})");
-    Ok(table_sql(conn, table)?
-        .is_some_and(|sql| column_check_predicates(&sql, name).any(|p| p == check)))
-}
-
-/// Whether `table` carries a column named `name` — the bare presence
-/// check the verified-shape test pairs with.
-fn migration_column_present(conn: &Connection, table: &str, name: &str) -> Result<bool> {
-    Ok(table_columns(conn, table)?.iter().any(|c| c.name == name))
-}
-
-/// The CREATE TABLE text `table` was built with, if it exists.
-fn table_sql(conn: &Connection, table: &str) -> Result<Option<String>> {
-    conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?1")?
-        .query_row([table], |row| row.get::<_, String>(0))
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            e => Err(e.into()),
-        })
-}
-
-/// The `CHECK(...)` predicates written on `column`'s own definition —
-/// every parenthesized group that follows the word `CHECK` before the
-/// column's definition ends at its comma or the table's closing paren.
-/// Table-level CHECKs and other columns' constraints never surface
-/// here, so an unrelated `'cancelled'` elsewhere in the SQL cannot pass
-/// as this column's constraint. Matching is word-bounded, depth- and
-/// quote-aware: `x_check_armed` is not `claim_armed`, `DEFAULT '('`
-/// never opens a group and a nested `IN (0,1)` cannot end one early.
-fn column_check_predicates<'a>(sql: &'a str, column: &str) -> impl Iterator<Item = &'a str> {
-    let bytes = sql.as_bytes();
-    let mut found = Vec::new();
-    let mut start = 0usize;
-    while let Some(off) = sql[start..].find(column) {
-        let at = start + off;
-        let end = at + column.len();
-        let bounded = (at == 0 || !is_ident_byte(bytes[at - 1]))
-            && (end == bytes.len() || !is_ident_byte(bytes[end]));
-        if bounded {
-            let mut i = end;
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'\'' => i = skip_literal(bytes, i),
-                    b'(' => {
-                        // A group preceded by the word `CHECK` is this
-                        // column's own constraint predicate.
-                        let word_end = bytes[..i]
-                            .iter()
-                            .rposition(|b| !b.is_ascii_whitespace())
-                            .map_or(0, |p| p + 1);
-                        let word_start = bytes[..word_end]
-                            .iter()
-                            .rposition(|b| !is_ident_byte(*b))
-                            .map_or(0, |p| p + 1);
-                        if sql[word_start..word_end].eq_ignore_ascii_case("check") {
-                            let (group, close) = parenthesized(&sql[i..]);
-                            found.push(group);
-                            i += close;
-                            continue;
-                        }
-                        let (_, close) = parenthesized(&sql[i..]);
-                        i += close;
-                    }
-                    b',' | b')' => break,
-                    _ => i += 1,
-                }
-            }
-        }
-        start = end;
-    }
-    found.into_iter()
-}
-
-/// Skip a `'...'` literal starting at `bytes[at] == '\''`, honouring
-/// SQL's doubled-quote escape; returns the index past its close.
-fn skip_literal(bytes: &[u8], mut at: usize) -> usize {
-    at += 1;
-    while at < bytes.len() {
-        if bytes[at] == b'\'' {
-            at += 1;
-            if at < bytes.len() && bytes[at] == b'\'' {
-                at += 1;
-            } else {
-                break;
-            }
-        } else {
-            at += 1;
-        }
-    }
-    at
-}
-
-/// The parenthesized group at `text[0] == '('` — the balanced span
-/// itself and its length. Unbalanced input yields the rest of `text`.
-fn parenthesized(text: &str) -> (&str, usize) {
-    let bytes = text.as_bytes();
-    let mut depth = 0i32;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' => {
-                i = skip_literal(bytes, i);
-                continue;
-            }
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    i += 1;
-                    return (&text[..i], i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    (text, text.len())
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// sqlite errors worth a fresh shutdown transaction: BUSY — whose

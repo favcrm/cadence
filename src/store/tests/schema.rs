@@ -1462,46 +1462,267 @@
             .unwrap()
     }
 
+    /// Seed one valid queue row through the store API, then return the
+    /// db path — the fixture for the rebuild cases below. `request` is
+    /// the idempotency key the caller picks per case.
+    fn queued_intent_db(dir: &TempDir, request: &str) -> std::path::PathBuf {
+        let db = migrated_db(dir);
+        {
+            let s = Store::open(&db).unwrap();
+            s.fixture_write(|conn| {
+                conn.execute(
+                    "INSERT INTO social_publish_intents(
+                      intent_id,request,install_id,context_id,run_id,effect_id,
+                      connection_id,destination_id,toolkit,caption_digest,
+                      image_digest,media_key,grant_id,approval_id,due_epoch,
+                      claim_after_epoch,claim_armed,timezone,state,frozen,
+                      frozen_digest,receipt,upstream,created,updated)
+                     VALUES('i1',?,'inst',NULL,'run','eff','conn','dest',
+                      'instagram','cap',NULL,NULL,'g','appr',10,0,1,'UTC',
+                      'queued','{}','d',NULL,NULL,1,1)",
+                    [request],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        db
+    }
+
+    /// The genuine v29 `social_publish_intents` column block — every
+    /// column the v37 rebuild's named copy requires, without either
+    /// claim column. `fabricate_intents` appends a caller `tail` so a
+    /// case can end the table with a comment, a literal or extra
+    /// columns.
+    const V29_INTENTS_COLUMNS: &str = "
+     intent_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,
+     install_id TEXT NOT NULL, context_id TEXT, run_id TEXT NOT NULL,
+     effect_id TEXT NOT NULL, connection_id TEXT NOT NULL,
+     destination_id TEXT NOT NULL, toolkit TEXT NOT NULL
+       CHECK(toolkit IN ('instagram','facebook')),
+     caption_digest TEXT NOT NULL, image_digest TEXT, media_key TEXT,
+     grant_id TEXT NOT NULL, approval_id TEXT NOT NULL,
+     due_epoch INTEGER NOT NULL CHECK(due_epoch>0), timezone TEXT NOT NULL,
+     state TEXT NOT NULL
+       CHECK(state IN ('queued','cancelled','processing','posted','refused','held')),
+     frozen TEXT NOT NULL, frozen_digest TEXT NOT NULL,
+     receipt TEXT, upstream TEXT, created REAL NOT NULL, updated REAL NOT NULL";
+
+    /// Rebuild `social_publish_intents` as a v35-or-earlier
+    /// predecessor — the v29 columns plus `tail` — carrying one row,
+    /// then roll the recorded version back so the real open migrates
+    /// it. The closing `)` sits on its own line so a `--` tail cannot
+    /// comment it out.
+    fn fabricate_intents(db: &std::path::Path, tail: &str, version: i64) {
+        Connection::open(db)
+            .unwrap()
+            .execute_batch(&format!(
+                "DROP INDEX IF EXISTS social_publish_due;
+                 DROP TABLE social_publish_intents;
+                 CREATE TABLE social_publish_intents({V29_INTENTS_COLUMNS}{tail}\n);
+                 INSERT INTO social_publish_intents(
+                  intent_id,request,install_id,context_id,run_id,effect_id,
+                  connection_id,destination_id,toolkit,caption_digest,
+                  image_digest,media_key,grant_id,approval_id,due_epoch,
+                  timezone,state,frozen,frozen_digest,receipt,upstream,
+                  created,updated)
+                 VALUES('i1','req-x','inst',NULL,'run','eff','conn','dest',
+                  'instagram','cap',NULL,NULL,'g','appr',10,'UTC','queued',
+                  '{{}}','d',NULL,NULL,1,1);
+                 UPDATE schema_version SET version={version};",
+            ))
+            .unwrap();
+    }
+
+    /// Every fake-CHECK spoof the reviews reproduced ends with the real
+    /// canonical table — a rebuild, never a text-promoted drift: the
+    /// open converges, the version is current, and the claim guards
+    /// actually refuse bad writes.
     #[test]
-    fn migration_v36_v37_refuse_an_incompatible_same_name_column() {
-        // A column that merely shares the migration's name is drift,
-        // not an applied step: a nullable TEXT `claim_armed` with no
-        // default or CHECK accepts nonbinary values, so converging the
-        // version would certify a guard that never installed. The open
-        // must refuse and leave the recorded version behind.
+    fn migration_v37_rebuild_enforces_the_real_claim_constraints() {
+        for (name, column, tail) in [
+            // A CHECK only inside a block comment certifies nothing.
+            (
+                "block-comment",
+                "claim_armed",
+                ", claim_armed INTEGER NOT NULL DEFAULT 1 /* CHECK(claim_armed IN (0,1)) */",
+            ),
+            // The line-comment analogue.
+            (
+                "line-comment",
+                "claim_armed",
+                ", claim_armed INTEGER NOT NULL DEFAULT 1 -- CHECK(claim_armed IN (0,1))",
+            ),
+            // The purported predicate inside another column's DEFAULT
+            // string literal.
+            (
+                "default-literal",
+                "claim_armed",
+                ", shape_note TEXT DEFAULT 'claim_armed CHECK(claim_armed IN (0,1))'",
+            ),
+            // A column whose own CHECK contradicts the migration's
+            // (accepts 7, refuses the legitimate unarmed 0).
+            (
+                "contradicting",
+                "claim_armed",
+                ", claim_armed INTEGER NOT NULL DEFAULT 1 CHECK(claim_armed=1)",
+            ),
+            // A quoted identifier carrying CHECK-looking text.
+            (
+                "quoted-identifier",
+                "claim_armed",
+                ", \"x CHECK(claim_armed IN (0,1))\" TEXT",
+            ),
+            // A real CHECK whose predicate hides the spoof in a comment.
+            (
+                "commented-predicate",
+                "claim_armed",
+                ", claim_armed INTEGER NOT NULL DEFAULT 1 CHECK(1 /* claim_armed CHECK(claim_armed IN (0,1)) */)",
+            ),
+            // The same classes on the v36 epoch column.
+            (
+                "epoch-comment",
+                "claim_after_epoch",
+                ", claim_after_epoch INTEGER NOT NULL DEFAULT 0 /* CHECK(claim_after_epoch>=0) */",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let db = queued_intent_db(&dir, name);
+            fabricate_intents(&db, tail, 35);
+            Store::open_for_schema_tests(&db)
+                .unwrap_or_else(|e| panic!("{name}: a spoofed shape must converge, not fail: {e}"));
+            assert_eq!(
+                db_version(&db),
+                crate::rollout::SCHEMA_VERSION,
+                "{name}: the rebuild must mark the store current"
+            );
+            let c = Connection::open(&db).unwrap();
+            match column {
+                "claim_armed" => {
+                    // The canonical binary guard is the one enforced —
+                    // inert comment/literal text is not a constraint.
+                    c.execute(
+                        "INSERT INTO social_publish_intents(
+                          intent_id,request,install_id,run_id,effect_id,
+                          connection_id,destination_id,toolkit,caption_digest,
+                          grant_id,approval_id,due_epoch,claim_armed,timezone,
+                          state,frozen,frozen_digest,created,updated)
+                         VALUES('i2','req-2','inst','run','eff','conn','dest',
+                          'instagram','cap','g','appr',10,7,'UTC','queued',
+                          '{}','d',1,1)",
+                        [],
+                    )
+                    .expect_err("{name}: claim_armed=7 must violate the real CHECK");
+                }
+                "claim_after_epoch" => {
+                    c.execute(
+                        "INSERT INTO social_publish_intents(
+                          intent_id,request,install_id,run_id,effect_id,
+                          connection_id,destination_id,toolkit,caption_digest,
+                          grant_id,approval_id,due_epoch,claim_after_epoch,
+                          timezone,state,frozen,frozen_digest,created,updated)
+                         VALUES('i2','req-2','inst','run','eff','conn','dest',
+                          'instagram','cap','g','appr',10,-1,'UTC','queued',
+                          '{}','d',1,1)",
+                        [],
+                    )
+                    .expect_err("{name}: claim_after_epoch=-1 must violate the real CHECK");
+                }
+                other => panic!("unknown column {other}"),
+            }
+            // The surviving v29 row carried across the rebuild.
+            assert_eq!(
+                c.query_row(
+                    "SELECT state FROM social_publish_intents WHERE intent_id='i1'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+                "queued",
+                "{name}: the rebuild dropped the retained row"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_v37_rebuild_preserves_rows_and_half_applied_claim_values() {
+        // A genuinely migrated store at v35/v36 with rolled-back
+        // version converges losslessly: every v29 row keeps its bytes,
+        // and a claim column the old table already carries (the
+        // half-applied case) keeps ITS values rather than the DEFAULT —
+        // an owner-attached row's recorded floor and disarmed flag must
+        // survive the rebuild.
         let dir = TempDir::new().unwrap();
-        let db = migrated_db(&dir);
+        let db = queued_intent_db(&dir, "req-keep");
         Connection::open(&db)
             .unwrap()
             .execute_batch(
-                "DROP INDEX social_publish_due;
-                 ALTER TABLE social_publish_intents DROP COLUMN claim_armed;
-                 ALTER TABLE social_publish_intents ADD COLUMN claim_armed TEXT;
+                "UPDATE social_publish_intents
+                  SET claim_after_epoch=40,claim_armed=0 WHERE intent_id='i1';
                  UPDATE schema_version SET version=36;",
             )
             .unwrap();
-        let error = Store::open_for_schema_tests(&db)
-            .err()
-            .expect("an incompatible claim_armed must refuse the open");
-        assert!(error.to_string().contains("claim_armed"), "{error}");
-        assert_eq!(db_version(&db), 36, "refusal must not bump the version");
+        Store::open_for_schema_tests(&db).unwrap();
+        let c = Connection::open(&db).unwrap();
+        let (floor, armed): (i64, i64) = c
+            .query_row(
+                "SELECT claim_after_epoch,claim_armed FROM social_publish_intents WHERE intent_id='i1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((floor, armed), (40, 0), "half-applied claim values lost");
 
-        // Same class at v36: a nullable claim_after_epoch without its
-        // NOT NULL/default/CHECK is not the applied column either.
+        // A v35 predecessor without either claim column defaults
+        // historical rows mature+armed (they were always dispatchable).
+        let dir = TempDir::new().unwrap();
+        let db = queued_intent_db(&dir, "req-v35");
+        fabricate_intents(&db, "", 34);
+        Store::open_for_schema_tests(&db).unwrap();
+        let c = Connection::open(&db).unwrap();
+        let (floor, armed): (i64, i64) = c
+            .query_row(
+                "SELECT claim_after_epoch,claim_armed FROM social_publish_intents WHERE intent_id='i1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((floor, armed), (0, 1), "canonical defaults not applied");
+    }
+
+    #[test]
+    fn migration_v37_rebuild_refuses_drift_and_preserves_the_version() {
+        // A predecessor that drops a required v29 column cannot copy:
+        // `no such column` inside the migration transaction rolls back
+        // and the open refuses rather than certifying a partial shape.
+        let dir = TempDir::new().unwrap();
+        let db = queued_intent_db(&dir, "req-drop");
         Connection::open(&db)
             .unwrap()
             .execute_batch(
                 "DROP INDEX IF EXISTS social_publish_due;
-                 ALTER TABLE social_publish_intents DROP COLUMN claim_armed;
-                 ALTER TABLE social_publish_intents DROP COLUMN claim_after_epoch;
-                 ALTER TABLE social_publish_intents ADD COLUMN claim_after_epoch TEXT;
+                 ALTER TABLE social_publish_intents DROP COLUMN frozen_digest;
                  UPDATE schema_version SET version=35;",
             )
             .unwrap();
-        let error = Store::open_for_schema_tests(&db)
+        Store::open_for_schema_tests(&db)
             .err()
-            .expect("an incompatible claim_after_epoch must refuse the open");
-        assert!(error.to_string().contains("claim_after_epoch"), "{error}");
+            .expect("a missing required column must refuse the open");
+        assert_eq!(db_version(&db), 35, "refusal must not bump the version");
+
+        // An extra same-named column whose values violate the canonical
+        // CHECK refuses the copy the same way — a `claim_armed=7` row
+        // can never slip past the binary guard by riding a WIP column.
+        let dir = TempDir::new().unwrap();
+        let db = queued_intent_db(&dir, "req-drift");
+        fabricate_intents(&db, ", claim_armed INTEGER", 35);
+        Connection::open(&db)
+            .unwrap()
+            .execute("UPDATE social_publish_intents SET claim_armed=7 WHERE intent_id='i1'", [])
+            .unwrap();
+        Store::open_for_schema_tests(&db)
+            .err()
+            .expect("out-of-range claim values must refuse the copy");
         assert_eq!(db_version(&db), 35, "refusal must not bump the version");
     }
 
@@ -1564,4 +1785,97 @@
             "label",
             "the rebuild dropped the existing row"
         );
+    }
+
+    #[test]
+    fn migration_v38_rebuild_maps_columns_by_name_not_position() {
+        // A positional `SELECT *` copy silently swaps same-typed
+        // fields when the predecessor's physical column order differs.
+        // The named copy binds source to target by name, so a v37
+        // table whose `destination_label` precedes `destination_id`
+        // preserves every row byte-for-byte BY NAME — no silent
+        // destination identity swap.
+        let dir = TempDir::new().unwrap();
+        let db = migrated_db(&dir);
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX social_publish_prepared_scope;
+                 ALTER TABLE social_publish_prepared RENAME TO social_publish_prepared_orig;
+                 CREATE TABLE social_publish_prepared(
+                  prepared_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,
+                  install_id TEXT NOT NULL, context_id TEXT, run_id TEXT NOT NULL,
+                  effect_id TEXT NOT NULL, connection_id TEXT NOT NULL, aos_connection_id TEXT,
+                  destination_label TEXT NOT NULL, destination_id TEXT NOT NULL,
+                  toolkit TEXT NOT NULL, timezone TEXT NOT NULL,
+                  caption_digest TEXT NOT NULL, image_digest TEXT, media_key TEXT,
+                  approval_id TEXT NOT NULL,
+                  mode TEXT NOT NULL CHECK(mode IN ('now','schedule')),
+                  due_epoch INTEGER NOT NULL CHECK(due_epoch>0),
+                  not_before_epoch INTEGER NOT NULL, expires_epoch INTEGER NOT NULL,
+                  state TEXT NOT NULL CHECK(state IN ('prepared','authorized','superseded','refused')),
+                  grant_id TEXT, descriptor TEXT NOT NULL, descriptor_digest TEXT NOT NULL,
+                  created REAL NOT NULL, updated REAL NOT NULL);
+                 INSERT INTO social_publish_prepared(
+                  prepared_id,request,install_id,context_id,run_id,effect_id,connection_id,
+                  aos_connection_id,destination_label,destination_id,toolkit,timezone,
+                  caption_digest,image_digest,media_key,approval_id,mode,due_epoch,
+                  not_before_epoch,expires_epoch,state,grant_id,descriptor,descriptor_digest,
+                  created,updated)
+                 SELECT
+                  prepared_id,request,install_id,context_id,run_id,effect_id,connection_id,
+                  aos_connection_id,destination_label,destination_id,toolkit,timezone,
+                  caption_digest,image_digest,media_key,approval_id,mode,due_epoch,
+                  not_before_epoch,expires_epoch,state,grant_id,descriptor,descriptor_digest,
+                  created,updated
+                 FROM social_publish_prepared_orig;
+                 DROP TABLE social_publish_prepared_orig;
+                 UPDATE schema_version SET version=37;",
+            )
+            .unwrap();
+        // Seed a row with distinct destination_id/destination_label so a
+        // positional swap is visible.
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO social_publish_prepared(
+                  prepared_id,request,install_id,context_id,run_id,effect_id,connection_id,
+                  aos_connection_id,destination_id,destination_label,toolkit,timezone,
+                  caption_digest,image_digest,media_key,approval_id,mode,due_epoch,
+                  not_before_epoch,expires_epoch,state,grant_id,descriptor,descriptor_digest,
+                  created,updated)
+                 VALUES('p2','req2','inst',NULL,'run','eff','conn',NULL,
+                  'dest-id','the-label','facebook','UTC','cap',NULL,NULL,'appr','now',10,0,20,
+                  'prepared',NULL,'{}','d2',2,2)",
+                [],
+            )
+            .unwrap();
+        {
+            let _s = Store::open_for_schema_tests(&db).unwrap();
+            assert_eq!(db_version(&db), crate::rollout::SCHEMA_VERSION);
+        }
+        let c = Connection::open(&db).unwrap();
+        let (id, label): (String, String) = c
+            .query_row(
+                "SELECT destination_id,destination_label FROM social_publish_prepared WHERE prepared_id='p2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (id.as_str(), label.as_str()),
+            ("dest-id", "the-label"),
+            "named copy must preserve destination identity, not swap the pair"
+        );
+        // The lifecycle CHECK is still installed on the rebuilt table.
+        c.execute(
+            "UPDATE social_publish_prepared SET state='cancelled' WHERE prepared_id='p2'",
+            [],
+        )
+        .expect("rebuilt state CHECK must admit cancelled");
+        c.execute(
+            "UPDATE social_publish_prepared SET state='bogus' WHERE prepared_id='p2'",
+            [],
+        )
+        .expect_err("rebuilt state CHECK must refuse a bogus state");
     }
