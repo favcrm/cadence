@@ -1364,7 +1364,16 @@ pub(crate) enum CatalogAction {
         rollback: bool,
     },
     /// Install a validated bundle without creating a project or grants.
-    Install { source: String },
+    Install {
+        source: String,
+        /// Refuse unless the resolved bundle digest equals this value, as
+        /// returned by `install-check`. Omitted: install whatever resolves.
+        #[arg(long)]
+        expected_digest: Option<String>,
+    },
+    /// Read-only: resolve and validate a bundle exactly as install would and
+    /// return its digest, name, version and file list. Writes nothing.
+    InstallCheck { source: String },
     /// Replace one exact workspace bundle while keeping its installation ID.
     /// The current digest and catalog generation must match the inspected row.
     UpgradeCheck {
@@ -1741,7 +1750,10 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     "app_local_install_revoke",
                     json!({"install_id":install_id,"digest":digest}),
                 ),
-                CatalogAction::Install { source } => {
+                CatalogAction::Install {
+                    source,
+                    expected_digest,
+                } => {
                     let source = if source.contains("://") || source.starts_with("git@") {
                         source.clone()
                     } else {
@@ -1750,7 +1762,22 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                             .to_string_lossy()
                             .into_owned()
                     };
-                    ("app_workspace_install", json!({"source":source}))
+                    let mut params = json!({"source":source});
+                    if let Some(digest) = expected_digest {
+                        params["expected_digest"] = json!(digest);
+                    }
+                    ("app_workspace_install", params)
+                }
+                CatalogAction::InstallCheck { source } => {
+                    let source = if source.contains("://") || source.starts_with("git@") {
+                        source.clone()
+                    } else {
+                        std::fs::canonicalize(source)
+                            .map_err(|e| Error::rejected(format!("workspace app source: {e}")))?
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    ("app_workspace_install_check", json!({"source":source}))
                 }
                 CatalogAction::Upgrade {
                     install_id,

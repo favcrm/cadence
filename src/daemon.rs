@@ -3340,6 +3340,7 @@ impl Shared {
             "app_content_send_prepare" => self.rpc_app_content(method, params, peer_pid),
             "app_workspace_install" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade" => self.rpc_app_workspace(method, params, peer_pid),
+            "app_workspace_install_check" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade_check" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade_recover" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_list" => self.rpc_app_workspace(method, params, peer_pid),

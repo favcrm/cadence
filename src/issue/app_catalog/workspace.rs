@@ -385,8 +385,11 @@ fn current(root: &Root) -> Result<(Catalog, Option<String>)> {
     let text = root.read(Path::new(CATALOG), CATALOG_CAP)?;
     let catalog: Catalog = text.as_deref().map(decode).transpose()?.unwrap_or_default();
     catalog.validate()?;
-    if text.is_none() && !legacy_records(root)?.is_empty() {
-        return Err(Error::rejected("legacy installations require explicit `cadence app catalog migrate` before workspace installation"));
+    if text.is_none() {
+        let legacy = legacy_records(root)?;
+        if !legacy.is_empty() {
+            return Err(legacy_unmigrated(&legacy));
+        }
     }
     for id in catalog.installations.keys() {
         catalog.require_current(root)?;
@@ -395,37 +398,84 @@ fn current(root: &Root) -> Result<(Catalog, Option<String>)> {
     Ok((catalog, text))
 }
 
-pub(crate) fn install(pm: &Pm, state: &Path, source: &str) -> Result<Value> {
-    let _ = state; // Caller must pass the daemon's connection-bound operator gate.
-    if !Path::new(source).is_absolute() && !source.contains("://") && !source.starts_with("git@") {
-        return Err(Error::rejected("workspace local source must be an absolute path; the CLI resolves caller-relative paths"));
-    }
-    validate_source_transport(source)?;
-    let (source_dir, provenance, _temporary) = app::resolve_source(source)?;
-    if source_dir.starts_with(pm.dir.canonicalize()?) {
-        return Err(Error::rejected(
-            "the tracker cannot be its own installation source",
-        ));
-    }
-    let (agents, agent_sources) = workflow::known_agents(&pm.dir, None, &[]);
-    let source_root = Root::open(&source_dir)?;
-    let files = snapshot(&source_root, Path::new(""), true)?;
-    let validated = app::validate_texts(
-        files
-            .iter()
-            .map(|(name, text)| (name.clone(), text.clone()))
-            .collect(),
-        &agents,
-        &agent_sources,
-    )?;
-    let _lock = pm.lock()?;
-    let root = Root::open(&pm.dir)?;
-    let (mut catalog, before_catalog) = current(&root)?;
+/// CAD-1186 legacy rule: while the workspace catalog does not exist, ANY
+/// unmigrated `<project>/apps/<name>` installation blocks every workspace
+/// install (not only a same-named one), because a first workspace install
+/// would create a catalog that does not account for them. Once `migrate` has
+/// catalogued them they carry their own install IDs and never block a
+/// workspace install of the same name. The message names this rule and the
+/// next command.
+fn legacy_unmigrated(legacy: &[(String, String, String)]) -> Error {
+    let mut names: Vec<String> = legacy.iter().map(|(p, n, _)| format!("{p}/{n}")).collect();
+    names.sort();
+    names.dedup();
+    let shown = names.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+    let more = names.len().saturating_sub(5);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    Error::rejected(format!("unmigrated legacy project installation(s) ({shown}{more}) block every workspace install until they are catalogued; run `cadence app catalog migrate` first, then repeat this command. After migration a legacy install never blocks a workspace install of the same name"))
+}
+
+fn same_name_workspace(catalog: &Catalog, app: &str) -> Result<()> {
     for (id, entry) in &catalog.installations {
-        if entry.storage == Storage::Workspace && entry.app == validated.manifest.app {
+        if entry.storage == Storage::Workspace && entry.app == app {
             return Err(Error::rejected(format!("app '{}' already has workspace installation {}; replacement/upgrade must explicitly target that ID and is not supported in this increment", entry.app, &**id)));
         }
     }
+    Ok(())
+}
+
+/// The one digest gate shared by install and the board relay. A malformed pin
+/// is refused as such; a well-formed pin must equal the resolved bytes.
+fn check_expected_digest(expected: &str, actual: &str) -> Result<()> {
+    let hex = expected.strip_prefix("sha256:").unwrap_or("");
+    if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(Error::rejected(
+            "expected digest must be 'sha256:' followed by 64 lowercase hex digits, as returned by `cadence app catalog install-check`",
+        ));
+    }
+    if expected != actual {
+        return Err(Error::rejected(format!("bundle digest {actual} differs from the expected digest {expected}; the source changed since `cadence app catalog install-check`. Nothing was installed; re-run install-check and confirm the new digest")));
+    }
+    Ok(())
+}
+
+/// Read-only install proposal (CAD-1186). Resolves and validates exactly as
+/// `install` does and returns the digest `--expected-digest` must carry. It
+/// writes nothing: no catalog, journal or lock file is created.
+pub(crate) fn install_check(pm: &Pm, source: &str) -> Result<Value> {
+    let (files, validated, provenance) = resolved_bundle(pm, source)?;
+    let _lock = pm.lock()?;
+    let root = Root::open(&pm.dir)?;
+    let (catalog, _) = current(&root)?;
+    same_name_workspace(&catalog, &validated.manifest.app)?;
+    Ok(json!({"schema":1,"name":validated.manifest.app,
+        "version":validated.manifest.version,"source":provenance,
+        "digest":bundle_digest(&files),
+        "files":files.keys().collect::<Vec<_>>(),
+        "committed":false,"notes":validated.notes,
+        "secret_warnings":crate::secret::warnings_json(&validated.secret_warnings)}))
+}
+
+pub(crate) fn install(
+    pm: &Pm,
+    state: &Path,
+    source: &str,
+    expected_digest: Option<&str>,
+) -> Result<Value> {
+    let _ = state; // Caller must pass the daemon's connection-bound operator gate.
+    let (files, validated, provenance) = resolved_bundle(pm, source)?;
+    // Refuse a changed bundle before the lock, the catalog read or any write.
+    if let Some(expected) = expected_digest {
+        check_expected_digest(expected, &bundle_digest(&files))?;
+    }
+    let _lock = pm.lock()?;
+    let root = Root::open(&pm.dir)?;
+    let (mut catalog, before_catalog) = current(&root)?;
+    same_name_workspace(&catalog, &validated.manifest.app)?;
     let id = InstallationId::parse(&uuid::Uuid::new_v4().simple().to_string())?;
     let record = Record {
         schema: 1,
@@ -1293,7 +1343,7 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         let pm = Pm::init(pm_dir.path()).unwrap();
         let source = sources.path().join("bundle-a");
         bundle(&source, MANIFEST_A);
-        let out = install(&pm, state_dir.path(), source.to_str().unwrap()).unwrap();
+        let out = install(&pm, state_dir.path(), source.to_str().unwrap(), None).unwrap();
         let id = out["install_id"].as_str().unwrap().to_string();
         (pm_dir, state_dir, sources, id)
     }

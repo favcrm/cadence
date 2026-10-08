@@ -70,6 +70,8 @@ const UPLOAD_MAX_FILES: usize = 128;
 #[derive(Debug)]
 struct UploadBody {
     files: Vec<(String, String)>,
+    /// CAD-1186: optional pin on the staged bundle's digest.
+    expected_digest: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for UploadBody {
@@ -88,9 +90,24 @@ impl<'de> Deserialize<'de> for UploadBody {
                 A: MapAccess<'de>,
             {
                 let mut files: Option<Vec<(String, String)>> = None;
+                let mut expected_digest: Option<String> = None;
                 while let Some(key) = map.next_key::<String>()? {
+                    if key == "expected_digest" {
+                        if expected_digest.is_some() {
+                            return Err(serde::de::Error::duplicate_field("expected_digest"));
+                        }
+                        let digest = map.next_value::<String>()?;
+                        if digest.is_empty() {
+                            return Err(serde::de::Error::custom("expected_digest is empty"));
+                        }
+                        expected_digest = Some(digest);
+                        continue;
+                    }
                     if key != "files" {
-                        return Err(serde::de::Error::unknown_field(&key, &["files"]));
+                        return Err(serde::de::Error::unknown_field(
+                            &key,
+                            &["files", "expected_digest"],
+                        ));
                     }
                     if files.is_some() {
                         return Err(serde::de::Error::duplicate_field("files"));
@@ -104,7 +121,10 @@ impl<'de> Deserialize<'de> for UploadBody {
                 if files.is_empty() {
                     return Err(serde::de::Error::custom("files map is empty"));
                 }
-                Ok(UploadBody { files })
+                Ok(UploadBody {
+                    files,
+                    expected_digest,
+                })
             }
         }
         deserializer.deserialize_map(UploadVisitor)
@@ -368,7 +388,11 @@ pub(super) fn workspace_upload(request: &mut Request, state: &std::path::Path) -
     // The daemon re-validates and journals the staged dir as a Source::Path;
     // `installed_by`/`approved` come from the proven operator connection, never
     // the body. `staging` (a TempDir) is removed on drop, success or failure.
-    match client::rpc(state, "app_workspace_install", json!({"source": source})) {
+    let mut params = json!({"source": source});
+    if let Some(digest) = &body.expected_digest {
+        params["expected_digest"] = json!(digest);
+    }
+    match client::rpc(state, "app_workspace_install", params) {
         Ok(value) => json_response(value),
         Err(error) => home::rpc_err(&error, "app_workspace_install"),
     }
@@ -1096,16 +1120,21 @@ pub(super) fn workspace(
             Err(_) => return err_response(400, "install body must be an object containing source"),
         };
         let valid = value.as_object().is_some_and(|fields| {
-            fields.len() == 1
+            fields
+                .get("source")
+                .and_then(Value::as_str)
+                .is_some_and(|source| !source.is_empty())
                 && fields
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .is_some_and(|source| !source.is_empty())
+                    .keys()
+                    .all(|k| k == "source" || k == "expected_digest")
+                && fields
+                    .get("expected_digest")
+                    .is_none_or(|d| d.as_str().is_some_and(|d| !d.is_empty()))
         });
         if !valid {
             return err_response(
                 400,
-                "install body admits only source; identity and approval are never caller fields",
+                "install body admits only source and an optional expected_digest; identity and approval are never caller fields",
             );
         }
         value

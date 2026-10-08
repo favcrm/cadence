@@ -496,7 +496,8 @@ impl Shared {
     ) -> Result<Value> {
         self.operator_connection("workspace app catalog", params, peer_pid)?;
         let allowed: &[&str] = match method {
-            "app_workspace_install" => &["source"],
+            "app_workspace_install" => &["source", "expected_digest"],
+            "app_workspace_install_check" => &["source"],
             "app_workspace_upgrade" => &[
                 "install_id",
                 "source",
@@ -527,7 +528,23 @@ impl Shared {
         use crate::issue::app_catalog::workspace;
         let mut result = match method {
             "app_workspace_install" => {
-                workspace::install(&pm, &self.state_dir, required_str(params, "source")?)
+                let expected = match params.get("expected_digest") {
+                    None => None,
+                    Some(value) => Some(
+                        value
+                            .as_str()
+                            .ok_or_else(|| Error::rejected("expected_digest must be a string"))?,
+                    ),
+                };
+                workspace::install(
+                    &pm,
+                    &self.state_dir,
+                    required_str(params, "source")?,
+                    expected,
+                )
+            }
+            "app_workspace_install_check" => {
+                workspace::install_check(&pm, required_str(params, "source")?)
             }
             "app_workspace_upgrade_check" => workspace::upgrade_check(
                 &pm,
