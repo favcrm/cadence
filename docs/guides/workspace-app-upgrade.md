@@ -6,27 +6,26 @@ The read-only check returns the exact proposed `digest` and a file-level
 structural diff:
 
 ```sh
-cadence app catalog upgrade-check <install-id> <absolute-source-path-or-git-url> \
+cadence app catalog upgrade-check <install-id> <absolute-source-path-or-git-url-or-builtin:id> \
   --expected-digest 'sha256:…' \
   --expected-generation '<catalog-generation>'
 ```
 
 An upgrade keeps the installation ID, contexts, bindings, and
-historical runs; it never creates a project. The board's **Settings → App
-package** panel at `/app-installations/<id>` is available for Social Content
-only. A verified operator in a writable session can enter a source path or Git
-URL, select **Check update**, inspect the proposal, then select **Apply checked
-update**; the board pins the checked digest and refuses a stale proposal.
+historical runs; it never creates a project. A verified operator in a writable
+session can check and apply updates for any installed app at
+`/apps/manage/<id>`: enter a source, select **Check update**, inspect the
+proposed version, digest, changed files and compatibility/notes, then select
+**Apply checked update**. The page pins the installed digest, catalog
+generation, and checked new digest, and refuses stale proposals. Built-in
+installs are prefilled with `builtin:<catalog_id>`, Git installs with their
+recorded URL, and path installs start empty for an absolute path or Git URL.
+The Social Content **Settings → App package** panel remains available.
 
-For other apps, `/apps` may show the operator **Review update** when a cached
-check found a changed digest. That button opens `/apps/manage/<id>`, which shows
-**Update ready** or **Up to date** and offers **Check now** only for Git-sourced
-installs. **Check now** checks upstream; the page has no apply-update control.
-Use the CLI `cadence app catalog upgrade-check` and `cadence app catalog
-upgrade` commands below to check and apply an update. In a hosted AgenticOS
-container, the remote CLI has no app-management verbs, so non-Social apps cannot
-currently be updated there. A verified operator can use the Social Content board
-panel in that environment.
+`cadence app catalog upgrade-check` and `cadence app catalog upgrade` accept
+absolute source paths, Git URLs, and `builtin:<catalog_id>`. In a hosted
+AgenticOS container the remote CLI still has no app-management verbs, so the
+Manage page is the board path for operators updating any app there.
 
 Installing or updating is the operator's consent for the exact installed
 digest when the bundle passes local execution validation. `cadence app catalog
@@ -37,7 +36,7 @@ project approvals. Either command refuses a stale digest. Approval of an app
 bundle does not approve an individual run or authorize outward effects.
 
 ```sh
-cadence app catalog upgrade <install-id> <absolute-source-path-or-git-url> \
+cadence app catalog upgrade <install-id> <absolute-source-path-or-git-url-or-builtin:id> \
   --expected-digest 'sha256:…' \
   --expected-generation '<catalog-generation>' \
   --expected-new-digest '<digest-from-upgrade-check>' \
@@ -106,10 +105,10 @@ Built-in app bundles and their catalog index are embedded in the Cadence
 binary. A new version of a built-in app arrives with a new Cadence build. The
 Explorer's operator-only `update_available` flag means a check for the installed
 app found a different bundle digest and cached that result; members do not see
-the flag. The remote CLI (`cadence --org …`) has no app-management verbs.
-Install apps from the hosted board as the operator; only Social Content can
-currently be updated there. Other apps require the CLI update commands above,
-which are unavailable in the hosted AgenticOS container.
+the flag. The remote CLI (`cadence --org …`) has no app-management verbs. In a hosted
+AgenticOS container, operators can update any installed app from its
+`/apps/manage/<id>` page; the same CLI commands accept `builtin:<catalog_id>`
+for embedded bundles.
 
 This transport currently handles the package bundle and Cadence-owned app
 metadata. Host-managed per-install SQLite storage and staged schema/data

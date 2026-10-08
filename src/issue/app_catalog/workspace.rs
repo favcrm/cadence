@@ -277,6 +277,16 @@ fn validate_source_transport(source: &str) -> Result<()> {
     Ok(())
 }
 
+fn upgrade_bundle(
+    pm: &Pm,
+    source: &str,
+) -> Result<(BTreeMap<String, String>, app::Validated, app::Source)> {
+    match source.strip_prefix(BUILTIN_SOURCE_PREFIX) {
+        Some(catalog_id) => builtin_bundle(pm, catalog_id),
+        None => resolved_bundle(pm, source),
+    }
+}
+
 fn resolved_bundle(
     pm: &Pm,
     source: &str,
@@ -571,7 +581,7 @@ pub(crate) fn upgrade_check(
     expected_generation: &str,
 ) -> Result<Value> {
     let id = InstallationId::parse(id)?;
-    let (files, validated, provenance) = resolved_bundle(pm, source)?;
+    let (files, validated, provenance) = upgrade_bundle(pm, source)?;
     let (entry_name, old_files) = optimistic(pm, || {
         let root = Root::open(&pm.dir)?;
         let (catalog, _) = current(&root)?;
@@ -625,12 +635,18 @@ pub(crate) fn upgrade(
     let expected_generation = request.expected_generation;
     let request_id = request.request_id;
     crate::proto::identifier(request_id, "upgrade request ID")?;
-    if !Path::new(source).is_absolute() && !source.contains("://") && !source.starts_with("git@") {
+    if !source.starts_with(BUILTIN_SOURCE_PREFIX)
+        && !Path::new(source).is_absolute()
+        && !source.contains("://")
+        && !source.starts_with("git@")
+    {
         return Err(Error::rejected(
             "workspace local source must be an absolute path",
         ));
     }
-    validate_source_transport(source)?;
+    if !source.starts_with(BUILTIN_SOURCE_PREFIX) {
+        validate_source_transport(source)?;
+    }
     // Completed request replay must not depend on a mutable/missing source.
     {
         let _lock = pm.lock()?;
@@ -640,7 +656,7 @@ pub(crate) fn upgrade(
             return Ok(row);
         }
     }
-    let (files, validated, provenance) = resolved_bundle(pm, source)?;
+    let (files, validated, provenance) = upgrade_bundle(pm, source)?;
     let new_digest = bundle_digest(&files);
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;

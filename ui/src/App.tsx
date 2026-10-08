@@ -984,7 +984,7 @@ export default function App() {
           <CatalogDetail id={route.id} viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
         {route.screen === "appsManage" && (
-          <ManageApp installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} />
+          <ManageApp key={route.installId} installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
         {route.screen === "workspaceApp" && (
           <AppShell installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} onInstallation={reportInstallation}>

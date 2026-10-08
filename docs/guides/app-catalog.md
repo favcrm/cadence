@@ -259,20 +259,20 @@ for a custom bundle. Members can browse, but see **Ask an admin to install**;
 that sends an install request for the operator to review. These install controls
 are operator-only.
 
-For Social Content only, the board update controls are at
-`/app-installations/<id>` → **Settings** → **App package**. A verified operator
-in a writable session can enter a package path or Git URL, choose **Check
-update**, review the proposal, and choose **Apply checked update**.
+A verified operator in a writable session can check and apply updates for any
+installed app at `/apps/manage/<id>`. Enter a package source, choose **Check
+update**, review the proposed version, digest, changed files and compatibility
+notes, then choose **Apply checked update**. Built-in installs are prefilled
+with `builtin:<catalog_id>`, Git installs with their recorded Git URL, and path
+installs start empty so the operator can enter an absolute path or Git URL. The
+Social Content **Settings → App package** panel remains available as well.
 
-For other apps, `/apps/manage/<id>` shows **Update ready** or **Up to date**.
-It offers **Check now** only for Git-sourced installs; this checks for an
-upstream change but does not apply it. Apply an update with
-`cadence app catalog upgrade-check` and `cadence app catalog upgrade` on the
-CLI. In a hosted AgenticOS container, the remote CLI (`cadence --org …`) is
-limited to status, agent/issue/message reads, and issue create/comment/set; it
-has no app-management verbs. Therefore non-Social apps cannot currently be
-updated there. Install apps from the hosted board as the operator. The Social
-Content board controls remain available to its operator.
+The `cadence app catalog upgrade-check` and `cadence app catalog upgrade`
+commands accept absolute paths, Git URLs, and `builtin:<catalog_id>` sources.
+The existing board upgrade-check and upgrade routes use the same pins and
+refuse stale proposals. The remote CLI (`cadence --org …`) remains limited to
+status, agent/issue/message reads, and issue create/comment/set; it has no
+app-management verbs, so hosted operators use the Manage page for updates.
 
 Built-in apps and their catalog index are embedded in the Cadence binary. A new
 built-in app version therefore arrives with a new Cadence build. An Explorer
