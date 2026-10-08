@@ -10,6 +10,7 @@ import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
 import { useInstallations } from "./features/workspace-apps/useInstallations";
 import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
+import { appLoadErrorCopy } from "./features/explorer/appErrors";
 import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
@@ -639,7 +640,7 @@ export default function App() {
     notice: installations.retrying
       ? { text: "The workspace is busy. Retrying the app list…", retrying: true, onRetry: installations.retry }
       : installations.error !== null
-        ? { text: installations.error, retrying: false, onRetry: installations.retry }
+        ? { text: appLoadErrorCopy(installations.error, "Your apps didn't load."), retrying: false, onRetry: installations.retry }
         : null,
   };
   // One element for both account menus (sidebar row, header avatar) so they cannot drift.

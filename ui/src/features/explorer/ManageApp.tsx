@@ -171,12 +171,12 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
           <div className="swrow">
             <div>
               <p>Let {inst.title} work</p>
-              <p className="hint">{off ? "Off — it can't run or use its connections. Its data is kept." : "On — it can run and use its connections."}</p>
+              <p className="hint">{removed ? "Off — the app is removed." : off ? "Off — it can't run or use its connections. Its data is kept." : "On — it can run and use its connections."}</p>
             </div>
             <button
               className="switch"
               role="switch"
-              aria-checked={!off}
+              aria-checked={!off && !removed}
               aria-label={`Let ${inst.title} work`}
               onClick={() => setNotice(off ? "Turn on through the app's page — consent is recorded there." : "Turn off through the app's page — consent is revoked there.")}
             />

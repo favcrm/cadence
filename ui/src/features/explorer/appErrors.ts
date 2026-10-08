@@ -28,12 +28,11 @@ const PATTERNS: { test: RegExp; copy: string }[] = [
     test: /installation is removed|is removed/i,
     copy: "This app is removed. Restore it first.",
   },
-  { test: /busy|resource_busy/i, copy: "The workspace is busy. Try again in a moment." },
 ];
 
 /** Does this still read like daemon text a person should not see? */
 function looksInternal(text: string): boolean {
-  return /`|\bcadence [a-z]|--[a-z]|\bpm\b|\.sock\b|\/tmp\/|[0-9a-f]{20,}/i.test(text);
+  return /`|\bcadence [a-z]|--[a-z]|\bpm\b|\.sock\b|\.apps\/|\.ya?ml\b|\/tmp\/|[0-9a-f]{20,}/i.test(text);
 }
 
 /** Copy for a failed call. `fallback` is the plain sentence for "something else went wrong". */
