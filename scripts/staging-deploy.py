@@ -4,7 +4,7 @@
 One idempotent tick: resolve the newest successful ci.yml run on main
 (or a pinned `--run-id`), verify the artifact through
 `delivery-candidate.py prepare` — a binary that never passed prepare is
-never executed — then `sandbox down`/`sandbox up` it on 127.0.0.1:3020.
+never executed — then `sandbox down`/`sandbox up` it on 127.0.0.1:3150.
 First tick seeds the tracker and registers two inbox agents; the tailnet
 publish is attempted under the sandbox opt-in and a refusal is recorded,
 not fatal. Health is checked on loopback with the board's own Host; a
@@ -27,7 +27,7 @@ import urllib.request
 
 REPO = "favcrm/cadence"
 NAME = "staging"
-PORT = 3020
+PORT = 3150
 TS_PORT = 9460
 KEEP = 5
 BASE = Path.home() / ".local/share/cadence-staging"
@@ -256,7 +256,8 @@ def tailnet(run, cadence, env):
         code, out, _ = run([cadence, "ui", "tailscale", "status"], env=env)
         if code != 0:
             return f"refused: tailscale status exited {code}"
-        sharing = "sharing: on" in out
+        # Match the CLI's current human-readable status line exactly.
+        sharing = "tailscale sharing: on" in out
         mapping_live = "(live)" in out
         foreign = "NOT ours" in out
         needs_publish = not sharing or (sharing and not mapping_live and not foreign)

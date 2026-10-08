@@ -81,7 +81,7 @@ class FakeRunner:
             if self.fail_up_for and self.fail_up_for in argv[0]:
                 return 1, "", "daemon start refused"
             self.state_dir.mkdir(parents=True, exist_ok=True)
-            return 0, '{"port": 3020}', ""
+            return 0, '{"port": 3150}', ""
         if "sandbox env" in joined:
             if self.env_rc:
                 return self.env_rc, "", "sandbox environment unavailable"
@@ -179,7 +179,7 @@ class TickTest(unittest.TestCase):
         self.assertEqual(status["ci_run_attempt"], 1)
         self.assertIsNone(status["previous_release"])
         self.assertIsNone(status["last_error"])
-        self.assertEqual(status["url_loopback"], "http://cadence-3020.localhost:3020")
+        self.assertEqual(status["url_loopback"], "http://cadence-3150.localhost:3150")
         self.assertIn("9460", status["url_tailnet"])
         self.assertIn("sharing", status["tailnet"])
         # Seeded once: repos init'd, seed script + two inbox agents.
@@ -192,7 +192,7 @@ class TickTest(unittest.TestCase):
         self.assertEqual(len(r.argvs("agent register")), 2)
         # The verified release binary, never anything else, is executed.
         cadence = str(self.base / "releases" / REL_A / "cadence")
-        self.assertTrue(r.argvs(f"{cadence} sandbox up staging --port 3020"))
+        self.assertTrue(r.argvs(f"{cadence} sandbox up staging --port 3150"))
 
     def test_noop_when_release_matches_and_healthy(self):
         (self.base / "status.json").write_text(json.dumps(
@@ -228,7 +228,7 @@ class TickTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         cadence = str(self.base / "releases" / REL_A / "cadence")
         self.assertTrue(r.argvs(f"{cadence} sandbox down"))
-        self.assertTrue(r.argvs(f"{cadence} sandbox up staging --port 3020"))
+        self.assertTrue(r.argvs(f"{cadence} sandbox up staging --port 3150"))
 
     def test_noop_retries_a_refused_tailnet(self):
         # Staging live but publication previously refused — the next
@@ -297,7 +297,7 @@ class TickTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         prev_bin = str(self.base / "releases" / REL_B / "cadence")
         self.assertTrue(
-            r.argvs(f"{prev_bin} sandbox up staging --port 3020"),
+            r.argvs(f"{prev_bin} sandbox up staging --port 3150"),
             "rollback must target the older release")
 
     def test_repair_rollback_records_the_live_fallback(self):
@@ -440,7 +440,7 @@ class TickTest(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         cadence = str(self.base / "releases" / REL_A / "cadence")
-        self.assertTrue(r.argvs(f"{cadence} sandbox up staging --port 3020"))
+        self.assertTrue(r.argvs(f"{cadence} sandbox up staging --port 3150"))
         status = json.loads((self.base / "status.json").read_text())
         self.assertIn("board recovered", status["tailnet"])
         self.assertEqual(status["deployed_sha"], SHA_A)
@@ -457,7 +457,7 @@ class TickTest(unittest.TestCase):
         r.ts_status_out = (
             "tailscale sharing: on\n"
             "url:      " + sd.URL_TAILNET + "\n"
-            "mapping:  https:9460 → http://127.0.0.1:3020  (live)\n"
+            "mapping:  https:9460 → http://127.0.0.1:3150  (live)\n"
         )
         probed = []
 
@@ -485,7 +485,7 @@ class TickTest(unittest.TestCase):
         r.ts_status_out = (
             "tailscale sharing: on\n"
             "url:      " + sd.URL_TAILNET + "\n"
-            "mapping:  https:9460 → http://127.0.0.1:3020  (live)\n"
+            "mapping:  https:9460 → http://127.0.0.1:3150  (live)\n"
         )
         rc = self.deploy(r, http_ok(SHA_A))
         self.assertEqual(rc, 0)
@@ -598,7 +598,7 @@ class TickTest(unittest.TestCase):
         self.assertIn("health check failed", status["last_error"])
         self.assertEqual(status["failed_release"], REL_A)
         prev = str(self.base / "releases" / REL_B / "cadence")
-        self.assertTrue(r.argvs(f"{prev} sandbox up staging --port 3020"))
+        self.assertTrue(r.argvs(f"{prev} sandbox up staging --port 3150"))
         # Rolled back: deployed still names the live release.
         self.assertEqual(status["deployed_release"], REL_B)
         # Never `sandbox reset` on its own.
@@ -617,7 +617,7 @@ class TickTest(unittest.TestCase):
         self.assertIn("daemon start refused", status["last_error"])
         self.assertEqual(status["failed_release"], REL_A)
         prev = str(self.base / "releases" / REL_B / "cadence")
-        self.assertTrue(r.argvs(f"{prev} sandbox up staging --port 3020"))
+        self.assertTrue(r.argvs(f"{prev} sandbox up staging --port 3150"))
         self.assertEqual(status["deployed_release"], REL_B)
 
     def test_known_bad_skip_only_while_live(self):
@@ -651,7 +651,7 @@ class TickTest(unittest.TestCase):
         rc = self.deploy(r, http_ok(SHA_B))  # board runs SHA_B after recovery
         self.assertEqual(rc, 0)
         prev = str(self.base / "releases" / REL_B / "cadence")
-        self.assertTrue(r.argvs(f"{prev} sandbox up staging --port 3020"))
+        self.assertTrue(r.argvs(f"{prev} sandbox up staging --port 3150"))
         status = json.loads((self.base / "status.json").read_text())
         self.assertEqual(status["deployed_release"], REL_B)
         self.assertEqual(status["deployed_sha"], SHA_B)
@@ -663,7 +663,7 @@ class TickTest(unittest.TestCase):
         r = FakeRunner(self.base)
         rc = self.deploy(r, http_ok(SHA_A))
         self.assertEqual(rc, 0)
-        self.assertTrue(r.argvs("sandbox up staging --port 3020"))
+        self.assertTrue(r.argvs("sandbox up staging --port 3150"))
         status = json.loads((self.base / "status.json").read_text())
         self.assertEqual(status["deployed_release"], REL_A)
 

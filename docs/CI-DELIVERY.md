@@ -483,16 +483,13 @@ tracker and registers two inbox agents once. The timer uses a dedicated clone
 checked out at `origin/main`; its state and release cache are under
 `~/.local/share/cadence-staging`.
 
-**Unresolved operator decision — do not install or enable the timer yet.**
-The current source and tests target port 3020, but the standing development
-instance policy allows ports 3110–3199. No exception or migration to another
-port has been authorized. Consequently `:3020`, tailnet `:9460`, the state
-directory and systemd units are not reserved or installed by this source
-refresh. The operator must decide a compliant port and its mapping before
-staging can be enabled; do not infer authorization from this documentation.
+**Operator decision — source refresh only; do not install or enable the timer.**
+The operator chose board port 3150, within the permitted 3110–3199 range. The
+board URL is `http://cadence-3150.localhost:3150`; tailnet HTTPS remains on
+`:9460`. This authorizes the source configuration only, not a runtime deploy,
+state-directory migration, unit installation, or timer enablement.
 
-The proposed board URL is `http://cadence-3020.localhost:3020`; its proposed
-tailnet URL is `https://ip-172-31-1-32.tail9fcf30.ts.net:9460`. Tailnet
+The tailnet URL is `https://ip-172-31-1-32.tail9fcf30.ts.net:9460`. Tailnet
 publishing is through `cadence ui tailscale` under the sandbox opt-in, not
 through sudo or nginx. The deploy code must revalidate an absent/foreign/live
 mapping on ordinary and known-bad healthy ticks, refuse to overwrite foreign
