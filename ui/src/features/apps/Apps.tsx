@@ -1,6 +1,5 @@
 import { resources } from "../../lib/resources";
-import { useEffect, useState } from "react";
-import { workspaceApps, type Installation } from "../workspace-apps/workspaceApps";
+import { useInstallations } from "../workspace-apps/useInstallations";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import Link from "../../ui/Link";
@@ -72,25 +71,15 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
 
 /** Workspace installations remain visible independently of the legacy project filter. */
 function WorkspaceCatalog() {
-  const [rows, setRows] = useState<Installation[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [revision, setRevision] = useState(0);
-  useEffect(() => {
-    const controller = new AbortController();
-    setRows(null);
-    setError(null);
-    void workspaceApps.installations(controller.signal).then(value => {
-      if (!controller.signal.aborted) setRows(value.filter(row => row.storage_kind === "workspace"));
-    }).catch((cause: unknown) => {
-      if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : "Could not load workspace apps");
-    });
-    return () => controller.abort();
-  }, [revision]);
+  const { list, error, retrying, retry } = useInstallations(true, null);
+  const rows = list === null ? null : list.filter(row => row.storage_kind === "workspace");
   return <section aria-label="Workspace apps" className="mb-5">
     <h2 className="text-cardtitle font-medium text-ink-100 mb-2">Workspace apps</h2>
-    {error ? <div className="card px-4 py-3 text-label text-ink-400" role="alert">
-      {error} <Button onClick={() => setRevision(value => value + 1)}>Retry</Button>
-    </div> : rows === null ? <p className="text-label text-ink-400" role="status">Loading workspace apps…</p> : rows.length === 0 ? <div className="card px-4 py-3 text-label text-ink-400">
+    {error !== null && <div className="card px-4 py-3 mb-2.5 text-label text-ink-400" role="alert">
+      {error} <Button onClick={retry}>Retry</Button>
+    </div>}
+    {retrying && <p className="text-label text-ink-400" role="status">The workspace is busy. Retrying…</p>}
+    {rows === null ? (error === null && !retrying && <p className="text-label text-ink-400" role="status">Loading workspace apps…</p>) : rows.length === 0 ? <div className="card px-4 py-3 text-label text-ink-400">
       No workspace apps installed. Install a package with <code>cadence app catalog install &lt;path|git-url&gt;</code>.
     </div> : <ul className="space-y-2.5">{rows.map(row => <li key={row.install_id} className="card px-3.5 py-3 min-w-0">
       <div className="app-card-layout">

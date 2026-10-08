@@ -12,8 +12,17 @@ export interface AppNavEntry {
   sections: AppMenuSection[] | null;
 }
 
+/** Shown under Apps when the installed-app list could not be refreshed. */
+export interface AppNavNotice {
+  text: string;
+  /** A busy daemon is being retried automatically; the manual retry follows if that fails. */
+  retrying: boolean;
+  onRetry: () => void;
+}
+
 export interface AppNav {
   apps: AppNavEntry[];
+  notice?: AppNavNotice | null;
 }
 
 /** An installation the host has verified: from the installation list or the shell's receipt. */

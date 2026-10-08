@@ -176,7 +176,7 @@ async function request<T>(path: string, signal?: AbortSignal, body?: object): Pr
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const value = await response.json().catch(() => null);
-  if (!response.ok) throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status);
+  if (!response.ok) throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status, typeof value?.code === "string" ? { code: value.code } : undefined);
   if (value === null) throw new ApiError("The server returned an invalid app receipt", 502);
   return value as T;
 }

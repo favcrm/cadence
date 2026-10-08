@@ -101,6 +101,13 @@ fn stored_context(
     .ok_or_else(|| err_response(404, "assistant receipt unavailable"))
 }
 fn rpc_error(error: Error) -> HttpResp {
+    // Busy is transient: 503 + Retry-After, with a fixed message (the
+    // daemon's lock detail stays out of this surface).
+    if error.kind() == "busy" {
+        if let Some(resp) = super::busy_response(&Error::busy("app assistant is busy; retry")) {
+            return resp;
+        }
+    }
     let text = error.to_string();
     let status = if text.contains("operator") || text.contains("caller") || text.contains("session")
     {
@@ -243,4 +250,9 @@ pub(super) fn handle(
             )
         }
     }
+}
+
+#[cfg(test)]
+pub(super) fn busy_status_for_test(e: &Error) -> u16 {
+    rpc_error(Error::busy(e.to_string())).status_code().0
 }
