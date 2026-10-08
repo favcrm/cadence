@@ -46,6 +46,14 @@ pub struct ScreenPackage {
     pub app: String,
     /// The declared remote image sets (host-listed names only).
     pub remote_images: Vec<String>,
+    /// The validated contract (`app-screens/v1` read-only or
+    /// `app-screens/v2` which may carry tool declarations).
+    pub contract: String,
+    /// The `may` bridge methods the validated declaration opted into
+    /// (empty on v1 / a v2 with none).
+    pub may: Vec<String>,
+    /// Declared logical tool alias → declared capability slot (v2 only).
+    pub tools: BTreeMap<String, String>,
 }
 
 /// `true` when `tag` is a legal screen tag (the bundle's tag grammar).
@@ -149,6 +157,9 @@ pub fn extract(files: &BTreeMap<String, String>, tag: &str) -> Result<ScreenPack
         assets,
         app: checked.app().to_string(),
         remote_images: checked.remote_images().to_vec(),
+        contract: checked.contract().to_string(),
+        may: checked.may().to_vec(),
+        tools: checked.tools().clone(),
     })
 }
 
@@ -268,5 +279,69 @@ mod tests {
         ] {
             assert!(extract(&with(bad.clone()), "a").is_err(), "admitted {bad}");
         }
+    }
+
+    fn decl_v2(assets: &[(&str, &str)], extra: serde_json::Value) -> String {
+        let mut decl: serde_json::Value = serde_json::from_str(&decl(assets)).unwrap();
+        decl["contract"] = json!("app-screens/v2");
+        decl["host_contract"] = json!("screen-actions.v1");
+        decl["may"] = json!(["tools.invoke"]);
+        for (k, v) in extra.as_object().unwrap() {
+            decl[k] = v.clone();
+        }
+        decl.to_string()
+    }
+
+    #[test]
+    fn cad1177_v2_declares_bounded_tool_alias_to_slot_map() {
+        let js = "x";
+        let good = bundle_with(
+            "a",
+            &decl_v2(
+                &[("client.js", js)],
+                json!({"tools": {"instagram.read": "source", "image.generate": "image"}}),
+            ),
+            &[("client.js", js)],
+        );
+        let pkg = extract(&good, "a").unwrap();
+        assert_eq!(pkg.contract, "app-screens/v2");
+        assert_eq!(pkg.may, vec!["tools.invoke".to_string()]);
+        assert_eq!(pkg.tools["instagram.read"], "source");
+        assert_eq!(pkg.tools["image.generate"], "image");
+
+        let with = |extra: serde_json::Value| {
+            bundle_with(
+                "a",
+                &decl_v2(&[("client.js", js)], extra),
+                &[("client.js", js)],
+            )
+        };
+        // An undeclared/bad alias grammar refuses.
+        assert!(extract(&with(json!({"tools":{"Instagram.Read":"source"}})), "a").is_err());
+        assert!(extract(
+            &with(json!({"tools":{"no_dots_ok_underscore":"source"}})),
+            "a"
+        )
+        .is_err());
+        // A slot that isn't a tag refuses.
+        assert!(extract(&with(json!({"tools":{"a.b":"not a slot!"}})), "a").is_err());
+        // An unknown may-method refuses.
+        assert!(extract(
+            &with(json!({"tools":{"a.b":"source"},"may":["tools.invoke","http.proxy"]})),
+            "a"
+        )
+        .is_err());
+        // An unknown host contract refuses.
+        assert!(extract(
+            &with(json!({"tools":{"a.b":"source"},"host_contract":"http.proxy"})),
+            "a"
+        )
+        .is_err());
+        // tools/host_contract under v1 refuses (read-only stays read-only).
+        let mut v1: serde_json::Value = serde_json::from_str(&decl(&[("client.js", js)])).unwrap();
+        v1["tools"] = json!({"a.b":"source"});
+        v1["may"] = json!(["tools.invoke"]);
+        let v1files = bundle_with("a", &v1.to_string(), &[("client.js", js)]);
+        assert!(extract(&v1files, "a").is_err());
     }
 }

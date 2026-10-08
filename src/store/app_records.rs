@@ -936,6 +936,7 @@ impl RecordStore {
                 }
             }
         }
+        super::app_social_drafts::ensure_schema(&conn)?;
         Ok(Self {
             install_id: install_id.to_string(),
             conn: Mutex::new(conn),

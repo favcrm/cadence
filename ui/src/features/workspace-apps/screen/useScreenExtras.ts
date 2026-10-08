@@ -69,11 +69,26 @@ export function useScreenExtras(args: {
     return () => controller.abort();
   }, [enabled, wantedKey]);
 
+  // CAD-1177: retained standalone tool receipts for this install — the
+  // read-effect results the `tools` library projection uses when no
+  // run-bound read is held. Install-scoped (tools have no context).
+  const toolScope = `${installId}:${contextId}`;
+  const [tools, setTools] = useState<{ scope: string; value: ScreenExtras["tools"] }>({ scope: "", value: undefined });
+  useEffect(() => {
+    if (!enabled || !installId || !contextId) { setTools({scope:toolScope,value:[]}); return; }
+    const controller = new AbortController();
+    workspaceApps.toolResults(installId, contextId, controller.signal)
+      .then(receipts => { if (!controller.signal.aborted) setTools({ scope: toolScope, value: receipts }); })
+      .catch((error: unknown) => { if (!controller.signal.aborted) { refuse(error); setTools({ scope: toolScope, value: null }); } });
+    return () => controller.abort();
+  }, [enabled, installId, contextId, toolScope]);
+
   const extras = useMemo<ScreenExtras | undefined>(() => enabled ? {
     installId, contextId, bindings, workers,
     source: sourceRun ? (source.scope === scope && (source.value === null || source.value?.runId === sourceRun) ? source.value : undefined) : null,
+    tools: tools.scope === toolScope ? tools.value : undefined,
     texts: new Map(texts.current),
-  } : undefined, [enabled, installId, contextId, bindings, workers, source, sourceRun, scope, textVersion]);
+  } : undefined, [enabled, installId, contextId, bindings, workers, source, sourceRun, tools, scope, textVersion, toolScope]);
 
   // The pushed ref names a run; only a run in this exact scope with a
   // reviewer-pinned image resolves. The channel already refused any ref

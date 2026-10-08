@@ -70,7 +70,7 @@ pub(super) fn frame_route(path: &str) -> Option<&str> {
 /// presents no session cookie for its origin — refused upstream by the
 /// daemon's check either way. Used ONLY by the mint POST; the frame GET
 /// relays nothing (the nonce is its sole authority).
-fn request_credentials(
+pub(super) fn request_credentials(
     request: &Request,
     opts: &ServeOpts,
 ) -> Option<(String, String, &'static str)> {
@@ -80,9 +80,10 @@ fn request_credentials(
     Some((token, key, origin.as_str()))
 }
 
-/// The mint handler — body `{}` only; scope (`install_id`,`tag`) from the
-/// URL; session credentials relayed from the proven request. `admit`'s
-/// OperatorOnly gate has already run before this handler is reached.
+/// The mint handler — body `{context_id?}` only; install/tag are from the
+/// URL and the optional context is re-proven by the daemon for that install.
+/// Session credentials are relayed from the proven request. The child frame
+/// never supplies or receives this authority.
 pub(super) fn mount(
     request: &mut Request,
     state_dir: &std::path::Path,
@@ -94,11 +95,16 @@ pub(super) fn mount(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let ok = serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .is_some_and(|v| v.as_object().is_some_and(|m| m.is_empty()));
-    if !ok {
-        return err_response(400, "screen mount takes no fields — send {}");
+    let body: Value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) if v.is_object() => v,
+        _ => return err_response(400, "screen mount body must be an object"),
+    };
+    if body.as_object().unwrap().keys().any(|k| k != "context_id") {
+        return err_response(400, "screen mount has unsupported fields");
+    }
+    let context_id = body.get("context_id").and_then(Value::as_str).unwrap_or("");
+    if context_id.len() > 128 {
+        return err_response(400, "screen context ID exceeds its bound");
     }
     let Some((token, key, origin)) = request_credentials(request, opts) else {
         return err_response(403, "screen mount needs a live operator session");
@@ -109,6 +115,7 @@ pub(super) fn mount(
         "app_screen_mint",
         json!({
             "install_id": install_id,
+            "context_id": if context_id.is_empty() { Value::Null } else { json!(context_id) },
             "tag": tag,
             "token": token,
             "key": key,
@@ -118,6 +125,147 @@ pub(super) fn mount(
     ) {
         Ok(v) => super::json_response(v),
         Err(e) => home::rpc_err(&e, "app_screen_mint"),
+    }
+}
+
+/// `POST /api/app-screen-tools/invoke` — the standalone tool call the
+/// trusted host relays for a live mounted frame. Body
+/// `{action_token, tool_alias, input, request_id}`. The host API adapter maps
+/// the child-facing `alias` selector to `tool_alias`. The board relays the
+/// request's own session credentials (the same `check_session` proof the
+/// mount mint uses); the daemon re-proves the session AND the
+/// server-bound mount action context before any broker/provider work.
+/// The frame itself never reaches this route (`connect-src 'none'`).
+pub(super) fn tool_route(path: &str) -> bool {
+    path == "/api/app-screen-tools/invoke"
+}
+
+pub(super) fn tool_invoke(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let body: Value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) if v.is_object() => v,
+        _ => return err_response(400, "tool invoke body must be a JSON object"),
+    };
+    // Closed body shape the daemon re-checks; the session fields are
+    // added host-side from the proven request, never from the body.
+    let alias = body.get("tool_alias").and_then(Value::as_str).unwrap_or("");
+    let action_token = body
+        .get("action_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let request_id = body.get("request_id").and_then(Value::as_str).unwrap_or("");
+    let input = body.get("input").cloned().unwrap_or_else(|| json!({}));
+    let generation_scope = body.get("generation_scope").cloned();
+    if body.as_object().is_some_and(|o| {
+        o.keys().any(|k| {
+            !matches!(
+                k.as_str(),
+                "action_token" | "tool_alias" | "input" | "request_id" | "generation_scope"
+            )
+        })
+    }) {
+        return err_response(400, "tool invoke body contains unsupported fields");
+    }
+    if alias.is_empty() || action_token.is_empty() || request_id.is_empty() || !input.is_object() {
+        return err_response(
+            400,
+            "tool invoke needs action_token, alias, request_id and object input",
+        );
+    }
+    let Some((token, key, origin)) = request_credentials(request, opts) else {
+        return err_response(403, "tool invoke needs a live operator session");
+    };
+    let mut params = json!({"action_token":action_token,"tool_alias":alias,"input":input,"request_id":request_id,"token":token,"key":key,"origin":origin});
+    if let Some(scope) = generation_scope {
+        params["generation_scope"] = scope;
+    }
+    match client::rpc(state_dir, "app_tool_invoke", params) {
+        Ok(v) => super::json_response(v),
+        Err(e) => home::rpc_err(&e, "app_tool_invoke"),
+    }
+}
+
+/// `POST /api/app-screen-tools/revoke` — the host tearing a mount down
+/// revokes its action handle. Body `{action_token}`. OperatorOnly; the
+/// board relays the request's own session so the daemon only revokes a
+/// context that session owns. Idempotent — tearing down an already-gone
+/// mount is a no-op, never an error.
+pub(super) fn tool_revoke_route(path: &str) -> bool {
+    path == "/api/app-screen-tools/revoke"
+}
+
+pub(super) fn tool_revoke(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let body: Value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) if v.is_object() => v,
+        _ => return err_response(400, "tool revoke body must be a JSON object"),
+    };
+    let action_token = body
+        .get("action_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if action_token.is_empty() {
+        return err_response(400, "tool revoke needs action_token");
+    }
+    let Some((token, key, origin)) = request_credentials(request, opts) else {
+        return err_response(403, "tool revoke needs a live operator session");
+    };
+    match client::rpc(
+        state_dir,
+        "app_tool_revoke",
+        json!({
+            "action_token": action_token,
+            "token": token,
+            "key": key,
+            "origin": origin,
+        }),
+    ) {
+        Ok(v) => super::json_response(v),
+        Err(e) => home::rpc_err(&e, "app_tool_revoke"),
+    }
+}
+
+/// `GET /api/app-screen-tools/results?install_id=<id>` — operator read of
+/// retained standalone tool receipts for one installation (the projection
+/// reads them to restore posts after reload). Operator-read gated like
+/// every app read; relays to `app_tool_results`.
+pub(super) fn tool_results_route(path: &str) -> bool {
+    path == "/api/app-screen-tools/results"
+}
+
+pub(super) fn tool_results(request: &Request, state_dir: &std::path::Path) -> HttpResp {
+    let query = request.url().split_once('?').map(|(_, q)| q).unwrap_or("");
+    let params: std::collections::HashMap<&str, &str> = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .collect();
+    let install_id = params.get("install_id").map(|v| v.to_string());
+    let context_id = params.get("context_id").map(|v| v.to_string());
+    let Some(install_id) = install_id.filter(|id| !id.is_empty()) else {
+        return err_response(400, "tool results needs an install_id");
+    };
+    let params = if let Some(context) = context_id {
+        json!({"install_id":install_id,"context_id":context})
+    } else {
+        json!({"install_id":install_id})
+    };
+    match client::rpc(state_dir, "app_tool_results", params) {
+        Ok(v) => super::json_response(v),
+        Err(e) => home::rpc_err(&e, "app_tool_results"),
     }
 }
 

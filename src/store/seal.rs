@@ -54,9 +54,11 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 }
 
 /// Highest reviewed schema the guard understands. A newer/unknown
-/// protected schema is `Unknown`, never default-open.
+/// protected schema is `Unknown`, never default-open. v35 adds only the
+/// standalone `app_tool_claims`/`app_tool_results` tables — it touches no
+/// sealed/witnessed surface, so the guard's assumptions are unchanged.
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 34;
+const PROTECTED_SCHEMA_MAX: i64 = 35;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must

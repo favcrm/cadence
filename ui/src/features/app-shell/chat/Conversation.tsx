@@ -1,10 +1,10 @@
+import { chatContext } from "../chatScreen";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, ApiError } from "../../../lib/api";
 import { resources } from "../../../lib/resources";
 import { streamInto } from "../../../lib/sse";
 import { useQuery, useResource } from "../../../lib/useResource";
 import Button from "../../../ui/Button";
-import Link from "../../../ui/Link";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
 import { ThreadItemView, type Density } from "../../home/ThreadView";
@@ -58,6 +58,7 @@ import type { ChatBinding } from "./types";
  * `home` renders the list only, byte-for-byte what Home rendered before; Home
  * keeps its own scroller and composer.
  */
+export { chatContext };
 export type ConversationMode =
   | { kind: "home" }
   | {
@@ -72,6 +73,9 @@ export type ConversationMode =
       contextName: string | null;
       /** The validated descriptor for this install, or null (plain chat). */
       descriptor: AppChat | null;
+      /** `list` lays the screen's static prompts out as suggestion rows and
+       *  drops the context chip; default is the compact chip row. */
+      promptLayout?: "chips" | "list";
     };
 type AppMode = Extract<ConversationMode, { kind: "app" }>;
 
@@ -139,19 +143,6 @@ function hidden(item: ThreadItem): ThreadItem {
     default:
       return item;
   }
-}
-
-/** The chip and quick prompts for the route's screen (prompts only fill the composer). */
-export function chatContext(
-  descriptor: AppChat | null,
-  screen: string | null,
-  recordOpen: boolean,
-): { label: string; prompts: string[] } | null {
-  const entry = screen === null ? undefined : descriptor?.contexts.find((c) => c.id === screen);
-  if (!entry) return null;
-  return recordOpen && entry.record
-    ? { label: `${entry.record.label} (open)`, prompts: entry.record.prompts }
-    : { label: entry.label, prompts: entry.prompts };
 }
 
 function AppRow({
@@ -264,6 +255,14 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
   const tail = items.slice(-8);
   const canSend = viewer.operator && !viewer.readOnly && usable;
   const canCreate = viewer.operator && !viewer.readOnly && active.state === "ready";
+  // Why the composer is disabled — always a plain reason, never a fake reply.
+  const sendBlockedReason = !viewer.operator
+    ? "Sign in as the operator to message the assistant"
+    : viewer.readOnly
+      ? "Read-only · Sending is unavailable"
+      : active.state === "failed"
+        ? "The conversations could not be read — retry above"
+        : "No conversation yet — start one with + New";
   // Waiting dot: the selected conversation grew while the rail was collapsed.
   const seen = useRef(items.length);
   if (!collapsed) seen.current = items.length;
@@ -379,8 +378,8 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
         <span className="app-chat-rail-label text-micro text-ink-400">ASSISTANT</span>
       </button>
       <div className="app-chat-head">
-        <p className="text-micro text-ink-500">
-          Assistant{descriptor?.presentation.showContext && mode.contextName ? ` · ${mode.contextName}` : ""} — context for this turn, never access proof.
+        <p className="app-chat-label slabel">
+          Assistant{descriptor?.presentation.showContext && mode.contextName ? ` · ${mode.contextName}` : ""}
         </p>
         <button
           type="button"
@@ -435,11 +434,6 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
           No conversation yet. Start one with + New.
         </p>
       )}
-      <p className="text-micro text-ink-500">
-        <Link href="/" className="lnk" data-chat-home-link>
-          Earlier history is in Home
-        </Link>
-      </p>
       {queued && (
         <p className="text-label text-ink-300" role="status" data-chat-queued>
           {QUEUED_NOTICE}
@@ -515,7 +509,23 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
           send();
         }}
       >
-        {ctx !== null && (
+        {ctx !== null && mode.promptLayout === "list" && (
+          <div className="app-chat-sugg" data-chat-context data-chat-prompts>
+            {ctx.prompts.map((p) => (
+              <button
+                key={p}
+                type="button"
+                className="app-chat-sugg-row"
+                disabled={!canSend}
+                onClick={() => setDraft(p)}
+              >
+                <span>{p}</span>
+                <span aria-hidden="true">→</span>
+              </button>
+            ))}
+          </div>
+        )}
+        {ctx !== null && mode.promptLayout !== "list" && (
           <div className="app-chat-ctx" data-chat-context>
             <span className="app-chat-chip text-micro text-ink-300">
               Context <b className="font-medium text-ink-100">{ctx.label}</b>
@@ -548,7 +558,7 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
           }}
           rows={2}
           disabled={!canSend}
-          placeholder={canSend ? "Ask Master… (Enter sends)" : "Read-only · Sending is unavailable"}
+          placeholder={canSend ? "Ask the assistant… (Enter sends)" : sendBlockedReason}
           aria-label="Message to the master"
           className="app-chat-box"
         />

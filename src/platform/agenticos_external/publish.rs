@@ -289,8 +289,16 @@ pub fn media_key_authorizes_connection(media_key: &str, connection: &str, digest
 
 // ---------- frozen send binding ----------
 
+/// Source authority for an exact frozen send. A standalone draft is never
+/// disguised as a fabricated app run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationSource {
+    Run { run_id: String },
+    SocialDraft { draft_id: String, revision: i64 },
+}
+
 /// The exact frozen binding one stable key names: one destination, one
-/// caption digest, one image digest, one approved Cadence run/effect.
+/// caption digest, one image digest, and a real typed authority source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendBinding {
     pub key: String,
@@ -299,7 +307,7 @@ pub struct SendBinding {
     pub toolkit: Toolkit,
     pub caption_digest: String,
     pub image_digest: Option<String>,
-    pub cadence_run_id: String,
+    pub source: PublicationSource,
     pub cadence_effect_id: String,
     pub grant_id: String,
 }
@@ -335,8 +343,16 @@ impl SendBinding {
                 ));
             }
         }
-        if self.cadence_run_id.is_empty() || self.cadence_run_id.len() > 120 {
-            return Err(Refusal::new("bad_run", "Cadence run identity is invalid"));
+        match &self.source {
+            PublicationSource::Run { run_id } if run_id.is_empty() || run_id.len() > 120 => {
+                return Err(Refusal::new("bad_run", "Cadence run identity is invalid"));
+            }
+            PublicationSource::SocialDraft { draft_id, revision }
+                if draft_id.is_empty() || draft_id.len() > 120 || *revision < 1 =>
+            {
+                return Err(Refusal::new("bad_draft", "social draft source is invalid"));
+            }
+            _ => {}
         }
         if self.cadence_effect_id.is_empty() || self.cadence_effect_id.len() > 120 {
             return Err(Refusal::new(

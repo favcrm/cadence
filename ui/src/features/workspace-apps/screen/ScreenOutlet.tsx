@@ -1,9 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { sessionHeaders } from "../../../lib/sessionKey";
 import { parseMount, ScreenChannel, type AssetLoader, type ScreenActions } from "./screenLifecycle";
+import { invokeTool, revokeTool } from "./screenActions";
 import { type SlotView } from "./screenSlot";
 import ScreenSlotLayer from "./ScreenSlotLayer";
-import type { ScreenPush } from "./screenProtocol";
+import { parseDraftImageRef, type ScreenPush } from "./screenProtocol";
+import { workspaceApps } from "../workspaceApps";
+import { downscaleToDataUrl } from "./screenAssets";
 
 /** App code lives in its independently installed bundle, never in the board. */
 export default function ScreenOutlet({ projection, fallback, loadAsset, actions }: {
@@ -28,6 +31,9 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
     let retired = false;
     let owned: ScreenChannel | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // The live mount's action token, held host-side for invoke relay and
+    // revoked on teardown so a stale mount's handle cannot be reused.
+    let actionToken: string | null = null;
     setState("loading");
     setSlot(null); setLink(null);
     const fail = () => { if (!retired) setState("fallback"); };
@@ -39,7 +45,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
         const response = await fetch(`/api/app-installations/${encodeURIComponent(current.install_id)}/screens/${encodeURIComponent(current.tag)}/mount`, {
           method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
           headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-          body: "{}",
+          body: JSON.stringify(current.context_id ? { context_id: current.context_id } : {}),
         });
         if (!response.ok) throw new Error("Screen mount refused");
         const receipt = parseMount(await response.json(), current.tag);
@@ -54,14 +60,30 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
         // The container has no earlier frame: previous layout cleanup removed it.
         container.current.replaceChildren(frame);
         if (!frame.contentWindow) throw new Error("Screen frame unavailable");
+        // CAD-1177: hold the mount's action token host-side. It is never
+        // rendered into the frame and never crosses the MessagePort — a
+        // `tool` op only carries alias/input/request_id, and the host
+        // appends this token on the invoke relay.
+        actionToken = receipt.action_token ?? null;
         owned = new ScreenChannel(frame.contentWindow, receipt, latest.current,
           () => frame.remove(), fail, () => { if (!retired) { clearTimeout(timer); setState("ready"); } },
-          ref => loader.current ? loader.current(ref) : Promise.resolve(null),
+          async ref => {
+            const draft=parseDraftImageRef(ref);
+            if(draft&&actionToken){
+              const image=await workspaceApps.socialDraftAsset({action_token:actionToken,alias:draft.alias,draft_id:draft.draftId});
+              const bytes=new Uint8Array(image.bytes);let binary="";
+              for(let offset=0;offset<bytes.length;offset+=0x8000) binary+=String.fromCharCode(...bytes.subarray(offset,offset+0x8000));
+              return downscaleToDataUrl(btoa(binary),image.mime);
+            }
+            return loader.current ? loader.current(ref) : null;
+          },
           acting.current ? {
             call: (verb, args, ui) => acting.current!.call(verb, args, ui),
             planner: (verb, args) => acting.current!.planner(verb, args),
             onSlot: view => { if (!retired) setSlot(view); },
             onLink: url => { if (!retired) setLink(url); },
+            ...(actionToken ? { invoke: (alias: string, input: Record<string, unknown>, requestId: string, scope?:import("./screenProtocol").GenerationScope) =>
+              invokeTool(actionToken!, alias, input, requestId, scope) } : {}),
           } : undefined);
         channel.current = owned;
         frame.addEventListener("load", () => owned?.load());
@@ -79,6 +101,14 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
       channel.current = null;
       setSlot(null); setLink(null);
       container.current?.replaceChildren();
+      // Retire the mount's action handle server-side so a torn-down or
+      // remounted screen's token cannot be replayed. Best-effort — the
+      // daemon's own consume/supersede already refuses a stale mount.
+      if (actionToken) {
+        const token = actionToken;
+        actionToken = null;
+        void revokeTool(token);
+      }
     };
   }, [scope]);
   useEffect(() => { channel.current?.update(projection); }, [projection]);

@@ -975,6 +975,14 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=34", [])?;
                 tx.commit()?;
             }
+            if version < 35 {
+                // CAD-1177: standalone (non-run) tool invocation receipts.
+                // A new pair of tables only; no existing row is touched.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::app_tools::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=35", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

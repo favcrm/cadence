@@ -438,7 +438,6 @@ fn send_body(binding: &SendBinding, material: &SendMaterial) -> Value {
         "key": binding.key,
         "connectionId": binding.connection_id,
         "caption": material.caption,
-        "cadenceRunId": binding.cadence_run_id,
         "cadenceEffectId": binding.cadence_effect_id,
         "grant": {
             "id": binding.grant_id,
@@ -448,6 +447,13 @@ fn send_body(binding: &SendBinding, material: &SendMaterial) -> Value {
             "imageDigest": binding.image_digest,
         },
     });
+    match &binding.source {
+        super::publish::PublicationSource::Run { run_id } => body["cadenceRunId"] = json!(run_id),
+        super::publish::PublicationSource::SocialDraft { draft_id, revision } => {
+            body["cadenceDraftId"] = json!(draft_id);
+            body["draftRevision"] = json!(revision);
+        }
+    }
     if let Some(media_key) = &material.media_key {
         body["mediaKey"] = Value::String(media_key.clone());
     }
@@ -841,6 +847,47 @@ fn store_material(
             })?;
     conn.busy_timeout(crate::store::BUSY_TIMEOUT)
         .map_err(|_| Refusal::new("store_unavailable", "publish material store is unavailable"))?;
+    if let super::publish::PublicationSource::SocialDraft { draft_id, revision } = &binding.source {
+        let row: (String,String,String,Option<String>) = conn.query_row(
+            "SELECT frozen_json,state,digest,media_key FROM app_social_effects WHERE effect_id=?",
+            rusqlite::params![binding.cadence_effect_id],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).map_err(|_|Refusal::new("unknown_key","no approved social draft effect holds this key"))?;
+        let frozen: Value = serde_json::from_str(&row.0)
+            .map_err(|_| Refusal::new("bad_effect", "frozen social draft effect is corrupt"))?;
+        if !matches!(row.1.as_str(), "approved" | "sending")
+            || crate::store::app_runs::material_digest(&frozen) != row.2
+            || frozen["idempotency_key"].as_str() != Some(binding.key.as_str())
+            || frozen["effect_id"].as_str() != Some(binding.cadence_effect_id.as_str())
+            || frozen["source"]["kind"].as_str() != Some("social_draft")
+            || frozen["source"]["draft_id"].as_str() != Some(draft_id.as_str())
+            || frozen["source"]["revision"].as_i64() != Some(*revision)
+            || frozen["aos_connection_id"].as_str() != Some(binding.connection_id.as_str())
+            || frozen["destination_id"].as_str() != Some(binding.destination_id.as_str())
+            || frozen["caption_digest"].as_str() != Some(binding.caption_digest.as_str())
+            || frozen["image_digest"].as_str() != binding.image_digest.as_deref()
+            || frozen["grant_id"].as_str() != Some(binding.grant_id.as_str())
+        {
+            return Err(Refusal::new(
+                "grant_binding_mismatch",
+                "social draft effect differs from its approved binding",
+            ));
+        }
+        let caption = frozen["caption"]
+            .as_str()
+            .ok_or_else(|| Refusal::new("bad_effect", "approved caption is missing"))?
+            .to_owned();
+        if super::publish::caption_digest_of(&caption) != binding.caption_digest {
+            return Err(Refusal::new(
+                "grant_binding_mismatch",
+                "approved caption digest changed",
+            ));
+        }
+        return Ok(SendMaterial {
+            caption,
+            media_key: row.3,
+        });
+    }
     let frozen_text: String = conn
         .query_row(
             "SELECT frozen FROM social_publish_intents WHERE request=?1",
@@ -979,7 +1026,9 @@ mod tests {
             toolkit: Toolkit::Facebook,
             caption_digest: caption_digest_of("Harbour at dusk."),
             image_digest: None,
-            cadence_run_id: "cad_run_test_01".into(),
+            source: super::super::publish::PublicationSource::Run {
+                run_id: "cad_run_test_01".into(),
+            },
             cadence_effect_id: "cad_fx_test_01".into(),
             grant_id: "dpq_test_grant_01".into(),
         }

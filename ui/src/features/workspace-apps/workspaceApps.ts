@@ -3,6 +3,13 @@ import { sessionHeaders } from "../../lib/sessionKey";
 import type { Agent } from "../../lib/types";
 
 export type { Agent };
+
+/** Keep child-facing manifest aliases out of operator identity fields on RPC. */
+function toolActionBody<T extends { alias: string }>(body: T): Omit<T, "alias"> & { tool_alias: string } {
+  const { alias, ...fields } = body;
+  if ("tool_alias" in fields) throw new Error("tool_alias is host-owned request data");
+  return { ...fields, tool_alias: alias };
+}
 export interface Installation {
   install_id: string; name: string; title: string; version: string;
   summary: string; digest: string; catalog_generation: string; storage_kind: "workspace" | "legacy";
@@ -55,6 +62,12 @@ export interface BindingDrift {
   state: "current" | "migrates" | "needs_confirm" | "unavailable";
   changes?: BindingChange[];
   reason?: string;
+}
+export interface SocialDraftEffect {
+  effect_id:string; install_id:string; context_id:string; draft_id:string; revision:number;
+  request:string; digest:string; state:string; needs_you:boolean; approval_id:string;
+  authorization_kind:"social_draft"; authority:Record<string,unknown>; record:Record<string,unknown>;
+  outcome?:unknown; created_at:number; updated_at:number;
 }
 export interface AppBinding {
   id: string; install_id: string; context_id: string | null; slot: string;
@@ -120,6 +133,20 @@ export interface CapabilityQuote {
   binding_digest: string;
   quote_digest: string;
   quote: { schema: 1; currency: "USD"; unit_price_micros: number; units: number; total_price_micros: number; price_revision: string };
+}
+/** CAD-1177: a retained standalone tool invocation receipt. The `result`
+ *  payload shape is tool-owned (e.g. `social.source.posts` for the
+ *  Instagram read); the envelope fields are host-stamped. */
+export interface ToolReceipt {
+  id: string; request_id: string; install_id: string; alias: string; slot: string;
+  binding_digest: string; input_digest: string; digest: string;
+  input: Record<string, unknown>;
+  result: { kind?: string; handle?: string; posts?: SourcePost[]; profile_verified?: boolean;
+    empty_reason?: string | null; charge?: { currency: string; scale: number; amount: string } | null;
+    [key: string]: unknown };
+  asset?: { media_type: string; digest: string; size: number } | null;
+  /** Host-stamped creation epoch seconds; the frame reads it as fetched_at. */
+  created_at?: number;
 }
 export interface AppEffect {
   effect_id: string; request: string; state: string; needs_you: boolean; digest: string;
@@ -219,9 +246,33 @@ export const workspaceApps = {
   capabilityResult: (id: string, signal?: AbortSignal) => request<SourceReceipt>(`/api/app-capability-results/${part(id)}`, signal),
   capabilityAsset: (id: string, signal?: AbortSignal) => request<ImageAsset>(`/api/app-capability-results/${part(id)}/asset`, signal),
   bindingQuote: (id: string, slot: string, contextId?: string, signal?: AbortSignal) => request<CapabilityQuote>(contextId ? `${installation(id)}/contexts/${part(contextId)}/bindings/${part(slot)}/quote` : `${installation(id)}/bindings/${part(slot)}/quote`, signal),
+  /** CAD-1177: invoke one declared screen tool through the host broker,
+   *  bound to the live mount's action context. The frame supplies only
+   *  alias/input/request_id; install/digest/slot/binding are server-side. */
+  invokeTool: (body: { action_token: string; alias: string; input: Record<string, unknown>; request_id: string; generation_scope?: {operation:"caption"|"image";draft_id:string;revision:number} }) =>
+    request<{ receipt?: ToolReceipt; generation_intent?: {request_id:string;operation:string;draft_id?:string;revision?:number;input_digest:string;state:"pending"|"uncertain";updated_at:number}; replayed: boolean }>("/api/app-screen-tools/invoke", undefined, toolActionBody(body)),
+  /** CAD-1177: retire a mount's action handle on teardown/remount. The
+   *  host sends the mount's action_token; the daemon revokes only a
+   *  context the proven session owns. Best-effort — never blocks unmount. */
+  revokeTool: (body: { action_token: string }) =>
+    request<{ revoked: boolean }>("/api/app-screen-tools/revoke", undefined, body),
+  /** The retained receipts for one installation (operator read). */
+  toolResults: async (id: string, contextId?: string, signal?: AbortSignal) => (await request<{ results: ToolReceipt[] }>(`/api/app-screen-tools/results?install_id=${part(id)}${contextId?`&context_id=${part(contextId)}`:""}`, signal)).results,
+  socialDraftAction: (operation: "create"|"list"|"show"|"update"|"sources/show"|"sources/save"|"effect-stage", body: Record<string, unknown> & { alias: string }) =>
+    request<Record<string, unknown>>(`/api/app-social-drafts/${operation}`, undefined, toolActionBody(body)),
+  socialDraftAsset: async (body:{action_token:string;alias:string;draft_id:string}):Promise<{bytes:ArrayBuffer;mime:string}> => {
+    const response=await fetch("/api/app-social-drafts/asset",{method:"POST",credentials:"same-origin",cache:"no-store",
+      headers:{"Content-Type":"application/json","X-Cadence-Board":"1",...sessionHeaders()},body:JSON.stringify(toolActionBody(body))});
+    if(!response.ok) { const value=await response.json().catch(()=>null); throw new ApiError(value?.error??`${response.status} ${response.statusText}`,response.status); }
+    const mime=response.headers.get("Content-Type")??"";
+    if(!["image/jpeg","image/png"].includes(mime)) throw new ApiError("The server returned an invalid social image",502);
+    return {bytes:await response.arrayBuffer(),mime};
+  },
   artifact: (id: string, signal?: AbortSignal) => request<TextArtifact>(`/api/app-run-artifacts/${part(id)}`, signal),
   stageEffect: async (id: string, body: { artifact_id: string; slot: string; request_id: string; title: string }) => (await request<{ effect: AppEffect }>(`${run(id)}/effects`, undefined, body)).effect,
   decideEffect: async (id: string, body: { digest: string; decision: "accept" | "decline" }) => (await request<{ effect: AppEffect }>(`${effect(id)}/decide`, undefined, body)).effect,
+  decideSocialDraftEffect: async (id:string,body:{digest:string;decision:"accept"|"decline"})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/decide`,undefined,body)).effect,
+  publishSocialDraftNow: async (id:string,body:{digest:string})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/publish-now`,undefined,body)).effect,
   resolveEffect: async (id: string, body: { digest: string; resolution: "close" | "acknowledge" }) => (await request<{ effect: AppEffect }>(`${effect(id)}/resolve`, undefined, body)).effect,
   outbox: (id: string, signal?: AbortSignal) => request<WorkspaceOutbox>(`/api/outbox?effect_id=${part(id)}`, signal),
 };
