@@ -1667,7 +1667,7 @@ impl Shared {
                 let reason = if self.store.has_unknown(alias).unwrap_or(false) {
                     format_unknown_fence(&self.preserved_unknown_detail(alias, &error.to_string()))
                 } else {
-                    error.to_string()
+                    Self::public_actor_fatal_reason(error)
                 };
                 // One write: `attention` must never be observable with
                 // the dead actor's endpoint still attached.
@@ -2314,6 +2314,16 @@ impl Shared {
                                 .store
                                 .orphan_running(alias, "endpoint lost after submission");
                             self.wake();
+                            // CAD-1142: stamp the claimed turn's proven
+                            // source onto the fatal error so `run_actor`
+                            // can classify its public fence text without
+                            // reading provider prose. The stamped text is
+                            // unchanged — only the public writes differ.
+                            let error = if message.source == "app_run_dispatch" {
+                                error.into_app_owned_fatal()
+                            } else {
+                                error
+                            };
                             return Err(error);
                         }
                     }
@@ -2571,6 +2581,22 @@ impl Shared {
             }
         }
         UNKNOWN_GENERIC_REASON.to_string()
+    }
+
+    /// CAD-1142: the public fence text for an actor-fatal exit. When the
+    /// returned error was provably raised on an app-owned turn (the actor
+    /// stamped `AppOwnedFatal` from the claimed message's source — never
+    /// inferred from the error text), the reason is the bounded
+    /// Cadence-authored class: the provider's prose stays on the
+    /// message row, whose `message read` for an app source already
+    /// requires operator proof. Any other actor error — and any turn
+    /// that is not app-owned — publishes the error verbatim, exactly as
+    /// before.
+    fn public_actor_fatal_reason(error: &Error) -> String {
+        if error.is_app_owned_fatal() {
+            return store::app_runs::app_worker_turn_reason("failed", true);
+        }
+        error.to_string()
     }
 
     /// An `OutcomeUnknown` never becomes a retry: mark the attempt and
@@ -8942,6 +8968,42 @@ mod app_unknown_fence_privacy {
         // The raw account is still on the operator-private row.
         let stored = shared.store.message("app-m3").unwrap().unwrap();
         assert_eq!(stored.error.as_deref(), Some(raw));
+    }
+
+    /// CAD-1142 actor-fatal privacy: an app-owned turn's fatal provider
+    /// error is stamped at the fatal arm, so `run_actor`'s public fence
+    /// text — `agents.error` and the `attention` event payload — carries
+    /// the bounded class, not the provider's prose. The raw account is
+    /// already on the operator-private message row.
+    #[test]
+    fn app_owned_actor_fatal_publishes_class_only() {
+        let raw = "pi 'prompt' refused: Authorization: Bearer s3cr3t";
+        let stamped = Error::provider(raw).into_app_owned_fatal();
+        assert!(stamped.is_app_owned_fatal());
+        // The error's own text is unchanged — the wire and the stored
+        // message.error still carry the provider's account.
+        assert_eq!(stamped.to_string(), raw);
+        let public = Shared::public_actor_fatal_reason(&stamped);
+        assert_eq!(public, "worker turn failed: provider error");
+        assert!(!public.contains("s3cr3t"), "{public}");
+    }
+
+    /// A fatal error on a non-app turn is never stamped, so the public
+    /// fence text keeps the provider's account verbatim — unchanged.
+    #[test]
+    fn non_app_actor_fatal_keeps_raw_detail() {
+        let raw = "pi 'prompt' refused: provider declined the turn";
+        let error = Error::provider(raw);
+        assert!(!error.is_app_owned_fatal());
+        assert_eq!(Shared::public_actor_fatal_reason(&error), raw);
+        // Stamping only rewrites text for the variants that reach the
+        // fatal arm; intercepted variants pass through untouched.
+        let unknown = Error::unknown("outcome unknown");
+        assert!(!unknown.is_app_owned_fatal());
+        assert!(matches!(
+            unknown.into_app_owned_fatal(),
+            Error::OutcomeUnknown(_)
+        ));
     }
 }
 
