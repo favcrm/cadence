@@ -298,6 +298,13 @@ impl Store {
         )
         .map(Some)
     }
+    /// CAD-1129 H5: revoke this install's consent at its current
+    /// digest — the soft-remove path. `app_capability_decide_audited`
+    /// already writes the `revoked` epoch; this is the operator-facing
+    /// wrapper that never leaves an `approved` slot behind.
+    pub fn app_install_revoke(&self, id: &str, digest: &str, via: &str) -> Result<Value> {
+        self.app_capability_decide_audited(id, digest, false, json!({"via": via}))
+    }
     fn app_capability_decide_audited(
         &self,
         id: &str,

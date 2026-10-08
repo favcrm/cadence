@@ -3,6 +3,9 @@ import { api, ApiError, type WriteResp } from "./lib/api";
 import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
 import AppDetail from "./features/apps/AppDetail";
+import Explorer from "./features/explorer/Explorer";
+import CatalogDetail from "./features/explorer/CatalogDetail";
+import ManageApp from "./features/explorer/ManageApp";
 import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
 import { useInstallations } from "./features/workspace-apps/useInstallations";
@@ -95,6 +98,9 @@ const SCREEN_LABEL: Record<Screen, string> = {
   overview: "overview",
   projects: "projects",
   apps: "apps",
+  appsExplore: "explore",
+  appsCatalog: "app",
+  appsManage: "manage",
   workspaceApp: "app",
   agents: "agents",
   wiki: "wiki",
@@ -933,6 +939,15 @@ export default function App() {
         )}
         {route.screen === "apps" && !route.project && (
           <Apps project={project} viewer={{ readOnly, operator: meta?.operator === true }} />
+        )}
+        {route.screen === "appsExplore" && (
+          <Explorer viewer={{ readOnly, operator: meta?.operator === true }} />
+        )}
+        {route.screen === "appsCatalog" && (
+          <CatalogDetail id={route.id} viewer={{ readOnly, operator: meta?.operator === true }} />
+        )}
+        {route.screen === "appsManage" && (
+          <ManageApp installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
         {route.screen === "workspaceApp" && (
           <AppShell installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} onInstallation={reportInstallation}>

@@ -16,10 +16,10 @@ use super::write_path::{
     write_route, HttpResp,
 };
 use super::{
-    app_assistant, app_audiences, app_chat, app_content, app_contexts, app_records, app_release,
-    app_runs, app_screens, apps, cli_route, connections, crm_send, delivery_sync, home, lane,
-    operator, platform_account, read_model, social_publish, stages, threads, updates, wiki,
-    workflows,
+    app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
+    app_release, app_runs, app_screens, apps, cli_route, connections, crm_send, delivery_sync,
+    home, lane, operator, platform_account, read_model, social_publish, stages, threads, updates,
+    wiki, workflows,
 };
 use super::{push_device_login_config, ready_file, tailnet_url, ServeOpts, READY_NONCE_ENV};
 use crate::adapter::registry;
@@ -1576,6 +1576,20 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     "app_workspace_list"
                 };
                 let response = apps::workspace(&mut request, state_dir, method, id);
+                send(request, response);
+                return;
+            }
+            // CAD-1129: the apps Explorer — `/api/app-catalog`,
+            // `/api/app-home`, `/api/app-favorites`, `/api/app-requests`.
+            // Member-capable reads ride `board_caller` like `/api/wiki`;
+            // the daemon re-proves `member_as` before a member row leaves.
+            if path == "/api/app-catalog"
+                || path.starts_with("/api/app-catalog/")
+                || path == "/api/app-home"
+                || path == "/api/app-favorites"
+                || path == "/api/app-requests"
+            {
+                let response = app_explorer::read(&request, &path, &query, state_dir, opts);
                 send(request, response);
                 return;
             }

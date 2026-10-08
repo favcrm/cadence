@@ -88,14 +88,14 @@ export function NewPost({
         || value.quote.unit_price_micros <= 0
         || value.quote.total_price_micros !== value.quote.unit_price_micros
         || typeof value.quote.price_revision !== "string" || !value.quote.price_revision) {
-        setImageQuoteError("The image connection or current provider price changed. Refresh Settings before planning an image.");
+        setImageQuoteError("The image connection changed or is unavailable. Refresh Settings before planning an image.");
         return;
       }
       setImageQuote(value);
     }).catch(reason => {
       if (controller.signal.aborted) return;
       if (reason instanceof ApiError && [401, 403].includes(reason.status)) { onDenied(); return; }
-      setImageQuoteError(reason instanceof Error ? reason.message : "Could not obtain the image provider’s price.");
+      setImageQuoteError(reason instanceof Error ? reason.message : "Could not reach the image provider.");
     });
     return () => controller.abort();
   }, [installId, contextId, imageSupported, imageBindingDigest, onDenied]);
@@ -128,9 +128,9 @@ export function NewPost({
       !title.trim() || !source.trim()
         ? "Enter a post title and source facts."
         : workflow === "image-instagram" && (!sourceChoice || !imageQuote)
-          ? "Choose a retained Instagram source and wait for its current image price."
+          ? "Choose a retained Instagram source and wait for the image option to be ready."
         : workflow === "image-manual" && (!imageQuote || !!sourceChoice)
-          ? "Use pasted facts and wait for the current image price."
+          ? "Use pasted facts and wait for the image option to be ready."
         : promptValidation
           ? promptValidation
         : /[\r\n\t]/.test(title) || (!sourceChoice && /[\r\n\t]/.test(source))
@@ -169,7 +169,7 @@ export function NewPost({
     <WorkspaceDialog title="New post" onClose={onClose}>
       <form className="wa-stack" onSubmit={submit}>
         <p className="wa-muted">
-          {sourceChoice ? "Review the chosen retained Instagram post before making a new caption. An image option appears when a draft provider is bound; its exact charge will be frozen in the plan." : "Paste the facts your team should use. You’ll review the frozen plan"}
+          {sourceChoice ? "Review the chosen retained Instagram post before making a new caption. An image option appears when a draft provider is bound." : "Paste the facts your team should use. You’ll review the frozen plan"}
           {!sourceChoice && " before the writer starts. Releasing the accepted text is a separate decision."}
         </p>
         {(error || validation) && (
@@ -180,10 +180,10 @@ export function NewPost({
         {imageSupported && (!imageBindingDigest
           ? <p className="wa-alert">To add an image, choose a ready image generation connection in Cadence Settings.</p>
           : imageQuote
-            ? <p className="wa-alert">Current rate for one generated image: <strong>USD {(imageQuote.quote.total_price_micros / 1_000_000).toFixed(6)}</strong> — billed at the provider's actual charge. The frozen plan requires a separate cost approval before dispatch.</p>
+            ? <p className="wa-alert">The image option is ready — the frozen plan needs your approval before the writer starts.</p>
             : imageQuoteError
               ? <p className="wa-alert" data-tone="fail" role="alert">{imageQuoteError}</p>
-              : <p className="wa-muted" role="status">Checking one-image provider price…</p>)}
+              : <p className="wa-muted" role="status">Checking the image option…</p>)}
         <div className="wa-field">
           <label htmlFor="wa-post-title">Post title</label>
           <input
@@ -260,7 +260,7 @@ export function NewPost({
           />
           <p id="wa-image-prompt-help" className="wa-kicker">
             {imageWorkflow && imageQuote
-              ? <>{imageEffective.origin === "run_override" ? "This post overrides " : "Using "}{imageDefault.origin === "context_default" ? `${contextLabel || "brand"}’s saved default` : "the app default"}. Clear the field to use that default. The provider, price and asset rules stay fixed.</>
+              ? <>{imageEffective.origin === "run_override" ? "This post overrides " : "Using "}{imageDefault.origin === "context_default" ? `${contextLabel || "brand"}’s saved default` : "the app default"}. Clear the field to use that default. The provider and asset rules stay fixed.</>
               : "Choose an image workflow with a ready generated image connection to edit this prompt."}
           </p>
         </div>

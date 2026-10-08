@@ -64,7 +64,7 @@ pub const LOCAL_CONNECTION: &str = "local";
 
 /// `app.md` frontmatter keys v0 knows. Anything else refuses — the same
 /// fail-loud rule the workflow and plan parsers apply.
-const MANIFEST_KEYS: &[&str] = &["app", "title", "version", "needs", "summary"];
+const MANIFEST_KEYS: &[&str] = &["app", "title", "version", "needs", "summary", "listing"];
 
 /// Frontmatter keys the later stages reserve — refused with their own
 /// message so a bundle carrying one names the stage, not "unknown key".
@@ -76,7 +76,16 @@ const GATED_KEYS: &[&str] = &["records", "actions", "ui", "settings", "actors"];
 /// `<stem>.<js|css|svg|json>` asset leaves. `views/` (CAD-864) holds
 /// exactly one file — `views/app-views-v1.json`, the app-views/v1
 /// descriptor — and only when `app.md` declares `needs.views.contract`.
-const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "screens", "views"];
+/// CAD-1129: `assets/` is the catalog's icon and screenshots — flat
+/// `*.svg` files only.
+const TOP_DIRS: &[&str] = &[
+    "workflows",
+    "rubrics",
+    "templates",
+    "screens",
+    "views",
+    "assets",
+];
 
 /// Largest single file in a bundle — workflows render to plans, so the
 /// plan cap applies; the same bound keeps every other file small.
@@ -106,6 +115,9 @@ pub struct Manifest {
     /// when the manifest declared it; the file and declaration pair up
     /// at `validate`/`validate_texts` (either alone refuses).
     pub view_contract: Option<String>,
+    /// CAD-1129 §3: the display-only catalog block (`listing:`), plain
+    /// JSON already host-validated — it can declare no capability.
+    pub listing: Option<crate::issue::app_listing::Listing>,
     pub guide: String,
 }
 
@@ -180,6 +192,20 @@ pub struct Record {
     pub installed_by: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// CAD-1129 H5: the epoch this install was soft-removed. A set
+    /// value hides it from Open, the home and `app_workspace_list`,
+    /// and refuses run creation. Restore clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<i64>,
+    /// The last epoch a restore is admitted; after it, `restore`
+    /// refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_after: Option<i64>,
+    /// The epoch the soft-removed bytes may be purged — kept for
+    /// CAD-1130's flag-gated purge; `remove` never writes it before
+    /// then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_after: Option<i64>,
 }
 
 /// Where an installed bundle came from. `git` records the exact commit
@@ -187,8 +213,23 @@ pub struct Record {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Source {
-    Path { path: String },
-    Git { url: String, sha: String },
+    Path {
+        path: String,
+    },
+    Git {
+        url: String,
+        sha: String,
+        /// CAD-1129: the bundle subdirectory inside the repo, when the
+        /// install came through the Explorer's Git check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<String>,
+    },
+    /// CAD-1129: installed from the host's embedded built-in catalog —
+    /// the catalog entry id and the bundle digest it shipped.
+    Builtin {
+        id: String,
+        digest: String,
+    },
 }
 
 impl Record {
@@ -337,6 +378,9 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             )));
         }
     }
+    // Decision 8: `cost`/`price`/`pricing` are refused anywhere in the
+    // frontmatter, at any depth — the UI never shows a price.
+    crate::issue::app_listing::refuse_price_keys(&serde_yaml::Value::Mapping(map.clone()))?;
     let get = |k: &str| map.get(serde_yaml::Value::String(k.to_string()));
     let need_str = |k: &str, what: &str| -> Result<String> {
         match get(k).and_then(|v| v.as_str()) {
@@ -346,6 +390,13 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     };
     let app = need_str("app", "the app name — the folder it installs as")?;
     check_name(&app, "app name")?;
+    // `/apps/explore` is the catalog route — an app named `explore`
+    // would shadow it on the board (CAD-1129 H10).
+    if app == "explore" {
+        return Err(Error::rejected(
+            "app name 'explore' is reserved for the app catalog route",
+        ));
+    }
     let title = need_str("title", "one line naming the app")?;
     let version = need_str("version", "a version string like 0.1.0")?;
     for (k, v, cap) in [("title", &title, 120), ("version", &version, 40)] {
@@ -470,6 +521,21 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             "a publication slot cannot also be a legacy connection slot",
         ));
     }
+    // `listing:` is display-only catalog copy (CAD-1129 §3). Slots it
+    // names must be declared; the block itself grants nothing. Asset
+    // references are collected on the `Listing` and `validate_contents`
+    // proves each one is in the bundle's own inventory.
+    let listing = match get("listing") {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(value) => {
+            let yaml_len = serde_yaml::to_string(value)
+                .map_err(|e| Error::rejected(format!("app.md listing: {e}")))?
+                .len();
+            let mut slots: Vec<String> = connections.clone();
+            slots.extend(capabilities.keys().cloned());
+            Some(crate::issue::app_listing::parse(value, yaml_len, &slots)?)
+        }
+    };
     Ok(Manifest {
         app,
         title,
@@ -478,6 +544,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         capabilities,
         summary,
         view_contract,
+        listing,
         guide: body.to_string(),
     })
 }
@@ -864,6 +931,7 @@ fn validate_contents(
                     capabilities: BTreeMap::new(),
                     summary: None,
                     view_contract: None,
+                    listing: None,
                     guide: String::new(),
                 }
             }
@@ -876,9 +944,21 @@ fn validate_contents(
             capabilities: BTreeMap::new(),
             summary: None,
             view_contract: None,
+            listing: None,
             guide: String::new(),
         },
     };
+    // CAD-1129 §3: every asset `listing` references must be in this
+    // bundle's own inventory — `assets/` flat *.svg, nothing outside.
+    if let Some(listing) = &manifest.listing {
+        for asset in &listing.assets {
+            if !files.iter().any(|(rel, _)| rel == asset) {
+                errors.push(format!(
+                    "listing asset '{asset}' is not in the bundle's assets/"
+                ));
+            }
+        }
+    }
     // CAD-1110: a package whose chat descriptor breaks the app-chat/v1
     // grammar is refused at install and update, not at first use.
     if let Some((_, text)) = files
@@ -1376,6 +1456,7 @@ pub(crate) fn resolve_source(source: &str) -> Result<(PathBuf, Source, Option<te
         Source::Git {
             url: source.to_string(),
             sha,
+            dir: None,
         },
         Some(tmp),
     ))
@@ -1474,6 +1555,9 @@ pub fn install(
         installed_at: now,
         installed_by: write::actor_who(actor, None),
         updated_at: None,
+        removed: None,
+        restore_after: None,
+        purge_after: None,
     };
     if let Err(e) = write_record(&record_path, &record) {
         rollback(false);
@@ -1481,7 +1565,8 @@ pub fn install(
     }
     let label = match &src {
         Source::Path { path } => format!("path {path}"),
-        Source::Git { url, sha } => format!("git {url} @ {}", &sha[..12]),
+        Source::Git { url, sha, .. } => format!("git {url} @ {}", &sha[..12]),
+        Source::Builtin { id, .. } => format!("builtin {id}"),
     };
     let foreign = match write::commit(
         pm,
@@ -1614,6 +1699,11 @@ pub fn update(
         None => match &record.source {
             Source::Path { path } => resolve_source(path)?,
             Source::Git { url, .. } => resolve_source(url)?,
+            Source::Builtin { .. } => {
+                return Err(Error::rejected(
+                    "a built-in app updates from the catalog's Check update, not a CLI path",
+                ))
+            }
         },
     };
     if src_dir.starts_with(pm.dir.canonicalize().unwrap_or_else(|_| pm.dir.clone())) {
@@ -1692,7 +1782,8 @@ pub fn update(
     write_record(&record_path, &record)?;
     let label = match &record.source {
         Source::Path { path } => format!("path {path}"),
-        Source::Git { url, sha } => format!("git {url} @ {}", &sha[..12]),
+        Source::Git { url, sha, .. } => format!("git {url} @ {}", &sha[..12]),
+        Source::Builtin { id, .. } => format!("builtin {id}"),
     };
     let foreign = write::commit(
         pm,

@@ -232,6 +232,61 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/app-installations", RouteClass::OperatorOnly),
+    // CAD-1194: the install-check — read-only, but it fetches and
+    // validates a source on the host, so it is the operator's like install.
+    route(
+        "POST",
+        "/api/app-installations/check",
+        RouteClass::OperatorOnly,
+    ),
+    // CAD-1129: the apps Explorer. The catalog install/git-check and
+    // the per-install update-check/remove/restore are the operator's,
+    // like every install write; favorites, the workspace default and
+    // an install request are the member verbs (`AgentAllowed` admits a
+    // named member's session, which the daemon re-proves).
+    route("POST", "/api/app-catalog/install", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/app-catalog/git-check",
+        RouteClass::OperatorOnly,
+    ),
+    route("POST", "/api/app-catalog/request", RouteClass::AgentAllowed),
+    route("POST", "/api/app-favorites", RouteClass::AgentAllowed),
+    route(
+        "POST",
+        "/api/app-favorites/default",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-favorites/opened",
+        RouteClass::AgentAllowed,
+    ),
+    route(
+        "POST",
+        "/api/app-requests/dismiss",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/update-check",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/remove-preview",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/remove",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/restore",
+        RouteClass::OperatorOnly,
+    ),
     // CAD-996: bounded manual `{files}` bundle upload — operator-only like the
     // sibling install route it stages into.
     route(
@@ -2074,6 +2129,62 @@ mod tests {
             concrete_board_server(&opts).unwrap(),
             "127.0.0.1:3115".parse().unwrap()
         );
+    }
+
+    /// CAD-1129 / CAD-1194 acceptance (reviewer-written, cc13-sonnet-spec794).
+    /// In production the board relays every write over ITS OWN daemon
+    /// connection, which proves operator and carries no agent identity, so
+    /// this table is the only thing that keeps an agent off the install,
+    /// check, git-check, remove and restore routes. The class of every
+    /// explorer route is pinned here: only the three member verbs are
+    /// `AgentAllowed`; everything else is `OperatorOnly`.
+    #[test]
+    fn explorer_routes_are_operator_only_except_the_member_verbs() {
+        for path in [
+            "/api/app-installations/check",
+            "/api/app-installations",
+            "/api/app-installations/upload",
+            "/api/app-catalog/install",
+            "/api/app-catalog/git-check",
+            "/api/app-favorites/default",
+            "/api/app-requests/dismiss",
+            "/api/app-installations/inst-1/update-check",
+            "/api/app-installations/inst-1/remove-preview",
+            "/api/app-installations/inst-1/remove",
+            "/api/app-installations/inst-1/restore",
+            "/api/app-catalog/unlisted-future-route",
+        ] {
+            assert_eq!(
+                route_class("POST", path),
+                RouteClass::OperatorOnly,
+                "{path} must be operator-only"
+            );
+        }
+        for path in [
+            "/api/app-catalog/request",
+            "/api/app-favorites",
+            "/api/app-favorites/opened",
+        ] {
+            assert_eq!(
+                route_class("POST", path),
+                RouteClass::AgentAllowed,
+                "{path} is a member verb"
+            );
+        }
+        // no explorer write may be read as a GET-class or session route.
+        for path in [
+            "/api/app-installations/check",
+            "/api/app-catalog/install",
+            "/api/app-installations/inst-1/remove",
+        ] {
+            for method in ["PUT", "PATCH", "DELETE"] {
+                assert_eq!(
+                    route_class(method, path),
+                    RouteClass::OperatorOnly,
+                    "{method} {path}"
+                );
+            }
+        }
     }
 
     #[test]

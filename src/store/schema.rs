@@ -951,6 +951,15 @@ impl Store {
                 }
                 migrated?;
             }
+            if version < 33 {
+                // CAD-1129: favourites, install requests and cached
+                // update checks for the apps Explorer — new tables only;
+                // no existing row is read or rewritten.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::app_explorer::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=33", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

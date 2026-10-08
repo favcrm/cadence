@@ -43,6 +43,9 @@ export type Route =
   | { screen: "projects"; slug: string | null; section: ProjectSection }
   | { screen: "issue"; project: string; id: string; tab: IssueTab }
   | { screen: "apps"; project: string | null; name: string | null }
+  | { screen: "appsExplore" }
+  | { screen: "appsCatalog"; id: string }
+  | { screen: "appsManage"; installId: string }
   | { screen: "workspaceApp"; installId: string }
   | { screen: "agents"; alias: string | null }
   | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null }
@@ -176,7 +179,23 @@ export function matchRoute(pathname: string): Route {
       }
     }
     if (head === "apps") {
+      // CAD-1129: the Apps home's siblings — the Explorer
+      // (`/apps/explore`), one catalog app (`/apps/catalog/<id>`) and
+      // the operator's manage tab (`/apps/manage/<install_id>`). The
+      // bare `/apps/<a>` shape is reserved for these reserved words so
+      // a project named "explore"/"catalog"/"manage" never collides.
       if (!a) return { screen: "apps", project: null, name: null };
+      if (a === "explore" && !b) return { screen: "appsExplore" };
+      if (a === "catalog" && b) {
+        const id = segment(b);
+        if (id && !rest.length) return { screen: "appsCatalog", id };
+      }
+      if (a === "manage" && b) {
+        const installId = segment(b);
+        if (installId && /^[A-Za-z0-9_-]{1,128}$/.test(installId) && !rest.length) {
+          return { screen: "appsManage", installId };
+        }
+      }
       const project = segment(a);
       const name = b ? segment(b) : null;
       if (project && name) return { screen: "apps", project, name };
@@ -226,6 +245,12 @@ export function routePath(route: Route): string {
       return route.name
         ? `/apps/${encodeURIComponent(route.project)}/${encodeURIComponent(route.name)}`
         : "/apps";
+    case "appsExplore":
+      return "/apps/explore";
+    case "appsCatalog":
+      return `/apps/catalog/${encodeURIComponent(route.id)}`;
+    case "appsManage":
+      return `/apps/manage/${encodeURIComponent(route.installId)}`;
     case "agents":
       return route.alias ? `/agents/${encodeURIComponent(route.alias)}` : "/agents";
     case "wiki": {

@@ -104,11 +104,11 @@ const TIMEOUT_TERM_CODE: i32 = 124;
 const TIMEOUT_KILL_CODE: i32 = 137;
 
 /// The v0 bundle shape — the same allowlist `app.rs` pins privately:
-/// `app.md` plus flat `workflows/`, `rubrics/`, `templates/` dirs, and
+/// `app.md` plus flat `workflows/`, `rubrics/`, `templates/` dirs,
 /// CAD-1006's `screens/` (one `<tag>/` subdir per package of flat
-/// `<stem>.<js|css|svg|json>` leaves + `screens.json`). Kept identical
-/// by inspection parity.
-const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "screens"];
+/// `<stem>.<js|css|svg|json>` leaves + `screens.json`) and CAD-1129's
+/// `assets/` (flat `*.svg`). Kept identical by inspection parity.
+const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "screens", "assets"];
 
 /// Most files a bundle may carry — pinned at `app.rs`'s private
 /// `MAX_FILES`.
@@ -350,6 +350,38 @@ pub fn resolve(source: &SelectedGitSource) -> Result<ResolvedGitBundle> {
 /// holding HOME, XDG_CONFIG_HOME, the empty global-config file and the
 /// empty template dir under `tmp`, so no step inherits caller state or
 /// leaves git state for the next.
+/// `git ls-remote <url> <ref>` — the explorer's ref→commit resolution
+/// step (CAD-1129). One bounded, scrubbed `git` call; its stdout's
+/// `sha\tref` line yields the pinned commit. Every refusal is a plain
+/// `Err`.
+pub(crate) fn ls_remote(tmp: &Path, url: &str, git_ref: &str) -> Result<String> {
+    let out = git_step(tmp, "ls-remote", |cmd| {
+        cmd.arg("ls-remote").arg("--").arg(url).arg(git_ref);
+    })?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| Error::rejected("ls-remote answered nothing — the ref is unknown"))?;
+    let (sha, name) = line
+        .split_once('\t')
+        .ok_or_else(|| Error::rejected("ls-remote answered an unparseable line"))?;
+    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::rejected("ls-remote answered a non-commit object"));
+    }
+    // The remote must answer the ref the caller named — never a peeled
+    // or adjacent one.
+    if !name.ends_with(git_ref)
+        && !(git_ref == "HEAD" && name == "HEAD")
+        && !(name == format!("refs/tags/{git_ref}") || name == format!("refs/tags/{git_ref}^{{}}"))
+    {
+        return Err(Error::rejected(format!(
+            "ls-remote resolved '{name}', not '{git_ref}' — refusing to substitute"
+        )));
+    }
+    Ok(sha.to_string())
+}
+
 fn git_step(tmp: &Path, step: &str, args: impl FnOnce(&mut Command)) -> Result<Output> {
     let env_dir = tmp.join("env").join(step);
     let (home, xdg, template, global) = (
@@ -772,6 +804,14 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
                                  not tag-shaped"
                             )));
                         }
+                    }
+                    // CAD-1129: assets/ leaves are flat *.svg only.
+                    if top_text == "assets"
+                        && (!leaf_text.ends_with(".svg") || leaf_text.len() > 128)
+                    {
+                        return Err(Error::rejected(format!(
+                            "bundle entry '{rel}': assets are flat <stem>.svg files"
+                        )));
                     }
                     add(&sub, &leaf, rel)?;
                 }

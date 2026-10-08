@@ -6,6 +6,8 @@ export type { Agent };
 export interface Installation {
   install_id: string; name: string; title: string; version: string;
   summary: string; digest: string; catalog_generation: string; storage_kind: "workspace" | "legacy";
+  /** The install's recorded upstream — `kind` is path/git/builtin (CAD-1129). */
+  source?: { kind?: string; url?: string; sha?: string; dir?: string; path?: string; id?: string };
   project_link: string | null; approved: boolean | null; executable: boolean;
   approval: { state: string }; guide: string; files: string[];
   /** Declared slot contract from the live bundle manifest (CAD-585): typed capability slots. */
@@ -219,4 +221,117 @@ export const workspaceApps = {
   decideEffect: async (id: string, body: { digest: string; decision: "accept" | "decline" }) => (await request<{ effect: AppEffect }>(`${effect(id)}/decide`, undefined, body)).effect,
   resolveEffect: async (id: string, body: { digest: string; resolution: "close" | "acknowledge" }) => (await request<{ effect: AppEffect }>(`${effect(id)}/resolve`, undefined, body)).effect,
   outbox: (id: string, signal?: AbortSignal) => request<WorkspaceOutbox>(`/api/outbox?effect_id=${part(id)}`, signal),
+};
+
+// ---------- CAD-1129: the apps Explorer ----------
+
+/** One catalog card (a built-in, or the operator's checked Git entry). */
+export interface CatalogCard {
+  id: string; source_kind: "builtin" | "git"; name: string; title: string;
+  version: string; tagline?: string; digest?: string; trust: "cadence" | "unreviewed";
+  state?: "available" | "installed" | "off" | "requested" | "removed";
+  install_id?: string; requested_by_me?: boolean; request_count?: number;
+  update_available?: boolean; featured?: boolean;
+  /** Git check's resolved repository and commit. */
+  source_url?: string; commit?: string; dir?: string;
+  listing?: Listing;
+  access?: { icon: string; title: string; sentence: string; chip?: unknown; note?: string }[];
+  never?: string;
+  about?: string; can?: string[]; screenshots?: { file: string; caption?: string }[];
+  setup?: SetupStep[]; data?: ListingData; access_notes?: Record<string, string>;
+  changes?: { version: string; notes: string[]; keeps?: string }[];
+}
+
+/** The Apps home's one row per live install (CAD-1129 H3). */
+export interface HomeInstallation {
+  install_id: string; name: string; title: string;
+  /** Legacy project association, when the install has one — two
+   *  same-name installs keep it visible so a reader can tell them
+   *  apart (the old `/apps` list's `Project:` chip). */
+  project?: string;
+  tagline?: string; icon?: string;
+  attention: {
+    state: "ok" | "setup" | "update" | "off" | "attention" | "removed";
+    message: string | null; action: string | null; count: number;
+  };
+}
+
+/** The pinned apps as the board uses them: install ids in pin order, and
+ * the same ids by most recently opened. */
+export interface FavoritesPayload {
+  favorites: string[]; workspace_default: string[]; recent: string[];
+}
+
+/** `app_favorites_get` / `app_favorites_put` as the daemon sends them. */
+interface DaemonFavorites {
+  owner?: string; is_default?: boolean;
+  favorites?: { install_id: string; position?: number; opened_at?: number | null }[];
+}
+
+function favoritesFromDaemon(raw: DaemonFavorites): FavoritesPayload {
+  const rows = [...(raw.favorites ?? [])].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+  const recent = rows.filter((r) => typeof r.opened_at === "number")
+    .sort((a, b) => (b.opened_at as number) - (a.opened_at as number)).map((r) => r.install_id);
+  return { favorites: rows.map((r) => r.install_id), workspace_default: [], recent };
+}
+
+/** `listing:` v1 (CAD-1129) — the OS-store card text. */
+export interface SetupStep { slot?: string; connection?: string; label: string; help?: string; recommended?: string }
+export interface ListingData { stores?: string[]; personal?: boolean }
+export interface Listing {
+  tagline?: string; icon?: string; category?: string; tags?: string[];
+  publisher?: { name: string; url?: string };
+  about?: string; can?: string[];
+  screenshots?: { file: string; caption?: string }[];
+  setup?: SetupStep[]; access_notes?: Record<string, string>;
+  changes?: { version: string; notes: string[]; keeps?: string }[];
+  data?: ListingData;
+}
+
+export interface InstallRequest {
+  id: string; catalog_id: string; requested_by: string; at: number;
+}
+
+/** The remove sheet's `remove-preview` payload. */
+export interface RemovePreview {
+  install_id: string; name: string; title: string;
+  personal_data: boolean; generation: string; digest: string;
+  keeps?: { data?: string };
+}
+
+/** The `install-check` receipt: what an install would admit, before it
+ * writes anything (CAD-1186/1194). */
+export interface InstallCheck {
+  schema: number; name: string; version: string; digest: string;
+  files: string[]; committed: false; notes: string[];
+  secret_warnings: { rule: string; line: number; column: number; redacted: string; severity: string }[];
+}
+
+export const appExplorer = {
+  catalog: (signal?: AbortSignal) => request<{ catalog: CatalogCard[] }>("/api/app-catalog", signal),
+  entry: (id: string, signal?: AbortSignal) => request<CatalogCard>(`/api/app-catalog/${part(id)}`, signal),
+  home: (signal?: AbortSignal) => request<{ installations: HomeInstallation[] }>("/api/app-home", signal),
+  favorites: async (signal?: AbortSignal) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites", signal)),
+  requests: (signal?: AbortSignal) => request<{ requests: InstallRequest[] }>("/api/app-requests", signal),
+  /** CAD-1194: the read-only install proposal. `source` is a path, a Git
+   * URL or `builtin:<catalog id>`; the returned `digest` is the pin every
+   * install below must carry. */
+  installCheck: (source: string) => request<InstallCheck>("/api/app-installations/check", undefined, { source }),
+  /** Install a built-in, pinned to the digest `installCheck("builtin:<id>")` returned. */
+  installEntry: (catalogId: string, expectedDigest: string) =>
+    request<Installation>("/api/app-catalog/install", undefined, { catalog_id: catalogId, expected_digest: expectedDigest }),
+  /** Install a checked source (a Git URL) — the workspace install route,
+   * pinned to the checked digest so changed bytes are refused. */
+  installSource: (source: string, expectedDigest: string) =>
+    request<Installation>("/api/app-installations", undefined, { source, expected_digest: expectedDigest }),
+  gitCheck: (url: string) => request<CatalogCard>("/api/app-catalog/git-check", undefined, { url }),
+  putFavorites: async (installIds: string[]) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites", undefined, { install_ids: installIds })),
+  putFavoritesDefault: async (installIds: string[]) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites/default", undefined, { install_ids: installIds })),
+  opened: (installId: string) => request<unknown>("/api/app-favorites/opened", undefined, { install_id: installId }),
+  requestInstall: (catalogId: string) => request<InstallRequest>("/api/app-catalog/request", undefined, { catalog_id: catalogId }),
+  dismissRequest: (id: string) => request<unknown>("/api/app-requests/dismiss", undefined, { id }),
+  updateCheck: (installId: string) => request<{ has_update: boolean; digest: string; access_change?: { state: string; added?: string[]; removed?: string[] } }>(`/api/app-installations/${part(installId)}/update-check`, undefined, {}),
+  removePreview: (installId: string) => request<RemovePreview>(`/api/app-installations/${part(installId)}/remove-preview`, undefined, {}),
+  remove: (installId: string, body: { expected_generation: string; expected_digest: string; request_id: string }) => request<unknown>(`/api/app-installations/${part(installId)}/remove`, undefined, body),
+  restore: (installId: string) => request<{ restored: boolean; digest: string }>(`/api/app-installations/${part(installId)}/restore`, undefined, {}),
 };

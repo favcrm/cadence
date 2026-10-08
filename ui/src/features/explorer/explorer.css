@@ -1,0 +1,98 @@
+/* The apps Explorer + home (CAD-1129) — the OS-style catalog. */
+
+.apps-explore .ohead h1, .apps-home .ohead h1 { margin: 0; }
+.apps-explore .popwrap { position: relative; }
+.apps-explore .pmenu {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 40;
+  min-width: 220px; padding: 6px; border-radius: 10px;
+  background: var(--color-ink-900, #1a1d24); border: 1px solid var(--color-ink-700, #333);
+  box-shadow: 0 8px 24px rgba(0,0,0,.35); display: flex; flex-direction: column; gap: 2px;
+}
+.apps-explore .pmenu button, .apps-explore .pmenu a {
+  display: block; padding: 8px 10px; border-radius: 7px; text-align: left;
+  color: var(--color-ink-200); font-size: var(--text-secondary); background: none; border: 0;
+}
+.apps-explore .pmenu button:hover, .apps-explore .pmenu a:hover { background: var(--color-ink-800, #24282f); }
+.apps-explore .cats .cat {
+  padding: 5px 12px; border-radius: 999px; border: 1px solid var(--color-ink-700, #333);
+  background: none; color: var(--color-ink-400); font-size: var(--text-label); cursor: pointer;
+}
+.apps-explore .cats .cat.on { background: var(--color-accent, #6d8dff); color: #fff; border-color: transparent; }
+.apps-explore .ccard { transition: border-color .15s; }
+.apps-explore .ccard:hover { border-color: var(--color-ink-600, #444); }
+.apps-explore .ccard .nm { white-space: normal; }
+
+/* The home's favorites + installed grids. */
+.apps-home .favs { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+.apps-home .fav { display: flex; flex-direction: column; gap: 8px; padding: 14px; cursor: pointer; position: relative; }
+.apps-home .fav .nm { font-weight: 500; color: var(--color-ink-100); }
+.apps-home .fav .ln { font-size: var(--text-label); color: var(--color-ink-400); }
+.apps-home .igrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+.apps-home .itile { display: flex; gap: 12px; align-items: flex-start; padding: 12px; cursor: pointer; position: relative; }
+.apps-home .itile .nm { font-weight: 500; color: var(--color-ink-100); }
+.apps-home .itile .ln { font-size: var(--text-label); color: var(--color-ink-400); }
+.apps-home .itile .acts { margin-left: auto; display: flex; gap: 4px; }
+.apps-home .star { background: none; border: 0; color: var(--color-ink-400); cursor: pointer; padding: 4px; border-radius: 6px; }
+.apps-home .star:hover { color: var(--color-ink-100); background: var(--color-ink-800, #24282f); }
+.apps-home .star.pinned { color: var(--color-warn, #e5b567); }
+.apps-home .attn { border: 1px solid var(--color-warn, #e5b567); border-radius: 12px; padding: 10px 14px; margin-bottom: 18px; }
+.apps-home .attn-head { display: flex; align-items: center; gap: 8px; color: var(--color-warn, #e5b567); font-weight: 500; margin-bottom: 8px; }
+.apps-home .attn-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; }
+.apps-home .attn-row .txt { flex: 1; font-size: var(--text-secondary); }
+.apps-home .favempty { display: flex; align-items: center; gap: 10px; color: var(--color-ink-400); padding: 18px; border: 1px dashed var(--color-ink-700, #333); border-radius: 12px; }
+.apps-home .sechead { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.apps-home .sechead h2 { font-size: var(--text-section); font-weight: 500; color: var(--color-ink-100); margin: 0; }
+.apps-home .explore-card { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px dashed var(--color-ink-700, #333); border-radius: 12px; cursor: pointer; color: var(--color-ink-300); }
+.apps-home .explore-card:hover { border-color: var(--color-accent, #6d8dff); }
+.apps-home .explore-card small { color: var(--color-ink-500); }
+.apps-home .sec { margin-top: 1.5rem; }
+.apps-home .sec:first-of-type { margin-top: 0; }
+
+/* Detail + manage (the app page). */
+.apps-detail .hero { display: flex; gap: 18px; align-items: center; margin-bottom: 4px; }
+.apps-detail .hero h1 { font-size: var(--text-drawer); font-weight: 600; color: var(--color-ink-100); margin: 0; }
+.apps-detail .hero .tag { color: var(--color-ink-400); margin: 4px 0 8px; }
+.apps-detail .by { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--color-ink-500); font-size: var(--text-label); }
+.apps-detail .dgrid { display: grid; gap: 18px; grid-template-columns: 1fr; margin-top: 18px; }
+@media (min-width: 1024px) { .apps-detail .dgrid { grid-template-columns: minmax(0,1fr) 320px; } }
+.apps-detail .side-card { align-self: start; position: sticky; top: 16px; }
+.apps-detail .dl dt { font-size: var(--text-micro); color: var(--color-ink-500); }
+.apps-detail .dl dd { margin: 0 0 10px; color: var(--color-ink-200); font-size: var(--text-label); }
+.apps-detail .shots { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px; margin-bottom: 14px; }
+.apps-detail .shot { flex: 0 0 200px; border: 1px solid var(--color-ink-700, #333); border-radius: 12px; overflow: hidden; }
+.apps-detail .shot .mui { aspect-ratio: 4/3; background: var(--color-ink-800, #24282f); display: grid; place-items: center; color: var(--color-ink-500); font-size: var(--text-micro); }
+.apps-detail .shot .cap { display: block; padding: 8px 10px; font-size: var(--text-micro); color: var(--color-ink-400); }
+.apps-detail .about { color: var(--color-ink-300); font-size: var(--text-secondary); line-height: 1.6; }
+.apps-detail .blk { margin-top: 22px; }
+.apps-detail .blk h2 { font-size: var(--text-cardtitle); font-weight: 500; color: var(--color-ink-100); margin-bottom: 10px; }
+.apps-detail .can { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.apps-detail .can li { display: flex; gap: 8px; color: var(--color-ink-300); font-size: var(--text-secondary); }
+.apps-detail .access { display: flex; flex-direction: column; gap: 10px; }
+.apps-detail .acc { display: flex; gap: 12px; align-items: flex-start; }
+.apps-detail .acc b { display: block; color: var(--color-ink-100); font-size: var(--text-secondary); }
+.apps-detail .acc span { color: var(--color-ink-400); font-size: var(--text-label); }
+.apps-detail .acc .ai { color: var(--color-ink-500); margin-top: 2px; }
+.apps-detail .never { display: flex; gap: 10px; align-items: flex-start; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--color-ink-800, #24282f); color: var(--color-ink-400); font-size: var(--text-label); }
+.apps-detail .tech { margin-top: 22px; border: 1px solid var(--color-ink-800, #24282f); border-radius: 10px; padding: 10px 14px; }
+.apps-detail .tech summary { cursor: pointer; color: var(--color-ink-400); font-size: var(--text-label); }
+.apps-detail .tech dl { margin-top: 10px; }
+.apps-detail .news { padding-left: 18px; color: var(--color-ink-300); font-size: var(--text-secondary); }
+.apps-detail .news li { margin-bottom: 4px; }
+.apps-detail .mcard { padding: 14px 16px; }
+.apps-detail .mcard h3 { font-size: var(--text-cardtitle); font-weight: 500; color: var(--color-ink-100); margin: 0 0 8px; }
+.apps-detail .mcard p { color: var(--color-ink-400); font-size: var(--text-label); margin: 0; }
+.apps-detail .mgrid { display: grid; gap: 14px; grid-template-columns: 1fr; }
+@media (min-width: 1024px) { .apps-detail .mgrid { grid-template-columns: 1fr 1fr; } }
+.apps-detail .conn { display: flex; align-items: center; gap: 10px; padding: 8px 0; }
+.apps-detail .conn small { display: block; color: var(--color-ink-500); font-size: var(--text-micro); }
+.apps-detail .swrow { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.apps-detail .switch { width: 40px; height: 22px; border-radius: 999px; background: var(--color-ink-700, #333); position: relative; border: 0; cursor: pointer; }
+.apps-detail .switch[aria-checked="true"] { background: var(--color-accent, #6d8dff); }
+.apps-detail .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .15s; }
+.apps-detail .switch[aria-checked="true"]::after { left: 21px; }
+
+/* CAD-1194: the install review panel. */
+.install-check .ic-facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; }
+.install-check .ic-facts dt { color: var(--ink-500, inherit); }
+.install-check .ic-digest { overflow-wrap: anywhere; font-size: 0.8em; }
+.install-check .ic-files { max-height: 10rem; overflow: auto; margin-top: 4px; }

@@ -1027,6 +1027,26 @@ impl Auth {
             .map(|r| r.hash.clone()))
     }
 
+    /// Does a live public session exist whose named member's handle is
+    /// exactly `handle` (CAD-1129)? `member_as` is the board's claim,
+    /// never the credential: this proves the handle names a live public
+    /// session's `member`-role user, so a forged `member_as` cannot
+    /// borrow another person's favorites or request attribution. The
+    /// daemon's caller rule is `board_session_check`-gated — only the
+    /// operator connection and the bearer may call it.
+    pub(crate) fn check_member(&mut self, handle: &str, now: i64) -> Result<bool> {
+        if self.prune(now) {
+            self.persist()?;
+        }
+        Ok(self.sessions.iter().any(|r| {
+            r.origin == Origin::Public
+                && r.live(now)
+                && r.user
+                    .as_ref()
+                    .is_some_and(|u| u.handle == handle && !u.is_operator())
+        }))
+    }
+
     /// The live sessions, oldest first.
     pub fn list(&mut self, now: i64) -> Result<Vec<SessionView>> {
         if self.prune(now) {

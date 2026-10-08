@@ -37,13 +37,13 @@ export function SourceImport({ installId, contextId, bindingDigest, workers, man
     void workspaceApps.bindingQuote(installId, "source", contextId, controller.signal).then(value => {
       if (controller.signal.aborted) return;
       if (value.slot !== "source" || value.binding_digest !== bindingDigest || value.quote.schema !== 1 || value.quote.currency !== "USD" || !Number.isSafeInteger(value.quote.total_price_micros) || value.quote.total_price_micros <= 0) {
-        setQuoteError("The source connection or provider price changed. Refresh Settings before creating a plan."); return;
+        setQuoteError("The source connection changed or is unavailable. Refresh Settings before creating a plan."); return;
       }
       setQuote(value);
     }).catch(reason => {
       if (controller.signal.aborted) return;
       if (reason instanceof ApiError && [401, 403].includes(reason.status)) { onDenied(); return; }
-      setQuoteError(reason instanceof Error ? reason.message : "Could not obtain the provider’s current price.");
+      setQuoteError(reason instanceof Error ? reason.message : "Could not reach the source provider.");
     });
     return () => controller.abort();
   }, [installId, contextId, bindingDigest, onDenied]);
@@ -66,9 +66,9 @@ export function SourceImport({ installId, contextId, bindingDigest, workers, man
   return <WorkspaceDialog title="Find Instagram source" onClose={onClose}>
     <form className="wa-stack" onSubmit={submit}>
       <p className="wa-muted">{host
-        ? "Read recent public posts through this app’s Instagram source connection. Cadence shows the current provider charge below; this click approves the exact frozen price and starts the read — no team and no separate plan approval."
-        : "Read recent public posts through this app’s Instagram source connection. Cadence shows the current provider charge below; you approve the exact frozen price and plan before a worker starts."}</p>
-      {quote ? <p className="wa-alert">Current provider charge for one read: <strong>USD {(quote.quote.total_price_micros / 1_000_000).toFixed(6)}</strong>. The plan will freeze this price; a change before execution stops the call.</p> : !quoteError && <p className="wa-muted" role="status">Checking provider price…</p>}
+        ? "Read recent public posts through this app’s Instagram source connection. This click starts the read — no team and no separate plan approval."
+        : "Read recent public posts through this app’s Instagram source connection. You approve the frozen plan before a worker starts."}</p>
+      {quote ? <p className="wa-alert">The source connection is ready{host ? "." : " — the plan needs your approval before the read starts."}</p> : !quoteError && <p className="wa-muted" role="status">Checking the source connection…</p>}
       {quoteError && <p className="wa-alert" data-tone="fail" role="alert">{quoteError}</p>}
       {(error || validation) && <p className="wa-alert" data-tone="fail" role="alert">{error || validation}</p>}
       <div className="wa-field">

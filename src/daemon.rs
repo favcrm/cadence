@@ -27,6 +27,7 @@ mod app_chat_rpc;
 mod app_content_rpc;
 mod app_contexts_rpc;
 mod app_effects_rpc;
+mod app_explorer_rpc;
 mod app_records_rpc;
 mod app_runs_rpc;
 mod app_screens_rpc;
@@ -51,6 +52,8 @@ mod crm_smtp_rpc;
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;
+#[cfg(all(test, feature = "test-seam"))]
+mod explorer_acceptance;
 mod idea_rpc;
 mod identity;
 #[cfg(target_os = "linux")]
@@ -3351,6 +3354,22 @@ impl Shared {
             "app_workspace_migrate" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_recover" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_migration_recover" => self.rpc_app_workspace(method, params, peer_pid),
+            "app_catalog_list"
+            | "app_catalog_show"
+            | "app_catalog_git_check"
+            | "app_home"
+            | "app_favorites_get"
+            | "app_favorites_put"
+            | "app_favorites_put_default"
+            | "app_favorites_opened"
+            | "app_install_request"
+            | "app_install_requests_list"
+            | "app_install_request_dismiss"
+            | "app_workspace_install_entry"
+            | "app_workspace_update_check"
+            | "app_workspace_remove_preview"
+            | "app_workspace_remove"
+            | "app_workspace_restore" => self.rpc_app_explorer(method, params, peer_pid),
             "app_chat_descriptor" => self.rpc_app_chat_descriptor(params, peer_pid),
             "app_assistant_actions" => self.rpc_app_assistant_agent(method, params, peer_pid),
             "app_assistant_invoke" => self.rpc_app_assistant_agent(method, params, peer_pid),
@@ -3420,6 +3439,7 @@ impl Shared {
             "operator_session_check" => self.rpc_operator_session_check(params),
             "board_session_open" => self.rpc_board_session_open(params, peer_pid),
             "board_session_check" => self.rpc_board_session_check(params),
+            "board_session_member" => self.rpc_board_session_member(params, peer_pid),
             "operator_session_logout" => self.rpc_operator_session_logout(params),
             "operator_session_stolen" => self.rpc_operator_session_stolen(params),
             "device_login_config" => self.rpc_device_login_config(),

@@ -101,7 +101,13 @@ async function main() {
   await click(button("Sources"));
   assert(host.textContent?.includes("No source reads yet"), "No source card is invented before a provider receipt");
   await click(button("Find public posts"));
-  assert(host.textContent?.includes("USD 0.002000"), "Operator sees exact current source charge before planning a paid read");
+  // CAD-1129: the source connection resolves (quote fetched) but the
+  // board shows no provider charge — spend stays in the host.
+  assert(host.textContent?.includes("source connection is ready"), "Operator sees the source connection resolve before planning a read");
+  // CAD-1129: the source dialog shows no provider charge — WorkspaceApp's
+  // approval copy is the CAD-1123 lane's own removal, not this dialog's.
+  const dlg = host.querySelector("dialog");
+  assert(dlg && !dlg.textContent?.includes("USD") && !dlg.textContent?.includes("price") && !dlg.textContent?.includes("charge"), "the source dialog shows no price or charge text");
   await fill("#wa-profile-handle", "@juicysuite_crm"); await choose("wa-source-owner", "pm-a"); await choose("wa-source-reader", "writer-a");
   await click(button("Create source plan"));
   assert(writes.length === 1 && writes[0].body.workflow === "source-instagram" && writes[0].body.inputs.profile_handle === "juicysuite_crm", "Source plan freezes operator-selected handle");

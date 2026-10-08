@@ -57,6 +57,15 @@ const BODY_CAP: u64 = 4 * 1024;
 const UPLOAD_WIRE_CAP: u64 = 8 * 1024 * 1024;
 /// Decoded ceiling for the whole bundle (matches `app::MAX_APP_BYTES`).
 const UPLOAD_TOTAL_BYTES: u64 = crate::issue::app::MAX_APP_BYTES;
+/// CAD-1194: the install-check body — exactly `{"source": …}`. The derive
+/// refuses unknown keys and a repeated `source`, which a `Value` parse
+/// would silently collapse to the last one.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallCheckBody {
+    source: String,
+}
+
 /// One file's ceiling (matches `plan::MAX_PLAN_BYTES`).
 const UPLOAD_FILE_BYTES: u64 = crate::issue::plan::MAX_PLAN_BYTES as u64;
 /// At most this many files — the same bound `snapshot` enforces on disk.
@@ -1109,6 +1118,24 @@ pub(super) fn workspace(
             json!({"install_id":id})
         } else {
             json!({})
+        }
+    } else if method == "app_workspace_install_check" {
+        // CAD-1194: the read-only digest proposal an install pins. The
+        // body is exactly `{source}` — decoded STRICTLY, so a repeated or
+        // unknown key is refused instead of collapsing to the last one;
+        // identity, approval and digest are never caller fields here.
+        let bytes = match read_body(request, BODY_CAP) {
+            Ok(bytes) => bytes,
+            Err(response) => return response,
+        };
+        match serde_json::from_slice::<InstallCheckBody>(&bytes) {
+            Ok(body) if !body.source.is_empty() => json!({"source":body.source}),
+            _ => {
+                return err_response(
+                    400,
+                    "install check body admits only a non-empty source; identity and approval are never caller fields",
+                )
+            }
         }
     } else if method == "app_workspace_install" {
         let bytes = match read_body(request, BODY_CAP) {

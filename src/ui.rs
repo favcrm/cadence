@@ -38,6 +38,7 @@ mod app_audiences;
 mod app_chat;
 mod app_content;
 mod app_contexts;
+mod app_explorer;
 mod app_records;
 mod app_release;
 mod app_runs;
