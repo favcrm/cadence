@@ -807,9 +807,23 @@ pub(crate) fn write_recovery_record(
     }
 }
 
+/// CAD-1247: one start-up line per provider command this daemon would
+/// fail to exec — pi first (CAD-1247's incident: a minimal service
+/// PATH left `pi` unresolvable and every pi agent fenced with only a
+/// provider log saying why). Resolved against the daemon's own PATH
+/// exactly as the adapter's `execvp` would; a warning only — a daemon
+/// whose workload never touches the provider must still start.
+fn warn_unresolved_provider_commands(env: &ProviderEnv) {
+    let path = std::env::var("PATH").ok();
+    if let Err(reason) = crate::adapter::pi::resolve_pi_launch_command(env, path.as_deref()) {
+        eprintln!("provider pi: {reason}; set CADENCE_PI_COMMAND");
+    }
+}
+
 /// Relaunch enabled actors at daemon start; fenced ones land in
 /// `attention` instead.
 pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
+    warn_unresolved_provider_commands(&shared.provider_env);
     // Inbox rows are durable mailboxes — enabled or not, they own no
     // actor and keep their pseudo-endpoint across restarts.
     for agent in shared.store.agents()? {

@@ -265,6 +265,36 @@ fn pi_command(env: &ProviderEnv) -> Vec<String> {
     vec!["pi".to_string()]
 }
 
+/// What [`resolve_pi_launch_command`] reports for the program the
+/// adapter would exec: `Ok(path)` is the resolved executable (or the
+/// verbatim override when it carries a `/`), `Err(reason)` is the
+/// clear "not found" line the daemon start log and `doctor --host`
+/// both surface (CAD-1247).
+pub(crate) fn resolve_pi_launch_command(
+    env: &ProviderEnv,
+    path: Option<&str>,
+) -> std::result::Result<PathBuf, String> {
+    let program = pi_command(env)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "pi".to_string());
+    let path_display = path.unwrap_or_default();
+    if !program.contains('/') {
+        return crate::master::which(&program, path)
+            .ok_or_else(|| format!("command '{program}' not found on PATH ({path_display})"));
+    }
+    let candidate = PathBuf::from(&program);
+    let executable = std::fs::metadata(&candidate).ok().is_some_and(|m| {
+        use std::os::unix::fs::PermissionsExt;
+        m.is_file() && m.permissions().mode() & 0o111 != 0
+    });
+    if executable {
+        Ok(candidate)
+    } else {
+        Err(format!("command '{program}' is not executable"))
+    }
+}
+
 /// The master's own Pi config dir — its `PI_CODING_AGENT_DIR`: auth
 /// and extension state live here, never in the operator's `~/.pi`,
 /// mirroring [`crate::master::claude_config_dir`].
@@ -3037,6 +3067,39 @@ impl ProviderAdapter for PiAdapter {
 #[cfg(test)]
 #[path = "pi/cad1195_acceptance.rs"]
 mod cad1195_acceptance;
+
+#[cfg(test)]
+mod cad1247_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// CAD-1247: the resolver the daemon-start warning and
+    /// `doctor --host` share — bare `pi` resolves on PATH, names the
+    /// PATH when absent; `CADENCE_PI_COMMAND` names its own program.
+    #[test]
+    fn pi_launch_command_resolution() {
+        let env = ProviderEnv::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        assert!(resolve_pi_launch_command(&env, Some(&path)).is_err());
+        let pi = dir.path().join("pi");
+        std::fs::write(&pi, "#!/bin/sh\n").unwrap();
+        let mut mode = pi.metadata().unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&pi, mode).unwrap();
+        assert_eq!(
+            resolve_pi_launch_command(&env, Some(&path)).as_deref().ok(),
+            Some(pi.as_path())
+        );
+        env.set("CADENCE_PI_COMMAND", "/missing/pi --flag");
+        assert!(resolve_pi_launch_command(&env, Some(&path)).is_err());
+        env.set("CADENCE_PI_COMMAND", "/bin/true --flag");
+        assert_eq!(
+            resolve_pi_launch_command(&env, Some(&path)).as_deref().ok(),
+            Some(Path::new("/bin/true"))
+        );
+    }
+}
 
 #[cfg(test)]
 mod cad1098_tests {

@@ -150,3 +150,33 @@ fn eval_provider_state(stores: &[StoreMeasure], t: &Thresholds) -> Check {
         .collect::<Vec<_>>();
     check(name, level, json!(value), threshold, detail, remedy)
 }
+
+// ---------- provider command resolution ----------
+
+/// CAD-1247: the pi adapter execs `CADENCE_PI_COMMAND` or bare `pi`
+/// via `execvp` — a daemon started under a minimal service PATH that
+/// lacks pi fences every pi agent with only a provider log saying why.
+/// This check resolves the program exactly the way the launch would
+/// and fails naming the remedy; the same helper runs at daemon start.
+pub(super) fn check_provider_commands() -> Check {
+    let env = crate::adapter::ProviderEnv::default();
+    let path = std::env::var("PATH").ok();
+    match crate::adapter::pi::resolve_pi_launch_command(&env, path.as_deref()) {
+        Ok(resolved) => check(
+            "provider-pi-command",
+            Level::Ok,
+            json!({"provider": "pi", "resolved": resolved}),
+            Value::Null,
+            format!("pi resolves to {}", resolved.display()),
+            String::new(),
+        ),
+        Err(reason) => check(
+            "provider-pi-command",
+            Level::Fail,
+            json!({"provider": "pi", "resolved": null, "reason": reason}),
+            Value::Null,
+            format!("pi: {reason}"),
+            "set CADENCE_PI_COMMAND to pi's absolute path, or add its directory to the daemon's PATH".to_string(),
+        ),
+    }
+}
