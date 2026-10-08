@@ -1087,6 +1087,21 @@ fn runnable(path: &Path) -> Result<PathBuf> {
     let real = std::fs::canonicalize(path)
         .map_err(|e| Error::rejected(format!("--build {} cannot be read ({e})", path.display())))?;
     let meta = std::fs::metadata(&real)?;
+    // CAD-1206: the board's identity check (`ui stop`, `dev down`) only
+    // recognises cadence-named binaries; any other name would leave the
+    // board it starts running with nothing able to stop it.
+    if !real
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(crate::ui::is_cadence_exe_name)
+    {
+        return Err(Error::rejected(format!(
+            "--build {} must be named `cadence` or `cadence-<suffix>` — the board it \
+             starts is found again by that name, and `dev down` could not stop it \
+             otherwise",
+            real.display()
+        )));
+    }
     if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
         return Err(Error::rejected(format!(
             "--build {} is not an executable file",
@@ -1677,5 +1692,31 @@ mod tests {
         )
         .unwrap();
         assert!(choose_port(&other, None, &lock_dir).is_err());
+    }
+
+    /// CAD-1206: a board whose exe is not named like cadence is invisible
+    /// to `ui stop`/`dev down` (the CAD-1081 identity check), so a build
+    /// the board could not be found under is refused before any child is
+    /// started, never left running as an orphan.
+    #[test]
+    fn runnable_refuses_a_build_the_board_could_not_be_found_under() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new()
+            .prefix("c1206-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        for (name, ok) in [
+            ("cadence", true),
+            ("cadence-new", true),
+            ("cadence-old", true),
+            ("a", false),
+            ("cadencex", false),
+            ("sleep", false),
+        ] {
+            let bin = dir.path().join(name);
+            std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(runnable(&bin).is_ok(), ok, "{name}");
+        }
     }
 }
