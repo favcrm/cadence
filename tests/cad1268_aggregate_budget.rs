@@ -9,17 +9,18 @@ use serde_json::{json, Value};
 use tempfile::Builder;
 
 fn budget(total_slots: usize) -> SlotConfig {
-    let mut config = SlotConfig::default();
-    config.total_slots = total_slots;
     // Keep every individual pool roomy so these assertions isolate the
     // aggregate budget rather than the legacy per-pool limits.
-    config.build_slots = 8;
-    config.suite_slots = 8;
-    config.check_slots = 8;
-    config.slot_mem_min_available_bytes = 0;
-    config.slot_mem_min_available_check_bytes = 0;
-    config.slot_disk_min_free_bytes = 0;
-    config
+    SlotConfig {
+        total_slots,
+        build_slots: 8,
+        suite_slots: 8,
+        check_slots: 8,
+        slot_mem_min_available_bytes: 0,
+        slot_mem_min_available_check_bytes: 0,
+        slot_disk_min_free_bytes: 0,
+        ..SlotConfig::default()
+    }
 }
 
 fn acquire(
