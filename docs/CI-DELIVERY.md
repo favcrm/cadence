@@ -64,9 +64,12 @@ wait, refuses a changed attempt or digest, then publishes a
 install or restart production. Only a successful workflow whose `stage`
 and `promote` jobs both passed can supply the default updater's candidate.
 
-`cadence update --check` and `cadence update [--to <sha>]` are the
-operator path; `cadence upgrade` is recovery only. The default updater
-now selects that approved artifact. The resolver pins its CI run, attempt and digest, and does not fall back to
+`cadence update --check` and `cadence update` are the operator path;
+`cadence upgrade` is recovery only. `cadence update` with no `--to` (and
+`cadence upgrade --latest-main`) select that approved artifact.
+`cadence update --to <sha>` pins a commit and runs the `upgrade --sha`
+checks, not the production-candidate receipt. The
+resolver pins its CI run, attempt and digest, and does not fall back to
 an unapproved green build. A rerun that changes the artifact requires
 new staging and approval. Existing attestation, ancestry, backward-move,
 operator, backup, drain, health and rollback checks remain in force.

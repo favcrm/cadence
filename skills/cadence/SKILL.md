@@ -458,9 +458,13 @@ Never restart the daemon. When production needs a new build, send the
 operator exactly these two lines and nothing else:
 
 ```
-cadence update --check --to <full main sha> --as operator:<name>
-cadence update --to <same sha> --as operator:<name>
+cadence update --check --as operator:<name>
+cadence update --as operator:<name>
 ```
+
+Only when the operator asks to pin a specific commit, use
+`--to <full main sha>` on both lines. That skips the production-candidate
+receipt and runs the `upgrade --sha` checks instead.
 
 Never relay `rollout claim|backup|handoff|grant` or `upgrade` recipes;
 those are recovery internals (docs/CLI.md). If `--check` refuses, report

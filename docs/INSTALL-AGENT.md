@@ -129,7 +129,8 @@ the basic installation path does not depend on `gh`.
 
 The public stable-release updater is not implemented. `cadence update
 [--to <sha>]` is the operator path and `cadence upgrade` is recovery only.
-Both use the authenticated, attested internal CI channel; do not present them as anonymous public-release upgrades (CAD-661/CAD-561).
+Both use the authenticated, attested internal CI channel; do not present
+them as anonymous public-release upgrades (CAD-661/CAD-561).
 
 The installer can select another published version explicitly, but replacing
 an executable while a daemon runs is not a coordinated upgrade or rollback.
