@@ -195,7 +195,30 @@ fn private_environment_and_leaf_measurements_are_finite() {
         "b".repeat(32)
     );
     let env = derived_env(&view, "routing-alias").unwrap();
-    assert_eq!(env.len(), 12);
+    let mut names: Vec<String> = env
+        .iter()
+        .map(|kv| kv.to_str().unwrap().split('=').next().unwrap().to_owned())
+        .collect();
+    names.sort();
+    let mut expected = vec![
+        "CADENCE_ALIAS",
+        "CADENCE_BRIEFING_DIR",
+        "CADENCE_PM_DIR",
+        "CADENCE_SOCKET",
+        "GH_CONFIG_DIR",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_TERMINAL_PROMPT",
+        "HOME",
+        "PATH",
+        "PI_CODING_AGENT_DIR",
+        "PI_OFFLINE",
+        "PI_SKIP_VERSION_CHECK",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+    ];
+    expected.sort_unstable();
+    assert_eq!(names, expected);
     for kv in env {
         let name = kv.to_str().unwrap().split('=').next().unwrap();
         assert!(
