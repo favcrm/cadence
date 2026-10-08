@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import {
@@ -32,7 +32,17 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
   const [checking, setChecking] = useState(false);
   const [applying, setApplying] = useState(false);
   const [upgradeSource, setUpgradeSource] = useState("");
-  const [upgradeProposal, setUpgradeProposal] = useState<{ source: string; receipt: UpgradeProposal } | null>(null);
+  const [upgradeProposal, setUpgradeProposal] = useState<{
+    installId: string;
+    source: string;
+    expectedDigest: string;
+    expectedGeneration: string;
+    receipt: UpgradeProposal;
+  } | null>(null);
+  const currentInstallId = useRef(installId);
+  currentInstallId.current = installId;
+  const checkRequest = useRef(0);
+  const applyRequest = useRef(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -135,32 +145,56 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
 
   const checkPackageUpdate = () => {
     const source = upgradeSource.trim();
+    const requestedInstallId = installId;
+    const request = ++checkRequest.current;
+    const expectedDigest = inst.digest;
+    const expectedGeneration = inst.catalog_generation;
+    const isCurrentRequest = () => currentInstallId.current === requestedInstallId && checkRequest.current === request;
     setChecking(true); setNotice(null); setUpgradeProposal(null);
-    void workspaceApps.upgradeCheck(installId, {
-      source, expected_digest: inst.digest, expected_generation: inst.catalog_generation,
+    void workspaceApps.upgradeCheck(requestedInstallId, {
+      source, expected_digest: expectedDigest, expected_generation: expectedGeneration,
     })
-      .then((receipt) => setUpgradeProposal({ source, receipt }))
-      .catch((e: unknown) => { setNotice(appErrorCopy(e, "The update check didn't finish. Try again in a moment.")); setReread((n) => n + 1); })
-      .finally(() => setChecking(false));
+      .then((receipt) => {
+        if (isCurrentRequest()) setUpgradeProposal({ installId: requestedInstallId, source, expectedDigest, expectedGeneration, receipt });
+      })
+      .catch((e: unknown) => {
+        if (!isCurrentRequest()) return;
+        setNotice(appErrorCopy(e, "The update check didn't finish. Try again in a moment."));
+        setReread((n) => n + 1);
+      })
+      .finally(() => { if (isCurrentRequest()) setChecking(false); });
   };
+  const proposalMatchesCurrent = upgradeProposal != null
+    && upgradeProposal.installId === installId
+    && upgradeProposal.source === upgradeSource.trim()
+    && upgradeProposal.expectedDigest === inst.digest
+    && upgradeProposal.expectedGeneration === inst.catalog_generation;
   const applyPackageUpdate = () => {
-    if (!upgradeProposal || upgradeProposal.source !== upgradeSource.trim()) return;
-    const { source, receipt } = upgradeProposal;
+    if (!proposalMatchesCurrent || !upgradeProposal) return;
+    const { source, receipt, expectedDigest, expectedGeneration } = upgradeProposal;
+    const requestedInstallId = installId;
+    const request = ++applyRequest.current;
+    const isCurrentRequest = () => currentInstallId.current === requestedInstallId && applyRequest.current === request;
     setApplying(true); setNotice(null);
-    void workspaceApps.upgrade(installId, {
+    void workspaceApps.upgrade(requestedInstallId, {
       source,
-      expected_digest: inst.digest,
-      expected_generation: inst.catalog_generation,
+      expected_digest: expectedDigest,
+      expected_generation: expectedGeneration,
       expected_new_digest: receipt.digest,
       request_id: `upgrade-${crypto.randomUUID()}`,
     })
       .then(async () => {
-        await appExplorer.updateCheck(installId).catch(() => undefined);
+        await appExplorer.updateCheck(requestedInstallId).catch(() => undefined);
+        if (!isCurrentRequest()) return;
         setNotice("Update applied."); setUpgradeProposal(null);
         notifyAppsChanged(); setReread((n) => n + 1);
       })
-      .catch((e: unknown) => { setNotice(appErrorCopy(e, "The update wasn't applied. Check the current package and try again.")); setReread((n) => n + 1); })
-      .finally(() => setApplying(false));
+      .catch((e: unknown) => {
+        if (!isCurrentRequest()) return;
+        setNotice(appErrorCopy(e, "The update wasn't applied. Check the current package and try again."));
+        setReread((n) => n + 1);
+      })
+      .finally(() => { if (isCurrentRequest()) setApplying(false); });
   };
 
   return (
@@ -191,14 +225,14 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
           <div className="mt-3">
             <Button className="btn-sm" disabled={checking || applying || !upgradeSource.trim()} onClick={checkPackageUpdate}>{checking ? "Checking…" : "Check update"}</Button>
           </div>
-          {upgradeProposal && upgradeProposal.source === upgradeSource.trim() && <div className="mt-3" aria-live="polite">
+          {proposalMatchesCurrent && upgradeProposal && <div className="mt-3" aria-live="polite">
             <p>Proposed version {upgradeProposal.receipt.version} · {upgradeProposal.receipt.name}</p>
             <p className="hint mt-2">New digest: <code className="break-all">{upgradeProposal.receipt.digest}</code></p>
             {(["added", "changed", "removed"] as const).map((kind) => <p className="hint mt-1" key={kind}>{kind}: {upgradeProposal.receipt.structural_diff[kind].join(", ") || "none"}</p>)}
             {upgradeProposal.receipt.compatibility != null && <p className="hint mt-2">Compatibility: {typeof upgradeProposal.receipt.compatibility === "string" ? upgradeProposal.receipt.compatibility : JSON.stringify(upgradeProposal.receipt.compatibility)}</p>}
             {!!upgradeProposal.receipt.notes?.length && <ul className="hint mt-2">{upgradeProposal.receipt.notes.map((note, index) => <li key={index}>{note}</li>)}</ul>}
             {!!upgradeProposal.receipt.secret_warnings?.length && <p className="alert warn mt-2">Package validation reported secret warnings; review the source before applying.</p>}
-            <div className="mt-3"><Button className="btn-primary btn-sm" disabled={applying || !!upgradeProposal.receipt.secret_warnings?.length} onClick={applyPackageUpdate}>{applying ? "Applying…" : "Apply checked update"}</Button></div>
+            <div className="mt-3"><Button className="btn-primary btn-sm" disabled={!proposalMatchesCurrent || applying || !!upgradeProposal.receipt.secret_warnings?.length} onClick={applyPackageUpdate}>{applying ? "Applying…" : "Apply checked update"}</Button></div>
           </div>}
         </div>
 

@@ -750,11 +750,11 @@ pub(crate) enum EffectAction {
         digest: String,
     },
 }
-/// The source the daemon installs from: a URL passes through, a local
-/// path is made absolute here because the daemon refuses relative ones.
-/// Shared by `install`, `install-check`, `upgrade-check`.
+/// The source the daemon installs from: URLs and `builtin:` sources pass
+/// through, a local path is made absolute because the daemon refuses relative
+/// ones. Shared by `install`, `install-check`, `upgrade-check`.
 fn install_source(source: &str) -> Result<String> {
-    if source.contains("://") || source.starts_with("git@") {
+    if source.contains("://") || source.starts_with("git@") || source.starts_with("builtin:") {
         return Ok(source.to_string());
     }
     Ok(std::fs::canonicalize(source)
@@ -1786,7 +1786,10 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     expected_new_digest,
                     request_id,
                 } => {
-                    let source = if source.contains("://") || source.starts_with("git@") {
+                    let source = if source.contains("://")
+                        || source.starts_with("git@")
+                        || source.starts_with("builtin:")
+                    {
                         source.clone()
                     } else {
                         // A committed request is replayable after its local
