@@ -209,6 +209,55 @@ struct Cleanup<'a> {
     watched: Vec<PathBuf>,
 }
 
+/// Pids running from, or naming, anything under the temp root: exe path, argv
+/// or environment (a board started by a reloaded build carries the root in its
+/// exe and in HOME).
+fn procs_under(root: &Path) -> Vec<u32> {
+    let needle = root.to_string_lossy().into_owned();
+    let me = std::process::id();
+    let mut pids = procs_naming(root);
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != me && exe_of(pid).is_some_and(|e| e.to_string_lossy().starts_with(&needle)) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// SIGTERM, then SIGKILL, every process under the root; wait for each to go.
+fn reap_under(root: &Path) {
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        let pids = procs_under(root);
+        if pids.is_empty() {
+            return;
+        }
+        for pid in &pids {
+            unsafe { libc::kill(*pid as i32, signal) };
+        }
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < until && !procs_under(root).is_empty() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+fn assert_nothing_runs_from(host: &Host) {
+    let left = procs_under(host.root.path());
+    assert!(
+        left.is_empty(),
+        "processes left running from the temp root: {left:?}"
+    );
+}
+
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         for n in &self.sandbox_names {
@@ -225,6 +274,7 @@ impl Drop for Cleanup<'_> {
                 unsafe { libc::kill(pid as i32, libc::SIGTERM) };
             }
         }
+        reap_under(self.host.root.path());
     }
 }
 
@@ -300,6 +350,8 @@ fn a4_a_reload_refused_on_unmarked_plain_state_dir() {
         );
     }
     c.watched.clear();
+    drop(c);
+    assert_nothing_runs_from(&host);
 }
 
 // --- (b) real `dev up` store, copied outside the sandbox base ---------------
@@ -462,6 +514,8 @@ fn a4_b_c_reload_refused_for_copied_and_production_resolving_stores() {
     );
     std::fs::remove_file(&state).unwrap();
     std::fs::rename(root.join("state.real"), &state).unwrap();
+    drop(c);
+    assert_nothing_runs_from(&host);
 }
 
 // --- (d) unmarked store + CADENCE_PROFILE=sandbox:x exported ---------------
@@ -511,6 +565,8 @@ fn a4_d_hand_set_sandbox_profile_unlocks_nothing() {
         );
     }
     c.watched.clear();
+    drop(c);
+    assert_nothing_runs_from(&host);
 }
 
 // --- non-dev store: a build change still demands the rollout lease ---------
@@ -598,4 +654,5 @@ fn a4_build_change_on_non_dev_store_still_requires_the_lease() {
     drop(conn);
     let _ = snap;
     drop(c);
+    assert_nothing_runs_from(&host);
 }
