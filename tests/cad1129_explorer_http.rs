@@ -536,3 +536,65 @@ fn operator_only_explorer_writes_refuse_agents() {
     );
     assert_eq!(status, 200, "{text}");
 }
+
+/// CAD-1129 F3 at the real board layer: an agent peer is refused by the
+/// board's own `principal` gate on every explorer route (read or write),
+/// with the board's message. The daemon would refuse the same agent with a
+/// different message ("operator action") because the seam forwards the
+/// identity, so asserting the board's text proves the board gate itself
+/// fired: with `principal` letting an agent through, this test fails on the
+/// message, even though the daemon still refuses in the seam.
+#[test]
+fn board_refuses_agent_peers_on_the_explorer_routes_itself() {
+    let fx = Fx::start();
+    let id = fx.op(
+        "app_workspace_install",
+        json!({"source": fx.bundle("a", "ag-a", "1")}),
+    )["install_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.op("app_favorites_put", json!({"install_ids": [id]}));
+    let before = fx.op("app_favorites_get", json!({}));
+    let board = "agents use the CLI";
+    for route in [
+        "/api/app-catalog",
+        "/api/app-catalog/crm",
+        "/api/app-home",
+        "/api/app-favorites",
+        "/api/app-requests",
+    ] {
+        let (status, text) = fx.get("agent:writer", route);
+        assert_eq!(status, 403, "GET {route}: {text}");
+        assert!(
+            text.contains(board),
+            "GET {route} not refused by the board gate: {text}"
+        );
+    }
+    for (route, body) in [
+        ("/api/app-favorites", json!({"install_ids": []})),
+        ("/api/app-favorites/opened", json!({"install_id": id})),
+        ("/api/app-catalog/request", json!({"catalog_id": "crm"})),
+    ] {
+        let (status, text) = fx.http("agent:writer", route, &body.to_string());
+        assert_eq!(status, 403, "POST {route}: {text}");
+        assert!(
+            text.contains(board),
+            "POST {route} not refused by the board gate: {text}"
+        );
+    }
+    assert_eq!(
+        fx.op("app_favorites_get", json!({})),
+        before,
+        "an agent changed the operator's favourites"
+    );
+    // positive control: the operator reads and writes the same routes.
+    let (status, text) = fx.get("operator", "/api/app-requests");
+    assert_eq!(status, 200, "{text}");
+    let (status, text) = fx.http(
+        "operator",
+        "/api/app-favorites",
+        &json!({"install_ids": [id]}).to_string(),
+    );
+    assert_eq!(status, 200, "{text}");
+}

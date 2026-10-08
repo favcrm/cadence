@@ -287,3 +287,33 @@ fn body_rpc_install(
         Err(e) => super::home::rpc_err(&e, method),
     }
 }
+
+#[cfg(test)]
+mod principal_acceptance {
+    //! CAD-1129 F3 (reviewer-written): the explorer's caller allowlist.
+    use super::*;
+    use crate::ui::operator::{Caller, Named};
+
+    fn named(operator: bool) -> Caller {
+        Caller::Named(Named {
+            actor: "A <a@x> (board)".into(),
+            author: "alice".into(),
+            operator,
+        })
+    }
+
+    #[test]
+    fn only_the_operator_and_named_members_pass() {
+        let ok = |c: Caller| match principal(&c) {
+            Ok(m) => m,
+            Err(_) => panic!("caller refused"),
+        };
+        assert_eq!(ok(Caller::Operator("operator (ui)".into())), None);
+        assert_eq!(ok(named(true)), None);
+        assert_eq!(ok(named(false)), Some("alice".to_string()));
+        match principal(&Caller::Agent("writer".into())) {
+            Ok(_) => panic!("an agent passed the explorer gate"),
+            Err(refused) => assert_eq!(refused.status_code().0, 403),
+        }
+    }
+}
