@@ -259,15 +259,20 @@ for a custom bundle. Members can browse, but see **Ask an admin to install**;
 that sends an install request for the operator to review. These install controls
 are operator-only.
 
-To update an installed app in the board, open `/app-installations/<id>` →
-**Settings** → **App package**, enter a package path or Git URL, choose
-**Check update**, review the proposal, then choose **Apply checked update**. This
-requires a verified operator and a writable (not read-only) session.
+For Social Content only, the board update controls are at
+`/app-installations/<id>` → **Settings** → **App package**. A verified operator
+in a writable session can enter a package path or Git URL, choose **Check
+update**, review the proposal, and choose **Apply checked update**.
 
-The remote CLI (`cadence --org …`) only exposes its allowlisted status,
-agent/issue/message reads and issue create/comment/set verbs; it has no app
-management verbs. In a hosted AgenticOS container, install and update apps only
-from the hosted board as the operator.
+For other apps, `/apps/manage/<id>` shows **Update ready** or **Up to date**.
+It offers **Check now** only for Git-sourced installs; this checks for an
+upstream change but does not apply it. Apply an update with
+`cadence app catalog upgrade-check` and `cadence app catalog upgrade` on the
+CLI. In a hosted AgenticOS container, the remote CLI (`cadence --org …`) is
+limited to status, agent/issue/message reads, and issue create/comment/set; it
+has no app-management verbs. Therefore non-Social apps cannot currently be
+updated there. Install apps from the hosted board as the operator. The Social
+Content board controls remain available to its operator.
 
 Built-in apps and their catalog index are embedded in the Cadence binary. A new
 built-in app version therefore arrives with a new Cadence build. An Explorer
