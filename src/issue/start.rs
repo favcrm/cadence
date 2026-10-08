@@ -704,6 +704,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     // any worktree work. (A reused lane keeps today's rule: no claim
     // commit; lock 2 only refreshes refs.)
     let mut claim_at: Option<String> = None;
+    let mut pre_claim: Option<(String, Option<String>, Option<model::Claim>)> = None;
     if !reuse {
         if branch_exists {
             return Err(Error::rejected(format!(
@@ -755,6 +756,11 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 let _ = write::save_front(&dir, &front, &body);
                 return Err(e);
             }
+            pre_claim = Some((
+                front.status.clone(),
+                front.owner.clone(),
+                front.claim.clone(),
+            ));
         }
     }
     drop(lock);
@@ -766,16 +772,42 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     // Clear registrations whose dirs are gone — a deleted worktree
     // must not block its own re-creation.
     let _ = git(&root, &["worktree", "prune"]);
-    let mut created = false;
-    let cargo_target: Option<PathBuf>;
-    if reuse {
-        let reattached = !dir_exists;
-        if reattached {
-            // Refs still accurate — record the interrupted recovery before
-            // re-attaching the surviving branch.
-            worktree::ensure_cadence_ignored(&root)?;
-            worktree::lifecycle::begin(&root, checkout_record())?;
-            if let Err(e) = worktree::add(&root, &wt_dir, None, &branch) {
+    let setup = || -> Result<(Option<PathBuf>, bool)> {
+        let mut created = false;
+        let cargo_target: Option<PathBuf>;
+        if reuse {
+            let reattached = !dir_exists;
+            if reattached {
+                // Refs still accurate — record the interrupted recovery before
+                // re-attaching the surviving branch.
+                worktree::ensure_cadence_ignored(&root)?;
+                worktree::lifecycle::begin(&root, checkout_record())?;
+                if let Err(e) = worktree::add(&root, &wt_dir, None, &branch) {
+                    let _ = worktree::lifecycle::transition(
+                        &root,
+                        &wt_dir,
+                        "setup-failed",
+                        Some(&e.to_string()),
+                    );
+                    return Err(e);
+                }
+            } else {
+                worktree::validate_registered_branch(&root, &wt_dir, &branch)?;
+            }
+            cargo_target = match worktree::setup_development(&wt_dir, &root, shared_deps) {
+                Ok(target) => target,
+                Err(e) => {
+                    let _ = worktree::lifecycle::transition(
+                        &root,
+                        &wt_dir,
+                        "setup-failed",
+                        Some(&e.to_string()),
+                    );
+                    return Err(e);
+                }
+            };
+            // Reused lanes re-heal shared cargo setup and the per-worktree hook.
+            if let Err(e) = worktree::lifecycle::activate(&root, checkout_record()) {
                 let _ = worktree::lifecycle::transition(
                     &root,
                     &wt_dir,
@@ -785,11 +817,12 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 return Err(e);
             }
         } else {
-            worktree::validate_registered_branch(&root, &wt_dir, &branch)?;
-        }
-        cargo_target = match worktree::setup_development(&wt_dir, &root, shared_deps) {
-            Ok(target) => target,
-            Err(e) => {
+            // Persist intent first: if the process stops during setup, inventory
+            // reports an interrupted checkout instead of inferring ownership from
+            // its directory name.
+            worktree::ensure_cadence_ignored(&root)?;
+            worktree::lifecycle::begin(&root, checkout_record())?;
+            if let Err(e) = worktree::add(&root, &wt_dir, Some(&branch), &base_sha) {
                 let _ = worktree::lifecycle::transition(
                     &root,
                     &wt_dir,
@@ -798,37 +831,21 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 );
                 return Err(e);
             }
-        };
-        // Reused lanes re-heal shared cargo setup and the per-worktree hook.
-        if let Err(e) = worktree::lifecycle::activate(&root, checkout_record()) {
-            let _ = worktree::lifecycle::transition(
-                &root,
-                &wt_dir,
-                "setup-failed",
-                Some(&e.to_string()),
-            );
-            return Err(e);
-        }
-    } else {
-        // Persist intent first: if the process stops during setup, inventory
-        // reports an interrupted checkout instead of inferring ownership from
-        // its directory name.
-        worktree::ensure_cadence_ignored(&root)?;
-        worktree::lifecycle::begin(&root, checkout_record())?;
-        if let Err(e) = worktree::add(&root, &wt_dir, Some(&branch), &base_sha) {
-            let _ = worktree::lifecycle::transition(
-                &root,
-                &wt_dir,
-                "setup-failed",
-                Some(&e.to_string()),
-            );
-            return Err(e);
-        }
-        // Existing build-target and pre-push setup must succeed before the
-        // checkout becomes active in the tracker.
-        cargo_target = match worktree::setup_development(&wt_dir, &root, shared_deps) {
-            Ok(target) => target,
-            Err(e) => {
+            // Existing build-target and pre-push setup must succeed before the
+            // checkout becomes active in the tracker.
+            cargo_target = match worktree::setup_development(&wt_dir, &root, shared_deps) {
+                Ok(target) => target,
+                Err(e) => {
+                    let _ = worktree::lifecycle::transition(
+                        &root,
+                        &wt_dir,
+                        "setup-failed",
+                        Some(&e.to_string()),
+                    );
+                    return Err(e);
+                }
+            };
+            if let Err(e) = worktree::lifecycle::activate(&root, checkout_record()) {
                 let _ = worktree::lifecycle::transition(
                     &root,
                     &wt_dir,
@@ -837,18 +854,44 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 );
                 return Err(e);
             }
-        };
-        if let Err(e) = worktree::lifecycle::activate(&root, checkout_record()) {
-            let _ = worktree::lifecycle::transition(
-                &root,
-                &wt_dir,
-                "setup-failed",
-                Some(&e.to_string()),
-            );
+            created = true;
+        }
+        Ok((cargo_target, created))
+    };
+    let (cargo_target, created) = match setup() {
+        Ok(done) => done,
+        Err(e) => {
+            // A refused new lane leaves the issue as it was: give the
+            // claim back (only if it is still the one lock 1 recorded).
+            if let (Some((status, owner, prev_claim)), Some(at)) = (pre_claim, &claim_at) {
+                let _lock = pm.lock()?;
+                let (mut cur, cur_body) = write::load_front(&dir)?;
+                if cur
+                    .claim
+                    .as_ref()
+                    .is_some_and(|c| c.by == requester && &c.at == at)
+                {
+                    cur.status = status;
+                    cur.owner = owner;
+                    cur.claim = prev_claim;
+                    let undone = write::save_front(&dir, &cur, &cur_body).and_then(|_| {
+                        write::commit_who(
+                            pm,
+                            &[dir.join("issue.md")],
+                            &format!("{}: start {branch} (claim released: setup failed)", cur.id),
+                            &[cur.id.as_str()],
+                            actor,
+                            Some(&requester),
+                        )
+                    });
+                    if undone.is_err() {
+                        let _ = write::save_front(&dir, &front, &cur_body);
+                    }
+                }
+            }
             return Err(e);
         }
-        created = true;
-    }
+    };
 
     // Lock 2 (short): re-load the issue and prove the claim is still
     // ours before recording the lane. The refs are merged onto the fresh
