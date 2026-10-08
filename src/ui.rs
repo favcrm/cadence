@@ -1259,12 +1259,24 @@ fn dir_of(proc_root: &Path, pid: i32) -> PathBuf {
     proc_root.join(pid.to_string())
 }
 
+/// The file names a cadence binary may run under: `cadence` or
+/// `cadence-<suffix>` (a side-by-side build such as `cadence-new`).
+/// One list for the board identity check and for `dev up|reload
+/// --build`, so a build is refused up front rather than started as a
+/// board `ui stop` could never find again (CAD-1206).
+pub(crate) fn is_cadence_exe_name(name: &str) -> bool {
+    name == "cadence" || name.strip_prefix("cadence-").is_some_and(|s| !s.is_empty())
+}
+
 /// The `--state-dir` of a board argv — `<…/cadence> … --state-dir
 /// <dir> … ui run …`, as `start_inner` has always spawned it — or
 /// `None` for anything else, an argv without `--state-dir` included.
 pub(crate) fn board_argv_state_dir(argv: &[String]) -> Option<PathBuf> {
     let (exe, args) = argv.split_first()?;
-    if Path::new(exe).file_name().and_then(|n| n.to_str()) != Some("cadence")
+    if !Path::new(exe)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_cadence_exe_name)
         || !args.windows(2).any(|w| w[0] == "ui" && w[1] == "run")
     {
         return None;
@@ -2660,5 +2672,22 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    /// CAD-1206: the board argv is recognised for a build named
+    /// `cadence-*` (what `dev reload --build` runs), not for strangers.
+    #[test]
+    fn board_argv_accepts_cadence_named_builds_only() {
+        let argv = |exe: &str| -> Vec<String> {
+            [exe, "--state-dir", "/tmp/s", "ui", "run", "--port", "1"]
+                .map(String::from)
+                .to_vec()
+        };
+        for exe in ["/x/cadence", "/x/cadence-new", "/x/cadence-old"] {
+            assert!(super::board_argv_state_dir(&argv(exe)).is_some(), "{exe}");
+        }
+        for exe in ["/x/a", "/x/cadencex", "/x/sleep", "/x/xcadence"] {
+            assert!(super::board_argv_state_dir(&argv(exe)).is_none(), "{exe}");
+        }
     }
 }
