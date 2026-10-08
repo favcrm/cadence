@@ -85,6 +85,7 @@ pub struct LocalWorkflow {
 }
 fn execution_agent() -> String {
     "agent".into()
+}
 impl LocalWorkflow {
     pub fn parse(text: &str, inputs: &BTreeMap<String, String>) -> Result<Self> {
         let template = workflow::parse_template(text)?;
