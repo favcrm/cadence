@@ -198,6 +198,16 @@ fn take_bytes(text: &str, limit: usize) -> String {
 }
 
 impl Store {
+    /// CAD-1212 test seam: rows inserted, updated or deleted on the daemon
+    /// store connection since it opened (SQLite `total_changes`). A check
+    /// reads it before and after a call and asserts it did not move, to
+    /// prove a callback switched to the lock-free
+    /// `workspace::with_runtime_read` writes nothing. Compiled out of release.
+    #[cfg(test)]
+    pub(crate) fn total_changes_for_test(&self) -> u64 {
+        self.conn().total_changes()
+    }
+
     /// The only way to take the connection lock (CAD-256). A panic while
     /// another caller held the guard poisons the mutex; `lock().unwrap()`
     /// would then panic on every later call and take the daemon down

@@ -842,7 +842,7 @@ impl Shared {
         }
         if let Ok(runs) = self.store.app_run_pending() {
             for (id, _, _) in runs {
-                if let Err(Error::Rejected(_)) = self.dispatch_app_run(&id) {
+                if matches!(self.dispatch_app_run(&id), Err(e) if e.kind() == "rejected") {
                     let _ = self.store.app_run_invalidate(&id);
                 }
             }
