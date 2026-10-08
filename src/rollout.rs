@@ -44,7 +44,9 @@ use crate::store::{self, Store};
 /// The newest migration in `store` writes this number.
 /// v33 (CAD-1129): `app_favorites`, `app_install_requests` and
 /// `app_update_checks` for the apps Explorer — new tables only.
-pub const SCHEMA_VERSION: i64 = 33;
+/// v34 (CAD-1246): `events_alias_kind` on `events(alias, kind, seq)` —
+/// an index only, so per-alias lookups stop full-scanning `events`.
+pub const SCHEMA_VERSION: i64 = 34;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -3329,7 +3331,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 33);
+        assert_eq!(SCHEMA_VERSION, 34);
     }
 
     struct MigrationHolder;

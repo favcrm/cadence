@@ -960,6 +960,21 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=33", [])?;
                 tx.commit()?;
             }
+            if version < 34 {
+                // CAD-1246: `events` carries only `events_job(job_id, seq)`,
+                // so every per-alias `WHERE alias=? AND kind=?` lookup
+                // full-scans it. `events_alias_kind(alias, kind, seq)` turns
+                // those into point index seeks; `seq` rides the index so the
+                // ORDER BY seq readers get a sorted scan. Index only — no
+                // row is read or rewritten; `IF NOT EXISTS` lets a
+                // half-applied store converge on reopen.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS events_alias_kind ON events(alias, kind, seq);",
+                )?;
+                tx.execute("UPDATE schema_version SET version=34", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(
