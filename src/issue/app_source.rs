@@ -359,27 +359,50 @@ pub(crate) fn ls_remote(tmp: &Path, url: &str, git_ref: &str) -> Result<String> 
         cmd.arg("ls-remote").arg("--").arg(url).arg(git_ref);
     })?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let line = text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .ok_or_else(|| Error::rejected("ls-remote answered nothing — the ref is unknown"))?;
-    let (sha, name) = line
-        .split_once('\t')
-        .ok_or_else(|| Error::rejected("ls-remote answered an unparseable line"))?;
-    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Error::rejected("ls-remote answered a non-commit object"));
+    // `ls-remote <pattern>` matches any ref ENDING in the pattern
+    // (`refs/heads/x/main` for `main`), so pick by exact name: the ref as
+    // typed, `refs/heads/<ref>`, `refs/tags/<ref>` or its peeled `^{}`.
+    let (mut head, mut tag, mut peeled) = (None, None, None);
+    let mut any = false;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        any = true;
+        let (sha, name) = line
+            .split_once('\t')
+            .ok_or_else(|| Error::rejected("ls-remote answered an unparseable line"))?;
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::rejected("ls-remote answered a non-commit object"));
+        }
+        let slot = if name == format!("refs/tags/{git_ref}^{{}}") {
+            &mut peeled
+        } else if name == format!("refs/tags/{git_ref}") || name == git_ref && git_ref.starts_with("refs/tags/") {
+            &mut tag
+        } else if name == "HEAD" && git_ref == "HEAD"
+            || name == format!("refs/heads/{git_ref}")
+            || name == git_ref
+        {
+            &mut head
+        } else {
+            continue;
+        };
+        *slot = Some(sha.to_string());
     }
-    // The remote must answer the ref the caller named — never a peeled
-    // or adjacent one.
-    if !name.ends_with(git_ref)
-        && !(git_ref == "HEAD" && name == "HEAD")
-        && !(name == format!("refs/tags/{git_ref}") || name == format!("refs/tags/{git_ref}^{{}}"))
-    {
-        return Err(Error::rejected(format!(
-            "ls-remote resolved '{name}', not '{git_ref}' — refusing to substitute"
-        )));
+    if !any {
+        return Err(Error::rejected(
+            "ls-remote answered nothing — the ref is unknown",
+        ));
     }
-    Ok(sha.to_string())
+    // An annotated tag resolves to the commit it peels to. A branch and a
+    // tag of the same name that disagree are ambiguous: refuse, never pick.
+    let tagged = peeled.or(tag);
+    match (head, tagged) {
+        (Some(h), Some(t)) if h != t => Err(Error::rejected(format!(
+            "'{git_ref}' names both a branch and a tag — refusing to guess"
+        ))),
+        (Some(sha), _) | (None, Some(sha)) => Ok(sha),
+        (None, None) => Err(Error::rejected(format!(
+            "ls-remote resolved no ref named '{git_ref}' — refusing to substitute"
+        ))),
+    }
 }
 
 fn git_step(tmp: &Path, step: &str, args: impl FnOnce(&mut Command)) -> Result<Output> {

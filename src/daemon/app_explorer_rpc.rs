@@ -22,27 +22,50 @@ use crate::error::{Error, Result};
 use crate::issue::app_access;
 use crate::issue::app_catalog::{self, workspace};
 
-/// What one catalog entry's installed state is for this caller:
-/// installed install-id, requested-by-me, request count.
-/// app-name → install_id for non-removed workspace installs. Reads
-/// each record's `removed` mark so a soft-removed app no longer counts
-/// as installed (its card returns to "Install").
+/// One workspace install of a catalog app, as the Explorer sees it.
+struct Installed {
+    install_id: String,
+    /// Soft-removed: the card offers Restore, never Install.
+    removed: bool,
+    /// Removed and still inside the restore window.
+    restorable: bool,
+}
+
+/// app-name → its workspace install. A live install wins over a
+/// soft-removed one of the same app; a removed one is still reported
+/// (with `removed`) so the card returns Restore instead of Install.
 fn installed_by_app(
     pm: &crate::issue::Pm,
     catalog: &app_catalog::Catalog,
-) -> BTreeMap<String, String> {
-    let mut by_app = BTreeMap::new();
+) -> BTreeMap<String, Installed> {
+    let now = crate::issue::time::now_epoch();
+    let mut by_app: BTreeMap<String, Installed> = BTreeMap::new();
     for (id, entry) in catalog.entries() {
         if entry.storage != app_catalog::Storage::Workspace {
             continue;
         }
-        let removed = workspace::describe_id(pm, catalog, id)
-            .ok()
-            .and_then(|d| d["removed"].as_i64())
-            .is_some();
-        if !removed {
-            by_app.insert(entry.app.clone(), id.to_string());
+        let Ok(desc) = workspace::describe_id(pm, catalog, id) else {
+            continue;
+        };
+        let removed = desc["removed"].as_i64().is_some();
+        let restorable = removed
+            && desc["restore_after"]
+                .as_i64()
+                .is_none_or(|after| now <= after);
+        if by_app.get(&entry.app).is_some_and(|prev| !prev.removed) {
+            continue;
         }
+        if removed && by_app.get(&entry.app).is_some_and(|prev| prev.restorable) {
+            continue;
+        }
+        by_app.insert(
+            entry.app.clone(),
+            Installed {
+                install_id: id.to_string(),
+                removed,
+                restorable,
+            },
+        );
     }
     by_app
 }
@@ -55,25 +78,18 @@ impl Shared {
         entry: &crate::issue::app_catalog::builtin::Builtin,
         manifest: &crate::issue::app::Manifest,
         digest: &str,
-        installed: Option<&Value>,
+        installed: Option<&Installed>,
         member: bool,
     ) -> Result<Value> {
+        let (holds_records, personal) = data_flags(manifest);
         let access = app_access::access_rows(
             manifest,
             manifest
                 .listing
                 .as_ref()
                 .and_then(|l| l.value["access_notes"].as_object()),
-            manifest
-                .listing
-                .as_ref()
-                .and_then(|l| l.value["data"]["personal"].as_bool())
-                .unwrap_or(false),
-            manifest
-                .listing
-                .as_ref()
-                .and_then(|l| l.value["data"]["personal"].as_bool())
-                .unwrap_or(false),
+            holds_records,
+            personal,
         );
         let mut row = json!({
             "id": entry.id,
@@ -89,10 +105,12 @@ impl Shared {
             "never": access["never"],
         });
         if let Some(installed) = installed {
-            row["state"] = json!("installed");
-            row["install_id"] = installed["install_id"].clone();
-            if installed["on"].as_bool() == Some(false) {
-                row["state"] = json!("off");
+            row["install_id"] = json!(installed.install_id);
+            if installed.removed {
+                row["state"] = json!("removed");
+                row["restorable"] = json!(installed.restorable);
+            } else {
+                row["state"] = json!("installed");
             }
         } else {
             row["state"] = json!("available");
@@ -132,11 +150,13 @@ impl Shared {
             let manifest = crate::issue::app::parse_manifest(app_md)?;
             let files: BTreeMap<String, String> = entry.files.clone();
             let digest = workspace::bundle_digest(&files);
-            let inst = installed
-                .get(&manifest.app)
-                .map(|iid| json!({"install_id": iid, "on": true}));
-            let mut row =
-                self.catalog_entry_row(&entry, &manifest, &digest, inst.as_ref(), member)?;
+            let mut row = self.catalog_entry_row(
+                &entry,
+                &manifest,
+                &digest,
+                installed.get(&manifest.app),
+                member,
+            )?;
             if member {
                 // Members never see the digest or a request count.
                 row.as_object_mut().unwrap().remove("digest");
@@ -145,7 +165,11 @@ impl Shared {
                     row["requested_by_me"] = json!(true);
                 }
             }
-            if installed.contains_key(&manifest.app) && pending.contains(&installed[&manifest.app])
+            // Members never see update state (the member projection).
+            if !member
+                && installed
+                    .get(&manifest.app)
+                    .is_some_and(|i| !i.removed && pending.contains(&i.install_id))
             {
                 row["update_available"] = json!(true);
             }
@@ -173,11 +197,14 @@ impl Shared {
         let pm = self.pm_at(&pm_dir)?;
         let catalog = app_catalog::Catalog::load(&pm.dir).unwrap_or_default();
         let installed = installed_by_app(&pm, &catalog);
-        let inst = installed
-            .get(&manifest.app)
-            .map(|iid| json!({"install_id": iid, "on": true}));
         let digest = workspace::bundle_digest(&entry.files);
-        let mut row = self.catalog_entry_row(&entry, &manifest, &digest, inst.as_ref(), member)?;
+        let mut row = self.catalog_entry_row(
+            &entry,
+            &manifest,
+            &digest,
+            installed.get(&manifest.app),
+            member,
+        )?;
         if member {
             row.as_object_mut().unwrap().remove("digest");
             row.as_object_mut().unwrap().remove("request_count");
@@ -246,17 +273,36 @@ impl Shared {
             if entry.storage != app_catalog::Storage::Workspace {
                 continue;
             }
+            let install_id = id.to_string();
             let desc = match workspace::describe_id(&pm, &catalog, id) {
                 Ok(desc) => desc,
-                Err(_) => continue,
+                Err(_) => {
+                    // A failed describe is shown, never skipped: a
+                    // missing row would read as "not installed".
+                    rows.push(json!({
+                        "install_id": install_id,
+                        "name": entry.app,
+                        "title": entry.app,
+                        "tagline": null,
+                        "icon": null,
+                        "attention": {"state":"attention","message":"This app could not be read. Check the workspace and try again.","action":null,"count":1},
+                    }));
+                    continue;
+                }
             };
-            let install_id = id.to_string();
             // A soft-removed install reads `removed` on its own row —
             // hidden from Open, listed under Recently removed.
             let removed = desc["removed"].as_i64().is_some();
             let mut attention = json!({"state":"ok","message":null,"action":null,"count":0});
             if removed {
-                attention = json!({"state":"removed","message":"Removed — restore within 30 days.","action":"restore","count":0});
+                let restorable = desc["restore_after"]
+                    .as_i64()
+                    .is_none_or(|after| crate::issue::time::now_epoch() <= after);
+                attention = if restorable {
+                    json!({"state":"removed","message":"Removed — restore within 30 days.","action":"restore","count":0})
+                } else {
+                    json!({"state":"removed","message":"Removed — the restore window has closed.","action":null,"count":0})
+                };
                 let listing = desc["listing"].clone();
                 rows.push(json!({
                     "install_id": install_id,
@@ -585,7 +631,8 @@ impl Shared {
             .ok_or_else(|| Error::rejected("the repo holds no app.md — not a Cadence app"))?;
         let manifest = crate::issue::app::parse_manifest(app_md)?;
         let digest = workspace::bundle_digest(&bundle.files);
-        let access = app_access::access_rows(&manifest, None, false, false);
+        let (holds_records, personal) = data_flags(&manifest);
+        let access = app_access::access_rows(&manifest, None, holds_records, personal);
         Ok(json!({
             "found": true,
             "name": manifest.app,
@@ -631,6 +678,19 @@ impl Shared {
     }
 }
 
+/// What the manifest's `listing.data` declares: `(holds_records,
+/// personal)`. `stores` names what the app keeps (records it holds);
+/// `personal` marks personal data. The two are independent, so an app
+/// that keeps records but no personal data still shows "its own data".
+fn data_flags(manifest: &crate::issue::app::Manifest) -> (bool, bool) {
+    let data = manifest.listing.as_ref().map(|l| &l.value["data"]);
+    let holds_records = data
+        .and_then(|d| d["stores"].as_array())
+        .is_some_and(|s| !s.is_empty());
+    let personal = data.and_then(|d| d["personal"].as_bool()).unwrap_or(false);
+    (holds_records, personal)
+}
+
 /// `member_as` param → `Some(handle)` when present and tag-shaped.
 fn member_claim(params: &Value) -> Result<Option<String>> {
     match params.get("member_as") {
@@ -663,7 +723,7 @@ fn member_claim(params: &Value) -> Result<Option<String>> {
 /// fixed and echoes nothing the caller sent or the network said.
 /// `app_source::SelectedGitSource::check_url` re-proves the shape; the
 /// resolution check in [`vet_resolved_host`] is the network-class half.
-fn check_git_url_public(url: &str) -> Result<()> {
+pub(super) fn check_git_url_public(url: &str) -> Result<()> {
     const REFUSED: &str = "git check refuses this URL; name a public https repository";
     let rest = url
         .strip_prefix("https://")
@@ -707,12 +767,25 @@ fn check_git_url_public(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// The one vet every route that fetches a Git source applies before git
+/// runs: the Explorer's check and the CLI-facing install, install-check,
+/// upgrade and upgrade-check. An absolute local path is not a network
+/// source and passes through to its own checks; anything else must pass
+/// the same public-https allowlist and resolved-host vet as the check.
+pub(super) fn vet_remote_source(source: &str) -> Result<()> {
+    if std::path::Path::new(source).is_absolute() {
+        return Ok(());
+    }
+    check_git_url_public(source)?;
+    vet_resolved_host(source)
+}
+
 /// Resolve the vetted host now and refuse any non-public address, so a
 /// public-looking name that points inside is refused before git runs.
 /// This narrows but cannot close DNS rebinding (git resolves again when
 /// it connects); the check is operator-only and read-only, and the
 /// install itself is pinned by the digest the operator reviews.
-fn vet_resolved_host(url: &str) -> Result<()> {
+pub(super) fn vet_resolved_host(url: &str) -> Result<()> {
     use std::net::ToSocketAddrs;
     let host = url
         .strip_prefix("https://")
