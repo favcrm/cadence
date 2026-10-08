@@ -3171,6 +3171,30 @@ mod tests {
         assert!(err.to_string().contains("backup"), "{err}");
     }
 
+    /// Sets an env var for one test and restores it on drop, so a panic
+    /// cannot leak it into the tests that run after.
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     /// CAD-310: a sandbox's own state dir starts a different build and
     /// crosses a schema with no identity and no lease; the same dir
     /// without its marker still refuses both.
@@ -3189,8 +3213,7 @@ mod tests {
         // CAD-1187: the root marker alone no longer exempts — the store
         // must hold the dev marker and sit under the sandbox base.
         std::fs::write(root.join(".cadence-sandbox"), r#"{"name":"sbx"}"#).unwrap();
-        let previous = std::env::var_os("CADENCE_SANDBOX_ROOT");
-        std::env::set_var("CADENCE_SANDBOX_ROOT", dir.path());
+        let _base = EnvGuard::set("CADENCE_SANDBOX_ROOT", dir.path());
         assert!(!sandbox_exempt(&state));
         assert!(authorize_spawn_for(&state, nobody()).is_err());
         let dev = serde_json::json!({
@@ -3203,10 +3226,6 @@ mod tests {
         assert!(authorize_migration(&db).is_ok());
         std::fs::remove_file(root.join(".cadence-sandbox")).unwrap();
         assert!(authorize_migration(&db).is_err());
-        match previous {
-            Some(v) => std::env::set_var("CADENCE_SANDBOX_ROOT", v),
-            None => std::env::remove_var("CADENCE_SANDBOX_ROOT"),
-        }
     }
 
     #[test]
