@@ -17,7 +17,9 @@ const PRE_COMMIT: &str = "#!/bin/sh\n\
 # cadence board tracker: refuse a commit that lint rejects (staged issues only).\n\
 set -e\n\
 if command -v cadence >/dev/null 2>&1; then\n\
-  out=$(CADENCE_PM_DIR=\"$(git rev-parse --show-toplevel)\" cadence issue lint --staged 2>&1) || {\n\
+  mode=\n\
+  cadence issue lint --help 2>/dev/null | grep -q -- --staged && mode=--staged\n\
+  out=$(CADENCE_PM_DIR=\"$(git rev-parse --show-toplevel)\" cadence issue lint $mode 2>&1) || {\n\
     echo \"cadence issue lint failed; commit refused:\" >&2\n\
     echo \"$out\" | sed -n '1,20p' >&2\n\
     exit 1\n\

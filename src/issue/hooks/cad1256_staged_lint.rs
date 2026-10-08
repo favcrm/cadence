@@ -30,7 +30,12 @@ fn shim() {
         return;
     };
     let pm = Pm::at(Path::new(&dir)).unwrap();
-    let report = lint::run_staged(&pm).unwrap();
+    // `old` stands in for a binary that predates `--staged`: full lint.
+    let report = if std::env::var("CAD1256_SHIM_OLD").is_ok() {
+        lint::run_with(&pm, None, None, None).unwrap()
+    } else {
+        lint::run_staged(&pm).unwrap()
+    };
     if report["ok"].as_bool() != Some(true) {
         eprintln!("{}", serde_json::to_string_pretty(&report).unwrap());
         std::process::exit(1);
@@ -46,6 +51,10 @@ struct Fixture {
 /// A tracker of `N` committed issues with the managed hooks installed
 /// and a `cadence` shim ahead of the host binary on the hook's PATH.
 fn fixture() -> Fixture {
+    fixture_with(false)
+}
+
+fn fixture_with(old: bool) -> Fixture {
     let root = tempfile::Builder::new()
         .prefix("c1256-")
         .tempdir_in("/tmp")
@@ -111,10 +120,21 @@ fn fixture() -> Fixture {
     std::fs::create_dir_all(&bin).unwrap();
     let exe = std::env::current_exe().unwrap();
     let shim = bin.join("cadence");
+    let help = if old {
+        "Usage: cadence issue lint [--project <P>]"
+    } else {
+        "Usage: cadence issue lint [--project <P>] [--staged]"
+    };
+    let reject = if old {
+        "case \"$*\" in *--staged*) echo \"error: unexpected argument '--staged' found\" >&2; exit 2;; esac\n"
+    } else {
+        ""
+    };
+    let old_env = if old { "CAD1256_SHIM_OLD=1 " } else { "" };
     std::fs::write(
         &shim,
         format!(
-            "#!/bin/sh\necho \"$@\" >> '{}/argv.log'\nCAD1256_SHIM_PM=\"$CADENCE_PM_DIR\" exec '{}' --exact issue::hooks::cad1256_staged_lint::shim --nocapture --test-threads 1 >/dev/null\n",
+            "#!/bin/sh\necho \"$@\" >> '{}/argv.log'\ncase \"$*\" in *--help*) echo '{help}'; exit 0;; esac\n{reject}{old_env}CAD1256_SHIM_PM=\"$CADENCE_PM_DIR\" exec '{}' --exact issue::hooks::cad1256_staged_lint::shim --nocapture --test-threads 1 >/dev/null\n",
             bin.display(),
             exe.display()
         ),
@@ -179,7 +199,7 @@ fn staged_lint_covers_only_the_staged_issue_in_a_300_issue_tracker() {
     let out = f.commit();
     assert!(out.status.success(), "{out:?}");
     let argv = std::fs::read_to_string(f.bin.join("argv.log")).unwrap();
-    assert_eq!(argv.trim(), "issue lint --staged");
+    assert_eq!(argv.trim(), "issue lint --help\nissue lint --staged");
 }
 
 #[test]
@@ -249,4 +269,25 @@ fn a_staged_duplicate_id_in_another_project_is_refused() {
     git_ok(&f.pm.dir, &["add", "oth/ACC-5/issue.md"]);
     let r = lint::run_staged(&f.pm).unwrap();
     assert!(r["errors"].to_string().contains("duplicated id"), "{r}");
+}
+
+/// A tracker whose PATH `cadence` predates `--staged` must not be frozen:
+/// the hook falls back to the full lint, which still refuses a bad issue.
+#[test]
+fn an_older_binary_without_staged_falls_back_to_full_lint() {
+    let f = fixture_with(true);
+    f.stage_issue(7, |t| t.replace("seed", "retitled"));
+    let out = f.commit();
+    assert!(out.status.success(), "valid commit must pass: {out:?}");
+    let argv = std::fs::read_to_string(f.bin.join("argv.log")).unwrap();
+    assert_eq!(argv.trim(), "issue lint --help\nissue lint");
+
+    f.stage_issue(9, |t| t.replace("status: backlog", "status: bogus"));
+    let head = git(&f.pm.dir, &["rev-parse", "HEAD"]).stdout;
+    let out = f.commit();
+    assert!(!out.status.success(), "invalid issue must be refused");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("commit refused:"), "{err}");
+    assert!(err.contains("ACC-9: unknown status 'bogus'"), "{err}");
+    assert_eq!(git(&f.pm.dir, &["rev-parse", "HEAD"]).stdout, head);
 }
