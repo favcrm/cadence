@@ -217,23 +217,44 @@ impl Shared {
             {
                 return Ok(None);
             }
-            let Some(app) = self.store.message_app(message_id)? else {
+            // Persisted provenance: the enqueue entry's own send-time
+            // stamp. A context stamp is re-proved against the live store;
+            // an installation-only stamp (an app chat with no context) is
+            // a valid destination with an empty context.
+            let Some(stamp) = self.store.message_app_stamp(message_id)? else {
                 return Ok(None);
             };
-            let Some(context) = app
-                .get("context_id")
-                .and_then(Value::as_str)
-                .filter(|context| !context.is_empty())
-            else {
-                return Ok(None);
-            };
-            if app.get("install_id").and_then(Value::as_str) != Some(install)
-                || (current_thread.context_id.as_deref() != Some(context)
-                    && !(current_thread.is_general && current_thread.context_id.is_none()))
+            if stamp.get("verified") != Some(&Value::Bool(true))
+                || stamp.get("install_id").and_then(Value::as_str) != Some(install)
             {
                 return Ok(None);
             }
-            self.store.app_context_proof(install, context)?;
+            let context = if stamp.get("context_id").is_some() {
+                let Some(app) = self.store.message_app(message_id)? else {
+                    return Ok(None);
+                };
+                let Some(context) = app
+                    .get("context_id")
+                    .and_then(Value::as_str)
+                    .filter(|context| !context.is_empty())
+                else {
+                    return Ok(None);
+                };
+                if app.get("install_id").and_then(Value::as_str) != Some(install)
+                    || (current_thread.context_id.as_deref() != Some(context)
+                        && !(current_thread.is_general && current_thread.context_id.is_none()))
+                {
+                    return Ok(None);
+                }
+                self.store.app_context_proof(install, context)?;
+                context.to_string()
+            } else {
+                String::new()
+            };
+            let app = json!({
+                "install_id": install,
+                "context_id": (!context.is_empty()).then_some(context.as_str()),
+            });
             self.verify_conversation_selector(alias, &app, &conversation_id)?;
             Ok(Some(json!({
                 "install_id": install,

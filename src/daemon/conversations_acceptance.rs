@@ -2703,3 +2703,70 @@ fn master_reads_attachments_on_its_live_turn_by_id_alone() {
     let err = err_text(read(&sent));
     assert!(err.contains("not on your turn's envelope"), "{err}");
 }
+
+/// CAD-1168 (Home links open the originating app conversation): the
+/// master turn Home shows names its app conversation from the message's
+/// persisted provenance — with a context, and without one (an
+/// installation-only chat). A Home turn, a foreign conversation and an
+/// archived one yield no link.
+///
+/// Guard: `master_turn_app_origin`.
+#[test]
+fn cad1168_home_turn_origin_is_the_persisted_app_conversation() {
+    let gx = gx();
+    let origin =
+        |gx: &Gx| gx.operator("master_state", json!({})).unwrap()["turn"]["app_origin"].clone();
+    let mut at = 1.0;
+    let mut done = |gx: &Gx, id: &str| {
+        at += 1.0;
+        gx.finish(id, at);
+    };
+
+    // With a context: the exact installation, context and conversation.
+    let conv = gx.general_of(&gx.crm, &gx.crm_a);
+    gx.send("o-ctx", &gx.crm, &gx.crm_a, Some(&conv));
+    gx.run("o-ctx");
+    assert_eq!(
+        origin(&gx),
+        json!({"install_id": gx.crm, "context_id": gx.crm_a, "conversation_id": conv})
+    );
+    done(&gx, "o-ctx");
+
+    // Without a context: a valid destination with an empty context.
+    let social = gx.general_of(&gx.social, &gx.social_ctx);
+    gx.operator(
+        "thread_send",
+        json!({"alias": "master", "text": "hi", "message": "o-bare",
+               "app": {"install_id": gx.social}, "conversation": social}),
+    )
+    .unwrap();
+    gx.run("o-bare");
+    assert_eq!(
+        origin(&gx),
+        json!({"install_id": gx.social, "context_id": "", "conversation_id": social})
+    );
+    done(&gx, "o-bare");
+
+    // A Home turn has no app conversation.
+    gx.send_home("o-home");
+    gx.run("o-home");
+    assert_eq!(origin(&gx), Value::Null);
+    done(&gx, "o-home");
+
+    // Foreign: a CRM-stamped turn whose conversation is Social's.
+    gx.send("o-foreign", &gx.crm, &gx.crm_a, None);
+    gx.repoint("o-foreign", &social);
+    gx.run("o-foreign");
+    assert_eq!(origin(&gx), Value::Null);
+    done(&gx, "o-foreign");
+
+    // Archived: the conversation is no longer a destination.
+    let other = gx.conversation(&gx.crm, &gx.crm_a, json!({}));
+    gx.send("o-arch", &gx.crm, &gx.crm_a, Some(&other));
+    gx.run("o-arch");
+    assert_ne!(origin(&gx), Value::Null);
+    gx.db()
+        .execute("UPDATE threads SET archived=1 WHERE id=?", [&other])
+        .unwrap();
+    assert_eq!(origin(&gx), Value::Null);
+}

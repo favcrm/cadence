@@ -35,7 +35,9 @@ export default function Composer({
       seed={seed}
       onCommand={onCommand}
       onSubmitted={onSent}
-      onSend={({ body, refs, attachments }) => sendToMaster(body, newMessageId(), refs, attachments)}
+      onSend={({ body, refs, attachments }) => {
+        void sendToMaster(body, newMessageId(), refs, attachments);
+      }}
       refocusAfterSend
       attach
       className="card p-2.5 relative"
