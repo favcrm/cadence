@@ -969,6 +969,8 @@ mod cad1120_tests;
 mod cad1123_acceptance;
 #[cfg(test)]
 mod cad1123_tests;
+#[cfg(test)]
+mod cad1230_acceptance;
 
 #[cfg(test)]
 mod cad742_tests {
