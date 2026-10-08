@@ -281,6 +281,12 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
             if args[0] == "ui" && args[1] == "start" {
                 cmd.env_remove("CADENCE_ALIAS");
             }
+            // CAD-1251: the board's start proof gets the update's own
+            // health budget, not the interactive 10 s.
+            cmd.env(
+                cadence_agent::ui::START_BUDGET_ENV,
+                cadence_agent::update::HEALTH_TIMEOUT.as_secs().to_string(),
+            );
             let out = cadence_agent::reaper::spawn(&mut cmd)
                 .and_then(|child| child.wait_with_output())
                 .map_err(|e| Error::internal(format!("could not run {}: {e}", binary.display())))?;
@@ -329,6 +335,44 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
     }
     fn board_running(&self) -> bool {
         cadence_agent::ui::detached_pid(self.state_dir).is_some()
+    }
+    /// CAD-1251: `ui start` on the restored build, retried within the
+    /// health budget. An older build ignores the budget variable and
+    /// proves its start within 10 s, stopping a board that is late; each
+    /// retry spawns a fresh one, so a loaded host gets several windows.
+    fn start_board(&self, binary: &Path) -> Result<()> {
+        let began = std::time::Instant::now();
+        let mut last = String::new();
+        while began.elapsed() < cadence_agent::update::HEALTH_TIMEOUT {
+            let mut cmd = Command::new(binary);
+            cmd.arg("--state-dir")
+                .arg(self.state_dir)
+                .args(["ui", "start"])
+                .env_remove("CADENCE_ALIAS")
+                .env(
+                    cadence_agent::ui::START_BUDGET_ENV,
+                    cadence_agent::update::HEALTH_TIMEOUT.as_secs().to_string(),
+                )
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped());
+            let out = cadence_agent::reaper::spawn(&mut cmd)
+                .and_then(|child| child.wait_with_output())
+                .map_err(|e| Error::internal(format!("could not run {}: {e}", binary.display())))?;
+            if out.status.success() {
+                return Ok(());
+            }
+            last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            self.line(&format!(
+                "warning: `ui start` on the restored build failed after {:.1}s: {last}",
+                began.elapsed().as_secs_f64()
+            ));
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        Err(Error::rejected(format!(
+            "`ui start` did not succeed within {}s: {last}",
+            cadence_agent::update::HEALTH_TIMEOUT.as_secs()
+        )))
     }
     fn progress_log(&self) -> Option<PathBuf> {
         self.progress_log.clone()

@@ -1383,6 +1383,26 @@ pub(crate) fn start(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i3
     start_inner(state_dir, flags, reset, false)
 }
 
+/// CAD-1251: the board's start proof (bind, readiness report, health)
+/// defaults to 10 s for an interactive `ui start`.
+pub(crate) const START_BUDGET_DEFAULT: Duration = Duration::from_secs(10);
+/// The budget a daemon restart gives the board it restarts — the same as
+/// the update's health wait, so a loaded host is not rolled back for a
+/// slow cold start.
+pub const START_BUDGET_RESTART: Duration = Duration::from_secs(90);
+/// Overrides the start-proof budget, in whole seconds (1..=600). The
+/// updater sets it on the `ui start` commands it runs; garbage falls back
+/// to the default rather than failing the start.
+pub const START_BUDGET_ENV: &str = "CADENCE_UI_START_BUDGET_SECS";
+
+fn start_budget() -> Duration {
+    std::env::var(START_BUDGET_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| (1..=600).contains(s))
+        .map_or(START_BUDGET_DEFAULT, Duration::from_secs)
+}
+
 /// `ui start` with no stdout — for composed callers (session's
 /// `--fix`) whose own output must stay a single document.
 pub(crate) fn start_quiet(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i32> {
@@ -1569,7 +1589,9 @@ pub(crate) fn start_inner(
     }
     let mut child = crate::reaper::spawn(&mut command)?;
     std::fs::write(pid_file(state_dir), child.id().to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let budget = start_budget();
+    let began = Instant::now();
+    let deadline = began + budget;
     loop {
         if child.try_wait()?.is_some() {
             // The bind failed (or the child died before it) — the log
@@ -1600,6 +1622,13 @@ pub(crate) fn start_inner(
                 http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[])
             {
                 let _ = std::fs::remove_file(ready_file(state_dir));
+                // CAD-1251: the window is sized from data, so say how
+                // much of it this start used.
+                eprintln!(
+                    "ui: board proved its start in {:.1}s (budget {}s)",
+                    began.elapsed().as_secs_f64(),
+                    budget.as_secs()
+                );
                 // CAD-841: only now that the child provably bound and
                 // serves does a `--device-login-*` triple reach the
                 // daemon — a failed spawn changes no live config
@@ -1642,10 +1671,11 @@ pub(crate) fn start_inner(
             // pid read from a file), and the pidfile goes only if it
             // still names that child.
             reap_unready_child(&mut child, state_dir);
-            return Err(Error::internal(
-                "ui server did not prove its own start within 10s — the board this \
+            return Err(Error::internal(format!(
+                "ui server did not prove its own start within {}s — the board this \
                  start spawned was stopped",
-            ));
+                budget.as_secs()
+            )));
         }
         std::thread::sleep(Duration::from_millis(100));
     }

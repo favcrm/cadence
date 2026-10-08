@@ -960,6 +960,17 @@ pub(crate) fn daemon_restart(
         // The restart's caller was resolved above; nothing after this
         // reads the alias.
         std::env::remove_var("CADENCE_ALIAS");
+        // CAD-1251: a restart's board start proves itself within the
+        // update's health budget, not the interactive 10 s (an explicit
+        // override wins).
+        if std::env::var_os(cadence_agent::ui::START_BUDGET_ENV).is_none() {
+            std::env::set_var(
+                cadence_agent::ui::START_BUDGET_ENV,
+                cadence_agent::ui::START_BUDGET_RESTART
+                    .as_secs()
+                    .to_string(),
+            );
+        }
         cadence_agent::ui::run_cli(
             state_dir,
             &cadence_agent::ui::UiAction::Start {

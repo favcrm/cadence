@@ -370,3 +370,43 @@ fn cad628_real_host_preserves_legacy_board_arguments_without_ui_json() {
     );
     assert!(start.contains("--allow-host legacy.example"), "{start}");
 }
+
+/// CAD-1251: the updater's `ui start` runs with the update's health budget,
+/// and the rollback's board start retries a start that lost to a loaded host.
+#[test]
+fn cad1251_restart_passes_the_board_budget_and_start_board_retries() {
+    let fixture = OldCli::new();
+    fixture.claim("operator:cad628");
+    let board = board_stand_in(&fixture.state, &[]);
+    std::fs::write(fixture.state.join("ui.pid"), board.0.id().to_string()).unwrap();
+    // `ui start` records the budget variable; the first one fails, as a
+    // timed-out proof does, the second succeeds.
+    std::fs::write(
+        &fixture.binary,
+        r#"#!/bin/sh
+d="$(dirname "$0")"
+if [ "$3" = daemon ]; then exit 0; fi
+if [ "$3" = ui ] && [ "$4" = start ]; then
+  echo "budget=$CADENCE_UI_START_BUDGET_SECS" >> "$d/starts"
+  if [ "$(wc -l < "$d/starts")" -lt 2 ]; then echo 'proof timed out' >&2; exit 70; fi
+fi
+exit 0
+"#,
+    )
+    .unwrap();
+    let result = test_seam::scoped(Asserted::Operator, || {
+        fixture.host().restart(&fixture.binary)
+    });
+    // The first `ui start` (the restart's own) fails, as a timed-out proof.
+    assert!(
+        matches!(result, Ok(RestartOutcome::Unclean(_))),
+        "{result:?}"
+    );
+    let starts = fixture.dir.path().join("starts");
+    let recorded = std::fs::read_to_string(&starts).unwrap_or_default();
+    assert!(recorded.contains("budget=90"), "{recorded}");
+    let retried = fixture.host().start_board(&fixture.binary);
+    assert!(retried.is_ok(), "{retried:?}");
+    let recorded = std::fs::read_to_string(&starts).unwrap();
+    assert!(recorded.lines().count() >= 2, "{recorded}");
+}
