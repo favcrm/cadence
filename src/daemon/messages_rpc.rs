@@ -1121,21 +1121,14 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        // CAD-880 (I3): caller identity is connection-bound. A CLI may
-        // carry its environment alias as a claim, but it is accepted only
-        // when the peer ancestry proves that exact agent; it never chooses
-        // whose turn is resolved.
-        if let Some(alias) = params.get("alias") {
-            let alias = alias.as_str().ok_or_else(|| {
-                Error::rejected("message report: request field 'alias' must be a string")
-            })?;
-            if !matches!(self.connection_caller(peer_pid)?, caller_rule::Who::Agent(ref actual) if actual == alias)
-            {
-                return Err(Error::rejected(
-                    "message report: caller identity is connection-bound; request field \
-                     'alias' does not match the proven agent",
-                ));
-            }
+        // CAD-880 (I3): caller identity is connection-bound — an `alias`
+        // field would name whose turn a default resolves, so it is
+        // refused outright rather than ignored.
+        if params.get("alias").is_some() {
+            return Err(Error::rejected(
+                "message report: caller identity is connection-bound; request field \
+                 'alias' is not accepted",
+            ));
         }
         reject_identity_fields(params, "message report")?;
         let kind = required_str(params, "kind")?;
