@@ -374,11 +374,13 @@ pub fn run_with_idle_test_process_use(
             cwd: Vec::new(),
             fd: Vec::new(),
             enumeration_error: None,
+            excused: Vec::new(),
         }),
         ReclaimTestProcessUse::Incomplete(reason) => Ok(finish::ProcessUse {
             cwd: Vec::new(),
             fd: Vec::new(),
             enumeration_error: Some(reason.clone()),
+            excused: Vec::new(),
         }),
         ReclaimTestProcessUse::ScanProcRoot(proc_root) => {
             finish::process_use_under_from_proc_root(lane, proc_root)

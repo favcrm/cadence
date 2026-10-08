@@ -1469,6 +1469,10 @@ pub(crate) struct ProcessUse {
     pub cwd: Vec<u32>,
     pub fd: Vec<u32>,
     pub enumeration_error: Option<String>,
+    /// CAD-1209: pids whose cwd/fd the kernel hid from this caller and
+    /// `policy_denies_read` explained (root's, capability-bearing,
+    /// non-dumpable). They are not inspected; finish reports them.
+    pub excused: Vec<u32>,
 }
 
 pub(crate) type ProcessUseProbe = dyn Fn(&Path) -> Result<ProcessUse>;
@@ -1699,9 +1703,14 @@ fn inspect_pid(view: &ProcView, dir: &Path, pid: u32, use_: &mut ProcessUse, cal
     let cwd_entry_owner = std::fs::symlink_metadata(proc_dir.join("cwd"))
         .ok()
         .map(|metadata| (metadata.uid(), metadata.gid()));
+    let excused = std::cell::Cell::new(false);
     let unreadable_by_policy = |error: &io::Error| {
-        error.kind() == io::ErrorKind::PermissionDenied
-            && policy_denies_read(&status, caller, cwd_entry_owner)
+        let denied = error.kind() == io::ErrorKind::PermissionDenied
+            && policy_denies_read(&status, caller, cwd_entry_owner);
+        if denied {
+            excused.set(true);
+        }
+        denied
     };
 
     match std::fs::read_link(proc_dir.join("cwd")) {
@@ -1764,6 +1773,9 @@ fn inspect_pid(view: &ProcView, dir: &Path, pid: u32, use_: &mut ProcessUse, cal
         Err(error) if unreadable_by_policy(&error) => {}
         Err(error) => remember_pid_error(&mut pending, "enumerate file descriptors", error, true),
     }
+    if excused.get() && !use_.excused.contains(&pid) {
+        use_.excused.push(pid);
+    }
     finish_pid_scan(view, pid, use_, pending);
 }
 
@@ -1789,6 +1801,7 @@ pub(crate) fn process_use_under_from_proc_root(dir: &Path, proc_root: &Path) -> 
         cwd: Vec::new(),
         fd: Vec::new(),
         enumeration_error: completeness_error,
+        excused: Vec::new(),
     };
     let procs = match std::fs::read_dir(&view.scan_root) {
         Ok(procs) => procs,
@@ -3102,9 +3115,14 @@ pub(crate) fn run(
     // tracker bindings were probed unlocked above; new tracker refs make the
     // stale-probe check fail, while process cwd/FD use can change without a
     // tracker write.
+    let mut excused_pids: Vec<u32> = Vec::new();
     if !refs_only {
         if let Some(d) = t.wt_dir.as_deref().filter(|d| d.is_dir()) {
-            match process_use_under(d) {
+            let scanned = process_use_under(d);
+            if let Ok(uses) = &scanned {
+                excused_pids = uses.excused.clone();
+            }
+            match scanned {
                 Err(e) => {
                     return Err(Error::rejected(format!(
                         "Cannot revalidate process cwd/open-fd use for {} ({e}) — refusing deletion; --force cannot override failed enumeration",
@@ -3416,6 +3434,10 @@ pub(crate) fn run(
         "remote_note": remote_note,
         "forced": force,
         "overrode": overridden,
+        // CAD-1209: processes the kernel hid from this caller (root's,
+        // capability-bearing, non-dumpable) and `policy_denies_read`
+        // excused. Not inspected, so the audit trail names them.
+        "unscanned_processes": {"count": excused_pids.len(), "pids": excused_pids},
         "merged_by": merged_by,
         "not_started": matches!(ev.state, Branch::NotStarted { .. }),
         "refs_only": refs_only,
