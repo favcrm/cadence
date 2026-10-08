@@ -250,18 +250,62 @@ fn reap_under(root: &Path) {
     }
 }
 
+/// Settle window for a late spawn (a detached `ui start` can bring its board
+/// up after the command that asked for it has returned).
+const SETTLE: Duration = Duration::from_secs(2);
+
 fn assert_nothing_runs_from(host: &Host) {
     let left = procs_under(host.root.path());
     assert!(
         left.is_empty(),
         "processes left running from the temp root: {left:?}"
     );
+    std::thread::sleep(SETTLE);
+    let late = procs_under(host.root.path());
+    assert!(
+        late.is_empty(),
+        "processes appeared after the settle window (late spawn): {late:?}"
+    );
+}
+
+/// Polls `cond` until it holds or `limit` passes; true if it held.
+fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let until = std::time::Instant::now() + limit;
+    loop {
+        if cond() {
+            return true;
+        }
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Waits until `dev status <name>` reports the board running (the detached
+/// `ui start` has spawned it and recorded ui.pid). False if it never does.
+fn wait_board_up(host: &Host, name: &str) -> bool {
+    wait_until(Duration::from_secs(15), || {
+        let out = host.run(&["dev", "status", name]);
+        serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .map(|v| v["ui"] == "running")
+            .unwrap_or(false)
+    })
+}
+
+/// Stops the dev Cadence through `dev down`, after the board is up and
+/// recorded, and waits for every process of it to exit.
+fn dev_down_and_wait(host: &Host, name: &str, state: &Path) {
+    let _ = wait_board_up(host, name);
+    let _ = host.run(&["dev", "down", name]);
+    wait_until(Duration::from_secs(15), || procs_naming(state).is_empty());
 }
 
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         for n in &self.sandbox_names {
-            let _ = self.host.run(&["sandbox", "down", n]);
+            let state = self.host.path("boxes").join(n).join("state");
+            dev_down_and_wait(self.host, n, &state);
             let _ = self.host.run(&["sandbox", "reset", n]);
         }
         for s in &self.plain_states {
@@ -274,6 +318,10 @@ impl Drop for Cleanup<'_> {
                 unsafe { libc::kill(pid as i32, libc::SIGTERM) };
             }
         }
+        reap_under(self.host.root.path());
+        // A detached spawn can still be in flight: reap again after a settle
+        // window so a late board never outlives the test.
+        std::thread::sleep(SETTLE);
         reap_under(self.host.root.path());
     }
 }
@@ -403,8 +451,16 @@ fn a4_b_c_reload_refused_for_copied_and_production_resolving_stores() {
         "control: no process for the dev store runs the given build"
     );
 
-    let down = host.run(&["sandbox", "down", "dv"]);
-    assert!(down.status.success(), "sandbox down: {}", text(&down));
+    // The reload may return before the detached board has spawned: wait for
+    // it to be up and recorded, so `dev down` cannot miss it.
+    assert!(
+        wait_board_up(&host, "dv"),
+        "control: after `dev reload` the board is not reported running by \
+         `dev status` (no live ui.pid), so `dev down` cannot stop it"
+    );
+    let down = host.run(&["dev", "down", "dv"]);
+    assert!(down.status.success(), "dev down: {}", text(&down));
+    wait_until(Duration::from_secs(15), || procs_naming(&state).is_empty());
 
     // (b) copy the whole store, marker included, outside the sandbox base.
     let copy_root = host.path("elsewhere/dv");
