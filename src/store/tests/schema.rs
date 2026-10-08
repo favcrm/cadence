@@ -690,7 +690,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            33,
+            34,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
@@ -1379,5 +1379,65 @@
         }
         for t in ["app_favorites", "app_install_requests", "app_update_checks"] {
             assert!(has(t), "{t} missing after half-applied converge");
+        }
+    }
+
+    #[test]
+    fn migration_v33_to_v34_adds_events_alias_kind_and_is_idempotent() {
+        // v34 adds one index, `events_alias_kind` on
+        // `events(alias, kind, seq)` — the per-alias `WHERE alias=? AND
+        // kind=?` lookups that full-scanned `events` now seek it. A v33
+        // store migrates in place; a half-applied v34 (index present,
+        // version rolled back) converges on reopen; pre-v34 rows are
+        // untouched.
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        // A genuine v33: everything but the new index.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX events_alias_kind;
+                 UPDATE schema_version SET version=33;",
+            )
+            .unwrap();
+        let has_index = || -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='events_alias_kind'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        let version = || -> i64 {
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(!has_index(), "events_alias_kind unexpectedly present at v33");
+        {
+            let _s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has_index(), "events_alias_kind missing after migrate");
+            assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
+        }
+        // Half-applied: index present, version rolled back — reopen is a
+        // no-op converge, not an error or a second build.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("UPDATE schema_version SET version=33;")
+            .unwrap();
+        {
+            let _s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has_index(), "events_alias_kind missing after converge");
+            assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
         }
     }
