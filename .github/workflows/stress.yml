@@ -175,6 +175,17 @@ jobs:
           STOP_ON_FAIL: ${{ inputs.stop_on_fail }}
         run: |
           set -u
+          # CAD-1242: same isolation as scripts/run-result-tests. Private
+          # HOME/XDG/TMPDIR so tests never touch the runner's real ~/pm or
+          # state dir (CAD-1210 refuses that); the toolchain homes are pinned
+          # first so cargo and rustup still resolve. scripts/cadence-nextest
+          # already drops every CADENCE_* variable except its allowlist.
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          scratch=$(mktemp -d "$RUNNER_TEMP/stress-home.XXXXXX")
+          export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/xdg-config" \
+                 XDG_DATA_HOME="$scratch/xdg-data" XDG_STATE_HOME="$scratch/xdg-state" \
+                 XDG_CACHE_HOME="$scratch/xdg-cache" TMPDIR="$scratch/tmp"
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
           out="$RUNNER_TEMP/stress-fail"
           mkdir -p "$out"
           pass=0
