@@ -306,7 +306,6 @@ fn probe_rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
 /// this worktree.
 struct Target {
     front: Front,
-    body: String,
     dir: PathBuf,
     wt_dir: Option<PathBuf>,
     wt_name: Option<String>,
@@ -443,7 +442,7 @@ fn lane_list(lanes: &[&Ref]) -> String {
 /// (hand-edited history) is still finishable on its own.
 fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
     let (_project, dir) = write::issue_dir(pm, id)?;
-    let (front, body) = write::load_front(&dir)?;
+    let (front, _body) = write::load_front(&dir)?;
     let open_wts: Vec<&Ref> = front
         .refs
         .iter()
@@ -619,7 +618,6 @@ fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
     let msg_refs = bound_msg_refs(&front, wt_name.as_deref(), wt_dir.as_deref());
     Ok(Resolve::Target(Box::new(Target {
         front,
-        body,
         dir,
         wt_dir,
         wt_name,
@@ -1911,7 +1909,6 @@ pub(crate) fn lane_in_use(
     let wt_name = lane.file_name().map(|n| n.to_string_lossy().into_owned());
     let t = Target {
         front: front.clone(),
-        body: String::new(),
         dir: PathBuf::new(),
         wt_dir: Some(lane.to_path_buf()),
         msg_refs: bound_msg_refs(front, wt_name.as_deref(), Some(lane)),
@@ -2943,12 +2940,14 @@ pub(crate) fn run(
         }
     }
 
-    // Phase 2 — the commit phase, under the pm lock. Re-resolve so a
-    // tracker write that landed mid-probe is seen, then prove every
-    // input the probe's evidence depended on is unmoved — all local
-    // `rev-parse`s; nothing networked runs while holding the lock.
-    let _lock = pm.lock()?;
-    let mut t = match resolve(pm, id, args.worktree)? {
+    // Phase 2 — the decision, under the pm lock (CAD-1191: lock 1).
+    // Re-resolve so a tracker write that landed mid-probe is seen, then
+    // prove every input the probe's evidence depended on is unmoved — all
+    // local `rev-parse`s — and record the release intent in the lifecycle
+    // ledger. The lock is returned before anything is removed; lock 2
+    // below only closes the refs.
+    let lock = pm.lock()?;
+    let t = match resolve(pm, id, args.worktree)? {
         // A concurrent finish closed the pair mid-probe — the same
         // idempotent answer the unlocked probe would have given.
         Resolve::Finished => {
@@ -3075,6 +3074,9 @@ pub(crate) fn run(
         None
     };
 
+    drop(lock);
+    crate::issue::lockseam::outside_lock("finish-remove");
+
     // Removal: the worktree first (frees the branch), then the branch
     // — and only the exact tip the evidence covered: a tip that moved
     // (or was never covered) keeps its commits, so an uncovered branch
@@ -3165,7 +3167,12 @@ pub(crate) fn run(
             .and_then(|mut release| release.released(&disposition).err())
             .map(|e| e.to_string())
     };
-    for r in &mut t.front.refs {
+    // CAD-1191 lock 2: close the refs on a fresh read of the issue, so a
+    // tracker write that landed during the removal is kept. The refs are
+    // matched by path, exactly as before.
+    let lock = pm.lock()?;
+    let (mut front, body) = write::load_front(&dir)?;
+    for r in &mut front.refs {
         if (r.kind == "worktree"
             && wt_dir
                 .as_deref()
@@ -3183,7 +3190,7 @@ pub(crate) fn run(
     // open on disk, not just in memory.
     let front_file = dir.join("issue.md");
     let front_prev = std::fs::read(&front_file).ok();
-    write::save_front(&dir, &t.front, &t.body)?;
+    write::save_front(&dir, &front, &body)?;
     let what = if branch.is_empty() {
         wt_name.as_deref().unwrap_or("worktree").to_string()
     } else {
@@ -3224,7 +3231,7 @@ pub(crate) fn run(
     // remote delete: a `push` can take seconds and the lock's spin
     // deadline is 15s. The lease below, not lock ordering, is what
     // makes the delete safe.
-    drop(_lock);
+    drop(lock);
 
     let mut remote_deleted = false;
     let mut remote_note = Value::Null;
@@ -3272,7 +3279,7 @@ pub(crate) fn run(
     // the shared dep cache it linked into survives untouched (rm
     // unlinks symlinks; it never follows them).
     let mut out = json!({
-        "issue": t.front.id,
+        "issue": front.id,
         "finished": true,
         "worktree": wt_dir,
         "branch": branch,
@@ -3290,7 +3297,7 @@ pub(crate) fn run(
         "refs_only": refs_only,
         "checkout_disposition": disposition,
         "lifecycle_warning": lifecycle_warning,
-        "status": t.front.status,
+        "status": front.status,
     });
     if let Some(target) = &cargo_target {
         // `symlink_metadata` — a recorded path that is itself a
@@ -3608,7 +3615,6 @@ mod tests {
     fn target(id: &str) -> Target {
         Target {
             front: Front::new(id, "t", "now"),
-            body: String::new(),
             dir: PathBuf::new(),
             wt_dir: None,
             wt_name: None,

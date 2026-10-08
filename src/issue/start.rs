@@ -578,8 +578,12 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         .clone()
         .or_else(|| args.job.as_ref().and_then(|j| j.assignee.clone()));
 
-    let _lock = pm.lock()?;
+    // CAD-1191: lock 1 (short) — claim check, take-over and, for a new
+    // lane, the claim record. Worktree work runs unlocked; lock 2
+    // records the lane refs.
+    let lock = pm.lock()?;
     let (mut front, body) = write::load_front(&dir)?;
+    let front_id = front.id.clone();
     // CAD-383: a doing/review issue held by someone else refuses before
     // any lane is touched; a take-over is its own commit, made now.
     let mut asking = vec![requester.as_str()];
@@ -632,9 +636,6 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             .find(|r| r.kind == kind)
             .and_then(|r| r.path.clone())
     };
-    // Clear registrations whose dirs are gone — a deleted worktree
-    // must not block its own re-creation.
-    let _ = git(&root, &["worktree", "prune"]);
     let dir_exists = wt_dir.is_dir();
     let branch_exists = git(
         &root,
@@ -692,12 +693,79 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             path: &wt_dir,
             branch: Some(&branch),
             pinned_sha: &pinned_base,
-            issue: Some(&front.id),
+            issue: Some(&front_id),
         });
         record.base_sha = Some(pinned_base.clone());
         record
     };
 
+    // A new lane is validated, then its claim is recorded under this
+    // lock — the commit that makes a concurrent start refuse — before
+    // any worktree work. (A reused lane keeps today's rule: no claim
+    // commit; lock 2 only refreshes refs.)
+    let mut claim_at: Option<String> = None;
+    if !reuse {
+        if branch_exists {
+            return Err(Error::rejected(format!(
+                "Branch '{branch}' already exists but the issue records \
+                 worktree '{}' — pick --name or reconcile the refs first",
+                first_recorded("worktree").unwrap_or_else(|| "(none)".to_string())
+            )));
+        }
+        if dir_exists {
+            return Err(Error::rejected(format!(
+                "Worktree dir {} already exists but the issue records \
+                 branch '{}' — remove it or pick --name",
+                wt_dir.display(),
+                first_recorded("branch").unwrap_or_else(|| "(none)".to_string())
+            )));
+        }
+        let mut claimed = front.clone();
+        if matches!(claimed.status.as_str(), "backlog" | "ready") {
+            claimed.status = "doing".to_string();
+        }
+        if claimed.owner.is_none() {
+            claimed.owner = Some(
+                new_owner
+                    .clone()
+                    .unwrap_or_else(|| write::actor_who(actor, args.by.as_deref())),
+            );
+        }
+        // CAD-383: the start that puts the issue into work claims it —
+        // the requester (the dispatching PM), not the lane.
+        if claimed.claim.is_none() || checked.warning.is_some() {
+            claimed.claim = Some(claim::new_claim(&requester, None));
+        }
+        claim_at = claimed.claim.as_ref().map(|c| c.at.clone());
+        if claimed.status != front.status
+            || claimed.owner != front.owner
+            || claimed.claim != front.claim
+        {
+            let committed = write::save_front(&dir, &claimed, &body).and_then(|_| {
+                write::commit_who(
+                    pm,
+                    &[dir.join("issue.md")],
+                    &format!("{}: start {branch} (claim)", front.id),
+                    &[front.id.as_str()],
+                    actor,
+                    Some(&requester),
+                )
+            });
+            if let Err(e) = committed {
+                let _ = write::save_front(&dir, &front, &body);
+                return Err(e);
+            }
+        }
+    }
+    drop(lock);
+
+    // Unlocked: worktree creation and setup (cargo target, hooks). The
+    // lifecycle ledger records the intent first, so a crash here leaves
+    // an inventoried `preparing` checkout that a re-run reuses.
+    crate::issue::lockseam::outside_lock("start-worktree");
+    // Clear registrations whose dirs are gone — a deleted worktree
+    // must not block its own re-creation.
+    let _ = git(&root, &["worktree", "prune"]);
     let mut created = false;
     let cargo_target: Option<PathBuf>;
     if reuse {
@@ -719,8 +787,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         } else {
             worktree::validate_registered_branch(&root, &wt_dir, &branch)?;
         }
-        let setup = worktree::setup_development(&wt_dir, &root, shared_deps);
-        cargo_target = match setup {
+        cargo_target = match worktree::setup_development(&wt_dir, &root, shared_deps) {
             Ok(target) => target,
             Err(e) => {
                 let _ = worktree::lifecycle::transition(
@@ -742,48 +809,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             );
             return Err(e);
         }
-        // Idempotent: same lane — no commit, unless its refs need a
-        // fix: a stale recorded cargo target (project config flipped,
-        // an older cadence recorded a different layout), a closed
-        // pair re-opened, a missing half of the pair. The fix is a
-        // real commit, same as any ref edit.
-        let refreshed = with_lane_refs(&front, &branch, &wt_str, &repo_label, &cargo_target);
-        if refreshed.refs != front.refs {
-            let committed = write::save_front(&dir, &refreshed, &body).and_then(|_| {
-                // The trailer binds the requester (the dispatching PM),
-                // not just the OS actor — the lane's area PM is read
-                // back from this record.
-                write::commit_who(
-                    pm,
-                    &[dir.join("issue.md")],
-                    &format!("{}: start {branch} (refs refreshed)", front.id),
-                    &[front.id.as_str()],
-                    actor,
-                    Some(&requester),
-                )
-            });
-            if let Err(e) = committed {
-                let _ = write::save_front(&dir, &front, &body);
-                return Err(e);
-            }
-            front = refreshed;
-        }
     } else {
-        if branch_exists {
-            return Err(Error::rejected(format!(
-                "Branch '{branch}' already exists but the issue records \
-                 worktree '{}' — pick --name or reconcile the refs first",
-                first_recorded("worktree").unwrap_or_else(|| "(none)".to_string())
-            )));
-        }
-        if dir_exists {
-            return Err(Error::rejected(format!(
-                "Worktree dir {} already exists but the issue records \
-                 branch '{}' — remove it or pick --name",
-                wt_dir.display(),
-                first_recorded("branch").unwrap_or_else(|| "(none)".to_string())
-            )));
-        }
         // Persist intent first: if the process stops during setup, inventory
         // reports an interrupted checkout instead of inferring ownership from
         // its directory name.
@@ -800,8 +826,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         }
         // Existing build-target and pre-push setup must succeed before the
         // checkout becomes active in the tracker.
-        let setup = worktree::setup_development(&wt_dir, &root, shared_deps);
-        cargo_target = match setup {
+        cargo_target = match worktree::setup_development(&wt_dir, &root, shared_deps) {
             Ok(target) => target,
             Err(e) => {
                 let _ = worktree::lifecycle::transition(
@@ -823,36 +848,73 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             return Err(e);
         }
         created = true;
+    }
 
-        // Refs already recorded (a front saved-but-never-committed on
-        // a crash or refused commit, or a closed pair of the same
-        // names) are re-opened, never duplicated.
-        let mut new_front = with_lane_refs(&front, &branch, &wt_str, &repo_label, &cargo_target);
-        if matches!(new_front.status.as_str(), "backlog" | "ready") {
-            new_front.status = "doing".to_string();
+    // Lock 2 (short): re-load the issue and prove the claim is still
+    // ours before recording the lane. The refs are merged onto the fresh
+    // front, so an unrelated edit made meanwhile (a comment, a priority
+    // change) is kept, never overwritten and never a reason to refuse.
+    let lock = pm.lock()?;
+    let (cur, cur_body) = write::load_front(&dir)?;
+    let claim_lost = |why: String| {
+        Error::rejected(format!(
+            "{}: {why} while the lane was being set up — refs for {branch} were not \
+             recorded. The worktree {} and its lifecycle record are left in place; \
+             re-run `cadence issue start {}` to reuse the lane once the claim is yours",
+            cur.id,
+            wt_dir.display(),
+            cur.id
+        ))
+    };
+    if created || claim_at.is_some() {
+        // A new lane: the claim lock 1 recorded must still be ours.
+        let ours = cur
+            .claim
+            .as_ref()
+            .is_some_and(|c| c.by == requester && Some(&c.at) == claim_at.as_ref());
+        if !ours {
+            return Err(claim_lost(format!(
+                "the claim on it changed (now held by {})",
+                claim::holders(&cur).join(", ")
+            )));
         }
-        if new_front.owner.is_none() {
-            new_front.owner = Some(
-                new_owner
-                    .clone()
-                    .unwrap_or_else(|| write::actor_who(actor, args.by.as_deref())),
-            );
+    } else {
+        // A reused lane: the same claim check lock 1 ran, with no
+        // take-over available — only a holder that is not us refuses.
+        let mut asking = vec![requester.as_str()];
+        asking.extend(new_owner.as_deref());
+        match claim::check(&cur, &asking, None, "issue start", || None) {
+            Ok(c) if c.take_over.is_none() => {}
+            _ => {
+                return Err(claim_lost(format!(
+                    "it was claimed by {}",
+                    claim::holders(&cur).join(", ")
+                )))
+            }
         }
-        // CAD-383: the start that puts the issue into work claims it —
-        // the requester (the dispatching PM), not the lane.
-        if new_front.claim.is_none() || checked.warning.is_some() {
-            new_front.claim = Some(claim::new_claim(&requester, None));
-        }
-        // A refused tracker commit restores the frontmatter but keeps the
-        // managed checkout in setup-failed state for an explicit retry.
-        let committed = write::save_front(&dir, &new_front, &body).and_then(|_| {
-            // `Actor:` is the requester (the dispatching PM), so the
-            // lane's advisory code-area PM is bound to this record and
-            // not to live frontmatter an agent can rewrite.
+    }
+    let body = cur_body;
+    // Refs already recorded (a front saved-but-never-committed on a
+    // crash, or a closed pair of the same names) are re-opened, never
+    // duplicated. Idempotent: the same lane commits nothing, unless its
+    // refs need a fix (a stale cargo target, a closed pair re-opened, a
+    // missing half of the pair).
+    let refreshed = with_lane_refs(&cur, &branch, &wt_str, &repo_label, &cargo_target);
+    front = cur;
+    if refreshed.refs != front.refs {
+        // `Actor:` is the requester (the dispatching PM), so the lane's
+        // advisory code-area PM is bound to this record and not to live
+        // frontmatter an agent can rewrite.
+        let subject = if created {
+            format!("{}: start {branch}", front.id)
+        } else {
+            format!("{}: start {branch} (refs refreshed)", front.id)
+        };
+        let committed = write::save_front(&dir, &refreshed, &body).and_then(|_| {
             write::commit_who(
                 pm,
                 &[dir.join("issue.md")],
-                &format!("{}: start {branch}", front.id),
+                &subject,
                 &[front.id.as_str()],
                 actor,
                 Some(&requester),
@@ -860,17 +922,21 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         });
         if let Err(e) = committed {
             let _ = write::save_front(&dir, &front, &body);
-            let _ = worktree::lifecycle::transition(
-                &root,
-                &wt_dir,
-                "setup-failed",
-                Some(&e.to_string()),
-            );
+            if created {
+                // The managed checkout stays in setup-failed state for an
+                // explicit retry.
+                let _ = worktree::lifecycle::transition(
+                    &root,
+                    &wt_dir,
+                    "setup-failed",
+                    Some(&e.to_string()),
+                );
+            }
             return Err(e);
         }
-        front = new_front;
+        front = refreshed;
     }
-    drop(_lock);
+    drop(lock);
 
     // CAD-113: the worktree's slot environment — a write failure is
     // reported, never silently swallowed.
