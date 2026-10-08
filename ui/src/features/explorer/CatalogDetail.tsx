@@ -6,6 +6,7 @@ import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip } from "./shared";
 import InstallCheckPanel from "./InstallCheckPanel";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
+import { Loading, Notice } from "../app-shell/shared/States";
 import "./explorer.css";
 
 /**
@@ -21,18 +22,19 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   const [busy, setBusy] = useState(false);
   const [reviewing, setReviewing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const isOp = viewer.operator && !viewer.readOnly;
+  const isOp = viewer.operator === true && !viewer.readOnly;
   const installed = card?.state === "installed" || card?.state === "off";
   const removed = card?.removed === true;
 
   useEffect(() => {
+    if (viewer.operator === null) return;
     const controller = new AbortController();
     setError(null);
     void appExplorer.entry(id, controller.signal)
       .then((c) => { if (!controller.signal.aborted) setCard(c); })
       .catch((e: unknown) => { if (!controller.signal.aborted) setError(appLoadErrorCopy(e, "Could not load the app. Try again in a moment.")); });
     return () => controller.abort();
-  }, [id]);
+  }, [id, viewer.operator]);
 
   // The install starts with a check (CAD-1194); the panel installs the
   // checked digest.
@@ -54,6 +56,15 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
       .finally(() => setBusy(false));
   };
 
+  if (viewer.operator === null) {
+    return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9" aria-label="app catalog detail">
+      {viewer.access === "unavailable" ? (
+        <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
+          Access could not be confirmed. Retry the access check before acting.
+        </Notice>
+      ) : <Loading>Checking whether this session can act…</Loading>}
+    </main>;
+  }
   if (error) {
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9">
       <div className="card px-4 py-5" role="alert">

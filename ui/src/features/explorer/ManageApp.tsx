@@ -13,6 +13,7 @@ import {
 import type { Viewer } from "../projects/work";
 import { AppGlyph, useModal } from "./shared";
 import { appErrorCopy, appLoadErrorCopy, isUnchangedUpgradeError } from "./appErrors";
+import { Loading, Notice } from "../app-shell/shared/States";
 import "./explorer.css";
 
 /**
@@ -46,10 +47,11 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const isOp = viewer.operator && !viewer.readOnly;
+  const isOp = viewer.operator === true && !viewer.readOnly;
 
   const [reread, setReread] = useState(0);
   useEffect(() => {
+    if (!isOp) return;
     const controller = new AbortController();
     setError(null);
     void workspaceApps.detail(installId, controller.signal)
@@ -62,7 +64,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       })
       .catch(() => {});
     return () => controller.abort();
-  }, [installId, reread]);
+  }, [installId, reread, isOp]);
 
   useEffect(() => {
     if (!inst) return;
@@ -73,6 +75,15 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
     setUpgradeProposal(null);
   }, [inst]);
 
+  if (viewer.operator === null) {
+    return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9" aria-label="manage app">
+      {viewer.access === "unavailable" ? (
+        <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
+          Access could not be confirmed. Retry the access check before acting.
+        </Notice>
+      ) : <Loading>Checking whether this session can act…</Loading>}
+    </main>;
+  }
   if (!isOp) {
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9">
       <div className="card px-4 py-5">

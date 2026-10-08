@@ -1160,10 +1160,10 @@ export default function App() {
           <Explorer viewer={viewer} />
         )}
         {route.screen === "appsCatalog" && (
-          <CatalogDetail id={route.id} viewer={{ readOnly, operator: meta?.operator === true }} />
+          <CatalogDetail id={route.id} viewer={viewer} />
         )}
         {route.screen === "appsManage" && (
-          <ManageApp key={route.installId} installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} />
+          <ManageApp key={route.installId} installId={route.installId} viewer={viewer} />
         )}
         {route.screen === "workspaceApp" && (
           <AppShell installId={route.installId} viewer={viewer} onInstallation={reportInstallation}>
