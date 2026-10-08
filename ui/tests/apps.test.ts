@@ -28,6 +28,7 @@ import {
   runStatus,
   runTitle,
   runsSummary,
+  screenInstallHref,
   slugFromTopic,
   slugProblem,
   sourceLabel,
@@ -648,5 +649,15 @@ equal(
   ],
   "candidates exclude inboxes and sort",
 );
+
+// CAD-1253: a project app card opens the installation's v3 screen when it
+// declares one; without screens (or when ambiguous) it keeps the legacy link.
+const scr = { install_id: "ins_1", name: "social", project_link: "cadence", removed: null, files: ["app.md", "screens/main/screens.json"] };
+equal(screenInstallHref([scr], "cadence", "social"), "/app-installations/ins_1", "screen install href");
+equal(screenInstallHref([{ ...scr, files: ["app.md"] }], "cadence", "social"), null, "no screens keeps legacy");
+equal(screenInstallHref([scr, { ...scr, install_id: "ins_2" }], "cadence", "social"), null, "ambiguous keeps legacy");
+equal(screenInstallHref([scr], "other", "social"), null, "other project keeps legacy");
+equal(screenInstallHref([{ ...scr, removed: 5 }], "cadence", "social"), null, "removed keeps legacy");
+equal(screenInstallHref(null, "cadence", "social"), null, "no list keeps legacy");
 
 console.log("apps checks passed");
