@@ -1390,9 +1390,10 @@ impl Store {
         })
     }
     /// Authority loss is terminal; existing artifacts and turn receipts remain
-    /// immutable. This never retries uncertain provider work. `reason` names
-    /// the actual cause (the dispatch/binding rejection that proved the loss)
-    /// so failed steps persist a plain-words cause instead of a bare state.
+    /// immutable. This never retries uncertain provider work. `reason` hints
+    /// at the cause; only its safe classification (`app_reason_class`) is
+    /// persisted on the failed steps — arbitrary error text interpolated
+    /// from transport or provider output can carry credentials.
     pub fn app_run_invalidate(&self, id: &str, reason: &str) -> Result<()> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
@@ -1417,6 +1418,12 @@ impl Store {
             // already closes material/dispatch authority; erasing the step
             // association would roll back the transport's terminal receipt.
             tx.execute("UPDATE app_run_steps SET state='failed' WHERE run_id=? AND state IN ('pending','dispatched') AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.id=app_run_steps.message_id AND m.state='running')", [id])?;
+            // CAD-1142: `reason` reaches here from a dispatch/binding
+            // rejection's `Display` — free text, possibly interpolated
+            // with provider output. Persist only its safe class; the
+            // classified string is still human-readable and names the
+            // authority kind (binding/price/assignment/context).
+            let reason = app_reason_class(reason);
             tx.execute("UPDATE tasks SET state='failed',error=?,updated=? WHERE id IN (SELECT task_id FROM app_run_steps WHERE run_id=? AND state='failed')", params![reason, now(), id])?;
             tx.execute("UPDATE messages SET state='failed',error='app submission authorization changed',completed=? WHERE source='app_run_dispatch' AND state IN ('queued','submitting') AND id IN (SELECT message_id FROM app_run_steps WHERE run_id=?)",params![now(),id])?;
             Self::event(
@@ -1618,6 +1625,55 @@ fn extract_single_json_object(text: &str) -> Option<&str> {
     Some(&text[start..end])
 }
 
+/// CAD-1142 reason privacy. A step's persisted reason — projected as
+/// `steps[].reason` on run reads and carried by the `app_run_failed` /
+/// `app_run_invalidated` daemon-stream payloads — is readable by any
+/// `agent_events` caller (`Rule::Read`, including Unproven). Provider
+/// error text (`messages.error`, `result.error`, managed Pi's verbatim
+/// `errorMessage`) may carry credentials or prose, so it is never
+/// copied onto those surfaces. Instead a free-text detail is classified
+/// onto this bounded allowlist of Cadence-authored classes: the class
+/// still names the real failure kind (binding, price, assignment,
+/// context), while the raw detail stays on operator-only surfaces (the
+/// message row and authorized run reads). An unrecognized detail
+/// degrades to the generic authority-loss class — the class may be less
+/// specific, but no provider string can escape through it.
+pub(super) fn app_reason_class(detail: &str) -> &'static str {
+    let lower = detail.to_lowercase();
+    if lower.contains("binding") || lower.contains("receipt") {
+        "run binding receipt is no longer current"
+    } else if lower.contains("price") || lower.contains("quote") {
+        "capability price changed since run approval"
+    } else if lower.contains("context") {
+        "run context was updated or archived"
+    } else if lower.contains("connection") {
+        "capability connection receipt is stale or unavailable"
+    } else if lower.contains("assignment") || lower.contains("identity") {
+        "registered assignment identity or group changed"
+    } else if lower.contains("approval") || lower.contains("digest") || lower.contains("bundle") {
+        "run execution approval is absent or stale"
+    } else {
+        "app authority or assignment is no longer current"
+    }
+}
+
+/// CAD-1142 reason privacy: classify how a worker's turn ended into a
+/// bounded human-readable class. `status` is already restricted to the
+/// terminal allowlist by `finish_in`/`reconcile`, so interpolating it
+/// is safe; `detail` names only whether the provider reported error
+/// prose at all, never the prose itself.
+fn app_worker_turn_reason(status: &str, detail: bool) -> String {
+    match (status, detail) {
+        ("failed", true) => "worker turn failed: provider error".to_string(),
+        ("interrupted", _) => "worker turn was interrupted".to_string(),
+        ("unknown", _) => {
+            "worker turn outcome is uncertain; inspect authorized run surfaces".to_string()
+        }
+        (other, true) => format!("worker turn {other}: provider error"),
+        (other, false) => format!("worker turn {other} without producing material"),
+    }
+}
+
 /// Pi sometimes surrounds its final material envelope with explanatory
 /// prose, either bare or inside one standalone `json` fence. Accept exactly
 /// one complete, bounded envelope in either form amid brace-free prose;
@@ -1706,27 +1762,23 @@ impl Store {
         let task = self.task_in(tx, task_id)?;
         if status != "completed" {
             // CAD-1142: the step's reason names what actually ended the
-            // worker's turn (provider error, interruption, unknown outcome),
-            // not a bare "failed". The message's own `error`/`result.error`
-            // carries the provider's words; fold it in so the board shows a
-            // plain-words cause instead of a state with no reason.
+            // worker's turn (provider error, interruption, uncertain
+            // outcome), not a bare "failed" — as a bounded
+            // classification, never the provider's own words. The
+            // message's `error`/`result.error` carries provider prose
+            // verbatim and may hold credentials; it stays on the
+            // operator-only message row while the step records only the
+            // class (see `app_reason_class` above).
             let detail = message
                 .error
-                .clone()
+                .as_deref()
                 .filter(|e| !e.trim().is_empty())
-                .or_else(|| {
-                    result
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .filter(|e| !e.trim().is_empty())
-                        .map(str::to_string)
-                });
-            let reason = match detail {
-                Some(detail) => format!("the assigned worker's turn ended {status}: {detail}"),
-                None => {
-                    format!("the assigned worker's turn ended {status} without producing material")
-                }
-            };
+                .is_some()
+                || result
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .is_some_and(|e| !e.trim().is_empty());
+            let reason = app_worker_turn_reason(status, detail);
             return self
                 .app_step_failed_in(tx, &run_id, &step_id, task_id, &reason)
                 .map(|_| true);
@@ -1970,6 +2022,10 @@ impl Store {
             "UPDATE app_run_steps SET state='failed' WHERE run_id=? AND step_id=?",
             params![run, step],
         )?;
+        // CAD-1142: callers pass classified or Cadence-literal reasons;
+        // bound defensively so no caller can grow an unbounded string on
+        // the projected step reason or the daemon-stream payload.
+        let reason: String = reason.chars().take(256).collect();
         tx.execute(
             "UPDATE tasks SET state='failed',error=?,updated=? WHERE id=?",
             params![reason, now(), task],
