@@ -120,3 +120,23 @@ fn start_and_team_are_operator_only() {
     // Stale team revision loses the compare-and-swap.
     assert!(refusal(fx.set_team()).contains("stale"));
 }
+
+/// CAD-1230: a replayed start races the run's own completion. The run was
+/// running when the replay read it, and is terminal by the time the replay
+/// dispatches it. The replay returns the run as it now stands; it does not
+/// fail with "approval absent or stale". A first start still fails.
+#[test]
+fn replayed_start_of_a_run_that_just_finished_returns_it() {
+    let fx = Fx::new();
+    fx.start_team();
+    fx.set_team().unwrap();
+    let run = fx.operator("app_run_start", fx.start_params("r1")).unwrap();
+    let id = run["id"].as_str().unwrap().to_string();
+    fx.operator("app_run_cancel", json!({"run_id": id}))
+        .unwrap();
+    let replay = fx.shared.dispatch_started_run(&id, true).unwrap();
+    assert_eq!(replay["id"], run["id"]);
+    assert_eq!(replay["state"], "cancelled", "{replay}");
+    let first = fx.shared.dispatch_started_run(&id, false);
+    assert!(refusal(first).contains("approval is absent or stale"));
+}
