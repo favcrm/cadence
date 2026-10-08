@@ -370,3 +370,211 @@ button.chip:focus-visible {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* CAD-1216 Home review drawer (DrawerShell scrim="board"): the scrim covers
+   the whole board and both sit above the rail's slide-over (z 51). About
+   560px on desktop; on a phone (<=860px) a bottom sheet with a full-width
+   primary button. CRM drawers carry no data-scrim, so they are untouched. */
+.crm-drawer-kicker {
+  font-size: var(--text-label);
+  font-weight: 500;
+  color: var(--color-accent);
+}
+.crm-drawer-scrim[data-scrim="board"] {
+  z-index: 60;
+}
+.crm-drawer.crm-drawer-shell[data-scrim="board"] {
+  z-index: 61;
+  width: min(35rem, 100dvw);
+  box-shadow: -16px 0 40px rgb(0 0 0 / 0.35);
+}
+.crm-drawer[data-scrim="board"] .crm-drawer-top {
+  padding: 1.25rem 1.5rem 0.9rem;
+}
+.crm-drawer[data-scrim="board"] .crm-drawer-body {
+  padding: 1.1rem 1.5rem 1.5rem;
+}
+.crm-drawer[data-scrim="board"] .crm-drawer-foot {
+  display: block;
+  padding: 0.85rem 1.5rem;
+}
+.rv-lead {
+  margin: 0;
+  color: var(--color-ink-200);
+  font-size: 0.9375rem;
+  line-height: 1.5;
+}
+.rv-h {
+  margin: 1.4rem 0 0.5rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-label);
+  font-weight: 600;
+}
+.rv-note {
+  margin: 0.4rem 0 0;
+  color: var(--color-ink-400);
+  font-size: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.rv-error {
+  margin: 0.9rem 0 0;
+  color: var(--color-fail);
+  font-size: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.rv-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.rv-steps li {
+  display: grid;
+  grid-template-columns: 1.6rem minmax(0, 1fr);
+  gap: 0.75rem;
+  align-items: start;
+  padding: 0.55rem 0;
+  border-bottom: 1px solid var(--color-ink-700);
+}
+.rv-steps li:last-child {
+  border-bottom: 0;
+}
+.rv-n {
+  display: grid;
+  place-items: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 50%;
+  background: var(--color-ink-800);
+  color: var(--color-ink-300);
+  font: 600 0.7rem "IBM Plex Mono", monospace;
+}
+.rv-steps b {
+  display: block;
+  color: var(--color-ink-100);
+  font-size: var(--text-secondary);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.rv-steps small {
+  color: var(--color-ink-500);
+  font-size: var(--text-label);
+}
+.rv-ticks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.4rem;
+}
+.rv-ticks li {
+  display: flex;
+  gap: 0.5rem;
+  color: var(--color-ink-300);
+  font-size: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.rv-ticks li::before {
+  content: "✓";
+  flex: none;
+  color: var(--color-ok);
+  font-weight: 600;
+}
+.rv-dlnk {
+  display: block;
+  margin-top: 1.4rem;
+  padding: 0;
+  color: var(--color-ink-500);
+  font-size: var(--text-label);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.rv-dlnk:disabled {
+  opacity: 0.5;
+}
+.rv-tech {
+  margin: 0.4rem 0 0;
+  color: var(--color-ink-500);
+  font: var(--text-micro) / 1.6 "IBM Plex Mono", monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.rv-sendback {
+  display: grid;
+  gap: 0.5rem;
+  justify-items: start;
+  margin-top: 1rem;
+}
+.rv-sendback textarea,
+.rv-sendback .field {
+  width: 100%;
+  min-height: 4.5rem;
+  padding: 0.6rem;
+  border: 1px solid var(--color-ink-600);
+  border-radius: 0.5rem;
+  background: var(--color-ink-850);
+  color: var(--color-ink-200);
+  font-size: var(--text-secondary);
+}
+.rv-sendback .field {
+  min-height: 0;
+}
+.rv-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.rv-count {
+  margin-left: auto;
+  color: var(--color-ink-500);
+  font-size: var(--text-label);
+}
+.rv-readonly {
+  margin: 0 0 0.5rem;
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+}
+
+@media (max-width: 860px) {
+  .crm-drawer.crm-drawer-shell[data-scrim="board"] {
+    top: auto;
+    left: 0;
+    right: 0;
+    width: 100%;
+    max-height: 88dvh;
+    border-left: 0;
+    border-top: 1px solid var(--color-ink-700);
+    border-radius: 1.1rem 1.1rem 0 0;
+    box-shadow: 0 -12px 32px rgb(0 0 0 / 0.35);
+  }
+  .crm-drawer.crm-drawer-shell[data-scrim="board"][data-closing] {
+    transform: translateY(105%);
+  }
+  .crm-drawer[data-scrim="board"] .crm-drawer-top,
+  .crm-drawer[data-scrim="board"] .crm-drawer-body {
+    padding-inline: 1.1rem;
+  }
+  .crm-drawer[data-scrim="board"] .crm-drawer-foot {
+    padding: 0.75rem 1.1rem calc(1rem + env(safe-area-inset-bottom, 0px));
+  }
+  .rv-primary {
+    order: -1;
+    flex: 1 0 100%;
+  }
+  .rv-primary .btn {
+    width: 100%;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .crm-drawer.crm-drawer-shell[data-scrim="board"] {
+      animation-name: rv-sheet-in;
+    }
+  }
+}
+@keyframes rv-sheet-in {
+  from {
+    transform: translateY(105%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}

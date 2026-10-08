@@ -1,9 +1,9 @@
 export {};
 /**
- * CAD-140: the operator's decision surfaces at a 390px phone width —
- * the researched-idea card (approve/reject/park) and the merge card
- * (merge pinned to its head, decline with a reason) through the real
- * NeedsRail. happy-dom has no layout engine, so like the CRM 390px
+ * CAD-140, CAD-1216: the operator's decision surfaces at a 390px phone
+ * width — the researched-idea drawer (approve/send back/park) and the
+ * merge drawer (publish pinned to its head, send back with a reason)
+ * opened from the real NeedsRail's To do cards. happy-dom has no layout engine, so like the CRM 390px
  * pass this guards the exact properties that keep a narrow viewport
  * intact — wrapping button rows, shrinking text containers, an
  * anchored overflow menu — and the operator re-verifies
@@ -63,7 +63,6 @@ host.setAttribute("style", "width:390px;overflow:hidden;");
 document.body.append(host);
 const root = createRoot(host);
 const flush = () => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
-const text = () => host.textContent ?? "";
 async function settle(check: () => void) {
   for (let i = 0; i < 60; i++) {
     await flush();
@@ -96,6 +95,27 @@ await (resources.issue("D-9") as { refreshUsing: (f: () => Promise<unknown>) => 
   blocked: false,
   created: "2026-09-29T00:00:00Z",
   rev: "fnv1a:0123456789abcdef",
+  counts: { comments: 0, artifacts: 0, refs: 0 },
+  checks: { done: 0, total: 0 },
+}));
+
+await (resources.issue("D-2") as { refreshUsing: (f: () => Promise<unknown>) => Promise<void> }).refreshUsing(async () => ({
+  id: "D-2",
+  project: "demo",
+  title: "Light the fuselage",
+  body: "## Outcome\n\nVisitors see a calm retrying message instead of an error. More detail follows.",
+  status: "review",
+  status_source: "direct",
+  priority: "P3",
+  tags: [],
+  blocked_by: [],
+  relates: [],
+  refs: [],
+  container: false,
+  ready: false,
+  blocked: false,
+  created: "2026-09-29T00:00:00Z",
+  rev: "fnv1a:00000000000000d2",
   counts: { comments: 0, artifacts: 0, refs: 0 },
   checks: { done: 0, total: 0 },
 }));
@@ -137,6 +157,7 @@ await React.act(async () => {
       readOnly: false,
       onOpenIssue: () => {},
       overviewHref: "/overview",
+      permissionsHref: "/settings/permissions",
       onAsk: () => {},
       collapsed: false,
       onToggleCollapse: () => {},
@@ -145,92 +166,85 @@ await React.act(async () => {
   );
 });
 
-// Decisions tab: the idea row decides inline.
-await settle(() => assert(text().includes("Decisions"), "rail tabs render"));
+// To do tab (the default): one line per card, one control; no kind chip,
+// issue id or hash on the card.
+await settle(() => assert(host.querySelector('[data-need="idea_plan"]'), "idea card renders"));
 {
-  const tabs = Array.from(host.querySelectorAll(".activity-tabs button"));
-  await click(tabs.find((b) => b.textContent?.includes("Decisions")));
-}
-await settle(() => assert(text().includes("idea plan ready"), "idea row renders"));
-{
-  const row = host.querySelector('[data-need="idea_plan"]');
-  assert(row, "idea row present");
-  const title = row.querySelector(".min-w-0.flex-1");
-  assert(title, "row title shrinks inside the row");
-  assert(title.classList.contains("break-words"), "long titles wrap instead of widening");
-  await click(Array.from(row.querySelectorAll("button")).find((b) => b.textContent?.includes("Decide")));
+  const card = host.querySelector('[data-need="idea_plan"]')!;
+  assert(!/D-9|idea plan ready/.test(card.textContent ?? ""), "the card carries no ticket id or technical row title");
+  const title = card.querySelector(".todo-title");
+  assert(title, "card has a one-line title");
+  const merge = host.querySelector('[data-need="merge_decision"]')!;
+  assert(!/cccc|acme\/app|r1/.test(merge.textContent ?? ""), "the merge card carries no hash, PR or reviewer");
+  assert(host.querySelectorAll("[data-need-group]").length === 0, "no group headings");
+  await click(Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Review"));
 }
 
-// The idea card: approve, reject-with-reason, park-with-date — every
-// control reachable at 390px without horizontal push.
-await settle(() => assert(host.querySelector('[data-idea-card="D-9"]'), "idea card renders"));
+// The idea drawer: approve, send back with a reason, park with a date —
+// every control reachable at 390px without horizontal push.
+await settle(() => assert(host.querySelector('[data-drawer="review"]'), "review drawer renders"));
 {
-  const card = host.querySelector('[data-idea-card="D-9"]')!;
-  assert(card.classList.contains("overflow-hidden"), "card clips to its column");
-  const title = card.querySelector(".text-cardtitle");
-  assert(title && title.classList.contains("break-words"), "long idea titles wrap");
-  const buttons = card.querySelector(".flex.flex-wrap");
-  assert(buttons, "decision buttons wrap onto more lines");
-  const labels = Array.from(card.querySelectorAll("button")).map((b) => b.textContent);
+  const drawer = host.querySelector('[data-drawer="review"]')!;
+  assert(drawer.getAttribute("data-scrim") === "board", "the scrim covers the whole board");
+  assert(host.querySelector(".crm-drawer-scrim")?.getAttribute("data-scrim") === "board", "scrim is board-wide");
+  const labels = Array.from(drawer.querySelectorAll("button")).map((b) => b.textContent);
   assert(labels.some((t) => t?.includes("Approve idea")), "approve offered");
-  await click(Array.from(card.querySelectorAll("button")).find((b) => b.textContent?.includes("Reject")));
-  assert(host.querySelector('[aria-label="rejection reason"]'), "reject asks why");
-  await click(Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Cancel"));
-  await click(Array.from(card.querySelectorAll("button")).find((b) => b.textContent?.includes("Park")));
-  assert(host.querySelector('[aria-label="park until date"]'), "park asks until when");
-  await click(Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Cancel"));
+  assert(labels.includes("Not now"), "Not now closes without deciding");
+  assert(/1 of 2/.test(drawer.textContent ?? ""), "n of m names the position");
+  assert(!/Easy to undo|Undo/.test(drawer.textContent ?? ""), "no undo promise: no server reversal exists");
+  assert(!drawer.textContent?.includes("cadence "), "no command in the drawer");
+  const title = drawer.querySelector(".crm-drawer-title");
+  assert(title && title.textContent?.startsWith("Dark mode"), "the drawer is titled by the idea");
+  await click(Array.from(drawer.querySelectorAll("button")).find((b) => b.textContent?.includes("Send back")));
+  assert(host.querySelector('[aria-label="What is wrong with this idea?"]'), "send back asks why");
+  await click(Array.from(drawer.querySelectorAll("button")).find((b) => b.textContent?.includes("Park it for later")));
+  assert(host.querySelector("#rv-park"), "park asks until when");
+  await click(Array.from(drawer.querySelectorAll("button")).find((b) => b.textContent === "Details"));
+  assert(drawer.querySelector(".rv-tech")?.textContent?.includes("D-9"), "Details shows the technical fields on request");
+  // Not now closes and leaves the card.
+  await click(Array.from(drawer.querySelectorAll("button")).find((b) => b.textContent === "Not now"));
 }
+await settle(() => assert(!host.querySelector('[data-drawer="review"]'), "Not now closes the drawer"));
+assert(host.querySelector('[data-need="idea_plan"]'), "the card stays after Not now");
 
-// The merge card: the head it merges, and the decline that states why.
-{
-  const tabs = Array.from(host.querySelectorAll(".activity-tabs button"));
-  assert(tabs.length > 0, "tabs present");
-  const row = host.querySelector('[data-need="merge_decision"]');
-  if (!row) {
-    // PRs group folds — open it.
-    const groups = Array.from(host.querySelectorAll("[data-need-group] button"));
-    await click(groups.find((b) => b.textContent?.includes("PRs")));
-  }
-}
-await settle(() => assert(host.querySelector('[data-need="merge_decision"]'), "merge row renders"));
+// The merge drawer: what passed, the pinned head under Details, and the
+// send-back that states why.
 {
   const row = host.querySelector('[data-need="merge_decision"]')!;
-  await click(Array.from(row.querySelectorAll("button")).find((b) => b.textContent?.includes("Review merge")));
+  await click(Array.from(row.querySelectorAll("button")).find((b) => b.textContent === "Review"));
 }
-await settle(() => assert(text().includes("acme/app#9"), "merge card renders"));
+await settle(() => assert(host.querySelector('[data-drawer="review"]'), "merge drawer renders"));
 {
-  assert(text().includes("head cccccccccccc"), "the shown head is named");
-  await click(Array.from(host.querySelectorAll("button")).find((b) => b.textContent?.includes("Decline")));
-  assert(host.querySelector('[aria-label="decline reason"]'), "decline asks why");
+  const drawer = host.querySelector('[data-drawer="review"]')!;
+  assert(drawer.querySelector(".crm-drawer-title")?.textContent === "Light the fuselage", "titled by the change");
+  assert(!drawer.textContent?.includes("cccccccccccc"), "the head is hidden until Details");
+  assert(drawer.textContent?.includes("passed by a second agent"), "a Checked tick appears for the reviewer the row carries");
+  assert(drawer.textContent?.includes("PASS — green at the reviewed head"), "the verdict summary the row carries is shown");
+  assert(Array.from(drawer.querySelectorAll("button")).some((b) => b.textContent === "Publish"), "publish offered");
+  await click(Array.from(drawer.querySelectorAll("button")).find((b) => b.textContent === "Details"));
+  assert(drawer.querySelector(".rv-tech")?.textContent?.includes("head cccccccccccc"), "Details names the reviewed head");
+  await click(Array.from(drawer.querySelectorAll("button")).find((b) => b.textContent?.includes("Send back")));
+  assert(host.querySelector('[aria-label="What should change before this goes out?"]'), "send back asks why");
 }
 
 // 390px containment on the RENDERED tree. happy-dom has no layout
 // engine — scrollWidth/clientWidth are always 0, so no harness can
-// measure overflow here (verified: a 600px child in a 390px parent
-// reports scrollWidth 0). What the harness CAN check on rendered
-// nodes: the computed styles that decide containment, plus the class
-// contracts the Tailwind bundle (stubbed in tests) fulfills in the
-// browser. The operator re-verifies `scrollWidth <= innerWidth` at
-// 390px in a real browser.
-const card = host.querySelector('[data-idea-card="D-9"]')!;
+// measure overflow here. What the harness CAN check on rendered nodes:
+// the class contracts that keep a narrow viewport intact (wrapping
+// rows, shrinking text containers), and the shipped CSS read back
+// computed. The operator re-verifies `scrollWidth <= innerWidth` in a
+// real browser.
 const must = (el: Element | null, cls: string, why: string) => {
   assert(el, `node present: ${why}`);
   assert(el.classList.contains(cls), `${why} carries .${cls} (wrap/shrink contract)`);
 };
-// Every text container shrinks and wraps; every button row wraps.
-must(card.querySelector("header"), "min-w-0", "idea header shrinks");
-must(card.querySelector(".text-cardtitle"), "break-words", "idea title wraps");
-must(card.querySelector(".flex.flex-wrap"), "flex-wrap", "decision buttons wrap");
 const row = host.querySelector('[data-need="idea_plan"]')!;
-must(row.querySelector(".min-w-0.flex-1"), "break-words", "row title wraps");
-// Shipped rail CSS, injected and read back computed: the row takes
-// the rail's width (no fixed floor) and the overflow menu anchors to
-// the row's right edge within a 390px column.
+must(row.querySelector(".todo-main"), "min-w-0", "card text shrinks");
 const fs = require("fs");
 const path = require("path");
 const proc = (globalThis as any).process;
 const css: string = fs.readFileSync(path.join(proc.cwd(), "src/styles.css"), "utf8");
-const shipped = [".needrow", ".needmenu"].map((sel) => {
+const shipped = [".needrow", ".needmenu", ".todo-card", ".todo-title"].map((sel) => {
   const match = css.match(new RegExp(`${sel.replace(/\./g, "\\.")}\\s*\\{([^}]*)\\}`));
   assert(match, `shipped CSS block exists: ${sel}`);
   return `${sel} {${match![1]}}`;

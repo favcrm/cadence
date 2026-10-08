@@ -377,12 +377,15 @@ export default function Home({
   overview,
   onOpenIssue,
   overviewHref,
+  permissionsHref,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
   overviewHref: string;
+  /** Settings → Master permissions (the standing "Always" rules). */
+  permissionsHref: string;
 }) {
   const thread = useQuery(resources.masterThread);
   const agents = useResource(resources.agents);
@@ -705,8 +708,8 @@ export default function Home({
 
   /** Ask master: a prefilled draft with the row's subject as refs —
    *  never sends; the operator reviews it in the composer. */
-  const onAsk = (need: HomeNeed) => {
-    const draft = askDraft(need);
+  const onAsk = (need: HomeNeed, lead?: string) => {
+    const draft = askDraft(need, lead);
     setSeed((s) => ({ text: draft.text, refs: draft.refs, n: s.n + 1 }));
   };
   const toggleRail = () => {
@@ -733,6 +736,7 @@ export default function Home({
           readOnly={readOnly}
           onOpenIssue={onOpenIssue}
           overviewHref={overviewHref}
+          permissionsHref={permissionsHref}
           onAsk={onAsk}
           onAskAgent={(agent, update) => setSeed((s) => ({
             text: `Check in with ${agent.alias}${agent.on.length ? ` on ${agent.on.join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`,

@@ -28,11 +28,13 @@ interface NavListProps {
   label?: string;
   /** The phone menu closes itself when a link is followed. */
   onNavigate?: () => void;
+  /** Pending To do items for the Home row's badge (CAD-1216); hidden at 0 or unknown. */
+  homeCount?: number;
 }
 
 /** The one nav row list: the desktop sidebar and the phone menu both
  *  render it, so there is a single row style. */
-export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate }: NavListProps) {
+export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0 }: NavListProps) {
   return (
     <nav className="grid gap-[2px]" aria-label={label}>
       {NAV.map((item) => {
@@ -52,6 +54,11 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
             >
               {NAV_ICONS[item.screen]}
               {item.label}
+              {item.screen === "home" && homeCount > 0 && (
+                <span className="navbadge num" title={`${homeCount} waiting for you`}>
+                  {homeCount}
+                </span>
+              )}
             </Link>
             {item.screen === "apps" && appMenu?.notice && (
               <div role="status" className="ml-[10px] border-l border-ink-700 pl-[6px] py-[3px] text-label text-ink-400">

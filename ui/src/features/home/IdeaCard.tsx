@@ -7,6 +7,45 @@ import Button from "../../ui/Button";
 import { ideaDecisionBody, type IdeaAction } from "./idea";
 
 /**
+ * The idea decision itself (CAD-140): approve, reject with a reason, or
+ * park until a date, bound to the revision shown. The card below and the
+ * review drawer (CAD-1216) both drive it.
+ */
+export function useIdeaDecision(issue: string, onDecided?: (issue: string, action: string) => void) {
+  const state = useQuery(resources.issue(issue));
+  const [busy, setBusy] = useState<IdeaAction | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const detail = state.data?.id === issue ? state.data : null;
+  const decide = (action: IdeaAction, reason: string, parkUntil: string, done?: () => void) => {
+    const decided = ideaDecisionBody(action, reason, parkUntil);
+    if (decided.body === null) {
+      setError(decided.error);
+      return;
+    }
+    const body = decided.body;
+    if (!detail) {
+      setError("Re-read the idea — it is still loading.");
+      return;
+    }
+    setBusy(action);
+    setError(null);
+    // CAD-140: bind the decision to the plan shown — REQUIRED. The
+    // card read this rev; a moved issue refuses with 409 `stale_view`.
+    api
+      .ideaDecide(issue, action, { ...body, expect_rev: detail.rev })
+      .then((out) => {
+        done?.();
+        void resources.issue(issue).invalidate();
+        void resources.overview.invalidate();
+        onDecided?.(issue, String((out as { decision?: { action?: unknown } }).decision?.action ?? action));
+      })
+      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      .finally(() => setBusy(null));
+  };
+  return { state, detail, busy, error, setError, decide };
+}
+
+/**
  * An idea card (CAD-140): a researched idea waiting at the gate, with
  * the operator's three decisions — Approve mints exactly the proposed
  * children, Reject (with a reason) drops it, Park (with a date)
@@ -25,44 +64,17 @@ export default function IdeaCard({
   onOpenIssue: (id: string) => void;
   onDecided?: (issue: string, action: string) => void;
 }) {
-  const state = useQuery(resources.issue(issue));
-  const [busy, setBusy] = useState<IdeaAction | null>(null);
   const [mode, setMode] = useState<"reject" | "park" | null>(null);
   const [reason, setReason] = useState("");
   const [parkUntil, setParkUntil] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
+  const { state, detail, busy, error, setError, decide: send } = useIdeaDecision(issue, onDecided);
   const block = useWriteBlock(readOnly);
-  const detail = state.data?.id === issue ? state.data : null;
-
-  const decide = (action: IdeaAction) => {
-    const decided = ideaDecisionBody(action, reason, parkUntil);
-    if (decided.body === null) {
-      setError(decided.error);
-      return;
-    }
-    const body = decided.body;
-    if (!detail) {
-      setError("Re-read the idea — it is still loading.");
-      return;
-    }
-    setBusy(action);
-    setError(null);
-    // CAD-140: bind the decision to the plan shown — REQUIRED. The
-    // card read this rev; a moved issue refuses with 409 `stale_view`.
-    api
-      .ideaDecide(issue, action, { ...body, expect_rev: detail.rev })
-      .then((out) => {
-        setMode(null);
-        setReason("");
-        setParkUntil("");
-        void resources.issue(issue).invalidate();
-        void resources.overview.invalidate();
-        onDecided?.(issue, String((out as { decision?: { action?: unknown } }).decision?.action ?? action));
-      })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
-      .finally(() => setBusy(null));
-  };
+  const decide = (action: IdeaAction) =>
+    send(action, reason, parkUntil, () => {
+      setMode(null);
+      setReason("");
+      setParkUntil("");
+    });
 
   if (!detail) {
     return (
