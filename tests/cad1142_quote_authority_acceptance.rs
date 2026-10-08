@@ -310,7 +310,10 @@ impl Drop for Fx {
 
 impl Fx {
     fn start() -> Self {
-        let root = tempfile::Builder::new().prefix("c1142acc").tempdir().unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("c1142acc")
+            .tempdir()
+            .unwrap();
         let provider = Probe::new();
         let mut fx = Self {
             root,
@@ -534,7 +537,10 @@ impl Fx {
     fn dispatch_first(&self, run_id: &str) -> Value {
         let dispatched = self.op("app_run_dispatch", json!({"run_id": run_id}));
         assert_eq!(dispatched["state"], "running", "{dispatched}");
-        assert_eq!(dispatched["steps"][0]["state"], "dispatched", "{dispatched}");
+        assert_eq!(
+            dispatched["steps"][0]["state"], "dispatched",
+            "{dispatched}"
+        );
         assert!(dispatched["steps"][0]["message_id"].is_string());
         dispatched
     }
@@ -604,7 +610,10 @@ fn transient_outage_survives_then_stale_binding_invalidates_with_reason() {
     let shown = fx.show(&run_id);
     assert_eq!(shown["steps"][0]["state"], "failed", "{shown}");
     let reason = step_reason(&shown, 0);
-    assert!(!reason.trim().is_empty(), "failed step carries no reason: {shown}");
+    assert!(
+        !reason.trim().is_empty(),
+        "failed step carries no reason: {shown}"
+    );
     assert!(
         reason.contains("binding"),
         "reason names the stale authority, got: {reason}"
@@ -638,7 +647,10 @@ fn outage_at_first_dispatch_still_dispatches() {
         dispatched["state"], "running",
         "a transient outage refused the dispatch: {dispatched}"
     );
-    assert_eq!(dispatched["steps"][0]["state"], "dispatched", "{dispatched}");
+    assert_eq!(
+        dispatched["steps"][0]["state"], "dispatched",
+        "{dispatched}"
+    );
     let shown = fx.show(&run_id);
     assert_eq!(
         shown["state"], "running",
@@ -736,16 +748,28 @@ fn agent_unproven_and_forged_fields_are_refused_and_write_nothing() {
     // asserted by the error AND by nothing changing below.
     for who in [Asserted::Agent("writer".into()), Asserted::Unproven] {
         for (method, params) in [
-            ("app_run_create", json!({"install_id": install, "workflow": "read",
+            (
+                "app_run_create",
+                json!({"install_id": install, "workflow": "read",
                 "inputs": {"handle":"probe","writer":"writer"},
-                "request_id":"forge-create", "owner_pm":"lead"})),
-            ("app_run_approve", json!({"run_id": run_id, "digest": "sha256:forged"})),
+                "request_id":"forge-create", "owner_pm":"lead"}),
+            ),
+            (
+                "app_run_approve",
+                json!({"run_id": run_id, "digest": "sha256:forged"}),
+            ),
             ("app_run_dispatch", json!({"run_id": run_id})),
             ("app_run_cancel", json!({"run_id": run_id})),
-            ("app_binding_revoke", json!({"install_id": install,
-                "binding_id": binding_id, "expected_revision": 1})),
-            ("app_binding_create", json!({"install_id": install, "slot": "source",
-                "connection_id": "forged-conn", "request_id": "forge-bind"})),
+            (
+                "app_binding_revoke",
+                json!({"install_id": install,
+                "binding_id": binding_id, "expected_revision": 1}),
+            ),
+            (
+                "app_binding_create",
+                json!({"install_id": install, "slot": "source",
+                "connection_id": "forged-conn", "request_id": "forge-bind"}),
+            ),
         ] {
             assert!(
                 fx.rpc(who.clone(), method, params.clone()).is_err(),
@@ -797,7 +821,10 @@ fn agent_unproven_and_forged_fields_are_refused_and_write_nothing() {
     );
     // No forged `forge-bind` binding row appeared.
     assert_eq!(
-        fx.binding_list(&install)["bindings"].as_array().unwrap().len(),
+        fx.binding_list(&install)["bindings"]
+            .as_array()
+            .unwrap()
+            .len(),
         bindings_before,
         "a refused call wrote a binding"
     );
@@ -875,7 +902,11 @@ fn stale_binding_revoked_while_queued_invalidates_with_reason() {
         json!({"install_id": install, "binding_id": binding_id,
             "expected_revision": 1}),
     );
-    fx.wait_state(&run_id, "failed", "revoked binding invalidates a queued run");
+    fx.wait_state(
+        &run_id,
+        "failed",
+        "revoked binding invalidates a queued run",
+    );
     let shown = fx.show(&run_id);
     assert_eq!(shown["steps"][0]["state"], "failed", "{shown}");
     let reason = step_reason(&shown, 0);
