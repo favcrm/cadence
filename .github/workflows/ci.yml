@@ -280,12 +280,21 @@ jobs:
       # CAD-1090: every cargo test target (scripts/result-test-args), with
       # the test seam on and a 0-test target treated as a failure.
       # CAD-1105: then the lib unit tests, with PATH cut to the toolchain.
-      - name: Run every integration test target and the lib suite
+      # CAD-1214: then the unit tests inside the binary targets.
+      - name: Run every integration test target, the lib suite and the binary unit tests
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         env:
           CARGO_BUILD_JOBS: 4
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
-        run: scripts/run-result-tests
+        run: |
+          # cadence-agent-exec protected_mechanics high-fd custody seats fd
+          # 70000 and fails closed unless the hard RLIMIT_NOFILE exceeds it.
+          # The hosted runner's hard limit is lower, so raise hard and soft for
+          # this shell (limits do not persist across steps) before the suite.
+          sudo prlimit --pid $$ --nofile=1048576:1048576
+          ulimit -n 1048576
+          echo "RLIMIT_NOFILE hard=$(ulimit -Hn) soft=$(ulimit -n)"
+          scripts/run-result-tests
 
   build:
     needs: [queue-evidence, change-scope]
