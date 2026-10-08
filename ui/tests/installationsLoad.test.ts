@@ -4,7 +4,7 @@ export {};
  * backoff; any other failure surfaces at once; abort stops the retries.
  */
 import { ApiError } from "../src/lib/api";
-import { BUSY_BACKOFF_MS, isBusyError, loadWithBackoff } from "../src/features/workspace-apps/installationsLoad";
+import { BUSY_BACKOFF_MS, isBusyError, loadFailureMessage, loadWithBackoff } from "../src/features/workspace-apps/installationsLoad";
 
 function equal(actual: unknown, expected: unknown, why: string): void {
   const a = JSON.stringify(actual);
@@ -47,6 +47,15 @@ async function main() {
     await loadWithBackoff(async () => { calls += 1; throw busy(); }, { signal: c.signal, sleep: async () => c.abort() });
   } catch (e) { thrown = e; }
   equal([calls, thrown !== null], [1, true], "abort stops retrying");
+  const down = new ApiError("down", 503, { code: "daemon_unavailable" });
+  equal(isBusyError(down), false, "daemon_unavailable is not busy");
+  equal(isBusyError(new ApiError("x", 503)), false, "a bare 503 is not busy");
+  equal(loadFailureMessage(down).startsWith("Daemon unreachable"), true, "daemon_unavailable reads as unreachable");
+  calls = 0;
+  try {
+    await loadWithBackoff(async () => { calls += 1; throw down; }, { signal: new AbortController().signal, sleep: noWait });
+  } catch { /* expected */ }
+  equal(calls, 1, "daemon_unavailable is not retried");
   console.log("installations load checks passed");
 }
 void main();

@@ -592,7 +592,9 @@ export default function App() {
   }, []);
   // Loading, error and ready stay separate: a failed refresh keeps the last
   // good list and says so; a busy daemon is retried before it does.
-  const installations = useInstallations(true, route.screen);
+  // Only the operator may read the list; member and agent sessions would get a
+  // 403 and a permanent notice, so they do not ask.
+  const installations = useInstallations(meta?.operator === true, route.screen);
   const installed: VerifiedApp[] = useMemo(
     () => (installations.list ?? []).map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
     [installations.list],
