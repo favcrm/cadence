@@ -70,7 +70,9 @@
   top: 0;
   bottom: 0;
   left: 0;
-  width: min(22rem, 88dvw);
+  right: 0;
+  /* Full screen on narrow widths, as the mockup's `.chat.open`. */
+  width: auto;
   z-index: 50;
   background: var(--color-ink-900);
   border-right: 1px solid var(--color-ink-700);
@@ -1268,4 +1270,12 @@ p.sfield-hint {
   color: var(--color-ink-100);
   font-size: var(--text-label);
   padding: 0 0.5rem;
+}
+
+/* The Home history link would push the Assistant chat button onto a second
+   line on a phone; the desktop header keeps it. */
+@media (max-width: 1023px) {
+  .app-shell-home-link {
+    display: none;
+  }
 }

@@ -198,8 +198,10 @@ const thread = {
 };
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
 const posts: { path: string; body: any }[] = [];
+const reads: string[] = [];
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const path = String(input);
+  reads.push(path);
   if (init?.method === "POST") {
     posts.push({ path, body: JSON.parse(String(init.body)) });
     return json({ ok: true });
@@ -956,6 +958,10 @@ const appsLinks = (hostEl: HTMLElement) =>
   ambiguous.remove();
 }
 
+// The assistant activity panel never asks before it has a context (an empty
+// context ID is a 400 on every poll).
+assert(reads.some((p) => p.includes("/assistant/")), "the assistant panel did read with a context");
+assert(!reads.some((p) => /\/assistant\/[a-z]+\?context_id=(&|$)/.test(p)), "no assistant read is sent with an empty context");
 console.log("app shell checks passed");
 }
 void main();

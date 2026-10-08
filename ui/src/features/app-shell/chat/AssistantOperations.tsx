@@ -238,10 +238,24 @@ interface AssistantData {
   operations: Operation[];
   permissions: Permission[];
   error: string | null;
+  /** The app's assistant descriptor is not consented yet: a calm, permanent-until-approved state. */
+  consent: boolean;
 }
 function emptyData(scopeKey: string): AssistantData {
-  return { scopeKey, actions: [], operations: [], permissions: [], error: null };
+  return { scopeKey, actions: [], operations: [], permissions: [], error: null, consent: false };
 }
+
+/** How a failed read settles. `none`: the app declares no assistant actions
+ *  (a valid, permanent state — no panel, no more polling). `consent`: the
+ *  descriptor awaits approval (calm notice, polling continues so approval
+ *  shows up). `error`: a real failure — the error with Retry. */
+export type ReadOutcome = "none" | "consent" | "error";
+export function readFailure(e: unknown): ReadOutcome {
+  if (e instanceof ApiError && e.status === 404) return "none";
+  if (e instanceof ApiError && e.status === 409 && /not consented/i.test(e.message)) return "consent";
+  return "error";
+}
+export const keepsPolling = (outcome: ReadOutcome | null): boolean => outcome !== "none";
 
 /** Routine refresh cadence, counted from the end of the previous read. */
 const POLL_MS = 8_000;
@@ -277,6 +291,8 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
     // Bumped by every confirmed write; a read that began earlier is stale.
     let epoch = 0;
     let timer: number | null = null;
+    // The last read's outcome: `none` ends polling for this scope.
+    let outcome: ReadOutcome | null = null;
     const stopTimer = () => {
       if (timer !== null) window.clearTimeout(timer);
       timer = null;
@@ -308,12 +324,17 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
           operations: operationResponse.operations.map((row) => parseOperation(record(row)?.operation ?? row)).filter((v): v is Operation => v !== null),
           permissions: permissionResponse.permissions.map((row) => parsePermission(record(row)?.permission ?? row)).filter((v): v is Permission => v !== null),
           error: null,
+          consent: false,
         });
+        outcome = null;
       } catch (e) {
         if (!alive) return;
         if (epoch !== startedAt) { requeue = true; return; }
-        if (e instanceof ApiError && e.status === 404) {
+        outcome = readFailure(e);
+        if (outcome === "none") {
           setData(emptyData(scopeKey));
+        } else if (outcome === "consent") {
+          setData({ ...emptyData(scopeKey), consent: true });
         } else {
           setData((previous) => ({
             ...(previous.scopeKey === scopeKey ? previous : emptyData(scopeKey)),
@@ -326,7 +347,7 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
     const schedule = () => {
       stopTimer();
       // Hidden tabs do not poll; the visibility listener resumes the reads.
-      if (document.hidden) return;
+      if (document.hidden || !keepsPolling(outcome)) return;
       timer = window.setTimeout(() => {
         timer = null;
         if (alive && !document.hidden) void poll();
@@ -364,6 +385,8 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
     };
 
     const handle: Poller = { alive: () => alive, written, refresh: poll };
+    // No context yet: nothing to ask for (an empty context ID is a 400).
+    if (contextId === "") return;
     poller.current = handle;
     document.addEventListener("visibilitychange", onVisibility);
     void poll();
@@ -400,7 +423,7 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
     runWrite(`block:${permission.id}`, () => api.assistantBlock(installId, contextId, { action_id: permission.action_id, resource_id: permission.resource_id }),
       "The action could not be blocked. Reload and try again.");
 
-  if (!visible.actions.length && !visible.operations.length && !visible.permissions.length && !visible.error) return null;
+  if (!visible.actions.length && !visible.operations.length && !visible.permissions.length && !visible.error && !visible.consent) return null;
   return (
     <section className="app-assistant-activity" aria-label="Assistant activity">
       <div className="app-assistant-section-head">
@@ -409,6 +432,7 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
           {expanded ? "Hide permissions and actions" : "Actions & permissions"}
         </button>
       </div>
+      {visible.consent && <p className="text-micro text-ink-400" role="status">Approve the app to enable assistant actions.</p>}
       {visible.error && <p className="text-micro text-fail" role="alert">{visible.error} <button className="lnk" type="button" onClick={() => void poller.current?.refresh()}>Retry</button></p>}
       {visible.operations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} busy={busy === operation.id || !canDecide} decide={decide} />)}
       {expanded && (
