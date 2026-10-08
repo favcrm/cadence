@@ -39,6 +39,8 @@ mod cad1184_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1184_revision_acceptance;
 #[cfg(test)]
+mod cad1210_acceptance;
+#[cfg(test)]
 mod cad1212_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
@@ -3839,9 +3841,35 @@ fn is_task_terminal(state: &str) -> bool {
 /// Pulled out of [`Shared::pm_dir`] so `Shared::new_leased` can name it
 /// before the `Arc` exists.
 fn pm_dir_of(provider_env: &ProviderEnv) -> Result<PathBuf> {
+    pm_dir_of_with(provider_env, crate::home::guard_tracker)
+}
+
+/// [`pm_dir_of`] with the CAD-1210 test guard injected, so a unit test
+/// can pass a fake real home without touching process env.
+fn pm_dir_of_with(
+    provider_env: &ProviderEnv,
+    guard: impl FnOnce(PathBuf) -> Result<PathBuf>,
+) -> Result<PathBuf> {
     match provider_env.var("CADENCE_PM_DIR") {
-        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
+        Some(dir) if !dir.is_empty() => guard(PathBuf::from(dir)),
         _ => crate::issue::default_dir(),
+    }
+}
+
+#[cfg(test)]
+mod cad1210_pm_dir_guard {
+    use super::*;
+
+    #[test]
+    fn pm_dir_of_refuses_the_real_tracker_not_a_temp_one() {
+        let fake = PathBuf::from("/tmp/c1210-fakehome");
+        let guard = |d| crate::home::guard_tracker_in(d, Some(&fake));
+        let env = ProviderEnv::default();
+        env.set("CADENCE_PM_DIR", fake.join("pm").to_str().unwrap());
+        let err = pm_dir_of_with(&env, guard).unwrap_err().to_string();
+        assert!(err.contains("CAD-1210"), "{err}");
+        env.set("CADENCE_PM_DIR", fake.join("elsewhere").to_str().unwrap());
+        assert!(pm_dir_of_with(&env, guard).is_ok());
     }
 }
 

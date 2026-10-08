@@ -106,9 +106,9 @@ pub fn home() -> Result<PathBuf> {
 /// `<home>/tracker` under the new layout, else `~/pm`.
 pub fn tracker_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CADENCE_PM_DIR") {
-        return Ok(PathBuf::from(dir));
+        return test_guard(PathBuf::from(dir), ".", "pm");
     }
-    tracker_default()
+    test_guard(tracker_default()?, ".", "pm")
 }
 
 /// `tracker_dir` with `CADENCE_PM_DIR` unset — the production
@@ -127,9 +127,9 @@ pub fn tracker_default() -> Result<PathBuf> {
 /// the new layout, else the legacy default.
 pub fn state_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("CADENCE_STATE_DIR") {
-        return Ok(PathBuf::from(dir));
+        return test_guard(PathBuf::from(dir), ".local/state", "cadence");
     }
-    state_default()
+    test_guard(state_default()?, ".local/state", "cadence")
 }
 
 /// `state_dir` with `CADENCE_STATE_DIR` unset — the production
@@ -232,4 +232,146 @@ fn legacy_state_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(dir).join("cadence"));
     }
     local_state_dir()
+}
+
+/// CAD-1210: a test process must never reach the invoking user's real
+/// tracker (`~/pm`) or state dir (`~/.local/state/cadence`). Armed
+/// only under `cfg(test)` and the `test-seam` feature (integration
+/// targets build the lib without `cfg(test)`); a release build is a
+/// no-op. Allowlist-shaped: only those two production roots refuse.
+#[cfg(not(any(test, feature = "test-seam")))]
+fn test_guard(dir: PathBuf, _rel: &str, _leaf: &str) -> Result<PathBuf> {
+    Ok(dir)
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+fn test_guard(dir: PathBuf, rel: &str, leaf: &str) -> Result<PathBuf> {
+    test_guard_in(dir, real_home().as_deref(), rel, leaf)
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+fn test_guard_in(dir: PathBuf, real: Option<&Path>, rel: &str, leaf: &str) -> Result<PathBuf> {
+    match real {
+        Some(real) => {
+            let mut root = real.to_path_buf();
+            if rel != "." {
+                root.push(rel);
+            }
+            refuse_under(dir, &root.join(leaf))
+        }
+        None => Ok(dir),
+    }
+}
+
+/// The same refusal for a tracker path that did not come through
+/// [`tracker_dir`] (a daemon's `provider_env`, the CLI's env read).
+pub fn guard_tracker(dir: PathBuf) -> Result<PathBuf> {
+    test_guard(dir, ".", "pm")
+}
+
+/// [`guard_tracker`] with the real home passed in (pure; for tests).
+#[cfg(test)]
+pub(crate) fn guard_tracker_in(dir: PathBuf, real: Option<&Path>) -> Result<PathBuf> {
+    test_guard_in(dir, real, ".", "pm")
+}
+
+/// `p` made absolute-comparable: `..`/`.` folded lexically, then the
+/// longest existing ancestor canonicalised (symlinks resolved) and the
+/// not-yet-existing tail re-appended.
+#[cfg(any(test, feature = "test-seam"))]
+fn resolve_for_compare(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut lex = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                lex.pop();
+            }
+            Component::CurDir => {}
+            c => lex.push(c.as_os_str()),
+        }
+    }
+    let mut tail = Vec::new();
+    let mut base = lex.clone();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&base) {
+            return tail.iter().rev().fold(real, |acc, t| acc.join(t));
+        }
+        match (base.file_name().map(|n| n.to_os_string()), base.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                base = parent.to_path_buf();
+            }
+            _ => return lex,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+fn refuse_under(dir: PathBuf, root: &Path) -> Result<PathBuf> {
+    let root = resolve_for_compare(root);
+    if resolve_for_compare(&dir).starts_with(&root) {
+        return Err(Error::rejected(format!(
+            "refusing to resolve {}: a test process must not touch the real {} \
+             (CAD-1210); point CADENCE_PM_DIR/CADENCE_STATE_DIR at a temp dir",
+            dir.display(),
+            root.display()
+        )));
+    }
+    Ok(dir)
+}
+
+/// The invoking user's home from the passwd database (never `$HOME`,
+/// which tests isolate). `CADENCE_TEST_REAL_HOME` substitutes a fake
+/// stand-in; it is read only in these test builds.
+#[cfg(any(test, feature = "test-seam"))]
+fn real_home() -> Option<PathBuf> {
+    if let Some(h) = std::env::var_os("CADENCE_TEST_REAL_HOME") {
+        return Some(PathBuf::from(h));
+    }
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: getpwuid returns null or a pointer to a static passwd
+    // record whose pw_dir is a NUL-terminated string; copied at once.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr((*pw).pw_dir);
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn production_roots_refuse_and_other_dirs_pass() {
+        let fake = PathBuf::from("/tmp/c1210-fakehome");
+        let pm = fake.join("pm");
+        let st = fake.join(".local/state/cadence");
+        let err = refuse_under(pm.join("sub"), &pm).unwrap_err().to_string();
+        assert!(err.contains("CAD-1210"), "{err}");
+        assert!(refuse_under(st.clone(), &st).is_err());
+        assert!(refuse_under(fake.join("pm-other"), &pm).is_ok());
+        assert!(refuse_under(fake.join("tmp-state"), &st).is_ok());
+    }
+
+    #[test]
+    fn symlinked_and_dotdot_paths_to_the_root_refuse() {
+        let base = std::env::temp_dir().join(format!("c1210-sl-{}", std::process::id()));
+        let pm = base.join("fakehome/pm");
+        std::fs::create_dir_all(&pm).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&pm, &link).unwrap();
+        // symlink to the root with a tail that does not exist yet
+        assert!(refuse_under(link.join("newsub/deeper"), &pm).is_err());
+        // `..` through a missing dir, back into the root
+        let dd = base.join("nope/../fakehome/pm/x");
+        assert!(refuse_under(dd, &pm).is_err());
+        // a sibling that merely shares a prefix still passes
+        assert!(refuse_under(base.join("fakehome/pm-other/x"), &pm).is_ok());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 }

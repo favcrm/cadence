@@ -151,7 +151,9 @@ pub(crate) fn run() -> Result<i32> {
     let resolved = org::resolve(
         cli.org.as_deref(),
         cli.state_dir.clone(),
-        std::env::var_os("CADENCE_PM_DIR").map(PathBuf::from),
+        std::env::var_os("CADENCE_PM_DIR")
+            .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
+            .transpose()?,
     )?;
     let state_dir = match resolved {
         org::Resolved::Local(state_dir) => state_dir,
