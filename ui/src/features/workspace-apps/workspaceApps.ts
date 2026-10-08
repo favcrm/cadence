@@ -231,8 +231,8 @@ export interface CatalogCard {
   version: string; tagline?: string; digest?: string; trust: "cadence" | "unreviewed";
   state?: "available" | "installed" | "off" | "requested" | "removed";
   install_id?: string; requested_by_me?: boolean; request_count?: number;
-  update_available?: boolean; featured?: string[];
-  /** Git check's pinned source (`url@commit` for installSource). */
+  update_available?: boolean; featured?: boolean;
+  /** Git check's resolved repository and commit. */
   source_url?: string; commit?: string; dir?: string;
   listing?: Listing;
   access?: { icon: string; title: string; sentence: string; chip?: unknown; note?: string }[];
@@ -256,8 +256,23 @@ export interface HomeInstallation {
   };
 }
 
+/** The pinned apps as the board uses them: install ids in pin order, and
+ * the same ids by most recently opened. */
 export interface FavoritesPayload {
   favorites: string[]; workspace_default: string[]; recent: string[];
+}
+
+/** `app_favorites_get` / `app_favorites_put` as the daemon sends them. */
+interface DaemonFavorites {
+  owner?: string; is_default?: boolean;
+  favorites?: { install_id: string; position?: number; opened_at?: number | null }[];
+}
+
+function favoritesFromDaemon(raw: DaemonFavorites): FavoritesPayload {
+  const rows = [...(raw.favorites ?? [])].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+  const recent = rows.filter((r) => typeof r.opened_at === "number")
+    .sort((a, b) => (b.opened_at as number) - (a.opened_at as number)).map((r) => r.install_id);
+  return { favorites: rows.map((r) => r.install_id), workspace_default: [], recent };
 }
 
 /** `listing:` v1 (CAD-1129) — the OS-store card text. */
@@ -296,7 +311,7 @@ export const appExplorer = {
   catalog: (signal?: AbortSignal) => request<{ catalog: CatalogCard[] }>("/api/app-catalog", signal),
   entry: (id: string, signal?: AbortSignal) => request<CatalogCard>(`/api/app-catalog/${part(id)}`, signal),
   home: (signal?: AbortSignal) => request<{ installations: HomeInstallation[] }>("/api/app-home", signal),
-  favorites: (signal?: AbortSignal) => request<FavoritesPayload>("/api/app-favorites", signal),
+  favorites: async (signal?: AbortSignal) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites", signal)),
   requests: (signal?: AbortSignal) => request<{ requests: InstallRequest[] }>("/api/app-requests", signal),
   /** CAD-1194: the read-only install proposal. `source` is a path, a Git
    * URL or `builtin:<catalog id>`; the returned `digest` is the pin every
@@ -310,8 +325,8 @@ export const appExplorer = {
   installSource: (source: string, expectedDigest: string) =>
     request<Installation>("/api/app-installations", undefined, { source, expected_digest: expectedDigest }),
   gitCheck: (url: string) => request<CatalogCard>("/api/app-catalog/git-check", undefined, { url }),
-  putFavorites: (installIds: string[]) => request<FavoritesPayload>("/api/app-favorites", undefined, { install_ids: installIds }),
-  putFavoritesDefault: (installIds: string[]) => request<FavoritesPayload>("/api/app-favorites/default", undefined, { install_ids: installIds }),
+  putFavorites: async (installIds: string[]) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites", undefined, { install_ids: installIds })),
+  putFavoritesDefault: async (installIds: string[]) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites/default", undefined, { install_ids: installIds })),
   opened: (installId: string) => request<unknown>("/api/app-favorites/opened", undefined, { install_id: installId }),
   requestInstall: (catalogId: string) => request<InstallRequest>("/api/app-catalog/request", undefined, { catalog_id: catalogId }),
   dismissRequest: (id: string) => request<unknown>("/api/app-requests/dismiss", undefined, { id }),

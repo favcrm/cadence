@@ -825,7 +825,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     // CAD-1129: a member's public session the board opens for
     // `member_as` re-proof — the compact bearer is the credential,
     // same class as `board_session_check`.
-    ("board_session_member", Rule::Bearer),
+    ("board_session_member", Rule::Handler("operator_connection (CAD-1129)")),
     (
         "operator_sessions",
         Rule::Handler("operator_with_secret: operator proof AND the operator secret (CAD-313)"),

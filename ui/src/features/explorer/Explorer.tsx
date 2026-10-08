@@ -5,7 +5,11 @@ import { appExplorer, type CatalogCard, type InstallRequest } from "../workspace
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip, InstallStateChip } from "./shared";
 import InstallCheckPanel from "./InstallCheckPanel";
+import { navigate } from "../../lib/useLocation";
 import "./explorer.css";
+
+/** A card opens its detail page through the router. */
+const openDetail = (id: string) => navigate(`/apps/catalog/${encodeURIComponent(id)}`);
 
 /**
  * The Apps Explorer (CAD-1129, `/apps/explore`): the catalog the host
@@ -59,7 +63,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
     });
   }, [catalog, q, cat]);
 
-  const featured = useMemo(() => catalog?.filter((c) => c.featured && c.featured.length > 0) ?? [], [catalog]);
+  const featured = useMemo(() => catalog?.filter((c) => c.featured) ?? [], [catalog]);
 
   // Every install starts with a check (CAD-1194): the panel shows what
   // the built-in would install and installs the checked digest.
@@ -167,8 +171,8 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
               <div className="feat grid gap-3 md:grid-cols-2">
                 {featured.map((c) => (
                   <div key={c.id} className="card fcard p-4 cursor-pointer" role="button" tabIndex={0}
-                    onClick={() => (window.location.hash = `#/apps/catalog/${c.id}`)}
-                    onKeyDown={(e) => e.key === "Enter" && (window.location.hash = `#/apps/catalog/${c.id}`)}>
+                    onClick={() => openDetail(c.id)}
+                    onKeyDown={(e) => e.key === "Enter" && openDetail(c.id)}>
                     <span className="why text-micro text-ink-500">Popular with shops like yours</span>
                     <div className="flex items-center gap-3 mt-1">
                       <AppGlyph name={c.name} icon={c.listing?.icon} size="sm" />
@@ -216,8 +220,8 @@ function CatalogCardView({ card, isOp, busy, onInstall, onRequest }: {
 }) {
   return (
     <div className="card ccard p-4 flex flex-col gap-2" role="button" tabIndex={0}
-      onClick={() => (window.location.hash = `#/apps/catalog/${card.id}`)}
-      onKeyDown={(e) => e.key === "Enter" && (window.location.hash = `#/apps/catalog/${card.id}`)}>
+      onClick={() => openDetail(card.id)}
+      onKeyDown={(e) => e.key === "Enter" && openDetail(card.id)}>
       <div className="flex items-start gap-3">
         <AppGlyph name={card.name} icon={card.listing?.icon} />
         <div className="min-w-0">

@@ -3436,7 +3436,7 @@ impl Shared {
             "operator_session_check" => self.rpc_operator_session_check(params),
             "board_session_open" => self.rpc_board_session_open(params, peer_pid),
             "board_session_check" => self.rpc_board_session_check(params),
-            "board_session_member" => self.rpc_board_session_member(params),
+            "board_session_member" => self.rpc_board_session_member(params, peer_pid),
             "operator_session_logout" => self.rpc_operator_session_logout(params),
             "operator_session_stolen" => self.rpc_operator_session_stolen(params),
             "device_login_config" => self.rpc_device_login_config(),

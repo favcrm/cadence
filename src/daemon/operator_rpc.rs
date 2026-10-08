@@ -521,7 +521,12 @@ impl Shared {
     /// `member_as` claim names a live public member session
     /// (CAD-1129). The bearer-caller board relays this so `member_as`
     /// never rides an unchecked string; the answer is yes/no only.
-    pub(super) fn rpc_board_session_member(&self, params: &Value) -> Result<Value> {
+    ///
+    /// The method carries no credential of its own, so it answers only
+    /// the operator's own connection: an agent or detached caller could
+    /// otherwise enumerate who is signed in to the board.
+    pub(super) fn rpc_board_session_member(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("board member session check", params, peer_pid)?;
         let handle = required_str(params, "handle")?;
         let now = self.operator_now();
         let member = self.operator_auth().check_member(handle, now)?;

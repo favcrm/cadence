@@ -572,7 +572,11 @@ impl Shared {
         // link-local and private hosts — `app_source::SelectedGitSource`
         // re-checks the URL shape; this layer rejects the network cases.
         check_git_url_public(url)?;
-        let commit = resolve_git_commit(url, git_ref)?;
+        vet_resolved_host(url)?;
+        // A network-class failure never echoes git's stderr (it names
+        // the internal service certificate or address that answered).
+        let commit = resolve_git_commit(url, git_ref)
+            .map_err(|_| Error::rejected("the repository or ref could not be read"))?;
         let selected = crate::issue::app_source::SelectedGitSource::new(url, &commit, dir)?;
         let bundle = crate::issue::app_source::resolve(&selected)?;
         let app_md = bundle
@@ -648,36 +652,117 @@ fn member_claim(params: &Value) -> Result<Option<String>> {
     }
 }
 
-/// The public-URL gate for the Git check: https only, no credentials,
-/// no `?`/`#`, no IP literals and no loopback/link-local/private hosts.
-/// `app_source::SelectedGitSource::check_url` re-proves the shape; this
-/// layer adds the network-class refusals the check needs.
+/// The public-URL gate for the Git check, an allowlist: `https://`, no
+/// credentials, query, fragment, escape or port, and a host that is a
+/// registered-shaped DNS name — lowercase letters, digits and hyphens in
+/// 1..=63-byte labels, at least two labels, no empty label (so no trailing
+/// dot), and a final label of letters only. That last rule is what makes
+/// every numeric spelling of an address (decimal, hex, octal, short
+/// dotted) a refusal: no such spelling ends in a letters-only label. Local
+/// and private suffixes are refused by name. The text of every refusal is
+/// fixed and echoes nothing the caller sent or the network said.
+/// `app_source::SelectedGitSource::check_url` re-proves the shape; the
+/// resolution check in [`vet_resolved_host`] is the network-class half.
 fn check_git_url_public(url: &str) -> Result<()> {
+    const REFUSED: &str = "git check refuses this URL; name a public https repository";
     let rest = url
         .strip_prefix("https://")
         .ok_or_else(|| Error::rejected("git check admits https:// URLs only"))?;
-    if rest.contains('?') || rest.contains('#') || rest.contains('@') || rest.contains('%') {
-        return Err(Error::rejected(
-            "git check refuses credential, query or fragment URLs",
-        ));
-    }
     let authority = rest.split('/').next().unwrap_or_default();
-    let host = authority.split(':').next().unwrap_or_default();
-    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
-        return Err(Error::rejected("git check refuses a local or empty host"));
-    }
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Err(Error::rejected(
-            "git check refuses IP-literal hosts — name a public repository",
-        ));
-    }
-    if !host
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+    if authority.is_empty()
+        || authority
+            .bytes()
+            .any(|b| !(b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-')))
     {
-        return Err(Error::rejected("git check host is not a valid DNS name"));
+        return Err(Error::rejected(REFUSED));
+    }
+    // Anything else in the URL that is not a plain path is refused.
+    if rest.contains(['?', '#', '@', '%', '\\']) {
+        return Err(Error::rejected(REFUSED));
+    }
+    let labels: Vec<&str> = authority.split('.').collect();
+    let tld = labels.last().copied().unwrap_or_default();
+    let label_ok =
+        |l: &&str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-');
+    if labels.len() < 2
+        || !labels.iter().all(label_ok)
+        || tld.len() < 2
+        || !tld.bytes().all(|b| b.is_ascii_lowercase())
+        || matches!(
+            tld,
+            "localhost"
+                | "local"
+                | "localdomain"
+                | "internal"
+                | "lan"
+                | "home"
+                | "arpa"
+                | "corp"
+                | "intranet"
+                | "private"
+        )
+    {
+        return Err(Error::rejected(REFUSED));
     }
     Ok(())
+}
+
+/// Resolve the vetted host now and refuse any non-public address, so a
+/// public-looking name that points inside is refused before git runs.
+/// This narrows but cannot close DNS rebinding (git resolves again when
+/// it connects); the check is operator-only and read-only, and the
+/// install itself is pinned by the digest the operator reviews.
+fn vet_resolved_host(url: &str) -> Result<()> {
+    use std::net::ToSocketAddrs;
+    let host = url
+        .strip_prefix("https://")
+        .and_then(|r| r.split('/').next())
+        .unwrap_or_default();
+    let addrs: Vec<_> = (host, 443u16)
+        .to_socket_addrs()
+        .map_err(|_| Error::rejected("the repository host could not be resolved"))?
+        .collect();
+    if addrs.is_empty() || addrs.iter().any(|a| !public_ip(a.ip())) {
+        return Err(Error::rejected(
+            "git check refuses this URL; name a public https repository",
+        ));
+    }
+    Ok(())
+}
+
+/// Globally routable unicast only: not loopback, private, link-local,
+/// CGNAT, documentation, benchmarking, multicast, reserved or unspecified.
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            !(v.is_unspecified()
+                || v.is_loopback()
+                || v.is_private()
+                || v.is_link_local()
+                || v.is_broadcast()
+                || v.is_multicast()
+                || v.is_documentation()
+                || o[0] == 0
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                || (o[0] == 198 && (18..=19).contains(&o[1]))
+                || o[0] >= 240)
+        }
+        IpAddr::V6(v) => {
+            if let Some(v4) = v.to_ipv4_mapped() {
+                return public_ip(IpAddr::V4(v4));
+            }
+            let s = v.segments();
+            !(v.is_unspecified()
+                || v.is_loopback()
+                || v.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] == 0x0064 && s[1] == 0xff9b))
+        }
+    }
 }
 
 /// Resolve `ref` to a 40-hex commit through `git ls-remote` — the one

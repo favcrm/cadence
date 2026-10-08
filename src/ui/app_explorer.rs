@@ -25,13 +25,20 @@ use std::path::Path;
 
 const BODY_CAP: u64 = 48 * 1024;
 
-/// The `member_as` claim this request's caller carries — only a named
-/// member's session supplies one; the operator's and an agent's are
-/// `None`, so those callers get full rows.
-fn member_as(caller: &operator::Caller) -> Option<String> {
+/// The explorer's allowlist of callers: the operator (full rows) or a
+/// named member's session (member rows, `member_as` re-proved by the
+/// daemon). An agent peer is neither — the board relays over its own
+/// operator connection, so relaying an agent would act as the operator.
+/// Refused with 403 on every explorer route, read or write.
+fn principal(caller: &operator::Caller) -> Result<Option<String>, HttpResp> {
     match caller {
-        operator::Caller::Named(named) if !named.operator => Some(named.author.clone()),
-        _ => None,
+        operator::Caller::Operator(_) => Ok(None),
+        operator::Caller::Named(named) if named.operator => Ok(None),
+        operator::Caller::Named(named) => Ok(Some(named.author.clone())),
+        operator::Caller::Agent(_) => Err(err_response(
+            403,
+            "the apps explorer is for the operator and signed-in members; agents use the CLI",
+        )),
     }
 }
 
@@ -66,7 +73,10 @@ pub(super) fn read(
         Ok(c) => c,
         Err(resp) => return resp,
     };
-    let member = member_as(&caller);
+    let member = match principal(&caller) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
     if path == "/api/app-catalog" {
         return relay(state_dir, "app_catalog_list", json!({}), member.as_deref());
     }
@@ -88,13 +98,12 @@ pub(super) fn read(
         return relay(state_dir, "app_favorites_get", json!({}), member.as_deref());
     }
     if path == "/api/app-requests" {
-        // The operator's Needs-you list — operator-only at the caller.
-        return relay(
-            state_dir,
-            "app_install_requests_list",
-            json!({}),
-            member.as_deref(),
-        );
+        // The operator's Needs-you list: a member's session is refused
+        // here, not relayed as the operator.
+        if member.is_some() {
+            return err_response(403, "install requests are the operator's list");
+        }
+        return relay(state_dir, "app_install_requests_list", json!({}), None);
     }
     let _ = query;
     err_response(404, "no such app explorer route")
@@ -112,7 +121,13 @@ pub(super) fn write(
     if *method != Method::Post {
         return err_response(405, "method not allowed");
     }
-    let member = caller.and_then(member_as);
+    // No admitted caller, or an agent, never reaches a relay: the
+    // member verbs below would otherwise run as the operator.
+    let member = match caller.map(principal) {
+        Some(Ok(m)) => m,
+        Some(Err(resp)) => return resp,
+        None => return err_response(401, "an operator or member session is required"),
+    };
     match path {
         // The operator-only writes relay over the board's own connection.
         "/api/app-catalog/install" => body_rpc(

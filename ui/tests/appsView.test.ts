@@ -159,7 +159,7 @@ globalThis.fetch = async (input, init) => {
       ],
     });
   if (url.pathname === "/api/app-favorites")
-    return json({ favorites: [], workspace_default: [], recent: [] });
+    return json({ owner: "operator", is_default: false, favorites: [] });
   if (url.pathname === "/api/app-requests") return json({ requests: [] });
   throw new Error(`Unexpected request ${url.pathname}`);
 };
