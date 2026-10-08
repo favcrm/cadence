@@ -316,6 +316,10 @@ mod registration_acceptance;
 #[path = "native_task_budget_acceptance.rs"]
 mod budget_acceptance;
 
+#[cfg(test)]
+#[path = "native_task_terminal_acceptance.rs"]
+mod terminal_acceptance;
+
 fn emit(
     control: &UnixDatagram,
     task: &str,
