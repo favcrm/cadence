@@ -1108,7 +1108,8 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
     if serde_yaml::to_value(&reread).map_err(|e| Error::internal(e.to_string()))?
         != serde_yaml::to_value(&record).map_err(|e| Error::internal(e.to_string()))?
     {
-        return Err(Error::rejected(
+        return Err(Error::invalid(
+            super::RECORD_CHANGED,
             "installation record changed during inspection",
         ));
     }
@@ -1195,19 +1196,22 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
 const READ_ATTEMPTS: u32 = 3;
 
 fn is_pending(error: &Error) -> bool {
-    matches!(error, Error::Rejected(m) if m.contains(" is pending"))
+    matches!(
+        error.code(),
+        Some(super::PENDING_UPGRADE | super::PENDING_INSTALL | super::PENDING_PUBLICATION)
+    )
 }
 
 fn changed_underneath(error: &Error) -> bool {
-    match error {
-        Error::Rejected(m) => {
-            m.contains("no longer published")
-                || m.contains("changed during inspection")
-                || m.contains("changed during runtime admission")
-                || m.contains("legacy app files changed during read")
-        }
-        _ => false,
-    }
+    matches!(
+        error.code(),
+        Some(
+            super::CATALOG_NOT_CURRENT
+                | super::RECORD_CHANGED
+                | super::ADMISSION_CHANGED
+                | super::LEGACY_CHANGED
+        )
+    )
 }
 
 fn optimistic<T>(pm: &Pm, mut read: impl FnMut() -> Result<T>) -> Result<T> {
@@ -1254,11 +1258,19 @@ fn read_catalog<T>(pm: &Pm, mut read: impl FnMut() -> Result<T>) -> Result<T> {
                 let _lock = pm.lock()?;
                 return read();
             }
-            _ => return Err(Error::rejected("legacy app files changed during read")),
+            _ => {
+                return Err(Error::invalid(
+                    super::LEGACY_CHANGED,
+                    "legacy app files changed during read",
+                ))
+            }
         };
         let result = read();
         if pm.legacy_generation() != Some(before) {
-            return Err(Error::rejected("legacy app files changed during read"));
+            return Err(Error::invalid(
+                super::LEGACY_CHANGED,
+                "legacy app files changed during read",
+            ));
         }
         result
     })
@@ -1379,11 +1391,45 @@ pub(crate) fn with_runtime_snapshot<T>(
     let (bundle, _) = catalog.installations[&id].paths(&id);
     let files = snapshot(&root, &bundle, false)?;
     if bundle_digest(&files) != description["digest"].as_str().unwrap_or("") {
-        return Err(Error::rejected(
+        return Err(Error::invalid(
+            super::ADMISSION_CHANGED,
             "installation changed during runtime admission",
         ));
     }
     callback(&description, &files)
+}
+
+/// CAD-1212: test seam for `with_runtime_read`. A check installs a hook that
+/// runs after `describe` and before the bundle `snapshot` (once per retry
+/// attempt), so it can modify a bundle file at exactly the point the digest
+/// compare guards. Compiled to nothing outside `cfg(test)`.
+pub(crate) mod read_seam {
+    #[cfg(test)]
+    use std::cell::RefCell;
+
+    #[cfg(test)]
+    type Hook = Box<dyn FnMut()>;
+
+    #[cfg(test)]
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    #[inline]
+    pub(super) fn between_describe_and_snapshot() {
+        #[cfg(test)]
+        HOOK.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f();
+            }
+        });
+    }
+
+    /// Install (or clear) the callback for this thread.
+    #[cfg(test)]
+    pub(crate) fn set_hook(hook: Option<Hook>) {
+        HOOK.with(|h| *h.borrow_mut() = hook);
+    }
 }
 
 /// CAD-1189: lock-free runtime read for callbacks that write nothing. It
@@ -1403,6 +1449,7 @@ pub(crate) fn with_runtime_read<T>(
         let catalog = Catalog::load(&pm.dir)?;
         no_pending(&root)?;
         let description = describe(&root, &catalog, &id)?;
+        read_seam::between_describe_and_snapshot();
         // CAD-1129 H5: the lock-free read funnel refuses a soft-removed
         // install exactly like `with_runtime_snapshot`.
         if description["removed"].as_i64().is_some() {
@@ -1413,7 +1460,8 @@ pub(crate) fn with_runtime_read<T>(
         let (bundle, _) = catalog.installations[&id].paths(&id);
         let files = snapshot(&root, &bundle, false)?;
         if bundle_digest(&files) != description["digest"].as_str().unwrap_or("") {
-            return Err(Error::rejected(
+            return Err(Error::invalid(
+                super::ADMISSION_CHANGED,
                 "installation changed during runtime admission",
             ));
         }
@@ -1866,6 +1914,72 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         let seen = with_runtime_read(&other, &id, |row, _| Ok(row["digest"].clone())).unwrap();
         assert_eq!(seen, json!(digest));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// CAD-1212: the seam fires between `describe` and the bundle
+    /// `snapshot`; a bundle edit there trips the digest compare, so the
+    /// read ends `busy` after its retries and the callback never runs.
+    #[test]
+    fn runtime_read_refuses_a_bundle_edited_after_describe() {
+        let (pm_dir, _state, _sources, id) = installed();
+        let pm = Pm::at(pm_dir.path()).unwrap();
+        let app_md = pm_dir.path().join(".apps").join(&id).join("app.md");
+        let app_md = if app_md.exists() {
+            app_md
+        } else {
+            walk_find(pm_dir.path(), "app.md").expect("installed app.md")
+        };
+        let hits = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = hits.clone();
+        read_seam::set_hook(Some(Box::new(move || {
+            seen.set(seen.get() + 1);
+            let mut text = std::fs::read_to_string(&app_md).unwrap();
+            text.push_str(&format!("\nedit {}\n", seen.get()));
+            std::fs::write(&app_md, text).unwrap();
+        })));
+        let ran = std::cell::Cell::new(false);
+        let err = with_runtime_read(&pm, &id, |_, _| {
+            ran.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+        read_seam::set_hook(None);
+        assert_eq!(err.code(), Some("resource_busy"), "{err:?}");
+        assert!(err.to_string().contains("runtime admission"), "{err}");
+        assert_eq!(hits.get(), READ_ATTEMPTS, "one hook call per attempt");
+        assert!(!ran.get(), "callback ran on a torn read");
+    }
+
+    fn walk_find(dir: &Path, name: &str) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == ".git") {
+                    continue;
+                }
+                if let Some(found) = walk_find(&path, name) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|n| n == name) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// CAD-1212: the retry classifier matches codes, not message text.
+    #[test]
+    fn retry_classifier_matches_codes_not_text() {
+        let reworded = Error::invalid(super::super::PENDING_UPGRADE, "totally different words");
+        assert!(is_pending(&reworded));
+        assert!(!is_pending(&Error::rejected(
+            "workspace upgrade is pending; use app catalog upgrade-recover"
+        )));
+        let changed = Error::invalid(super::super::ADMISSION_CHANGED, "reworded");
+        assert!(changed_underneath(&changed));
+        assert!(!changed_underneath(&Error::rejected(
+            "installation changed during runtime admission"
+        )));
     }
 
     /// A crashed leftover journal (no live writer) keeps the recovery

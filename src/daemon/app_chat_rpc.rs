@@ -64,7 +64,7 @@ impl Shared {
             Ok(None) => Ok(json!({"found": false})),
             // An unknown or removed install, a changed bundle and a bad
             // descriptor file are all "no descriptor" to the board.
-            Err(Error::Rejected(_)) => Ok(json!({"found": false})),
+            Err(e) if e.kind() == "rejected" => Ok(json!({"found": false})),
             Err(e) => Err(e),
         }
     }
