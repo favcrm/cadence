@@ -67,6 +67,8 @@ function statusLine(parts: Source[], noteCount: number): { text: string; warn: b
     if (parts.some((p) => p.failed && !p.loaded)) return { text: "Some recent updates could not be loaded.", warn: true, retry: true };
     return { text: noteCount > 0 ? "Refresh failed; showing earlier updates." : "Refresh failed.", warn: true, retry: true };
   }
+  // A refresh of notes already on screen says so; earlier notes stay visible.
+  if (parts.some((p) => p.pending && p.loaded)) return { text: noteCount > 0 ? "Showing earlier updates while refreshing…" : "Refreshing recent updates…", warn: false, retry: false };
   if (parts.every((p) => p.loaded)) return noteCount === 0 ? { text: "No recent progress notes.", warn: false, retry: false } : null;
   return { text: noteCount === 0 ? "Reading recent updates…" : "Reading more updates…", warn: false, retry: false };
 }

@@ -285,13 +285,20 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
     const readOnce = async (): Promise<void> => {
       const startedAt = epoch;
       try {
-        const [actionResponse, operationResponse, permissionResponse] = await Promise.all([
+        // Wait for every sibling to settle: a failed read must not release the batch while others are in flight.
+        const [actions, operations, permissions] = await Promise.allSettled([
           api.assistantActions(installId, contextId),
           api.assistantOperations(installId, contextId),
           api.assistantPermissions(installId, contextId),
         ]);
         if (!alive) return;
         if (epoch !== startedAt) { requeue = true; return; }
+        if (actions.status === "rejected") throw actions.reason;
+        if (operations.status === "rejected") throw operations.reason;
+        if (permissions.status === "rejected") throw permissions.reason;
+        const actionResponse = actions.value;
+        const operationResponse = operations.value;
+        const permissionResponse = permissions.value;
         if (!Array.isArray(actionResponse.actions) || !Array.isArray(operationResponse.operations) || !Array.isArray(permissionResponse.permissions)) {
           throw new Error("The assistant service returned an invalid response.");
         }
