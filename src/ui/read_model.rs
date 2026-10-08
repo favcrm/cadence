@@ -53,6 +53,8 @@ const WATCH_EVERY: Duration = Duration::from_secs(1);
 /// this age a read joins or starts a fetch instead, so an unreachable
 /// watcher cannot leave reads on data from long ago.
 const DAEMON_MAX_STALE: Duration = Duration::from_secs(120);
+/// A served snapshot this old reports `stale: true` beside its age.
+const SNAPSHOT_STALE: Duration = Duration::from_secs(10);
 /// An overview this young is served without a rebuild; an older one is
 /// served while a background pass refreshes it.
 const OVERVIEW_FRESH: Duration = Duration::from_secs(2);
@@ -467,6 +469,9 @@ pub(super) struct BoardRead {
     pub by_issue: Value,
     /// CAD-405 gate approvals, read with the daemon snapshot.
     pub approvals: Arc<work::Approvals>,
+    /// Age, staleness and refresh error of the daemon snapshot behind
+    /// this read — the same keys `/api/agents` and the stream carry.
+    pub freshness: Value,
     pm_dir: PathBuf,
 }
 
@@ -514,6 +519,8 @@ struct DaemonSlot {
     /// The fetch in flight. Callers that need a snapshot join it while it
     /// started after the last change mark.
     building: Option<Arc<Build>>,
+    /// The last fetch failed (and left `kept` alone, or had nothing kept).
+    refresh_failed: bool,
 }
 
 /// One daemon fetch shared by its callers. Ends `Done` with the snapshot,
@@ -600,6 +607,9 @@ pub(super) struct DaemonSnap {
     /// `None` when `agent_list` failed.
     agents_fp: Option<u64>,
     approvals: Arc<work::Approvals>,
+    /// `agent_list` or `job_list` failed: the agents are an "unreachable"
+    /// stand-in, never served in place of a good snapshot.
+    failed: bool,
 }
 
 /// Fields of an `agent_list` row (and of the board's agent row) that the
@@ -672,6 +682,7 @@ fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
             approvals.join().unwrap_or_default(),
         )
     });
+    let failed = list.is_none() || jobs.is_none();
     let agents = agents_payload_from(state_dir, list.clone(), jobs.as_ref());
     let agents_fp =
         list.map(|l| value_fp(&json!([rows_fp(&l["agents"]), rows_fp(&agents["agents"])])));
@@ -686,6 +697,7 @@ fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
         agents,
         agents_fp,
         approvals: Arc::new(approvals),
+        failed,
     }
 }
 
@@ -727,6 +739,11 @@ struct Watch {
     rows: HashMap<String, u64>,
     projects: Option<u64>,
     overview: Option<u64>,
+    /// Fetch start of the newest snapshot published: an older one is never
+    /// published after it.
+    at: Option<Instant>,
+    /// The refresh-error state last published.
+    refresh_error: bool,
 }
 
 /// A heartbeat the stream loop drops: a failed send is how the watcher
@@ -871,7 +888,12 @@ impl Model {
     fn daemon_snap(&self) -> Arc<DaemonSnap> {
         let watched = lock(&self.hub).running;
         let kept = lock(&self.daemon).kept.clone();
-        if let Some(snap) = kept.filter(|snap| watched && snap.at.elapsed() < DAEMON_MAX_STALE) {
+        if let Some(snap) = kept.filter(|snap| {
+            watched
+                && !snap.failed
+                && snap.at.elapsed() < DAEMON_MAX_STALE
+                && self.after_change(snap.at)
+        }) {
             return snap;
         }
         self.fetch_shared()
@@ -911,8 +933,7 @@ impl Model {
             // fetcher stamped: the change marks compare against that start.
             let mut fetched = (self.fetch)(&self.state_dir);
             fetched.at = build.started;
-            let snap = Arc::new(fetched);
-            {
+            let snap = {
                 let mut slot = lock(&self.daemon);
                 if slot
                     .building
@@ -921,31 +942,67 @@ impl Model {
                 {
                     slot.building = None;
                 }
-                self.keep_in(&mut slot, snap.clone());
-            }
+                self.keep_in(&mut slot, Arc::new(fetched))
+            };
             build.end(Outcome::Done(snap.clone()));
             guard.done = true;
             return snap;
         }
     }
 
-    /// Keep `snap` now (a stream baseline fetched outside the shared fetch).
-    fn keep_snap(&self, snap: Arc<DaemonSnap>) {
-        self.keep_in(&mut lock(&self.daemon), snap);
-    }
-
     /// Keep `snap` unless a newer one is kept or it started before the
-    /// last change mark (a fetch racing a write may predate the write).
-    /// The mark is read under the slot lock: [`Self::invalidate`] marks
-    /// first and clears the slot after, so either this keep sees the mark
-    /// or the clear lands after it.
-    fn keep_in(&self, slot: &mut DaemonSlot, snap: Arc<DaemonSnap>) {
+    /// last change mark (a fetch racing a write may predate the write),
+    /// and return what the fetch's callers are served. The mark is read
+    /// under the slot lock: [`Self::invalidate`] marks first and clears
+    /// the slot after, so either this keep sees the mark or the clear
+    /// lands after it. A failed fetch is never kept and never replaces the
+    /// last good snapshot: that is served instead, with the failure
+    /// reported by [`Self::freshness`]; with none kept, the failed
+    /// snapshot answers its callers alone.
+    fn keep_in(&self, slot: &mut DaemonSlot, snap: Arc<DaemonSnap>) -> Arc<DaemonSnap> {
         if !self.after_change(snap.at) {
-            return;
+            return snap;
+        }
+        slot.refresh_failed = snap.failed;
+        if snap.failed {
+            return slot.kept.clone().unwrap_or(snap);
         }
         if slot.kept.as_ref().is_none_or(|old| old.at <= snap.at) {
-            slot.kept = Some(snap);
+            slot.kept = Some(snap.clone());
         }
+        snap
+    }
+
+    /// The snapshot the stream watcher publishes from: one fetched after
+    /// the last change mark (a build a write overtook is fetched again,
+    /// never published) and not older than `after`, the newest snapshot
+    /// already published. `None` when a write keeps overtaking the fetch.
+    /// A failed snapshot (no good one to fall back on) comes back as is:
+    /// the watcher publishes tracker changes from it, never daemon ones.
+    fn fetch_current(&self, after: Option<Instant>) -> Option<Arc<DaemonSnap>> {
+        for _ in 0..3 {
+            let snap = self.fetch_shared();
+            if !self.after_change(snap.at) {
+                continue;
+            }
+            if after.is_some_and(|at| snap.at < at) {
+                return None;
+            }
+            return Some(snap);
+        }
+        None
+    }
+
+    /// Age, staleness and refresh error of `snap` as it is served, beside
+    /// an HTTP payload or a stream frame.
+    fn freshness(&self, snap: &DaemonSnap) -> Value {
+        let error = snap.failed || lock(&self.daemon).refresh_failed;
+        let age = snap.at.elapsed();
+        json!({
+            "snapshot_age_secs": age.as_secs_f64(),
+            "stale": error || age >= SNAPSHOT_STALE,
+            "refresh_error": error,
+        })
     }
 
     /// Was something read at `at` read after the last change mark?
@@ -984,6 +1041,7 @@ impl Model {
             revs: t.revs(),
             by_issue: snap.agents["by_issue"].clone(),
             approvals: snap.approvals.clone(),
+            freshness: self.freshness(snap),
             pm_dir: pm.dir.clone(),
         }
     }
@@ -996,13 +1054,13 @@ impl Model {
         self.board_with(pm, project, &snap)
     }
 
-    /// `/api/agents`.
-    /// `snapshot_age_secs` is the served snapshot's age since its fetch
-    /// started: the data is at least that old.
+    /// `/api/agents`, with the snapshot's [`Self::freshness`] keys:
+    /// `snapshot_age_secs` is its age since its fetch started (the data is
+    /// at least that old).
     pub(super) fn agents(&self) -> Value {
         let snap = self.daemon_snap();
         let mut agents = snap.agents.clone();
-        agents["snapshot_age_secs"] = json!(snap.at.elapsed().as_secs_f64());
+        merge_freshness(&mut agents, self.freshness(&snap));
         agents
     }
 
@@ -1257,8 +1315,12 @@ impl Model {
             !std::mem::replace(&mut hub.running, true)
         };
         if start {
-            let snap = Arc::new((self.fetch)(&self.state_dir));
-            self.keep_snap(snap.clone());
+            // A panic before the watcher spawns must not leave `running` set.
+            let _reset = self.reset_hub_on_panic();
+            // The baseline joins the shared fetch like every other reader.
+            let snap = self
+                .fetch_current(None)
+                .unwrap_or_else(|| self.fetch_shared());
             let (cards, plans) = self.entities(&snap);
             let (projects, overview) = self.aggregate_fps();
             let base = Watch {
@@ -1272,6 +1334,8 @@ impl Model {
                 rows: fps(&agent_rows(&snap)),
                 projects,
                 overview,
+                at: Some(snap.at),
+                refresh_error: snap.failed,
             };
             let me = self.clone();
             std::thread::spawn(move || me.watch(base));
@@ -1315,18 +1379,23 @@ impl Model {
         (cards, plans)
     }
 
-    fn watch(self: Arc<Self>, mut w: Watch) {
-        // A panicking watcher must not leave `running` set — no stream
-        // would ever start another. Dropping the senders ends the
-        // streams; clients reconnect and start a fresh watcher.
+    /// A panicking watcher (or a start that panics before the watcher
+    /// runs) must not leave `running` set — no stream would ever start
+    /// another. Dropping the senders ends the streams; clients reconnect
+    /// and start a fresh watcher.
+    fn reset_hub_on_panic(self: &Arc<Self>) -> OnDrop<impl FnMut()> {
         let me = self.clone();
-        let _reset = OnDrop(move || {
+        OnDrop(move || {
             if std::thread::panicking() {
                 let mut hub = lock(&me.hub);
                 hub.running = false;
                 hub.subs.clear();
             }
-        });
+        })
+    }
+
+    fn watch(self: Arc<Self>, mut w: Watch) {
+        let _reset = self.reset_hub_on_panic();
         loop {
             std::thread::sleep(WATCH_EVERY);
             {
@@ -1357,6 +1426,14 @@ impl Model {
         // The change mark: whatever was read before this tick began may
         // predate the change it finds.
         let started = Instant::now();
+        // Fetched before the watcher's state moves: with nothing current to
+        // publish the tick leaves it as it was and the next one retries.
+        let Some(snap) = self.fetch_current(w.at) else {
+            return;
+        };
+        if !snap.failed {
+            w.at = Some(snap.at);
+        }
         let scanned = board::collection_parses();
         let tracker = dir_mtime(&self.pm_dir);
         let issues = tracker != w.tracker;
@@ -1372,13 +1449,12 @@ impl Model {
                 frames.push(legacy_frame("issues"));
             }
         }
-        let snap = self.fetch_shared();
-        let jobs = snap.jobs_fp != w.jobs;
+        let jobs = !snap.failed && snap.jobs_fp != w.jobs;
         if jobs {
             w.jobs = snap.jobs_fp;
             frames.push(legacy_frame("jobs"));
         }
-        let agents = snap.agents_fp != w.agents;
+        let agents = !snap.failed && snap.agents_fp != w.agents;
         if agents {
             w.agents = snap.agents_fp;
             frames.push(legacy_frame("agents"));
@@ -1396,15 +1472,16 @@ impl Model {
             w.cards = fps(&cards);
             w.plans = fps(&plans);
         }
-        if jobs || agents {
+        let refresh_error = self.freshness(&snap)["refresh_error"] == json!(true);
+        if !snap.failed && (jobs || agents || refresh_error != w.refresh_error) {
+            w.refresh_error = refresh_error;
             // Bindings and totals can move without an agent row moving.
-            frames.push(frame(
-                "agent_meta",
-                &json!({
-                    "daemon": snap.agents["daemon"], "totals": snap.agents["totals"],
-                    "by_issue": snap.agents["by_issue"]
-                }),
-            ));
+            let mut meta = json!({
+                "daemon": snap.agents["daemon"], "totals": snap.agents["totals"],
+                "by_issue": snap.agents["by_issue"]
+            });
+            merge_freshness(&mut meta, self.freshness(&snap));
+            frames.push(frame("agent_meta", &meta));
             let rows = agent_rows(&snap);
             diff_frames("agent", &w.rows, &rows, frames);
             w.rows = fps(&rows);
@@ -1425,6 +1502,13 @@ impl Model {
         if scanned > 0 {
             self.collection_parses.fetch_add(scanned, Ordering::Relaxed);
         }
+    }
+}
+
+/// Adds the keys of the freshness object `fresh` to the JSON object `into`.
+pub(super) fn merge_freshness(into: &mut Value, fresh: Value) {
+    if let (Some(into), Value::Object(fresh)) = (into.as_object_mut(), fresh) {
+        into.extend(fresh);
     }
 }
 
@@ -1475,6 +1559,8 @@ mod tests {
             rows: HashMap::new(),
             projects: None,
             overview: None,
+            at: None,
+            refresh_error: false,
         };
         let mut frames = Vec::new();
         model.tick(&mut watch, &mut frames);
@@ -1505,6 +1591,16 @@ mod tests {
         delay: impl Fn(u64) -> Duration + Send + Sync + 'static,
         panic_on: Option<u64>,
     ) -> (Arc<Model>, Arc<AtomicU64>) {
+        fake_daemon_failing(delay, panic_on, |_| false)
+    }
+
+    /// [`fake_daemon`] whose fetch number `n` reports a failed refresh when
+    /// `fails(n)`. Every snapshot carries `n` as its job and agent fingerprint.
+    fn fake_daemon_failing(
+        delay: impl Fn(u64) -> Duration + Send + Sync + 'static,
+        panic_on: Option<u64>,
+        fails: impl Fn(u64) -> bool + Send + Sync + 'static,
+    ) -> (Arc<Model>, Arc<AtomicU64>) {
         let calls = Arc::new(AtomicU64::new(0));
         let seen = calls.clone();
         let fetch: Fetch = Box::new(move |_| {
@@ -1516,10 +1612,11 @@ mod tests {
             DaemonSnap {
                 at: Instant::now(),
                 outcomes: Default::default(),
-                jobs_fp: None,
+                jobs_fp: Some(n),
                 agents: json!({"daemon": "reachable", "agents": [], "v": n}),
-                agents_fp: None,
+                agents_fp: Some(n),
                 approvals: Arc::new(Default::default()),
+                failed: fails(n),
             }
         });
         (
@@ -1616,6 +1713,128 @@ mod tests {
             "the late older fetch must not be kept"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn blank_watch() -> Watch {
+        Watch {
+            tracker: None,
+            delivery: 0,
+            jobs: None,
+            agents: None,
+            monitoring: None,
+            cards: HashMap::new(),
+            plans: HashMap::new(),
+            rows: HashMap::new(),
+            projects: None,
+            overview: None,
+            at: None,
+            refresh_error: false,
+        }
+    }
+
+    #[test]
+    fn the_first_stream_subscriber_joins_the_shared_fetch() {
+        let (model, calls) = fake_daemon(|_| Duration::from_millis(400), None);
+        let reader = {
+            let m = model.clone();
+            std::thread::spawn(move || m.agents()["v"].clone())
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let _rx = model.subscribe();
+        assert_eq!(reader.join().unwrap(), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the stream baseline must not build a second snapshot"
+        );
+        assert_eq!(model.stats()["daemon_joins"], 1);
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_last_good_snapshot_and_says_so() {
+        let (model, calls) = fake_daemon_failing(|_| Duration::ZERO, None, |n| n == 2);
+        lock(&model.hub).running = true;
+        let good = model.agents();
+        assert_eq!(good["v"], 1);
+        assert_eq!(good["refresh_error"], false);
+        let failed = model.fetch_shared();
+        assert_eq!(failed.agents["v"], 1, "the failed fetch replaced last-good");
+        let served = model.agents();
+        assert_eq!(served["v"], 1);
+        assert_eq!(served["refresh_error"], true);
+        assert_eq!(served["stale"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // The next good fetch clears the error.
+        assert_eq!(model.fetch_shared().agents["v"], 3);
+        assert_eq!(model.agents()["refresh_error"], false);
+    }
+
+    #[test]
+    fn the_watcher_publishes_nothing_for_a_failed_refresh() {
+        let (model, _) = fake_daemon_failing(|_| Duration::ZERO, None, |n| n == 2);
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        assert_eq!(watch.agents, Some(1));
+        // A write drops last-good; the next fetch fails with nothing to
+        // fall back on, so the stream keeps what it published.
+        model.invalidate();
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        assert_eq!(watch.agents, Some(1), "published an unreachable stand-in");
+        assert!(
+            frames.iter().all(|f| !f.starts_with("event: agent")),
+            "{frames:?}"
+        );
+        model.tick(&mut watch, &mut frames);
+        assert_eq!(watch.agents, Some(3));
+    }
+
+    #[test]
+    fn the_watcher_never_publishes_a_build_a_write_overtook() {
+        // Fetch 1 (the watcher's) is slow; a write lands while it runs and
+        // a post-write read builds fetch 2 and keeps it. Fetch 1 ends
+        // afterwards: the cache refuses it, and the watcher must not
+        // publish it after the newer view.
+        let (model, calls) = fake_daemon(
+            |n| {
+                if n == 1 {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::ZERO
+                }
+            },
+            None,
+        );
+        let ticking = {
+            let m = model.clone();
+            std::thread::spawn(move || {
+                let mut watch = blank_watch();
+                let mut frames = Vec::new();
+                m.tick(&mut watch, &mut frames);
+                (watch.agents, watch.at)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        model.invalidate();
+        let post_write = model.agents();
+        assert_eq!(post_write["v"], 2);
+        let (published, _) = ticking.join().unwrap();
+        assert_ne!(published, Some(1), "published the pre-write build");
+        assert_eq!(published, Some(3), "the watcher fetches a current view");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_tick_skips_a_snapshot_older_than_the_one_it_published() {
+        let (model, _) = fake_daemon(|_| Duration::ZERO, None);
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        let published = watch.agents;
+        watch.at = Some(Instant::now() + Duration::from_secs(60));
+        model.tick(&mut watch, &mut frames);
+        assert_eq!(watch.agents, published, "an older snapshot was published");
     }
 
     #[test]

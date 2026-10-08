@@ -1260,17 +1260,16 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // CAD-405: each card carries its `work` block.
                 let by_id = read.by_id();
                 let ctx = read.ctx(&by_id);
-                send(
-                    request,
-                    json_response(json!({
-                        "issues": read
-                            .views
-                            .iter()
-                            .filter(|v| slice.matches(v))
-                            .map(|v| read.card(&ctx, v))
-                            .collect::<Vec<_>>(),
-                    })),
-                );
+                let mut body = json!({
+                    "issues": read
+                        .views
+                        .iter()
+                        .filter(|v| slice.matches(v))
+                        .map(|v| read.card(&ctx, v))
+                        .collect::<Vec<_>>(),
+                });
+                read_model::merge_freshness(&mut body, read.freshness.clone());
+                send(request, json_response(body));
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
