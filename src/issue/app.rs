@@ -98,9 +98,9 @@ pub(crate) const MAX_SCREEN_ASSET_BYTES: u64 = 384 * 1024;
 /// The per-file cap for bundle member `rel`: [`MAX_SCREEN_ASSET_BYTES`] for a
 /// screen JS/CSS leaf, else [`MAX_FILE_BYTES`].
 pub(crate) fn file_cap(rel: &str) -> u64 {
-    let screen_leaf = rel.strip_prefix("screens/").is_some_and(|r| {
-        r.split('/').count() == 2 && (r.ends_with(".js") || r.ends_with(".css"))
-    });
+    let screen_leaf = rel
+        .strip_prefix("screens/")
+        .is_some_and(|r| r.split('/').count() == 2 && (r.ends_with(".js") || r.ends_with(".css")));
     if screen_leaf {
         MAX_SCREEN_ASSET_BYTES
     } else {
