@@ -323,20 +323,34 @@ fn cad1196_finish_enumeration_on_a_normal_host() {
         return;
     }
 
-    // 1. A clean lane finishes for this (non-root) operator.
+    // 1. A clean lane. The kernel behaviour the ticket covers is an EMPTY
+    // `2/ns/pid` link for a non-root reader (Linux 7.0 on this host): there
+    // the lane must finish. Kernels that answer EACCES instead (the CI
+    // runner) cannot be proven complete and must still fail closed, with
+    // that reason, and leave the lane untouched.
+    let pid2_link_is_empty = matches!(
+        fs::read_link("/proc/2/ns/pid"),
+        Ok(target) if target.as_os_str().is_empty()
+    );
     let clean = Fixture::new();
     let (id, lane, branch) = clean.merged_lane();
     let out = clean.finish(&id, &lane, false);
-    assert!(
-        out.status.success(),
-        "clean lane must finish: {}",
-        text(&out)
-    );
-    assert!(!lane.exists(), "clean lane was not removed");
-    assert!(
-        git(&clean.home, &clean.repo, &["branch", "--list", &branch]).is_empty(),
-        "branch not removed"
-    );
+    if pid2_link_is_empty {
+        assert!(
+            out.status.success(),
+            "clean lane must finish: {}",
+            text(&out)
+        );
+        assert!(!lane.exists(), "clean lane was not removed");
+        assert!(
+            git(&clean.home, &clean.repo, &["branch", "--list", &branch]).is_empty(),
+            "branch not removed"
+        );
+    } else {
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(text(&out).contains("2/ns/pid"), "{}", text(&out));
+        assert!(lane.is_dir(), "fail-closed refusal removed the lane");
+    }
 
     // 2. Own-uid process with its cwd inside refuses.
     let cwd_case = Fixture::new();
@@ -377,13 +391,15 @@ fn cad1196_finish_enumeration_on_a_normal_host() {
     assert!(lane.is_dir(), "lane deleted despite fd holder");
     drop(fd_holder);
 
-    // Holders gone: the same lane now finishes, so the guard (not some
-    // unrelated condition) was the sole refusal above.
-    let out = fd_case.finish(&id, &lane, false);
-    assert!(
-        out.status.success(),
-        "lane must finish once released: {}",
-        text(&out)
-    );
+    // Holders gone: where the scan can complete, the same lane now finishes,
+    // so the guard (not some unrelated condition) was the sole refusal above.
+    if pid2_link_is_empty {
+        let out = fd_case.finish(&id, &lane, false);
+        assert!(
+            out.status.success(),
+            "lane must finish once released: {}",
+            text(&out)
+        );
+    }
     let _ = std::io::stdout().flush();
 }
