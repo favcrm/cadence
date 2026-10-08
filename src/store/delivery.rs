@@ -782,6 +782,24 @@ impl Store {
         ))
     }
 
+    /// CAD-1142: true when the alias fences on an app-owned
+    /// (`app_run_dispatch`) unknown — the fence's public text must be
+    /// the bounded class, never the operator-private provider account
+    /// `preferred_unknown_error` would restamp.
+    pub fn has_app_unknown(&self, alias: &str) -> Result<bool> {
+        self.read_tx(|conn| {
+            let count: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL} \
+                     AND source='app_run_dispatch'"
+                ),
+                [alias],
+                |r| r.get(0),
+            )?;
+            Ok(count > 0)
+        })
+    }
+
     /// True when the alias has an `unknown` in-flight attempt that must be
     /// reconciled before it may run again.
     pub fn has_unknown(&self, alias: &str) -> Result<bool> {

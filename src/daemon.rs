@@ -2545,7 +2545,15 @@ impl Shared {
         format_unknown_fence(&self.preserved_unknown_detail(alias, ""))
     }
 
+    /// CAD-1142: when the fencing unknown is app-owned its stored
+    /// account is operator-private (provider text, possibly carrying
+    /// credentials) — restamps of the public `agents.error` field
+    /// publish only the bounded app class. The raw detail still lives
+    /// on the message row, which `message read` gates to the operator.
     fn preserved_unknown_detail(&self, alias: &str, actor_error: &str) -> String {
+        if self.store.has_app_unknown(alias).unwrap_or(false) {
+            return store::app_runs::app_uncertain_turn_reason();
+        }
         if let Some(detail) = self.store.preferred_unknown_error(alias).ok().flatten() {
             let bounded = bound_unknown_detail(&detail);
             if !bounded.is_empty() && bounded != UNKNOWN_GENERIC_REASON {
@@ -2569,19 +2577,36 @@ impl Shared {
     /// fence the actor for review. `reason` is the provider's own account
     /// of the uncertainty (idle window, EOF, cap exceeded, …) — the
     /// operator needs it to reconcile.
+    ///
+    /// CAD-1142 reason privacy: for an app-owned turn (`app_run_dispatch`)
+    /// the provider's account may carry credentials or prose, so it is
+    /// never published on surfaces any `agent_events`/`agent_show` reader
+    /// can see — the public `attention` event and the agent row's `error`
+    /// carry the bounded Cadence-authored class instead. The raw account
+    /// stays on the message row, whose `message read` for an app source
+    /// already requires operator proof (`rpc_message_read`), so the
+    /// operator still reconciles from the full detail.
     fn unknown(&self, alias: &str, message: &Message, reason: &str) -> Result<()> {
         let stored = json!({"status": "unknown", "text": "", "error": reason});
         self.store
             .finish(message, "unknown", &stored, Some(reason))?;
         self.notify_routed_target(message, &stored);
+        let public_reason = if message.source == "app_run_dispatch" {
+            store::app_runs::app_uncertain_turn_reason()
+        } else {
+            reason.to_string()
+        };
         // One write: the fence is visible immediately, so the cleared
         // endpoint must land with it — a reader in between must never
         // see `attention` plus a live endpoint.
-        self.store
-            .set_state_detached(alias, "attention", Some(&format_unknown_fence(reason)))?;
+        self.store.set_state_detached(
+            alias,
+            "attention",
+            Some(&format_unknown_fence(&public_reason)),
+        )?;
         let _ = self
             .store
-            .event_public(alias, "attention", json!({"reason": reason}));
+            .event_public(alias, "attention", json!({"reason": public_reason}));
         self.wake();
         Err(Error::unknown(UNKNOWN_GENERIC_REASON))
     }
@@ -8765,6 +8790,158 @@ mod unknown_fence_guidance {
             interrupted.contains("`cadence job dispatch task-a` starts revision 2"),
             "{interrupted}"
         );
+    }
+}
+
+#[cfg(test)]
+mod app_unknown_fence_privacy {
+    use super::*;
+    use crate::store::NewAgent;
+
+    /// A worker whose `app_run_dispatch` message is running under a
+    /// turn token — the shape `run_actor` holds when the adapter's
+    /// uncertain-error path calls `Shared::unknown`.
+    fn app_worker(dir: &Path, shared: &Arc<Shared>, alias: &str, id: &str) -> Message {
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias,
+                provider: "fake",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: dir.to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared
+            .store
+            .enqueue(alias, "work", None, id, "app_run_dispatch")
+            .unwrap();
+        // `take_queued` would demand the full run/step admission proof;
+        // `unknown` only needs the row — a bare enqueue is the same
+        // `app_run_dispatch` message the actor fences on.
+        shared.store.message(id).unwrap().unwrap()
+    }
+
+    /// CAD-1142: the provider's raw uncertainty account never reaches
+    /// the public `attention` event or the agent row's `error` for an
+    /// app-owned turn — both carry the bounded class — while the
+    /// operator-private message row keeps the full detail.
+    #[test]
+    fn app_owned_unknown_publishes_class_keeps_raw_on_message_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Shared::new(dir.path(), &ServeOptions::default()).unwrap();
+        let message = app_worker(dir.path(), &shared, "w1", "app-m1");
+        let raw = "Pi native input cleanup was not confirmed: Authorization: Bearer s3cr3t";
+        let outcome = shared.unknown("w1", &message, raw);
+        assert!(outcome.is_err());
+
+        // Operator-private: the message row carries the provider's
+        // own account verbatim, so reconcile still sees it.
+        let stored = shared.store.message("app-m1").unwrap().unwrap();
+        assert_eq!(stored.state, "unknown");
+        assert_eq!(stored.error.as_deref(), Some(raw));
+        assert_eq!(stored.result.unwrap()["error"], raw);
+
+        // Public: the agent row's error is the bounded class, not prose.
+        let agent = shared.store.agent("w1").unwrap();
+        assert_eq!(agent.state, "attention");
+        let error = agent.error.unwrap();
+        assert!(
+            error.contains("worker turn outcome is uncertain"),
+            "{error}"
+        );
+        assert!(!error.contains("s3cr3t"), "{error}");
+        assert!(!error.contains("Authorization"), "{error}");
+
+        // Public: the attention event payload is the class too.
+        let events = shared.store.events("w1", 0, 100).unwrap();
+        let attention = events
+            .iter()
+            .find(|e| e.kind == "attention")
+            .expect("attention event");
+        let reason = attention.payload["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("worker turn outcome is uncertain"),
+            "{reason}"
+        );
+        assert!(!reason.contains("s3cr3t"), "{reason}");
+    }
+
+    /// A non-app turn keeps the provider's account on the public
+    /// surfaces — that detail is what the operator inspects and the
+    /// fence text must carry it.
+    #[test]
+    fn non_app_unknown_still_publishes_raw_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Shared::new(dir.path(), &ServeOptions::default()).unwrap();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "w2",
+                provider: "fake",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: dir.path().to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared
+            .store
+            .enqueue("w2", "work", None, "m-plain", "user")
+            .unwrap();
+        let Take::Message(_m) = shared.store.take_queued("w2").unwrap() else {
+            panic!("w2: queued message must be taken");
+        };
+        shared.store.mark_running("m-plain", "turn-1").unwrap();
+        let message = shared.store.message("m-plain").unwrap().unwrap();
+        let raw = "idle window exceeded with output pending";
+        let _ = shared.unknown("w2", &message, raw);
+
+        let agent = shared.store.agent("w2").unwrap();
+        assert!(agent.error.unwrap().contains(raw));
+        let events = shared.store.events("w2", 0, 100).unwrap();
+        let attention = events
+            .iter()
+            .find(|e| e.kind == "attention")
+            .expect("attention event");
+        assert_eq!(attention.payload["reason"].as_str().unwrap(), raw);
+    }
+
+    /// The restamp path (`preserved_unknown_detail` via actor exit,
+    /// relaunch-skip and `start_actor_locked`) must not republish the
+    /// app turn's operator-private account onto the public `agents.error`.
+    #[test]
+    fn app_owned_restamp_never_republishes_raw_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Shared::new(dir.path(), &ServeOptions::default()).unwrap();
+        let message = app_worker(dir.path(), &shared, "w3", "app-m3");
+        let raw = "Pi native input cleanup was not confirmed: Bearer s3cr3t";
+        let _ = shared.unknown("w3", &message, raw);
+
+        // A restamp — e.g. actor exit or relaunch — derives the fence
+        // text from the stored account. For an app-owned unknown it
+        // must yield the class, not the provider prose.
+        let detail = shared.preserved_unknown_detail("w3", "generic");
+        assert!(
+            detail.contains("worker turn outcome is uncertain"),
+            "{detail}"
+        );
+        assert!(!detail.contains("s3cr3t"), "{detail}");
+        let fence = shared.uncertain_fence_text("w3");
+        assert!(!fence.contains("s3cr3t"), "{fence}");
+
+        // The raw account is still on the operator-private row.
+        let stored = shared.store.message("app-m3").unwrap().unwrap();
+        assert_eq!(stored.error.as_deref(), Some(raw));
     }
 }
 

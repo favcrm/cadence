@@ -1662,7 +1662,7 @@ pub(super) fn app_reason_class(detail: &str) -> &'static str {
 /// terminal allowlist by `finish_in`/`reconcile`, so interpolating it
 /// is safe; `detail` names only whether the provider reported error
 /// prose at all, never the prose itself.
-fn app_worker_turn_reason(status: &str, detail: bool) -> String {
+pub(crate) fn app_worker_turn_reason(status: &str, detail: bool) -> String {
     match (status, detail) {
         ("failed", true) => "worker turn failed: provider error".to_string(),
         ("interrupted", _) => "worker turn was interrupted".to_string(),
@@ -1672,6 +1672,16 @@ fn app_worker_turn_reason(status: &str, detail: bool) -> String {
         (other, true) => format!("worker turn {other}: provider error"),
         (other, false) => format!("worker turn {other} without producing material"),
     }
+}
+
+/// CAD-1142 reason privacy: the bounded class an app-owned turn's
+/// uncertain-outcome fence publishes on the public surfaces — the
+/// worker's `attention` event and the agent row's `error`. The raw
+/// provider account stays on the operator-private message row (app
+/// mail inspection already requires operator proof); this class is
+/// the only text Unproven and Agent readers ever see.
+pub(crate) fn app_uncertain_turn_reason() -> String {
+    app_worker_turn_reason("unknown", true)
 }
 
 /// Pi sometimes surrounds its final material envelope with explanatory
