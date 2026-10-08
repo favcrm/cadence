@@ -1270,6 +1270,7 @@ pub fn ensure_install_id(pm: &Pm, project: &str, name: &str, actor: &str) -> Res
     }
     record.install_id = mint_install_id();
     let path = record_file(&pm.dir, project, name)?;
+    let _legacy = pm.begin_legacy_write()?;
     write_record(&path, &record)?;
     write::commit(
         pm,
@@ -1502,6 +1503,7 @@ pub fn install(
     let target = apps.join(&name);
     let record_path = apps.join(format!("{name}.yaml"));
     let _lock = pm.lock()?;
+    let _legacy = pm.begin_legacy_write()?;
     for path in [&target, &record_path] {
         match path.symlink_metadata() {
             Ok(m) if m.is_symlink() => {
@@ -1741,6 +1743,7 @@ pub fn update(
         bindings.remove(slot);
     }
     let _lock = pm.lock()?;
+    let _legacy = pm.begin_legacy_write()?;
     // Replace: the dir is our own verified layout — remove the files
     // the diff says are gone, then write the new set. A failure mid-way
     // leaves a partially-updated dir that fails digest — unusable until
@@ -2018,6 +2021,7 @@ pub fn remove(
     // folder delete. Approve takes this lock and then writes sqlite;
     // reading holders first lets that approve commit into the gap.
     let _lock = pm.lock()?;
+    let _legacy = pm.begin_legacy_write()?;
     let install_id = current_install_id(&pm.dir, project_key, name);
     revoke_derived_on_remove(project_key, name, &install_id, state_dir, actor)?;
     std::fs::remove_dir_all(&dir)?;
@@ -2104,6 +2108,7 @@ pub fn set(
             .insert(slot.to_string(), Some(conn.to_string()));
     }
     let _lock = pm.lock()?;
+    let _legacy = pm.begin_legacy_write()?;
     let record_path = record_file(&pm.dir, project_key, name)?;
     write_record(&record_path, &record)?;
     let foreign = write::commit(
@@ -2207,6 +2212,7 @@ pub fn set_team(
         record.team.insert(input.to_string(), agent.to_string());
     }
     let _lock = pm.lock()?;
+    let _legacy = pm.begin_legacy_write()?;
     let record_path = record_file(&pm.dir, project_key, name)?;
     write_record(&record_path, &record)?;
     let foreign = write::commit(
