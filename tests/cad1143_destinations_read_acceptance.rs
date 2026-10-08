@@ -609,20 +609,21 @@ fn destinations_read_refuses_non_operator_and_forged_fields_with_zero_upstream_r
 struct RegisteredCaller(Option<std::process::Child>);
 impl RegisteredCaller {
     fn new(fx: &Fx) -> Self {
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "destinations_read_refuses_non_operator_and_forged_fields_with_zero_upstream_reads",
-                "--nocapture",
-                "--test-threads",
-                "2",
-            ])
-            .env("ACC1143_REGISTERED_CHILD", fx.dir())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let child = cadence_agent::reaper::spawn(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "destinations_read_refuses_non_operator_and_forged_fields_with_zero_upstream_reads",
+                    "--nocapture",
+                    "--test-threads",
+                    "2",
+                ])
+                .env("ACC1143_REGISTERED_CHILD", fx.dir())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .unwrap();
         let owned = Self(Some(child));
         let pid = owned.0.as_ref().unwrap().id();
         let alias = "registered-destinations-reader";
