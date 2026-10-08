@@ -103,9 +103,7 @@ impl LocalWorkflow {
                 || meta.contains_key("reviewer")
                 || meta.contains_key("uses")
             {
-                return Err(Error::rejected(
-                    "local runs require explicit review steps and support one attempt; reviewer/tries directives are unsupported",
-                ));
+                return Err(Error::rejected("local runs require explicit review steps and support one attempt; reviewer/tries directives are unsupported"));
             }
             let kind = match meta.get("action").map(String::as_str) {
                 Some("local.text.produce") => "produce_text",
@@ -2281,9 +2279,7 @@ impl LocalWorkflow {
                 || fields.contains_key("reviewer")
                 || !supported
             {
-                return Err(Error::rejected(
-                    "local capability approval requires explicit supported action steps; uses, tries and implicit reviewer are unsupported",
-                ));
+                return Err(Error::rejected("local capability approval requires explicit supported action steps; uses, tries and implicit reviewer are unsupported"));
             }
         }
         Ok(())
@@ -2383,9 +2379,7 @@ impl Store {
                 .transpose()?
                 .unwrap_or(false)
         {
-            return Err(Error::rejected(
-                "local app runs authorize run-owned text artifacts only; account grants do not authorize app outward effects",
-            ));
+            return Err(Error::rejected("local app runs authorize run-owned text artifacts only; account grants do not authorize app outward effects"));
         }
         Ok(())
     }

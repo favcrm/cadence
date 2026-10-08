@@ -664,12 +664,12 @@ impl Store {
                         return Err(Error::rejected(format!(
                             "Approval id '{id}' was revoked — an approval id is never \
                                      reused; pass a new --id, or omit --id for a fresh default id"
-                        )));
+                        )))
                     }
                     (true, false, false) => {
                         return Err(Error::rejected(format!(
                             "Approval id '{id}' already names different evidence"
-                        )));
+                        )))
                     }
                     (false, _, _) => continue,
                 }

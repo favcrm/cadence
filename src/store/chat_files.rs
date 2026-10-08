@@ -1,18 +1,17 @@
 //! CAD-1168 slice 2: host-custodied chat attachments.
 //!
 //! A retained file the operator attaches to a `thread_send` message.
-//! Bytes live content-addressed under `<workspace>/.cadence/chat-files/<sha256>`
-//! for daemon writes; the legacy Store entry points retain their historical
-//! `<state>/chat-files/` behavior for existing callers and fixtures.
-//! this table is the metadata index — the daemon-minted `id` is the
+//! Bytes live content-addressed under `<workspace>/.cadence/chat-files/<sha256>`,
+//! opened and written only through directory descriptors (Linux; other
+//! platforms refuse the upload). This table is the metadata index — the daemon-minted `id` is the
 //! only handle any caller ever sees, so no path, name or hash is a
 //! reference the client supplies at read or send time.
 //!
 //! The caller's staging path is only a name under the server-owned
 //! `<state>/wiki-uploads/` directory: the source is read through that
 //! directory's own descriptor (never through the caller's alias), and
-//! the private custody stage is owned only once its exclusive create
-//! succeeded.
+//! the private custody stage is an anonymous `O_TMPFILE` inode that
+//! only this call can see.
 //!
 //! Scope rules:
 //! - upload is the operator's alone (the board route is OperatorOnly and
@@ -29,12 +28,12 @@
 //!   against `message_app` + `message_conversation`
 //!   (daemon/chat_files_rpc.rs); the operator path re-proves the stored
 //!   scope too, never bypassing it because the caller is the operator.
-//!   Legacy `home` rows are never relabeled as app rows, and a stored
-//!   label that is neither `home` nor a well-formed app scope refuses.
+//!   A `home` row is never relabeled as an app row, and a stored label
+//!   that is neither `home` nor a well-formed app scope refuses.
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
@@ -58,7 +57,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS chat_files_sha_scope
     ON chat_files(sha256, scope, context_id);
 ";
 
-/// Blob dir under the state dir: `<state>/chat-files/`.
+/// Custody leaf under `<workspace>/.cadence/`: `chat-files/`.
 pub const CHAT_FILES_DIR: &str = "chat-files";
 
 /// One file is at most 10 MiB (the mock's ceiling; the multipart
@@ -192,25 +191,17 @@ impl ChatFile {
     }
 
     /// The read projection of one row from the exact bytes whose size
-    /// and digest were verified against it: a non-text kind stays
-    /// metadata-only (the bytes are still verified, never fabricated
-    /// into text), a text kind returns bounded secret-scanned UTF-8
-    /// text. The caller passes the checked bytes; this helper never
+    /// and digest were verified against it: bounded secret-scanned UTF-8
+    /// text (only text kinds are ever retained). The caller passes the
+    /// checked bytes; this helper never
     /// opens a path, so a completed scope or capability proof is not
     /// undone by a second read.
     pub fn read_projection(&self, bytes: Vec<u8>) -> Result<Value> {
         if !text_kind(&self.mime) {
-            return Ok(json!({
-                "id": self.id,
-                "name": self.name,
-                "size": self.size,
-                "mime": self.mime,
-                "sha256": self.sha256,
-                "extractable": false,
-                "text": Value::Null,
-                "note": "this kind is metadata-only in v1 — no PDF, image or \
-                         OCR extraction runs on attachments",
-            }));
+            return Err(Error::rejected(format!(
+                "attachment '{}' is not a text attachment",
+                self.id
+            )));
         }
         let text = String::from_utf8(bytes)
             .map_err(|_| Error::rejected(format!("attachment '{}' is not UTF-8 text", self.id)))?;
@@ -237,33 +228,11 @@ impl ChatFile {
     }
 }
 
-/// A path this request itself created under its own custody staging,
-/// removed on every return path — success, refusal or unwind. The
-/// guard is constructed only after `create_new` succeeded, so it is
-/// proof this call owns the path: a pre-existing or colliding stage is
-/// never deleted or truncated. A caller-supplied source `tmp` is never
-/// wrapped — the store did not create it.
-struct StagedFile(PathBuf);
-
 /// Explicit storage authority passed by native callers. Grouping the two
 /// roots keeps daemon adapter signatures clear without hiding authority in a flag.
 pub struct ChatFileStorageRoots<'a> {
     pub state_dir: &'a Path,
     pub workspace_dir: &'a Path,
-}
-
-struct ChatFileUpload<'a> {
-    tmp: &'a Path,
-    name: &'a str,
-    scope: &'a str,
-    context_id: &'a str,
-    uploader: &'a str,
-}
-
-impl Drop for StagedFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
 }
 
 /// The daemon-minted id grammar — `chf-` + 32 lowercase hex. Checked at
@@ -377,15 +346,15 @@ impl Store {
     /// read, and a symlink/FIFO/device leaf is refused. The
     /// store never deletes the caller's source `tmp` — it does not
     /// create it and cannot prove it owns it; the caller (the board
-    /// route, or a direct RPC caller) owns that cleanup. The store
-    /// owns only its private custody stage, and only after the
-    /// exclusive create that minted it.
+    /// route, or a direct RPC caller) owns that cleanup.
     ///
     /// The source is read with a bounded no-follow/nonblocking open
     /// (at most [`CHAT_FILE_MAX_BYTES`] + 1 bytes), the exact bytes
-    /// read are written to private staging, and only those bytes are
-    /// published — the checked bytes are the published bytes. The
-    /// digest, kind, UTF-8 and secret checks run before publication.
+    /// read are written to an anonymous custody stage, and only those
+    /// bytes are published — the checked bytes are the published bytes.
+    /// The digest, kind, UTF-8 and secret checks run before publication.
+    /// Retained bytes are workspace custody only; there is no state-dir
+    /// fallback.
     ///
     /// `scope` is the stored provenance label the daemon derived, never
     /// a request field: `home` for the operator's own chat, or
@@ -393,32 +362,6 @@ impl Store {
     /// and conversation with the proven context in `context_id`.
     /// Idempotent by (sha256, scope, context_id): same bytes in the same
     /// scope return the same row; different scope is a different row.
-    pub fn chat_file_put(
-        &self,
-        state_dir: &Path,
-        tmp: &Path,
-        name: &str,
-        scope: &str,
-        context_id: &str,
-        uploader: &str,
-    ) -> Result<ChatFile> {
-        self.chat_file_put_at(
-            state_dir,
-            &state_dir.join(CHAT_FILES_DIR),
-            ChatFileUpload {
-                tmp,
-                name,
-                scope,
-                context_id,
-                uploader,
-            },
-            None,
-        )
-    }
-
-    /// Workspace-authoritative variant used by daemon RPCs. The upload
-    /// source remains transient state-dir staging; retained bytes never
-    /// fall back to state custody when workspace custody is unavailable.
     pub fn chat_file_put_in_workspace(
         &self,
         roots: ChatFileStorageRoots<'_>,
@@ -428,36 +371,9 @@ impl Store {
         context_id: &str,
         uploader: &str,
     ) -> Result<ChatFile> {
+        let state_dir = roots.state_dir;
         let root = workspace_blob_dir(roots.workspace_dir, true)?
             .ok_or_else(|| Error::rejected("workspace custody directory is unavailable"))?;
-        self.chat_file_put_at(
-            roots.state_dir,
-            &root.path,
-            ChatFileUpload {
-                tmp,
-                name,
-                scope,
-                context_id,
-                uploader,
-            },
-            Some(&root),
-        )
-    }
-
-    fn chat_file_put_at(
-        &self,
-        state_dir: &Path,
-        dir: &Path,
-        upload: ChatFileUpload<'_>,
-        pinned: Option<&PinnedBlobDir>,
-    ) -> Result<ChatFile> {
-        let ChatFileUpload {
-            tmp,
-            name,
-            scope,
-            context_id,
-            uploader,
-        } = upload;
         let name = sanitize_name(name)?;
         // The caller's path names a leaf under the staging dir and
         // proves (by canonicalized parent) that it claims that dir; the
@@ -496,7 +412,7 @@ impl Store {
         // are validated, but before allocating the bounded upload buffer.
         // Replays remain protected by the same lock and do not allocate
         // another custody object.
-        let _quota_lock = pinned.map(acquire_workspace_quota_lock).transpose()?;
+        let _quota_lock = acquire_workspace_quota_lock(&root)?;
 
         // Read the source through the opened descriptor with a hard cap
         // — never an unbounded `fs::copy` — so a source growing after
@@ -520,75 +436,40 @@ impl Store {
             crate::secret::guard(&format!("chat-file/{name}"), text)?;
         }
 
-        if let Some(root) = pinned {
-            let existing = {
-                let conn = self.conn();
-                Self::chat_file_by_sha_in(&*conn, &sha256, scope, context_id)?
-            };
-            if let Some(existing) = existing {
-                if let Some(stored) = open_blob_at(root, &existing.sha256)? {
-                    let actual = read_bounded_file(&stored, CHAT_FILE_MAX_BYTES)?;
-                    if actual.len() as u64 != existing.size
-                        || sha256_hex(&actual) != existing.sha256
-                    {
-                        return Err(Error::rejected(
-                            "existing workspace attachment bytes failed digest verification",
-                        ));
-                    }
-                    return Ok(existing);
+        let existing = {
+            let conn = self.conn();
+            Self::chat_file_by_sha_in(&*conn, &sha256, scope, context_id)?
+        };
+        if let Some(existing) = existing {
+            if let Some(stored) = open_blob_at(&root, &existing.sha256)? {
+                let actual = read_bounded_file(&stored, CHAT_FILE_MAX_BYTES)?;
+                if actual.len() as u64 != existing.size || sha256_hex(&actual) != existing.sha256 {
+                    return Err(Error::rejected(
+                        "existing workspace attachment bytes failed digest verification",
+                    ));
                 }
+                return Ok(existing);
             }
-            enforce_workspace_quota(self, state_dir, root, scope, bytes.len() as u64)?;
         }
+        enforce_workspace_quota(self, &root, scope, bytes.len() as u64)?;
 
-        // Private custody staging: write exactly the checked bytes and
+        // Anonymous custody stage: write exactly the checked bytes and
         // re-read them bounded, so what is published is provably what
-        // was checked. The stage is this call's own uuid-named file and
-        // is removed on every return path.
-        create_blob_dir(dir)?;
-        let stage_at = pinned
-            .map(|root| write_stage_at(root, &bytes))
-            .transpose()?;
-        let stage = if stage_at.is_none() {
-            Some(dir.join(format!(".tmp-{}", uuid::Uuid::new_v4().simple())))
-        } else {
-            None
-        };
-        let _stage_guard = stage
-            .as_ref()
-            .map(|path| write_stage(path, &bytes))
-            .transpose()?;
-        let staged = if let Some(stage) = stage_at.as_ref() {
-            stage.read_back(CHAT_FILE_MAX_BYTES)?
-        } else {
-            read_bounded(
-                stage.as_deref().expect("legacy stage exists"),
-                CHAT_FILE_MAX_BYTES,
-            )?
-            .ok_or_else(|| {
-                Error::rejected("chat_file_upload refused: the custody stage vanished")
-            })?
-        };
-        if staged != bytes {
+        // was checked. The stage has no name, so nothing is left behind
+        // on any return path.
+        let stage = write_stage_at(&root, &bytes)?;
+        if stage.read_back(CHAT_FILE_MAX_BYTES)? != bytes {
             return Err(Error::rejected(
                 "chat_file_upload refused: the custody stage did not match the checked bytes",
             ));
         }
 
         // Publish content-addressed, never overwriting and never
-        // directly at the final name: a hard link from the private
-        // stage is atomic, and a racing writer that landed the same
-        // digest first wins — the existing blob is then verified and a
-        // mismatch refuses the upload rather than replacing or
-        // deleting it. A filesystem without hard links refuses rather
-        // than exposing a partial blob under the final digest name.
-        if let Some(stage) = stage_at.as_ref() {
-            publish_blob_at(stage, &sha256, bytes.len() as u64)?;
-        } else {
-            let stage = stage.as_deref().expect("legacy stage exists");
-            let dest = dir.join(&sha256);
-            publish_blob(stage, &dest, &sha256, bytes.len() as u64)?;
-        }
+        // directly at the final name: a link of the stage's own inode is
+        // atomic, and a racing writer that landed the same digest first
+        // wins — the existing blob is then verified and a mismatch
+        // refuses the upload rather than replacing it.
+        publish_blob_at(&stage, &sha256, bytes.len() as u64)?;
 
         // The row: idempotent on (sha256, scope, context_id) — a retry
         // reads the row it already made.
@@ -672,28 +553,6 @@ impl Store {
         Ok(out)
     }
 
-    /// `chat_file_read` (the daemon checked the caller): text kinds
-    /// return bounded UTF-8 text with the digest re-verified and the
-    /// secret scan re-run; pdf/images return metadata with
-    /// `extractable:false` — an honest refusal to fabricate rather than
-    /// a mock extraction. Raw binary is never returned.
-    pub fn chat_file_read(&self, state_dir: &Path, id: &str) -> Result<Value> {
-        let file = self
-            .chat_file(id)?
-            .ok_or_else(|| Error::rejected(format!("unknown attachment '{id}'")))?;
-        let path = blob_path_for(state_dir, &file.sha256)?;
-        let bytes = read_verified_blob(&path, &file.sha256, file.size)
-            .map_err(|e| {
-                Error::rejected(format!("attachment '{id}' is unreadable or altered: {e}"))
-            })?
-            .ok_or_else(|| {
-                Error::rejected(format!(
-                    "attachment '{id}' is unreadable or altered: the retained blob is missing"
-                ))
-            })?;
-        file.read_projection(bytes)
-    }
-
     /// The raw persisted app stamp of `message_id`'s enqueue entry —
     /// exactly what was stored at send time, without the live re-proof
     /// [`Store::message_app`] adds. The stamp is provenance, never
@@ -707,139 +566,39 @@ impl Store {
         Self::entry_app_in(&conn, message_id)
     }
 
-    /// [`Store::chat_file_read`] for a row the caller already resolved
-    /// and proved: the same digest-verified read and projection, without
-    /// looking the row up again. The caller's proof is not undone by a
-    /// second lookup, and the bytes served are the bytes verified here.
-    pub fn chat_file_read_row(&self, state_dir: &Path, file: &ChatFile) -> Result<Value> {
-        let path = blob_path_for(state_dir, &file.sha256)?;
-        self.chat_file_read_row_path(file, &path)
-    }
-
-    /// Workspace-rooted read with non-destructive legacy fallback. Only
-    /// a genuinely absent primary entry permits reading state custody;
-    /// an existing symlink, FIFO, directory, or corrupt blob refuses.
+    /// Workspace-rooted read of a row the caller already resolved and
+    /// proved: the digest-verified bytes projected as bounded text. An
+    /// existing symlink, FIFO, directory or corrupt blob refuses, and a
+    /// missing blob refuses — there is no other custody to fall back to.
     pub fn chat_file_read_row_in_workspace(
         &self,
-        state_dir: &Path,
         workspace_dir: &Path,
         file: &ChatFile,
     ) -> Result<Value> {
-        let digest = validated_digest(&file.sha256)?;
-        let bytes = match workspace_blob_dir(workspace_dir, false)? {
-            Some(root) => read_verified_at(&root, digest, file.size)?,
-            None => None,
-        };
-        let bytes = match bytes {
-            Some(bytes) => bytes,
-            None => read_from_legacy_root(state_dir, digest, file.size)?
-                .ok_or_else(|| Error::rejected("legacy retained blob is missing"))?,
-        };
-        file.read_projection(bytes)
+        file.read_projection(read_workspace_blob(workspace_dir, file)?)
     }
 
-    fn chat_file_read_row_path(&self, file: &ChatFile, path: &Path) -> Result<Value> {
-        let bytes = read_verified_blob(path, &file.sha256, file.size)
-            .map_err(|e| {
-                Error::rejected(format!(
-                    "attachment '{}' is unreadable or altered: {e}",
-                    file.id
-                ))
-            })?
-            .ok_or_else(|| {
-                Error::rejected(format!(
-                    "attachment '{}' is unreadable or altered: the retained blob is missing",
-                    file.id
-                ))
-            })?;
-        file.read_projection(bytes)
-    }
-
-    /// Checked readiness for one retained text source, against the bytes
-    /// on disk: the row must be a text kind, the blob must exist as a
-    /// regular file, and its bounded content must still match the
-    /// declared size and digest, sniff as an allowed text kind, decode as
-    /// UTF-8 and pass the secret gate. Returns the row only when every
-    /// check holds — existence-only [`Store::chat_files_for`] is not
-    /// readiness, and a metadata-only PDF/image row is never usable as
-    /// ready text. The caller may then reference the row.
-    pub fn chat_file_ready(&self, state_dir: &Path, id: &str) -> Result<ChatFile> {
-        self.chat_file_ready_bytes(state_dir, id, CHAT_FILE_MAX_BYTES)
-            .map(|(file, _)| file)
-    }
-
-    /// [`Store::chat_file_ready`] with the exact bytes that passed every
-    /// check, bounded by `cap` (itself clamped to
-    /// [`CHAT_FILE_MAX_BYTES`]). A caller that needs a smaller window
-    /// (the CRM CSV import's 256 KiB) passes it and gets a refusal when
-    /// the retained row is larger — never a silently truncated read. The
-    /// bytes returned are the bytes whose size and digest were verified,
-    /// and the caller still holds no path: the blob is derived from the
-    /// validated stored digest inside this store.
-    pub fn chat_file_ready_bytes(
-        &self,
-        state_dir: &Path,
-        id: &str,
-        cap: u64,
-    ) -> Result<(ChatFile, Vec<u8>)> {
-        let file = self
-            .chat_file(id)?
-            .ok_or_else(|| Error::rejected(format!("unknown attachment '{id}'")))?;
-        let bytes = self.chat_file_ready_checked(state_dir, &file, cap)?;
-        Ok((file, bytes))
-    }
-
-    /// [`Store::chat_file_ready_bytes`] for a row the caller already
-    /// resolved: the same byte-level readiness checks (text kind, cap,
-    /// digest/size, sniff, UTF-8, secret policy) against the exact
-    /// bytes whose size and digest the row declares. This proves bytes
-    /// only — scope, provenance and capability stay the caller's proof,
-    /// and a caller holding an authorized operation must call this
-    /// while that operation is still open.
-    pub fn chat_file_ready_checked(
-        &self,
-        state_dir: &Path,
-        file: &ChatFile,
-        cap: u64,
-    ) -> Result<Vec<u8>> {
-        let path = blob_path_for(state_dir, &file.sha256)?;
-        self.chat_file_ready_checked_path(file, cap, &path)
-    }
-
-    /// Workspace-rooted readiness adapter used by native scoped reads.
-    /// A present but invalid workspace entry is an error and is never
-    /// hidden by a same-digest legacy state blob.
+    /// Checked readiness for one retained text row against the bytes on
+    /// disk: the row must be a text kind within `cap` (clamped to
+    /// [`CHAT_FILE_MAX_BYTES`]; a larger row refuses, never truncates),
+    /// the workspace blob must exist as a regular file and its bounded
+    /// content must still match the declared size and digest, sniff as an
+    /// allowed text kind, decode as UTF-8 and pass the secret gate.
+    /// Returns the exact checked bytes. This proves bytes only — scope,
+    /// provenance and capability stay the caller's proof, and a caller
+    /// holding an authorized operation must call this while that
+    /// operation is still open.
     pub fn chat_file_ready_checked_in_workspace(
         &self,
-        state_dir: &Path,
         workspace_dir: &Path,
         file: &ChatFile,
         cap: u64,
     ) -> Result<Vec<u8>> {
-        let digest = validated_digest(&file.sha256)?;
-        let bytes = match workspace_blob_dir(workspace_dir, false)? {
-            Some(root) => read_verified_at(&root, digest, file.size)?,
-            None => None,
-        };
-        let bytes = match bytes {
-            Some(bytes) => bytes,
-            None => read_from_legacy_root(state_dir, digest, file.size)?
-                .ok_or_else(|| Error::rejected("legacy retained blob is missing"))?,
-        };
-        self.chat_file_ready_checked_bytes(file, cap, bytes)
-    }
-
-    fn chat_file_ready_checked_path(
-        &self,
-        file: &ChatFile,
-        cap: u64,
-        path: &Path,
-    ) -> Result<Vec<u8>> {
         let cap = cap.min(CHAT_FILE_MAX_BYTES);
         if !text_kind(&file.mime) {
             return Err(Error::rejected(format!(
                 "attachment '{}' is not a ready text source — only txt, md and csv \
-                 rows can be referenced; PDF/image rows stay metadata-only",
+                 rows can be referenced",
                 file.id
             )));
         }
@@ -849,51 +608,19 @@ impl Store {
                 file.id, file.size
             )));
         }
-        let bytes = read_verified_blob(path, &file.sha256, file.size)
-            .map_err(|e| {
-                Error::rejected(format!(
-                    "attachment '{}' is not ready — the retained bytes failed their \
-                     checks: {e}",
-                    file.id
-                ))
-            })?
-            .ok_or_else(|| {
-                Error::rejected(format!(
-                    "attachment '{}' is not ready — the retained bytes are missing",
-                    file.id
-                ))
-            })?;
-        self.chat_file_ready_checked_bytes(file, cap, bytes)
+        let bytes = read_workspace_blob(workspace_dir, file)?;
+        self.chat_file_ready_checked_bytes(file, bytes)
     }
 
-    fn chat_file_ready_checked_bytes(
-        &self,
-        file: &ChatFile,
-        cap: u64,
-        bytes: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        let cap = cap.min(CHAT_FILE_MAX_BYTES);
-        if !text_kind(&file.mime) {
-            return Err(Error::rejected(format!(
-                "attachment '{}' is not a ready text source — only txt, md and csv \
-                 rows can be referenced; PDF/image rows stay metadata-only",
-                file.id
-            )));
-        }
-        if file.size > cap {
-            return Err(Error::rejected(format!(
-                "attachment '{}' is {} bytes — over the {cap}-byte read cap",
-                file.id, file.size
-            )));
-        }
+    fn chat_file_ready_checked_bytes(&self, file: &ChatFile, bytes: Vec<u8>) -> Result<Vec<u8>> {
         if bytes.is_empty() {
             return Err(Error::rejected(format!(
                 "attachment '{}' is not ready — the retained file is empty",
                 file.id
             )));
         }
-        // The same first-block sniff the upload ran: a legacy row whose
-        // bytes now shape as html/svg is not an allowed text source.
+        // The same first-block sniff the upload ran: a row whose bytes
+        // now shape as html/svg is not an allowed text source.
         let head = &bytes[..bytes.len().min(8192)];
         if sniffed_kind(head) != "text" {
             return Err(Error::rejected(format!(
@@ -950,9 +677,8 @@ fn valid_digest(sha256: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
-/// The blob path a row's digest names — derived only from a validated
-/// stored digest, never from request data. A malformed digest refuses
-/// before any path is built.
+/// A digest to name a custody entry — validated stored data, never
+/// request data. A malformed digest refuses before any name is built.
 fn validated_digest(sha256: &str) -> Result<&str> {
     if !valid_digest(sha256) {
         return Err(Error::rejected(
@@ -962,10 +688,22 @@ fn validated_digest(sha256: &str) -> Result<&str> {
     Ok(sha256)
 }
 
-fn blob_path_for(state_dir: &Path, sha256: &str) -> Result<PathBuf> {
-    Ok(state_dir
-        .join(CHAT_FILES_DIR)
-        .join(validated_digest(sha256)?))
+/// Open the workspace custody and read the row's blob, digest-verified.
+/// A genuinely absent custody directory or blob refuses (the retained
+/// bytes are missing); an aliased, non-regular or corrupt entry refuses.
+fn read_workspace_blob(workspace_dir: &Path, file: &ChatFile) -> Result<Vec<u8>> {
+    let digest = validated_digest(&file.sha256)?;
+    let root = workspace_blob_dir(workspace_dir, false)?;
+    let bytes = match root {
+        Some(root) => read_verified_at(&root, digest, file.size)?,
+        None => None,
+    };
+    bytes.ok_or_else(|| {
+        Error::rejected(format!(
+            "attachment '{}' is not readable — the retained bytes are missing",
+            file.id
+        ))
+    })
 }
 
 /// A directory descriptor pinned after a no-follow component walk. Every
@@ -973,7 +711,6 @@ fn blob_path_for(state_dir: &Path, sha256: &str) -> Result<PathBuf> {
 struct PinnedBlobDir {
     #[cfg(unix)]
     fd: std::os::fd::OwnedFd,
-    path: PathBuf,
 }
 
 /// Open the workspace and custody suffix without following any component.
@@ -1080,21 +817,14 @@ fn workspace_blob_dir(workspace: &Path, create: bool) -> Result<Option<PinnedBlo
             }
             current = unsafe { OwnedFd::from_raw_fd(fd) };
         }
-        Ok(Some(PinnedBlobDir {
-            fd: current,
-            path: workspace.join(".cadence").join(CHAT_FILES_DIR),
-        }))
+        Ok(Some(PinnedBlobDir { fd: current }))
     }
     #[cfg(not(unix))]
     {
-        let path = workspace.join(".cadence").join(CHAT_FILES_DIR);
-        if create {
-            std::fs::create_dir_all(&path)?;
-        }
-        if !path.is_dir() {
-            return Ok(None);
-        }
-        Ok(Some(PinnedBlobDir { path }))
+        let _ = (workspace, create);
+        Err(Error::rejected(
+            "descriptor-pinned workspace custody is unsupported on this platform",
+        ))
     }
 }
 
@@ -1143,94 +873,6 @@ fn read_verified_at(_root: &PinnedBlobDir, _digest: &str, _size: u64) -> Result<
     Err(Error::rejected(
         "descriptor-pinned workspace custody is unsupported on this platform",
     ))
-}
-
-#[cfg(unix)]
-fn read_from_legacy_root(state_dir: &Path, digest: &str, size: u64) -> Result<Option<Vec<u8>>> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let state = open_absolute_directory(state_dir)?;
-    let leaf = std::ffi::CString::new(CHAT_FILES_DIR).unwrap();
-    let fd = unsafe {
-        libc::openat(
-            state.as_raw_fd(),
-            leaf.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENOENT) {
-            return Ok(None);
-        }
-        return Err(Error::rejected(format!(
-            "legacy custody directory is invalid: {error}"
-        )));
-    }
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 || stat.st_uid != unsafe { libc::geteuid() } {
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(Error::rejected(
-            "legacy custody directory is not owned by the daemon uid",
-        ));
-    }
-    let root = PinnedBlobDir {
-        fd: unsafe { OwnedFd::from_raw_fd(fd) },
-        path: state_dir.join(CHAT_FILES_DIR),
-    };
-    read_verified_at(&root, digest, size)
-}
-
-#[cfg(not(unix))]
-fn read_from_legacy_root(_state_dir: &Path, _digest: &str, _size: u64) -> Result<Option<Vec<u8>>> {
-    Err(Error::rejected(
-        "descriptor-pinned legacy fallback is unsupported on this platform",
-    ))
-}
-
-#[cfg(unix)]
-fn open_absolute_directory(path: &Path) -> Result<std::os::fd::OwnedFd> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-    if !path.is_absolute() {
-        return Err(Error::rejected("custody root must be absolute"));
-    }
-    let slash = std::ffi::CString::new("/").unwrap();
-    let fd = unsafe {
-        libc::open(
-            slash.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected("cannot open filesystem root"));
-    }
-    let mut current = unsafe { OwnedFd::from_raw_fd(fd) };
-    for component in path.components() {
-        match component {
-            std::path::Component::RootDir => {}
-            std::path::Component::Normal(part) => {
-                let name = std::ffi::CString::new(part.as_bytes())
-                    .map_err(|_| Error::rejected("custody path is invalid"))?;
-                let child = unsafe {
-                    libc::openat(
-                        current.as_raw_fd(),
-                        name.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if child < 0 {
-                    return Err(Error::rejected(
-                        "custody root is missing, aliased, or unavailable",
-                    ));
-                }
-                current = unsafe { OwnedFd::from_raw_fd(child) };
-            }
-            _ => return Err(Error::rejected("custody root is not normalized")),
-        }
-    }
-    Ok(current)
 }
 
 #[cfg(unix)]
@@ -1298,7 +940,20 @@ struct QuotaFile {
     device: libc::dev_t,
     inode: libc::ino_t,
     size: u64,
-    original_root: bool,
+}
+
+/// Reset the thread's `errno` so a `readdir` end-of-directory can be told
+/// from a read error.
+#[cfg(unix)]
+fn clear_errno() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        *libc::__error() = 0;
+    }
 }
 
 #[cfg(unix)]
@@ -1314,11 +969,7 @@ impl Drop for QuotaDir {
 }
 
 #[cfg(unix)]
-fn quota_scan_dir(
-    fd: std::os::fd::RawFd,
-    workspace_root: bool,
-    original_root: bool,
-) -> Result<Vec<QuotaFile>> {
+fn quota_scan_dir(fd: std::os::fd::RawFd) -> Result<Vec<QuotaFile>> {
     let scan_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
     if scan_fd < 0 {
         return Err(Error::rejected(
@@ -1336,9 +987,7 @@ fn quota_scan_dir(
     let mut files = Vec::new();
     let mut entries = 0u64;
     loop {
-        unsafe {
-            *libc::__errno_location() = 0;
-        }
+        clear_errno();
         let entry = unsafe { libc::readdir(dir.0) };
         if entry.is_null() {
             let read_error = std::io::Error::last_os_error();
@@ -1353,7 +1002,7 @@ fn quota_scan_dir(
         if raw.to_bytes() == b"." || raw.to_bytes() == b".." {
             continue;
         }
-        if workspace_root && raw.to_bytes() == b".quota.lock" {
+        if raw.to_bytes() == b".quota.lock" {
             continue;
         }
         entries = entries
@@ -1401,33 +1050,19 @@ fn quota_scan_dir(
             device: stat.st_dev,
             inode: stat.st_ino,
             size: stat.st_size as u64,
-            original_root,
         });
     }
     Ok(files)
 }
 
-#[cfg(unix)]
-fn quota_open_state_dir(state_dir: &Path, leaf: &str) -> Result<Option<OwnedFd>> {
-    let state = open_absolute_directory(state_dir)?;
-    let name = std::ffi::CString::new(leaf).unwrap();
-    let fd = unsafe {
-        libc::openat(
-            state.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENOENT) {
-            return Ok(None);
-        }
-        return Err(Error::rejected(format!(
-            "quota accounting cannot open {leaf}: {error}"
-        )));
-    }
-    Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
+/// The stable code a quota refusal carries (the board maps it to 413).
+pub const CHAT_QUOTA_CODE: &str = "chat_quota_reached";
+
+fn quota_reached(which: &str) -> Error {
+    Error::invalid(
+        CHAT_QUOTA_CODE,
+        format!("chat attachment {which} quota reached"),
+    )
 }
 
 struct QuotaMetadataLedger {
@@ -1478,7 +1113,7 @@ fn quota_metadata_ledger(store: &Store, scope: &str) -> Result<QuotaMetadataLedg
             .checked_add(1)
             .ok_or_else(|| Error::rejected("quota object count overflow"))?;
         if ledger.metadata_objects > INSTANCE_OBJECTS {
-            return Err(Error::rejected("chat attachment instance quota reached"));
+            return Err(quota_reached("instance"));
         }
         ledger
             .known_blobs
@@ -1499,7 +1134,6 @@ fn quota_metadata_ledger(store: &Store, scope: &str) -> Result<QuotaMetadataLedg
 
 fn enforce_workspace_quota(
     store: &Store,
-    state_dir: &Path,
     root: &PinnedBlobDir,
     scope: &str,
     new_size: u64,
@@ -1510,13 +1144,7 @@ fn enforce_workspace_quota(
     const BUCKET_OBJECTS: u64 = 250;
     #[cfg(unix)]
     {
-        let workspace_files = quota_scan_dir(root.fd.as_raw_fd(), true, true)?;
-        let mut observed = workspace_files;
-        for (leaf, is_original_root) in [(CHAT_FILES_DIR, true), (crate::wiki::UPLOAD_DIR, false)] {
-            if let Some(dir) = quota_open_state_dir(state_dir, leaf)? {
-                observed.extend(quota_scan_dir(dir.as_raw_fd(), false, is_original_root)?);
-            }
-        }
+        let observed = quota_scan_dir(root.fd.as_raw_fd())?;
         let ledger = quota_metadata_ledger(store, scope)?;
         let known_blobs = ledger.known_blobs;
         let bucket_bytes = ledger.bucket_bytes;
@@ -1525,7 +1153,7 @@ fn enforce_workspace_quota(
         let mut physical =
             std::collections::HashMap::<(libc::dev_t, libc::ino_t), (u64, bool)>::new();
         for file in observed {
-            let known = file.original_root && known_blobs.contains(&(file.name, file.size));
+            let known = known_blobs.contains(&(file.name, file.size));
             let entry = physical
                 .entry((file.device, file.inode))
                 .or_insert((file.size, false));
@@ -1572,10 +1200,10 @@ fn enforce_workspace_quota(
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| Error::rejected("quota object count overflow"))?;
         if projected_instance > INSTANCE_BYTES || projected_objects > INSTANCE_OBJECTS {
-            return Err(Error::rejected("chat attachment instance quota reached"));
+            return Err(quota_reached("instance"));
         }
         if projected_bucket_bytes > BUCKET_BYTES || projected_bucket_objects > BUCKET_OBJECTS {
-            return Err(Error::rejected("chat attachment scope quota reached"));
+            return Err(quota_reached("scope"));
         }
         Ok(())
     }
@@ -1583,7 +1211,6 @@ fn enforce_workspace_quota(
     {
         let _ = (
             store,
-            state_dir,
             root,
             scope,
             new_size,
@@ -1596,33 +1223,6 @@ fn enforce_workspace_quota(
             "workspace quota accounting is unsupported on this platform",
         ))
     }
-}
-
-fn create_blob_dir(dir: &Path) -> Result<()> {
-    if dir.file_name().and_then(|n| n.to_str()) == Some(CHAT_FILES_DIR)
-        && dir
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|n| n.to_str())
-            == Some(".cadence")
-    {
-        return Ok(());
-    }
-    std::fs::create_dir_all(dir)?;
-    Ok(())
-}
-
-/// Read one regular file with a hard cap, opened once with no-follow
-/// and non-blocking flags: a symlink leaf is refused rather than
-/// followed, and a FIFO/device cannot block the open (no writer) or be
-/// read as if it were custody. `Ok(None)` when the path does not exist.
-fn read_bounded(path: &Path, cap: u64) -> Result<Option<Vec<u8>>> {
-    let f = match open_nofollow(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::rejected(format!("unreadable: {e}"))),
-    };
-    Ok(Some(read_bounded_file(&f, cap)?))
 }
 
 /// Read an already-opened descriptor with a hard cap. The descriptor is
@@ -1767,60 +1367,16 @@ fn open_upload_source(state_dir: &Path, tmp: &Path) -> Result<Option<std::fs::Fi
     }
 }
 
-/// Open a path without following a leaf symlink and without blocking on
-/// a FIFO/device with no writer. The flags are applied on Unix (the
-/// supported target); elsewhere a plain open is used and the
-/// descriptor's `is_file` check still refuses non-regular files.
-fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::File::open(path)
-    }
-}
-
-/// Create and write private custody staging: `create_new` (never an
-/// existing path) is the ownership proof, and the guard is returned
-/// only after it succeeds — a collision refuses without deleting the
-/// occupied path, while a partial write of the path this call created
-/// is still removed by the guard. The caller holds the guard across
-/// every later fallible step (write, sync, re-read, publication, DB)
-/// and on success too.
-fn write_stage(stage: &Path, bytes: &[u8]) -> Result<StagedFile> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(stage)?;
-    let guard = StagedFile(stage.to_path_buf());
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    Ok(guard)
-}
-
-/// Publish checked bytes at their content address without ever
-/// replacing or deleting what is already there, and without ever
-/// exposing a partial file under the final digest name. A hard link
-/// from the same-directory private stage is the atomic primitive
-/// (atomic on one filesystem, fails with `AlreadyExists` when the name
-/// is taken). A filesystem without hard links refuses rather than
-/// writing directly to the final name. A concurrent writer racing the
-/// same digest wins the name; this call then verifies the existing
-/// blob and refuses when it does not match.
-#[cfg(unix)]
+/// An anonymous (`O_TMPFILE`) custody inode in the pinned directory.
+/// Publication links this very inode, so the published bytes are the
+/// checked bytes and no named stage can be raced or left behind.
+#[cfg(target_os = "linux")]
 struct PinnedStage {
     root_fd: std::os::fd::OwnedFd,
     file: std::fs::File,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl PinnedStage {
     fn read_back(&self, cap: u64) -> Result<Vec<u8>> {
         use std::io::Seek;
@@ -1830,7 +1386,7 @@ impl PinnedStage {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn write_stage_at(root: &PinnedBlobDir, bytes: &[u8]) -> Result<PinnedStage> {
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -1873,14 +1429,31 @@ fn write_stage_at(root: &PinnedBlobDir, bytes: &[u8]) -> Result<PinnedStage> {
     Ok(stage)
 }
 
-#[cfg(not(unix))]
+/// Anonymous `O_TMPFILE` custody is Linux-only; elsewhere an upload
+/// fails closed rather than falling back to a named, racy stage.
+#[cfg(not(target_os = "linux"))]
+enum PinnedStage {}
+
+#[cfg(not(target_os = "linux"))]
+impl PinnedStage {
+    fn read_back(&self, _cap: u64) -> Result<Vec<u8>> {
+        match *self {}
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 fn write_stage_at(_root: &PinnedBlobDir, _bytes: &[u8]) -> Result<PinnedStage> {
     Err(Error::rejected(
-        "descriptor-pinned workspace custody is unsupported on this platform",
+        "chat attachments are not supported on this platform",
     ))
 }
 
-#[cfg(unix)]
+#[cfg(not(target_os = "linux"))]
+fn publish_blob_at(stage: &PinnedStage, _digest: &str, _size: u64) -> Result<()> {
+    match *stage {}
+}
+
+#[cfg(target_os = "linux")]
 fn publish_blob_at(stage: &PinnedStage, digest: &str, size: u64) -> Result<()> {
     use std::os::fd::AsRawFd;
     let dest = std::ffi::CString::new(digest).unwrap();
@@ -1918,7 +1491,6 @@ fn publish_blob_at(stage: &PinnedStage, digest: &str, size: u64) -> Result<()> {
             read_verified_at(
                 &PinnedBlobDir {
                     fd: duplicate_fd(stage.root_fd.as_raw_fd())?,
-                    path: PathBuf::new()
                 },
                 digest,
                 size
@@ -1936,7 +1508,7 @@ fn publish_blob_at(stage: &PinnedStage, digest: &str, size: u64) -> Result<()> {
     )))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn duplicate_fd(fd: std::os::fd::RawFd) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
     let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
@@ -1948,59 +1520,11 @@ fn duplicate_fd(fd: std::os::fd::RawFd) -> Result<std::os::fd::OwnedFd> {
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(copy) })
 }
 
-#[cfg(not(unix))]
-fn publish_blob_at(_stage: &PinnedStage, _digest: &str, _size: u64) -> Result<()> {
-    Err(Error::rejected(
-        "descriptor-pinned workspace custody is unsupported on this platform",
-    ))
-}
-
-fn publish_blob(stage: &Path, dest: &Path, sha256: &str, size: u64) -> Result<()> {
-    match std::fs::hard_link(stage, dest) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if matches!(read_verified_blob(dest, sha256, size), Ok(Some(_))) {
-                Ok(())
-            } else {
-                Err(Error::rejected(
-                    "chat_file_upload refused: the retained blob for this content \
-                     failed its digest check — refusing to overwrite it",
-                ))
-            }
-        }
-        Err(e) => Err(Error::rejected(format!(
-            "chat_file_upload refused: could not publish the retained blob atomically \
-             (a hard link from its own staging is required): {e}"
-        ))),
-    }
-}
-
-/// One retained blob verified against the digest and size its row
-/// declares. The bytes returned are the very bytes that were hashed, so
-/// no caller verifies one read and then uses another.
-fn read_verified_blob(path: &Path, sha256: &str, size: u64) -> Result<Option<Vec<u8>>> {
-    let Some(bytes) = read_bounded(path, CHAT_FILE_MAX_BYTES)? else {
-        return Ok(None);
-    };
-    if bytes.len() as u64 != size || sha256_hex(&bytes) != sha256 {
-        return Err(Error::rejected(
-            "the retained bytes failed their digest check — they no longer match the row",
-        ));
-    }
-    Ok(Some(bytes))
-}
-
-/// The blob path for a row — derived only from the verified sha, never
-/// from a caller-supplied name.
-#[cfg(test)]
-fn blob_path(state_dir: &Path, sha256: &str) -> PathBuf {
-    state_dir.join(CHAT_FILES_DIR).join(sha256)
-}
-
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::store::NewAgent;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn store() -> (TempDir, Store) {
@@ -2017,16 +1541,41 @@ mod tests {
         tmp
     }
 
+    fn workspace(state_dir: &Path) -> PathBuf {
+        let ws = state_dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        ws
+    }
+
+    fn put_as(s: &Store, dir: &Path, tmp: &Path, name: &str, scope: &str) -> Result<ChatFile> {
+        s.chat_file_put_in_workspace(
+            ChatFileStorageRoots {
+                state_dir: dir,
+                workspace_dir: &workspace(dir),
+            },
+            tmp,
+            name,
+            scope,
+            "",
+            "operator",
+        )
+    }
+
+    fn put(s: &Store, dir: &Path, bytes: &[u8], name: &str) -> Result<ChatFile> {
+        put_as(s, dir, &stage(dir, bytes), name, CHAT_FILE_SCOPE_HOME)
+    }
+
+    fn read(s: &Store, dir: &Path, file: &ChatFile) -> Result<Value> {
+        s.chat_file_read_row_in_workspace(&workspace(dir), file)
+    }
+
     #[test]
     fn put_retains_text_and_read_returns_it() {
         let (dir, s) = store();
-        let tmp = stage(dir.path(), b"hello world");
-        let f = s
-            .chat_file_put(dir.path(), &tmp, "notes.txt", "home", "", "operator")
-            .unwrap();
+        let f = put(&s, dir.path(), b"hello world", "notes.txt").unwrap();
         assert!(valid_id(&f.id));
         assert_eq!(f.mime, "text/plain");
-        let out = s.chat_file_read(dir.path(), &f.id).unwrap();
+        let out = read(&s, dir.path(), &f).unwrap();
         assert_eq!(out["text"], json!("hello world"));
         assert_eq!(out["extractable"], json!(true));
     }
@@ -2034,125 +1583,39 @@ mod tests {
     #[test]
     fn put_is_idempotent_in_one_scope() {
         let (dir, s) = store();
-        let a = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"same"),
-                "a.txt",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap();
-        let b = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"same"),
-                "b.txt",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap();
+        let a = put(&s, dir.path(), b"same", "a.txt").unwrap();
+        let b = put(&s, dir.path(), b"same", "b.txt").unwrap();
         assert_eq!(a.id, b.id, "same bytes same scope dedupe to one row");
-        let c = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"same"),
-                "a.txt",
-                "inst-1",
-                "",
-                "operator",
-            )
-            .unwrap();
+        let other = ChatFile::app_scope("inst-1", "conv-1").unwrap();
+        let c = put_as(&s, dir.path(), &stage(dir.path(), b"same"), "a.txt", &other).unwrap();
         assert_ne!(a.id, c.id, "a different scope is a different row");
     }
 
     #[test]
     fn refuses_bad_magic_and_offlist() {
         let (dir, s) = store();
+        let refused =
+            |bytes: &[u8], name: &str| put(&s, dir.path(), bytes, name).unwrap_err().to_string();
         // PDF/image claims are refused while no processing contract
         // exists — a magic prefix is not processing.
-        let err = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"hello"),
-                "fake.pdf",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not available yet"), "{err}");
+        assert!(refused(b"hello", "fake.pdf").contains("not available yet"));
         // a zip named .png is refused the same way (no image processing)
-        let err = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"PK\x03\x04rest"),
-                "a.png",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not available yet"), "{err}");
+        assert!(refused(b"PK\x03\x04rest", "a.png").contains("not available yet"));
         // svg is text-ish by shape but off the allowlist
-        let err = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"<svg></svg>"),
-                "x.txt",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("sniff"), "{err}");
+        assert!(refused(b"<svg></svg>", "x.txt").contains("sniff"));
         // an unsupported extension refuses before sniffing
-        let err = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"MZ"),
-                "a.exe",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not an attachable type"), "{err}");
+        assert!(refused(b"MZ", "a.exe").contains("not an attachable type"));
     }
 
     #[test]
     fn refuses_oversize_and_empty() {
         let (dir, s) = store();
         let big = vec![b'x'; (CHAT_FILE_MAX_BYTES + 1) as usize];
-        let err = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), &big),
-                "big.txt",
-                "home",
-                "",
-                "operator",
-            )
+        let err = put(&s, dir.path(), &big, "big.txt")
             .unwrap_err()
             .to_string();
         assert!(err.contains("cap"), "{err}");
-        let err = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b""),
-                "e.txt",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap_err()
-            .to_string();
+        let err = put(&s, dir.path(), b"", "e.txt").unwrap_err().to_string();
         assert!(err.contains("empty"), "{err}");
     }
 
@@ -2161,153 +1624,49 @@ mod tests {
         let (dir, s) = store();
         let elsewhere = dir.path().join("elsewhere.txt");
         std::fs::write(&elsewhere, b"hi").unwrap();
-        let err = s
-            .chat_file_put(dir.path(), &elsewhere, "e.txt", "home", "", "operator")
+        let err = put_as(&s, dir.path(), &elsewhere, "e.txt", CHAT_FILE_SCOPE_HOME)
             .unwrap_err()
             .to_string();
         assert!(err.contains("directly under"), "{err}");
     }
 
-    /// A row retained by an earlier build (image/PDF kinds were accepted
-    /// then) still reads metadata-only — historical rows are preserved,
-    /// never deleted, and never fabricated into text.
-    fn legacy_row(s: &Store, dir: &Path, name: &str, mime: &str, bytes: &[u8]) -> ChatFile {
-        let sha = {
-            use sha2::Digest;
-            sha2::Sha256::digest(bytes)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        };
-        let blob_dir = dir.join(CHAT_FILES_DIR);
-        std::fs::create_dir_all(&blob_dir).unwrap();
-        std::fs::write(blob_dir.join(&sha), bytes).unwrap();
-        let file = ChatFile {
-            id: format!("chf-{}", uuid::Uuid::new_v4().simple()),
-            sha256: sha,
-            size: bytes.len() as u64,
-            mime: mime.to_string(),
-            name: name.to_string(),
-            scope: "home".to_string(),
-            context_id: String::new(),
-            uploader: "operator".to_string(),
-            created: 0.0,
-        };
-        s.write_tx(|tx| {
-            tx.execute(
-                "INSERT INTO chat_files(id,sha256,size,mime,name,scope,context_id,uploader,created)
-                 VALUES(?,?,?,?,?,?,?,?,?)",
-                params![
-                    file.id,
-                    file.sha256,
-                    file.size as i64,
-                    file.mime,
-                    file.name,
-                    file.scope,
-                    file.context_id,
-                    file.uploader,
-                    file.created
-                ],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-        file
-    }
-
     #[test]
-    fn image_read_is_metadata_only() {
+    fn altered_blob_refuses_and_missing_blob_does_not_fall_back() {
         let (dir, s) = store();
-        let png = legacy_row(
-            &s,
-            dir.path(),
-            "p.png",
-            "image/png",
-            b"\x89PNG\r\n\x1a\nrest",
-        );
-        let out = s.chat_file_read(dir.path(), &png.id).unwrap();
-        assert_eq!(out["extractable"], json!(false));
-        assert_eq!(out["mime"], json!("image/png"));
-        assert_eq!(out["text"], Value::Null);
-    }
-
-    #[test]
-    fn a_legacy_pdf_read_is_metadata_only() {
-        let (dir, s) = store();
-        let pdf = legacy_row(
-            &s,
-            dir.path(),
-            "d.pdf",
-            "application/pdf",
-            b"%PDF-1.1\n1 0 obj\n<<>>\nendobj\n",
-        );
-        let out = s.chat_file_read(dir.path(), &pdf.id).unwrap();
-        assert_eq!(out["extractable"], json!(false));
-        assert_eq!(out["text"], Value::Null);
-    }
-
-    #[test]
-    fn unknown_id_and_altered_blob_refuse() {
-        let (dir, s) = store();
-        assert!(s.chat_file_read(dir.path(), "chf-nope").is_err());
-        let f = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"data"),
-                "d.txt",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap();
+        let f = put(&s, dir.path(), b"data", "d.txt").unwrap();
+        let blob = workspace(dir.path())
+            .join(".cadence")
+            .join(CHAT_FILES_DIR)
+            .join(&f.sha256);
         // Corrupt the blob after landing.
-        std::fs::write(blob_path(dir.path(), &f.sha256), b"tampered").unwrap();
-        let err = s.chat_file_read(dir.path(), &f.id).unwrap_err().to_string();
+        std::fs::write(&blob, b"tampered").unwrap();
+        let err = read(&s, dir.path(), &f).unwrap_err().to_string();
         assert!(err.contains("digest"), "{err}");
+        // A state-dir copy is never consulted: removing the workspace blob
+        // refuses even with the right bytes sitting in `<state>/chat-files`.
+        std::fs::remove_file(&blob).unwrap();
+        let legacy = dir.path().join(CHAT_FILES_DIR);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(&f.sha256), b"data").unwrap();
+        let err = read(&s, dir.path(), &f).unwrap_err().to_string();
+        assert!(err.contains("missing"), "{err}");
     }
 
     #[test]
     fn csv_and_markdown_are_text_kinds() {
         let (dir, s) = store();
-        let csv = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"a,b\n1,2"),
-                "rows.csv",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap();
+        let csv = put(&s, dir.path(), b"a,b\n1,2", "rows.csv").unwrap();
         assert_eq!(csv.mime, "text/csv");
-        let md = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"# hi"),
-                "n.md",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap();
+        let md = put(&s, dir.path(), b"# hi", "n.md").unwrap();
         assert_eq!(md.mime, "text/markdown");
-        let out = s.chat_file_read(dir.path(), &csv.id).unwrap();
+        let out = read(&s, dir.path(), &csv).unwrap();
         assert_eq!(out["text"], json!("a,b\n1,2"));
     }
 
     #[test]
     fn names_are_sanitized() {
         let (dir, s) = store();
-        let f = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"x"),
-                "../evil/\u{1}\u{2}name.txt",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap();
+        let f = put(&s, dir.path(), b"x", "../evil/\u{1}\u{2}name.txt").unwrap();
         assert_eq!(f.name, "name.txt");
     }
 
@@ -2329,26 +1688,8 @@ mod tests {
             model_policy: None,
         })
         .unwrap();
-        let a = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"1"),
-                "a.txt",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap();
-        let b = s
-            .chat_file_put(
-                dir.path(),
-                &stage(dir.path(), b"2"),
-                "b.txt",
-                "home",
-                "",
-                "operator",
-            )
-            .unwrap();
+        let a = put(&s, dir.path(), b"1", "a.txt").unwrap();
+        let b = put(&s, dir.path(), b"2", "b.txt").unwrap();
         let got = s.chat_files_for(&[b.id.clone(), a.id.clone()]).unwrap();
         assert_eq!(got[0].id, b.id);
         assert_eq!(got[1].id, a.id);

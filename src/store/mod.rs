@@ -66,8 +66,8 @@ pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
 mod chat_files;
 pub use chat_files::{
     text_kind as chat_text_kind, valid_id as chat_file_id, ChatFile, ChatFileStorageRoots,
-    CHAT_FILES_DIR, CHAT_FILE_MAX_BYTES, CHAT_FILE_MAX_PER_MESSAGE, CHAT_FILE_SCOPE_HOME,
-    CHAT_FILE_TEXT_CAP,
+    CHAT_FILE_MAX_BYTES, CHAT_FILE_MAX_PER_MESSAGE, CHAT_FILE_SCOPE_HOME, CHAT_FILE_TEXT_CAP,
+    CHAT_QUOTA_CODE,
 };
 pub mod app_audiences;
 pub use app_audiences::{AudienceBase, Predicate};

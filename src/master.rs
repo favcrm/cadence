@@ -158,9 +158,8 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(cadence wiki history *)",
     "Bash(cadence wiki put *)",
     // CAD-1168: the retained chat attachments the master's turn was
-    // sent — bounded text reads (pdf/image stay metadata-only). The
-    // read binds to the live turn daemon-side; this lets the master
-    // invoke it at all.
+    // sent — bounded text reads. The daemon resolves the live turn and
+    // checks the id is on its envelope; this lets the master invoke it.
     "Bash(cadence attachment read *)",
     // CAD-615: ask the operator to approve one plain command. The
     // decision verbs are not here — the master cannot approve itself.

@@ -40,7 +40,7 @@ pub fn csv_decisions_digest(decisions: &Value) -> Result<String> {
         _ => {
             return Err(Error::rejected(
                 "customer CSV decisions digest source must be an array",
-            ));
+            ))
         }
     };
     let mut normalized = Vec::with_capacity(list.len());

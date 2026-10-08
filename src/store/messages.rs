@@ -965,7 +965,7 @@ impl Store {
                 return Err(Error::rejected(format!(
                     "native nudge disposition must be queued|skipped_inactive|rejected|unknown, \
                      not '{other}'"
-                )));
+                )))
             }
         };
         self.write_tx(|conn| {
@@ -1691,7 +1691,7 @@ impl Store {
                 _ => {
                     return Err(Error::rejected(format!(
                         "since '{since}' is neither a message id of '{alias}' nor a timestamp"
-                    )));
+                    )))
                 }
             }
         }

@@ -1002,8 +1002,8 @@ impl Store {
             if version < 37 {
                 // CAD-1168 slice 2: retained chat attachments — one row
                 // per (sha256, scope, context_id); bytes live
-                // content-addressed in `<state>/chat-files/`, never in
-                // the table. New table only; nothing is moved or
+                // content-addressed in `<workspace>/.cadence/chat-files/`,
+                // never in the table. New table only; nothing is moved or
                 // rewritten, and a missing table on reopen converges.
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(super::chat_files::SCHEMA)?;

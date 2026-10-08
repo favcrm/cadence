@@ -1570,8 +1570,8 @@
     /// v37 adds the CAD-1168 retained-attachment table only:
     /// `chat_files` — metadata rows keyed `chf-<hex>` with the
     /// `(sha256, scope, context_id)` uniqueness index; bytes live
-    /// content-addressed under `<state>/chat-files/`, never in the
-    /// table. `IF NOT EXISTS`, so a v36 store migrates in place and a
+    /// content-addressed under `<workspace>/.cadence/chat-files/`, never
+    /// in the table. `IF NOT EXISTS`, so a v36 store migrates in place and a
     /// half-applied v37 converges; pre-v37 rows are preserved.
     #[test]
     fn migration_v36_to_v37_adds_chat_files() {

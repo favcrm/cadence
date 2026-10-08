@@ -969,10 +969,9 @@ pub(crate) enum Commands {
         action: ThreadAction,
     },
     /// A retained chat attachment (CAD-1168): `attachment read <id>`
-    /// returns its bounded safe representation (text for txt/md/csv,
-    /// metadata only for pdf/image). The operator reads any retained id;
-    /// inside the master's running turn the turn's own message id and
-    /// token are derived from `cadence self`.
+    /// returns its bounded text (txt/md/csv). The operator reads any
+    /// retained id; the master reads only an id on its own running
+    /// turn's envelope.
     Attachment {
         #[command(subcommand)]
         action: AttachmentAction,

@@ -200,12 +200,12 @@ impl Store {
                 Some(s) => {
                     return Err(Error::rejected(format!(
                         "cannot park '{message}' on '{alias}': it is {s}, not queued"
-                    )));
+                    )))
                 }
                 None => {
                     return Err(Error::rejected(format!(
                         "cannot park '{message}': no such message on '{alias}'"
-                    )));
+                    )))
                 }
             }
             Self::event(

@@ -311,7 +311,7 @@ impl Store {
             _ => {
                 return Err(Error::rejected(
                     "required reviewed binary asset pin is absent or incomplete",
-                ));
+                ))
             }
         };
         if reviewed["material"]["kind"] != "review_text"

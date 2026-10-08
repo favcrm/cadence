@@ -18,8 +18,9 @@
 //!   is refused whole; a conversation without an app binding refuses,
 //!   and so does an app binding without its explicit conversation.
 //! - `chat_file_read` — the operator (same proof) or the master holding
-//!   a live assigned turn (`message` + `token`, the pattern
-//!   `app_run_artifact` uses) — and only for a file that same persisted
+//!   a live assigned turn (resolved by the daemon from the proven
+//!   caller; `message` + `token`, the pattern `app_run_artifact` uses,
+//!   are optional and re-proved when sent) — and only for a file that same persisted
 //!   turn envelope actually carries. A live token plus an id learned
 //!   elsewhere (another turn's payload, an earlier message, an
 //!   operator-side receipt) is refused before any byte is read. The
@@ -27,10 +28,8 @@
 //!   read against the turn's own `message_app` + `message_conversation`,
 //!   an operator read against the stored conversation and the current
 //!   approved declaration — the operator never bypasses scope merely by
-//!   being the operator. Text kinds return bounded secret-scanned text;
-//!   pdf/image kinds return metadata with `extractable:false` — no
-//!   fabricated extraction, and no PDF/image processing exists in this
-//!   slice.
+//!   being the operator. Only text kinds are retained; a read returns
+//!   bounded secret-scanned text.
 
 use std::path::PathBuf;
 
@@ -156,12 +155,9 @@ impl Shared {
                 .chat_file(id)?
                 .ok_or_else(|| Error::rejected(format!("unknown attachment '{id}'")))?;
             file.scope_matches(install, context, conversation)?;
-            let bytes = self.store.chat_file_ready_checked_in_workspace(
-                &self.state_dir,
-                &self.pm_dir()?,
-                &file,
-                cap,
-            )?;
+            let bytes =
+                self.store
+                    .chat_file_ready_checked_in_workspace(&self.pm_dir()?, &file, cap)?;
             Ok((file, bytes))
         })
     }
@@ -192,7 +188,6 @@ impl Shared {
                     .ok_or_else(|| Error::rejected(format!("unknown attachment '{id}'")))?;
                 file.scope_matches(install, context, conversation)?;
                 self.store.chat_file_ready_checked_in_workspace(
-                    &self.state_dir,
                     &self.pm_dir()?,
                     &file,
                     store::CHAT_FILE_MAX_BYTES,
@@ -280,21 +275,19 @@ impl Shared {
                 if app.get("context_id").is_none() {
                     self.known_install(install)?;
                 }
-                self.verify_conversation_selector(crate::master::ALIAS, app, conversation)?;
                 // Context absence stays absent (installation-only
                 // binding); it is never filled from the conversation's
                 // creation context or any current/default context.
                 let context = app["context_id"].as_str().unwrap_or("").to_string();
                 let scope = store::ChatFile::app_scope(install, conversation)?;
-                // The declaration is proved, and the selector is
-                // re-proved against the native seams, while the
+                // The declaration and the conversation/context selector
+                // are proved once, against the native seams, while the
                 // exact-approved runtime snapshot is held: the actual
                 // retention runs inside that held authorized operation,
                 // not merely beside its label. An undeclared, revoked or
                 // upgraded bundle, or a conversation/context that moved,
                 // refuses the upload whole.
                 self.with_file_upload_capability(install, |_digest| {
-                    self.verify_conversation_selector(crate::master::ALIAS, app, conversation)?;
                     self.prove_scoped_conversation(app, conversation)?;
                     self.store.chat_file_put_in_workspace(
                         store::ChatFileStorageRoots {
@@ -313,12 +306,14 @@ impl Shared {
         Ok(file.to_json())
     }
 
-    /// `chat_file_read {id}` for the operator, or `{id, message, token}`
-    /// for the master's live assigned turn — the same turn shape
-    /// `app_run_artifact` redeems, narrowed here to the master (the
-    /// only agent chat attachments are ever delivered to). Any other
-    /// agent caller is refused. The stored provenance is re-proved
-    /// before `chat_file_read` serves any byte.
+    /// `chat_file_read {id}` for the operator, or for the master's live
+    /// assigned turn — `{id}` alone resolves the master's own running
+    /// turn from the proven caller (an app turn may not call
+    /// `agent_show`); `{id, message, token}` is the explicit form
+    /// `app_run_artifact` redeems. Narrowed to the master (the only
+    /// agent chat attachments are ever delivered to); any other agent
+    /// caller is refused. The stored provenance is re-proved before any
+    /// byte is served.
     pub(super) fn rpc_chat_file_read(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         Self::reject_chat_file_fields(params, &["id", "message", "token"])?;
         let id = required_str(params, "id")?;
@@ -344,11 +339,8 @@ impl Shared {
                 match store::ChatFile::parse_scope(&file.scope)? {
                     None => {
                         file.home_scope()?;
-                        self.store.chat_file_read_row_in_workspace(
-                            &self.state_dir,
-                            &self.pm_dir()?,
-                            &file,
-                        )?
+                        self.store
+                            .chat_file_read_row_in_workspace(&self.pm_dir()?, &file)?
                     }
                     Some((install, conversation)) => {
                         let (file, bytes) = self.scoped_chat_file(
@@ -374,13 +366,37 @@ impl Shared {
                 // it, is running under exactly this token, and the token
                 // is current under the endpoint's own scheme — the
                 // `scoped_chat_assistant` turn checks mirrored here.
-                let message = required_str(params, "message")?;
-                let token = required_str(params, "token")?;
+                // A caller that names neither is resolved to the master's
+                // own live message here (the pane needs no `agent_show`,
+                // which an app turn may not call); naming only one is an
+                // error. Either way the same checks below run.
+                let (message, token) = match (params.get("message"), params.get("token")) {
+                    (None, None) => {
+                        let live = self.store.active_message_id(&alias)?.ok_or_else(|| {
+                            Error::rejected(
+                                "chat file read needs the master's active assigned turn — \
+                                 none is running",
+                            )
+                        })?;
+                        let turn = self
+                            .store
+                            .message(&live)?
+                            .and_then(|m| m.turn_id)
+                            .unwrap_or_default();
+                        (live, turn)
+                    }
+                    _ => (
+                        required_str(params, "message")?.to_string(),
+                        required_str(params, "token")?.to_string(),
+                    ),
+                };
+                let (message, token) = (message.as_str(), token.as_str());
                 let stored = self
                     .store
                     .message(message)?
                     .ok_or_else(|| Error::rejected("chat file read: turn is unknown"))?;
-                if stored.alias != alias
+                if token.is_empty()
+                    || stored.alias != alias
                     || stored.state != "running"
                     || stored.turn_id.as_deref() != Some(token)
                 {
@@ -440,11 +456,8 @@ impl Shared {
                     })?;
                 if thread.is_home() {
                     file.home_scope()?;
-                    self.store.chat_file_read_row_in_workspace(
-                        &self.state_dir,
-                        &self.pm_dir()?,
-                        &file,
-                    )?
+                    self.store
+                        .chat_file_read_row_in_workspace(&self.pm_dir()?, &file)?
                 } else {
                     let install = thread.install_id.as_deref().unwrap_or_default();
                     let stamp = self.store.message_app_stamp(message)?.ok_or_else(|| {

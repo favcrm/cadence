@@ -228,7 +228,7 @@ pub(super) fn read(
                 return err_response(
                     400,
                     &format!("limit must be 1-{}", crate::store::THREAD_PAGE_MAX),
-                );
+                )
             }
         },
     };
@@ -574,8 +574,8 @@ pub(super) fn post_upload(request: &mut Request, state_dir: &Path) -> HttpResp {
         Err(Error::Structured(details)) if details.kind == "busy" => {
             err_response(429, &details.message)
         }
-        Err(Error::Rejected(message)) if message.contains("quota reached") => {
-            err_response(413, &message)
+        Err(Error::Structured(details)) if details.code == crate::store::CHAT_QUOTA_CODE => {
+            err_response(413, &details.message)
         }
         Err(e) => write_err(&e),
     }

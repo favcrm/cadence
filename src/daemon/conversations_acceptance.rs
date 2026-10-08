@@ -2619,3 +2619,87 @@ fn cad1168_independent_attachment_scope_refusals() {
     assert_eq!(reply["state"], json!("queued"), "{reply}");
     assert_eq!(count("SELECT count(*) FROM messages"), messages0 + 1);
 }
+
+/// CAD-1168: the master reads an attachment with the id alone, on its own
+/// live turn, in an APP conversation too — the CLI no longer calls
+/// `agent_show` (which Gate 2 refuses under an app turn), so the daemon
+/// resolves the running turn from the proven caller. An id on the turn's
+/// envelope reads; an id of the same conversation that was never sent
+/// with this turn is refused with the envelope reason, a Home turn
+/// still reads its own file, and a master with no running turn reads
+/// nothing.
+///
+/// Guards: `rpc_chat_file_read`'s agent arm (the live-turn resolution and
+/// the envelope-membership check, daemon/chat_files_rpc.rs).
+#[test]
+fn master_reads_attachments_on_its_live_turn_by_id_alone() {
+    let gx = gx();
+    let staged = |bytes: &[u8]| {
+        let dir = gx.dir.path().join(crate::wiki::UPLOAD_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(format!("upload-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&tmp, bytes).unwrap();
+        tmp.to_string_lossy().into_owned()
+    };
+    let app = json!({"install_id": gx.crm, "context_id": gx.crm_a});
+    let conv = gx.conversation(&gx.crm, &gx.crm_a, json!({"general": true}));
+    let app_upload = |name: &str, bytes: &[u8]| -> String {
+        gx.operator(
+            "chat_file_upload",
+            json!({"name": name, "tmp": staged(bytes), "app": app, "conversation": conv}),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let sent = app_upload("sent.csv", b"name\nAnn");
+    let unsent = app_upload("unsent.txt", b"never sent");
+    let read = |id: &str| {
+        gx.call(
+            Asserted::Agent("master".into()),
+            "chat_file_read",
+            json!({"id": id}),
+        )
+    };
+
+    // No running turn: nothing is readable.
+    let err = err_text(read(&sent));
+    assert!(err.contains("none is running"), "{err}");
+
+    // An app turn: the id on its envelope reads (Gate 2 admits the verb
+    // and no `agent_show` is involved) ...
+    gx.operator(
+        "thread_send",
+        json!({"alias": "master", "text": "see file", "message": "m-app",
+               "app": app, "conversation": conv, "attachments": [{"id": sent}]}),
+    )
+    .unwrap();
+    gx.run("m-app");
+    gx.policy("chat_file_read", &json!({"id": sent})).unwrap();
+    assert!(gx
+        .policy("agent_show", &json!({"alias": "master"}))
+        .is_err());
+    assert_eq!(read(&sent).unwrap()["text"], json!("name\nAnn"));
+    // ... an id of the same conversation that this turn did not carry is
+    // refused, and so is an id that does not exist.
+    let err = err_text(read(&unsent));
+    assert!(err.contains("not on your turn's envelope"), "{err}");
+    let err = err_text(read("chf-0000000000000000000000000000dead"));
+    assert!(err.contains("not on your turn's envelope"), "{err}");
+
+    // A Home turn still reads its own file, and not the app one.
+    gx.finish("m-app", 2.0);
+    let home = chat_upload(&gx, "home.txt", b"home text");
+    let home_id = home["id"].as_str().unwrap().to_string();
+    gx.operator(
+        "thread_send",
+        json!({"alias": "master", "text": "home file", "message": "m-home",
+               "attachments": [{"id": home_id}]}),
+    )
+    .unwrap();
+    gx.run("m-home");
+    assert_eq!(read(&home_id).unwrap()["text"], json!("home text"));
+    let err = err_text(read(&sent));
+    assert!(err.contains("not on your turn's envelope"), "{err}");
+}

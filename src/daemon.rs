@@ -1124,10 +1124,7 @@ impl Shared {
             // CAD-1168: retained attachments the send named ride as a
             // bounded envelope too — metadata and the read verb only,
             // never file bytes or paths in the prompt.
-            if let Some(envelope) = self
-                .attachments_hint(message)
-                .and_then(|files| attachments_envelope(&files))
-            {
+            if let Some(envelope) = self.attachments_notice(message) {
                 body = format!("{envelope}\n\n{body}");
             }
             if let Some(hint) = self.delivery_hint(message) {
@@ -3735,18 +3732,22 @@ impl Shared {
         self.pm_at(&self.pm_dir()?)
     }
 
-    /// CAD-1168: the attachment rows a queued operator message
-    /// carries — the stored payload re-read through the entry so a
-    /// tampered or missing payload field simply yields no envelope
-    /// (fail soft on the hint, never on the message, which delivers
-    /// exactly as queued).
-    fn attachments_hint(&self, message: &Message) -> Option<Vec<Value>> {
-        self.store
-            .message_attachments(&message.id)
-            .ok()
-            .flatten()
-            .and_then(|v| v.as_array().cloned())
-            .filter(|a| !a.is_empty())
+    /// CAD-1168: the attachments envelope a queued operator message
+    /// carries, re-read from the stored entry. A message with no
+    /// attachments yields `None`; one whose stored list cannot be read
+    /// or rendered yields an explicit "unavailable" line, so the turn
+    /// never silently loses the files the operator attached.
+    fn attachments_notice(&self, message: &Message) -> Option<String> {
+        const UNAVAILABLE: &str = "[Attachments — the operator attached files to this message \
+but the host could not read their list; do not claim to have read them.]";
+        match self.store.message_attachments(&message.id) {
+            Ok(None) => None,
+            Ok(Some(Value::Array(rows))) if rows.is_empty() => None,
+            Ok(Some(Value::Array(rows))) => {
+                Some(attachments_envelope(&rows).unwrap_or_else(|| UNAVAILABLE.to_string()))
+            }
+            Ok(Some(_)) | Err(_) => Some(UNAVAILABLE.to_string()),
+        }
     }
 
     /// [`Self::pm`] at an explicit dir — for seams whose signature
@@ -4064,12 +4065,6 @@ fn optional_strs(params: &Value, field: &str) -> Result<Vec<String>> {
     }
 }
 
-/// CAD-574: `thread_send`'s `refs` — at most eight `{kind,id}` subjects
-/// of needs-me rows the operator's message cites. The array is
-/// normalized to `{kind,id}` pairs only — an extra key refuses the
-/// whole call, like the verb's field allowlist. The stored entry
-/// carries them so the board can render the citation and the retry
-/// check can compare them.
 /// CAD-1168: `thread_send`'s `attachments` — at most
 /// [`store::CHAT_FILE_MAX_PER_MESSAGE`] `{id}` handles of retained
 /// upload rows. The array is normalized to metadata rows resolved
@@ -4085,9 +4080,8 @@ fn optional_strs(params: &Value, field: &str) -> Result<Vec<String>> {
 /// the store's one codec, never inferred from an id.
 ///
 /// Readiness is checked against the actual bytes, not the row's
-/// existence: a stored row or a previously retained metadata-only
-/// PDF/image must not be usable as ready text, and an altered or
-/// unreadable blob refuses the send before the message is queued. The
+/// existence: an altered or unreadable blob refuses the send before
+/// the message is queued. The
 /// aggregate is bounded explicitly at 50 MiB (five 10 MiB maxima) with
 /// checked arithmetic — an over-cap set refuses whole, never silently
 /// drops a file.
@@ -4137,7 +4131,6 @@ fn thread_attachments(shared: &Shared, value: &Value, app: Option<&Value>) -> Re
                     .ok_or_else(|| Error::rejected(format!("unknown attachment '{id}'")))?;
                 file.home_scope()?;
                 shared.store.chat_file_ready_checked_in_workspace(
-                    &shared.state_dir,
                     &shared.pm_dir()?,
                     &file,
                     store::CHAT_FILE_MAX_BYTES,
@@ -4171,6 +4164,12 @@ fn thread_attachments(shared: &Shared, value: &Value, app: Option<&Value>) -> Re
     ))
 }
 
+/// CAD-574: `thread_send`'s `refs` — at most eight `{kind,id}` subjects
+/// of needs-me rows the operator's message cites. The array is
+/// normalized to `{kind,id}` pairs only — an extra key refuses the
+/// whole call, like the verb's field allowlist. The stored entry
+/// carries them so the board can render the citation and the retry
+/// check can compare them.
 fn thread_refs(value: &Value) -> Result<Value> {
     let arr = value.as_array().ok_or_else(|| {
         Error::rejected("refs must be an array of {\"kind\":…, \"id\":…} subjects")
@@ -4317,7 +4316,7 @@ fn app_hint_notice(hint: &Value) -> Option<String> {
 /// verb. Names are the sanitized basenames stored at upload (no path,
 /// no control chars); each is still flattened to one quoted line so a
 /// hostile name never shapes the prompt. `None` when the rows cannot
-/// render (the message then delivers exactly as queued).
+/// render (the caller then says so rather than omitting the envelope).
 fn attachments_envelope(files: &[Value]) -> Option<String> {
     if files.is_empty() || files.len() > store::CHAT_FILE_MAX_PER_MESSAGE {
         return None;

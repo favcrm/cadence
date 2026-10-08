@@ -148,10 +148,10 @@ pub struct Manifest {
 
 impl Manifest {
     /// The installation's reserved `file.upload` declaration, if any
-    /// (CAD-1168/CAD-1114 subset). Declared is not available: the host
-    /// upload service is not implemented, and a later scoped integration
-    /// must re-prove the current exact-digest consent and this declaration
-    /// at upload/reference/read rather than trust a browser projection.
+    /// (CAD-1168/CAD-1114 subset). A declaration is not a grant: the
+    /// chat upload service re-proves the current exact-digest consent and
+    /// this declaration at every upload, reference and read, never from a
+    /// browser projection.
     pub fn file_upload(&self) -> Option<&CapabilityNeed> {
         self.capabilities
             .values()
