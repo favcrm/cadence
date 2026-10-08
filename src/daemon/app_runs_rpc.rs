@@ -121,7 +121,8 @@ impl Shared {
             .ok_or_else(|| Error::internal("created run has no id"))?
             .to_string();
         let mut run = created;
-        if run["state"] == "awaiting_approval" {
+        let mut replayed = run["state"] != "awaiting_approval";
+        if !replayed {
             let digest = required_str(&run, "snapshot_digest")?.to_string();
             let approved = self.with_app_run_current(&id, |bundle| {
                 self.store
@@ -135,15 +136,36 @@ impl Shared {
                     if !matches!(shown["state"].as_str(), Some("approved" | "running")) {
                         return Err(error);
                     }
+                    replayed = true;
                     shown
                 }
             };
         }
         if matches!(run["state"].as_str(), Some("approved" | "running")) {
-            run = self.dispatch_app_run(&id)?;
+            run = self.dispatch_started_run(&id, replayed)?;
             self.auto_resume_tick();
         }
         Ok(run)
+    }
+
+    /// Dispatch the run `app_run_start` just created or approved. A replay
+    /// found the run already approved or running, so a worker (or a cancel)
+    /// may finish it between that read and this dispatch; the dispatch then
+    /// sees a terminal run and refuses it as "approval absent or stale".
+    /// For a replay that is the answer the caller would have got a moment
+    /// later, so return the run as it now stands. A first start that is
+    /// refused still fails.
+    fn dispatch_started_run(&self, id: &str, replayed: bool) -> Result<Value> {
+        match self.dispatch_app_run(id) {
+            Err(error) if replayed => {
+                let shown = self.store.app_run_show(id)?;
+                match shown["state"].as_str() {
+                    Some("succeeded" | "failed" | "cancelled") => Ok(shown),
+                    _ => Err(error),
+                }
+            }
+            other => other,
+        }
     }
 
     /// The one run-creation path: `app_run_create` (owner and workers named by
