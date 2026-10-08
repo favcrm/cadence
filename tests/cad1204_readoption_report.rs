@@ -7,6 +7,8 @@ use cadence_agent::{
     store::{Message, Store},
 };
 use std::{
+    io::{BufRead, BufReader, Write},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Child, Command, Output},
     thread,
@@ -229,7 +231,7 @@ fn text(out: &Output) -> String {
         String::from_utf8_lossy(&out.stderr)
     )
 }
-fn result(root: &Path, id: &str, token: &str, alias: Option<&str>) -> Output {
+fn result(root: &Path, id: &str, token: &str) -> Output {
     let mut c = Fx::command(
         root,
         &[
@@ -242,10 +244,31 @@ fn result(root: &Path, id: &str, token: &str, alias: Option<&str>) -> Output {
             "acceptance report",
         ],
     );
-    if let Some(a) = alias {
-        c.env("CADENCE_ALIAS", a);
-    }
     reaper::output(&mut c).unwrap()
+}
+fn forged_alias_report(root: &Path, id: &str, token: &str) -> serde_json::Value {
+    let socket = root.join("state/cadence.sock");
+    let stream = UnixStream::connect(socket).expect("connect directly to isolated daemon");
+    writeln!(
+        &stream,
+        "{}",
+        serde_json::json!({
+            "method": "message_report",
+            "params": {
+                "kind": "result",
+                "message": id,
+                "token": token,
+                "text": "acceptance report",
+                "alias": "forged-alias"
+            }
+        })
+    )
+    .expect("write forged-alias RPC frame");
+    let mut response = String::new();
+    BufReader::new(stream)
+        .read_line(&mut response)
+        .expect("read forged-alias RPC response");
+    serde_json::from_str(&response).expect("parse forged-alias RPC response")
 }
 fn wait_file(path: &Path) {
     let until = Instant::now() + Duration::from_secs(10);
@@ -277,7 +300,7 @@ fn pending_report_is_held_then_completed_once_after_real_readoption() {
     let root = fx.root.clone();
     let id = before.id.clone();
     let tok = token.clone();
-    let report = thread::spawn(move || result(&root, &id, &tok, None));
+    let report = thread::spawn(move || result(&root, &id, &tok));
     thread::sleep(Duration::from_millis(100));
     assert!(
         !report.is_finished(),
@@ -297,7 +320,7 @@ fn pending_report_is_held_then_completed_once_after_real_readoption() {
     );
     let done = fx.store().message(&before.id).unwrap().unwrap();
     assert_eq!(done.state, "completed");
-    let resend = result(&fx.root, &before.id, &token, None);
+    let resend = result(&fx.root, &before.id, &token);
     let after = fx.store().message(&before.id).unwrap().unwrap();
     assert_eq!(after.state, "completed");
     assert!(
@@ -322,34 +345,51 @@ fn invalid_identity_and_dead_pane_fail_closed_during_pending_adoption() {
     fx.start();
     wait_file(&entered);
     let cases = [
-        (message.id.clone(), "forged-token".to_owned(), None),
-        ("different-message".to_owned(), token.clone(), None),
-        (
-            message.id.clone(),
-            token.clone(),
-            Some("forged-alias".to_owned()),
-        ),
+        (message.id.clone(), "forged-token".to_owned()),
+        ("different-message".to_owned(), token.clone()),
     ];
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let invalid_reports: Vec<_> = cases
         .into_iter()
-        .map(|(id, tok, alias)| {
+        .map(|(id, tok)| {
             let root = fx.root.clone();
             let started = started_tx.clone();
             thread::spawn(move || {
                 started.send(()).unwrap();
-                result(&root, &id, &tok, alias.as_deref())
+                result(&root, &id, &tok)
             })
         })
         .collect();
+    let alias_root = fx.root.clone();
+    let alias_id = message.id.clone();
+    let alias_token = token.clone();
+    let (alias_started_tx, alias_started_rx) = std::sync::mpsc::channel();
+    let forged_alias = thread::spawn(move || {
+        alias_started_tx.send(()).unwrap();
+        forged_alias_report(&alias_root, &alias_id, &alias_token)
+    });
+    alias_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("forged-alias RPC caller did not start during pending adoption");
     drop(started_tx);
     for _ in 0..invalid_reports.len() {
         started_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("invalid report caller did not start during pending adoption");
     }
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        forged_alias.is_finished(),
+        "forged-alias RPC was held instead of rejected during pending adoption"
+    );
+    let alias_response = forged_alias.join().unwrap();
+    assert_eq!(
+        alias_response["ok"], false,
+        "forged alias was not refused: {alias_response}"
+    );
     let before_release = fx.store().message(&message.id).unwrap().unwrap();
     assert_eq!(before_release.state, "running");
+    assert_eq!(before_release.turn_id, message.turn_id);
     assert_eq!(
         before_release.result, message.result,
         "invalid reports changed the result while adoption was pending"
@@ -386,9 +426,9 @@ fn invalid_identity_and_dead_pane_fail_closed_during_pending_adoption() {
     assert_eq!(after_settle.turn_id, message.turn_id);
     assert_eq!(after_settle.result, message.result);
     // The same forged identities remain refused after the pending window.
-    let forged = result(&fx.root, &message.id, "forged-token-after", None);
-    let mismatch = result(&fx.root, "different-message-after", &token, None);
-    let alias = result(&fx.root, &message.id, &token, Some("forged-alias"));
+    let forged = result(&fx.root, &message.id, "forged-token-after");
+    let mismatch = result(&fx.root, "different-message-after", &token);
+    let alias = forged_alias_report(&fx.root, &message.id, &token);
     assert!(
         !forged.status.success(),
         "post-window forged token accepted"
@@ -397,7 +437,10 @@ fn invalid_identity_and_dead_pane_fail_closed_during_pending_adoption() {
         !mismatch.status.success(),
         "post-window mismatched message accepted"
     );
-    assert!(!alias.status.success(), "post-window forged alias accepted");
+    assert_eq!(
+        alias["ok"], false,
+        "post-window forged alias accepted: {alias}"
+    );
     let after_invalid = fx.store().message(&message.id).unwrap().unwrap();
     assert_eq!(after_invalid.state, "running");
     assert_eq!(after_invalid.turn_id, message.turn_id);
@@ -417,7 +460,7 @@ fn dead_pane_at_adoption_refuses_pending_report_without_completion() {
     let root = fx.root.clone();
     let id = message.id.clone();
     let tok = token.clone();
-    let pending = thread::spawn(move || result(&root, &id, &tok, None));
+    let pending = thread::spawn(move || result(&root, &id, &tok));
     thread::sleep(Duration::from_millis(50));
     assert!(!pending.is_finished());
     let state = fx.root.join("tmux/state.json");
