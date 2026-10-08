@@ -1495,20 +1495,23 @@ impl Model {
             w.monitoring = monitoring_fp;
             frames.push(legacy_frame("monitoring"));
         }
-        if issues || jobs || agents || w.cards_stale {
-            if snap.failed {
-                // Cards built from the stand-in would lose their bindings
-                // and job state, and nothing would repair them once the
-                // daemon is back with the same data: rebuild then.
-                w.cards_stale = true;
-            } else {
-                w.cards_stale = false;
-                let (cards, plans) = self.entities(&snap);
-                diff_frames("issue", &w.cards, &cards, frames);
-                diff_frames("plan", &w.plans, &plans, frames);
-                w.cards = fps(&cards);
-                w.plans = fps(&plans);
-            }
+        if snap.failed {
+            // Cards, plans and agent rows read from the stand-in are
+            // stripped or empty, and a client that refetches mid-outage
+            // holds them. Forget what was published so the first good tick
+            // upserts every card, plan and agent row again, whatever
+            // changed meanwhile.
+            w.cards.clear();
+            w.plans.clear();
+            w.rows.clear();
+            w.cards_stale = true;
+        } else if issues || jobs || agents || w.cards_stale {
+            w.cards_stale = false;
+            let (cards, plans) = self.entities(&snap);
+            diff_frames("issue", &w.cards, &cards, frames);
+            diff_frames("plan", &w.plans, &plans, frames);
+            w.cards = fps(&cards);
+            w.plans = fps(&plans);
         }
         let fresh = self.freshness(&snap);
         let error_moved = (fresh["refresh_error"] == json!(true)) != w.refresh_error;
@@ -1973,13 +1976,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cards_changed_during_an_outage_are_rebuilt_with_their_bindings_on_recovery() {
+    /// A tracker with card CAD-1 bound to agent `w` by the daemon, and a
+    /// switch that makes every daemon fetch fail with the real stand-in.
+    #[allow(clippy::type_complexity)]
+    fn outage_fixture() -> (
+        tempfile::TempDir,
+        Arc<Model>,
+        Arc<std::sync::atomic::AtomicBool>,
+        Box<dyn Fn(&str)>,
+    ) {
         let tmp = tempfile::TempDir::new().unwrap();
         let pm = Pm::init(&tmp.path().join("pm")).unwrap();
         issue_write::project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
-        let write_card = |title: &str| {
-            let dir = pm.dir.join("cadence").join("CAD-1");
+        let pm_dir = pm.dir.clone();
+        let write_card = move |title: &str| {
+            let dir = pm_dir.join("cadence").join("CAD-1");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join("issue.md"),
@@ -2002,7 +2013,7 @@ mod tests {
                 agents: if failed {
                     agents_payload_from(Path::new("/nonexistent/state"), None, None)
                 } else {
-                    json!({"daemon": "reachable", "agents": [],
+                    json!({"daemon": "reachable", "agents": [{"alias": "w"}],
                            "by_issue": {"CAD-1": [{"alias": "w"}]}})
                 },
                 agents_fp: (!failed).then_some(1),
@@ -2012,13 +2023,20 @@ mod tests {
             }
         });
         let model = Arc::new(Model::new(Path::new("/nonexistent/state"), &pm.dir, fetch));
-        let issue_frames = |frames: &[Arc<str>]| -> Vec<String> {
-            frames
-                .iter()
-                .filter(|f| f.starts_with("event: issue\n"))
-                .map(|f| f.to_string())
-                .collect()
-        };
+        (tmp, model, down, Box::new(write_card))
+    }
+
+    fn issue_frames(frames: &[Arc<str>]) -> Vec<String> {
+        frames
+            .iter()
+            .filter(|f| f.starts_with("event: issue\n"))
+            .map(|f| f.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn cards_changed_during_an_outage_are_rebuilt_with_their_bindings_on_recovery() {
+        let (tmp, model, down, write_card) = outage_fixture();
         let mut watch = blank_watch();
         let mut frames = Vec::new();
         model.tick(&mut watch, &mut frames);
@@ -2034,7 +2052,7 @@ mod tests {
         down.store(true, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(20));
         write_card("second");
-        std::fs::write(pm.dir.join("note.md"), "x").unwrap();
+        std::fs::write(tmp.path().join("pm").join("note.md"), "x").unwrap();
         frames.clear();
         model.tick(&mut watch, &mut frames);
         assert!(
@@ -2051,6 +2069,47 @@ mod tests {
                 .iter()
                 .any(|f| f.contains("\"alias\":\"w\"") && f.contains("second")),
             "recovery left the card stripped: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn a_client_that_refetched_mid_outage_gets_cards_and_agents_upserted_on_recovery() {
+        let (_tmp, model, down, _write_card) = outage_fixture();
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        // Nothing changes on disk during the outage; the client's own
+        // `/api/issues` read is built from the stand-in.
+        model.invalidate();
+        down.store(true, Ordering::SeqCst);
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        assert!(issue_frames(&frames).is_empty(), "{frames:?}");
+        let pm = Pm::at(&model.pm_dir).unwrap();
+        let read = model.board(&pm, None);
+        assert!(
+            read.by_issue.get("CAD-1").is_none(),
+            "the read was not stripped"
+        );
+        assert_eq!(
+            model.agents()["agents"],
+            json!([]),
+            "the read was not empty"
+        );
+        down.store(false, Ordering::SeqCst);
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        assert!(
+            issue_frames(&frames)
+                .iter()
+                .any(|f| f.contains("\"alias\":\"w\"")),
+            "the stripped cards were never repaired: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.starts_with("event: agent\n") && f.contains("\"alias\":\"w\"")),
+            "the emptied agent list was never repaired: {frames:?}"
         );
     }
 
