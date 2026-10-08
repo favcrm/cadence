@@ -153,6 +153,7 @@ export default function TodoCard({
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sent, setSent] = useState(false);
+  const [sending, setSending] = useState(false);
   const action = need.action;
   const answer = action.type === "answer" ? (need as HomeNeed & { action: { type: "answer" } }) : null;
   const yesNo = answer && answer.action.options.length === 2 ? answer : null;
@@ -191,9 +192,16 @@ export default function TodoCard({
     );
   };
   const fixIt = () => {
-    sendToMaster(fixPrompt(need, title), undefined, needRefs(need));
-    setSent(true);
-    onSent();
+    if (sending) return;
+    setSending(true);
+    setError(null);
+    void sendToMaster(fixPrompt(need, title), undefined, needRefs(need)).then((r) => {
+      setSending(false);
+      if (r.ok) {
+        setSent(true);
+        onSent();
+      } else setError(`It couldn't be sent to Master. ${r.error}`);
+    });
   };
   const control = () => {
     if (spec.place === "drawer") onReview(need.key);
@@ -294,7 +302,7 @@ export default function TodoCard({
       type="button"
       className={`btn btn-sm ${spec.control === "Allow" ? "btn-primary" : ""}`}
       aria-expanded={spec.place === "inline" ? open : undefined}
-      disabled={spec.place !== "drawer" && !!block}
+      disabled={spec.place !== "drawer" && (!!block || sending)}
       title={spec.place !== "drawer" && block ? READ_ONLY_COPY : undefined}
       onClick={control}
     >

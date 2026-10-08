@@ -73,6 +73,11 @@ export default function PermissionCard({
           {card.cwd ? <p className="text-micro text-ink-500 break-all">{card.cwd}</p> : null}
         </>
       )}
+      {compact && card.risk !== "low" ? (
+        <p className="text-micro text-warn" data-permission-risk={card.risk}>
+          {card.risk === "high" ? "High risk" : "Some risk"}: Master wants to run a command that can change or delete things.
+        </p>
+      ) : null}
       {card.reason ? (
         <p className={`text-micro text-ink-500 ${compact ? "line-clamp-2 break-words" : ""}`}>{card.reason}</p>
       ) : null}

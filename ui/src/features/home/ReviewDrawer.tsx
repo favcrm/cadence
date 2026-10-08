@@ -282,7 +282,7 @@ function IdeaReview({ need, readOnly, index, total, onDone, onClose }: ReviewPro
       need={need}
       verb="Approve idea"
       title={detail?.title ?? "Idea"}
-      subtitle={`Waiting ${waiting(need)}`}
+      subtitle={`Waiting ${ageWords(need.age)}`}
       onClose={onClose}
       body={
         !detail ? (

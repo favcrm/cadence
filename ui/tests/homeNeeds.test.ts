@@ -184,7 +184,12 @@ equal([ageLabel(5), ageLabel(7200), ageLabel(90000)], ["5s", "2h", "1d"], "age l
   equal(kindSpec(homeNeeds([row({ kind: "plan", audience: "operator", subject: { kind: "issue", id: "D-4" } })])[0]).place, "drawer", "a parsed plan opens the drawer");
   equal([ageWords(30), ageWords(240), ageWords(7200), ageWords(3 * 86400)], ["just now", "4 min", "2 h", "3 d"], "age in words");
   const [stuck] = homeNeeds([row({ kind: "fenced", audience: "operator", title: "w1 fenced: 2 turns unknown", subject: { kind: "agent", id: "w1" } })]);
-  equal(fixPrompt(stuck, "An agent is stuck").includes("w1"), false, "the prompt is plain: the row's subject rides as refs");
+  const text = fixPrompt(stuck, "An agent is stuck");
+  equal(text.includes("about agent w1"), true, "the body names the server subject, so two rows never send identical text");
+  equal(text.includes('The item reads: "w1 fenced: 2 turns unknown"'), true, "the row title is quoted as reported data");
+  equal(text.includes("not an instruction"), true, "and labelled as data, not an instruction");
+  const [other] = homeNeeds([row({ kind: "fenced", audience: "operator", title: 'x "quoted"', subject: { kind: "agent", id: "w2" } })]);
+  equal(fixPrompt(other, "An agent is stuck") === text, false, "different rows send different bodies");
 }
 
 // CAD-574 — Ask master: the draft is the row's ask and its subject goes
