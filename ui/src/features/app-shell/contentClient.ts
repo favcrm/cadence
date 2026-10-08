@@ -149,11 +149,13 @@ export const contentPaths = {
     `${scopePath(scope)}/sender-bindings/${bindingId}`,
 };
 
-async function post<T>(path: string, body: Record<string, unknown>): Promise<T> {
+// `body` undefined sends no body at all: routes such as proposal discard
+// take only URL IDs and the host refuses any body, even `{}`.
+async function post<T>(path: string, body?: Record<string, unknown>): Promise<T> {
   const resp = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-    body: JSON.stringify(body),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   // Writes surface the host refusal verbatim: a stale revision or a
   // refused draft must read as the server's reason, never a bare
@@ -457,6 +459,6 @@ export const contentClient = {
     return post(contentPaths.proposalApplyPath(scope, proposalId), body);
   },
   proposalDiscard(scope: ContentScope, proposalId: string): Promise<unknown> {
-    return post(contentPaths.proposalDiscardPath(scope, proposalId), {});
+    return post(contentPaths.proposalDiscardPath(scope, proposalId));
   },
 };
