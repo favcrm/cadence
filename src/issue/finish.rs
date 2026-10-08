@@ -4024,3 +4024,202 @@ mod tests {
         assert!(stale_probe_reason(&probe2, &target("CAD-1")).is_none());
     }
 }
+
+/// CAD-1196 reviewer-written acceptance check for the process-enumeration
+/// gate: every refusal is driven through `process_use_under_from_proc_root`
+/// (the real guard) over a synthetic proc tree that starts from a state
+/// where the scan completes cleanly, so each case isolates one guard.
+#[cfg(all(test, target_os = "linux"))]
+mod cad1196_acceptance {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use tempfile::{Builder, TempDir};
+
+    struct Proc {
+        _root: TempDir,
+        proc_root: PathBuf,
+        lane: PathBuf,
+    }
+
+    impl Proc {
+        fn new() -> Self {
+            let root = Builder::new().prefix("c1196u-").tempdir_in("/tmp").unwrap();
+            let proc_root = root.path().join("proc");
+            let lane = root.path().join("lane");
+            std::fs::create_dir_all(&lane).unwrap();
+            std::fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+            std::fs::create_dir_all(proc_root.join("2/ns")).unwrap();
+            let canon = proc_root.canonicalize().unwrap();
+            let p = Self {
+                _root: root,
+                proc_root,
+                lane,
+            };
+            p.mountinfo(&canon, "rw");
+            std::fs::write(p.proc_root.join("self/kernel-release"), "7.0.0\n").unwrap();
+            p.kthreadd(2_097_152);
+            symlink("pid:[42]", p.proc_root.join("self/ns/pid")).unwrap();
+            symlink("pid:[42]", p.proc_root.join("2/ns/pid")).unwrap();
+            std::fs::write(
+                p.proc_root.join("self/status"),
+                "Name:\tt\nState:\tR (running)\nNSpid:\t7\nCapPrm:\t0000000000000000\n",
+            )
+            .unwrap();
+            p.process(2, Path::new("/"), &[]);
+            p
+        }
+
+        fn mountinfo(&self, canon: &Path, opts: &str) {
+            std::fs::write(
+                self.proc_root.join("self/mountinfo"),
+                format!(
+                    "1 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc {opts}\n",
+                    canon.display()
+                ),
+            )
+            .unwrap();
+        }
+
+        fn kthreadd(&self, flags: u64) {
+            std::fs::write(
+                self.proc_root.join("2/stat"),
+                format!("2 (kthreadd) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"),
+            )
+            .unwrap();
+        }
+
+        fn relink(&self, rel: &str, target: &str) {
+            let path = self.proc_root.join(rel);
+            let _ = std::fs::remove_file(&path);
+            symlink(target, path).unwrap();
+        }
+
+        /// An own-uid, fully readable process.
+        fn process(&self, pid: u32, cwd: &Path, fds: &[&Path]) -> PathBuf {
+            let dir = self.proc_root.join(pid.to_string());
+            std::fs::create_dir_all(dir.join("fd")).unwrap();
+            let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            std::fs::write(
+                dir.join("status"),
+                format!(
+                    "Name:\tfixture\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nGroups:\t{gid}\nCapEff:\t0000000000000000\nCapPrm:\t0000000000000000\n"
+                ),
+            )
+            .unwrap();
+            symlink(cwd, dir.join("cwd")).unwrap();
+            for (i, fd) in fds.iter().enumerate() {
+                symlink(fd, dir.join("fd").join((3 + i).to_string())).unwrap();
+            }
+            dir
+        }
+
+        fn scan(&self) -> ProcessUse {
+            process_use_under_from_proc_root(&self.lane, &self.proc_root).unwrap()
+        }
+
+        fn refused(&self, expect: &str) {
+            let uses = self.scan();
+            let err = uses.enumeration_error.expect("scan must be incomplete");
+            assert!(err.contains(expect), "expected {expect:?} in {err:?}");
+        }
+    }
+
+    #[test]
+    fn complete_synthetic_view_with_harmless_process_is_clean() {
+        let p = Proc::new();
+        p.process(900, Path::new("/"), &[]);
+        let uses = p.scan();
+        assert!(
+            uses.enumeration_error.is_none(),
+            "{:?}",
+            uses.enumeration_error
+        );
+        assert!(uses.cwd.is_empty() && uses.fd.is_empty());
+    }
+
+    #[test]
+    fn own_uid_cwd_or_fd_inside_the_lane_is_named() {
+        let p = Proc::new();
+        p.process(901, &p.lane.canonicalize().unwrap(), &[]);
+        p.process(902, Path::new("/"), &[&p.lane.canonicalize().unwrap()]);
+        let uses = p.scan();
+        assert_eq!(uses.cwd, vec![901]);
+        assert_eq!(uses.fd, vec![902]);
+    }
+
+    #[test]
+    fn own_uid_unexplained_permission_denied_is_an_incomplete_scan() {
+        // Entry (cwd) is owned by the caller, so the kernel policy cannot
+        // explain the EACCES on fd/: it must refuse, not excuse.
+        let p = Proc::new();
+        let dir = p.process(903, Path::new("/"), &[]);
+        std::fs::set_permissions(dir.join("fd"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let uses = p.scan();
+        std::fs::set_permissions(dir.join("fd"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            uses.enumeration_error.is_some(),
+            "unexplained EACCES on an own-uid process was excused"
+        );
+    }
+
+    #[test]
+    fn hidepid_hidden_view_is_refused() {
+        let p = Proc::new();
+        let canon = p.proc_root.canonicalize().unwrap();
+        p.mountinfo(&canon, "rw,hidepid=2");
+        p.refused("hidepid");
+    }
+
+    #[test]
+    fn non_canonical_or_other_pid2_namespace_link_is_refused() {
+        for bad in [
+            "pid:[042]",
+            "pid:[0]",
+            "net:[42]",
+            "pid:[43]",
+            "garbage",
+            "pid:[42]x",
+        ] {
+            let p = Proc::new();
+            p.relink("2/ns/pid", bad);
+            let uses = p.scan();
+            assert!(
+                uses.enumeration_error.is_some(),
+                "PID 2 link {bad:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn caller_namespace_link_must_parse() {
+        for bad in ["garbage", "pid:[0]", "pid:[042]"] {
+            let p = Proc::new();
+            p.relink("self/ns/pid", bad);
+            assert!(p.scan().enumeration_error.is_some(), "caller link {bad:?}");
+        }
+    }
+
+    #[test]
+    fn pid2_must_be_kthreadd() {
+        let p = Proc::new();
+        p.kthreadd(0); // no PF_KTHREAD
+        p.refused("kthreadd");
+        let p = Proc::new();
+        std::fs::write(
+            p.proc_root.join("2/stat"),
+            "2 (bash) S 0 0 0 0 -1 2097152 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        p.refused("kthreadd");
+    }
+
+    #[test]
+    fn nspid_proof_for_an_empty_pid2_link() {
+        // The synthetic seam cannot make an empty symlink, so the empty-link
+        // branch is driven through its two decisions directly.
+        assert!(status_has_single_nspid("NSpid:\t7\n"));
+        assert!(!status_has_single_nspid("NSpid:\t7\t1\n"));
+        assert!(!status_has_single_nspid("NSpid:\t7\t3\t1\n"));
+        assert!(!status_has_single_nspid(""));
+    }
+}
