@@ -20,7 +20,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use super::execfd::OpenKind;
-use super::{acct, Error, Layer, Result, Role, Segments};
+use super::{acct, Error, Result, Role, Segments};
 
 /// `linux/openat2.h` `struct open_how` — matches the in-tree declaration in
 /// `src/platform/local.rs`.
@@ -162,8 +162,8 @@ where
 }
 
 /// `openat2`-relative open of a canonical absolute `path`, walking each
-/// component beneath the pinned `/` dirfd. This is the exec-target walk used
-/// by `open_bound`: every ancestor must be an **immutable root-owned**
+/// component beneath the pinned `/` dirfd. This is the walk used by
+/// the `open_at2` callers: every ancestor must be an **immutable root-owned**
 /// directory — owned by uid 0 and not group- or other-writable — so no
 /// intermediate a guest or group could reshape ever sits on the path to a
 /// binary the kernel will exec. The leaf itself is `fstat`-checked by the
@@ -265,8 +265,8 @@ impl ProtectedTopology {
         let guest = resolve_uid(acct::GUEST)?;
         let guest_gid = resolve_primary_gid(acct::GUEST)?;
         let shared = resolve_gid(acct::SHARED_GROUP)?;
-        // `cadence-launch` is the helper's group — verify it resolves so the
-        // exec pin's expected gid can be checked (execfd consumes it).
+        // `cadence-launch` is the helper's group — verify it resolves so a
+        // missing group refuses before any view is opened.
         let _launch = resolve_gid(acct::LAUNCH_GROUP)?;
         if agent_uid == 0 || agent_uid == supervisor || agent_uid != guest {
             return Err(Error::rejected(format!(
@@ -479,8 +479,8 @@ impl ProtectedTopology {
     }
 
     /// The hop policy for the dynamic per-alias view: the skeleton rows plus
-    /// the alias/generation segment rows this launch names. Both `verify_view`
-    /// and `view_dir` walk against this so the per-hop check knows every
+    /// the alias/generation segment rows this launch names. `verify_view`
+    /// walks against this so the per-hop check knows every
     /// intermediate on the protected view path — an alias or generation dir
     /// that is not in the policy is refused.
     fn view_policy(&self, segs: &Segments) -> HopPolicy {
@@ -638,27 +638,6 @@ impl ProtectedTopology {
             &self.skeleton_policy(),
         )
     }
-
-    #[allow(dead_code)]
-    // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
-    /// Open the per-launch view dirfd for `layer` — verified, not created.
-    pub(crate) fn view_dir(&self, segs: &Segments, layer: Layer) -> Result<OwnedFd> {
-        let path = match layer {
-            Layer::Durable => format!("/srv/cadence/guest-views/{}/durable", segs.alias_hex()),
-            Layer::Generation => {
-                format!(
-                    "/srv/cadence/guest-views/{}/{}",
-                    segs.alias_hex(),
-                    segs.generation_hex()
-                )
-            }
-        };
-        // Walk the view path under the *view* policy — the alias/generation
-        // segments have their own rows; a skeleton-only policy would refuse
-        // them as unprofiled.
-        let policy = self.view_policy(segs);
-        self.check_with(&path, self.supervisor, self.shared, 0o750, true, &policy)
-    }
 }
 
 /// The per-hop policy check for a *protected* (skeleton or view) path. A hop
@@ -731,8 +710,8 @@ fn resolve_uid(name: &str) -> Result<u32> {
     Ok(unsafe { (*pw).pw_uid })
 }
 
-/// NSS group resolution exposed to `execfd` for the exec pin's expected-gid
-/// check — same rule: by name, never a hardcoded number or caller value.
+/// NSS group resolution exposed to the installer constructor — by name,
+/// never a hardcoded number or caller value.
 pub(crate) fn resolve_gid_pub(name: &str) -> Result<u32> {
     resolve_gid(name)
 }
