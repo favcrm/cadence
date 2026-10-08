@@ -290,6 +290,15 @@ export default function App() {
   const metaRequest = useRef(0);
   const metaInFlight = useRef<{ scope: string; promise: Promise<Meta | null> } | null>(null);
   const [credentialGeneration, setCredentialGeneration] = useState(0);
+  // CAD-1193: the two unknowns stay distinct. `meta === null` alone is
+  // "checking"; a completed probe that could not answer — the fetch
+  // failed/aborted, or the server answered `operator: null` /
+  // `signed_in: null` — marks the check `unavailable` so the surfaces
+  // can say access could not be confirmed and offer a bounded retry,
+  // instead of showing "Checking…" forever. Never a sign-out, never a
+  // resolved non-operator, and never authority: only an answered probe
+  // clears it.
+  const [metaUnavailable, setMetaUnavailable] = useState(false);
 
   /** One bounded meta read. The same tab key shares one in-flight
    *  request; a different key (sign-in/sign-out) starts a fresh probe
@@ -335,6 +344,9 @@ export default function App() {
       metaInFlight.current = null;
       setCredentialGeneration((generation) => generation + 1);
       setMeta(null);
+      // A new credential owns its own check from scratch — the last
+      // key's outcome (including its failure) never follows it.
+      setMetaUnavailable(false);
     }
     const asked = !operatorKnown.current;
     let expectedKey = sentKey;
@@ -349,6 +361,7 @@ export default function App() {
           // below does that.
           operatorKnown.current = false;
           setMeta(null);
+          setMetaUnavailable(true);
         }
         return;
       }
@@ -367,16 +380,37 @@ export default function App() {
       }
       if (changed && !asked) {
         operatorKnown.current = false;
+        // The follow-up proof gets a payload without an `operator`
+        // field, so it cannot confuse a stale value for a new answer.
         setMeta({ ...next, operator: undefined });
+        setMetaUnavailable(true);
         metaProbe(true, sentKey).then((fresh) => {
           if (!current() || fresh === null) return;
           metaIdentity.current = JSON.stringify([fresh.signed_in ?? null, fresh.session?.id ?? null, fresh.read_only]);
           operatorKnown.current = typeof fresh.operator === "boolean";
           setMeta(fresh);
+          setMetaUnavailable(fresh.operator === null || fresh.operator === undefined);
         });
         return;
       }
-      if (typeof next.operator === "boolean") operatorKnown.current = true;
+      if (typeof next.operator === "boolean") {
+        operatorKnown.current = true;
+        // A proven role — the check answered; unknown is behind us.
+        setMetaUnavailable(false);
+      } else if (next.operator === null) {
+        // The server answered but its proof dependencies could not —
+        // the completed check is unavailable, not still checking.
+        setMetaUnavailable(true);
+      } else if (!asked) {
+        // A bare poll answered the session fields and preserved the
+        // proven role below — the check is answered, not unavailable.
+        setMetaUnavailable(false);
+      } else {
+        // An asked probe answered without an `operator` field at all
+        // (a pre-CAD-432 daemon): the proof never ran, so the state is
+        // unavailable rather than a resolved role or a pending check.
+        setMetaUnavailable(true);
+      }
       setMeta((prev) => ({ ...next, operator: next.operator ?? (!asked && !changed ? prev?.operator : undefined) }));
     });
     void resources.projects.refresh();
@@ -385,6 +419,17 @@ export default function App() {
     if (overviewWantedRef.current) void resources.overview.refresh();
     loadDetail();
   }, [loadDetail, metaProbe]);
+
+  // The Retry an unavailable access check offers (CAD-1193): a real
+  // re-probe of this credential's metadata — the failed probe's slot
+  // is dropped so the same key starts one fresh bounded read instead
+  // of joining a settled-null promise. Never a reload, never a
+  // sign-in, and never a key clear: ownership rules in `refresh` are
+  // unchanged.
+  const retryAccess = useCallback(() => {
+    metaInFlight.current = null;
+    refresh();
+  }, [refresh]);
 
   useEffect(() => {
     refresh();
@@ -716,6 +761,18 @@ export default function App() {
   const activeId = onAppScreen && routeInstallId !== null
     ? menuApps.find((a) => a.installId === routeInstallId)?.installId ?? null
     : null;
+  // CAD-1193: one viewer for every consumer — `access` splits the
+  // `operator: null` unknown into "checking" (a probe is still in
+  // flight or has never run) and "unavailable" (a completed probe
+  // could not answer), and `onRetryAccess` gives the surfaces a real
+  // re-check instead of a reload. `operator === true` stays the only
+  // grant; both unknowns and every failure grant nothing.
+  const viewer = {
+    readOnly,
+    operator: meta?.operator ?? null,
+    access: metaUnavailable ? ("unavailable" as const) : ("checking" as const),
+    onRetryAccess: retryAccess,
+  };
   const [last, setLast] = useState<LastApp | null>(() => readLastApp());
   const activeSection = activeId === null ? null : sectionFromSearch(menuApps.find((a) => a.installId === activeId)!.kind, search);
   useEffect(() => {
@@ -767,7 +824,11 @@ export default function App() {
   );
 
   return (
-    <WriteGate.Provider value={meta === null ? "Checking write access…" : block}>
+    <WriteGate.Provider value={meta === null
+      ? metaUnavailable
+        ? "The access check could not confirm this session — writes stay off until it answers."
+        : "Checking write access…"
+      : block}>
     <div
       data-app-shell
       className={`grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 ${
@@ -833,7 +894,7 @@ export default function App() {
               health={health}
               onRefresh={refresh}
             >
-              <SignIn meta={meta} onChange={refresh} />
+              <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryAccess={retryAccess} />
               {staleBuild !== null && staleBuild !== dismissedBuild && (
                 <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
               )}
@@ -890,7 +951,7 @@ export default function App() {
                 health={health}
                 onRefresh={refresh}
               >
-                <SignIn meta={meta} onChange={refresh} />
+                <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryAccess={retryAccess} />
               </StatusChips>
             </div>
           </div>
@@ -1043,7 +1104,7 @@ export default function App() {
           <Epics
             project={route.slug}
             issues={issuesState}
-            viewer={{ readOnly, operator: meta?.operator ?? null }}
+            viewer={viewer}
             onOpenIssue={openIssue}
             onRetry={() => void resources.issues.refresh()}
           />
@@ -1054,7 +1115,7 @@ export default function App() {
         {route.screen === "projects" && route.slug && route.section === "workflows" && (
           <Workflows
             project={route.slug}
-            viewer={{ readOnly, operator: meta?.operator ?? null }}
+            viewer={viewer}
             onOpenIssue={openIssue}
             onHome={() => goRoute({ screen: "home" })}
           />
@@ -1069,7 +1130,7 @@ export default function App() {
           />
         )}
         {route.screen === "apps" && !route.project && (
-          <Apps project={project} viewer={{ readOnly, operator: meta?.operator ?? null }} />
+          <Apps project={project} viewer={viewer} />
         )}
         {route.screen === "appsExplore" && (
           <Explorer viewer={{ readOnly, operator: meta?.operator === true }} />
@@ -1081,8 +1142,8 @@ export default function App() {
           <ManageApp key={route.installId} installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
         {route.screen === "workspaceApp" && (
-          <AppShell installId={route.installId} viewer={{ readOnly, operator: meta?.operator ?? null }} onInstallation={reportInstallation}>
-            <WorkspaceApp installId={route.installId} viewer={{ readOnly, operator: meta?.operator ?? null }} onBack={() => goRoute({ screen: "apps", project: null, name: null })} />
+          <AppShell installId={route.installId} viewer={viewer} onInstallation={reportInstallation}>
+            <WorkspaceApp installId={route.installId} viewer={viewer} onBack={() => goRoute({ screen: "apps", project: null, name: null })} />
           </AppShell>
         )}
         {route.screen === "workspaceAppKey" && (
@@ -1098,7 +1159,7 @@ export default function App() {
           <AppDetail
             project={route.project}
             name={route.name}
-            viewer={{ readOnly, operator: meta?.operator ?? null }}
+            viewer={viewer}
             onOpenIssue={openIssue}
             onHome={() => goRoute({ screen: "home" })}
           />
@@ -1152,16 +1213,16 @@ export default function App() {
         )}
         {route.screen === "settings" && route.section === "models" && <ModelDefaults />}
         {route.screen === "settings" && route.section === "connections" && (
-          <Connections viewer={{ readOnly, operator: meta?.operator ?? null }} />
+          <Connections viewer={viewer} />
         )}
         {route.screen === "settings" && route.section === "email" && (
-          <EmailSending viewer={{ readOnly, operator: meta?.operator ?? null }} />
+          <EmailSending viewer={viewer} />
         )}
         {route.screen === "settings" && route.section === "account" && <PlatformAccount />}
         {route.screen === "settings" && route.section === "update" && (
-          <Update viewer={{ readOnly, operator: meta?.operator ?? null }} />
+          <Update viewer={viewer} />
         )}
-        {route.screen === "settings" && route.section === "permissions" && <MasterPermissions viewer={{ readOnly, operator: meta?.operator ?? null, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
+        {route.screen === "settings" && route.section === "permissions" && <MasterPermissions viewer={{ ...viewer, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
         {screen === "login" && (
           <Login
             onSignedIn={() => {

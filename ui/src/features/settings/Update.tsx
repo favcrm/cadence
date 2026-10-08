@@ -66,7 +66,14 @@ function outcome(
 export default function Update({
   viewer,
 }: {
-  viewer: { readOnly: boolean; operator: boolean | null };
+  viewer: {
+    readOnly: boolean;
+    operator: boolean | null;
+    /** CAD-1193: splits the `operator: null` unknown into checking vs
+     *  a completed-but-unanswered check. */
+    access?: "checking" | "unavailable" | null;
+    onRetryAccess?: () => void;
+  };
 }) {
   const [status, setStatus] = useState<UpdateStatus | null>(null);
   const [readError, setReadError] = useState<string | null>(null);
@@ -254,7 +261,18 @@ export default function Update({
           Refresh status
         </Button>
       </header>
-      {blocked && <p className="update-access">{blocked}</p>}
+      {blocked && (
+        <p className="update-access">
+          {blocked}
+          {viewer.operator === null && viewer.access === "unavailable" && viewer.onRetryAccess && (
+            // CAD-1193: retry the real access check, not a reload.
+            <>
+              {" "}
+              <Button size="sm" onClick={viewer.onRetryAccess}>Retry access check</Button>
+            </>
+          )}
+        </p>
+      )}
       {readError && (
         <div className="update-notice" data-tone="fail" role="alert">
           <div>

@@ -98,7 +98,14 @@ function enrollErrorMessage(e: unknown): string {
 export default function Connections({
   viewer,
 }: {
-  viewer: { operator: boolean | null; readOnly: boolean };
+  viewer: {
+    operator: boolean | null;
+    readOnly: boolean;
+    /** CAD-1193: splits the `operator: null` unknown into checking
+     *  vs a completed-but-unanswered check. */
+    access?: "checking" | "unavailable" | null;
+    onRetryAccess?: () => void;
+  };
 }) {
   const listRes = viewer.operator ? resources.connections : null;
   const providersRes = viewer.operator ? resources.connectionProviders : null;
@@ -163,10 +170,20 @@ export default function Connections({
       </div>
 
       {viewer.operator === null ? (
-        // CAD-1193: unresolved role — still proving this session, not
-        // a refusal. No connection reads or writes run below.
-        <PageState title="Checking access…">
-          Connections are available to the operator; the board is still proving this session.
+        <PageState title={viewer.access === "unavailable" ? "Access could not be confirmed" : "Checking access…"}>
+          {viewer.access === "unavailable" ? (
+            <>
+              Connections are available to the operator; the board's access
+              check did not answer, so nothing is shown.{" "}
+              {viewer.onRetryAccess && (
+                <Button size="sm" onClick={viewer.onRetryAccess}>
+                  Retry access check
+                </Button>
+              )}
+            </>
+          ) : (
+            "Connections are available to the operator; the board is still proving this session."
+          )}
         </PageState>
       ) : !viewer.operator ? (
         <PageState title="Operator access required">

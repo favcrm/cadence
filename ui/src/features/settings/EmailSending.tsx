@@ -88,8 +88,19 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
         until an operator approves a campaign.
       </p>
       {viewer.operator === null ? (
-        <PageState title="Checking access…">
-          Checking whether this session may manage email sending…
+        <PageState title={viewer.access === "unavailable" ? "Access could not be confirmed" : "Checking access…"}>
+          {viewer.access === "unavailable" ? (
+            <>
+              The board's access check did not answer, so email sending stays closed.{" "}
+              {viewer.onRetryAccess && (
+                <Button size="sm" onClick={viewer.onRetryAccess}>
+                  Retry access check
+                </Button>
+              )}
+            </>
+          ) : (
+            "Checking whether this session may manage email sending…"
+          )}
         </PageState>
       ) : !viewer.operator ? (
         <PageState title="Operator access required">

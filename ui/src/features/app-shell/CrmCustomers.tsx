@@ -293,7 +293,16 @@ function CustomerList({
         )}
       </div>
       {viewer.operator === null && (
-        <Notice>Checking whether this session may inspect customer records…</Notice>
+        viewer.access === "unavailable" ? (
+          // CAD-1193: a completed unanswered check is unavailable, not
+          // still checking — the retry re-runs the real access probe.
+          <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
+            Access could not be confirmed — the board's access check did
+            not answer, so customer records stay closed.
+          </Notice>
+        ) : (
+          <Notice>Checking whether this session may inspect customer records…</Notice>
+        )
       )}
       {viewer.operator === false && (
         <Notice>Sign in as the operator to inspect customer records.</Notice>

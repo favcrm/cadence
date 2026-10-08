@@ -8,10 +8,36 @@ import { IconLock } from "../../ui/icons";
  * browser holds no operator session, else nothing. The signed-in identity lives in AccountMenu (CAD-1030).
  * Nothing on a read-only board (the read-only chip says it all).
  */
-export default function SignIn({ meta, onChange }: { meta: Meta | null; onChange: () => void }) {
+export default function SignIn({
+  meta,
+  onChange,
+  access,
+  onRetryAccess,
+}: {
+  meta: Meta | null;
+  onChange: () => void;
+  /** CAD-1193: how the board's access check currently reads —
+   *  `"unavailable"` when a completed probe could not answer. */
+  access?: "checking" | "unavailable" | null;
+  /** Bounded retry of the access check (the real metadata refresh). */
+  onRetryAccess?: () => void;
+}) {
   // CAD-1193: `signed_in === null` is an unanswerable check —
-  // unavailable, never a sign-out. Nothing is shown until the daemon
-  // answers for real.
+  // unavailable, never a sign-out. A completed check that could not
+  // answer says so explicitly and offers a bounded retry of the real
+  // probe — never the sign-in flow, which cannot fix a stalled check.
+  if (access === "unavailable" && !meta?.read_only) {
+    return (
+      <span className="chip bg-warn/10 text-warn" role="status">
+        Access check unavailable
+        {onRetryAccess && (
+          <button type="button" className="lnk text-warn" onClick={onRetryAccess}>
+            Retry
+          </button>
+        )}
+      </span>
+    );
+  }
   if (!meta || meta.read_only || meta.signed_in === undefined || meta.signed_in === null) return null;
   if (!meta.signed_in) {
     const cmd = meta.login_hint ?? SIGN_IN_COMMAND;

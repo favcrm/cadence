@@ -732,11 +732,28 @@ export default function AppShell({
               <h2 className="text-cardtitle font-medium text-ink-100">
                 {title}
               </h2>
-              <p className="text-secondary text-ink-400 mt-1">
-                Checking whether this session may inspect this
-                installation… If access was denied, the board will say so
-                here.
-              </p>
+              {viewer.access === "unavailable" ? (
+                // CAD-1193: a completed check that could not answer is
+                // unavailable, not still checking and not a sign-out —
+                // the retry re-runs the real metadata probe, never a
+                // reload and never a login.
+                <p className="text-secondary text-ink-400 mt-1">
+                  Access could not be confirmed — the board's access
+                  check did not answer. Write controls stay off and no
+                  records load until it does.{" "}
+                  {viewer.onRetryAccess && (
+                    <Button size="sm" onClick={viewer.onRetryAccess}>
+                      Retry access check
+                    </Button>
+                  )}
+                </p>
+              ) : (
+                <p className="text-secondary text-ink-400 mt-1">
+                  Checking whether this session may inspect this
+                  installation… If access was denied, the board will say so
+                  here.
+                </p>
+              )}
             </main>
           )}
           {!loading && !installation && !loadError && viewer.operator === false && (

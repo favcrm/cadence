@@ -958,10 +958,23 @@ export default function WorkspaceApp({
     },
   ];
   if (viewer.operator === null) {
+    // CAD-1193: "checking" only while a probe is in flight; a completed
+    // unanswered probe is unavailable, with a retry wired to the real
+    // metadata refresh — never a sign-in and never authority.
     return (
       <main className="workspace-app" aria-label="Workspace app" role="status">
         <h1>Workspace app</h1>
-        <p className="wa-alert">Checking whether this session may inspect this installation…</p>
+        {viewer.access === "unavailable" ? (
+          <p className="wa-alert">
+            Access could not be confirmed — the board's access check did
+            not answer. This installation stays closed until it does.{" "}
+            {viewer.onRetryAccess && (
+              <Button onClick={viewer.onRetryAccess}>Retry access check</Button>
+            )}
+          </p>
+        ) : (
+          <p className="wa-alert">Checking whether this session may inspect this installation…</p>
+        )}
       </main>
     );
   }

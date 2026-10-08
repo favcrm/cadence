@@ -115,6 +115,16 @@ export interface Viewer {
    *  still being checked. Unknown is never shown as signed out and
    *  grants nothing: every consumer reads `=== true` as the only yes. */
   operator: boolean | null;
+  /** CAD-1193: when `operator` is `null`, `access` says which unknown
+   *  it is — `"checking"` while the first probe is still in flight,
+   *  `"unavailable"` once a completed probe failed or the server
+   *  could not answer. Absent/`null` reads as the unknown the
+   *  `operator` value already carries; it never grants anything and
+   *  never marks a signed-out or non-operator viewer. */
+  access?: "checking" | "unavailable" | null;
+  /** CAD-1193: a bounded retry of the access check itself — wired to
+   *  the real metadata refresh, never a reload or a sign-in. */
+  onRetryAccess?: () => void;
 }
 
 /**
@@ -150,7 +160,9 @@ export function noMoveReason(stage: WorkStage | null | undefined, viewer: Viewer
   }
   if (viewer.readOnly) return "The board is read-only.";
   if (viewer.operator === null) {
-    return "Checking whether this session may move stages…";
+    return viewer.access === "unavailable"
+      ? "The access check could not confirm this session — stage moves stay off until it answers."
+      : "Checking whether this session may move stages…";
   }
   if (!viewer.operator) {
     return "Stage moves on the board are the operator's. Agents move a stage with `cadence issue epic stage`.";
