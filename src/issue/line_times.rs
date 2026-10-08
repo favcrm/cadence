@@ -130,6 +130,16 @@ fn git(
     }
 }
 
+/// The tracker's current HEAD commit (empty when it has none) — the
+/// revision a lock-free sweep snapshot is stamped with, compared again
+/// under the PM lock (CAD-1257). `Err` when git could not answer in time.
+pub fn tracker_head(pm_dir: &Path, timeout: Duration) -> std::result::Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    Ok(locate(pm_dir, deadline)?
+        .map(|(_, head)| head)
+        .unwrap_or_default())
+}
+
 /// The tracker's git dir and HEAD commit; `None` when it has neither.
 fn locate(
     pm_dir: &Path,

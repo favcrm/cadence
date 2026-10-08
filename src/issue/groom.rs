@@ -29,7 +29,9 @@ use serde_json::{json, Value};
 use crate::error::Result;
 use crate::issue::model::Front;
 use crate::issue::write::{commit_front_with_comment, issue_dir, load_front, save_front};
-use crate::issue::{board, line_times::LineTimes, parse, project, time, Pm};
+use crate::issue::{
+    blocked, board, line_times, line_times::LineTimes, lockseam, parse, project, time, Pm,
+};
 
 /// Tag a stale verdict leaves on a `backlog`/`ready` item — the durable
 /// marker the Overview row and a later pass read. Operators clear it by
@@ -115,6 +117,7 @@ fn touched_paths(root: &Path, since_iso: &str, paths: &[String]) -> Value {
         "--".into(),
     ];
     args.extend(paths.iter().take(PATH_MAX).cloned());
+    lockseam::outside_lock("groom-git-log");
     let out = crate::reaper::output(
         Command::new("git")
             .arg("-C")
@@ -401,85 +404,89 @@ fn groom_with_hooks(
     mut after_locked_snapshot: impl FnMut(),
 ) -> Result<Value> {
     let now = time::now_epoch();
-    // Advisory enumeration: every candidate is reloaded and re-judged
-    // under its own PM lock immediately before the write.
+    // CAD-1257: everything up to the write runs on lock-free snapshots.
+    // The enumeration already applies the eligibility test, so a pass
+    // with nothing eligible never takes the PM lock.
     let issues = board::load_all(&pm.dir, project)?;
     let views = board::views(&pm.config.notes_dir(), issues);
-    let candidates: Vec<String> = views
-        .iter()
-        .filter(|v| {
-            matches!(v.status.as_str(), "backlog" | "ready")
-                && !v.container
-                && !v.issue.front.tags.iter().any(|t| t == "intake")
-                && v.issue.front.kind.is_none() // intake kinds carry `kind`
-        })
-        .map(|v| v.issue.front.id.clone())
-        .collect();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut candidates: Vec<String> = Vec::new();
+    for v in views.iter().filter(|v| open_leaf(v)) {
+        if eligible(v, now, grace_secs) {
+            candidates.push(v.issue.front.id.clone());
+        } else {
+            skipped.push(v.issue.front.id.clone());
+        }
+    }
+    drop(views);
     after_advisory_snapshot();
 
     let mut flagged: Vec<Value> = Vec::new();
     let mut stamped: Vec<String> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
     let mut verdicts: Vec<Value> = Vec::new(); // per-candidate, dry_run
-    for id in candidates {
-        let _lock = pm.lock()?;
-        // Re-derive the whole evidence set under this candidate's lock —
-        // the eligibility fields AND the sibling/container view the
-        // verdict reads (blocked.rs's recheck, same pattern). A sibling
-        // closing or a child appearing between snapshot and lock must not
-        // commit an outdated verdict.
-        let current = board::load_all(&pm.dir, project)?;
-        let live = board::views(&pm.config.notes_dir(), current);
-        let Some(v) = live.iter().find(|v| v.issue.front.id == id) else {
-            continue; // dropped or renamed between snapshot and lock
-        };
-        after_locked_snapshot();
-        // The close-time clock rides the same locked snapshot as the
-        // sibling set: a `done` committed during the race must appear in
-        // `live` AND have a `status_at` time, or `superseded` would be
-        // judged against a close the clock cannot yet date.
-        let times = LineTimes::load(&pm.dir, STATUS_CLOCK_BUDGET).ok();
-        let front = &v.issue.front;
-        // Recheck under the lock: a competing writer can move it off
-        // backlog/ready, mark it intake, or make it a container after the
-        // advisory snapshot.
-        if !matches!(front.status.as_str(), "backlog" | "ready")
-            || v.container
-            || front.tags.iter().any(|t| t == "intake")
-            || front.kind.is_some()
-        {
-            skipped.push(front.id.clone());
-            continue;
-        }
-        if !dormant(front, now, grace_secs)
-            || groomed_recently(front, now, grace_secs)
-            || front.tags.iter().any(|t| t == TRIAGE_TAG)
-        {
-            skipped.push(front.id.clone());
-            continue;
-        }
-        let repos = repo_roots(&pm.dir, &v.issue.project);
-        let verdict = judge(pm, front, &live, &repos, times.as_ref(), now);
-        verdicts.push(json!({
-            "id": front.id,
-            "verdict": verdict.kind,
-            "reasons": verdict.reasons,
-            "paths_touched": verdict.touched,
-        }));
-        if verdict.kind == "valid" {
-            // `valid`: stamp `last_groomed_at` silently — the cooldown
-            // marker, no comment (a clean ticket collects no noise).
-            stamped.push(front.id.clone());
+    'candidates: for id in candidates {
+        // A concurrent writer between the lock-free snapshot and the
+        // lock invalidates the verdict: re-judge on a fresh snapshot a
+        // bounded number of times, then leave the ticket to the next pass.
+        for _attempt in 0..SNAPSHOT_ATTEMPTS {
+            let head = line_times::tracker_head(&pm.dir, STATUS_CLOCK_BUDGET).ok();
+            let live = board::views(&pm.config.notes_dir(), board::load_all(&pm.dir, project)?);
+            let Some(v) = live.iter().find(|v| v.issue.front.id == id) else {
+                continue 'candidates; // dropped or renamed since enumeration
+            };
+            let front = &v.issue.front;
+            // A competing writer can move it off backlog/ready, mark it
+            // intake, or make it a container after the enumeration.
+            if !eligible(v, now, grace_secs) {
+                skipped.push(front.id.clone());
+                continue 'candidates;
+            }
+            // The close-time clock rides the same snapshot as the sibling
+            // set: a `done` committed in the race must appear in `live`
+            // AND have a `status_at` time, or `superseded` would be judged
+            // against a close the clock cannot yet date.
+            lockseam::outside_lock("groom-line-times");
+            let times = LineTimes::load(&pm.dir, STATUS_CLOCK_BUDGET).ok();
+            let repos = repo_roots(&pm.dir, &v.issue.project);
+            let verdict = judge(pm, front, &live, &repos, times.as_ref(), now);
+            let row = json!({
+                "id": front.id,
+                "verdict": verdict.kind,
+                "reasons": verdict.reasons,
+                "paths_touched": verdict.touched,
+            });
+            if dry_run {
+                verdicts.push(row.clone());
+                if verdict.kind == "valid" {
+                    stamped.push(front.id.clone());
+                } else {
+                    flagged.push(row);
+                }
+                continue 'candidates;
+            }
+            // Lock only for the write. Re-validate under it: the ticket's
+            // own front and the tracker HEAD (any committed sibling or
+            // child change) must equal what the verdict was judged on.
+            let _lock = pm.lock()?;
+            let unchanged = head.is_some()
+                && line_times::tracker_head(&pm.dir, STATUS_CLOCK_BUDGET).ok() == head
+                && blocked::locked_front_matches(pm, front);
+            if !unchanged {
+                continue; // drop the lock, re-judge on a fresh snapshot
+            }
+            after_locked_snapshot();
             write_verdict(pm, front, &verdict, now, actor, dry_run)?;
-            continue;
+            verdicts.push(row.clone());
+            if verdict.kind == "valid" {
+                // `valid`: stamp `last_groomed_at` silently — the cooldown
+                // marker, no comment (a clean ticket collects no noise).
+                stamped.push(front.id.clone());
+            } else {
+                flagged.push(row);
+            }
+            continue 'candidates;
         }
-        write_verdict(pm, front, &verdict, now, actor, dry_run)?;
-        flagged.push(json!({
-            "id": front.id,
-            "verdict": verdict.kind,
-            "reasons": verdict.reasons,
-            "paths_touched": verdict.touched,
-        }));
+        skipped.push(id); // kept changing under us; next pass retries
     }
     Ok(json!({
         "dry_run": dry_run,
@@ -489,6 +496,31 @@ fn groom_with_hooks(
         "skipped": skipped,
         "verdicts": verdicts,
     }))
+}
+
+/// How many fresh snapshots one candidate gets before the pass leaves
+/// it to the next one.
+const SNAPSHOT_ATTEMPTS: usize = 3;
+
+/// Whether a view is a groom candidate right now: an open dormant
+/// `backlog`/`ready` leaf not already groomed, flagged, intake or a
+/// container.
+fn eligible(v: &board::View, now: i64, grace_secs: i64) -> bool {
+    let front = &v.issue.front;
+    open_leaf(v)
+        && !front.tags.iter().any(|t| t == TRIAGE_TAG)
+        && dormant(front, now, grace_secs)
+        && !groomed_recently(front, now, grace_secs)
+}
+
+/// A `backlog`/`ready` leaf that is not intake — the only shape the
+/// pass ever reports on (as judged or skipped).
+fn open_leaf(v: &board::View) -> bool {
+    let front = &v.issue.front;
+    matches!(v.status.as_str(), "backlog" | "ready")
+        && !v.container
+        && !front.tags.iter().any(|t| t == "intake")
+        && front.kind.is_none() // intake kinds carry `kind`
 }
 
 #[cfg(test)]
