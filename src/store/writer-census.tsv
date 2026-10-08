@@ -11,8 +11,8 @@ bin/cadence-agent-exec/main.rs	capability-seal-non-sqlite-prepare	prepare	1
 cli/update_recovery_tests.rs	test-fixtures	open	1
 continuity.rs	inline-test-store-fixtures	open	1
 contract_fixture.rs	contract-test-fixtures	execute	1
-daemon.rs	daemon-store-construction-and-inline-tests	execute	23
-daemon.rs	daemon-store-construction-and-inline-tests	open	18
+daemon.rs	daemon-store-construction-and-inline-tests	execute	24
+daemon.rs	daemon-store-construction-and-inline-tests	open	19
 daemon.rs	daemon-store-construction-and-inline-tests	transaction	2
 daemon/app_capabilities_rpc/tests.rs	test-fixtures	execute	1
 daemon/app_capabilities_rpc/tests.rs	test-fixtures	open	1
