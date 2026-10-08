@@ -315,6 +315,7 @@ mod tests {
             host: host.to_string(),
             issuer: "https://issuer".into(),
             company: "c".into(),
+            company_slug: Some("acme".into()),
             authorize_url: "https://app/x".into(),
         }
     }

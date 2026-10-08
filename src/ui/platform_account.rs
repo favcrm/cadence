@@ -20,7 +20,7 @@ pub(super) fn get(opts: &ServeOpts) -> HttpResp {
     let usage = fetch(USAGE_URL).and_then(project_usage);
     json_response(json!({
         "configured": true,
-        "manage_url": manage_url(&board.host),
+        "manage_url": manage_url(board.company_slug.as_deref()),
         "account": account.as_ref().ok(),
         "usage": usage.as_ref().ok().cloned().unwrap_or_default(),
         "account_error": account.err().map(|_| "Account information is unavailable. Try Refresh."),
@@ -128,16 +128,9 @@ fn project_usage(data: Value) -> std::result::Result<Vec<Value>, ()> {
         .collect()
 }
 
-fn manage_url(host: &str) -> Option<String> {
-    let slug = host.strip_suffix(".cadencecloud.app")?;
-    if slug.is_empty()
-        || slug.len() > 63
-        || !slug
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        || slug.starts_with('-')
-        || slug.ends_with('-')
-    {
+fn manage_url(company_slug: Option<&str>) -> Option<String> {
+    let slug = company_slug?;
+    if !super::valid_board_company_slug(slug) {
         return None;
     }
     Some(format!(
@@ -193,16 +186,12 @@ mod tests {
         assert!(projected.get("links").is_none());
         assert!(projected.get("token").is_none());
         assert!(projected["company"].get("id").is_none());
-        for host in [
-            "evil.test",
-            "acme.cadencecloud.app.evil.test",
-            "a.b.cadencecloud.app",
-            "-bad.cadencecloud.app",
-        ] {
-            assert!(manage_url(host).is_none());
+        for slug in ["", "evil.test", "a.b", "-bad", "acme-staging"] {
+            assert!(manage_url(Some(slug)).is_none());
         }
+        assert!(manage_url(None).is_none());
         assert_eq!(
-            manage_url("acme.cadencecloud.app").unwrap(),
+            manage_url(Some("acme")).unwrap(),
             "https://app-v2.agenticos.hk/account?company=acme"
         );
     }

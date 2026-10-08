@@ -38,7 +38,12 @@ impl Shared {
                 "toolkit",
                 "timezone",
                 "grant_id",
+                "aos_connection_id",
             ],
+            // CAD-1143: the operator's read of the destinations the bound
+            // connection's workspace authorizes — discovery only, never
+            // send/workspace authority. Params are the scope ids alone.
+            "app_publish_destinations_list" => &["install_id", "context_id"],
             "app_binding_show" => &["install_id", "binding_id"],
             "app_binding_list" => &["install_id", "context_id"],
             _ => return Err(Error::rejected("unknown app binding method")),
@@ -68,6 +73,20 @@ impl Shared {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     self.set_binding_publish(install, params)
+                })
+            }
+            "app_publish_destinations_list" => {
+                let pm = self.pm_at(&self.pm_dir()?)?;
+                workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                    let _custody = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    self.publish_destinations_list(install, context, bundle, files)
                 })
             }
             "app_binding_show" => self
@@ -326,6 +345,110 @@ impl Shared {
                 )))
             }
         }
+    }
+
+    /// CAD-1143: `app_publish_destinations_list` — the operator's read-only
+    /// discovery under the configured runtime READ credential, scoped to one
+    /// configured publication binding. Params are the scope ids alone
+    /// (`install_id`, optional `context_id`); the operator proof ran before
+    /// this call. Validates the install through the runtime snapshot, the
+    /// (optional) context as belonging-to and active on this installation, the
+    /// manifest's single valid `text.publish` publication slot, and an existing
+    /// configured binding whose receipt is still current (revoked/drifted/stale
+    /// refuses — never migrated or written here). Only then does the attached
+    /// read credential issue one bounded destinations GET; a full window or any
+    /// malformed row fails closed, and a missing resolver or upstream fault
+    /// maps to `capability_unavailable`. The rows are what the READ credential's
+    /// workspace happens to authorize — that scoping is NOT evidence the read,
+    /// send or binding share an AOS workspace, so the rows are never send or
+    /// workspace authority; they grant no per-binding account and no
+    /// configuration or send right.
+    fn publish_destinations_list(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        bundle: &Value,
+        files: &BTreeMap<String, String>,
+    ) -> Result<Value> {
+        // An explicit context must belong to this installation and be active.
+        if let Some(ctx) = context {
+            self.store.app_context_proof(install, ctx)?;
+        }
+        // The manifest's publication slot: the exact unique valid
+        // `text.publish` declaration — schema 1, version 1, action `publish`,
+        // `connection_account`, effect `send`. Zero or several matches (or an
+        // unsupported contract) is refused before any read; we never pick an
+        // arbitrary first declaration.
+        let manifest = app::parse_manifest(
+            files
+                .get("app.md")
+                .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
+        )?;
+        let mut slots = manifest
+            .capabilities
+            .iter()
+            .filter(|(_, declaration)| declaration.capability == "text.publish")
+            .map(|(slot, declaration)| (slot.clone(), declaration));
+        let (slot, declaration) = match (slots.next(), slots.next()) {
+            (Some(one), None) => one,
+            _ => {
+                return Err(Error::rejected(
+                    "this app must declare exactly one publication slot",
+                ))
+            }
+        };
+        if declaration.action != "publish"
+            || declaration.effect != "send"
+            || declaration.version != 1
+            || declaration.resource_kind != "connection_account"
+        {
+            return Err(Error::rejected(
+                "publication slot is not the send/publish connection-account contract",
+            ));
+        }
+        declaration.validate()?;
+        // Require the existing configured publication binding for this exact
+        // scope on the current bundle digest, and re-prove its receipt is still
+        // current. Read-only: a drifted/revoked/stale receipt refuses here and
+        // is never migrated or written by this call.
+        let proof = self
+            .store
+            .app_binding_for_slot(install, context, &slot, required_str(bundle, "digest")?)?
+            .ok_or_else(|| {
+                Error::rejected("publication binding is absent or revoked for this scope")
+            })?;
+        self.app_binding_receipt_current(install, context, &slot, &proof, bundle, files)?;
+        // The attached read credential (provider.read/draft) — never the send
+        // credential. Absent or a failed/ambiguous/complete-window read maps
+        // to `capability_unavailable`; a clean list returns every validated row
+        // (including non-publishable), never survivor-filtered.
+        let resolver = self.social_media_resolver.clone().ok_or_else(|| {
+            Error::rejected("capability_unavailable: no media resolver configured")
+        })?;
+        let destinations = match resolver.list() {
+            crate::platform::agenticos_external::media_import::DestinationList::Complete(rows) => {
+                rows.iter()
+                    .map(|row| {
+                        json!({
+                            "connection_id": row.connection_id,
+                            "toolkit": row.toolkit,
+                            "destination_id": row.destination_id,
+                            "display_name": row.display_name,
+                            "status": row.status,
+                            "available": row.available,
+                            "publishable": row.publishable,
+                        })
+                    })
+                    .collect::<Vec<Value>>()
+            }
+            crate::platform::agenticos_external::media_import::DestinationList::Ambiguous
+            | crate::platform::agenticos_external::media_import::DestinationList::Unavailable => {
+                return Err(Error::rejected(
+                    "capability_unavailable: the destinations read did not produce a complete list",
+                ))
+            }
+        };
+        Ok(json!({"install_id": install, "destinations": destinations}))
     }
 
     /// The operator's view of one configured binding's receipt against the

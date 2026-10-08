@@ -1,6 +1,7 @@
 import { parseChild, type ReplyMessage } from "../src/features/workspace-apps/screen/screenProtocol";
 import { SlotController, slotBox, SLOT_GUARD_MS, type SlotView } from "../src/features/workspace-apps/screen/screenSlot";
 import { ScreenChannel, type ScreenActions } from "../src/features/workspace-apps/screen/screenLifecycle";
+import { makePlanner, type ActionContext } from "../src/features/workspace-apps/screen/screenActions";
 
 function check(value: unknown, label: string): void { if (!value) throw new Error(label); }
 
@@ -11,7 +12,8 @@ check(parseChild({ v: 2, op: "slot", id: "s1", verb: "run.start", args: {}, anch
 check(!parseChild({ v: 2, op: "call", id: "c1", verb: "run.start", args: {} }), "a spend verb is never a call");
 check(!parseChild({ v: 2, op: "slot", id: "s1", verb: "read.run", args: {}, anchor: "footer" }), "a call verb is never a slot");
 check(!parseChild({ v: 2, op: "call", id: "c1", verb: "publish.start", args: {} }), "unknown verb refused");
-check(!parseChild({ v: 2, op: "slot", id: "s1", verb: "publish.start", args: {}, anchor: "footer" }), "publish verbs wait for HP4");
+check(parseChild({ v: 2, op: "slot", id: "s1", verb: "publish.start", args: {}, anchor: "footer" }), "publish.start is a host-controlled slot");
+check(!parseChild({ v: 2, op: "slot", id: "s1", verb: "publish.start", args: {}, anchor: "footer", actor: "operator" }), "a frame cannot assert its actor");
 check(!parseChild({ v: 2, op: "call", id: "c1", verb: "read.run", args: {}, actor: "operator" }), "forged field refused");
 check(!parseChild({ v: 2, op: "slot", id: "s1", verb: "run.start", args: {}, anchor: { x: -1, y: 0, w: 1, h: 1 } }), "negative anchor refused");
 check(!parseChild({ v: 2, op: "slot", id: "s1", verb: "run.start", args: {}, anchor: { x: 0, y: 0, w: 0, h: 1 } }), "empty anchor refused");
@@ -112,6 +114,34 @@ const tick = () => new Promise(resolve => setTimeout(resolve, 0));
   const ok = mountChannel(actions); ok.port.receive({ v: 1, op: "ready", accepts: ["screen.v2"] }); ok.port.receive(callMsg);
   await tick();
   check(!ok.port.closed && JSON.stringify(ok.port.sent.at(-1)) === JSON.stringify({ v: 2, op: "reply", id: "c1", ok: true, data: { hi: 1 } }), "a v2 child gets its reply");
+
+  // CAD-1143: the real frame channel and host planner reject caller-minted
+  // authority/material fields before drawing a button or reaching an API.
+  const forgedContext = {} as unknown as ActionContext;
+  let shownSlots = 0;
+  const guardedActions: ScreenActions = {
+    call: async () => ({ ok: true, data: {} }),
+    planner: makePlanner(() => forgedContext),
+    onSlot: view => { if (view) shownSlots++; },
+    onLink: () => undefined,
+  };
+  const forged = mountChannel(guardedActions);
+  forged.port.receive({ v: 1, op: "ready", accepts: ["screen.v2"] });
+  forged.port.receive({
+    v: 2, op: "slot", id: "owner-forge", verb: "publish.start",
+    args: {
+      mode: "now", run_id: "run-a", actor: "operator",
+      company_slug: "frame-controlled-slug",
+      grant_id: "dpq_forged_frame_grant_01", owner_intent: { intent_id: "intent-forged" },
+      destination_id: "dest-forged", approval_id: "apv-forged",
+    },
+    anchor: "footer",
+  });
+  await tick();
+  const refused = forged.port.sent.at(-1) as ReplyMessage;
+  check(!forged.port.closed && refused.op === "slot-state" && refused.state === "refused" && refused.refusal?.code === "bad_args",
+    "forged owner fields are refused by the real planner");
+  check(shownSlots === 0, "forged frame authority never creates a host action button");
   const unknown = mountChannel(actions); unknown.port.receive({ v: 1, op: "ready", accepts: ["screen.v2"] });
   unknown.port.receive({ v: 2, op: "call", id: "c2", verb: "run.start", args: {} });
   check(unknown.port.closed, "an unknown call verb closes the port");

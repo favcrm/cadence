@@ -44,6 +44,11 @@ export interface Connection {
   descriptor: { action_mappings: ActionMapping[] } | null;
   status: { manifest_status: string; custody_available: boolean; adapter_registered: boolean };
 }
+export interface PublishDestination {
+  connection_id: string; toolkit: "instagram" | "facebook"; destination_id: string;
+  display_name: string; status: "active" | "pending" | "expired" | "revoked" | "error";
+  available: boolean; publishable: boolean;
+}
 /** One field a bound connection's re-derived receipt changed (CAD-1119). */
 export interface BindingChange { field: string; from: unknown; to: unknown }
 /**
@@ -59,7 +64,12 @@ export interface BindingDrift {
 export interface AppBinding {
   id: string; install_id: string; context_id: string | null; slot: string;
   revision: number; state: string; digest: string;
-  config: { bundle_digest: string; connection_id: string; provider: string; account: string; mapping: ActionMapping };
+  config: { bundle_digest: string; connection_id: string; provider: string; account: string; mapping: ActionMapping;
+    /** CAD-1123 HP4: the operator's publish target on the publication
+     *  binding (a runtime passthrough of `config.publish`). `grant_id` is
+     *  board-held only — it is never projected to a frame. */
+    publish?: { destination_id: string; destination_label: string; toolkit: string; timezone: string;
+      grant_id?: string | null; aos_connection_id?: string } };
   drift?: BindingDrift;
 }
 export interface UpgradeProposal {
@@ -150,6 +160,9 @@ export interface StartRun {
   install_id: string; workflow: string; inputs: Record<string, string>;
   request_id: string; expected_quotes: Record<string, CapabilityQuote["quote"]>; context_id?: string;
   source_receipt_id?: string; selected_post_id?: string;
+  /** CAD-1143 Redo carry: source run + untouched half only. The daemon
+   *  derives everything else; unknown keys and mixed provenance refuse. */
+  carry?: { from_run_id: string; retain: "image" | "text" };
 }
 /** The installation's default team (owner PM and one worker alias per workflow role). */
 export interface InstallTeam { owner_pm: string; roles: Record<string, string>; revision: number }
@@ -168,6 +181,32 @@ const part = encodeURIComponent;
 const installation = (id: string) => `/api/app-installations/${part(id)}`;
 const run = (id: string) => `/api/app-runs/${part(id)}`;
 const effect = (id: string) => `/api/app-effects/${part(id)}`;
+
+function readPublishDestinations(value: unknown, installId: string): PublishDestination[] {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new ApiError("The server returned an invalid publish-account receipt", 502);
+  const reply = value as Record<string, unknown>;
+  if (Object.keys(reply).sort().join() !== "destinations,install_id" || reply.install_id !== installId ||
+      !Array.isArray(reply.destinations) || reply.destinations.length >= 100)
+    throw new ApiError("The server returned an invalid publish-account receipt", 502);
+  const rows: PublishDestination[] = [];
+  for (const value of reply.destinations) {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new ApiError("The server returned an invalid publish-account receipt", 502);
+    const row = value as Record<string, unknown>;
+    if (Object.keys(row).sort().join() !== "available,connection_id,destination_id,display_name,publishable,status,toolkit" ||
+        typeof row.connection_id !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(row.connection_id) ||
+        (row.toolkit !== "instagram" && row.toolkit !== "facebook") ||
+        typeof row.destination_id !== "string" || !/^[A-Za-z0-9._-]{1,120}$/.test(row.destination_id) ||
+        typeof row.display_name !== "string" || row.display_name.trim().length === 0 ||
+        row.display_name.length > 200 || /[\u0000-\u001f\u007f-\u009f]/.test(row.display_name) ||
+        !["active", "pending", "expired", "revoked", "error"].includes(String(row.status)) ||
+        typeof row.available !== "boolean" || typeof row.publishable !== "boolean")
+      throw new ApiError("The server returned an invalid publish-account receipt", 502);
+    rows.push(row as unknown as PublishDestination);
+  }
+  return rows;
+}
 
 /** Reads are abortable and uncached so receipts never outlive an operator session. */
 async function request<T>(path: string, signal?: AbortSignal, body?: object): Promise<T> {
@@ -195,6 +234,12 @@ export const workspaceApps = {
   contexts: async (id: string, signal?: AbortSignal) => (await request<{ contexts: AppContext[] }>(`${installation(id)}/contexts`, signal)).contexts,
   bindings: async (id: string, contextId?: string, signal?: AbortSignal) => (await request<{ bindings: AppBinding[] }>(contextId ? `${installation(id)}/contexts/${part(contextId)}/bindings` : `${installation(id)}/bindings`, signal)).bindings,
   connections: async (signal?: AbortSignal) => (await request<{ connections: Connection[] }>("/api/connections", signal)).connections,
+  publishDestinations: async (id: string, contextId?: string, signal?: AbortSignal) => {
+    const path = contextId
+      ? `${installation(id)}/contexts/${part(contextId)}/publish-destinations`
+      : `${installation(id)}/publish-destinations`;
+    return readPublishDestinations(await request<unknown>(path, signal), id);
+  },
   agents: async (signal?: AbortSignal) => (await request<{ agents: Agent[] }>("/api/agents", signal)).agents,
   runs: async (id: string, contextId?: string, signal?: AbortSignal) => {
     const query = new URLSearchParams({ install_id: id });
@@ -207,6 +252,10 @@ export const workspaceApps = {
   updateContext: async (id: string, contextId: string, body: { expected_revision: number; label: string; input_defaults: Record<string, string> }) => (await request<{ context: AppContext }>(`${installation(id)}/contexts/${part(contextId)}/update`, undefined, body)).context,
   createBinding: async (id: string, body: BindingCreate) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings`, undefined, body)).binding,
   updateBinding: async (id: string, bindingId: string, body: { expected_revision: number; connection_id: string }) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings/${part(bindingId)}/update`, undefined, body)).binding,
+  /** CAD-1143: persist a destination selected from the fresh operator-scoped
+   *  destinations read. The daemon revalidates the AOS account tuple, CASes
+   *  `expected_revision`, and never accepts a frame-supplied grant. */
+  setBindingPublish: async (id: string, bindingId: string, body: { expected_revision: number; destination_id: string; destination_label: string; toolkit: string; timezone: string; aos_connection_id: string }) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings/${part(bindingId)}/publish-set`, undefined, body)).binding,
   createRun: (body: CreateRun) => request<WorkspaceRun>("/api/app-runs", undefined, body),
   startRun: (body: StartRun) => request<WorkspaceRun>("/api/app-runs/start", undefined, body),
   team: async (id: string, signal?: AbortSignal) => (await request<{ team: InstallTeam | null }>(`${installation(id)}/team`, signal)).team,

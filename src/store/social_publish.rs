@@ -48,6 +48,39 @@ pub const SOCIAL_PUBLISH_CANCELLED_EVENT: &str = "social_publish_cancelled";
 pub const SOCIAL_PUBLISH_RESCHEDULED_EVENT: &str = "social_publish_rescheduled";
 pub const SOCIAL_PUBLISH_CLAIMED_EVENT: &str = "social_publish_claimed";
 pub const SOCIAL_PUBLISH_REPORTED_EVENT: &str = "social_publish_reported";
+/// Minimum server-owned delay between queue commit and either claim path.
+pub(crate) const SOCIAL_PUBLISH_UNDO_SECS: i64 = 5;
+
+/// Test-only attach transaction boundaries. The hook receives no transaction
+/// or store access and can only synchronize an acceptance fixture.
+#[cfg(feature = "test-seam")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocialPublishAttachBoundary {
+    BeforeAuthorizationCommit,
+    AfterAuthorizationCommitBeforeArm,
+}
+
+#[cfg(feature = "test-seam")]
+pub type SocialPublishAttachTestHook =
+    std::sync::Arc<dyn Fn(SocialPublishAttachBoundary) + Send + Sync>;
+
+#[cfg(feature = "test-seam")]
+fn social_publish_attach_test_hooks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, SocialPublishAttachTestHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, SocialPublishAttachTestHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(feature = "test-seam")]
+fn social_publish_attach_test_hook(database_id: &str) -> Option<SocialPublishAttachTestHook> {
+    social_publish_attach_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(database_id)
+        .cloned()
+}
 
 /// Params for [`Store::social_publish_schedule`]. The artifact triple
 /// (`artifact_id`, `bundle_digest`, `slot`) is present exactly for
@@ -78,6 +111,8 @@ pub struct NewSocialPublish<'a> {
     pub grant_id: &'a str,
     pub approval_id: &'a str,
     pub due_epoch: i64,
+    /// Server-owned maturity time; distinct from the AOS signed due window.
+    pub claim_after_epoch: i64,
     pub timezone: &'a str,
 }
 
@@ -140,6 +175,9 @@ fn validate_new(row: &NewSocialPublish<'_>) -> Result<()> {
     }
     if row.due_epoch <= 0 {
         return Err(bad("due time"));
+    }
+    if row.claim_after_epoch < 0 {
+        return Err(bad("claim maturity time"));
     }
     if row.timezone.is_empty()
         || row.timezone.len() > 64
@@ -217,7 +255,7 @@ fn parse_json_cell(cell: Option<String>, what: &str) -> Result<Option<Value>> {
 }
 
 fn read_row(conn: &impl super::StoreConn, intent_id: &str) -> Result<Value> {
-    let row: (
+    type PublishIntentRow = (
         String,
         String,
         String,
@@ -226,9 +264,12 @@ fn read_row(conn: &impl super::StoreConn, intent_id: &str) -> Result<Value> {
         Option<String>,
         Option<String>,
         i64,
-    ) = conn
+        i64,
+        i64,
+    );
+    let row: PublishIntentRow = conn
         .query_row(
-            "SELECT intent_id,request,state,frozen,frozen_digest,receipt,upstream,due_epoch FROM social_publish_intents WHERE intent_id=?",
+            "SELECT intent_id,request,state,frozen,frozen_digest,receipt,upstream,due_epoch,claim_after_epoch,claim_armed FROM social_publish_intents WHERE intent_id=?",
             [intent_id],
             |r| {
                 Ok((
@@ -240,6 +281,8 @@ fn read_row(conn: &impl super::StoreConn, intent_id: &str) -> Result<Value> {
                     r.get(5)?,
                     r.get(6)?,
                     r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
                 ))
             },
         )
@@ -257,11 +300,11 @@ fn read_row(conn: &impl super::StoreConn, intent_id: &str) -> Result<Value> {
         receipt.as_ref(),
         upstream.as_ref(),
     );
-    // The `due_epoch` COLUMN is the scheduled-time source of truth the
-    // claim SQL selects on; the send-now lateness check reads it so a
-    // forged column can never hide behind the still-frozen
-    // `frozen.due_epoch`.
+    // These columns are the queue/claim SQL source of truth. `due_epoch`
+    // remains distinct from the server-owned post-queue undo maturity floor.
     env["intent"]["due_epoch"] = json!(row.7);
+    env["intent"]["claim_after_epoch"] = json!(row.8);
+    env["intent"]["claim_armed"] = json!(row.9 == 1);
     Ok(env)
 }
 
@@ -339,8 +382,8 @@ impl Store {
                 ));
             }
             let intent_id = format!("spub-{}", uuid::Uuid::new_v4().simple());
-            tx.execute("INSERT INTO social_publish_intents(intent_id,request,install_id,context_id,run_id,effect_id,connection_id,destination_id,toolkit,caption_digest,image_digest,media_key,grant_id,approval_id,due_epoch,timezone,state,frozen,frozen_digest,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?,?)",
-                params![intent_id,request,row.install_id,row.context_id,row.run_id,row.effect_id,row.connection_id,row.destination_id,row.toolkit,row.caption_digest,row.image_digest,row.media_key,row.grant_id,row.approval_id,row.due_epoch,row.timezone,frozen.to_string(),digest,now(),now()])?;
+            tx.execute("INSERT INTO social_publish_intents(intent_id,request,install_id,context_id,run_id,effect_id,connection_id,destination_id,toolkit,caption_digest,image_digest,media_key,grant_id,approval_id,due_epoch,claim_after_epoch,timezone,state,frozen,frozen_digest,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?,?)",
+                params![intent_id,request,row.install_id,row.context_id,row.run_id,row.effect_id,row.connection_id,row.destination_id,row.toolkit,row.caption_digest,row.image_digest,row.media_key,row.grant_id,row.approval_id,row.due_epoch,row.claim_after_epoch,row.timezone,frozen.to_string(),digest,now(),now()])?;
             Self::event(
                 &tx,
                 platform::PLATFORM_STREAM,
@@ -501,6 +544,57 @@ impl Store {
             .ok_or_else(|| Error::rejected("run has no independently approved artifact"))
     }
 
+    /// CAD-1143 Redo render seeding: exactly one approved caption —
+    /// multiple DISTINCT approved artifacts are ambiguous (no first-pick,
+    /// no naive latest); the transaction re-derives the same rule before
+    /// freezing. Single-caption sources pass unchanged.
+    pub(crate) fn app_run_single_approved_artifact(&self, run_id: &str) -> Result<String> {
+        let distinct: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(DISTINCT artifact_id) FROM app_run_reviews WHERE run_id=? AND decision='approve'",
+                [run_id],
+                |r| r.get(0),
+            )?;
+        if distinct == 0 {
+            return Err(Error::rejected(
+                "carry source has no independently approved caption",
+            ));
+        }
+        if distinct > 1 {
+            return Err(Error::rejected(
+                "carry source approves more than one caption",
+            ));
+        }
+        self.conn()
+            .query_row(
+                "SELECT artifact_id FROM app_run_reviews WHERE run_id=? AND decision='approve' ORDER BY step_id LIMIT 1",
+                [run_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::rejected("carry source has no independently approved caption"))
+    }
+
+    /// CAD-1143 Redo render seeding: the approved review's image pin for
+    /// one artifact, if any. The creation transaction re-derives and
+    /// asserts it before freezing; this read only seeds the render.
+    pub(crate) fn app_run_approved_asset_pin(
+        &self,
+        run_id: &str,
+        artifact_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .conn()
+            .query_row(
+                "SELECT asset_receipt_id, asset_digest FROM app_run_reviews WHERE run_id=? AND artifact_id=? AND decision='approve' ORDER BY step_id LIMIT 1",
+                params![run_id, artifact_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(receipt, digest)| receipt.zip(digest)))
+    }
+
     pub fn social_publish_show(&self, intent_id: &str) -> Result<Value> {
         read_row(&self.conn(), intent_id)
     }
@@ -558,24 +652,24 @@ impl Store {
         })
     }
 
-    /// Peek the oldest due queued intent without claiming. The dispatch
-    /// RPC uses it to compare operator-supplied current authority against
+    /// Peek the oldest due AND mature queued intent without claiming. The
+    /// dispatch RPC compares operator-supplied current authority against
     /// frozen before claiming; the claim itself re-verifies in-transaction.
     pub(crate) fn social_publish_peek_due(&self, now_epoch: i64) -> Result<Option<Value>> {
         self.read_tx(|conn| {
 
                     let next: Option<String> = conn
                         .query_opt(
-                            "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=? ORDER BY due_epoch,intent_id LIMIT 1",
-                            [now_epoch],
+                            "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND claim_armed=1 AND due_epoch<=? AND claim_after_epoch<=? ORDER BY due_epoch,intent_id LIMIT 1",
+                            [now_epoch, now_epoch],
                             |r| r.get(0),
                         )?;
                     next.map(|id| read_row(&conn, &id)).transpose()
         })
     }
 
-    /// CAD-1020: one page of the driver's due rows — up to `limit` due
-    /// queued intents, oldest first, after the `(due_epoch, intent_id)`
+    /// CAD-1020: one page of the driver's due rows — up to `limit` due and
+    /// mature queued intents, oldest first, after the `(due_epoch, intent_id)`
     /// keyset `after`. A read only; each row is still claimed by identity.
     pub(crate) fn social_publish_due_batch(
         &self,
@@ -586,7 +680,7 @@ impl Store {
         let (after_due, after_id) = after.unwrap_or((i64::MIN, ""));
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=?1 AND (due_epoch>?3 OR (due_epoch=?3 AND intent_id>?4)) ORDER BY due_epoch,intent_id LIMIT ?2",
+            "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND claim_armed=1 AND due_epoch<=?1 AND claim_after_epoch<=?1 AND (due_epoch>?3 OR (due_epoch=?3 AND intent_id>?4)) ORDER BY due_epoch,intent_id LIMIT ?2",
         )?;
         let ids = stmt
             .query_map(params![now_epoch, limit as i64, after_due, after_id], |r| {
@@ -652,8 +746,8 @@ impl Store {
         Ok(asset == frozen["image_digest"].as_str())
     }
 
-    /// Atomically claim the oldest due queued intent for dispatch. The
-    /// caller proves current authority through `eligible` (grant, binding,
+    /// Atomically claim the oldest due and mature queued intent for dispatch.
+    /// The caller proves current authority through `eligible` (grant, binding,
     /// app/context eligibility and unchanged digests at dispatch): a false
     /// verdict leaves the row queued. Exactly one claimant wins.
     pub(crate) fn social_publish_claim_due<F>(
@@ -668,8 +762,8 @@ impl Store {
             let tx = &mut *conn;
             let next: Option<String> = tx
                 .query_row_raw(
-                    "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND due_epoch<=? ORDER BY due_epoch,intent_id LIMIT 1",
-                    [now_epoch],
+                    "SELECT intent_id FROM social_publish_intents WHERE state='queued' AND claim_armed=1 AND due_epoch<=? AND claim_after_epoch<=? ORDER BY due_epoch,intent_id LIMIT 1",
+                    [now_epoch, now_epoch],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -689,7 +783,7 @@ impl Store {
             if !eligible(tx, &id, &frozen)? {
                 return Ok(None);
             }
-            let changed = tx.execute("UPDATE social_publish_intents SET state='processing',updated=? WHERE intent_id=? AND state='queued'",params![now(),id])?;
+            let changed = tx.execute("UPDATE social_publish_intents SET state='processing',updated=? WHERE intent_id=? AND state='queued' AND claim_armed=1 AND due_epoch<=? AND claim_after_epoch<=?",params![now(),id,now_epoch,now_epoch])?;
             if changed != 1 {
                 return Ok(None);
             }
@@ -734,7 +828,8 @@ impl Store {
     /// scope — the operator's send-now. Unlike `claim_due` there is no
     /// due_epoch filter: the operator's explicit click IS the dispatch
     /// trigger (the lateness bound runs earlier and refuses only the
-    /// over-stale). The install and exact context are checked against the
+    /// over-stale). The owner-attach maturity floor still applies. The install
+    /// and exact context are checked against the
     /// row inside the same compare-and-set as the state, so exactly one
     /// claimant wins and a wrong scope never claims; a second click, a
     /// racing `claim_due` or a cancel reads a non-queued row and yields
@@ -744,12 +839,13 @@ impl Store {
         intent_id: &str,
         install_id: &str,
         context_id: Option<&str>,
+        now_epoch: i64,
     ) -> Result<Option<Value>> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let changed = tx.execute(
-                "UPDATE social_publish_intents SET state='processing',updated=? WHERE intent_id=? AND state='queued' AND install_id=? AND context_id IS ?",
-                params![now(), intent_id, install_id, context_id],
+                "UPDATE social_publish_intents SET state='processing',updated=? WHERE intent_id=? AND state='queued' AND claim_armed=1 AND install_id=? AND context_id IS ? AND claim_after_epoch<=?",
+                params![now(), intent_id, install_id, context_id, now_epoch],
             )?;
             if changed != 1 {
                 return Ok(None);
@@ -1011,6 +1107,7 @@ pub struct FreezeFromArtifact<'a> {
     pub grant_id: &'a str,
     pub approval_id: &'a str,
     pub due_epoch: i64,
+    pub claim_after_epoch: i64,
     pub timezone: &'a str,
 }
 
@@ -1143,7 +1240,1173 @@ impl Store {
             grant_id: row.grant_id,
             approval_id: row.approval_id,
             due_epoch: row.due_epoch,
+            claim_after_epoch: row.claim_after_epoch,
             timezone: row.timezone,
         })
+    }
+}
+
+// ===========================================================================
+// CAD-1143: prepared immutable owner intents — an ACCOUNT-ONLY publication
+// intent with NO send grant, held in its own table so the queued-only dispatch
+// SQL can never see it. `prepare` records a stable, content-bound,
+// non-dispatchable intent; `attach` is the atomic compare-and-swap that
+// carries an actual owner-exchange grant across PREPARED -> AUTHORIZED.
+// Neither path mints, writes, or inherits a grant onto the binding, and
+// neither queues, claims or sends. A separate private descriptor exchange
+// (AOS contract pending) is what supplies the grant this table stores only
+// after it is validated.
+// ===========================================================================
+
+/// The prepared-intent table. Deliberately a SEPARATE table from
+/// `social_publish_intents`: the due-worker's queued-only SQL
+/// (`state='queued'`) selects only `social_publish_intents`, so a PREPARED
+/// row here is structurally invisible to every claim/dispatch path. No
+/// `grant_id` column is optional-forged — the grant arrives only at
+/// `attach`, never at `prepare`.
+pub(crate) const SCHEMA_PREPARED: &str = "
+CREATE TABLE IF NOT EXISTS social_publish_prepared(
+ prepared_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,
+ install_id TEXT NOT NULL, context_id TEXT, run_id TEXT NOT NULL,
+ effect_id TEXT NOT NULL,
+ connection_id TEXT NOT NULL, aos_connection_id TEXT,
+ destination_id TEXT NOT NULL, destination_label TEXT NOT NULL,
+ toolkit TEXT NOT NULL, timezone TEXT NOT NULL,
+ caption_digest TEXT NOT NULL, image_digest TEXT, media_key TEXT,
+ approval_id TEXT NOT NULL,
+ mode TEXT NOT NULL CHECK(mode IN ('now','schedule')),
+ due_epoch INTEGER NOT NULL CHECK(due_epoch>0),
+ not_before_epoch INTEGER NOT NULL, expires_epoch INTEGER NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('prepared','authorized','cancelled','superseded','refused')),
+ grant_id TEXT, descriptor TEXT NOT NULL, descriptor_digest TEXT NOT NULL,
+ created REAL NOT NULL, updated REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS social_publish_prepared_scope
+ ON social_publish_prepared(install_id,context_id,prepared_id);
+";
+
+/// Event kinds for the prepared-intent lifecycle (own stream, never the
+/// dispatch path's).
+pub const SOCIAL_PUBLISH_PREPARED_EVENT: &str = "social_publish_prepared";
+pub const SOCIAL_PUBLISH_AUTHORIZED_EVENT: &str = "social_publish_authorized";
+pub const SOCIAL_PUBLISH_PREPARED_CANCELLED_EVENT: &str = "social_publish_prepared_cancelled";
+
+/// The four-field ACCOUNT representation — destination id, derived label,
+/// toolkit and timezone — with NO grant. A `prepare` carries exactly these
+/// fields and nothing else; a `grant_id` (or any other key) never parses,
+/// so a forged authority-bearing field cannot slip into the account row.
+/// Distinct from `PublishTarget` (the legacy five-field, grant-bearing
+/// receipt) which is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub struct PublishAccount {
+    pub destination_id: String,
+    pub destination_label: String,
+    pub toolkit: String,
+    pub timezone: String,
+}
+
+impl PublishAccount {
+    const FIELDS: [&'static str; 4] =
+        ["destination_id", "destination_label", "toolkit", "timezone"];
+
+    /// Validate a candidate account object. Exactly the four fields, all
+    /// present and well-formed; a `grant_id`, `connection_id`, owner,
+    /// request or any other key never parses — the account carries no
+    /// send or workspace authority.
+    pub fn parse(account: &Value) -> Result<Self> {
+        use crate::platform::agenticos_external::publish as device;
+        let object = account
+            .as_object()
+            .ok_or_else(|| Error::rejected("publish account must be an object"))?;
+        if object.len() != Self::FIELDS.len()
+            || object.keys().any(|k| !Self::FIELDS.contains(&k.as_str()))
+        {
+            return Err(Error::rejected(
+                "publish account needs exactly destination_id, destination_label, toolkit and timezone (no grant)",
+            ));
+        }
+        let text = |field: &str| {
+            account[field]
+                .as_str()
+                .ok_or_else(|| Error::rejected(format!("publish account {field} must be a string")))
+        };
+        let (id, label, toolkit, tz) = (
+            text("destination_id")?,
+            text("destination_label")?,
+            text("toolkit")?,
+            text("timezone")?,
+        );
+        let bad = |what: &str| {
+            Err(Error::rejected(format!(
+                "publish account {what} is invalid"
+            )))
+        };
+        if !(1..=120).contains(&id.len())
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return bad("destination_id");
+        }
+        if label.trim().is_empty()
+            || label.chars().count() > 80
+            || label.chars().any(char::is_control)
+        {
+            return bad("destination_label");
+        }
+        if device::Toolkit::parse(toolkit).is_none() {
+            return bad("toolkit");
+        }
+        if tz.is_empty()
+            || tz.len() > 64
+            || !tz
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'+'))
+        {
+            return bad("timezone");
+        }
+        Ok(Self {
+            destination_id: id.into(),
+            destination_label: label.into(),
+            toolkit: toolkit.into(),
+            timezone: tz.into(),
+        })
+    }
+}
+
+/// Params for `social_publish_prepare_intent`. The descriptor is the
+/// daemon-assembled, content-bound record of what the owner authorizes —
+/// its digest is the identity a changed run/material/window/receipt
+/// refuses on. No grant, no caller artifact, no workspace.
+#[allow(clippy::too_many_arguments)]
+pub struct NewPreparedIntent<'a> {
+    pub request_id: &'a str,
+    pub install_id: &'a str,
+    pub context_id: Option<&'a str>,
+    pub run_id: &'a str,
+    pub effect_id: &'a str,
+    pub connection_id: &'a str,
+    pub aos_connection_id: Option<&'a str>,
+    pub account: &'a PublishAccount,
+    pub caption_digest: &'a str,
+    pub image_digest: Option<&'a str>,
+    pub media_key: Option<&'a str>,
+    pub approval_id: &'a str,
+    pub mode: &'a str,
+    pub due_epoch: i64,
+    pub not_before_epoch: i64,
+    pub expires_epoch: i64,
+    /// The daemon-assembled descriptor (already validated, content-bound).
+    pub descriptor: &'a Value,
+}
+
+fn prepared_row_of(row: &NewPreparedIntent<'_>) -> Result<Value> {
+    let mut descriptor = row.descriptor.clone();
+    if descriptor.get("grant_id").is_some() {
+        return Err(Error::rejected(
+            "prepared intent descriptor must not contain a grant",
+        ));
+    }
+    let object = descriptor
+        .as_object_mut()
+        .ok_or_else(|| Error::rejected("prepared intent descriptor must be an object"))?;
+    let bound = json!({
+        "schema": 1,
+        "install_id": row.install_id,
+        "context_id": row.context_id,
+        "run_id": row.run_id,
+        "effect_id": row.effect_id,
+        "binding_connection_id": row.connection_id,
+        "aos_connection_id": row.aos_connection_id,
+        "destination_id": row.account.destination_id,
+        "destination_label": row.account.destination_label,
+        "toolkit": row.account.toolkit,
+        "timezone": row.account.timezone,
+        "caption_digest": row.caption_digest,
+        "image_digest": row.image_digest,
+        "media_key": row.media_key,
+        "approval_id": row.approval_id,
+        "mode": row.mode,
+        "due_epoch": row.due_epoch,
+        "not_before_epoch": row.not_before_epoch,
+        "expires_epoch": row.expires_epoch,
+    });
+    for (key, value) in bound.as_object().into_iter().flatten() {
+        object.insert(key.clone(), value.clone());
+    }
+    Ok(descriptor)
+}
+
+fn prepared_envelope(
+    prepared_id: &str,
+    request: &str,
+    state: &str,
+    descriptor: &Value,
+    digest: &str,
+) -> Value {
+    // Never project the attached grant itself; consumers receive only the
+    // intent state and content digest.
+    json!({"prepared":{"schema":1,"prepared_id":prepared_id,"request":request,"state":state,
+        "descriptor":descriptor,"descriptor_digest":digest}})
+}
+
+fn read_prepared_row(conn: &impl super::StoreConn, prepared_id: &str) -> Result<Value> {
+    let row: (String, String, String, String, String) = conn
+        .query_row(
+            "SELECT prepared_id,request,state,descriptor,descriptor_digest FROM social_publish_prepared WHERE prepared_id=?",
+            [prepared_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?
+        .ok_or_else(|| Error::rejected("prepared publish intent does not exist"))?;
+    let descriptor: Value = serde_json::from_str(&row.3)?;
+    // Re-derive and compare the descriptor receipt; corrupt or changed
+    // persisted content fails closed, never trusts the digest column.
+    let digest = app_runs::material_digest(&descriptor);
+    if digest != row.4 {
+        return Err(Error::rejected(
+            "prepared intent descriptor receipt is corrupt",
+        ));
+    }
+    Ok(prepared_envelope(
+        &row.0,
+        &row.1,
+        &row.2,
+        &descriptor,
+        &digest,
+    ))
+}
+
+fn descriptor_string<'a>(descriptor: &'a Value, field: &str) -> Result<&'a str> {
+    descriptor
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::rejected("prepared publish descriptor is corrupt"))
+}
+
+fn descriptor_optional_string<'a>(descriptor: &'a Value, field: &str) -> Result<Option<&'a str>> {
+    match descriptor.get(field) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        _ => Err(Error::rejected("prepared publish descriptor is corrupt")),
+    }
+}
+
+fn prepared_send_row<'a>(
+    request: &'a str,
+    descriptor: &'a Value,
+    grant_id: &'a str,
+    claim_after_epoch: i64,
+) -> Result<NewSocialPublish<'a>> {
+    let context_id = descriptor_optional_string(descriptor, "context_id")?;
+    let image_digest = descriptor_optional_string(descriptor, "image_digest")?;
+    let media_key = descriptor_optional_string(descriptor, "media_key")?;
+    let due_epoch = descriptor
+        .get("due_epoch")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| Error::rejected("prepared publish due time is corrupt"))?;
+    Ok(NewSocialPublish {
+        request_id: request,
+        install_id: descriptor_string(descriptor, "install_id")?,
+        context_id,
+        run_id: descriptor_string(descriptor, "run_id")?,
+        effect_id: descriptor_string(descriptor, "effect_id")?,
+        artifact_id: Some(descriptor_string(descriptor, "artifact_id")?),
+        bundle_digest: Some(descriptor_string(descriptor, "bundle_digest")?),
+        slot: Some(descriptor_string(descriptor, "slot")?),
+        connection_id: descriptor_string(descriptor, "binding_connection_id")?,
+        aos_connection_id: Some(descriptor_string(descriptor, "aos_connection_id")?),
+        destination_id: descriptor_string(descriptor, "destination_id")?,
+        toolkit: descriptor_string(descriptor, "toolkit")?,
+        caption_digest: descriptor_string(descriptor, "caption_digest")?,
+        image_digest,
+        media_key,
+        grant_id,
+        approval_id: descriptor_string(descriptor, "approval_id")?,
+        due_epoch,
+        claim_after_epoch,
+        timezone: descriptor_string(descriptor, "timezone")?,
+    })
+}
+
+fn prepared_status_output(
+    conn: &impl super::StoreConn,
+    prepared_id: &str,
+    install_id: &str,
+    context_id: Option<&str>,
+) -> Result<Value> {
+    let prepared: Option<(String, String)> = conn
+        .query_row(
+            "SELECT request,state FROM social_publish_prepared WHERE prepared_id=? AND install_id=? AND context_id IS ?",
+            params![prepared_id,install_id,context_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (request, state) = prepared.ok_or_else(|| {
+        Error::rejected("no prepared publish intent with this id in this install and context")
+    })?;
+    // Validate the durable descriptor receipt without projecting the
+    // descriptor itself into the status response.
+    let _ = read_prepared_row(conn, prepared_id)?;
+    type PreparedQueueStatusRow = (String, String, i64, i64, i64, String, Option<String>);
+    let queued: Option<PreparedQueueStatusRow> = conn
+        .query_row(
+            "SELECT intent_id,state,due_epoch,claim_after_epoch,claim_armed,install_id,context_id FROM social_publish_intents WHERE request=?",
+            [&request],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
+        )
+        .optional()?;
+    if state == "prepared" && queued.is_some() {
+        return Err(Error::rejected(
+            "prepared intent unexpectedly has queued-send state",
+        ));
+    }
+    if state == "authorized" && queued.is_none() {
+        return Err(Error::rejected(
+            "authorized prepared intent has no queued send row",
+        ));
+    }
+    let queued = queued
+        .map(
+            |(
+                intent_id,
+                queue_state,
+                due_epoch,
+                claim_after,
+                armed,
+                queue_install,
+                queue_context,
+            )| {
+                if queue_install != install_id || queue_context.as_deref() != context_id {
+                    return Err(Error::rejected("prepared intent queue scope is corrupt"));
+                }
+                if armed != 0 && armed != 1 || (armed == 1 && claim_after <= 0) {
+                    return Err(Error::rejected("prepared intent queue maturity is corrupt"));
+                }
+                Ok(json!({
+                    "intent_id": intent_id,
+                    "state": queue_state,
+                    "due_epoch": due_epoch,
+                    "claim_armed": armed == 1,
+                    "claim_after_epoch": if armed == 1 { json!(claim_after) } else { Value::Null },
+                }))
+            },
+        )
+        .transpose()?;
+    if state == "cancelled"
+        && queued
+            .as_ref()
+            .is_some_and(|queue| queue["state"] != "cancelled")
+    {
+        return Err(Error::rejected(
+            "cancelled prepared intent still has live queued-send state",
+        ));
+    }
+    Ok(json!({
+        "prepared_id": prepared_id,
+        "install_id": install_id,
+        "context_id": context_id,
+        "state": state,
+        "queued": queued,
+    }))
+}
+
+fn attached_output(
+    conn: &impl super::StoreConn,
+    prepared_id: &str,
+    install_id: &str,
+    context_id: Option<&str>,
+) -> Result<Value> {
+    let row: (String, String, String, String, String) = conn
+        .query_row(
+            "SELECT request,state,grant_id,descriptor,descriptor_digest FROM social_publish_prepared WHERE prepared_id=? AND install_id=? AND context_id IS ?",
+            params![prepared_id, install_id, context_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get::<_,Option<String>>(2)?.unwrap_or_default(), r.get(3)?, r.get(4)?)),
+        )
+        .optional()?
+        .ok_or_else(|| Error::rejected("no prepared publish intent with this id in this install and context"))?;
+    if row.1 != "authorized"
+        || !crate::platform::agenticos_external::publish::valid_grant_id(&row.2)
+        || !crate::platform::agenticos_external::publish::valid_idempotency_key(&row.0)
+    {
+        return Err(Error::rejected(
+            "prepared publish intent has no authorized queue handoff",
+        ));
+    }
+    let descriptor: Value = serde_json::from_str(&row.3)
+        .map_err(|_| Error::rejected("prepared publish descriptor is corrupt"))?;
+    let descriptor_digest = app_runs::material_digest(&descriptor);
+    if descriptor_digest != row.4 {
+        return Err(Error::rejected(
+            "prepared intent descriptor receipt is corrupt",
+        ));
+    }
+    let queued_row: Option<(String, String, i64, i64)> = conn
+        .query_row(
+            "SELECT intent_id,state,claim_after_epoch,claim_armed FROM social_publish_intents WHERE request=?",
+            [&row.0],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let (queued_id, _queue_state, claim_after_epoch, claim_armed) = queued_row
+        .ok_or_else(|| Error::rejected("authorized prepared intent has no queued send row"))?;
+    if claim_armed != 1 || claim_after_epoch <= 0 {
+        return Err(Error::rejected(
+            "authorized prepared intent queue is not armed after its undo floor",
+        ));
+    }
+    let send_row = prepared_send_row(&row.0, &descriptor, &row.2, claim_after_epoch)?;
+    validate_new(&send_row)?;
+    let expected_frozen = frozen_of(&send_row);
+    let expected_digest = app_runs::material_digest(&expected_frozen);
+    let queued = read_row(conn, &queued_id)?;
+    if queued["intent"]["request"] != row.0
+        || queued["intent"]["frozen"] != expected_frozen
+        || queued["intent"]["frozen_digest"] != expected_digest
+        || queued["intent"]["due_epoch"].as_i64() != Some(send_row.due_epoch)
+    {
+        return Err(Error::rejected(
+            "authorized prepared intent queue handoff is corrupt",
+        ));
+    }
+    let prepared = read_prepared_row(conn, prepared_id)?;
+    Ok(json!({
+        "prepared": prepared["prepared"].clone(),
+        "queued": {
+            "intent_id": queued_id,
+            "request": row.0,
+            "state": queued["intent"]["state"].clone(),
+            "due_epoch": queued["intent"]["due_epoch"].clone(),
+            "claim_after_epoch": queued["intent"]["claim_after_epoch"].clone(),
+            "claim_armed": queued["intent"]["claim_armed"].clone(),
+        }
+    }))
+}
+
+fn authorized_queue_recovery_id(
+    conn: &impl super::StoreConn,
+    prepared_id: &str,
+    install_id: &str,
+    context_id: Option<&str>,
+    request: &str,
+    grant_id: &str,
+    descriptor: &Value,
+) -> Result<String> {
+    let descriptor_digest = app_runs::material_digest(descriptor);
+    let current: Option<(String, String, Option<String>, String, String)> = conn
+        .query_row(
+            "SELECT request,state,grant_id,descriptor,descriptor_digest FROM social_publish_prepared WHERE prepared_id=? AND install_id=? AND context_id IS ?",
+            params![prepared_id,install_id,context_id],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        )
+        .optional()?;
+    let Some((stored_request, state, stored_grant, stored_descriptor, stored_digest)) = current
+    else {
+        return Err(Error::rejected(
+            "authorized prepared intent is outside this scope",
+        ));
+    };
+    let stored_descriptor_value: Value = serde_json::from_str(&stored_descriptor)?;
+    if state != "authorized"
+        || stored_request != request
+        || stored_grant.as_deref() != Some(grant_id)
+        || stored_digest != descriptor_digest
+        || &stored_descriptor_value != descriptor
+    {
+        return Err(Error::rejected(
+            "authorized prepared intent changed before queue recovery",
+        ));
+    }
+
+    type AuthorizedQueueRecoveryRow = (
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        String,
+        String,
+    );
+    let queued: Option<AuthorizedQueueRecoveryRow> = conn
+        .query_row(
+            "SELECT intent_id,state,grant_id,due_epoch,claim_after_epoch,claim_armed,install_id,context_id,frozen,frozen_digest FROM social_publish_intents WHERE request=?",
+            [request],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?)),
+        )
+        .optional()?;
+    let Some((
+        intent_id,
+        queue_state,
+        queue_grant,
+        due_epoch,
+        claim_after,
+        armed,
+        queue_install,
+        queue_context,
+        frozen_text,
+        frozen_digest,
+    )) = queued
+    else {
+        return Err(Error::rejected(
+            "authorized prepared intent has no queued recovery row",
+        ));
+    };
+    let valid_intent_id = intent_id.strip_prefix("spub-").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if !valid_intent_id
+        || queue_state != "queued"
+        || queue_grant != grant_id
+        || queue_install != install_id
+        || queue_context.as_deref() != context_id
+        || (armed == 0 && claim_after != 0)
+        || (armed == 1 && claim_after <= 0)
+        || (armed != 0 && armed != 1)
+    {
+        return Err(Error::rejected(
+            "authorized prepared intent queue row is not safely recoverable",
+        ));
+    }
+    let floor = if armed == 1 { claim_after } else { 0 };
+    let send_row = prepared_send_row(request, descriptor, grant_id, floor)?;
+    validate_new(&send_row)?;
+    let expected_frozen = frozen_of(&send_row);
+    let expected_digest = app_runs::material_digest(&expected_frozen);
+    let frozen: Value = serde_json::from_str(&frozen_text)
+        .map_err(|_| Error::rejected("authorized prepared queue row is corrupt"))?;
+    if due_epoch != send_row.due_epoch
+        || frozen != expected_frozen
+        || frozen_digest != expected_digest
+    {
+        return Err(Error::rejected(
+            "authorized prepared queue row differs from its immutable descriptor",
+        ));
+    }
+    let shown = read_row(conn, &intent_id)?;
+    if shown["intent"]["request"] != request
+        || shown["intent"]["state"] != "queued"
+        || shown["intent"]["frozen"]["grant_id"] != grant_id
+        || shown["intent"]["frozen"]["install_id"] != install_id
+        || shown["intent"]["frozen"]["context_id"]
+            != context_id.map(Value::from).unwrap_or(Value::Null)
+        || shown["intent"]["frozen"] != expected_frozen
+        || shown["intent"]["frozen_digest"] != expected_digest
+        || shown["intent"]["due_epoch"].as_i64() != Some(due_epoch)
+        || shown["intent"]["claim_armed"] != Value::Bool(armed == 1)
+        || shown["intent"]["claim_after_epoch"].as_i64() != Some(claim_after)
+    {
+        return Err(Error::rejected(
+            "authorized prepared queue recovery row changed before arm",
+        ));
+    }
+    Ok(intent_id)
+}
+
+impl Store {
+    /// Durably store a PREPARED immutable intent — account-only, no grant,
+    /// never dispatched. Idempotent on the host-minted `request`: the same
+    /// request with the same descriptor returns the same row; the same
+    /// request with a different descriptor (changed run/material/window/
+    /// receipt) refuses rather than forking the key.
+    pub fn social_publish_prepare_intent(&self, row: &NewPreparedIntent<'_>) -> Result<Value> {
+        // Bound the request id and re-derive the stable request key and the
+        // descriptor digest — both content-bound, never caller-trusted.
+        crate::proto::identifier(row.request_id, "publish prepare request id")?;
+        if row.run_id.is_empty() || row.effect_id.is_empty() || row.install_id.is_empty() {
+            return Err(Error::rejected("prepared intent run identity is invalid"));
+        }
+        if !valid_approval_id(row.approval_id) {
+            return Err(Error::rejected(
+                "bad_approval: approval id must be apv- followed by 32 lowercase hex",
+            ));
+        }
+        if !matches!(row.mode, "now" | "schedule") {
+            return Err(Error::rejected(
+                "prepared intent mode must be now or schedule",
+            ));
+        }
+        if !(row.not_before_epoch > 0
+            && row.due_epoch > 0
+            && row.due_epoch >= row.not_before_epoch
+            && row.due_epoch <= row.expires_epoch)
+        {
+            return Err(Error::rejected(
+                "prepared intent window is invalid (due must sit within not_before..=expires)",
+            ));
+        }
+        let request = format!(
+            "social-publish-prepared-{}",
+            uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!("{}:{}", row.install_id, row.request_id).as_bytes()
+            )
+            .simple()
+        );
+        let descriptor = prepared_row_of(row)?;
+        let descriptor_digest = app_runs::material_digest(&descriptor);
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            if let Some(existing) = tx
+                .query_row_raw(
+                    "SELECT prepared_id,request,state,descriptor,descriptor_digest FROM social_publish_prepared WHERE request=?",
+                    [&request],
+                    |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)),
+                )
+                .optional()?
+            {
+                let existing_descriptor: Value = serde_json::from_str(&existing.3)?;
+                let existing_digest = app_runs::material_digest(&existing_descriptor);
+                if existing_digest != existing.4 || existing_digest != descriptor_digest {
+                    return Err(Error::rejected(
+                        "publish prepare request already names different or corrupt immutable intent",
+                    ));
+                }
+                return Ok(prepared_envelope(
+                    &existing.0, &existing.1, &existing.2, &existing_descriptor,
+                    &existing_digest,
+                ));
+            }
+            // A UI reload can mint a fresh request id while retrying the
+            // same run/mode/window. Reuse the one active scoped identity
+            // rather than creating another owner action. Schedule matches
+            // its exact due time; send-now has one active intent per run.
+            let scope_count: i64 = tx.query_row_raw(
+                "SELECT count(*) FROM social_publish_prepared WHERE install_id=? AND context_id IS ? AND run_id=? AND mode=? AND state IN ('prepared','authorized') AND (?='now' OR due_epoch=?)",
+                params![row.install_id,row.context_id,row.run_id,row.mode,row.mode,row.due_epoch],
+                |r| r.get(0),
+            )?;
+            if scope_count > 1 {
+                return Err(Error::rejected(
+                    "multiple active prepared intents match this run scope",
+                ));
+            }
+            if scope_count == 1 {
+                let existing: (String, String, String, String, String) = tx.query_row_raw(
+                    "SELECT prepared_id,request,state,descriptor,descriptor_digest FROM social_publish_prepared WHERE install_id=? AND context_id IS ? AND run_id=? AND mode=? AND state IN ('prepared','authorized') AND (?='now' OR due_epoch=?)",
+                    params![row.install_id,row.context_id,row.run_id,row.mode,row.mode,row.due_epoch],
+                    |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+                )?;
+                let existing_descriptor: Value = serde_json::from_str(&existing.3)?;
+                let existing_digest = app_runs::material_digest(&existing_descriptor);
+                if existing_digest != existing.4 || existing_digest != descriptor_digest {
+                    return Err(Error::rejected(
+                        "prepared run scope already names different or corrupt immutable intent",
+                    ));
+                }
+                return Ok(prepared_envelope(
+                    &existing.0, &existing.1, &existing.2, &existing_descriptor,
+                    &existing_digest,
+                ));
+            }
+            let prepared_id = format!("sprep-{}", uuid::Uuid::new_v4().simple());
+            tx.execute("INSERT INTO social_publish_prepared(prepared_id,request,install_id,context_id,run_id,effect_id,connection_id,aos_connection_id,destination_id,destination_label,toolkit,timezone,caption_digest,image_digest,media_key,approval_id,mode,due_epoch,not_before_epoch,expires_epoch,state,descriptor,descriptor_digest,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'prepared',?,?,?,?)",
+                params![prepared_id,request,row.install_id,row.context_id,row.run_id,row.effect_id,row.connection_id,row.aos_connection_id,row.account.destination_id,row.account.destination_label,row.account.toolkit,row.account.timezone,row.caption_digest,row.image_digest,row.media_key,row.approval_id,row.mode,row.due_epoch,row.not_before_epoch,row.expires_epoch,descriptor.to_string(),descriptor_digest,now(),now()])?;
+            Self::event(
+                &tx,
+                platform::PLATFORM_STREAM,
+                SOCIAL_PUBLISH_PREPARED_EVENT,
+                json!({"prepared_id":prepared_id,"request":request,"digest":descriptor_digest}),
+            )?;
+            read_prepared_row(&tx, &prepared_id)
+        })
+    }
+
+    /// The PREPARED intent a host-minted request already froze in this
+    /// install, if any — so a retried/double-tapped prepare resumes the
+    /// same intent (stable identity), and `attach` can re-load it.
+    pub(crate) fn social_publish_prepared_find_request(
+        &self,
+        install_id: &str,
+        request_id: &str,
+    ) -> Result<Option<Value>> {
+        let request = format!(
+            "social-publish-prepared-{}",
+            uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!("{install_id}:{request_id}").as_bytes()
+            )
+            .simple()
+        );
+        let conn = self.conn();
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT prepared_id FROM social_publish_prepared WHERE request=?",
+                [&request],
+                |r| r.get(0),
+            )
+            .optional()?;
+        id.map(|id| read_prepared_row(&conn, &id)).transpose()
+    }
+
+    /// Find a single active prepared row for the exact run scope. This is
+    /// the recovery key when a native surface reloads and loses its
+    /// in-memory request id; ambiguity refuses rather than choosing one.
+    pub(crate) fn social_publish_prepared_find_scope(
+        &self,
+        install_id: &str,
+        context_id: Option<&str>,
+        run_id: &str,
+        mode: &str,
+        due_epoch: Option<i64>,
+    ) -> Result<Option<Value>> {
+        if !matches!(mode, "now" | "schedule") || (mode == "schedule") != due_epoch.is_some() {
+            return Err(Error::rejected("prepared run recovery scope is invalid"));
+        }
+        let conn = self.conn();
+        let matches: i64 = conn.query_row(
+            "SELECT count(*) FROM social_publish_prepared WHERE install_id=? AND context_id IS ? AND run_id=? AND mode=? AND state IN ('prepared','authorized') AND (?='now' OR due_epoch=?)",
+            params![install_id,context_id,run_id,mode,mode,due_epoch.unwrap_or_default()],
+            |r| r.get(0),
+        )?;
+        if matches > 1 {
+            return Err(Error::rejected(
+                "multiple active prepared intents match this run scope",
+            ));
+        }
+        let id: Option<String> = if matches == 0 {
+            None
+        } else {
+            Some(conn.query_row(
+                "SELECT prepared_id FROM social_publish_prepared WHERE install_id=? AND context_id IS ? AND run_id=? AND mode=? AND state IN ('prepared','authorized') AND (?='now' OR due_epoch=?)",
+                params![install_id,context_id,run_id,mode,mode,due_epoch.unwrap_or_default()],
+                |r| r.get(0),
+            )?)
+        };
+        id.map(|id| read_prepared_row(&conn, &id)).transpose()
+    }
+
+    /// The current immutable intent addressed by an AOS-signed read
+    /// assertion. This deliberately omits caller-supplied scope: the
+    /// verifier already checked the configured issuer, workspace, audience,
+    /// intent id and one-use jti. Terminal rows are never re-disclosed.
+    pub(crate) fn social_publish_prepared_owner_show(&self, prepared_id: &str) -> Result<Value> {
+        let conn = self.conn();
+        let state: Option<String> = conn
+            .query_row(
+                "SELECT state FROM social_publish_prepared WHERE prepared_id=?",
+                [prepared_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !matches!(state.as_deref(), Some("prepared" | "authorized")) {
+            return Err(Error::rejected("prepared owner intent is unavailable"));
+        }
+        let media_key: Option<String> = conn.query_row(
+            "SELECT media_key FROM social_publish_prepared WHERE prepared_id=?",
+            [prepared_id],
+            |row| row.get(0),
+        )?;
+        let mut shown = read_prepared_row(&conn, prepared_id)?;
+        // This private daemon-only projection is consumed for local custody
+        // re-proof and is never included in the HTTP descriptor response.
+        shown["prepared"]["media_key"] = json!(media_key);
+        Ok(shown)
+    }
+
+    /// The PREPARED intent by id, scoped to its own install and exact
+    /// context (null-preserving). Out-of-scope refuses.
+    pub(crate) fn social_publish_prepared_show_scoped(
+        &self,
+        prepared_id: &str,
+        install_id: &str,
+        context_id: Option<&str>,
+    ) -> Result<Value> {
+        let conn = self.conn();
+        let in_scope: Option<String> = conn
+            .query_row(
+                "SELECT prepared_id FROM social_publish_prepared WHERE prepared_id=? AND install_id=? AND context_id IS ?",
+                params![prepared_id, install_id, context_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if in_scope.is_none() {
+            return Err(Error::rejected(
+                "no prepared publish intent with this id in this install and context",
+            ));
+        }
+        read_prepared_row(&conn, prepared_id)
+    }
+
+    /// Non-mutating, exact-scope projection for owner completion status. It
+    /// deliberately omits the descriptor, receipt, grant and owner material.
+    pub(crate) fn social_publish_prepared_status_scoped(
+        &self,
+        prepared_id: &str,
+        install_id: &str,
+        context_id: Option<&str>,
+    ) -> Result<Value> {
+        let conn = self.conn();
+        prepared_status_output(&conn, prepared_id, install_id, context_id)
+    }
+
+    /// Terminal, exact-scope cancellation. PREPARED rows become cancelled;
+    /// an attached queue row can be cancelled only while still queued, so a
+    /// claim and cancellation serialize with the same writer transaction.
+    pub(crate) fn social_publish_prepared_cancel_scoped(
+        &self,
+        prepared_id: &str,
+        install_id: &str,
+        context_id: Option<&str>,
+    ) -> Result<Value> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let prepared: Option<(String, String)> = tx
+                .query_row_raw(
+                    "SELECT request,state FROM social_publish_prepared WHERE prepared_id=? AND install_id=? AND context_id IS ?",
+                    params![prepared_id,install_id,context_id],
+                    |r| Ok((r.get(0)?,r.get(1)?)),
+                )
+                .optional()?;
+            let (request, state) = prepared.ok_or_else(|| {
+                Error::rejected("no prepared publish intent with this id in this install and context")
+            })?;
+            match state.as_str() {
+                "cancelled" => return prepared_status_output(&tx, prepared_id, install_id, context_id),
+                "prepared" => {
+                    let has_queue: bool = tx.query_row_raw(
+                        "SELECT EXISTS(SELECT 1 FROM social_publish_intents WHERE request=?)",
+                        [&request],
+                        |r| r.get(0),
+                    )?;
+                    if has_queue {
+                        return Err(Error::rejected("prepared intent unexpectedly has queued-send state"));
+                    }
+                    let changed = tx.execute(
+                        "UPDATE social_publish_prepared SET state='cancelled',updated=? WHERE prepared_id=? AND state='prepared' AND install_id=? AND context_id IS ?",
+                        params![now(),prepared_id,install_id,context_id],
+                    )?;
+                    if changed != 1 {
+                        return Err(Error::rejected("prepared intent changed before cancellation"));
+                    }
+                    Self::event(
+                        &tx,
+                        platform::PLATFORM_STREAM,
+                        SOCIAL_PUBLISH_PREPARED_CANCELLED_EVENT,
+                        json!({"prepared_id":prepared_id}),
+                    )?;
+                }
+                "authorized" => {
+                    let queued: Option<(String, String)> = tx
+                        .query_row_raw(
+                            "SELECT intent_id,state FROM social_publish_intents WHERE request=? AND install_id=? AND context_id IS ?",
+                            params![request,install_id,context_id],
+                            |r| Ok((r.get(0)?,r.get(1)?)),
+                        )
+                        .optional()?;
+                    let (intent_id, queue_state) = queued.ok_or_else(|| {
+                        Error::rejected("authorized prepared intent has no queued row in this scope")
+                    })?;
+                    if queue_state != "queued" {
+                        return Err(Error::rejected("only an unclaimed queued owner attachment can be cancelled"));
+                    }
+                    let changed_queue = tx.execute(
+                        "UPDATE social_publish_intents SET state='cancelled',updated=? WHERE intent_id=? AND state='queued' AND install_id=? AND context_id IS ?",
+                        params![now(),intent_id,install_id,context_id],
+                    )?;
+                    let changed_prepared = tx.execute(
+                        "UPDATE social_publish_prepared SET state='cancelled',updated=? WHERE prepared_id=? AND state='authorized' AND install_id=? AND context_id IS ?",
+                        params![now(),prepared_id,install_id,context_id],
+                    )?;
+                    if changed_queue != 1 || changed_prepared != 1 {
+                        return Err(Error::rejected("attached owner intent changed before cancellation"));
+                    }
+                    Self::event(
+                        &tx,
+                        platform::PLATFORM_STREAM,
+                        SOCIAL_PUBLISH_CANCELLED_EVENT,
+                        json!({"intent_id":intent_id}),
+                    )?;
+                    Self::event(
+                        &tx,
+                        platform::PLATFORM_STREAM,
+                        SOCIAL_PUBLISH_PREPARED_CANCELLED_EVENT,
+                        json!({"prepared_id":prepared_id,"queued_intent_id":intent_id}),
+                    )?;
+                }
+                _ => return Err(Error::rejected("only an active prepared owner intent can be cancelled")),
+            }
+            prepared_status_output(&tx, prepared_id, install_id, context_id)
+        })
+    }
+
+    /// Read-only retry path for an already attached intent. A committed
+    /// attach always has its queued-send row in the same transaction; a
+    /// historical or corrupt AUTHORIZED marker without that row refuses.
+    pub(crate) fn social_publish_attached_show_scoped(
+        &self,
+        prepared_id: &str,
+        install_id: &str,
+        context_id: Option<&str>,
+    ) -> Result<Value> {
+        let conn = self.conn();
+        attached_output(&conn, prepared_id, install_id, context_id)
+    }
+
+    /// Register the acceptance-only attach barrier for this database. The
+    /// hook has no transaction, database, or authorization access and exists
+    /// only in the non-release `test-seam` build.
+    #[cfg(feature = "test-seam")]
+    pub fn set_social_publish_attach_test_hook(&self, hook: Option<SocialPublishAttachTestHook>) {
+        let mut hooks = social_publish_attach_test_hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(hook) = hook {
+            hooks.insert(self.db_identity.clone(), hook);
+        } else {
+            hooks.remove(&self.db_identity);
+        }
+    }
+
+    /// Arm an already committed owner-attachment row after its first
+    /// transaction. The undo floor is sampled only after that commit; claim
+    /// paths remain fenced by `claim_armed=0` until this update commits.
+    fn social_publish_arm_attached_intent(
+        &self,
+        prepared_id: &str,
+        expected_intent_id: &str,
+        install_id: &str,
+        context_id: Option<&str>,
+        queue_clock: &dyn Fn() -> f64,
+    ) -> Result<Value> {
+        let conn = self.conn();
+        let current: Option<(String, i64, String)> = conn
+            .query_row(
+                "SELECT p.state,q.claim_armed,q.state FROM social_publish_prepared p JOIN social_publish_intents q ON q.request=p.request WHERE p.prepared_id=? AND p.install_id=? AND p.context_id IS ? AND q.intent_id=? AND q.install_id=? AND q.context_id IS ?",
+                params![prepared_id,install_id,context_id,expected_intent_id,install_id,context_id],
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+            )
+            .optional()?;
+        let (prepared_state, armed, queue_state) = current.ok_or_else(|| {
+            Error::rejected("no attached owner queue row with this id in this install and context")
+        })?;
+        if prepared_state != "authorized" {
+            return Err(Error::rejected(
+                "only an authorized owner attachment can be armed",
+            ));
+        }
+        if armed == 1 {
+            drop(conn);
+            return self.social_publish_attached_show_scoped(prepared_id, install_id, context_id);
+        }
+        if armed != 0 || queue_state != "queued" {
+            return Err(Error::rejected(
+                "unarmed owner queue row is not safely claimable",
+            ));
+        }
+        drop(conn);
+
+        // This sample is necessarily after the prepared→authorized + queue
+        // commit above. The whole-second ceiling preserves the five-second
+        // floor; a slow arm transaction only makes the row older before its
+        // claim fence opens, never younger than the committed queue row.
+        let claim_after = (queue_clock() + SOCIAL_PUBLISH_UNDO_SECS as f64).ceil();
+        if !claim_after.is_finite() || claim_after <= 0.0 || claim_after >= i64::MAX as f64 {
+            return Err(Error::rejected("queue maturity time is invalid"));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let changed = tx.execute(
+                "UPDATE social_publish_intents SET claim_after_epoch=?,claim_armed=1,updated=? WHERE intent_id=? AND request=(SELECT request FROM social_publish_prepared WHERE prepared_id=? AND state='authorized' AND install_id=? AND context_id IS ?) AND state='queued' AND claim_armed=0 AND install_id=? AND context_id IS ?",
+                params![claim_after as i64,now(),expected_intent_id,prepared_id,install_id,context_id,install_id,context_id],
+            )?;
+            if changed == 0 {
+                // A concurrent exact attach retry may have armed the same
+                // row. Return it only if the committed local handoff is now
+                // fully valid; cancellation or a claim race still refuses.
+                let attached = attached_output(&tx, prepared_id, install_id, context_id)?;
+                if attached["queued"]["intent_id"] != expected_intent_id {
+                    return Err(Error::rejected(
+                        "authorized prepared queue row changed before arm",
+                    ));
+                }
+                return Ok(attached);
+            }
+            if changed != 1 {
+                return Err(Error::rejected("owner queue arm changed more than one row"));
+            }
+            let attached = attached_output(&tx, prepared_id, install_id, context_id)?;
+            if attached["queued"]["intent_id"] != expected_intent_id {
+                return Err(Error::rejected(
+                    "authorized prepared queue row changed during arm",
+                ));
+            }
+            Ok(attached)
+        })
+    }
+
+    /// Atomically CAS PREPARED -> AUTHORIZED and insert the exact frozen
+    /// queue row unarmed. An already-authorized recovery accepts only its
+    /// freshly verified matching grant and validates the same queued row; it
+    /// never inserts a duplicate or repeats lifecycle events. A separate
+    /// post-commit arm installs the undo floor before any claim.
+    pub(crate) fn social_publish_attach_intent(
+        &self,
+        prepared_id: &str,
+        install_id: &str,
+        context_id: Option<&str>,
+        grant: &crate::daemon::social_publish_queue::VerifiedPublishGrant,
+        queue_clock: &dyn Fn() -> f64,
+    ) -> Result<Value> {
+        if grant.prepared_id() != prepared_id
+            || !crate::platform::agenticos_external::publish::valid_digest(
+                grant.owner_intent_digest(),
+            )
+        {
+            return Err(Error::rejected(
+                "verified owner grant is not bound to this prepared intent",
+            ));
+        }
+        let grant_id = grant.grant_id();
+        if !crate::platform::agenticos_external::publish::valid_grant_id(grant_id) {
+            return Err(Error::rejected("verified owner grant id is malformed"));
+        }
+        #[cfg(feature = "test-seam")]
+        let test_hook = social_publish_attach_test_hook(&self.db_identity);
+        let (intent_id, _newly_attached) = self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let current: Option<(String, String, Option<String>, String, String)> = tx
+                .query_row_raw(
+                    "SELECT request,state,grant_id,descriptor,descriptor_digest FROM social_publish_prepared WHERE prepared_id=? AND install_id=? AND context_id IS ?",
+                    params![prepared_id, install_id, context_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()?;
+            let Some((request, state, attached, descriptor_text, descriptor_digest)) = current else {
+                return Err(Error::rejected(
+                    "no prepared publish intent with this id in this install and context",
+                ));
+            };
+            if grant.prepared_descriptor_digest() != descriptor_digest {
+                return Err(Error::rejected(
+                    "verified owner grant names a changed prepared descriptor",
+                ));
+            }
+            let descriptor: Value = serde_json::from_str(&descriptor_text)
+                .map_err(|_| Error::rejected("prepared publish descriptor is corrupt"))?;
+            if app_runs::material_digest(&descriptor) != descriptor_digest {
+                return Err(Error::rejected("prepared intent descriptor receipt is corrupt"));
+            }
+            let mut send_row = prepared_send_row(&request, &descriptor, grant_id, 0)?;
+            validate_new(&send_row)?;
+            crate::proto::identifier(&request, "prepared publish request key")?;
+            if !crate::platform::agenticos_external::publish::valid_idempotency_key(&request) {
+                return Err(Error::rejected("prepared publish request key is malformed"));
+            }
+
+            match state.as_str() {
+                "authorized" if attached.as_deref() == Some(grant_id) => {
+                    let intent_id = authorized_queue_recovery_id(
+                        tx,
+                        prepared_id,
+                        install_id,
+                        context_id,
+                        &request,
+                        grant_id,
+                        &descriptor,
+                    )?;
+                    return Ok((intent_id, false));
+                }
+                "authorized" => {
+                    return Err(Error::rejected(
+                        "this prepared intent already authorized a different grant",
+                    ));
+                }
+                "prepared" => {}
+                _ => {
+                    return Err(Error::rejected(
+                        "only a prepared publish intent can accept an owner grant",
+                    ));
+                }
+            }
+            let queued: Option<String> = tx
+                .query_row_raw(
+                    "SELECT intent_id FROM social_publish_intents WHERE request=?",
+                    [&request],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if queued.is_some() {
+                return Err(Error::rejected(
+                    "prepared publish request already has queued-send state",
+                ));
+            }
+            let replayed: Option<String> = tx
+                .query_row_raw(
+                    "SELECT intent_id FROM social_publish_intents WHERE approval_id=?",
+                    [send_row.approval_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if replayed.is_some() {
+                return Err(Error::rejected(
+                    "approval_replay: this approval already authorized another social publish intent",
+                ));
+            }
+
+            // The prepared→authorized marker, unarmed queue insertion and
+            // lifecycle events share this writer transaction. The queue row
+            // cannot be claimed until a later transaction arms it after this
+            // commit, so this commit establishes the maturity-floor origin.
+            let frozen = frozen_of(&send_row);
+            let frozen_digest = app_runs::material_digest(&frozen);
+
+            let changed = tx.execute(
+                "UPDATE social_publish_prepared SET state='authorized',grant_id=?,updated=? WHERE prepared_id=? AND state='prepared' AND install_id=? AND context_id IS ? AND descriptor_digest=?",
+                params![grant_id, now(), prepared_id, install_id, context_id, descriptor_digest],
+            )?;
+            if changed != 1 {
+                return Err(Error::rejected(
+                    "prepared intent left the prepared state before the grant attached",
+                ));
+            }
+            let intent_id = format!("spub-{}", uuid::Uuid::new_v4().simple());
+            let created = now();
+            send_row.claim_after_epoch = 0;
+            validate_new(&send_row)?;
+            tx.execute(
+                "INSERT INTO social_publish_intents(intent_id,request,install_id,context_id,run_id,effect_id,connection_id,destination_id,toolkit,caption_digest,image_digest,media_key,grant_id,approval_id,due_epoch,claim_after_epoch,claim_armed,timezone,state,frozen,frozen_digest,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,'queued',?,?,?,?)",
+                params![intent_id,request,send_row.install_id,send_row.context_id,send_row.run_id,send_row.effect_id,send_row.connection_id,send_row.destination_id,send_row.toolkit,send_row.caption_digest,send_row.image_digest,send_row.media_key,grant_id,send_row.approval_id,send_row.due_epoch,send_row.claim_after_epoch,send_row.timezone,frozen.to_string(),frozen_digest,created,created],
+            )?;
+            Self::event(
+                &tx,
+                platform::PLATFORM_STREAM,
+                SOCIAL_PUBLISH_SCHEDULED_EVENT,
+                json!({"intent_id":intent_id.clone(),"request":request,"digest":frozen_digest}),
+            )?;
+            Self::event(
+                &tx,
+                platform::PLATFORM_STREAM,
+                SOCIAL_PUBLISH_AUTHORIZED_EVENT,
+                json!({
+                    "prepared_id":prepared_id,
+                    "owner_intent_digest":grant.owner_intent_digest(),
+                    "queued_intent_id":intent_id.clone(),
+                }),
+            )?;
+            #[cfg(feature = "test-seam")]
+            if let Some(hook) = test_hook.as_ref() {
+                hook(SocialPublishAttachBoundary::BeforeAuthorizationCommit);
+            }
+            Ok((intent_id, true))
+        })?;
+        #[cfg(feature = "test-seam")]
+        if _newly_attached {
+            if let Some(hook) = test_hook.as_ref() {
+                hook(SocialPublishAttachBoundary::AfterAuthorizationCommitBeforeArm);
+            }
+        }
+        self.social_publish_arm_attached_intent(
+            prepared_id,
+            &intent_id,
+            install_id,
+            context_id,
+            queue_clock,
+        )
     }
 }

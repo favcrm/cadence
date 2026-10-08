@@ -152,6 +152,7 @@ impl Fx {
             grant_id: GRANT,
             approval_id: request,
             due_epoch: due,
+            claim_after_epoch: self.clock.load(SeqCst) - 5,
             timezone: "Asia/Hong_Kong",
         };
         let store = Store::open(&self.dir().join("cadence.sqlite3")).unwrap();
@@ -308,6 +309,7 @@ fn r3_agent_and_member_are_refused_over_rpc_and_http() {
         authorize_url: format!("{issuer}/v2/board/authorize"),
         issuer: issuer.clone(),
         company: "co_1".into(),
+        company_slug: None,
     };
     let opts = cadence_agent::ui::ServeOpts {
         host: "127.0.0.1".into(),

@@ -1,6 +1,6 @@
 import type { Installation, AppContext, WorkspaceRun, AppEffect, AppBinding, SourceReceipt } from "../workspaceApps";
 import { PUBLISH_LIST_CAP, type PublishIntent } from "../socialPublish";
-import { ACTION_VERBS, shapeFor, type ScreenDefaults, type ScreenIntent, type ScreenIntents, type ScreenPush,
+import { ACTION_VERBS, shapeFor, type ScreenDefaults, type ScreenIntent, type ScreenIntents, type ScreenPublishSettings, type ScreenPush,
   type ScreenRefusal, type ScreenRunV2, type ScreenSourcePost, type ScreenSources } from "./screenProtocol";
 
 /** The verified `socialPublish.list` read, tagged with the scope it was
@@ -22,7 +22,10 @@ export function settleIntentRead(previous: IntentRead | undefined, installId: st
 }
 const ID_MAX = 128;
 const isId = (value: string) => value.length > 0 && value.length <= ID_MAX;
-function isZone(timezone: string): boolean {
+/** A real IANA timezone name (the publish target's scheduling zone). Shared
+ *  with the `publish.settings.save` host check: a forged zone is refused
+ *  in both places, never stored or pushed. */
+export function isZone(timezone: string): boolean {
   if (timezone.length === 0 || timezone.length > 64) return false;
   try { new Intl.DateTimeFormat("en-CA", { timeZone: timezone }); return true; } catch { return false; }
 }
@@ -255,6 +258,36 @@ function defaultsOf(installation: Installation, context: AppContext | undefined)
   }
   return out;
 }
+/** CAD-1143 — the bound publication target for this scope, read-only. Only
+ *  the in-scope publication binding's own receipt is used (configured, on
+ *  this install's digest): every pushed field is grammar-checked the way the
+ *  daemon checks it, and anything unverified is omitted, never invented. The
+ *  send grant is never pushed — the frame never supplies one. The whole
+ *  section is omitted when the slot has no bound target, so absence reads
+ *  as unset. Destination choices are deliberately not cached in the push;
+ *  the frame must ask `publish.accounts.refresh` for a fresh operator-scoped
+ *  AOS destinations read before setup or account changes. */
+function publishSettingsOf(installation: Installation, contextId: string,
+  bindings: AppBinding[] | undefined): ScreenPublishSettings | null {
+  const binding = bindings?.find(value => value.install_id === installation.install_id &&
+    (value.context_id ?? "") === contextId && value.slot === "publication" &&
+    value.state === "configured" && value.config.bundle_digest === installation.digest);
+  const publish = binding?.config.publish;
+  if (!binding || !publish || typeof publish !== "object") return null;
+  const { destination_id, destination_label, toolkit, timezone } = publish;
+  const settings = present({
+    revision: Number.isSafeInteger(binding.revision) && binding.revision >= 0 ? binding.revision : null,
+    destination_id: typeof destination_id === "string" && destination_id.length >= 1 &&
+      destination_id.length <= 120 && /^[A-Za-z0-9._-]+$/.test(destination_id) ? destination_id : null,
+    destination_label: typeof destination_label === "string" && destination_label.trim().length > 0 &&
+      destination_label.length <= 80 && !/[\u0000-\u001f\u007f-\u009f]/.test(destination_label)
+      ? destination_label : null,
+    toolkit: toolkit === "instagram" || toolkit === "facebook" ? toolkit : null,
+    timezone: typeof timezone === "string" && timezone.length <= 64 &&
+      /^[A-Za-z0-9/_+\-]+$/.test(timezone) && isZone(timezone) ? timezone : null,
+  });
+  return settings.revision === undefined ? null : settings as ScreenPublishSettings;
+}
 function readinessOf(installation: Installation, contextId: string, extras: ScreenExtras | undefined): { ok: boolean; blockers: string[] } {
   const blockers: string[] = [];
   if (!installation.approved) blockers.push("install_unapproved");
@@ -301,7 +334,8 @@ export function screenProjection(installation: Installation, tag: string, contex
       run_id: e.authority.run_id, context_id: e.authority.context?.id ?? "" })),
     publish_intents: scopedIntents(intents, installation.install_id, contextId,
       new Map(scopedRuns.map(r => [r.id, r.context_id ?? ""])), true),
-    ...present({ sources: sourcesOf(installation, scopedRuns, scoped) }),
+    ...present({ sources: sourcesOf(installation, scopedRuns, scoped),
+      publish_settings: publishSettingsOf(installation, contextId, scoped?.bindings) }),
     defaults: defaultsOf(installation, active.find(c => c.id === contextId)),
     readiness: readinessOf(installation, contextId, scoped),
     // Verbs only a viewer with the operator's board reads may use; the daemon

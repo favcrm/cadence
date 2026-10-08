@@ -115,6 +115,14 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-installations/*/bindings/*/revoke",
         RouteClass::OperatorOnly,
     ),
+    // CAD-1143: the Settings drawer's publish-target write — proven-
+    // operator-only, relayed with the same `operator_connection` gate the
+    // underlying `app_binding_publish_set` verb enforces.
+    route(
+        "POST",
+        "/api/app-installations/*/bindings/*/publish-set",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/app-runs/*/effects", RouteClass::OperatorOnly),
     route(
         "POST",

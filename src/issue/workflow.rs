@@ -68,6 +68,7 @@ const META_KEYS: &[&str] = &[
     "capability_slots",
     "required_asset_slot",
     "execution",
+    "carries",
 ];
 
 /// Workflow-only frontmatter keys: pulled out at parse and removed
@@ -80,6 +81,7 @@ const WORKFLOW_ONLY_KEYS: &[&str] = &[
     "capability_slots",
     "required_asset_slot",
     "execution",
+    "carries",
 ];
 
 /// Ticket metadata lines a workflow recognises: the plan's own plus
@@ -216,6 +218,10 @@ pub struct Template {
     pub capability_slots: Vec<String>,
     pub required_asset_slot: Option<String>,
     pub execution: Execution,
+    /// Redo carry: which prior-run halves this workflow may retain
+    /// (`image`, `text`, or both declared distinctly). Constrained against
+    /// the run request's `carry.retain`, never a step-skip control.
+    pub carries: Vec<String>,
 }
 
 /// The declared inputs as the board renders them — file order, each
@@ -327,6 +333,7 @@ struct Front {
     capability_slots: Vec<String>,
     required_asset_slot: Option<String>,
     execution: Execution,
+    carries: Vec<String>,
 }
 
 fn parse_front(yaml: &str) -> Result<Front> {
@@ -407,17 +414,46 @@ fn parse_front(yaml: &str) -> Result<Front> {
             "workflow capability_slots must be a nonempty list of at most eight static slot names",
         )),
     };
+    // Redo carry: which prior-run halves this workflow may retain. At most
+    // the two halves, distinctly named; the run request's `carry.retain`
+    // must name one of them (checked at run start, not here).
+    let carries = match map.remove(serde_yaml::Value::String("carries".into())) {
+        None => Vec::new(),
+        Some(serde_yaml::Value::Sequence(halves)) if !halves.is_empty() && halves.len() <= 2 => {
+            let mut kept = Vec::new();
+            for half in halves {
+                let name = half
+                    .as_str()
+                    .filter(|s| matches!(*s, "image" | "text"))
+                    .ok_or_else(|| {
+                        Error::rejected("workflow carries must name image and/or text")
+                    })?;
+                if kept.iter().any(|existing| existing == name) {
+                    return Err(Error::rejected("workflow carries must be distinct"));
+                }
+                kept.push(name.to_string());
+            }
+            kept
+        }
+        Some(_) => {
+            return Err(Error::rejected(
+                "workflow carries must be a list of one or two of image, text",
+            ))
+        }
+    };
     let required_asset_slot =
         match map.remove(serde_yaml::Value::String("required_asset_slot".into())) {
             None => None,
             Some(serde_yaml::Value::String(slot))
-                if capability_slots.iter().any(|name| name == &slot) =>
+                if capability_slots.iter().any(|name| name == &slot)
+                    || (slot == "image"
+                        && carries.iter().any(|half| half == "image")) =>
             {
                 Some(slot)
             }
             Some(_) => {
                 return Err(Error::rejected(
-                    "workflow required_asset_slot must name a declared capability slot",
+                    "workflow required_asset_slot must name a declared capability slot, or image for an image-carry workflow",
                 ))
             }
         };
@@ -606,6 +642,7 @@ fn parse_front(yaml: &str) -> Result<Front> {
         capability_slots,
         required_asset_slot,
         execution,
+        carries,
     })
 }
 
@@ -780,6 +817,7 @@ pub fn parse_template(text: &str) -> Result<Template> {
         capability_slots: front.capability_slots,
         required_asset_slot: front.required_asset_slot,
         execution: front.execution,
+        carries: front.carries,
     })
 }
 

@@ -289,6 +289,101 @@ impl Store {
         Ok(receipt)
     }
 
+    /// CAD-1143 Redo carry read: a dispatched turn of a redo run may fetch
+    /// exactly its frozen carried receipt — never another run's rows. Turn
+    /// authentication mirrors the ordinary capability-turn path but stays
+    /// bound to the caller's own carry run: the receipt's source run is
+    /// never impersonated and no general cross-run read opens. The frozen
+    /// carry record (digest-bound via the caller's currentness check below)
+    /// plus readable custody re-proves the receipt; the full chain was
+    /// walked once at carry derivation.
+    pub(crate) fn app_capability_carry_receipt_for_turn(
+        &self,
+        id: &str,
+        alias: &str,
+        message: &str,
+        token: &str,
+        bundle: &str,
+    ) -> Result<Value> {
+        let receipt = self.app_capability_result(id)?;
+        let conn = self.conn();
+        let caller_id: String = conn
+            .query_row(
+                "SELECT run_id FROM app_run_steps WHERE message_id=? AND state='dispatched'",
+                [message],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::rejected("carry read needs a current dispatched step"))?;
+        let caller = Self::app_run_show_in(&conn, &caller_id)?;
+        let carry = &caller["snapshot"]["carry"];
+        if carry["retain"] != "image" || carry["asset_receipt_id"] != id {
+            return Err(Error::rejected("capability receipt belongs to another run"));
+        }
+        let msg = self
+            .message_in(&conn, message)?
+            .filter(|m| {
+                m.alias == alias
+                    && m.source == "app_run_dispatch"
+                    && m.state == "running"
+                    && m.turn_id.as_deref() == Some(token)
+            })
+            .ok_or_else(|| Error::rejected("carry read needs its active assigned turn"))?;
+        self.app_message_admit_in(&conn, &msg, bundle)?;
+        let spec: String = conn
+            .query_row(
+                "SELECT spec FROM app_run_steps WHERE run_id=? AND message_id=? AND state='dispatched'",
+                params![caller_id, message],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::rejected("carry read needs a current dispatched step"))?;
+        let step: super::app_runs::LocalStep =
+            serde_json::from_str(&spec).map_err(|e| Error::internal(e.to_string()))?;
+        let assigned = &caller["snapshot"]["assignments"][&step.id];
+        let generation = self.agent_in(&conn, alias)?.generation;
+        if step.assignee != alias
+            || super::app_runs::material_digest(&Self::app_binding_identity(
+                &self.agent_in(&conn, alias)?,
+            )) != assigned["identity_digest"].as_str().unwrap()
+            || !super::app_runs::local_token_current(
+                assigned["provider"].as_str().unwrap_or_default(),
+                assigned["endpoint_kind"].as_str().unwrap_or_default(),
+                generation.as_deref(),
+                token,
+            )
+        {
+            return Err(Error::rejected("carry read endpoint is no longer current"));
+        }
+        // Caller currentness pins the frozen carry record (snapshot digest)
+        // and the bundle it executes under.
+        Self::app_current_in(&conn, &caller, bundle)?;
+        // Same install/context on both ends (the chain was same-scope at
+        // derivation; re-asserted here against live rows).
+        let receipt_run = Self::app_run_show_in(
+            &conn,
+            receipt["run_id"]
+                .as_str()
+                .ok_or_else(|| Error::rejected("carry receipt run is missing"))?,
+        )?;
+        if receipt_run["install_id"] != caller["install_id"]
+            || receipt_run["context_id"] != caller["context_id"]
+        {
+            return Err(Error::rejected(
+                "carry receipt is outside the reading run scope",
+            ));
+        }
+        // Custody re-proof: the readable bytes still match the frozen record.
+        let (proven, _) = asset_material_in(&conn, id)?;
+        if proven["asset"]["digest"] != carry["asset_digest"]
+            || proven["slot"] != carry["asset_slot"]
+            || proven["binding_digest"] != carry["asset_binding_digest"]
+        {
+            return Err(Error::rejected("carried custody changed under its record"));
+        }
+        Ok(receipt)
+    }
+
     pub(crate) fn app_capability_result_for_slot(
         &self,
         run: &str,

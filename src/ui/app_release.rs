@@ -14,6 +14,14 @@ pub(super) enum Route<'a> {
     Quote(&'a str, Option<&'a str>, &'a str),
     Update(&'a str, &'a str),
     Revoke(&'a str, &'a str),
+    /// CAD-1143: record the publication binding's publish target
+    /// (`app_binding_publish_set`) from the new Settings drawer.
+    PublishSet(&'a str, &'a str),
+    /// CAD-1143: operator-only read-only discovery of the destinations the
+    /// bound publication connection's workspace authorizes
+    /// (`app_publish_destinations_list`) — install scope and context scope.
+    /// A read for HTTP method handling ONLY, never weaker auth.
+    PublishDestinations(&'a str, Option<&'a str>),
     Stage(&'a str),
     Effects(Option<&'a str>, Option<&'a str>),
     Effect(&'a str),
@@ -62,6 +70,9 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         [install, "bindings", binding, "revoke"] if segment(install) && segment(binding) => {
             Some(Route::Revoke(install, binding))
         }
+        [install, "bindings", binding, "publish-set"] if segment(install) && segment(binding) => {
+            Some(Route::PublishSet(install, binding))
+        }
         [install, "effects"] if segment(install) => Some(Route::Effects(Some(install), None)),
         [install, "contexts", context, "bindings"] if segment(install) && segment(context) => {
             Some(Route::Bindings(install, Some(context)))
@@ -73,6 +84,18 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         }
         [install, "contexts", context, "effects"] if segment(install) && segment(context) => {
             Some(Route::Effects(Some(install), Some(context)))
+        }
+        // CAD-1143: the operator's read-only discovery of the publication
+        // destinations the bound connection's workspace authorizes. The
+        // install-scope and context-scope paths carry the scope ids alone;
+        // operator admission runs before app_release::handle (serve.rs).
+        [install, "publish-destinations"] if segment(install) => {
+            Some(Route::PublishDestinations(install, None))
+        }
+        [install, "contexts", context, "publish-destinations"]
+            if segment(install) && segment(context) =>
+        {
+            Some(Route::PublishDestinations(install, Some(context)))
         }
         _ => None,
     }
@@ -86,6 +109,7 @@ impl Route<'_> {
                 | Self::Quote(..)
                 | Self::Effects(..)
                 | Self::Effect(_)
+                | Self::PublishDestinations(..)
         )
     }
     pub(super) fn is_write(self) -> bool {
@@ -94,6 +118,7 @@ impl Route<'_> {
             Self::Bindings(_, None)
                 | Self::Update(..)
                 | Self::Revoke(..)
+                | Self::PublishSet(..)
                 | Self::Stage(_)
                 | Self::Decide(_)
                 | Self::Resolve(_)
@@ -101,6 +126,11 @@ impl Route<'_> {
     }
 }
 fn nonnull_context<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
+}
+fn present_string<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
     String::deserialize(deserializer).map(Some)
@@ -128,6 +158,26 @@ struct Update {
 #[serde(deny_unknown_fields)]
 struct Revoke {
     expected_revision: u64,
+}
+/// CAD-1143: the publish-target write. Exactly the daemon's
+/// `app_binding_publish_set` fields (a forged extra key never serializes);
+/// `install_id`/`binding_id` come from the path, never the body.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PublishSet {
+    expected_revision: u64,
+    destination_id: String,
+    destination_label: String,
+    toolkit: String,
+    timezone: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    aos_connection_id: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -223,11 +273,21 @@ pub(super) fn handle(
                 params["binding_id"] = json!(binding);
                 ("app_binding_revoke", params)
             }
+            Route::PublishSet(install, binding) => {
+                let mut params = typed::<PublishSet>(request)?;
+                params["install_id"] = json!(install);
+                params["binding_id"] = json!(binding);
+                ("app_binding_publish_set", params)
+            }
             Route::Stage(run) => {
                 let mut params = typed::<Stage>(request)?;
                 params["run_id"] = json!(run);
                 ("app_effect_stage", params)
             }
+            Route::PublishDestinations(install, context) if !write => (
+                "app_publish_destinations_list",
+                scoped(Some(install), context),
+            ),
             Route::Effects(install, context) => ("app_effect_list", scoped(install, context)),
             Route::Effect(effect) => ("app_effect_show", json!({"effect_id":effect})),
             Route::Decide(effect) => {
@@ -241,6 +301,7 @@ pub(super) fn handle(
                 ("app_effect_resolve", params)
             }
             Route::Bindings(_, Some(_)) => return Err(err_response(405, "method not allowed")),
+            Route::PublishDestinations(..) => return Err(err_response(405, "method not allowed")),
         })
     })();
     let (method, params) = match result {
@@ -308,6 +369,13 @@ mod tests {
             route("/api/app-effects/effect-a/decide"),
             Some(Route::Decide("effect-a"))
         ));
+        // CAD-1143: the publish-target write routes exactly, and only there.
+        assert!(matches!(
+            route("/api/app-installations/install-a/bindings/bind-a/publish-set"),
+            Some(Route::PublishSet("install-a", "bind-a"))
+        ));
+        assert!(!Route::PublishSet("install-a", "bind-a").is_read());
+        assert!(Route::PublishSet("install-a", "bind-a").is_write());
         for path in [
             "/api/app-installations/../bindings",
             "/api/app-installations/i/bindings/",
@@ -318,6 +386,9 @@ mod tests {
             "/api/app-installations/i/contexts/c/bindings/b",
             "/api/app-installations/i/bindings/source/quote/other",
             "/api/app-installations/i/contexts/c/bindings/source/quote/other",
+            "/api/app-installations/i/bindings/b/publish-set/extra",
+            "/api/app-installations/i/bindings/b/publish-set/../update",
+            "/api/app-installations/../bindings/b/publish-set",
         ] {
             assert!(route(path).is_none(), "admitted {path}");
         }
@@ -370,6 +441,29 @@ mod tests {
             r#"{"digest":"d","digest":"other","decision":"accept"}"#,
         ] {
             assert!(serde_json::from_str::<Decision>(body).is_err());
+        }
+        // CAD-1143: the publish-target write takes exactly the daemon's
+        // fields — scope comes from the path, and the optional AOS account
+        // selector is revalidated against a fresh destinations read.
+        assert!(serde_json::from_str::<PublishSet>(
+            r#"{"expected_revision":2,"destination_id":"17841400008460056","destination_label":"@harbour","toolkit":"instagram","timezone":"Asia/Hong_Kong","grant_id":"dpq_synthetic_grant_01"}"#
+        )
+        .is_ok());
+        assert!(serde_json::from_str::<PublishSet>(
+            r#"{"expected_revision":2,"destination_id":"17841400008460056","destination_label":"@harbour","toolkit":"instagram","timezone":"Asia/Hong_Kong","aos_connection_id":"connA_harbour"}"#
+        )
+        .is_ok());
+        for body in [
+            r#"{"expected_revision":2,"destination_id":"17841400008460056","destination_label":"@harbour","toolkit":"instagram","timezone":"Asia/Hong_Kong","grant_id":"dpq_synthetic_grant_01","price":"0.06"}"#,
+            r#"{"expected_revision":2,"destination_id":"17841400008460056","destination_label":"@harbour","toolkit":"instagram","timezone":"Asia/Hong_Kong","grant_id":"dpq_synthetic_grant_01","connection_id":"conn-a"}"#,
+            r#"{"expected_revision":2,"destination_id":"17841400008460056","destination_label":"@harbour","toolkit":"instagram","timezone":"Asia/Hong_Kong","grant_id":"dpq_synthetic_grant_01","install_id":"other"}"#,
+            r#"{"expected_revision":2,"destination_id":"17841400008460056","destination_label":"@harbour","toolkit":"instagram","timezone":"Asia/Hong_Kong","grant_id":"dpq_synthetic_grant_01","binding_id":"other"}"#,
+            r#"{"expected_revision":2,"destination_id":"17841400008460056","destination_label":"@harbour","toolkit":"instagram","timezone":"Asia/Hong_Kong","aos_connection_id":null}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PublishSet>(body).is_err(),
+                "accepted {body}"
+            );
         }
     }
     #[test]

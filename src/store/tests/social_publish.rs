@@ -47,6 +47,7 @@ fn intent(request: &str) -> NewSocialPublish<'_> {
         // fixture request carries its own approval identity.
         approval_id: request,
         due_epoch: 1_750_000_000,
+        claim_after_epoch: 1_749_999_995,
         timezone: "Asia/Hong_Kong",
     }
 }
@@ -415,6 +416,7 @@ fn cad771_freeze_without_approved_material_is_refused() {
             grant_id: "dpq_synthetic_grant_01",
             approval_id: "cad_approval_freeze_01",
             due_epoch: 1_750_000_000,
+            claim_after_epoch: 1_749_999_995,
             timezone: "Asia/Hong_Kong",
         })
         .is_err());
@@ -563,7 +565,7 @@ fn cad1041_claim_id_identity_and_two_handles_one_claim() {
         ("sp-never-scheduled", "install-harbour", None),
     ] {
         assert!(
-            s1.social_publish_claim_id(want, install, context)
+            s1.social_publish_claim_id(want, install, context, 1_800_000_000)
                 .unwrap()
                 .is_none(),
             "claimed {want} in {install}/{context:?}"
@@ -578,14 +580,14 @@ fn cad1041_claim_id_identity_and_two_handles_one_claim() {
         .is_err());
     // The named claim in its own scope wins once.
     let claimed = s1
-        .social_publish_claim_id(&id, "install-harbour", None)
+        .social_publish_claim_id(&id, "install-harbour", None, 1_800_000_000)
         .unwrap()
         .unwrap();
     assert_eq!(claimed["intent"]["state"], "processing");
     // A second Store handle on the same file cannot re-claim it.
     let s2 = Store::open(&path).unwrap();
     assert!(s2
-        .social_publish_claim_id(&id, "install-harbour", None)
+        .social_publish_claim_id(&id, "install-harbour", None, 1_800_000_000)
         .unwrap()
         .is_none());
 }
@@ -637,7 +639,7 @@ fn cad1123_reschedule_is_one_atomic_swap_on_a_queued_intent() {
         due + 600
     );
     // A claimed row can no longer move; neither can a cancelled one.
-    s.social_publish_claim_id(&id, install, None)
+    s.social_publish_claim_id(&id, install, None, 1_800_000_000)
         .unwrap()
         .unwrap();
     assert!(s

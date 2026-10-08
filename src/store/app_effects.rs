@@ -284,29 +284,69 @@ impl Store {
         let reviewed =
             historical_step_receipt(conn, &run, &review.0, &review.2, &review.1, &review_turn)?;
         let required_asset_slot = run["snapshot"]["workflow"]["required_asset_slot"].as_str();
+        // CAD-1143 carried image: an asset-less approval can never publish —
+        // the pin is mandatory even when no declaration forces it.
+        if run["snapshot"]["carry"]["retain"] == "image" && review.4.is_none() {
+            return Err(Error::rejected(
+                "carried image approval needs its asset pin",
+            ));
+        }
         let asset = match (&review.4, &review.5) {
             (None, None) if required_asset_slot.is_none() => None,
             (Some(receipt_id), Some(asset_digest)) => {
-                let (receipt, _) = super::app_capabilities::asset_material_in(conn, receipt_id)?;
-                if receipt["receipt_schema"] != 2
-                    || receipt["run_id"] != id
-                    || receipt["step_id"] != step
-                    || required_asset_slot.is_some_and(|slot| receipt["slot"] != slot)
-                    || receipt["asset"]["digest"] != *asset_digest
-                    || run["snapshot"]["capabilities"][receipt["slot"].as_str().unwrap_or("")]
-                        ["digest"]
-                        != receipt["binding_digest"]
-                {
-                    return Err(Error::rejected(
-                        "reviewed binary asset no longer matches its run receipt",
-                    ));
-                }
-                Some(
-                    json!({"receipt_id":receipt_id,"receipt_digest":receipt["digest"],
+                if run["snapshot"]["carry"]["retain"] == "image" {
+                    // carried asset: must equal the frozen carry record with
+                    // its source chain re-verified (receipt, slot, binding,
+                    // custody readable). The fresh independent review on THIS
+                    // combined draft is checked above and below; binding,
+                    // currency and authority checks below are unchanged.
+                    // Content carry never supplies authority/grant/approval.
+                    let carry = &run["snapshot"]["carry"];
+                    let (receipt, _) =
+                        super::app_capabilities::asset_material_in(conn, receipt_id)?;
+                    if receipt_id.as_str() != carry["asset_receipt_id"].as_str().unwrap_or_default()
+                        || asset_digest.as_str()
+                            != carry["asset_digest"].as_str().unwrap_or_default()
+                        || receipt["receipt_schema"] != 2
+                        || receipt["step_id"]
+                            != carry["asset_producer_step"].as_str().unwrap_or_default()
+                        || receipt["slot"] != carry["asset_slot"]
+                        || receipt["asset"]["digest"] != carry["asset_digest"]
+                        || receipt["binding_digest"] != carry["asset_binding_digest"]
+                    {
+                        return Err(Error::rejected(
+                            "carried asset differs from its frozen carry record",
+                        ));
+                    }
+                    Some(
+                        json!({"receipt_id":receipt_id,"receipt_digest":receipt["digest"],
                     "binding_digest":receipt["binding_digest"],
                     "digest":receipt["asset"]["digest"],"media_type":receipt["asset"]["media_type"],
                     "size":receipt["asset"]["size"]}),
-                )
+                    )
+                } else {
+                    let (receipt, _) =
+                        super::app_capabilities::asset_material_in(conn, receipt_id)?;
+                    if receipt["receipt_schema"] != 2
+                        || receipt["run_id"] != id
+                        || receipt["step_id"] != step
+                        || required_asset_slot.is_some_and(|slot| receipt["slot"] != slot)
+                        || receipt["asset"]["digest"] != *asset_digest
+                        || run["snapshot"]["capabilities"][receipt["slot"].as_str().unwrap_or("")]
+                            ["digest"]
+                            != receipt["binding_digest"]
+                    {
+                        return Err(Error::rejected(
+                            "reviewed binary asset no longer matches its run receipt",
+                        ));
+                    }
+                    Some(
+                        json!({"receipt_id":receipt_id,"receipt_digest":receipt["digest"],
+                    "binding_digest":receipt["binding_digest"],
+                    "digest":receipt["asset"]["digest"],"media_type":receipt["asset"]["media_type"],
+                    "size":receipt["asset"]["size"]}),
+                    )
+                }
             }
             _ => {
                 return Err(Error::rejected(
@@ -334,6 +374,333 @@ impl Store {
             material["asset"] = asset;
         }
         Ok(material)
+    }
+
+    /// CAD-1143 Redo carry material: the content-only half of
+    /// `app_publication_material_in`, deliberately WITHOUT its bundle,
+    /// publication-slot and binding-currency checks — those stay on the
+    /// publication path only, and this function must never be used to
+    /// obtain publication authority. Re-proves an independently reviewed
+    /// caption and the reviewed image receipt from durable store — the pin
+    /// is required when the source declares required image or the retain
+    /// is image, and always chain-verified when present; caption-only
+    /// sources pass pinless only for text retain. Plus the source run's
+    /// frozen facts for the new run's inputs. Every scope, liveness and
+    /// content check refuses BEFORE anything is frozen. No grant, approval,
+    /// binding or effect crosses here.
+    pub(crate) fn app_carry_material_in(
+        conn: &impl super::StoreConn,
+        install_id: &str,
+        context_id: Option<&str>,
+        from_run_id: &str,
+        retain_image: bool,
+    ) -> Result<Value> {
+        let run = Self::app_run_show_in(conn, from_run_id)?;
+        // Same install AND exact context — a carry never crosses scope.
+        if run["install_id"].as_str() != Some(install_id)
+            || run["context_id"].as_str() != context_id
+        {
+            return Err(Error::rejected(
+                "carry source is outside this installation and context",
+            ));
+        }
+        if run["state"] != "succeeded"
+            || run["approved_digest"] != run["snapshot_digest"]
+            || app_runs::material_digest(&run["snapshot"]) != run["snapshot_digest"]
+        {
+            return Err(Error::rejected(
+                "carry needs an approved completed run with its exact frozen snapshot",
+            ));
+        }
+        // Exactly one approved caption (multiple distinct approvals are ambiguous — no
+        // first-pick, no naive latest). Pin rule: a source declaring
+        // required image, or an image retain, must pin completely
+        // (chain-verified below); a present pin is always verified, never
+        // ignored. Caption-only sources pass pinless only for text retain.
+        let distinct: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT artifact_id) FROM app_run_reviews WHERE run_id=? AND decision='approve'",
+                [from_run_id],
+                |r| r.get(0),
+            )?;
+        if distinct == 0 {
+            return Err(Error::rejected(
+                "carry source has no independently approved caption",
+            ));
+        }
+        if distinct > 1 {
+            return Err(Error::rejected(
+                "carry source approves more than one caption",
+            ));
+        }
+        let artifact: String = conn
+            .query_row(
+                "SELECT artifact_id FROM app_run_reviews WHERE run_id=? AND decision='approve' ORDER BY step_id LIMIT 1",
+                [from_run_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::rejected("carry source has no independently approved caption"))?;
+        let (step, message, turn, producer, digest, media, body): (String, String, String, String, String, String, Vec<u8>) = conn.query_row(
+            "SELECT step_id,message_id,turn_id,producer,digest,media_type,substr(content,1,?) FROM app_run_artifacts WHERE id=? AND run_id=?",
+            params![(app_runs::ARTIFACT_BYTES + 1) as i64, artifact, from_run_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?
+            .ok_or_else(||Error::rejected("carry artifact does not belong to its run"))?;
+        if body.is_empty()
+            || body.len() > app_runs::ARTIFACT_BYTES
+            || !matches!(media.as_str(), "text/plain" | "text/markdown")
+            || app_runs::artifact_digest(&body) != digest
+        {
+            return Err(Error::rejected(
+                "carry artifact integrity or type is invalid",
+            ));
+        }
+        let producer_receipt =
+            historical_step_receipt(conn, &run, &step, &message, &producer, &turn)?;
+        if producer_receipt["material"]["kind"] != "produce_text"
+            || producer_receipt["material"]["outcome"] != "succeeded"
+            || producer_receipt["material"]["artifacts"][0]["text"]
+                .as_str()
+                .map(|text| text.as_bytes())
+                != Some(body.as_slice())
+        {
+            return Err(Error::rejected(
+                "carry artifact differs from its actual completed producer receipt",
+            ));
+        }
+        let review: (String, String, String, String, Option<String>, Option<String>) = conn.query_row(
+            "SELECT step_id,reviewer,message_id,rationale,asset_receipt_id,asset_digest FROM app_run_reviews WHERE run_id=? AND artifact_id=? AND artifact_digest=? AND decision='approve' ORDER BY step_id LIMIT 1",
+            params![from_run_id, artifact, digest],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?
+            .ok_or_else(||Error::rejected("carry artifact has no accepted independent review"))?;
+        if review.1 == producer {
+            return Err(Error::rejected("carry artifact review is not independent"));
+        }
+        let review_turn: String = conn.query_row(
+            "SELECT turn_id FROM messages WHERE id=?",
+            [&review.2],
+            |r| r.get(0),
+        )?;
+        let reviewed =
+            historical_step_receipt(conn, &run, &review.0, &review.2, &review.1, &review_turn)?;
+        let asset = match (&review.4, &review.5) {
+            (Some(receipt_id), Some(asset_digest)) => Some(Self::resolve_carry_asset_chain(
+                conn,
+                install_id,
+                context_id,
+                from_run_id,
+                receipt_id,
+                asset_digest,
+            )?),
+            (None, None)
+                if run["snapshot"]["workflow"]["required_asset_slot"] != "image"
+                    && !retain_image =>
+            {
+                None
+            }
+            _ => return Err(Error::rejected("carry source lacks the required image pin")),
+        };
+        if reviewed["material"]["kind"] != "review_text"
+            || reviewed["material"]["decision"] != "approve"
+            || reviewed["material"]["producer_step_id"] != step
+            || reviewed["material"]["artifact_sha256"] != digest
+            || reviewed["material"]["rationale"] != review.3
+            || reviewed["material"]["asset_receipt_id"] != json!(review.4)
+            || reviewed["material"]["asset_sha256"] != json!(review.5)
+        {
+            return Err(Error::rejected(
+                "carry stored review differs from its actual accepted turn",
+            ));
+        }
+        let text = String::from_utf8(body)
+            .map_err(|_| Error::rejected("carry artifact is not UTF-8 text"))?;
+        let facts = run["snapshot"]["inputs"]["source"]
+            .as_str()
+            .filter(|facts| !facts.is_empty())
+            .ok_or_else(|| Error::rejected("carry source has no frozen source facts"))?;
+        Ok(json!({"source_run_id":from_run_id,
+            "source_bundle_digest":run["snapshot"]["bundle_digest"],
+            "source_snapshot_digest":run["snapshot_digest"],
+            "artifact":{"id":artifact,"digest":digest,"media_type":media,"text":text},
+            "producer_receipt":producer_receipt,"review_receipt":reviewed,
+            "asset":asset,"source_facts":facts,
+            "source_subject":run["snapshot"]["inputs"]["subject"],
+            "source_origin":run["snapshot"]["source"]}))
+    }
+
+    /// CAD-1143 carry link proof: the link's fresh combined review pinning
+    /// THIS receipt, with full historical producer AND review receipts
+    /// verified — not just DB reviewer/digest columns. The receipt belongs
+    /// to the producer step (joined via the reviewed artifact); comparing it
+    /// to the review step would refuse every valid original. Returns the
+    /// producer step for the terminal asset record.
+    fn verify_carry_link_review(
+        conn: &impl super::StoreConn,
+        link: &Value,
+        link_id: &str,
+        receipt_id: &str,
+        asset_digest: &str,
+    ) -> Result<String> {
+        let pinned: (String, String, String, String, String, String) = conn
+            .query_row(
+                "SELECT r.step_id,r.reviewer,r.message_id,r.artifact_id,r.artifact_digest,r.rationale FROM app_run_reviews r WHERE r.run_id=? AND r.asset_receipt_id=? AND r.asset_digest=? AND r.decision='approve' ORDER BY r.step_id LIMIT 1",
+                params![link_id, receipt_id, asset_digest],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                Error::rejected("carry chain link lacks a fresh combined review")
+            })?;
+        let (review_step, reviewer, review_message, artifact_id, artifact_review_digest, rationale) =
+            pinned;
+        let (producer_step, message, turn, producer, digest, media, body): (
+            String, String, String, String, String, String, Vec<u8>,
+        ) = conn
+            .query_row(
+                "SELECT step_id,message_id,turn_id,producer,digest,media_type,substr(content,1,?) FROM app_run_artifacts WHERE id=? AND run_id=?",
+                params![(app_runs::ARTIFACT_BYTES + 1) as i64, artifact_id, link_id],
+                |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::rejected("carry chain review artifact is absent"))?;
+        if body.is_empty()
+            || body.len() > app_runs::ARTIFACT_BYTES
+            || !matches!(media.as_str(), "text/plain" | "text/markdown")
+            || app_runs::artifact_digest(&body) != digest
+            || digest != artifact_review_digest
+        {
+            return Err(Error::rejected(
+                "carry chain review artifact integrity is invalid",
+            ));
+        }
+        let producer_receipt =
+            historical_step_receipt(conn, link, &producer_step, &message, &producer, &turn)?;
+        if producer_receipt["material"]["kind"] != "produce_text"
+            || producer_receipt["material"]["outcome"] != "succeeded"
+            || producer_receipt["material"]["artifacts"][0]["text"]
+                .as_str()
+                .map(|text| text.as_bytes())
+                != Some(body.as_slice())
+        {
+            return Err(Error::rejected(
+                "carry chain producer receipt differs from history",
+            ));
+        }
+        let review_turn: String = conn
+            .query_row(
+                "SELECT turn_id FROM messages WHERE id=?",
+                [&review_message],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::rejected("carry chain review turn is absent"))?;
+        let reviewed = historical_step_receipt(
+            conn,
+            link,
+            &review_step,
+            &review_message,
+            &reviewer,
+            &review_turn,
+        )?;
+        if reviewer == producer
+            || reviewed["material"]["kind"] != "review_text"
+            || reviewed["material"]["decision"] != "approve"
+            || reviewed["material"]["producer_step_id"] != producer_step
+            || reviewed["material"]["artifact_sha256"] != digest
+            || reviewed["material"]["rationale"] != rationale
+            || reviewed["material"]["asset_receipt_id"] != receipt_id
+            || reviewed["material"]["asset_sha256"] != asset_digest
+        {
+            return Err(Error::rejected(
+                "carry chain review differs from its accepted turn",
+            ));
+        }
+        Ok(producer_step)
+    }
+
+    /// CAD-1143 carry lineage: resolve a carried image receipt through its
+    /// explicit immutable chain. Redo re-pins the same receipt, so each link
+    /// re-pinned it with a fresh approve review in the same install/context;
+    /// the terminal link owns the receipt and gets full chain validation.
+    /// Bounded depth with repeated runs refused (cycles can only arise from
+    /// tampering — history is append-only). Returns the terminal asset
+    /// record, shaped exactly like the direct validation it replaces.
+    fn resolve_carry_asset_chain(
+        conn: &impl super::StoreConn,
+        install_id: &str,
+        context_id: Option<&str>,
+        from_run_id: &str,
+        receipt_id: &str,
+        asset_digest: &str,
+    ) -> Result<Value> {
+        const MAX_DEPTH: usize = 8;
+        let (receipt, _) = super::app_capabilities::asset_material_in(conn, receipt_id)?;
+        if receipt["asset"]["digest"] != asset_digest {
+            return Err(Error::rejected(
+                "carry receipt digest differs from its review pin",
+            ));
+        }
+        let mut visited: Vec<String> = Vec::new();
+        let mut current = from_run_id.to_owned();
+        for _ in 0..=MAX_DEPTH {
+            if visited.iter().any(|seen| seen == &current) {
+                return Err(Error::rejected("carry chain repeats a run"));
+            }
+            visited.push(current.clone());
+            let link = Self::app_run_show_in(conn, &current)?;
+            if link["install_id"].as_str() != Some(install_id)
+                || link["context_id"].as_str() != context_id
+                || link["state"] != "succeeded"
+                || link["approved_digest"] != link["snapshot_digest"]
+                || app_runs::material_digest(&link["snapshot"]) != link["snapshot_digest"]
+            {
+                return Err(Error::rejected(
+                    "carry chain link is outside scope or not intact history",
+                ));
+            }
+            // The link's fresh combined review pinning THIS receipt, with
+            // full historical receipts verified (producer step joined via
+            // the reviewed artifact — never the review step).
+            let producer_step =
+                Self::verify_carry_link_review(conn, &link, &current, receipt_id, asset_digest)?;
+            if receipt["run_id"].as_str() == Some(current.as_str()) {
+                // Terminal link: full chain validation against its own
+                // frozen snapshot (required slot, receipt, binding digest).
+                let required = link["snapshot"]["workflow"]["required_asset_slot"].as_str();
+                if receipt["receipt_schema"] != 2
+                    || receipt["step_id"] != producer_step
+                    || required.is_some_and(|slot| receipt["slot"] != slot)
+                    || receipt["asset"]["digest"] != asset_digest
+                    || link["snapshot"]["capabilities"][receipt["slot"].as_str().unwrap_or("")]
+                        ["digest"]
+                        != receipt["binding_digest"]
+                {
+                    return Err(Error::rejected(
+                        "carry receipt no longer matches its run receipt",
+                    ));
+                }
+                return Ok(
+                    json!({"receipt_id":receipt_id,"receipt_digest":receipt["digest"],
+                    "producer_step":producer_step,"slot":receipt["slot"],
+                    "binding_digest":receipt["binding_digest"],
+                    "digest":receipt["asset"]["digest"],"media_type":receipt["asset"]["media_type"],
+                    "size":receipt["asset"]["size"]}),
+                );
+            }
+            // Otherwise this link must carry the same receipt forward with
+            // an image retain; anything else breaks the chain.
+            if link["snapshot"]["carry"]["retain"] != "image"
+                || link["snapshot"]["carry"]["asset_receipt_id"] != receipt_id
+                || link["snapshot"]["carry"]["asset_digest"] != asset_digest
+            {
+                return Err(Error::rejected("carry chain breaks at an uncarried link"));
+            }
+            current = link["snapshot"]["carry"]["from_run_id"]
+                .as_str()
+                .ok_or_else(|| Error::rejected("carry chain link has no source"))?
+                .to_owned();
+        }
+        Err(Error::rejected("carry chain exceeds its bounded depth"))
     }
 
     pub fn app_effect_show(&self, id: &str) -> Result<Value> {

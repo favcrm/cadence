@@ -59,7 +59,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
           ref => loader.current ? loader.current(ref) : Promise.resolve(null),
           acting.current ? {
             call: (verb, args, ui) => acting.current!.call(verb, args, ui),
-            planner: (verb, args) => acting.current!.planner(verb, args),
+            planner: (verb, args, signal) => acting.current!.planner(verb, args, signal),
             onSlot: view => { if (!retired) setSlot(view); },
             onLink: url => { if (!retired) setLink(url); },
           } : undefined);
@@ -86,7 +86,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
     <div aria-label="Installed app screen" style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "fallback" ? "none" : "block" }}>
       <div ref={container} style={{ position: "absolute", inset: 0 }} />
       <ScreenSlotLayer view={slot} link={link} onDismissLink={() => setLink(null)}
-        onTap={(token, trusted, at) => { channel.current?.tapSlot(token, trusted, at); }} />
+        onTap={(token, trusted, at) => channel.current?.tapSlot(token, trusted, at) ?? false} />
     </div>
     {state === "loading" && <p role="status">Loading installed app…</p>}
     {state === "fallback" && fallback}

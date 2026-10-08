@@ -1,7 +1,9 @@
 //! Operator-owned local app lifecycle and turn-bound dependency artifacts.
 use super::*;
 use crate::issue::app_catalog::workspace;
-use crate::store::app_runs::{self, LocalRunProvenance, LocalRunRequest, LocalWorkflow};
+use crate::store::app_runs::{
+    self, CarryRequest, LocalRunProvenance, LocalRunRequest, LocalWorkflow,
+};
 use std::collections::BTreeMap;
 
 /// Resolve app, context and per-run content in that order. A blank prompt
@@ -190,6 +192,37 @@ impl Shared {
                 "source receipt and selected post must be supplied together",
             ));
         }
+        // CAD-1143 Redo carry: exactly `{from_run_id, retain}` — the frame
+        // names the source run and the untouched half only. Unknown keys,
+        // mixed provenance and frame-supplied carry inputs refuse here;
+        // everything else derives daemon-side from durable store below.
+        let carry: Option<(&str, bool)> = match params.get("carry") {
+            None => None,
+            Some(Value::Object(map)) if map.len() == 2 => {
+                let from = map
+                    .get("from_run_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= 128)
+                    .ok_or_else(|| Error::rejected("carry names a source run id"))?;
+                let retain = map
+                    .get("retain")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::rejected("carry retains image or text"))?;
+                if !matches!(retain, "image" | "text") {
+                    return Err(Error::rejected("carry retains image or text"));
+                }
+                Some((from, retain == "image"))
+            }
+            Some(_) => return Err(Error::rejected("carry is exactly from_run_id and retain")),
+        };
+        if carry.is_some()
+            && (params.get("source_receipt_id").is_some()
+                || params.get("selected_post_id").is_some())
+        {
+            return Err(Error::rejected(
+                "carry and source selection conflict; provenance is one or the other",
+            ));
+        }
         let id = required_str(params, "install_id")?;
         let name = required_str(params, "workflow")?;
         if !crate::issue::model::valid_tag(name) {
@@ -205,6 +238,62 @@ impl Shared {
             > 32 * 1024
         {
             return Err(Error::rejected("inputs exceed encoded byte limit"));
+        }
+        if carry.is_some()
+            && (inputs.contains_key("source")
+                || inputs.contains_key("subject")
+                || inputs.contains_key("carry_caption")
+                || inputs.contains_key("carry_asset_receipt_id"))
+        {
+            return Err(Error::rejected(
+                "carry inputs come from the frozen source run, not the request",
+            ));
+        }
+        // CAD-1143 Redo render seeding: pre-read frozen source values so
+        // the rendered plan carries them (absent inputs render empty — the
+        // frame must not reconstitute them). The creation transaction below
+        // re-derives and asserts them before freezing; pre-read staleness
+        // is impossible (terminal runs and reviews are immutable).
+        if let Some((from_run_id, retain_image)) = carry {
+            let shown = self.store.app_run_show(from_run_id)?;
+            // Scope BEFORE any foreign-run preload: no server facts from
+            // out-of-scope runs, even transiently. The creation
+            // transaction re-proves scope authoritatively.
+            if shown["install_id"].as_str() != Some(id)
+                || shown["context_id"].as_str() != optional_str(params, "context_id")
+            {
+                return Err(Error::rejected(
+                    "carry source is outside this installation and context",
+                ));
+            }
+            // One approved caption (strict rule shared with the creation
+            // transaction below): ambiguous multi-caption sources refuse.
+            let approved = self.store.app_run_single_approved_artifact(from_run_id)?;
+            let facts = shown["snapshot"]["inputs"]["source"]
+                .as_str()
+                .filter(|facts| !facts.is_empty())
+                .ok_or_else(|| Error::rejected("carry source has no frozen source facts"))?;
+            inputs.insert("source".into(), facts.to_owned());
+            if let Some(subject) = shown["snapshot"]["inputs"]["subject"].as_str() {
+                inputs.insert("subject".into(), subject.to_owned());
+            }
+            if !retain_image {
+                let record = self.store.app_artifact_for_operator(&approved)?;
+                let caption = record["text"]
+                    .as_str()
+                    .ok_or_else(|| Error::rejected("carry source caption is unavailable"))?;
+                inputs.insert("carry_caption".into(), caption.to_owned());
+            } else {
+                // Reviewer discovery for the retained image: seed its
+                // receipt id for the review instruction. The creation
+                // transaction asserts it against the derived pin; fetching
+                // it still goes through the carry-read branch below.
+                let pin = self
+                    .store
+                    .app_run_approved_asset_pin(from_run_id, &approved)?
+                    .ok_or_else(|| Error::rejected("carry source review pins no image"))?;
+                inputs.insert("carry_asset_receipt_id".into(), pin.0);
+            }
         }
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, id, |row, files| {
@@ -314,6 +403,20 @@ impl Shared {
                     error
                 }
             })?;
+            // The workflow's `carries:` declaration and the request bind
+            // both ways: a carry needs a workflow that declares its half,
+            // and a carry workflow never starts without one.
+            if let Some((_, retain_image)) = carry {
+                let retain = if retain_image { "image" } else { "text" };
+                if !workflow.carries.iter().any(|half| half == retain) {
+                    return Err(Error::rejected(
+                        "workflow does not carry the requested half",
+                    ));
+                }
+            }
+            if !workflow.carries.is_empty() && carry.is_none() {
+                return Err(Error::rejected("carry workflow needs a carry source run"));
+            }
             let binding = workflow
                 .publication_slot
                 .as_deref()
@@ -395,6 +498,10 @@ impl Shared {
                     selected_source: optional_str(params, "source_receipt_id")
                         .zip(optional_str(params, "selected_post_id")),
                     input_origins: &input_origins,
+                    carry: carry.map(|(from_run_id, retain_image)| CarryRequest {
+                        from_run_id,
+                        retain_image,
+                    }),
                 },
             )
         })
@@ -467,6 +574,7 @@ impl Shared {
                 "source_receipt_id",
                 "selected_post_id",
                 "expected_quotes",
+                "carry",
             ],
             "app_run_approve" => &["run_id", "digest"],
             "app_run_cancel" | "app_run_dispatch" | "app_run_show" => &["run_id"],

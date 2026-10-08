@@ -442,17 +442,41 @@ fn receipt_of(
 // ===========================================================================
 
 const DESTINATIONS_PATH: &str = "/v1/runtime/connectors/destinations";
+/// The device's list cap (`listWorkspaceConnectionBindings(…, 100)`): a
+/// full raw window means completeness is unknown — an unseen later match
+/// can't be ruled out — so it refuses before any filtering.
+const DESTINATIONS_WINDOW: usize = 100;
+/// The version-1 row keys, exactly (`devicePublishDestinationsSchema`).
+/// A row carrying anything else refuses the row, never the read.
+const DESTINATION_ROW_KEYS: [&str; 7] = [
+    "connectionId",
+    "toolkit",
+    "displayName",
+    "destinationId",
+    "status",
+    "available",
+    "publishable",
+];
 
 /// One upstream destination row (`toDeviceDestination`, AOS
 /// `device-publish.ts`): `{connectionId, toolkit, displayName,
 /// destinationId, status, available, publishable}` — no workspace/account
-/// field, so it can never be used as workspace evidence.
+/// field, so it can never be used as workspace evidence. Strict version-1
+/// shape, validated at parse; only the wire fields are stored.
 #[derive(Debug, Clone)]
 pub struct DestinationRow {
     /// The remote AOS `connectionId` — the wire identity to map to.
     pub connection_id: String,
     pub toolkit: String,
+    /// The operator-facing account label (`displayName`). Discovery/display
+    /// only — never send or workspace authority.
+    pub display_name: String,
     pub destination_id: String,
+    /// The pinned status vocabulary (`connectors.ts:12`). Discovery only.
+    pub status: String,
+    /// The company overlay's per-toolkit open flag. Validated, retained for
+    /// display; `publishable` already encodes the server's send verdict.
+    pub available: bool,
     /// `publishable` — a row not publishable cannot be a send target.
     pub publishable: bool,
 }
@@ -484,6 +508,19 @@ pub enum DestinationLookup {
     Unavailable,
 }
 
+/// The closed typed read of the destinations list (discovery only — never
+/// send/workspace authority). `Complete` holds every validated row;
+/// `Ambiguous` is a full-window reply (completeness unknown); `Unavailable`
+/// is transport, envelope or any malformed row.
+pub enum DestinationList {
+    /// Every raw row validated against the version-1 shape.
+    Complete(Vec<DestinationRow>),
+    /// The reply hit the ≤100-row window cap — a later match may be unseen.
+    Ambiguous,
+    /// The destinations read failed (transport, envelope, malformed row).
+    Unavailable,
+}
+
 impl DestinationLookup {
     /// Collapse to a refusal for callers that treat non-resolution as a
     /// hard stop. `Unmapped` is a binding mismatch; `Ambiguous`/`Unavailable`
@@ -505,6 +542,60 @@ impl DestinationLookup {
             )),
         }
     }
+}
+
+/// One strict version-1 destination row. Every bound mirrors the current
+/// device contract, UTF-16-measured like Zod: `status` is the pinned enum
+/// only (`connectors.ts:12`) — anything else refuses the row, and one bad
+/// row refuses the whole lookup (see `resolve`). `available` is validated
+/// but not stored: it is the server's input to `publishable`, not a second
+/// switch the daemon reads.
+fn parse_destination_row(value: &Value) -> Option<DestinationRow> {
+    let row = value.as_object()?;
+    if row.len() != DESTINATION_ROW_KEYS.len()
+        || row
+            .keys()
+            .any(|k| !DESTINATION_ROW_KEYS.contains(&k.as_str()))
+    {
+        return None;
+    }
+    let connection_id = row.get("connectionId")?.as_str()?;
+    if connection_id.is_empty() || connection_id.encode_utf16().count() > 80 {
+        return None;
+    }
+    let toolkit = row.get("toolkit")?.as_str()?;
+    if toolkit != "instagram" && toolkit != "facebook" {
+        return None;
+    }
+    let display_name = row.get("displayName")?.as_str()?;
+    if display_name.is_empty() || display_name.encode_utf16().count() > 200 {
+        return None;
+    }
+    let destination_id = row.get("destinationId")?.as_str()?;
+    // Zod string bounds are UTF-16 code units: measure exactly, including
+    // displayName. `status` is the pinned enum only (`connectors.ts:12`);
+    // anything else refuses the row — `publishable` already encodes the
+    // server's verdict, so an unknown status can never mean sendable.
+    if destination_id.encode_utf16().count() > 120 {
+        return None;
+    }
+    row.get("available")?.as_bool()?;
+    let status = row.get("status")?.as_str()?;
+    if !matches!(
+        status,
+        "active" | "pending" | "expired" | "revoked" | "error"
+    ) {
+        return None;
+    }
+    Some(DestinationRow {
+        connection_id: connection_id.to_owned(),
+        toolkit: toolkit.to_owned(),
+        display_name: display_name.to_owned(),
+        destination_id: destination_id.to_owned(),
+        status: status.to_owned(),
+        available: row.get("available")?.as_bool()?,
+        publishable: row.get("publishable")?.as_bool()?,
+    })
 }
 
 /// Read-credential destinations client (`provider.read`/`provider.draft`
@@ -534,54 +625,25 @@ impl MediaResolver {
     }
 
     /// Resolve `(toolkit, destination_id)` to its remote AOS `connectionId`
-    /// under the read credential's scoped workspace. The reply row set is
-    /// already filtered by `listWorkspaceConnectionBindings(…, 100)` — a
-    /// full 100-row window means completeness is unknown, so it refuses
-    /// `Ambiguous` even if a match is visible (an unseen later match can't
-    /// be ruled out). A caller-supplied id is never trusted; the read is
-    /// the only source of the map.
+    /// under the read credential's scoped workspace. The reply is the
+    /// current version-1 envelope (`{ok:true,data:{version:"1",
+    /// destinations:[...]}}`, ≤100 rows); a bare-array `data` is the retired
+    /// shape and is refused, never parsed. The RAW row count is checked
+    /// BEFORE filtering — a full-window reply means completeness is
+    /// unknown, so it refuses `Ambiguous` even if a match is visible (an
+    /// unseen later match can't be ruled out). Any malformed row refuses
+    /// the WHOLE lookup (`Unavailable`): dropping it could hide a second
+    /// matching row and manufacture uniqueness. A caller-supplied id is
+    /// never trusted; the read is the only source of the map. Read rows
+    /// are discovery only, never send
+    /// workspace authority (the send credential's workspace is enforced
+    /// upstream at import and send).
     pub fn resolve(&self, toolkit: &str, destination_id: &str) -> DestinationLookup {
-        let url = format!("{}{}", self.base, DESTINATIONS_PATH);
-        let data = match self
-            .http
-            .get(&url)
-            .header("authorization", &self.credential.authorization())
-            .call()
-        {
-            Ok(resp) => match read_destinations_envelope(resp) {
-                Ok(d) => d,
-                Err(Fault::Ambiguous) => return DestinationLookup::Unavailable,
-                Err(Fault::Refused(_)) => return DestinationLookup::Unavailable,
-            },
-            Err(_) => return DestinationLookup::Unavailable,
+        let rows = match self.list() {
+            DestinationList::Complete(rows) => rows,
+            DestinationList::Ambiguous => return DestinationLookup::Ambiguous,
+            DestinationList::Unavailable => return DestinationLookup::Unavailable,
         };
-        // Parse the row set; malformed rows are dropped, not trusted.
-        let rows: Vec<DestinationRow> = data
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| {
-                        let connection_id = v.get("connectionId")?.as_str()?.to_owned();
-                        let toolkit = v.get("toolkit")?.as_str()?.to_owned();
-                        let destination_id = v.get("destinationId")?.as_str()?.to_owned();
-                        let publishable = v
-                            .get("publishable")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        Some(DestinationRow {
-                            connection_id,
-                            toolkit,
-                            destination_id,
-                            publishable,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        // A full 100-row window can't rule out an unseen later match.
-        if rows.len() >= 100 {
-            return DestinationLookup::Ambiguous;
-        }
         let matches: Vec<&DestinationRow> = rows
             .iter()
             .filter(|r| r.toolkit == toolkit && r.destination_id == destination_id && r.publishable)
@@ -596,11 +658,59 @@ impl MediaResolver {
             _ => DestinationLookup::Ambiguous,
         }
     }
+
+    /// The typed destinations read, consumed by `resolve` and any caller
+    /// that needs the full validated row set. Same request, envelope,
+    /// raw-window completeness and all-row parse as `resolve` — preserved
+    /// classification: transport/envelope/5xx/malformed → `Unavailable`,
+    /// full window → `Ambiguous`, clean complete list → `Complete`.
+    /// Discovery only: a row is never send or workspace authority.
+    pub fn list(&self) -> DestinationList {
+        let url = format!("{}{}", self.base, DESTINATIONS_PATH);
+        let data = match self
+            .http
+            .get(&url)
+            .header("authorization", &self.credential.authorization())
+            .call()
+        {
+            Ok(resp) => match read_destinations_envelope(resp) {
+                Ok(d) => d,
+                Err(Fault::Ambiguous) => return DestinationList::Unavailable,
+                Err(Fault::Refused(_)) => return DestinationList::Unavailable,
+            },
+            Err(_) => return DestinationList::Unavailable,
+        };
+        // Raw-window completeness BEFORE any parsing: only the raw count
+        // can prove the window wasn't truncated. Then parse every row
+        // against the strict version-1 shape: one malformed row refuses the
+        // whole list, since a dropped row could hide a second match.
+        let raw = match data.as_array() {
+            Some(rows) => rows,
+            // Unreachable: the envelope reader only returns the version-1
+            // array. Fail closed if it ever drifts.
+            None => return DestinationList::Unavailable,
+        };
+        if raw.len() >= DESTINATIONS_WINDOW {
+            return DestinationList::Ambiguous;
+        }
+        let mut rows: Vec<DestinationRow> = Vec::with_capacity(raw.len());
+        for value in raw.iter() {
+            match parse_destination_row(value) {
+                Some(row) => rows.push(row),
+                None => return DestinationList::Unavailable,
+            }
+        }
+        DestinationList::Complete(rows)
+    }
 }
 
-/// Read the destinations envelope. Only a 2xx `{ok:true,data:[…]}` is a
-/// read; a 4xx door error is a refused read, 5xx/redirect/drift ambiguous.
-/// The upstream `message` is never consulted.
+/// Read the destinations envelope. Only a 2xx `{ok:true,data:{version:"1",
+/// destinations:[...]}}` is a read — the current version-1 contract, with
+/// `data` carrying exactly those two keys. A bare-array `data` is the
+/// retired shape and is refused (no fallback); a 4xx door error is a
+/// refused read, 5xx/redirect/drift ambiguous.
+/// The upstream `message` is never consulted. Read rows are discovery
+/// only, never send workspace authority.
 fn read_destinations_envelope(
     mut response: ureq::http::Response<ureq::Body>,
 ) -> std::result::Result<Value, Fault> {
@@ -616,8 +726,18 @@ fn read_destinations_envelope(
         .map_err(|_| Fault::Ambiguous)?;
     let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| Fault::Ambiguous)?;
     if (200..=299).contains(&status) {
-        if envelope.get("ok") == Some(&Value::Bool(true)) && envelope.get("data").is_some() {
-            return Ok(envelope["data"].clone());
+        // `data` is exactly `{version, destinations}` (`z.strictObject`):
+        // unknown keys refuse the read, never ride along.
+        let shaped = match envelope.get("data") {
+            Some(Value::Object(data)) => {
+                data.len() == 2
+                    && data.get("version").and_then(Value::as_str) == Some("1")
+                    && data.get("destinations").is_some_and(|rows| rows.is_array())
+            }
+            _ => false,
+        };
+        if envelope.get("ok") == Some(&Value::Bool(true)) && shaped {
+            return Ok(envelope["data"]["destinations"].clone());
         }
         return Err(Fault::Ambiguous);
     }

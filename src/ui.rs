@@ -427,6 +427,10 @@ pub struct PublicBoard {
     /// The company/workspace id this instance serves — `company` must
     /// equal it; one Cadence serves one company (contract §9).
     pub company: String,
+    /// Canonical company slug resolved server-side from the workspace row;
+    /// distinct from `company`, which is the workspace id.
+    #[serde(default)]
+    pub company_slug: Option<String>,
     /// Where an absent or expired browser session redirects:
     /// `{app}/v2/board/authorize` on the app origin.
     pub authorize_url: String,
@@ -938,6 +942,18 @@ pub(crate) fn push_device_login_config(state_dir: &Path, triple: &DeviceLoginOpt
     Ok(())
 }
 
+fn valid_board_company_slug(slug: &str) -> bool {
+    let bytes = slug.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 42
+        && !slug.ends_with("-staging")
+        && matches!(bytes[0], b'a'..=b'z' | b'0'..=b'9')
+        && matches!(bytes[bytes.len() - 1], b'a'..=b'z' | b'0'..=b'9')
+        && bytes
+            .iter()
+            .all(|byte| matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+}
+
 /// CAD-526: merge the board-identity configuration — flags win, then
 /// `AGENTICOS_BOARD_*` env (how the hosted container is told), then the
 /// persisted block. All of host/issuer/company must resolve together.
@@ -968,12 +984,25 @@ pub(crate) fn resolve_board(flags: &UiFlags, persisted: &UiOpts) -> Result<Optio
         "AGENTICOS_BOARD_COMPANY",
         saved.map(|b| &b.company),
     );
+    // AOS boardContainerEnv resolves this separately from the workspace id
+    // and host label. It is the only owner-portal slug source; saved state is
+    // its persisted server-side value, never caller/frame input.
+    let company_slug = std::env::var("AGENTICOS_BOARD_COMPANY_SLUG")
+        .ok()
+        .or_else(|| saved.and_then(|b| b.company_slug.clone()))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
     let authorize_url = field(
         flags.board_authorize_url.as_ref(),
         "AGENTICOS_BOARD_AUTHORIZE_URL",
         saved.map(|b| &b.authorize_url),
     );
-    if host.is_none() && issuer.is_none() && company.is_none() && authorize_url.is_none() {
+    if host.is_none()
+        && issuer.is_none()
+        && company.is_none()
+        && company_slug.is_none()
+        && authorize_url.is_none()
+    {
         return Ok(None);
     }
     let missing = |name: &str, env: &str| -> Error {
@@ -985,6 +1014,11 @@ pub(crate) fn resolve_board(flags: &UiFlags, persisted: &UiOpts) -> Result<Optio
     let host = host.ok_or_else(|| missing("host", "AGENTICOS_BOARD_HOST"))?;
     let issuer = issuer.ok_or_else(|| missing("issuer", "AGENTICOS_BOARD_ISSUER"))?;
     let company = company.ok_or_else(|| missing("company", "AGENTICOS_BOARD_COMPANY"))?;
+    if let Some(slug) = company_slug.as_deref() {
+        if !valid_board_company_slug(slug) {
+            return Err(Error::rejected("invalid board company slug"));
+        }
+    }
     if !crate::board_identity::valid_aud(&host) {
         return Err(Error::rejected(format!(
             "invalid board host '{host}' — expected `slug.board-domain` or \
@@ -1008,6 +1042,7 @@ pub(crate) fn resolve_board(flags: &UiFlags, persisted: &UiOpts) -> Result<Optio
         host,
         issuer,
         company,
+        company_slug,
         authorize_url,
     }))
 }
@@ -2212,6 +2247,7 @@ mod tests {
             host: "acme.board.localhost:3111".to_string(),
             issuer: "http://api.internal".to_string(),
             company: "co_1".to_string(),
+            company_slug: Some("acme".to_string()),
             authorize_url: "http://api.internal/v2/board/authorize".to_string(),
         };
         let persisted = super::UiOpts {

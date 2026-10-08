@@ -975,6 +975,70 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=34", [])?;
                 tx.commit()?;
             }
+            if version < 35 {
+                // CAD-1143: prepared immutable owner intents — an
+                // account-only, grant-free, non-dispatchable publication
+                // intent in its own table. New table only; the
+                // queued-only dispatch SQL on `social_publish_intents` is
+                // untouched, so a PREPARED row is structurally invisible
+                // to every claim/dispatch path.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::social_publish::SCHEMA_PREPARED)?;
+                tx.execute("UPDATE schema_version SET version=35", [])?;
+                tx.commit()?;
+            }
+            if version < 36 {
+                // CAD-1143: persist a host-owned five-second post-queue
+                // maturity floor. Historical rows default to mature; every
+                // newly queued row records its own server-derived floor.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "ALTER TABLE social_publish_intents ADD COLUMN claim_after_epoch INTEGER NOT NULL DEFAULT 0 CHECK(claim_after_epoch>=0);\n\
+                     DROP INDEX IF EXISTS social_publish_due;\n\
+                     CREATE INDEX social_publish_due ON social_publish_intents(state,due_epoch,claim_after_epoch,intent_id);",
+                )?;
+                tx.execute("UPDATE schema_version SET version=36", [])?;
+                tx.commit()?;
+            }
+            if version < 37 {
+                // CAD-1143: a queue row created by owner attach stays
+                // nondispatchable until a second, post-commit transaction
+                // installs its undo floor and arms claims. Historical rows
+                // were already dispatchable and therefore default armed.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "ALTER TABLE social_publish_intents ADD COLUMN claim_armed INTEGER NOT NULL DEFAULT 1 CHECK(claim_armed IN (0,1));\n\
+                     DROP INDEX IF EXISTS social_publish_due;\n\
+                     CREATE INDEX social_publish_due ON social_publish_intents(state,claim_armed,due_epoch,claim_after_epoch,intent_id);",
+                )?;
+                tx.execute("UPDATE schema_version SET version=37", [])?;
+                tx.commit()?;
+            }
+            if version < 38 {
+                // Cancellation is terminal for a PREPARED owner action and
+                // its attached-but-unclaimed queue row. Rebuild the narrow
+                // lifecycle table to add that explicit terminal state.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "DROP INDEX IF EXISTS social_publish_prepared_scope;\n\
+                     ALTER TABLE social_publish_prepared RENAME TO social_publish_prepared_v37;\n\
+                     CREATE TABLE social_publish_prepared(\n\
+                      prepared_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,\n\
+                      install_id TEXT NOT NULL, context_id TEXT, run_id TEXT NOT NULL,\n\
+                      effect_id TEXT NOT NULL, connection_id TEXT NOT NULL, aos_connection_id TEXT,\n\
+                      destination_id TEXT NOT NULL, destination_label TEXT NOT NULL, toolkit TEXT NOT NULL, timezone TEXT NOT NULL,\n\
+                      caption_digest TEXT NOT NULL, image_digest TEXT, media_key TEXT, approval_id TEXT NOT NULL,\n\
+                      mode TEXT NOT NULL CHECK(mode IN ('now','schedule')),\n\
+                      due_epoch INTEGER NOT NULL CHECK(due_epoch>0), not_before_epoch INTEGER NOT NULL, expires_epoch INTEGER NOT NULL,\n\
+                      state TEXT NOT NULL CHECK(state IN ('prepared','authorized','cancelled','superseded','refused')),\n\
+                      grant_id TEXT, descriptor TEXT NOT NULL, descriptor_digest TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);\n\
+                     INSERT INTO social_publish_prepared SELECT * FROM social_publish_prepared_v37;\n\
+                     DROP TABLE social_publish_prepared_v37;\n\
+                     CREATE INDEX social_publish_prepared_scope ON social_publish_prepared(install_id,context_id,prepared_id);",
+                )?;
+                tx.execute("UPDATE schema_version SET version=38", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

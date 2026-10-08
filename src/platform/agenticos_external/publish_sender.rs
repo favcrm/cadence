@@ -4,9 +4,12 @@
 //! speaking the versioned device publish door as LANDED in
 //! `agenticos-stack/agenticos-v2` (AOS-94 device-publish v1, revalidated
 //! 2026-09-29 against the `agenticos-v2` staging worktree carrying PR
-//! #214): bearer-authenticated `POST /v1/runtime/connectors/publish/preflight`,
+//! #214), plus the AOS-150 read-only owner queue inspection. The client uses
+//! bearer-authenticated `POST /v1/runtime/connectors/publish/preflight`,
+//! `POST /v1/runtime/connectors/publish/queue-validation`,
 //! `POST /v1/runtime/connectors/publish` and
-//! `GET /v1/runtime/connectors/publish/{key}/status`.
+//! `GET /v1/runtime/connectors/publish/{key}/status`. Queue validation is a
+//! selector-only signed inspection; its receipt is not send authority.
 //!
 //! Conformance rules (pinned, do not drift without revalidation):
 //! - every response document must carry wire version exactly `"1"`;
@@ -62,13 +65,17 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::publish::{LedgerOutcome, PublishState, Refusal, SendBinding};
+use super::publish::{
+    LedgerOutcome, PublishState, QueueValidationRequest, QueueValidationResponse, Refusal,
+    SendBinding,
+};
 use crate::error::{Error, Result};
 
 /// Wire version every v1 door document carries.
 pub const DEVICE_PUBLISH_VERSION: &str = "1";
 
 const PREFLIGHT_PATH: &str = "/v1/runtime/connectors/publish/preflight";
+const QUEUE_VALIDATION_PATH: &str = "/v1/runtime/connectors/publish/queue-validation";
 const EXEC_PATH: &str = "/v1/runtime/connectors/publish";
 const STATUS_PATH: &str = "/v1/runtime/connectors/publish";
 const RESPONSE_CAP: u64 = 1024 * 1024;
@@ -316,6 +323,31 @@ impl HttpPublishSender {
 }
 
 impl super::publish::PublishSender for HttpPublishSender {
+    fn inspect_queue(
+        &self,
+        request: &QueueValidationRequest,
+    ) -> std::result::Result<QueueValidationResponse, Refusal> {
+        request.validate()?;
+        let body = serde_json::to_value(request)
+            .map_err(|_| Refusal::new("bad_intent", "queue selector could not be encoded"))?;
+        let data = match self.post(QUEUE_VALIDATION_PATH, &body) {
+            Ok(data) => data,
+            Err(Fault::Refused(refusal)) => return Err(refusal),
+            Err(Fault::Ambiguous) => {
+                return Err(Refusal::new(
+                    "queue_validation_uncertain",
+                    "read-only queue validation is uncertain; the intent remains prepared",
+                ));
+            }
+        };
+        serde_json::from_value(data).map_err(|_| {
+            Refusal::new(
+                "queue_validation_malformed",
+                "queue-validation response is malformed; the intent remains prepared",
+            )
+        })
+    }
+
     fn execute(&self, binding: &SendBinding) -> std::result::Result<LedgerOutcome, Refusal> {
         let material = (self.material)(binding)?;
         self.execute_request(binding, &material)

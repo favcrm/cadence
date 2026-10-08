@@ -804,6 +804,27 @@ impl Auth {
         })
     }
 
+    /// Atomically consume a verified external assertion's JTI without
+    /// opening a board session. CAD-1143's AOS intent-read assertion is
+    /// purpose-separated from sign-in but shares the durable hashed replay
+    /// ledger, so a daemon restart cannot reopen its 15-second window.
+    pub fn consume_assertion_jti(&mut self, jti: &str, exp: i64, now: i64) -> Result<bool> {
+        if jti.is_empty() || jti.len() > 100 || exp <= now {
+            return Err(Error::invalid(
+                "assertion_invalid",
+                "assertion replay record is outside its validity window",
+            ));
+        }
+        self.prune(now);
+        let key = digest(jti);
+        if self.jtis.contains_key(&key) {
+            return Ok(false);
+        }
+        self.jtis.insert(key, exp);
+        self.persist()?;
+        Ok(true)
+    }
+
     /// Open a `public` session for a verified platform user (CAD-526).
     /// `None` is the refusal — the `jti` was seen before (the daemon
     /// maps it to the contract's `assertion_replayed`).

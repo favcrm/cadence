@@ -53,6 +53,8 @@ interface BackendIntent {
   frozen_digest: string;
   receipt: unknown;
   upstream: unknown;
+  claim_after_epoch?: number;
+  claim_armed?: boolean;
   writer?: unknown;
   reviewer?: unknown;
 }
@@ -81,6 +83,10 @@ export interface PublishIntent {
   /** The schedule request key, echoed as the idempotency material. */
   idempotency_key: string;
   due_epoch: number;
+  /** Server-owned post-queue undo maturity; never derived from AOS not_before. */
+  claim_after_epoch?: number;
+  /** False only while an owner attachment awaits its post-commit arm. */
+  claim_armed?: boolean;
   timezone: string;
   grant_id: string;
   approval_id: string;
@@ -111,12 +117,16 @@ export function toPublishIntent(envelope: BackendIntent): PublishIntent {
   const state = envelope.state;
   const channel = frozen.toolkit;
   const dueEpoch = frozen.due_epoch;
+  const claimAfterEpoch = envelope.claim_after_epoch ?? 0;
+  const claimArmed = envelope.claim_armed ?? true;
   if (!(STATES as readonly string[]).includes(state))
     throw new ApiError(`unknown publish state: ${state}`, 502);
   if (channel !== "instagram" && channel !== "facebook")
     throw new ApiError(`unknown publish channel: ${String(channel)}`, 502);
   if (!Number.isInteger(dueEpoch))
     throw new ApiError("publish due time is not an integer epoch", 502);
+  if (!Number.isSafeInteger(claimAfterEpoch) || claimAfterEpoch < 0 || typeof claimArmed !== "boolean")
+    throw new ApiError("publish claim maturity is not a valid epoch", 502);
   const get = (key: string) => str(frozen[key]);
   const required = ["install_id", "run_id", "effect_id", "destination_id", "caption_digest", "grant_id", "approval_id", "timezone"] as const;
   for (const key of required) {
@@ -144,6 +154,8 @@ export function toPublishIntent(envelope: BackendIntent): PublishIntent {
     frozen_digest: envelope.frozen_digest,
     idempotency_key: envelope.request,
     due_epoch: dueEpoch as number,
+    claim_after_epoch: claimAfterEpoch as number,
+    claim_armed: claimArmed,
     timezone: get("timezone") as string,
     grant_id: get("grant_id") as string,
     approval_id: get("approval_id") as string,
@@ -181,6 +193,93 @@ export interface SchedulePublishBody {
   timezone: string;
 }
 
+/** CAD-1143 prepare body: only the host-minted id and selected run/mode;
+ *  scope, account, grant and immutable publication material derive server-side. */
+export interface PublishIntentPrepareBody {
+  request_id: string;
+  run_id: string;
+  mode: "now" | "schedule";
+  due_epoch?: number;
+}
+
+export interface PreparedOwnerIntent {
+  prepared_id: string;
+  request: string;
+  state: "prepared" | "authorized";
+  descriptor_digest: string;
+  install_id: string;
+  context_id: string | null;
+  run_id: string;
+  mode: "now" | "schedule";
+  due_epoch: number;
+  not_before_epoch: number;
+  owner_intent: {
+    version: "social-owner-intent.v1";
+    intent_id: string;
+    intent_digest: string;
+    expires_at: number;
+  };
+  owner_action_url: string;
+}
+
+export interface PublishIntentAttachBody {
+  prepared_id: string;
+  install_id: string;
+  context_id?: string;
+}
+
+export interface PreparedOwnerScopeBody {
+  prepared_id: string;
+  install_id: string;
+  context_id: string | null;
+}
+
+export interface AttachedPublishIntent {
+  prepared_id: string;
+  queued: {
+    intent_id: string;
+    request: string;
+    state: PublishState;
+    due_epoch: number;
+    claim_after_epoch: number;
+    claim_armed: true;
+  };
+}
+
+export type OwnerCompletionStatus = "ready" | "pending" | "unknown" | "refused";
+export type PreparedOwnerLifecycle = "prepared" | "authorized" | "cancelled" | "superseded" | "refused";
+export interface PreparedOwnerStatus {
+  prepared_id: string;
+  install_id: string;
+  context_id: string | null;
+  state: PreparedOwnerLifecycle;
+  owner_status: OwnerCompletionStatus;
+  queued: null | {
+    intent_id: string;
+    state: PublishState;
+    due_epoch: number;
+    claim_armed: boolean;
+    claim_after_epoch: number | null;
+  };
+}
+
+export interface PreparedOwnerCancellation {
+  prepared_id: string;
+  install_id: string;
+  context_id: string | null;
+  state: "cancelled";
+  queued: PreparedOwnerStatus["queued"];
+}
+
+/** CAD-1123 HP4 reschedule body: the intent's own scope, the time the
+ *  operator saw and the new time (compare-and-swap on the queued intent). */
+export interface PublishRescheduleBody {
+  install_id: string;
+  context_id?: string;
+  expected_due_epoch: number;
+  due_epoch: number;
+}
+
 /** Pilot destination identity (771 revalidated): operator-named Instagram
  *  professional account. The source receipt handle (@juicysuite_crm) is a
  *  different role and must never appear here. */
@@ -201,6 +300,10 @@ const paths = {
   cancel: (intentId: string) =>
     `/api/social-publishes/${encodeURIComponent(intentId)}/cancel`,
   importMedia: () => "/api/social-media-imports",
+  prepareIntent: () => "/api/social-publish-intents/prepare",
+  attachIntent: () => "/api/social-publish-intents/attach",
+  statusIntent: () => "/api/social-publish-intents/status",
+  cancelPreparedIntent: () => "/api/social-publish-intents/cancel",
   sendNow: (intentId: string) =>
     `/api/social-publishes/${encodeURIComponent(intentId)}/send-now`,
 };
@@ -234,12 +337,19 @@ function sameOrigin(path: string): string {
 /** Body keys the relay accepts per operation (mirrors the hostActions
 guard pattern): anything else is forged and never serializes. Schedule
 carries the artifact-freeze grammar only — digests derive server-side.
-Cancel carries an empty body. */
+Queued cancel names its exact install/context; prepared status/cancel always
+carry all three exact scope selectors. */
 const SCHEDULE_KEYS = [
   "request_id", "install_id", "context_id", "run_id", "effect_id",
   "artifact_id", "bundle_digest", "slot", "destination_id", "toolkit",
   "media_key", "grant_id", "approval_id", "due_epoch", "timezone",
 ] as const;
+const PUBLISH_INTENT_PREPARE_KEYS = ["request_id", "run_id", "mode", "due_epoch"] as const;
+const PUBLISH_INTENT_ATTACH_KEYS = ["prepared_id", "install_id", "context_id"] as const;
+const PUBLISH_INTENT_SCOPE_KEYS = ["prepared_id", "install_id", "context_id"] as const;
+/** CAD-1123 HP4: the reschedule grammar mirrors the relay's `Reschedule`
+ *  struct exactly — the intent's own scope plus the two epochs. */
+const PUBLISH_RESCHEDULE_KEYS = ["install_id", "context_id", "expected_due_epoch", "due_epoch"] as const;
 const CANCEL_KEYS = ["install_id", "context_id"] as const;
 const MEDIA_IMPORT_KEYS = [
   "request_id", "install_id", "context_id", "run_id", "artifact_id",
@@ -250,6 +360,243 @@ function assertCleanBody(body: Record<string, unknown>, allowed: readonly string
   for (const key of Object.keys(body)) {
     if (!allowed.includes(key)) throw new ApiError(`refused publish field: ${key}`, 400);
   }
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validOwnerActionUrl(
+  value: string,
+  preparedId: string,
+  intentDigest: string,
+): boolean {
+  try {
+    const rawAuthority = /^https:\/\/([^/?#]+)/.exec(value)?.[1];
+    if (!rawAuthority || rawAuthority.includes(":") || rawAuthority.includes("@")) return false;
+    const url = new URL(value);
+    const query = [...url.searchParams.entries()];
+    const keys = query.map(([key]) => key);
+    const slug = url.searchParams.get("company_slug") ?? "";
+    return url.protocol === "https:" &&
+      url.username === "" && url.password === "" && url.pathname === "/social-owner-action" &&
+      url.hash === "" && query.length === 3 && new Set(keys).size === 3 &&
+      ["company_slug", "intent_id", "intent_digest"].every(key => url.searchParams.getAll(key).length === 1) &&
+      /^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$/.test(slug) && !slug.endsWith("-staging") &&
+      url.searchParams.get("intent_id") === preparedId &&
+      url.searchParams.get("intent_digest") === intentDigest;
+  } catch {
+    return false;
+  }
+}
+
+function toPreparedOwnerIntent(
+  value: unknown,
+  expected: { installId: string; contextId: string | null; runId: string; mode: "now" | "schedule" },
+): PreparedOwnerIntent {
+  const root = record(value) ? value : null;
+  const envelope = root && record(root.prepared) ? root.prepared : null;
+  const owner = envelope && record(envelope.owner_intent) ? envelope.owner_intent : null;
+  const descriptor = envelope && record(envelope.descriptor) ? envelope.descriptor : null;
+  const preparedId = envelope ? str(envelope.prepared_id) : null;
+  const request = envelope ? str(envelope.request) : null;
+  const state = envelope ? str(envelope.state) : null;
+  const descriptorDigest = envelope ? str(envelope.descriptor_digest) : null;
+  const intentId = owner ? str(owner.intent_id) : null;
+  const intentDigest = owner ? str(owner.intent_digest) : null;
+  const expiresAt = owner?.expires_at;
+  const ownerActionUrl = root ? str(root.owner_action_url) : null;
+  const installId = descriptor ? str(descriptor.install_id) : null;
+  const contextId = descriptor && Object.prototype.hasOwnProperty.call(descriptor, "context_id")
+    ? (descriptor.context_id === null ? null : str(descriptor.context_id)) : undefined;
+  const runId = descriptor ? str(descriptor.run_id) : null;
+  const mode = descriptor ? str(descriptor.mode) : null;
+  const dueEpoch = descriptor?.due_epoch;
+  const notBeforeEpoch = descriptor?.not_before_epoch;
+  const expiresEpoch = descriptor?.expires_epoch;
+  if (!preparedId || preparedId !== intentId || !/^sprep-[0-9a-f]{32}$/.test(preparedId) ||
+      !request || !/^[A-Za-z0-9_-]{8,128}$/.test(request) ||
+      (state !== "prepared" && state !== "authorized") ||
+      !descriptorDigest || !/^[a-f0-9]{64}$/.test(descriptorDigest) ||
+      installId !== expected.installId || contextId !== expected.contextId ||
+      runId !== expected.runId || mode !== expected.mode ||
+      !Number.isSafeInteger(dueEpoch) || (dueEpoch as number) <= 0 ||
+      notBeforeEpoch !== dueEpoch || !Number.isSafeInteger(expiresEpoch) ||
+      (expiresEpoch as number) < (dueEpoch as number) || expiresAt !== expiresEpoch ||
+      !owner || owner.version !== "social-owner-intent.v1" || !intentDigest ||
+      !/^[a-f0-9]{64}$/.test(intentDigest) || !Number.isSafeInteger(expiresAt) ||
+      (expiresAt as number) < 0 || !ownerActionUrl ||
+      !validOwnerActionUrl(ownerActionUrl, preparedId, intentDigest))
+    throw new ApiError("The server returned an invalid prepared owner intent", 502);
+  return {
+    prepared_id: preparedId, request, state, descriptor_digest: descriptorDigest,
+    install_id: expected.installId,
+    context_id: expected.contextId,
+    run_id: expected.runId,
+    mode: expected.mode,
+    due_epoch: dueEpoch as number,
+    not_before_epoch: notBeforeEpoch as number,
+    owner_intent: {
+      version: "social-owner-intent.v1", intent_id: intentId,
+      intent_digest: intentDigest, expires_at: expiresAt as number,
+    },
+    owner_action_url: ownerActionUrl,
+  };
+}
+
+function toAttachedPublishIntent(value: unknown, expected: PreparedOwnerIntent): AttachedPublishIntent {
+  const envelope = record(value) ? value : null;
+  const prepared = envelope && record(envelope.prepared) ? envelope.prepared : null;
+  const queued = envelope && record(envelope.queued) ? envelope.queued : null;
+  const returnedId = prepared ? str(prepared.prepared_id) : null;
+  const intentId = queued ? str(queued.intent_id) : null;
+  const requestId = queued ? str(queued.request) : null;
+  const state = queued ? str(queued.state) : null;
+  const dueEpoch = queued?.due_epoch;
+  const claimAfterEpoch = queued?.claim_after_epoch;
+  const claimArmed = queued?.claim_armed;
+  const descriptorDigest = prepared ? str(prepared.descriptor_digest) : null;
+  const descriptor = prepared && record(prepared.descriptor) ? prepared.descriptor : null;
+  const installId = descriptor ? str(descriptor.install_id) : null;
+  const contextId = descriptor && Object.prototype.hasOwnProperty.call(descriptor, "context_id")
+    ? (descriptor.context_id === null ? null : str(descriptor.context_id)) : undefined;
+  const runId = descriptor ? str(descriptor.run_id) : null;
+  const mode = descriptor ? str(descriptor.mode) : null;
+  const descriptorDueEpoch = descriptor?.due_epoch;
+  const descriptorNotBeforeEpoch = descriptor?.not_before_epoch;
+  if (!returnedId || returnedId !== expected.prepared_id ||
+      !intentId || !/^spub-[0-9a-f]{32}$/.test(intentId) ||
+      !requestId || requestId !== expected.request ||
+      !prepared || prepared.state !== "authorized" || prepared.request !== expected.request ||
+      descriptorDigest !== expected.descriptor_digest ||
+      installId !== expected.install_id || contextId !== expected.context_id ||
+      runId !== expected.run_id || mode !== expected.mode ||
+      descriptorDueEpoch !== expected.due_epoch ||
+      descriptorNotBeforeEpoch !== expected.not_before_epoch ||
+      !(STATES as readonly string[]).includes(String(state)) ||
+      !Number.isSafeInteger(dueEpoch) || dueEpoch !== expected.due_epoch || (dueEpoch as number) <= 0 ||
+      !Number.isSafeInteger(claimAfterEpoch) ||
+      (claimAfterEpoch as number) <= 0 || claimArmed !== true)
+    throw new ApiError("The server returned an invalid owner intent attachment", 502);
+  return {
+    prepared_id: returnedId,
+    queued: {
+      intent_id: intentId, request: requestId, state: state as PublishState,
+      due_epoch: dueEpoch as number, claim_after_epoch: claimAfterEpoch as number,
+      claim_armed: true,
+    },
+  };
+}
+
+function toPreparedOwnerStatus(
+  value: unknown,
+  expected: { preparedId: string; installId: string; contextId: string | null },
+): PreparedOwnerStatus {
+  const root = record(value) ? value : null;
+  if (!root || !exactRecordKeys(root, [
+    "prepared_id", "install_id", "context_id", "state", "owner_status", "queued",
+  ])) throw new ApiError("The server returned an invalid owner intent status", 502);
+  const preparedId = str(root.prepared_id);
+  const installId = str(root.install_id);
+  if (root.context_id !== null && typeof root.context_id !== "string")
+    throw new ApiError("The server returned an invalid owner intent scope", 502);
+  const contextId = root.context_id === null ? null : root.context_id as string;
+  const state = str(root.state);
+  const ownerStatus = str(root.owner_status);
+  if (preparedId !== expected.preparedId || installId !== expected.installId ||
+      contextId !== expected.contextId ||
+      !["prepared", "authorized", "cancelled", "superseded", "refused"].includes(String(state)) ||
+      !["ready", "pending", "unknown", "refused"].includes(String(ownerStatus)))
+    throw new ApiError("The server returned an invalid owner intent status", 502);
+
+  let queued: PreparedOwnerStatus["queued"] = null;
+  if (root.queued !== null) {
+    const row = record(root.queued) ? root.queued : null;
+    if (!row || !exactRecordKeys(row, ["intent_id", "state", "due_epoch", "claim_armed", "claim_after_epoch"]))
+      throw new ApiError("The server returned an invalid owner queue status", 502);
+    const intentId = str(row.intent_id);
+    const queueState = str(row.state);
+    const dueEpoch = row.due_epoch;
+    const claimArmed = row.claim_armed;
+    const claimAfter = row.claim_after_epoch;
+    if (!intentId || !/^spub-[0-9a-f]{32}$/.test(intentId) ||
+        !(STATES as readonly string[]).includes(String(queueState)) ||
+        !Number.isSafeInteger(dueEpoch) || (dueEpoch as number) <= 0 ||
+        typeof claimArmed !== "boolean" ||
+        (claimArmed ? !Number.isSafeInteger(claimAfter) || (claimAfter as number) <= 0 : claimAfter !== null))
+      throw new ApiError("The server returned an invalid owner queue status", 502);
+    queued = {
+      intent_id: intentId,
+      state: queueState as PublishState,
+      due_epoch: dueEpoch as number,
+      claim_armed: claimArmed,
+      claim_after_epoch: claimArmed ? claimAfter as number : null,
+    };
+  }
+  if ((state === "prepared" && queued !== null) ||
+      (state === "authorized" && queued === null) ||
+      ((ownerStatus === "ready" || ownerStatus === "pending") && state !== "prepared") ||
+      (state === "cancelled" && queued !== null && queued.state !== "cancelled"))
+    throw new ApiError("The server returned an inconsistent owner intent lifecycle", 502);
+  return {
+    prepared_id: preparedId as string,
+    install_id: installId as string,
+    context_id: contextId,
+    state: state as PreparedOwnerLifecycle,
+    owner_status: ownerStatus as OwnerCompletionStatus,
+    queued,
+  };
+}
+
+function toPreparedOwnerCancellation(
+  value: unknown,
+  expected: { preparedId: string; installId: string; contextId: string | null },
+): PreparedOwnerCancellation {
+  const root = record(value) ? value : null;
+  if (!root || !exactRecordKeys(root, ["prepared_id", "install_id", "context_id", "state", "queued"]))
+    throw new ApiError("The server returned an invalid owner intent cancellation", 502);
+  const preparedId = str(root.prepared_id);
+  const installId = str(root.install_id);
+  if (root.context_id !== null && typeof root.context_id !== "string")
+    throw new ApiError("The server returned an invalid owner intent cancellation scope", 502);
+  const contextId = root.context_id === null ? null : root.context_id as string;
+  if (preparedId !== expected.preparedId || installId !== expected.installId ||
+      contextId !== expected.contextId || root.state !== "cancelled")
+    throw new ApiError("The server returned an invalid owner intent cancellation", 502);
+
+  let queued: PreparedOwnerStatus["queued"] = null;
+  if (root.queued !== null) {
+    const row = record(root.queued) ? root.queued : null;
+    if (!row || !exactRecordKeys(row, ["intent_id", "state", "due_epoch", "claim_armed", "claim_after_epoch"]))
+      throw new ApiError("The server returned an invalid cancelled queue status", 502);
+    const intentId = str(row.intent_id);
+    const dueEpoch = row.due_epoch;
+    const claimArmed = row.claim_armed;
+    const claimAfter = row.claim_after_epoch;
+    if (!intentId || !/^spub-[0-9a-f]{32}$/.test(intentId) || row.state !== "cancelled" ||
+        !Number.isSafeInteger(dueEpoch) || (dueEpoch as number) <= 0 ||
+        typeof claimArmed !== "boolean" ||
+        (claimArmed ? !Number.isSafeInteger(claimAfter) || (claimAfter as number) <= 0 : claimAfter !== null))
+      throw new ApiError("The server returned an invalid cancelled queue status", 502);
+    queued = {
+      intent_id: intentId,
+      state: "cancelled",
+      due_epoch: dueEpoch as number,
+      claim_armed: claimArmed,
+      claim_after_epoch: claimArmed ? claimAfter as number : null,
+    };
+  }
+  return {
+    prepared_id: preparedId as string,
+    install_id: installId as string,
+    context_id: contextId,
+    state: "cancelled",
+    queued,
+  };
+}
+
+function exactRecordKeys(value: Record<string, unknown>, keys: string[]): boolean {
+  return Object.keys(value).sort().join() === [...keys].sort().join();
 }
 
 /** Reads are abortable and uncached so receipts never outlive an operator
@@ -290,6 +637,80 @@ export const socialPublish = {
     const key = str(reply.media_key), digest = str(reply.image_digest);
     if (!key || !digest) throw new ApiError("The server returned an invalid media import receipt", 502);
     return { media_key: key, image_digest: digest };
+  },
+  /** CAD-1143: prepare is nondispatchable. The daemon derives all immutable
+   *  publication fields, then exposes only the signed-contract selector the
+   *  trusted top-level owner portal needs; caller material/grants never pass. */
+  prepareIntent: async (
+    body: PublishIntentPrepareBody,
+    expected: { installId: string; contextId: string | null },
+    signal?: AbortSignal,
+  ): Promise<PreparedOwnerIntent> => {
+    const wire: Record<string, unknown> = { request_id: body.request_id, run_id: body.run_id, mode: body.mode };
+    if (body.mode === "schedule") wire.due_epoch = body.due_epoch;
+    const reply = await request<unknown>(paths.prepareIntent(), signal, wire, PUBLISH_INTENT_PREPARE_KEYS);
+    return toPreparedOwnerIntent(reply, {
+      ...expected, runId: body.run_id, mode: body.mode,
+    });
+  },
+  /** CAD-1143: advisory status is an uncached, exact-scope read. A `ready`
+   *  result is not attach authority and never carries a receipt/JTI/grant. */
+  statusIntent: async (
+    body: PreparedOwnerScopeBody,
+    expected: { installId: string; contextId: string | null },
+    signal?: AbortSignal,
+  ): Promise<PreparedOwnerStatus> => {
+    const wire: Record<string, unknown> = {
+      prepared_id: body.prepared_id, install_id: body.install_id, context_id: body.context_id,
+    };
+    if (body.install_id !== expected.installId || body.context_id !== expected.contextId)
+      throw new ApiError("The owner intent status scope changed", 400);
+    const reply = await request<unknown>(paths.statusIntent(), signal, wire, PUBLISH_INTENT_SCOPE_KEYS);
+    return toPreparedOwnerStatus(reply, {
+      preparedId: body.prepared_id, installId: expected.installId, contextId: expected.contextId,
+    });
+  },
+  /** Cancellation is a separate exact-scope local terminal transition; it
+   *  never claims remote AOS deletion or revocation. */
+  cancelPreparedIntent: async (
+    body: PreparedOwnerScopeBody,
+    expected: { installId: string; contextId: string | null },
+    signal?: AbortSignal,
+  ): Promise<PreparedOwnerCancellation> => {
+    const wire: Record<string, unknown> = {
+      prepared_id: body.prepared_id, install_id: body.install_id, context_id: body.context_id,
+    };
+    if (body.install_id !== expected.installId || body.context_id !== expected.contextId)
+      throw new ApiError("The owner intent cancel scope changed", 400);
+    const reply = await request<unknown>(paths.cancelPreparedIntent(), signal, wire, PUBLISH_INTENT_SCOPE_KEYS);
+    return toPreparedOwnerCancellation(reply, {
+      preparedId: body.prepared_id, installId: expected.installId, contextId: expected.contextId,
+    });
+  },
+  /** CAD-1143: attach sends only the exact prepared selector and scope. The
+   *  daemon obtains/verifies AOS queue validation and atomically attaches. */
+  attachIntent: async (
+    body: PublishIntentAttachBody,
+    expected: PreparedOwnerIntent,
+    signal?: AbortSignal,
+  ): Promise<AttachedPublishIntent> => {
+    const wire: Record<string, unknown> = {
+      prepared_id: body.prepared_id, install_id: body.install_id,
+      ...(body.context_id ? { context_id: body.context_id } : {}),
+    };
+    if (body.prepared_id !== expected.prepared_id || body.install_id !== expected.install_id ||
+        (body.context_id ?? null) !== expected.context_id)
+      throw new ApiError("The owner intent attach scope changed", 400);
+    const reply = await request<unknown>(paths.attachIntent(), signal, wire, PUBLISH_INTENT_ATTACH_KEYS);
+    return toAttachedPublishIntent(reply, expected);
+  },
+  /** CAD-1123 HP4: move a queued intent, compare-and-swap on the time the
+   *  operator saw. Names the intent's own install and exact context, as
+   *  cancel does — the daemon refuses any other scope. */
+  reschedule: async (intentId: string, body: PublishRescheduleBody) => {
+    const reply = await request<{ intent: BackendIntent }>(`/api/social-publishes/${encodeURIComponent(intentId)}/reschedule`,
+      undefined, body as unknown as Record<string, unknown>, PUBLISH_RESCHEDULE_KEYS);
+    return { intent: toPublishIntent(reply.intent) };
   },
   /** CAD-1027: cancel names the intent's own install and exact context;
    *  the daemon refuses any other scope. */

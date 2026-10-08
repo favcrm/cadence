@@ -961,6 +961,27 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             send(request, resp);
             return;
         }
+        // AOS-150's dedicated owner-intent GET is a narrow signed-assertion
+        // capability, not a board-cookie read. It is served only on this
+        // board's configured public Host; the daemon independently verifies
+        // issuer/JWKS/scope/time and consumes the assertion jti once.
+        if let Some(route) = social_publish::route(&path) {
+            if let Some(intent_id) = route.owner_intent_id() {
+                let response = if method != Method::Get {
+                    err_response(405, "signed owner-intent route is GET only")
+                } else if opts
+                    .public
+                    .as_ref()
+                    .is_none_or(|public| !host.trim().eq_ignore_ascii_case(&public.host))
+                {
+                    err_response(404, "owner intent not found")
+                } else {
+                    social_publish::handle_owner_intent_read(&request, state_dir, intent_id)
+                };
+                send(request, response);
+                return;
+            }
+        }
         if is_write {
             let send_write = |req: Request, resp: HttpResp| {
                 read_model::get(state_dir, pm_dir).invalidate();
@@ -1538,7 +1559,13 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, response);
                     return;
                 }
-                let response = social_publish::handle(&mut request, state_dir, route, false);
+                let response = social_publish::handle(
+                    &mut request,
+                    state_dir,
+                    route,
+                    false,
+                    opts.public.as_ref(),
+                );
                 send(request, response);
                 return;
             }
