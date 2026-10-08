@@ -38,6 +38,8 @@ mod area_rpc;
 mod cad1184_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1184_revision_acceptance;
+#[cfg(test)]
+mod cad1212_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
@@ -46,8 +48,6 @@ mod connection_test;
 mod connections_rpc;
 #[cfg(all(test, feature = "test-seam"))]
 mod conversations_acceptance;
-#[cfg(test)]
-mod cad1212_acceptance;
 mod conversations_rpc;
 mod crm_send_rpc;
 mod crm_smtp_rpc;
