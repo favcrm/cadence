@@ -29,6 +29,7 @@ import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
+import { todoCount } from "./features/home/needs";
 import Context from "./features/projects/Context";
 import { contextNavigationSearch } from "./features/projects/contextRoute";
 import Workflows from "./features/projects/Workflows";
@@ -149,6 +150,8 @@ export default function App() {
   const projectsState = useResource(resources.projects);
   const agentsState = useResource(resources.agents);
   const overviewState = useResource(resources.overview);
+  // The Home badge counts pending To do items only (CAD-1216).
+  const homeCount = todoCount(overviewState.data?.needs_me);
   const issues = issuesState.data ?? [];
   const projects = projectsState.data ?? [];
   const agents = agentsState.data;
@@ -685,6 +688,7 @@ export default function App() {
         screen={screen === "workspaceApp" ? "apps" : screen}
         navHref={hrefFor}
         appMenu={appMenu}
+        homeCount={homeCount}
         project={navProject}
         projectHref={projectHref}
         projects={projects}
@@ -767,6 +771,7 @@ export default function App() {
               screen={screen === "workspaceApp" ? "apps" : screen}
               navHref={hrefFor}
               appMenu={appMenu}
+              homeCount={homeCount}
               label="Workspace"
               onNavigate={() => setMenuOpen(false)}
             />
@@ -811,6 +816,7 @@ export default function App() {
             overview={overviewState}
             onOpenIssue={openIssue}
             overviewHref={hrefFor({ screen: "overview" })}
+            permissionsHref={hrefFor({ screen: "settings", section: "permissions" })}
           />
         )}
         {screen === "overview" && (

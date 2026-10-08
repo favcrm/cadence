@@ -12,6 +12,9 @@ import { useDrawerClose } from "./useDrawerClose";
  *    (opens upward, destructive item last and red), secondary buttons,
  *    one primary on the right. While editing it becomes Cancel / Save.
  * The scrim dims the outlet only: the left chat pane stays usable.
+ * `scrim="board"` (CAD-1216, the Home review drawer) is opt-in: the scrim
+ * covers the whole board, a `kicker` sits above the title and `foot`
+ * replaces the footer's slots; phones get a bottom sheet.
  * Escape closes an open menu first, then cancels an edit, then the
  * drawer; focus returns through `useDrawerClose`.
  */
@@ -30,6 +33,10 @@ export type DrawerEdit = {
 export interface DrawerShellProps {
   kind: string;
   label: string;
+  /** Small accent line above the title (board scrim). */
+  kicker?: ReactNode;
+  /** `board` dims the whole board, not only the outlet. Default `outlet`. */
+  scrim?: "outlet" | "board";
   title: string;
   subtitle?: ReactNode;
   avatar?: ReactNode;
@@ -49,6 +56,8 @@ export interface DrawerShellProps {
   primary?: ReactNode;
   /** Footer text when the viewer has no actions (read-only view). */
   note?: ReactNode;
+  /** Replaces the footer's menu / note / secondary / primary slots. */
+  foot?: ReactNode;
   onClose: () => void;
 }
 
@@ -128,7 +137,7 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
 }
 
 export default function DrawerShell(props: DrawerShellProps) {
-  const { kind, label, title, subtitle, avatar, pills, warning, tabs, tab: tabProp, onTab, edit, state, menu, secondary, primary, note, onClose } = props;
+  const { kind, label, kicker, scrim = "outlet", title, subtitle, avatar, pills, warning, tabs, tab: tabProp, onTab, edit, state, menu, secondary, primary, note, foot, onClose } = props;
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const [tabState, setTabState] = useState(tabs[0]?.id ?? "");
   const tab = tabProp ?? tabState;
@@ -163,13 +172,15 @@ export default function DrawerShell(props: DrawerShellProps) {
     setTab(next.id);
     document.getElementById(`crm-tab-${kind}-${next.id}`)?.focus();
   };
-  const hasFooter = state == null && (editing || (menu?.length ?? 0) > 0 || secondary != null || primary != null || note != null);
+  const hasFooter = state == null && (editing || foot != null || (menu?.length ?? 0) > 0 || secondary != null || primary != null || note != null);
+  const board = scrim === "board";
 
   return (
     <>
       <div
         className="crm-drawer-scrim"
-        style={{ left: scrimLeft }}
+        style={{ left: board ? 0 : scrimLeft }}
+        data-scrim={board ? "board" : undefined}
         data-closing={closing || undefined}
         onClick={requestClose}
         aria-hidden="true"
@@ -180,6 +191,7 @@ export default function DrawerShell(props: DrawerShellProps) {
         aria-modal="false"
         aria-label={label}
         data-drawer={kind}
+        data-scrim={board ? "board" : undefined}
         data-mode={editing ? "edit" : "view"}
         data-closing={closing || undefined}
         onTransitionEnd={onTransitionEnd}
@@ -188,6 +200,7 @@ export default function DrawerShell(props: DrawerShellProps) {
           <div className="crm-drawer-id">
             {avatar != null && <span className="crm-drawer-avatar" aria-hidden="true">{avatar}</span>}
             <div className="crm-drawer-titles">
+              {kicker != null && <div className="crm-drawer-kicker">{kicker}</div>}
               <h3 ref={headRef} className="crm-drawer-title" tabIndex={-1}>
                 {title}
               </h3>
@@ -243,6 +256,8 @@ export default function DrawerShell(props: DrawerShellProps) {
                   {edit.pending ? "Saving…" : (edit.saveLabel ?? "Save")}
                 </button>
               </>
+            ) : foot != null ? (
+              foot
             ) : (
               <>
                 {menu != null && menu.length > 0 && <OverflowMenu items={menu} open={menuOpen} setOpen={setMenuOpen} />}

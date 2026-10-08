@@ -1,9 +1,15 @@
 import {
   ageLabel,
+  ageWords,
   askDraft,
+  fixPrompt,
   homeNeeds,
-  needGroups,
+  kindSpec,
+  KIND_TABLE,
+  metaLine,
   readRailCollapsed,
+  todoCount,
+  todoSplit,
   UNFENCE_CHOICES,
   writeRailCollapsed,
 } from "../src/features/home/needs";
@@ -112,30 +118,73 @@ equal([ageLabel(5), ageLabel(7200), ageLabel(90000)], ["5s", "2h", "1d"], "age l
   equal(needs[1].action, { type: "command", command: "cadence x" }, "bad issue → command");
 }
 
-// CAD-574 — the rail groups: PRs by kind or pr-subject, Blocked→ready,
-// Inboxes, Decisions, the rest Other; rows past 14d fold into Old (n)
-// and leave their group. Tested through homeNeeds → needGroups.
+// CAD-1216 — the To do list: Info rows and drift go to Updates and never
+// count; decided permissions leave the list (and the count) for the
+// history, newest first; an unknown kind stays a card, never nothing.
 {
-  const needs = homeNeeds([
+  const rows = [
     row({ kind: "pr_no_verdict", audience: "operator", title: "PR #187 has had no verdict", age: 400, subject: { kind: "pr", id: "acme/app#187" } }),
     row({ kind: "approval", audience: "operator", title: "approve merge", age: 30 }),
-    row({ kind: "blocked_ready", audience: "operator", title: "D-3 unblocked", age: 90 }),
     row({ kind: "inbox_stale", audience: "operator", title: "w1 inbox stale", age: 200 }),
+    row({ kind: "inbox_unread", audience: "info", title: "w1 inbox unread", age: 100 }),
+    row({ kind: "drift", audience: "dependency", title: "build drift", age: 90 }),
+    row({ kind: "delivery_sync", audience: "info", title: "github read failing", age: 80 }),
     row({ kind: "a_new_server_kind", audience: "operator", title: "unknown kind", age: 10 }),
-    row({ kind: "approval", audience: "operator", title: "ancient approval", age: 15 * 86400 }),
-  ]);
-  const { groups, old } = needGroups(needs);
-  equal(
-    groups.map((g) => g.key),
-    ["decisions", "prs", "ready", "inboxes", "other"],
-    "group order",
-  );
-  equal(groups[0].needs.map((n) => n.title), ["approve merge"], "decisions");
-  equal(groups[1].needs.map((n) => n.title), ["PR #187 has had no verdict"], "prs");
-  equal(groups[2].needs.map((n) => n.title), ["D-3 unblocked"], "blocked → ready");
-  equal(groups[3].needs.map((n) => n.title), ["w1 inbox stale"], "inboxes");
-  equal(groups[4].needs.map((n) => n.title), ["unknown kind"], "other");
-  equal(old.map((n) => n.title), ["ancient approval"], "14d+ folds into Old");
+    row({
+      kind: "master_permission",
+      audience: "operator",
+      title: "pending",
+      age: 5,
+      subject: { kind: "permission", id: "p1" },
+      permission: { id: "p1", command: "send", status: "pending", reason: "Send email to 212 customers" },
+    }),
+    row({
+      kind: "master_permission",
+      audience: "operator",
+      title: "decided old",
+      age: 900,
+      subject: { kind: "permission", id: "p2" },
+      permission: { id: "p2", command: "send", status: "decided", decision_label: "Allowed once", reason: "older" },
+    }),
+    row({
+      kind: "master_permission",
+      audience: "operator",
+      title: "decided new",
+      age: 60,
+      subject: { kind: "permission", id: "p3" },
+      permission: { id: "p3", command: "send", status: "decided", decision_label: "Denied", reason: "newer" },
+    }),
+  ];
+  const { todo, updates, decided } = todoSplit(rows);
+  equal(todo.map((n) => n.kind).sort(), ["a_new_server_kind", "approval", "master_permission", "pr_no_verdict"], "only work for the operator is To do");
+  equal(updates.map((n) => n.kind), ["delivery_sync", "drift", "inbox_unread", "inbox_stale"], "info rows and drift go to Updates, newest first");
+  equal(decided.map((n) => n.key), ["permission:p3", "permission:p2"], "decided history is newest first");
+  equal(todoCount(rows), 4, "the count (and the Home badge) is pending To do items only");
+  equal(todoCount(undefined), 0, "no overview yet");
+  const unknown = todo.find((n) => n.kind === "a_new_server_kind")!;
+  equal([kindSpec(unknown).type, kindSpec(unknown).control], ["stuck", "Fix it"], "an unknown kind is a generic amber Fix it card");
+  const permission = todo.find((n) => n.kind === "master_permission")!;
+  equal(kindSpec(permission).title(permission, { issueTitle: null }), "Send email to 212 customers", "a permission is titled by its reason");
+  equal(metaLine({ ...permission, project: "customers" }), "customers · just now", "meta line is where · age in words");
+}
+
+// CAD-1216 — the kind table: every server kind has a type, a control and a
+// place; titles carry no alias, issue id, PR or command; a plan, idea or
+// merge row that did not parse falls back to a Fix it card.
+{
+  const ids = /[A-Z]{1,10}-\d+|#\d+|cadence |\bw1\b/;
+  for (const [kind, spec] of Object.entries(KIND_TABLE)) {
+    const need = homeNeeds([row({ kind, audience: "operator", title: "t", age: 5 })])[0];
+    const title = spec.title(need, { issueTitle: null });
+    equal(ids.test(title), false, `${kind}: plain title (${title})`);
+    equal(["ok", "question", "stuck"].includes(spec.type), true, `${kind}: type`);
+  }
+  const badPlan = homeNeeds([row({ kind: "plan", audience: "operator", plan: { epic: "../x" } })])[0];
+  equal(kindSpec(badPlan).place, "send", "an unparsed plan degrades to Fix it");
+  equal(kindSpec(homeNeeds([row({ kind: "plan", audience: "operator", subject: { kind: "issue", id: "D-4" } })])[0]).place, "drawer", "a parsed plan opens the drawer");
+  equal([ageWords(30), ageWords(240), ageWords(7200), ageWords(3 * 86400)], ["just now", "4 min", "2 h", "3 d"], "age in words");
+  const [stuck] = homeNeeds([row({ kind: "fenced", audience: "operator", title: "w1 fenced: 2 turns unknown", subject: { kind: "agent", id: "w1" } })]);
+  equal(fixPrompt(stuck, "An agent is stuck").includes("w1"), false, "the prompt is plain: the row's subject rides as refs");
 }
 
 // CAD-574 — Ask master: the draft is the row's ask and its subject goes

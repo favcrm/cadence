@@ -30,9 +30,11 @@ interface Props {
    *  menu (CAD-784): sections arrive as data with real hrefs — the
    *  sidebar never invents entries from the bare route. */
   appMenu?: AppNav | null;
+  /** Pending To do items, for the Home row's badge. */
+  homeCount?: number;
 }
 
-export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null }: Props) {
+export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null, homeCount = 0 }: Props) {
   return (
     <aside data-account-open={accountOpen || undefined} className={`hidden lg:flex sticky top-0 ${accountOpen ? "z-[35]" : ""} h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[16px] pb-4`}>
       {/* Only the nav scrolls: the footer's account dialog opens above its row and must not be clipped by a scroll container. */}
@@ -45,7 +47,7 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
             </span>
           </span>
         </div>
-        <NavList screen={screen} navHref={navHref} appMenu={appMenu} />
+        <NavList screen={screen} navHref={navHref} appMenu={appMenu} homeCount={homeCount} />
         <div className="slabel flex justify-between mx-[11px] mt-[18px] mb-[5px]">
           <span>Projects</span>
           <span className="text-[10px]">~/pm</span>

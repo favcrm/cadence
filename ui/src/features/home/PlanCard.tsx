@@ -21,6 +21,41 @@ const STATUS_CHIP: Record<string, string> = {
 };
 
 /**
+ * The plan decision itself: read the epic, approve it, or reject it with
+ * a reason. The card below and the review drawer (CAD-1216) both drive
+ * it, so there is one path to the operator-only plan endpoints.
+ */
+export function usePlanDecision(epic: string, block: string | null, onDecided?: (epic: string, state: string) => void) {
+  const state = useQuery(resources.issue(epic));
+  const [busy, setBusy] = useState<null | "approve" | "reject">(null);
+  const [error, setError] = useState<string | null>(null);
+  const detail = state.data?.id === epic ? state.data : null;
+  const view = detail ? planView(detail, block) : null;
+  const decide = (verb: "approve" | "reject", reason = "", done?: () => void) => {
+    if (verb === "reject") {
+      const why = rejectReasonError(reason);
+      if (why) {
+        setError(why);
+        return;
+      }
+    }
+    setBusy(verb);
+    setError(null);
+    api
+      .decidePlan(epic, verb, verb === "reject" ? reason : undefined)
+      .then((out) => {
+        done?.();
+        void resources.issue(epic).invalidate();
+        void resources.overview.invalidate();
+        onDecided?.(epic, String((out as { state?: unknown }).state ?? verb));
+      })
+      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      .finally(() => setBusy(null));
+  };
+  return { state, detail, view, busy, error, setError, decide };
+}
+
+/**
  * A plan card (CAD-328): the epic's goal, its tickets with size and
  * acceptance, size-weighted progress, and — while the plan is proposed —
  * Approve, or Reject with a required reason. Both go through the board's
@@ -38,15 +73,10 @@ export default function PlanCard({
   onOpenIssue: (id: string) => void;
   onDecided?: (epic: string, state: string) => void;
 }) {
-  const state = useQuery(resources.issue(epic));
-  const [busy, setBusy] = useState<null | "approve" | "reject">(null);
+  const block = useWriteBlock(readOnly);
+  const { state, detail, view, busy, error, setError, decide: send } = usePlanDecision(epic, block, onDecided);
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
-  const block = useWriteBlock(readOnly);
-  const detail = state.data?.id === epic ? state.data : null;
-  const view = detail ? planView(detail, block) : null;
 
   if (!detail) {
     return (
@@ -63,28 +93,11 @@ export default function PlanCard({
     );
   }
 
-  const decide = (verb: "approve" | "reject") => {
-    if (verb === "reject") {
-      const why = rejectReasonError(reason);
-      if (why) {
-        setError(why);
-        return;
-      }
-    }
-    setBusy(verb);
-    setError(null);
-    api
-      .decidePlan(epic, verb, verb === "reject" ? reason : undefined)
-      .then((out) => {
-        setRejecting(false);
-        setReason("");
-        void resources.issue(epic).invalidate();
-        void resources.overview.invalidate();
-        onDecided?.(epic, String((out as { state?: unknown }).state ?? verb));
-      })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
-      .finally(() => setBusy(null));
-  };
+  const decide = (verb: "approve" | "reject") =>
+    send(verb, reason, () => {
+      setRejecting(false);
+      setReason("");
+    });
 
   return (
     <section className="card overflow-hidden" data-plan-card={epic} aria-label={`plan ${epic}`}>

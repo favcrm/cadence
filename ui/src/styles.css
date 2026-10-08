@@ -161,6 +161,16 @@ body {
   font-size: 13px;
   transition: background-color .16s ease, color .16s ease;
 }
+.navlink .navbadge {
+  margin-left: auto;
+  min-width: 1.1rem;
+  padding: 0 .375rem;
+  border-radius: 9999px;
+  background: var(--color-warn);
+  color: #1a1200;
+  font: 600 .65rem/1.1rem "IBM Plex Mono", monospace;
+  text-align: center;
+}
 .navlink[data-parent-current] {
   background: none;
   color: var(--color-ink-100);
@@ -1169,6 +1179,220 @@ pre {
 }
 .needrow {
   position: relative;
+}
+
+/* CAD-1216: the To do rail — tabs, one-line cards, the decided history. */
+.todo-tabs {
+  display: flex;
+  align-items: flex-end;
+  gap: .25rem;
+  min-height: 3rem;
+  padding: 0 .75rem;
+  border-bottom: 1px solid var(--color-ink-700);
+}
+.todo-tabs > button {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+  padding: .85rem .6rem .7rem;
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  color: var(--color-ink-400);
+  font-size: var(--text-secondary);
+}
+.todo-tabs > button[aria-pressed="true"] {
+  color: var(--color-ink-100);
+  border-color: var(--color-accent);
+  font-weight: 500;
+}
+.todo-tools {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: .75rem;
+  padding-bottom: .8rem;
+}
+.todo-count {
+  min-width: 1.1rem;
+  padding: 0 .35rem;
+  border-radius: 9999px;
+  background: var(--color-ink-700);
+  color: var(--color-ink-200);
+  font: 600 .65rem/1.1rem "IBM Plex Mono", monospace;
+  text-align: center;
+}
+.todo-count.on {
+  background: var(--color-warn);
+  color: #1a1200;
+}
+.todo-list {
+  padding: .5rem .625rem 1rem;
+  list-style: none;
+}
+.todo-hint {
+  margin: 0;
+  padding: 0 .875rem 1rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-label);
+}
+.todo-note {
+  margin: .5rem .875rem 0;
+  padding: .45rem .65rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .5rem;
+  background: var(--color-ink-850);
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+}
+.todo-card {
+  display: grid;
+  grid-template-columns: 2.125rem minmax(0, 1fr) auto;
+  gap: .625rem;
+  align-items: center;
+  padding: .625rem;
+  border: 1px solid transparent;
+  border-radius: .625rem;
+}
+.todo + .todo {
+  margin-top: .125rem;
+}
+.todo-card:hover {
+  background: var(--color-ink-800);
+}
+.todo[data-open] .todo-card {
+  align-items: start;
+  background: var(--color-ink-850);
+  border-color: var(--color-ink-700);
+}
+.todo-hit {
+  cursor: default;
+  border-radius: .375rem;
+}
+.todo-hit[role="button"] {
+  cursor: pointer;
+}
+.todo-hit:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 25%, transparent);
+}
+.todo-icon {
+  display: grid;
+  place-items: center;
+  width: 2.125rem;
+  height: 2.125rem;
+  border-radius: .625rem;
+}
+.todo[data-type="ok"] .todo-icon {
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  color: var(--color-accent);
+}
+.todo[data-type="question"] .todo-icon {
+  background: color-mix(in srgb, var(--color-info) 14%, transparent);
+  color: var(--color-info);
+}
+.todo[data-type="stuck"] .todo-icon {
+  background: color-mix(in srgb, var(--color-warn) 14%, transparent);
+  color: var(--color-warn);
+}
+.todo-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  color: var(--color-ink-100);
+  font-size: var(--text-secondary);
+  font-weight: 500;
+  line-height: 1.3;
+}
+.todo-meta {
+  margin-top: .0625rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-label);
+}
+.todo-act {
+  display: flex;
+  align-items: center;
+  gap: .25rem;
+}
+.todo-yn {
+  display: inline-flex;
+  gap: .25rem;
+}
+.todo-yn .btn {
+  max-width: 6rem;
+}
+.todo[data-done] {
+  opacity: .5;
+}
+.todo[data-done] .todo-title {
+  text-decoration: line-through;
+}
+.todo-tech {
+  margin: 0 .625rem .5rem 3.5rem;
+  padding-top: .375rem;
+  border-top: 1px dashed var(--color-ink-700);
+  font: var(--text-micro)/1.6 "IBM Plex Mono", monospace;
+  color: var(--color-ink-500);
+}
+.todo-tech > div {
+  display: flex;
+  gap: .5rem;
+}
+.todo-tech dt {
+  flex: none;
+  min-width: 4rem;
+  color: var(--color-ink-400);
+}
+.todo-tech dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.todo-decided {
+  padding: 0 .875rem 1rem;
+  border-top: 1px solid var(--color-ink-700);
+}
+.todo-decided-h {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  width: 100%;
+  padding: .6rem 0;
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+}
+.todo-decided-h[aria-expanded="true"] .steps-caret {
+  transform: rotate(90deg);
+}
+.todo-decided li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: .5rem;
+  padding: .3rem 0;
+  color: var(--color-ink-300);
+  font-size: var(--text-label);
+}
+.todo-decided-t {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.todo-fyi {
+  list-style: none;
+  padding: .25rem .875rem;
+  border-bottom: 1px solid var(--color-ink-700);
+}
+.todo-fyi li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: .125rem .75rem;
+  padding: .4rem 0;
+  color: var(--color-ink-300);
+  font-size: var(--text-label);
 }
 
 /* The header chips' dropdown (model / effort). */
