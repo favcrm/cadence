@@ -246,10 +246,27 @@ fn test_guard(dir: PathBuf, _rel: &str, _leaf: &str) -> Result<PathBuf> {
 
 #[cfg(any(test, feature = "test-seam"))]
 fn test_guard(dir: PathBuf, rel: &str, leaf: &str) -> Result<PathBuf> {
-    match real_home() {
+    test_guard_in(dir, real_home().as_deref(), rel, leaf)
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+fn test_guard_in(dir: PathBuf, real: Option<&Path>, rel: &str, leaf: &str) -> Result<PathBuf> {
+    match real {
         Some(real) => refuse_under(dir, &real.join(rel).join(leaf)),
         None => Ok(dir),
     }
+}
+
+/// The same refusal for a tracker path that did not come through
+/// [`tracker_dir`] (a daemon's `provider_env`, the CLI's env read).
+pub fn guard_tracker(dir: PathBuf) -> Result<PathBuf> {
+    test_guard(dir, ".", "pm")
+}
+
+/// [`guard_tracker`] with the real home passed in (pure; for tests).
+#[cfg(any(test, feature = "test-seam"))]
+pub(crate) fn guard_tracker_in(dir: PathBuf, real: Option<&Path>) -> Result<PathBuf> {
+    test_guard_in(dir, real, ".", "pm")
 }
 
 #[cfg(any(test, feature = "test-seam"))]

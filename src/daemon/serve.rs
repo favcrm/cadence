@@ -415,7 +415,7 @@ pub(super) fn hosted_config(opts: &ServeOptions) -> Result<crate::lease::Hosted>
         return Ok(hosted.clone());
     }
     let pm_dir = match opts.provider_env.var("CADENCE_PM_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        Some(dir) if !dir.is_empty() => crate::home::guard_tracker(PathBuf::from(dir))?,
         _ => crate::issue::default_dir()?,
     };
     crate::doctor::host::read_hosted_overrides(&pm_dir)
