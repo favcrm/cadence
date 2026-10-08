@@ -1468,11 +1468,18 @@ pub(super) fn meta(
         request_origin(request, opts),
         ReqOrigin::Known(Origin::Loopback | Origin::Tailnet)
     ) && device_config(state_dir, Some(budget)).is_some();
-    // `None` (unanswerable) reports `signed_in: null`; `Some(None)`
-    // (proven not valid) reports `false`; `Some(Some)` reports `true`.
+    // `None` with a cookie (a check that could not answer) reports
+    // `signed_in: null`; `Some(None)` (proven not valid) and a request
+    // carrying no session credential at all report `false`;
+    // `Some(Some)` reports `true`.
     let proven_signed_out = session == Some(None);
+    let signed_in = match &session {
+        Some(s) => Some(s.is_some()),
+        None if !cookie => Some(false),
+        None => None,
+    };
     json!({
-        "signed_in": session.as_ref().map(|s| s.is_some()),
+        "signed_in": signed_in,
         "hosted": hosted,
         "session": session.flatten(),
         "login_hint": hint,
