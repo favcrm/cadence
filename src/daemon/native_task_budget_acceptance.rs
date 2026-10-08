@@ -6,8 +6,14 @@
 //! native-runtime-task-wire.ts `event()`, reached from executor-admission.ts
 //! "task-event") accepts at most 65,536 decoded bytes and 4,096 parts per task,
 //! and otherwise throws "native task stream unavailable". CAD must therefore
-//! never emit beyond either limit and must end the output with
+//! never emit beyond either limit and must end the DATA output with
 //! `TASK_OUTPUT_TRUNCATED_MARKER`, which itself fits inside the budget.
+//! CAD-1203 amendment: room for ONE terminal event (`result` / `failed`, at
+//! most `TERMINAL_EVENT_MAX` bytes, one part) is reserved after the marker, so
+//! the data budget is 65,536 - marker - TERMINAL_EVENT_MAX bytes and 4,094
+//! parts. The terminal behaviour itself is pinned in
+//! `native_task_terminal_acceptance.rs`; probes here use non-terminal events,
+//! except where a test below says otherwise.
 //!
 //! Contract the implementer must provide in `native_task.rs` (names asserted):
 //!   * `const TASK_OUTPUT_TRUNCATED_MARKER: &[u8]` - non-empty, <= 1024 bytes.
@@ -26,10 +32,13 @@ use std::sync::{Arc, Mutex};
 
 const AOS_MAX_BYTES: usize = 65_536;
 const AOS_MAX_PARTS: usize = 4_096;
-/// Data budget: the marker's bytes and one part are reserved for it.
-const DATA_MAX_PARTS: usize = AOS_MAX_PARTS - 1;
+/// CAD-1203: bytes reserved for the one terminal event. Must equal the
+/// implementation's `TERMINAL_EVENT_MAX` (4,096, PM-accepted).
+const TERMINAL_EVENT_MAX: usize = 4_096;
+/// Data budget: the marker (1 part) and the terminal event (1 part) are reserved.
+const DATA_MAX_PARTS: usize = AOS_MAX_PARTS - 2;
 fn data_max_bytes() -> usize {
-    AOS_MAX_BYTES - TASK_OUTPUT_TRUNCATED_MARKER.len()
+    AOS_MAX_BYTES - TASK_OUTPUT_TRUNCATED_MARKER.len() - TERMINAL_EVENT_MAX
 }
 const TASK: &str = "0123456789abcdef0123456789abcdef";
 
@@ -185,17 +194,24 @@ fn over_the_byte_budget_is_cut_and_ends_with_the_marker() {
     let out = total(&parts);
     assert_in_aos_budget(&parts);
     assert!(
-        out.ends_with(TASK_OUTPUT_TRUNCATED_MARKER),
+        out.windows(TASK_OUTPUT_TRUNCATED_MARKER.len())
+            .any(|w| w == TASK_OUTPUT_TRUNCATED_MARKER),
         "marker missing"
     );
     // The cut keeps a real prefix of the original output.
-    let marker = TASK_OUTPUT_TRUNCATED_MARKER.len();
-    let original = wire(&values);
-    assert_eq!(&out[..out.len() - marker], &original[..out.len() - marker]);
+    // CAD-1203: the late `result` is the terminal event, so it follows the
+    // marker as exactly one line and nothing follows it.
+    let terminal = wire(&values[2..]);
+    assert!(out.ends_with(&terminal), "terminal line missing");
+    let head = &out[..out.len() - terminal.len()];
     assert!(
-        !out.windows(4).any(|w| w == b"late"),
-        "nothing after the cut"
+        head.ends_with(TASK_OUTPUT_TRUNCATED_MARKER),
+        "marker precedes the terminal line"
     );
+    let data = &head[..head.len() - TASK_OUTPUT_TRUNCATED_MARKER.len()];
+    let original = wire(&values);
+    assert_eq!(data, &original[..data.len()]);
+    assert_eq!(out.windows(4).filter(|w| *w == b"late").count(), 1);
 }
 
 #[test]
@@ -204,7 +220,13 @@ fn data_after_truncation_is_dropped_without_error() {
     let state = Mutex::new(StreamState::new());
     emit(&control, TASK, &state, &event_of_len(80_000)).unwrap();
     while private_wire::receive_child(&peer).unwrap().is_some() {}
+    // Data stays dropped (the original assertion, with a non-terminal probe).
+    emit(&control, TASK, &state, &json!({"type":"event","n":1})).unwrap();
+    assert!(private_wire::receive_child(&peer).unwrap().is_none());
+    // CAD-1203: the first terminal event is emitted, then nothing more.
     emit(&control, TASK, &state, &json!({"type":"result"})).unwrap();
+    assert!(private_wire::receive_child(&peer).unwrap().is_some());
+    emit(&control, TASK, &state, &json!({"type":"event","n":2})).unwrap();
     assert!(private_wire::receive_child(&peer).unwrap().is_none());
 }
 
@@ -231,8 +253,21 @@ fn a_cut_never_splits_a_multibyte_codepoint() {
         let parts = run(&values);
         let out = total(&parts);
         assert_in_aos_budget(&parts);
-        assert!(out.ends_with(TASK_OUTPUT_TRUNCATED_MARKER), "shift {shift}");
-        let body = &out[..out.len() - TASK_OUTPUT_TRUNCATED_MARKER.len()];
+        // CAD-1203: marker, then ONE minimal terminal line (the result itself
+        // is oversized), then nothing. The codepoint check is on the data
+        // prefix before the marker.
+        let at = out
+            .windows(TASK_OUTPUT_TRUNCATED_MARKER.len())
+            .rposition(|w| w == TASK_OUTPUT_TRUNCATED_MARKER)
+            .unwrap_or_else(|| panic!("marker missing, shift {shift}"));
+        let tail = &out[at + TASK_OUTPUT_TRUNCATED_MARKER.len()..];
+        assert!(tail.ends_with(b"\n") && tail.len() <= TERMINAL_EVENT_MAX);
+        assert_eq!(
+            serde_json::from_slice::<Value>(tail).unwrap(),
+            json!({"type":"result","truncated":true}),
+            "shift {shift}"
+        );
+        let body = &out[..at];
         assert!(
             std::str::from_utf8(body).is_ok(),
             "split codepoint, shift {shift}"
