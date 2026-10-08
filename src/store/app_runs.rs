@@ -92,10 +92,14 @@ impl LocalWorkflow {
     }
 
     /// Parse with a run-owned carry map. CAD-1143 Redo: the retained
-    /// caption is digest-verified material, not a caller input, so its
-    /// bytes bypass the one-line input grammar via `render_with_carry`
-    /// while every other input still satisfies it. `carry` keys are
-    /// declared inputs that must not collide with `inputs`.
+    /// caption is digest-verified material, not a caller input.
+    /// `render_carry_positions` parses and skeleton-checks the plan
+    /// with an opaque token at every carried `{{name}}` — the carried
+    /// bytes never pass through the plan parser, then splices the
+    /// verified material into the parsed ticket fields verbatim —
+    /// while every other input still satisfies the one-line grammar.
+    /// `carry` keys are declared inputs that must not collide with
+    /// `inputs` and each must land in exactly one place.
     pub fn parse_carry(
         text: &str,
         inputs: &BTreeMap<String, String>,
@@ -107,11 +111,7 @@ impl LocalWorkflow {
         let required_asset_slot = template.required_asset_slot;
         let execution = template.execution.as_str().to_string();
         let carries = template.carries;
-        let rendered = workflow::render_with_carry(text, inputs, carry)?;
-        let parsed = plan::parse_plan(&rendered)?;
-        let (_, body) =
-            parse::split_front(&rendered).map_err(|e| Error::rejected(e.to_string()))?;
-        let metadata = workflow::ticket_meta(body)?;
+        let (parsed, metadata) = workflow::render_carry_positions(text, inputs, carry)?;
         if parsed.tickets.len() > 16 {
             return Err(Error::rejected("local runs support at most 16 steps"));
         }
@@ -292,9 +292,9 @@ pub struct LocalRunProvenance<'a> {
 /// `carry_inputs` are the run-owned, digest-verified material values the
 /// daemon resolved from durable history (`carry_caption` for a text
 /// retain, `carry_asset_receipt_id` for an image retain). They are not
-/// caller inputs: they never pass through the one-line input grammar, and
-/// the creation transaction asserts each byte against the derived
-/// material before it is frozen into `snapshot.inputs`.
+/// caller inputs: the plan is parsed with an opaque token at their
+/// positions and the creation transaction asserts each byte against the
+/// derived material before it is frozen into `snapshot.inputs`.
 pub struct CarryRequest<'a> {
     pub from_run_id: &'a str,
     pub retain_image: bool,

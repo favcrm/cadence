@@ -255,9 +255,9 @@ impl Shared {
         // re-derives and asserts them before freezing; pre-read staleness
         // is impossible (terminal runs and reviews are immutable). The
         // retained half is verified material, not a caller input, so it is
-        // resolved into `carry_inputs` and rendered through the carry
-        // channel — its bytes never pass the one-line input grammar but
-        // are byte-asserted against the transaction's own derived material.
+        // resolved into `carry_inputs` and attached through the carry
+        // channel — its bytes never pass through the plan parser but are
+        // byte-asserted against the transaction's own derived material.
         let mut carry_inputs: BTreeMap<String, String> = BTreeMap::new();
         if let Some((from_run_id, retain_image)) = carry {
             let shown = self.store.app_run_show(from_run_id)?;
