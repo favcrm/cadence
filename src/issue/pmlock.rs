@@ -1329,6 +1329,43 @@ impl Pm {
         }
     }
 
+    /// CAD-1202: the legacy-storage generation (a seqlock counter in the
+    /// git dir, outside the tracked tree). Even: no legacy app file is
+    /// being rewritten. Odd: a writer is mid-rewrite, or crashed in one.
+    /// Absent counts as 0. `None` when unreadable or malformed, which a
+    /// reader treats like odd.
+    pub(crate) fn legacy_generation(&self) -> Option<u64> {
+        let dir = self.lock_git_dir().ok()?;
+        match std::fs::read_to_string(dir.join(LEGACY_GENERATION_FILE)) {
+            Ok(text) => text.trim().parse().ok(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+            Err(_) => None,
+        }
+    }
+
+    /// CAD-1202: mark a legacy app rewrite. The caller holds the PM write
+    /// lock. The counter goes odd now (refusing the write if it cannot be
+    /// saved, before any file is touched) and to the next even value when
+    /// the guard drops, on success, on an early return and on a panic.
+    pub(crate) fn begin_legacy_write(&self) -> Result<LegacyWrite> {
+        let path = self
+            .lock_git_dir()
+            .map_err(|e| self.git_dir_error(e))?
+            .join(LEGACY_GENERATION_FILE);
+        let current = match std::fs::read_to_string(&path) {
+            Ok(text) => text.trim().parse::<u64>().unwrap_or(0),
+            Err(_) => 0,
+        };
+        // An odd value is a crashed writer's leftover: stay odd.
+        let odd = if current % 2 == 0 {
+            current + 1
+        } else {
+            current + 2
+        };
+        write_generation(&path, odd)?;
+        Ok(LegacyWrite { path, odd })
+    }
+
     /// CAD-1189: true while a live process holds the write flock. A
     /// non-blocking probe that releases at once: no git status, no marker
     /// work, no fence check. Unreadable or absent counts as not held.
@@ -1452,6 +1489,40 @@ impl Pm {
 
 #[cfg(test)]
 mod cad1190_acceptance;
+
+const LEGACY_GENERATION_FILE: &str = "cadence-legacy-generation";
+
+/// Atomic: a reader sees the old or the new value, never a partial one.
+fn write_generation(path: &std::path::Path, value: u64) -> Result<()> {
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, value.to_string())?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Held for the span of a legacy app rewrite (CAD-1202). Declare it right
+/// after `pm.lock()` so it drops first and the counter is even again while
+/// the PM lock is still held.
+pub(crate) struct LegacyWrite {
+    path: PathBuf,
+    odd: u64,
+}
+
+impl Drop for LegacyWrite {
+    fn drop(&mut self) {
+        // A failed save leaves the counter odd: readers fall back to the
+        // PM lock, and the next legacy write moves it on. Never lets a
+        // reader accept a half-written bundle.
+        for _ in 0..3 {
+            if write_generation(&self.path, self.odd + 1).is_ok() {
+                return;
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

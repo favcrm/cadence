@@ -1161,6 +1161,7 @@ fn changed_underneath(error: &Error) -> bool {
             m.contains("no longer published")
                 || m.contains("changed during inspection")
                 || m.contains("changed during runtime admission")
+                || m.contains("legacy app files changed during read")
         }
         _ => false,
     }
@@ -1192,36 +1193,36 @@ fn optimistic<T>(pm: &Pm, mut read: impl FnMut() -> Result<T>) -> Result<T> {
     }
 }
 
-/// Legacy entries (`<project>/apps/<name>`) are rewritten in place by
-/// `app::update` under the PM lock, with no journal and an unchanged
-/// catalog, so no freshness check can see a torn read. A read that touches
-/// one takes the PM lock exactly as before. The peek is lock-free; if it
-/// cannot read a clean catalog it also takes the lock (the old behaviour).
-fn lock_for_legacy(pm: &Pm, only: Option<&InstallationId>) -> bool {
-    match Catalog::load(&pm.dir) {
-        Ok(catalog) => catalog
-            .installations
-            .iter()
-            .any(|(id, e)| e.storage != Storage::Workspace && only.is_none_or(|o| o == id)),
-        Err(_) => true,
-    }
-}
-
-fn read_catalog<T>(
-    pm: &Pm,
-    only: Option<&InstallationId>,
-    read: impl FnMut() -> Result<T>,
-) -> Result<T> {
-    if lock_for_legacy(pm, only) {
-        let _lock = pm.lock()?;
-        let mut read = read;
-        return read();
-    }
-    optimistic(pm, read)
+/// Legacy entries (`<project>/apps/<name>`) are rewritten in place by the
+/// `app` writers under the PM lock, with no journal and an unchanged
+/// catalog, so no catalog freshness check can see a torn read. Those
+/// writers bump a seqlock counter (`Pm::begin_legacy_write`): odd while
+/// they rewrite, the next even value after. A read accepts its result only
+/// when the counter was even before it and unchanged after it. An odd
+/// counter with no live writer is a crash leftover: that one attempt reads
+/// under the PM lock (the old behaviour) instead of reporting busy forever.
+/// A read of workspace entries only is unaffected by the counter apart from
+/// a spurious retry.
+fn read_catalog<T>(pm: &Pm, mut read: impl FnMut() -> Result<T>) -> Result<T> {
+    optimistic(pm, || {
+        let before = match pm.legacy_generation() {
+            Some(g) if g % 2 == 0 => g,
+            _ if !pm.write_lock_held() => {
+                let _lock = pm.lock()?;
+                return read();
+            }
+            _ => return Err(Error::rejected("legacy app files changed during read")),
+        };
+        let result = read();
+        if pm.legacy_generation() != Some(before) {
+            return Err(Error::rejected("legacy app files changed during read"));
+        }
+        result
+    })
 }
 
 pub fn list(pm: &Pm) -> Result<Value> {
-    read_catalog(pm, None, || {
+    read_catalog(pm, || {
         let catalog = Catalog::load(&pm.dir)?;
         let root = Root::open(&pm.dir)?;
         let rows = catalog
@@ -1235,7 +1236,7 @@ pub fn list(pm: &Pm) -> Result<Value> {
 }
 pub fn show(pm: &Pm, id: &str) -> Result<Value> {
     let id = InstallationId::parse(id)?;
-    read_catalog(pm, Some(&id), || {
+    read_catalog(pm, || {
         let catalog = Catalog::load(&pm.dir)?;
         let root = Root::open(&pm.dir)?;
         describe(&root, &catalog, &id)
@@ -1347,7 +1348,7 @@ pub(crate) fn with_runtime_read<T>(
     callback: impl FnOnce(&Value, &BTreeMap<String, String>) -> Result<T>,
 ) -> Result<T> {
     let id = InstallationId::parse(id)?;
-    let (description, files) = read_catalog(pm, Some(&id), || {
+    let (description, files) = read_catalog(pm, || {
         let root = Root::open(&pm.dir)?;
         let catalog = Catalog::load(&pm.dir)?;
         no_pending(&root)?;
@@ -1558,5 +1559,55 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         for err in [list(&pm).unwrap_err(), show(&pm, &id).unwrap_err()] {
             assert_eq!(err.kind(), "rejected", "{err:?}");
         }
+    }
+
+    /// CAD-1202: an entry with `Storage::Legacy` answers `list`, `show`
+    /// and `with_runtime_read` while another handle holds the PM lock. A
+    /// crash leftover (odd counter, no live writer) still answers, through
+    /// the locked path; a live writer mid-rewrite is retryable `busy`.
+    #[test]
+    fn legacy_entries_answer_without_the_pm_lock() {
+        let pm_dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let sources = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let pm = Pm::init(pm_dir.path()).unwrap();
+        crate::issue::write::project_add(
+            &pm,
+            "legacy",
+            "LEG",
+            &[repo.path().display().to_string()],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let src = sources.path().join("fixture-app");
+        bundle(&src, MANIFEST_A);
+        crate::issue::app::install(&pm, "legacy", src.to_str().unwrap(), state.path(), "t")
+            .unwrap();
+        crate::issue::app_catalog::migrate_authorized(&pm).unwrap();
+        let rows = list(&pm).unwrap();
+        let row = &rows.as_array().unwrap()[0];
+        assert_eq!(row["storage_kind"], "legacy", "{row}");
+        let id = row["install_id"].as_str().unwrap().to_string();
+
+        let gen_file = pm_dir.path().join(".git/cadence-legacy-generation");
+        let held = pm.lock().unwrap();
+        let other = Pm::at(pm_dir.path()).unwrap();
+        assert!(other.try_lock().unwrap().is_none(), "lock is really held");
+        let started = std::time::Instant::now();
+        assert_eq!(list(&other).unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(show(&other, &id).unwrap()["storage_kind"], "legacy");
+        with_runtime_read(&other, &id, |row, _| Ok(row["digest"].clone())).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // Odd while a live writer holds the lock: retryable busy.
+        std::fs::write(&gen_file, "7").unwrap();
+        let err = list(&other).unwrap_err();
+        assert_eq!(err.kind(), "busy", "{err:?}");
+        drop(held);
+        // Odd with no live writer: a crash leftover, read under the lock.
+        assert_eq!(list(&other).unwrap().as_array().unwrap().len(), 1);
     }
 }
