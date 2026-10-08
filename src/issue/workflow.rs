@@ -951,11 +951,19 @@ pub fn render_carry_positions(
     // placeholder's own rendering. Zero occurrences means the
     // placeholder was never used; several means `{{name}}` repeats or
     // sits mid-word, which would split the carried bytes.
+    //
+    // Count EVERY occurrence of the token, not just the placements
+    // `token_matches` accepts: a second `{{name}}` on the same line, or
+    // one embedded mid-word on another line, is still an occurrence —
+    // it must refuse, not sail through with an unresolved token left in
+    // the instruction.
     let mut placements = CarryPlacements::default();
     for (name, token) in &tokens {
         let mut found: Vec<CarryPlacement> = Vec::new();
+        let mut occurrences = 0usize;
         for (i, meta) in metas.iter().enumerate() {
             for (key, value) in meta {
+                occurrences += token_occurrences(value, token);
                 if value == token {
                     found.push(CarryPlacement::Meta {
                         ticket: i,
@@ -966,6 +974,7 @@ pub fn render_carry_positions(
             }
         }
         for (i, ticket) in doc.tickets.iter().enumerate() {
+            occurrences += token_occurrences(&ticket.description, token);
             for (start, end) in token_matches(&ticket.description, token) {
                 found.push(CarryPlacement::Description {
                     ticket: i,
@@ -975,11 +984,12 @@ pub fn render_carry_positions(
                 });
             }
         }
-        if found.len() != 1 {
+        if occurrences != 1 || found.len() != 1 {
             return Err(Error::rejected(format!(
                 "carry input '{name}' must land in exactly one position — one \
                  `{{{{{name}}}}}` on an `agent:` line or one whole line / line tail \
-                 in a ticket body; it resolves to {} positions",
+                 in a ticket body; it resolves to {} occurrences, {} permitted",
+                occurrences,
                 found.len()
             )));
         }
@@ -1005,6 +1015,10 @@ pub fn render_carry_positions(
 /// span is replaced). A token embedded mid-word is not a carry
 /// position — splicing bytes there would let content rewrite the run's
 /// own prose mid-sentence.
+///
+/// The byte range comes from the token's real occurrence — the end of
+/// the line's trimmed span — never from `content.len()`: trailing
+/// whitespace must not shift the splice inside the token.
 fn token_matches(text: &str, token: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut base = 0usize;
@@ -1016,12 +1030,27 @@ fn token_matches(text: &str, token: &str) -> Vec<(usize, usize)> {
             && trimmed[..trimmed.len() - token.len()]
                 .ends_with(|c: char| c.is_whitespace() || c == ':');
         if trimmed == token || tail {
-            let start = base + content.len() - token.len();
+            // The token ends the trimmed span; its start is that end
+            // minus the token's own length. `trimmed` may sit inside
+            // `content` (leading whitespace), so anchor on the offset
+            // of the trimmed slice, not on `content`'s end.
+            let lead = content.len() - content.trim_start().len();
+            let start = base + lead + trimmed.len() - token.len();
             out.push((start, start + token.len()));
         }
         base += line.len();
     }
     out
+}
+
+/// Every raw occurrence of `token` in `text` as `(start, end)` byte
+/// ranges, regardless of position. Carry resolution counts these
+/// against the permitted placements: an occurrence that is not a
+/// legal placement (mid-word, a second position, a structural field)
+/// still counts, so the input refuses rather than leaving an
+/// unresolved token in the rendered plan.
+fn token_occurrences(text: &str, token: &str) -> usize {
+    text.matches(token).count()
 }
 
 /// Where one carried input's bytes attach in the parsed plan. `input`
@@ -3212,5 +3241,60 @@ agent: writer\nsize: S\ndepends_on: 1\naction: local.text.produce\n\nRun this.\n
         with_input.insert("carry_caption".into(), "x".into());
         let e = render_carry_positions(WF_CARRY, &with_input, &carry).unwrap_err();
         assert!(e.to_string().contains("collides"), "{e}");
+    }
+
+    #[test]
+    fn carry_replaces_the_full_token_under_trailing_whitespace() {
+        // A legal `prefix: {{name}}` tail followed by trailing spaces is
+        // recognized after trimming; the splice must cover the token's
+        // own byte range — anchored at the trimmed end, not the raw
+        // line's — or the caption would land two bytes inside the token
+        // and leave its tail behind.
+        let provided = inputs(&[("w", "dev-1"), ("r", "qa-1")]);
+        let carry = inputs(&[("carry_caption", "CAP")]);
+        let spaced = WF_CARRY.replace(
+            "Reissue exactly: {{carry_caption}}",
+            "Reissue exactly: {{carry_caption}}   \nSecond paragraph.",
+        );
+        let (doc, _) = render_carry_positions(&spaced, &provided, &carry).unwrap();
+        assert!(
+            doc.tickets[0]
+                .description
+                .contains("Reissue exactly: CAP   "),
+            "trailing-space splice left token bytes: {:?}",
+            doc.tickets[0].description
+        );
+        assert!(
+            !doc.tickets[0].description.contains("carry-"),
+            "opaque token leaked into the instruction: {:?}",
+            doc.tickets[0].description
+        );
+        assert!(
+            doc.tickets[0].description.contains("Second paragraph."),
+            "lost the following paragraph: {:?}",
+            doc.tickets[0].description
+        );
+    }
+
+    #[test]
+    fn carry_refuses_extra_occurrences_outside_the_permitted_position() {
+        let provided = inputs(&[("w", "dev-1"), ("r", "qa-1")]);
+        let carry = inputs(&[("carry_caption", "cap")]);
+        // Two placeholders on one line: `token_matches` sees the tail
+        // once, but the plan would keep an unresolved token.
+        let twice_same_line = WF_CARRY.replace(
+            "Reissue exactly: {{carry_caption}}",
+            "Reissue exactly: {{carry_caption}} {{carry_caption}}",
+        );
+        let e = render_carry_positions(&twice_same_line, &provided, &carry).unwrap_err();
+        assert!(e.to_string().contains("exactly one position"), "{e}");
+        // One legal tail plus a mid-word occurrence on another line:
+        // accepted placements say one; every occurrence says two.
+        let valid_plus_midword = WF_CARRY.replace(
+            "Reissue exactly: {{carry_caption}}",
+            "Reissue exactly: {{carry_caption}}\npre{{carry_caption}}post",
+        );
+        let e = render_carry_positions(&valid_plus_midword, &provided, &carry).unwrap_err();
+        assert!(e.to_string().contains("exactly one position"), "{e}");
     }
 }

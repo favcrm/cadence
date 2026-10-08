@@ -991,10 +991,23 @@ impl Store {
                 // CAD-1143: persist a host-owned five-second post-queue
                 // maturity floor. Historical rows default to mature; every
                 // newly queued row records its own server-derived floor.
+                // Column add skipped when present (the same half-applied
+                // converge as v14/v15/v16): a store that already carries
+                // the column but rolled the version back converges instead
+                // of failing on a duplicate column.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(social_publish_intents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                if !columns.iter().any(|column| column == "claim_after_epoch") {
+                    tx.execute_batch(
+                        "ALTER TABLE social_publish_intents ADD COLUMN claim_after_epoch INTEGER NOT NULL DEFAULT 0 CHECK(claim_after_epoch>=0)",
+                    )?;
+                }
                 tx.execute_batch(
-                    "ALTER TABLE social_publish_intents ADD COLUMN claim_after_epoch INTEGER NOT NULL DEFAULT 0 CHECK(claim_after_epoch>=0);\n\
-                     DROP INDEX IF EXISTS social_publish_due;\n\
+                    "DROP INDEX IF EXISTS social_publish_due;\n\
                      CREATE INDEX social_publish_due ON social_publish_intents(state,due_epoch,claim_after_epoch,intent_id);",
                 )?;
                 tx.execute("UPDATE schema_version SET version=36", [])?;
@@ -1005,10 +1018,20 @@ impl Store {
                 // nondispatchable until a second, post-commit transaction
                 // installs its undo floor and arms claims. Historical rows
                 // were already dispatchable and therefore default armed.
+                // The column add is skipped when present, as v36's is.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(social_publish_intents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                if !columns.iter().any(|column| column == "claim_armed") {
+                    tx.execute_batch(
+                        "ALTER TABLE social_publish_intents ADD COLUMN claim_armed INTEGER NOT NULL DEFAULT 1 CHECK(claim_armed IN (0,1))",
+                    )?;
+                }
                 tx.execute_batch(
-                    "ALTER TABLE social_publish_intents ADD COLUMN claim_armed INTEGER NOT NULL DEFAULT 1 CHECK(claim_armed IN (0,1));\n\
-                     DROP INDEX IF EXISTS social_publish_due;\n\
+                    "DROP INDEX IF EXISTS social_publish_due;\n\
                      CREATE INDEX social_publish_due ON social_publish_intents(state,claim_armed,due_epoch,claim_after_epoch,intent_id);",
                 )?;
                 tx.execute("UPDATE schema_version SET version=37", [])?;
@@ -1018,23 +1041,35 @@ impl Store {
                 // Cancellation is terminal for a PREPARED owner action and
                 // its attached-but-unclaimed queue row. Rebuild the narrow
                 // lifecycle table to add that explicit terminal state.
+                // A store whose table already carries `cancelled` (the
+                // rebuild ran, only the version rolled back) skips it —
+                // `CREATE INDEX IF NOT EXISTS` converges the index.
+                let has_cancelled: bool = conn
+                    .prepare("SELECT sql FROM sqlite_master WHERE name='social_publish_prepared'")?
+                    .query_row([], |row| row.get::<_, String>(0))
+                    .map(|sql| sql.contains("'cancelled'"))
+                    .unwrap_or(false);
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                if !has_cancelled {
+                    tx.execute_batch(
+                        "DROP INDEX IF EXISTS social_publish_prepared_scope;\n\
+                         ALTER TABLE social_publish_prepared RENAME TO social_publish_prepared_v37;\n\
+                         CREATE TABLE social_publish_prepared(\n\
+                          prepared_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,\n\
+                          install_id TEXT NOT NULL, context_id TEXT, run_id TEXT NOT NULL,\n\
+                          effect_id TEXT NOT NULL, connection_id TEXT NOT NULL, aos_connection_id TEXT,\n\
+                          destination_id TEXT NOT NULL, destination_label TEXT NOT NULL, toolkit TEXT NOT NULL, timezone TEXT NOT NULL,\n\
+                          caption_digest TEXT NOT NULL, image_digest TEXT, media_key TEXT, approval_id TEXT NOT NULL,\n\
+                          mode TEXT NOT NULL CHECK(mode IN ('now','schedule')),\n\
+                          due_epoch INTEGER NOT NULL CHECK(due_epoch>0), not_before_epoch INTEGER NOT NULL, expires_epoch INTEGER NOT NULL,\n\
+                          state TEXT NOT NULL CHECK(state IN ('prepared','authorized','cancelled','superseded','refused')),\n\
+                          grant_id TEXT, descriptor TEXT NOT NULL, descriptor_digest TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);\n\
+                         INSERT INTO social_publish_prepared SELECT * FROM social_publish_prepared_v37;\n\
+                         DROP TABLE social_publish_prepared_v37;",
+                    )?;
+                }
                 tx.execute_batch(
-                    "DROP INDEX IF EXISTS social_publish_prepared_scope;\n\
-                     ALTER TABLE social_publish_prepared RENAME TO social_publish_prepared_v37;\n\
-                     CREATE TABLE social_publish_prepared(\n\
-                      prepared_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,\n\
-                      install_id TEXT NOT NULL, context_id TEXT, run_id TEXT NOT NULL,\n\
-                      effect_id TEXT NOT NULL, connection_id TEXT NOT NULL, aos_connection_id TEXT,\n\
-                      destination_id TEXT NOT NULL, destination_label TEXT NOT NULL, toolkit TEXT NOT NULL, timezone TEXT NOT NULL,\n\
-                      caption_digest TEXT NOT NULL, image_digest TEXT, media_key TEXT, approval_id TEXT NOT NULL,\n\
-                      mode TEXT NOT NULL CHECK(mode IN ('now','schedule')),\n\
-                      due_epoch INTEGER NOT NULL CHECK(due_epoch>0), not_before_epoch INTEGER NOT NULL, expires_epoch INTEGER NOT NULL,\n\
-                      state TEXT NOT NULL CHECK(state IN ('prepared','authorized','cancelled','superseded','refused')),\n\
-                      grant_id TEXT, descriptor TEXT NOT NULL, descriptor_digest TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);\n\
-                     INSERT INTO social_publish_prepared SELECT * FROM social_publish_prepared_v37;\n\
-                     DROP TABLE social_publish_prepared_v37;\n\
-                     CREATE INDEX social_publish_prepared_scope ON social_publish_prepared(install_id,context_id,prepared_id);",
+                    "CREATE INDEX IF NOT EXISTS social_publish_prepared_scope ON social_publish_prepared(install_id,context_id,prepared_id);",
                 )?;
                 tx.execute("UPDATE schema_version SET version=38", [])?;
                 tx.commit()?;
