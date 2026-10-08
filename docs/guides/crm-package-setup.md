@@ -14,7 +14,7 @@ custody, send authority, or a sandbox over what workers may do.
 Use a trusted Cadence source checkout and an owned, disposable test daemon
 and workspace. These are operator commands, not a production rollout.
 
-## Install and approve
+## Install (consent)
 
 ```sh
 cadence app catalog install workspace-apps/crm
@@ -23,10 +23,10 @@ cadence app catalog show <install-id>
 
 `install` validates and copies the local bundle and returns a stable
 installation ID plus the bundle `digest` and `catalog_generation`.
-Installing is the approval (CAD-1119): it records the approval of exactly
-that digest, which permits the bundle's bounded local text capability
-only. It creates no run, dispatch, binding,
-customer record, SMTP connection or send authority.
+Installing is the operator's consent (CAD-1119): when the bundle passes local
+execution checks, install records approval of exactly that digest, which permits
+the bundle's bounded local text capability only. It creates no run, dispatch,
+binding, customer record, SMTP connection or send authority.
 
 ## Generic app assistant declaration
 

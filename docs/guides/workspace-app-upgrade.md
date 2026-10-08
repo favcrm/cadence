@@ -12,11 +12,29 @@ cadence app catalog upgrade-check <install-id> <absolute-source-path-or-git-url>
 ```
 
 An upgrade keeps the installation ID, contexts, bindings, and
-historical runs; it never creates a project. In the board, open the app's
-**Settings → App package**, enter the source path or Git URL, select **Check
-update**, inspect the proposed version, digest and changed files, then select
-**Apply checked update**. The board sends the same pinned arguments as the
-CLI; a stale proposal is refused.
+historical runs; it never creates a project. The board's **Settings → App
+package** panel at `/app-installations/<id>` is available for Social Content
+only. A verified operator in a writable session can enter a source path or Git
+URL, select **Check update**, inspect the proposal, then select **Apply checked
+update**; the board pins the checked digest and refuses a stale proposal.
+
+For other apps, `/apps` may show the operator **Review update** when a cached
+check found a changed digest. That button opens `/apps/manage/<id>`, which shows
+**Update ready** or **Up to date** and offers **Check now** only for Git-sourced
+installs. **Check now** checks upstream; the page has no apply-update control.
+Use the CLI `cadence app catalog upgrade-check` and `cadence app catalog
+upgrade` commands below to check and apply an update. In a hosted AgenticOS
+container, the remote CLI has no app-management verbs, so non-Social apps cannot
+currently be updated there. A verified operator can use the Social Content board
+panel in that environment.
+
+Installing or updating is the operator's consent for the exact installed
+digest when the bundle passes local execution validation. `cadence app catalog
+approve <install-id> --digest <digest>` explicitly approves the exact current
+digest for supported local artifact steps; `revoke` with the same arguments
+withdraws local capabilities for that digest and does not change legacy
+project approvals. Either command refuses a stale digest. Approval of an app
+bundle does not approve an individual run or authorize outward effects.
 
 ```sh
 cadence app catalog upgrade <install-id> <absolute-source-path-or-git-url> \
@@ -48,8 +66,13 @@ binding rows are retained. A context whose defaults are incompatible with the ne
 cannot authorize a new run until its defaults are updated. Binding receipts
 pin the old bundle and cannot silently grant a new run authority. A second
 configured binding for the new digest may use the same slot and context;
-updating an old-version binding into a new digest is refused. The new
-bundle digest is unapproved, so approve it separately before creating new runs.
+updating an old-version binding into a new digest is refused. A successful
+operator update records consent for the new digest when it passes the local
+execution checks. If local capabilities were later revoked, use the
+digest-pinned `cadence app catalog approve` command above to restore them after
+reviewing the bundle. Approval still validates the local execution contract; it
+cannot bypass a failed check. Run approval and outward-effect permissions remain
+separate.
 
 A completed, reviewed draft may still be released to Local from its exact
 retained old bundle, and a retained Instagram source receipt may be selected
@@ -78,6 +101,15 @@ and new bundle before resuming delivery. It does not replay a provider call.
 There is no in-place rollback after a committed upgrade. To return to earlier
 bytes, submit a new upgrade from those bytes with the current digest and
 generation, then review and approve that digest again.
+
+Built-in app bundles and their catalog index are embedded in the Cadence
+binary. A new version of a built-in app arrives with a new Cadence build. The
+Explorer's operator-only `update_available` flag means a check for the installed
+app found a different bundle digest and cached that result; members do not see
+the flag. The remote CLI (`cadence --org …`) has no app-management verbs.
+Install apps from the hosted board as the operator; only Social Content can
+currently be updated there. Other apps require the CLI update commands above,
+which are unavailable in the hosted AgenticOS container.
 
 This transport currently handles the package bundle and Cadence-owned app
 metadata. Host-managed per-install SQLite storage and staged schema/data
