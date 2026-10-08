@@ -338,6 +338,11 @@ jobs:
             echo "release binary contains the CAD-482 test seam" >&2
             exit 1
           fi
+          # S-VIEW-1 diagnostic seam (src/adapter/pi_guest/diag_seam.rs) marker.
+          if grep -aq 'cadence-n1-s-view-1-isolate-seam-refusal-v1' target/ci/cadence; then
+            echo "release binary contains the S-VIEW-1 diagnostic seam" >&2
+            exit 1
+          fi
       # CAD-482: the grep above proves the shipped binary carries no
       # seam, but the exclusion itself needs a tripwire — a deleted
       # compile_error would leave this whole job green. This probe
