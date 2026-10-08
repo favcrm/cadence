@@ -1879,3 +1879,100 @@
         )
         .expect_err("rebuilt state CHECK must refuse a bogus state");
     }
+
+    /// The non-autoindex names attached to `social_publish_intents`
+    /// right now — `sqlite_autoindex_*` entries (PRIMARY KEY / UNIQUE)
+    /// are SQLite-owned and out of scope.
+    fn intents_index_names(db: &std::path::Path) -> Vec<String> {
+        let conn = Connection::open(db).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index'
+                  AND tbl_name='social_publish_intents'
+                  AND name NOT LIKE 'sqlite_autoindex_%' ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn migration_v37_rebuild_preserves_claim_columns_under_any_case() {
+        // SQLite resolves column identifiers ASCII-case-insensitively,
+        // so a predecessor that carries `CLAIM_AFTER_EPOCH`/`CLAIM_ARMED`
+        // — any spelling — still carries the guard columns. Detection
+        // must match the same way: the existing values ride the named
+        // copy under their real spelling into the canonical lowercase
+        // column, and a present guard is never silently defaulted.
+        for (name, epoch_col, arm_col) in [
+            ("both-upper", "CLAIM_AFTER_EPOCH", "CLAIM_ARMED"),
+            ("arm-upper", "claim_after_epoch", "CLAIM_ARMED"),
+            ("epoch-upper", "CLAIM_AFTER_EPOCH", "claim_armed"),
+            ("mixed", "Claim_After_Epoch", "Claim_Armed"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let db = queued_intent_db(&dir, name);
+            Connection::open(&db)
+                .unwrap()
+                .execute_batch(&format!(
+                    "ALTER TABLE social_publish_intents
+                      RENAME COLUMN claim_after_epoch TO {epoch_col};
+                     ALTER TABLE social_publish_intents
+                      RENAME COLUMN claim_armed TO {arm_col};
+                     UPDATE social_publish_intents
+                      SET {epoch_col}=900,{arm_col}=0 WHERE intent_id='i1';
+                     UPDATE schema_version SET version=36;",
+                ))
+                .unwrap();
+            Store::open_for_schema_tests(&db)
+                .unwrap_or_else(|e| panic!("{name}: a case-varied guard shape must converge: {e}"));
+            assert_eq!(db_version(&db), crate::rollout::SCHEMA_VERSION);
+            let c = Connection::open(&db).unwrap();
+            let (floor, armed): (i64, i64) = c
+                .query_row(
+                    "SELECT claim_after_epoch,claim_armed FROM social_publish_intents WHERE intent_id='i1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (floor, armed),
+                (900, 0),
+                "{name}: a case-varied claim column must copy its values, not default"
+            );
+            // The rebuilt table exposes the canonical lowercase names.
+            c.query_row(
+                "SELECT claim_after_epoch FROM social_publish_intents LIMIT 1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or_else(|e| panic!("{name}: canonical claim columns must exist: {e}"));
+        }
+    }
+
+    #[test]
+    fn migration_v37_rebuild_restores_every_v29_index() {
+        // Renaming the old table drops every user index it carried;
+        // the rebuild must leave the canonical index set — the v37 due
+        // predicate index and the install-scope index — behind, on a
+        // fresh v38 open and on a genuine v34 upgrade alike.
+        let expected = vec![
+            "social_publish_due".to_string(),
+            "social_publish_install".to_string(),
+        ];
+        let dir = TempDir::new().unwrap();
+        let db = queued_intent_db(&dir, "req-idx-fresh");
+        assert_eq!(intents_index_names(&db), expected, "fresh v38 index set");
+
+        let dir = TempDir::new().unwrap();
+        let db = queued_intent_db(&dir, "req-idx-v34");
+        fabricate_intents(&db, "", 34);
+        Store::open_for_schema_tests(&db).unwrap();
+        assert_eq!(
+            intents_index_names(&db),
+            expected,
+            "v34->v38 upgrade index set"
+        );
+    }

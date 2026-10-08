@@ -166,10 +166,10 @@ store/tests/native_nudge.rs	test-fixtures	open	1
 store/tests/queue.rs	test-fixtures	execute	1
 store/tests/queue.rs	test-fixtures	guarded_write	1
 store/tests/queue.rs	test-fixtures	open	2
-store/tests/schema.rs	test-fixtures	execute	60
+store/tests/schema.rs	test-fixtures	execute	61
 store/tests/schema.rs	test-fixtures	guarded_write	2
-store/tests/schema.rs	test-fixtures	open	139
-store/tests/schema.rs	test-fixtures	prepare	4
+store/tests/schema.rs	test-fixtures	open	144
+store/tests/schema.rs	test-fixtures	prepare	5
 store/tests/social_publish.rs	test-fixtures	open	5
 store/threads.rs	constructor-owned-v32-migration-guarded-store-and-inline-fixtures	execute	22
 store/threads.rs	guarded-store-and-read-queries	guarded_write	7

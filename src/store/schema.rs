@@ -1004,19 +1004,38 @@ impl Store {
                 // name, and a same-named column whose values violate the
                 // canonical CHECK refuses the copy. Either way the
                 // transaction rolls back and the open refuses rather
-                // than certifying drift. `claim_after_epoch` defaults
-                // every historical row mature; `claim_armed` defaults
-                // them armed (only owner-attach rows ever carry 0, and
-                // none existed before v37). A half-applied/WIP store
-                // that already carries either claim column has its
-                // values copied by name — detected through `PRAGMA
-                // table_info`, never by parsing CREATE text — so a
-                // recorded undo floor or pending arm is never lost. Every
-                // v29 column is required on the old table — a missing one
-                // fails the copy with `no such column` inside this
-                // transaction and the open refuses.
+                // than certifying drift. Every v29 column is required on
+                // the old table — a missing one fails the copy with
+                // `no such column` inside this transaction and the open
+                // refuses. `claim_after_epoch` defaults every historical
+                // row mature; `claim_armed` defaults them armed (only
+                // owner-attach rows ever carry 0, and none existed
+                // before v37). A half-applied/WIP store that already
+                // carries either claim column has its values copied by
+                // name — detected through `PRAGMA table_info`, never by
+                // parsing CREATE text — so a recorded undo floor or
+                // pending arm is never lost. The match is
+                // ASCII-case-insensitive like SQLite identifier
+                // resolution itself: a `CLAIM_ARMED` spelling still
+                // names the claim column, and its real spelling (quoted
+                // on the SELECT side) carries the recorded values into
+                // the canonical lowercase target — a present guard
+                // column is never silently defaulted, and two
+                // case-varied spellings of one claim refuse the open.
+                // The rename also drops every user index the old table
+                // carried, so the rebuild recreates BOTH v29 indexes:
+                // `social_publish_due` (v37 claim predicate shape) and
+                // `social_publish_install` (its original v29
+                // definition — the store never changed it). No release
+                // ever shipped a trigger on this table.
                 let existing = table_column_names(&conn, "social_publish_intents")?;
-                let mut copy: Vec<&str> = vec![
+                // (target, source) column pairs: for every fixed v29
+                // column both sides are the canonical name. The claim
+                // columns ride the copy only when the old table really
+                // carries them — under any ASCII case — and the source
+                // side then uses the existing spelling; otherwise the
+                // canonical DEFAULTs apply on insert.
+                let mut pairs: Vec<(String, String)> = [
                     "intent_id",
                     "request",
                     "install_id",
@@ -1032,16 +1051,23 @@ impl Store {
                     "grant_id",
                     "approval_id",
                     "due_epoch",
-                ];
-                // The claim columns ride the copy only when the old table
-                // really carries them; otherwise the canonical DEFAULTs
-                // apply on insert.
+                ]
+                .into_iter()
+                .map(|c| (c.to_string(), c.to_string()))
+                .collect();
                 for claim in ["claim_after_epoch", "claim_armed"] {
-                    if existing.iter().any(|c| c == claim) {
-                        copy.push(claim);
+                    let mut found = existing.iter().filter(|c| c.eq_ignore_ascii_case(claim));
+                    match (found.next(), found.next()) {
+                        (None, _) => {}
+                        (Some(name), None) => pairs.push((claim.to_string(), name.clone())),
+                        (Some(_), Some(_)) => {
+                            return Err(Error::rejected(format!(
+                                "social_publish_intents carries ambiguous claim column {claim}"
+                            )))
+                        }
                     }
                 }
-                copy.extend([
+                for c in [
                     "timezone",
                     "state",
                     "frozen",
@@ -1050,11 +1076,31 @@ impl Store {
                     "upstream",
                     "created",
                     "updated",
-                ]);
-                let list = copy.join(",");
+                ] {
+                    pairs.push((c.to_string(), c.to_string()));
+                }
+                let targets = pairs
+                    .iter()
+                    .map(|(target, _)| target.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                // Quote only a spelled-differently existing name — every
+                // other identifier is a fixed canonical literal.
+                let sources = pairs
+                    .iter()
+                    .map(|(target, source)| {
+                        if source == target {
+                            source.clone()
+                        } else {
+                            format!("\"{}\"", source.replace('"', "\"\""))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(&format!(
                     "DROP INDEX IF EXISTS social_publish_due;\n\
+                     DROP INDEX IF EXISTS social_publish_install;\n\
                      ALTER TABLE social_publish_intents RENAME TO social_publish_intents_v35;\n\
                      CREATE TABLE social_publish_intents(\n\
                       intent_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,\n\
@@ -1072,11 +1118,13 @@ impl Store {
                         CHECK(state IN ('queued','cancelled','processing','posted','refused','held')),\n\
                       frozen TEXT NOT NULL, frozen_digest TEXT NOT NULL,\n\
                       receipt TEXT, upstream TEXT, created REAL NOT NULL, updated REAL NOT NULL);\n\
-                     INSERT INTO social_publish_intents({list})\n\
-                     SELECT {list} FROM social_publish_intents_v35;\n\
+                     INSERT INTO social_publish_intents({targets})\n\
+                     SELECT {sources} FROM social_publish_intents_v35;\n\
                      DROP TABLE social_publish_intents_v35;\n\
                      CREATE INDEX social_publish_due\n\
-                      ON social_publish_intents(state,claim_armed,due_epoch,claim_after_epoch,intent_id);",
+                      ON social_publish_intents(state,claim_armed,due_epoch,claim_after_epoch,intent_id);\n\
+                     CREATE INDEX social_publish_install\n\
+                      ON social_publish_intents(install_id,context_id,intent_id);",
                 ))?;
                 tx.execute("UPDATE schema_version SET version=37", [])?;
                 tx.commit()?;
