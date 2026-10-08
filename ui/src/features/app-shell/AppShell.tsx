@@ -203,11 +203,11 @@ export default function AppShell({
   const loadError = loadFailure?.key === receiptKey ? loadFailure.message : null;
   const socialSelectionReady =
     installation?.name !== "social-content" || socialContextInstall === installId;
-  const loading = viewer.operator
+  const loading = viewer.operator === true
     ? requestLoading || !currentReadComplete || !socialSelectionReady
     : requestLoading;
   const receiptReady =
-    viewer.operator &&
+    viewer.operator === true &&
     currentReadComplete &&
     loadError === null &&
     socialSelectionReady &&
@@ -238,6 +238,31 @@ export default function AppShell({
   const firstInstall = useRef(installId);
   const handledQuery = useRef<string | undefined>(undefined);
   const [adoptedContextKey, setAdoptedContextKey] = useState<string | null>(null);
+
+  // CAD-1193: the render right after an installId switch still holds
+  // the departed installation's receipt state — React commits the new
+  // route before the reset effect below runs. That state is pending
+  // receipts for THIS route: nothing may read it as the new
+  // installation's binding, scope or contexts. Resetting here (before
+  // `activeIds`, `binding` and `scope` are computed) is React's
+  // documented adjust-state-during-render pattern — the states settle
+  // in the same commit, so the stale install/context pair never
+  // reaches Conversation, AssistantOperations or the outlet. The
+  // effect below still does the real cleanup (query strip, notice).
+  // `loadError` is keyed to the departed route's receiptKey, so the
+  // keyed `loadFailure` needs no clearing here — the new route's
+  // `loadError` computes to null and the stale entry is overwritten
+  // by the switch effect's `setLoadFailure(null)`.
+  if (firstInstall.current !== installId && (installation !== null || contexts.length > 0 || contextId !== "" || linkNotice !== null || loadError !== null)) {
+    setInstallation(null);
+    setContexts([]);
+    setContextId("");
+    setLinkNotice(null);
+  }
+  // Receipts count only when they are the current route's verified
+  // ones: a departed install's `installation`/`contexts`, or a load
+  // that has not answered yet, leaves the scope unresolved.
+  const receiptsPending = !receiptReady || installation === null || installation.install_id !== installId || loading || loadError !== null;
 
   // Every internal query write marks the resulting key as handled, so
   // the adoption effect below only answers external URL changes
@@ -418,6 +443,10 @@ export default function AppShell({
     if (firstInstall.current === installId) return;
     firstInstall.current = installId;
     handledQuery.current = undefined;
+    // The render-phase reset above already cleared the departed
+    // installation's state on this commit; setting it again here is a
+    // no-op for anything already mounted on the new route, but keeps
+    // the reset self-contained for paths that skipped the render gate.
     setInstallation(null);
     setContexts([]);
     setLoadFailure(null);
@@ -550,25 +579,34 @@ export default function AppShell({
 
   // The App binding for chat sends: install plus the concrete context
   // the shell owns (generic outlet) or the workspace screen owns
-  // (social, observed live via subscription). Empty context sends
-  // plain chat — there is no App scope to bind. A selected context
-  // that is no longer active blocks the send early with a clear
-  // message; the server re-proves every binding on send regardless.
-  const verified = receiptReady && installation !== null && installation.install_id === installId;
-  const wantedContext = installation?.name === "social-content" ? socialContext || "" : contextId;
-  const bindingUnavailableError = loadError ??
-    (!viewer.operator
-      ? "Sign in as the operator to verify this app context before sending."
-      : loading
-        ? "The current app context is still being verified. Wait before sending."
-        : "The current app context could not be verified. Retry before sending.");
-  const binding: ChatBinding = verified
-    ? chatBinding({ installId, wanted: wantedContext, known: true, activeIds })
-    : { scope: null, error: bindingUnavailableError };
+  // (social, observed live via subscription). CAD-1193: receipts
+  // pending (loading, a failed load, or a departed installation still
+  // held on this commit) mean the wanted context is "" — no
+  // install/context pair is exposed, so AssistantOperations runs zero
+  // scoped reads instead of querying the new install with the old
+  // context. Plain chat stays; nothing invents or auto-binds a
+  // context. A selected context that is no longer active blocks the
+  // send early with a clear message; the server re-proves every
+  // binding on send regardless.
+  const verified = receiptReady === true && installation !== null && installation.install_id === installId;
   const contextAdoptionReady = installation?.name === "social-content"
     ? socialContextInstall === installId
     : adoptedContextKey === queryKey(query.get("ctx"), query.get("record"), query.get("appview"), query.get("crm"));
-  const contextProofStatus = loadError !== null || (!viewer.operator && !loading)
+  const wantedContext = receiptsPending || !contextAdoptionReady ? "" : installation?.name === "social-content" ? socialContext || "" : contextId;
+  const bindingUnavailableError = loadError ??
+    (viewer.operator === false
+      ? "Sign in as the operator to verify this app context before sending."
+      : viewer.operator === null
+        ? viewer.access === "unavailable"
+          ? "Access could not be confirmed. Retry the access check before sending."
+          : "The board is still checking access. Wait before sending."
+        : loading || !contextAdoptionReady
+          ? "The current app context is still being verified. Wait before sending."
+          : "The current app context could not be verified. Retry before sending.");
+  const binding: ChatBinding = verified && contextAdoptionReady
+    ? chatBinding({ installId, wanted: wantedContext, known: true, activeIds })
+    : { scope: null, error: bindingUnavailableError };
+  const contextProofStatus = loadError !== null || (viewer.operator === false && !loading)
     ? "failed"
     : loading || !verified || !contextAdoptionReady
       ? "pending"
@@ -580,7 +618,9 @@ export default function AppShell({
       ? loadError ?? "The current app context could not be verified."
       : binding.error ?? (binding.scope === null ? "No active app context is available." : null),
   };
-  const scope: HostScope = { installId, contextId };
+  // The outlet's scope follows the same rule — a context id is only
+  // ever named alongside an installation receipt that proved it.
+  const scope: HostScope = { installId, contextId: receiptsPending || !contextAdoptionReady ? "" : contextId };
   // CAD-813: the Campaigns page mints assistant proposal requests
   // against the operator's most recent chat message stamped by the
   // daemon with exactly this scope. The id travels as ordinary

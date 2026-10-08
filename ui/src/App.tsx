@@ -333,7 +333,7 @@ export default function App() {
     return promise;
   }, []);
 
-  const refresh = useCallback(() => {
+  const refresh = useCallback((forceProof = false) => {
     api.health().then(setHealth).catch(() => setHealth(null));
     const request = ++metaRequest.current;
     const sentKey = sessionKey();
@@ -348,7 +348,12 @@ export default function App() {
       // key's outcome (including its failure) never follows it.
       setMetaUnavailable(false);
     }
-    const asked = !operatorKnown.current;
+    // An explicit re-probe (the Retry an unavailable check offers)
+    // re-runs the real `?operator=1` proof; it never reuses the bare
+    // poll's in-flight request or its unproven answer. The flag is
+    // strictly `=== true` — event handlers that pass `refresh` a
+    // truthy argument (a click's MouseEvent) stay bare polls.
+    const asked = forceProof === true || !operatorKnown.current;
     let expectedKey = sentKey;
     const current = () => request === metaRequest.current && sessionKey() === expectedKey;
     metaProbe(asked, sentKey).then((next) => {
@@ -397,21 +402,37 @@ export default function App() {
         operatorKnown.current = true;
         // A proven role — the check answered; unknown is behind us.
         setMetaUnavailable(false);
-      } else if (next.operator === null) {
-        // The server answered but its proof dependencies could not —
+      } else if (next.operator === null && asked) {
+        // The asked proof answered but its dependencies could not —
         // the completed check is unavailable, not still checking.
         setMetaUnavailable(true);
       } else if (!asked) {
-        // A bare poll answered the session fields and preserved the
-        // proven role below — the check is answered, not unavailable.
-        setMetaUnavailable(false);
+        if (next.signed_in === null) {
+          // The session check itself could not answer — the cached
+          // authority is dropped below and the check reports
+          // unavailable. A recovered session changes the identity and
+          // re-proves through the `changed` path above.
+          setMetaUnavailable(true);
+        } else {
+          // A bare poll never asks the proof, so `operator: null` here
+          // says nothing about the role: the previously proven one is
+          // preserved below and the check stays answered — an
+          // unrequested `null` is not an unavailable verdict.
+          setMetaUnavailable(false);
+        }
       } else {
         // An asked probe answered without an `operator` field at all
         // (a pre-CAD-432 daemon): the proof never ran, so the state is
         // unavailable rather than a resolved role or a pending check.
         setMetaUnavailable(true);
       }
-      setMeta((prev) => ({ ...next, operator: next.operator ?? (!asked && !changed ? prev?.operator : undefined) }));
+      // The preserved role rides only an unchanged, session-verified
+      // bare poll: an asked answer, an identity change, or a null
+      // session check drops it to `undefined` rather than guessing.
+      setMeta((prev) => ({
+        ...next,
+        operator: next.operator ?? (!asked && !changed && next.signed_in !== null ? prev?.operator : undefined),
+      }));
     });
     void resources.projects.refresh();
     void resources.issues.refresh();
@@ -421,14 +442,17 @@ export default function App() {
   }, [loadDetail, metaProbe]);
 
   // The Retry an unavailable access check offers (CAD-1193): a real
-  // re-probe of this credential's metadata — the failed probe's slot
-  // is dropped so the same key starts one fresh bounded read instead
-  // of joining a settled-null promise. Never a reload, never a
-  // sign-in, and never a key clear: ownership rules in `refresh` are
-  // unchanged.
+  // re-probe of this credential's metadata — a fresh `?operator=1`
+  // read, never the bare poll the proof was skipped on. The failed
+  // probe's slot is dropped so the same key starts one new bounded
+  // request instead of joining a settled-null promise, and
+  // `operatorKnown` resets so the answer is asked for, not assumed.
+  // Never a reload, never a sign-in, and never a key clear: ownership
+  // rules in `refresh` are unchanged.
   const retryAccess = useCallback(() => {
     metaInFlight.current = null;
-    refresh();
+    operatorKnown.current = false;
+    refresh(true);
   }, [refresh]);
 
   useEffect(() => {
