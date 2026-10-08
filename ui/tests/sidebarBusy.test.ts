@@ -51,10 +51,12 @@ const mk = (id: string, name: string, title: string) => ({
 });
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
 let mode: "ok" | "fail" | "busy-once" = "ok";
+let operator = true;
+let listCalls = 0;
 globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
   const url = new URL(path, "http://localhost");
-  if (path.startsWith("/api/meta")) return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: null });
+  if (path.startsWith("/api/meta")) return json({ read_only: false, operator, signed_in: true, actor: "operator (ui)", session: null });
   if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });
   if (path === "/api/projects") return json({ projects: [] });
   if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });
@@ -62,6 +64,8 @@ globalThis.fetch = (async (input: unknown) => {
   if (path === "/api/update/banner") return json(null);
   if (path.startsWith("/api/threads/master")) return json({ thread: null, entries: [], more_before: false });
   if (path === "/api/app-installations") {
+    listCalls += 1;
+    if (!operator) return json({ error: "operator only" }, 403);
     if (mode === "fail") return json({ error: "list exploded" }, 500);
     if (mode === "busy-once") { mode = "ok"; return json({ error: "another live writer holds the lock", code: "resource_busy" }, 503); }
     return json([mk("install-crm", "crm", "CRM"), mk("install-soc", "social-content", "Social Content")]);
@@ -127,6 +131,18 @@ for (let i = 0; i < 40 && notice(); i++) await React.act(async () => { await new
 assert(!notice(), "the automatic retry recovered");
 assert(appLink("CRM") && appLink("Social Content"), "list intact after the automatic retry");
 await React.act(async () => { root.unmount(); });
+
+// A non-operator session never asks for the list and shows no notice.
+operator = false;
+listCalls = 0;
+const host2 = document.createElement("div");
+document.body.append(host2);
+const root2 = createRoot(host2);
+await React.act(async () => { root2.render(React.createElement(App)); });
+for (let i = 0; i < 10; i++) await flush();
+assert(listCalls === 0, "a non-operator session does not load the installation list");
+assert(!host2.querySelector('aside nav[aria-label="Primary"] [role="status"]'), "no installation notice for a non-operator");
+await React.act(async () => { root2.unmount(); });
 console.log("sidebar busy checks passed");
 }
 void main();
