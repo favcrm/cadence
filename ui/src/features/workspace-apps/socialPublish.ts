@@ -375,12 +375,12 @@ function validOwnerActionUrl(
     const rawAuthority = /^https:\/\/([^/?#]+)/.exec(value)?.[1];
     if (!rawAuthority || rawAuthority.includes(":") || rawAuthority.includes("@")) return false;
     const url = new URL(value);
-    const query = [...url.searchParams.entries()];
-    const keys = query.map(([key]) => key);
+    const keys: string[] = [];
+    url.searchParams.forEach((_value, key) => keys.push(key));
     const slug = url.searchParams.get("company_slug") ?? "";
     return url.protocol === "https:" &&
       url.username === "" && url.password === "" && url.pathname === "/social-owner-action" &&
-      url.hash === "" && query.length === 3 && new Set(keys).size === 3 &&
+      url.hash === "" && keys.length === 3 && new Set(keys).size === 3 &&
       ["company_slug", "intent_id", "intent_digest"].every(key => url.searchParams.getAll(key).length === 1) &&
       /^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$/.test(slug) && !slug.endsWith("-staging") &&
       url.searchParams.get("intent_id") === preparedId &&
