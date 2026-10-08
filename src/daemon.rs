@@ -610,6 +610,13 @@ impl Shared {
             state_dir,
             opts.test_seam || crate::test_seam::armed(state_dir),
         )?;
+        // Armed-fixture provider seal: blank or missing provider
+        // command overrides refuse/seal before the lease is taken or
+        // the store opens — the same point `serve_with` applies it,
+        // before `hot_restart_begin` could consume restart state.
+        if seam.is_some() {
+            opts.provider_env.isolate_for_test()?;
+        }
         // CAD-538: a configured hosted lease must be held before the
         // store opens — `recover` writes at open. A daemon that cannot
         // take the lease refuses here having written nothing.
@@ -627,6 +634,15 @@ impl Shared {
         lease: Option<Arc<crate::lease::LeaseCtl>>,
         seam: Option<crate::test_seam::Seam>,
     ) -> Result<Arc<Self>> {
+        // Backstop for the armed-fixture seal applied at the entry
+        // points (`new_hot` above, `serve_with`): idempotent — an
+        // already-sealed env validates and writes nothing — so it
+        // covers this constructor no matter which entry reached it,
+        // before the env is read or stored anywhere below. Production
+        // (`seam` None) never runs it.
+        if seam.is_some() {
+            opts.provider_env.isolate_for_test()?;
+        }
         let HotStart { instance, marker } = hot;
         let daemon_id = instance.clone();
         let db_path = state_dir.join("cadence.sqlite3");
@@ -4835,7 +4851,14 @@ pub struct ServeOptions {
     /// uses `/var/lib/cadence/cadence.sock` and the fixed cadence group.
     pub shared_socket: Option<(PathBuf, u32)>,
     /// Provider launch overrides (`CADENCE_CLAUDE_COMMAND`, …) for this
-    /// daemon only; unset names fall back to the environment.
+    /// daemon only; unset names fall back to the environment. When the
+    /// test seam is armed (`test_seam`), the start paths seal this env
+    /// with [`ProviderEnv::isolate_for_test`] — immediately after the
+    /// arm validates and before the lease, restart marker or store is
+    /// touched: an unset provider command seals to `false` instead of
+    /// falling through to the installed CLI, an explicit or inherited
+    /// nonempty mock is snapshotted, and a blank override refuses
+    /// startup. Production is untouched.
     pub provider_env: ProviderEnv,
     /// Stall screen-sample interval in seconds for this daemon; 0 falls
     /// back to `CADENCE_STALL_SAMPLE_SECS`, then one minute. Shared so
@@ -5136,6 +5159,16 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         state_dir,
         opts.test_seam || crate::test_seam::armed(state_dir),
     )?;
+    // Armed-fixture provider seal, immediately after the validated arm
+    // and before hosted config, platform attach, lease acquisition and
+    // `hot_restart_begin`: a blank provider command override refuses
+    // startup before the shutdown marker is consumed or any restart
+    // state is touched; a missing one seals to `false`. The store is
+    // still unopened at this point — only the singleton lock, backup
+    // check and seam token exist.
+    if seam.is_some() {
+        opts.provider_env.isolate_for_test()?;
+    }
     // CAD-538: a configured hosted lease is taken before the marker is
     // consumed and before the store opens — a daemon that cannot hold
     // it refuses here having written nothing but the singleton lock.

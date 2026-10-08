@@ -126,6 +126,76 @@ impl ProviderEnv {
         env
     }
 
+    /// Fail-closed seal for an armed test-fixture daemon only —
+    /// `Shared::new_leased` invokes it when the test seam is armed: a
+    /// fixture that forgot a provider-command mock gets
+    /// [`REFUSED_COMMAND`], never a silent fall-through to the
+    /// installed CLI. Production daemons never reach it.
+    ///
+    /// For every [`PROVIDER_COMMAND_VARS`] name:
+    /// - an explicit nonempty value set on this env (the supported
+    ///   mock-override channel) is preserved;
+    /// - a nonempty value inherited from the process environment is
+    ///   snapshotted into this env, fixing [`Self::var`]'s resolution
+    ///   to the value seen at seal time instead of tracking mutable
+    ///   ambient env. [`Self::vars`] then *exposes* the entry — an
+    ///   env-local mock still reaches a spawned or restarted daemon
+    ///   only through an explicit handoff by the harness that spawns
+    ///   it; nothing here adds that transport;
+    /// - a blank value (whitespace-only counts), whether set here or
+    ///   inherited, is a hard error: adapters treat blank as unset and
+    ///   fall through to the installed CLI;
+    /// - a name resolving nowhere becomes [`REFUSED_COMMAND`].
+    ///
+    /// All entries are validated before any is written, so a refused
+    /// env is never left half-sealed.
+    ///
+    /// Limitation: a missing or blank override can no longer fall
+    /// through to a real CLI, but an explicit nonempty override — set
+    /// on this env or exported to the process — may still name a real
+    /// binary. The seam proves the daemon is a fixture, not what a
+    /// command points at; this is provider-command fail-closed
+    /// behavior, not network isolation.
+    pub fn isolate_for_test(&self) -> Result<()> {
+        // `.ok()` maps unset and non-UTF-8 alike to `None` → sealed to
+        // `false`; neither can reach the real CLI.
+        self.isolate_for_test_with(|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::isolate_for_test`] with the inherited-environment
+    /// lookup injected, so tests exercise every branch without
+    /// touching the shared process environment.
+    fn isolate_for_test_with(&self, inherited: impl Fn(&str) -> Option<String>) -> Result<()> {
+        let mut seal: Vec<(&str, String)> = Vec::new();
+        for name in PROVIDER_COMMAND_VARS {
+            match self.own(name) {
+                Some(own) if own.trim().is_empty() => {
+                    return Err(Error::rejected(format!(
+                        "test fixture: {name} is set but blank — a blank provider \
+                         command override falls through to the installed CLI; set a \
+                         mock or leave it unset for {REFUSED_COMMAND}"
+                    )));
+                }
+                Some(_) => {}
+                None => match inherited(name) {
+                    Some(value) if value.trim().is_empty() => {
+                        return Err(Error::rejected(format!(
+                            "test fixture: {name} is blank in the process environment \
+                             — a blank provider command override falls through to the \
+                             installed CLI; set a mock or unset it for {REFUSED_COMMAND}"
+                        )));
+                    }
+                    Some(value) => seal.push((name, value)),
+                    None => seal.push((name, REFUSED_COMMAND.to_string())),
+                },
+            }
+        }
+        for (name, value) in seal {
+            self.set(name, value);
+        }
+        Ok(())
+    }
+
     pub fn set(&self, name: &str, value: impl Into<String>) {
         self.0
             .write()
@@ -1000,6 +1070,145 @@ mod tests {
             app.env_remove(name);
         }
         assert_child_lacks_secrets(&mut app);
+    }
+
+    /// `isolate_for_test` — the armed-fixture seal `Shared::new_leased`
+    /// invokes. Pure `ProviderEnv` cases only: every scenario is armed
+    /// through the env's own entries and a synthetic inherited lookup,
+    /// never by reading or mutating the shared process environment.
+    mod isolate_for_test {
+        use super::*;
+
+        /// Lookup table → the injected `inherited` closure.
+        fn inherits<'a>(table: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+            move |name| {
+                table
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        }
+
+        /// A fixture that mocked nothing: every provider command
+        /// resolves to `false`, held on this env so `var()` answers
+        /// `REFUSED_COMMAND` without consulting ambient env.
+        #[test]
+        fn missing_commands_seal_to_refused() {
+            let env = ProviderEnv::default();
+            env.isolate_for_test_with(|_| None).unwrap();
+            for name in PROVIDER_COMMAND_VARS {
+                assert_eq!(env.own(name).as_deref(), Some(REFUSED_COMMAND), "{name}");
+            }
+        }
+
+        /// A blank override — the value adapters silently fall past to
+        /// the real CLI — must refuse, whether it sits on the env or
+        /// arrives inherited.
+        #[test]
+        fn blank_overrides_refuse() {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_CLAUDE_COMMAND", "");
+            let err = env.isolate_for_test_with(|_| None).unwrap_err().to_string();
+            assert!(err.contains("CADENCE_CLAUDE_COMMAND"), "{err}");
+
+            let env = ProviderEnv::default();
+            env.set("CADENCE_TMUX_COMMAND", "   ");
+            assert!(env.isolate_for_test_with(|_| None).is_err());
+
+            let env = ProviderEnv::default();
+            let err = env
+                .isolate_for_test_with(inherits(&[("CADENCE_TMUX_COMMAND", "\t")]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("CADENCE_TMUX_COMMAND"), "{err}");
+        }
+
+        /// The supported mock channel, both forms: an explicit fake
+        /// command set on the env survives verbatim, and a nonempty
+        /// inherited fake is snapshotted into the env — `var()`
+        /// resolves it from this env's own entries (visible via
+        /// `vars()`), not from ambient env.
+        #[test]
+        fn explicit_and_inherited_fakes_are_preserved() {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_CLAUDE_COMMAND", "python3 /fixtures/fake-claude.py");
+            env.isolate_for_test_with(inherits(&[("CADENCE_TMUX_COMMAND", "/fixtures/fake-tmux")]))
+                .unwrap();
+            assert_eq!(
+                env.var("CADENCE_CLAUDE_COMMAND").as_deref(),
+                Some("python3 /fixtures/fake-claude.py")
+            );
+            assert_eq!(
+                env.own("CADENCE_TMUX_COMMAND").as_deref(),
+                Some("/fixtures/fake-tmux")
+            );
+            assert!(env.vars().contains(&(
+                "CADENCE_TMUX_COMMAND".to_string(),
+                "/fixtures/fake-tmux".to_string()
+            )));
+        }
+
+        /// An own entry wins over the inherited value — a fixture's
+        /// explicit mock is never displaced by ambient env.
+        #[test]
+        fn own_override_wins_over_inherited() {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_CLAUDE_COMMAND", "/fixture/fake-claude");
+            env.isolate_for_test_with(inherits(&[(
+                "CADENCE_CLAUDE_COMMAND",
+                "/ambient/other-claude",
+            )]))
+            .unwrap();
+            assert_eq!(
+                env.var("CADENCE_CLAUDE_COMMAND").as_deref(),
+                Some("/fixture/fake-claude")
+            );
+        }
+
+        /// Validation precedes every write: a refused env retains
+        /// exactly its prior entries — no half-sealed state.
+        #[test]
+        fn a_refused_env_is_not_partially_sealed() {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_PM_DIR", "/fixture/pm");
+            env.set("CADENCE_TMUX_COMMAND", "");
+            assert!(env.isolate_for_test_with(|_| None).is_err());
+            assert_eq!(env.own("CADENCE_PM_DIR").as_deref(), Some("/fixture/pm"));
+            for name in PROVIDER_COMMAND_VARS {
+                if name != "CADENCE_TMUX_COMMAND" {
+                    assert!(
+                        env.own(name).is_none(),
+                        "{name} was sealed before the error"
+                    );
+                }
+            }
+        }
+
+        /// Non-command configuration rides the same env and is not
+        /// provider-boundary state — the seal leaves it alone.
+        #[test]
+        fn unrelated_config_is_preserved() {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_PM_DIR", "/fixture/pm");
+            env.set("CADENCE_PROFILE", "sandbox:x");
+            env.set("CADENCE_DAEMON_ID", "inst-1");
+            env.isolate_for_test_with(|_| None).unwrap();
+            assert_eq!(env.own("CADENCE_PM_DIR").as_deref(), Some("/fixture/pm"));
+            assert_eq!(env.own("CADENCE_PROFILE").as_deref(), Some("sandbox:x"));
+            assert_eq!(env.own("CADENCE_DAEMON_ID").as_deref(), Some("inst-1"));
+        }
+
+        /// Production behavior is unchanged: a fresh default env
+        /// carries no entries — nothing is refused, injected, or
+        /// rewritten until the armed-seam path asks for it.
+        #[test]
+        fn default_env_is_untouched() {
+            let env = ProviderEnv::default();
+            assert!(env.vars().is_empty());
+            for name in PROVIDER_COMMAND_VARS {
+                assert!(env.own(name).is_none(), "{name}");
+            }
+        }
     }
 
     /// CAD-310: the tracker and profile a launched agent gets back are
