@@ -1029,4 +1029,56 @@ mod hot_restart_marker_tests {
         assert!(marker.stale.is_none(), "fresh marker adopts");
         assert_eq!(marker.failed.as_deref(), Some("drain exploded"));
     }
+
+    /// A blank command refuses the in-process fixture before store creation.
+    #[cfg(feature = "test-seam")]
+    #[test]
+    fn a_blank_command_refuses_before_the_store_opens() {
+        let dir = dir_with("old-run", r#"{"instance":"old-run","at":1,"entries":[]}"#);
+        let opts = crate::daemon::ServeOptions {
+            test_seam: true,
+            ..crate::daemon::ServeOptions::default()
+        };
+        opts.provider_env.set("CADENCE_CLAUDE_COMMAND", "");
+        let err = crate::daemon::Shared::new(dir.path(), &opts)
+            .err()
+            .expect("a blank provider command must refuse an armed fixture")
+            .to_string();
+        assert!(err.contains("CADENCE_CLAUDE_COMMAND"), "{err}");
+        assert!(
+            !dir.path().join("cadence.sqlite3").exists(),
+            "the seal must refuse before the store file is created"
+        );
+        assert!(
+            dir.path().join(SHUTDOWN_FILE).exists(),
+            "the constructor must preserve the existing marker"
+        );
+    }
+
+    /// Exercise the actual startup path: refusal must precede
+    /// `hot_restart_begin`, preserving both restart evidence files.
+    #[cfg(feature = "test-seam")]
+    #[test]
+    fn a_blank_command_preserves_restart_evidence_on_serve() {
+        let marker = r#"{"instance":"old-run","at":1,"entries":[]}"#;
+        let dir = dir_with("old-run", marker);
+        let opts = crate::daemon::ServeOptions {
+            test_seam: true,
+            ..crate::daemon::ServeOptions::default()
+        };
+        opts.provider_env.set("CADENCE_CLAUDE_COMMAND", "");
+        let err = crate::daemon::serve_with(dir.path(), opts)
+            .expect_err("a blank command must refuse before the daemon starts")
+            .to_string();
+        assert!(err.contains("CADENCE_CLAUDE_COMMAND"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(SHUTDOWN_FILE)).unwrap(),
+            marker
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(INSTANCE_FILE)).unwrap(),
+            "old-run"
+        );
+        assert!(!dir.path().join("cadence.sqlite3").exists());
+    }
 }
