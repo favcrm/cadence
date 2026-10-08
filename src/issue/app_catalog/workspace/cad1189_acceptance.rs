@@ -196,3 +196,107 @@ fn cad1189_legacy_remove_waits_for_running_admission() {
          and nothing replaced it"
     );
 }
+
+/// Lock acquisition can fail on a transient git read (a detached
+/// `gc --auto` from the previous commit): pre-existing tracker
+/// infrastructure, not what (c) checks. Everything else must be whole
+/// or busy.
+fn tolerated(e: &Error) -> bool {
+    e.kind() == "busy" || e.to_string().starts_with("tracker lock state unknown")
+}
+
+/// (c) Legacy-storage entries are rewritten in place by `app update`
+/// (no pending journal, no catalog change), so a lock-free read of one
+/// could see a half-rewritten bundle. Every runtime read and list answer
+/// during legacy updates must be a whole published version or busy.
+#[test]
+fn cad1189_legacy_reads_never_tear_during_app_update() {
+    let pm_dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let pm = Pm::init(pm_dir.path()).unwrap();
+    crate::issue::write::project_add(
+        &pm,
+        "legacy",
+        "LEG",
+        &[repo.path().display().to_string()],
+        &[],
+        &[],
+        None,
+    )
+    .unwrap();
+    let v1 = sources.path().join("v1").join("legacy-app");
+    let v2 = sources.path().join("v2").join("legacy-app");
+    bundle(&v1, "legacy-app", 1);
+    bundle(&v2, "legacy-app", 2);
+    app::install(&pm, "legacy", v1.to_str().unwrap(), state.path(), "accept").unwrap();
+    crate::issue::app_catalog::migrate_authorized(&pm).unwrap();
+    let id = list(&pm).unwrap()[0]["install_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let (pm_dir, id, done) = (pm.dir.clone(), id.clone(), done.clone());
+        std::thread::spawn(move || {
+            let pm = Pm::at(&pm_dir).unwrap();
+            let mut ok = 0u32;
+            while !done.load(Ordering::SeqCst) {
+                let read = with_runtime_read(&pm, &id, |row, files| {
+                    let version = row["version"].as_str().unwrap_or("").to_string();
+                    let text = files.get("app.md").cloned().unwrap_or_default();
+                    if !text.contains(&format!("version: '{version}'")) {
+                        return Ok(Err(format!("row v{version} with bundle app.md {text:?}")));
+                    }
+                    Ok(Ok(()))
+                });
+                match read {
+                    Ok(Ok(())) => ok += 1,
+                    Ok(Err(torn)) => panic!("torn legacy read: {torn}"),
+                    Err(e) if tolerated(&e) => {}
+                    Err(e) => panic!("a racing legacy read must be whole or busy, got: {e}"),
+                }
+                match list(&pm) {
+                    Ok(rows) => {
+                        let row = &rows[0];
+                        let v: u32 = row["version"].as_str().unwrap().parse().unwrap();
+                        let want = if v % 2 == 1 {
+                            json!(["cms"])
+                        } else {
+                            json!([])
+                        };
+                        assert_eq!(row["connection_slots"], want, "torn legacy list row: {row}");
+                    }
+                    Err(e) if tolerated(&e) => {}
+                    Err(e) => panic!("a racing legacy list must be whole or busy, got: {e}"),
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            ok
+        })
+    };
+    for round in 0..200 {
+        let src = if round % 2 == 0 { &v2 } else { &v1 };
+        // The writer queues behind readers like any tracker writer: a
+        // busy answer is retried, never a failure of this check.
+        loop {
+            match app::update(
+                &pm,
+                "legacy",
+                "legacy-app",
+                Some(src.to_str().unwrap()),
+                state.path(),
+                "accept",
+            ) {
+                Ok(_) => break,
+                Err(e) if e.kind() == "busy" => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => panic!("legacy update failed: {e}"),
+            }
+        }
+    }
+    done.store(true, Ordering::SeqCst);
+    let ok = reader.join().expect("a legacy read tore");
+    assert!(ok > 0, "the reader must observe whole versions");
+}
