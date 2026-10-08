@@ -724,7 +724,15 @@ fn snapshot_time(git_dir: &Path) -> Option<std::time::SystemTime> {
 /// writer's output inside a foreign directory. `>=` because file times
 /// are coarse; a tie is read as new, the refusing side. Bounded, and
 /// symlinks are not followed.
-fn files_since(root: &Path, rel: &str, since: std::time::SystemTime, out: &mut Vec<String>) {
+///
+/// Returns true when the scan stopped early: the names are then only
+/// a sample, and the caller must block the whole directory.
+fn files_since(
+    root: &Path,
+    rel: &str,
+    since: std::time::SystemTime,
+    out: &mut Vec<String>,
+) -> bool {
     const CAP: usize = 64;
     let mut stack = vec![rel.trim_end_matches('/').to_string()];
     let mut visited = 0usize;
@@ -735,7 +743,7 @@ fn files_since(root: &Path, rel: &str, since: std::time::SystemTime, out: &mut V
         for e in rd.flatten() {
             visited += 1;
             if out.len() >= CAP || visited > 500_000 {
-                return;
+                return true;
             }
             let Ok(m) = e.metadata() else { continue };
             let name = format!("{dir}/{}", e.file_name().to_string_lossy());
@@ -746,6 +754,7 @@ fn files_since(root: &Path, rel: &str, since: std::time::SystemTime, out: &mut V
             }
         }
     }
+    false
 }
 
 fn write_snapshot(git_dir: &Path, tree: &Tree) -> Result<()> {
@@ -777,7 +786,12 @@ fn sweep_tmp(git_dir: &Path) {
     }
 }
 
-fn classify(tree: &Tree, snapshot: &HashSet<String>, inside: &[String]) -> Option<Interruption> {
+fn classify(
+    tree: &Tree,
+    snapshot: &HashSet<String>,
+    inside: &[String],
+    whole: &[String],
+) -> Option<Interruption> {
     let mut named: Vec<String> = Vec::new();
     let mut foreign: Vec<String> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
@@ -801,6 +815,11 @@ fn classify(tree: &Tree, snapshot: &HashSet<String>, inside: &[String]) -> Optio
     for p in inside {
         named.push(format!("untracked {p}"));
         paths.push(p.clone());
+    }
+    // Names are a capped sample; a directory scanned in part blocks
+    // everything under it, so the bound never shrinks the blocked set.
+    for d in whole {
+        paths.push(d.trim_end_matches('/').to_string());
     }
     if named.is_empty() {
         None
@@ -1021,18 +1040,23 @@ impl Pm {
         // writer's new file inside it by the listing; files modified
         // since the snapshot can.
         let mut inside = Vec::new();
+        let mut whole = Vec::new();
         let taken = snapshot_time(git_dir);
         for (kind, p) in &tree.loose {
             if *kind != "untracked" || !p.ends_with('/') {
                 continue;
             }
             if !snapshot.contains(p) {
+                // A new directory is the crash's: block all of it.
                 files_since(&self.dir, p, std::time::UNIX_EPOCH, &mut inside);
+                whole.push(p.clone());
             } else if let Some(since) = taken {
-                files_since(&self.dir, p, since, &mut inside);
+                if files_since(&self.dir, p, since, &mut inside) {
+                    whole.push(p.clone());
+                }
             }
         }
-        Ok(classify(tree, &snapshot, &inside))
+        Ok(classify(tree, &snapshot, &inside, &whole))
     }
 
     /// One acquisition attempt. `declared` (repo-relative or absolute
