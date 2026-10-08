@@ -578,9 +578,14 @@ pub enum IssueAction {
     /// Check the whole PM dir: schema, id/folder mismatch, dangling and
     /// cyclic links, depth > 2, oversize artifacts, unknown status/kind.
     /// Non-zero exit on any error.
+    /// With `--staged`, lint only the issues the git index stages (what
+    /// the tracker's commit hook runs); a staged change that is not a
+    /// plain issue edit falls back to the whole tracker.
     Lint {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "staged")]
         project: Option<String>,
+        #[arg(long)]
+        staged: bool,
     },
     /// Reconcile tracker status with merge reality (CAD-754): classify
     /// every `doing`/`review` leaf issue against its recorded branch,
@@ -1707,12 +1712,15 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             print_json(&write::attach(&pm, id, file)?);
             Ok(0)
         }
-        IssueAction::Lint { project } => {
+        IssueAction::Lint { project, staged } => {
             let pm = open_pm()?;
-            let approvals = work::fetch_approvals(state_dir);
-            let delivery = crate::issue::delivery_policy::fetch_approvals(state_dir);
-            let report =
-                lint::run_with(&pm, project.as_deref(), Some(&approvals), Some(&delivery))?;
+            let report = if *staged {
+                lint::run_staged(&pm)?
+            } else {
+                let approvals = work::fetch_approvals(state_dir);
+                let delivery = crate::issue::delivery_policy::fetch_approvals(state_dir);
+                lint::run_with(&pm, project.as_deref(), Some(&approvals), Some(&delivery))?
+            };
             if report["ok"].as_bool() == Some(true) {
                 print_json(&report);
                 Ok(0)
