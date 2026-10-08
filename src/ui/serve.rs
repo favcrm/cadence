@@ -1906,7 +1906,14 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     // that spawned this board. A bind failure above never writes it, so
     // the waiting start sees the dead child plus its ui.log, not a
     // foreign board's health answer (CAD-817).
-    if let Some(nonce) = &opts.ready_nonce {
+    // CAD-1207 test seam: a board that binds but never proves readiness,
+    // so `ui start`'s timeout path can be exercised. Compiled only under
+    // the `test-seam` feature, which release builds refuse (CAD-482).
+    #[cfg(feature = "test-seam")]
+    let withhold_ready = std::env::var_os("CADENCE_TEST_UI_WITHHOLD_READY").is_some();
+    #[cfg(not(feature = "test-seam"))]
+    let withhold_ready = false;
+    if let Some(nonce) = opts.ready_nonce.as_ref().filter(|_| !withhold_ready) {
         let marker = json!({"pid": std::process::id(), "nonce": nonce});
         // A `ui.json` save owns `ui.tmp`; keep the marker's sidecar apart.
         let tmp = ready_file(state_dir).with_extension("ready.tmp");

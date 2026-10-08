@@ -26,7 +26,11 @@ export function useInstallations(enabled: boolean, refreshKey: unknown): Install
   const [loading, setLoading] = useState(false);
   const [manual, setManual] = useState(0);
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled) {
+      // Not the operator (any more): drop the last operator list and state.
+      setList(null); setError(null); setRetrying(false); setLoading(false);
+      return;
+    }
     const controller = new AbortController();
     setLoading(true);
     setRetrying(false);

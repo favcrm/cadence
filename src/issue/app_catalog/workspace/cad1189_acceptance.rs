@@ -300,3 +300,56 @@ fn cad1189_legacy_reads_never_tear_during_app_update() {
     let ok = reader.join().expect("a legacy read tore");
     assert!(ok > 0, "the reader must observe whole versions");
 }
+
+/// (d) CAD-1212: the digest compare in `with_runtime_read` is a real guard.
+/// A bundle file edited between `describe` and the bundle snapshot (the
+/// read seam) must never reach the callback: the read retries, then answers
+/// busy.
+#[test]
+fn cad1212_runtime_read_never_hands_out_a_bundle_edited_mid_read() {
+    let pm_dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let pm = Pm::init(pm_dir.path()).unwrap();
+    let v1 = sources.path().join("v1");
+    bundle(&v1, "seam-app", 1);
+    let out = install(&pm, state.path(), v1.to_str().unwrap(), None).unwrap();
+    let id = out["install_id"].as_str().unwrap().to_string();
+    let manifest = pm
+        .dir
+        .join(".apps/installations")
+        .join(&id)
+        .join("bundle/app.md");
+    assert!(
+        manifest.is_file(),
+        "fixture bundle at {}",
+        manifest.display()
+    );
+    let edits = Arc::new(Mutex::new(0u32));
+    {
+        let (manifest, edits) = (manifest.clone(), edits.clone());
+        super::read_seam::set_hook(Some(Box::new(move || {
+            let mut n = edits.lock().unwrap();
+            *n += 1;
+            std::fs::write(&manifest, manifest_text_edit(*n)).unwrap();
+        })));
+    }
+    let reached = Arc::new(AtomicBool::new(false));
+    let seen = reached.clone();
+    let read = with_runtime_read(&pm, &id, move |_, _| {
+        seen.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+    super::read_seam::set_hook(None);
+    assert!(
+        !reached.load(Ordering::SeqCst),
+        "the callback received a bundle edited between describe and snapshot"
+    );
+    let err = read.expect_err("an edited bundle must not be admitted");
+    assert_eq!(err.kind(), "busy", "{err}");
+    assert!(*edits.lock().unwrap() >= 1, "the seam never fired");
+}
+
+fn manifest_text_edit(n: u32) -> String {
+    format!("---\napp: seam-app\ntitle: Tampered {n}\nversion: '1'\nneeds:\n  connections: [cms]\n---\n\nEdited mid-read.\n")
+}

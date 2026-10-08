@@ -1,9 +1,10 @@
 import { useMemo, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
-import { appExplorer, type CatalogCard } from "../workspace-apps/workspaceApps";
+import { appExplorer, notifyAppsChanged, type CatalogCard } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
-import { AppGlyph, TrustChip, InstallStateChip } from "./shared";
+import { AppGlyph, TrustChip, InstallStateChip, useEscape } from "./shared";
+import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
 import InstallCheckPanel from "./InstallCheckPanel";
 import { navigate } from "../../lib/useLocation";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
@@ -38,7 +39,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
   const requestsLoad = useBackoffLoad((signal) => appExplorer.requests(signal).then((r) => r.requests), revision, isOp);
   const catalog = catalogLoad.data;
   const requests = requestsLoad.data;
-  const error = catalogLoad.error;
+  const error = catalogLoad.error === null ? null : appLoadErrorCopy(catalogLoad.error, "The catalog didn't load.");
 
   const cats = useMemo(() => {
     const set = new Set<string>();
@@ -68,7 +69,17 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
     setBusy((b) => ({ ...b, [id]: true }));
     void appExplorer.requestInstall(id)
       .then(() => { setNotice("Asked — your admin will see the request."); setRevision((r) => r + 1); })
-      .catch((e: unknown) => setNotice(e instanceof Error ? e.message : "Could not send the request"))
+      .catch((e: unknown) => setNotice(appErrorCopy(e, "Could not send the request. Try again in a moment.")))
+      .finally(() => setBusy((b) => ({ ...b, [id]: false })));
+  };
+  // A removed app comes back with Restore, never a second Install.
+  const restore = (card: CatalogCard) => {
+    if (!card.install_id) return;
+    const id = card.id;
+    setBusy((b) => ({ ...b, [id]: true }));
+    void appExplorer.restore(card.install_id)
+      .then(() => { setNotice(`Restored — ${card.title} is live again.`); setRevision((r) => r + 1); notifyAppsChanged(); })
+      .catch((e: unknown) => setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment.")))
       .finally(() => setBusy((b) => ({ ...b, [id]: false })));
   };
 
@@ -103,7 +114,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
 
       {isOp && gitOpen && (
         <GitAdd
-          onDone={() => { setGitOpen(false); setNotice("Installed — it's in your apps now."); setRevision((r) => r + 1); }}
+          onDone={() => { setGitOpen(false); setNotice("Installed — it's in your apps now."); setRevision((r) => r + 1); notifyAppsChanged(); }}
           onClose={() => setGitOpen(false)}
         />
       )}
@@ -114,7 +125,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
           source={`builtin:${reviewing.id}`}
           label={reviewing.title}
           install={(digest) => appExplorer.installEntry(reviewing.id, digest)}
-          onInstalled={() => { setReviewing(null); setNotice("Installed — it's in your apps now."); setRevision((r) => r + 1); }}
+          onInstalled={() => { setReviewing(null); setNotice("Installed — it's in your apps now."); setRevision((r) => r + 1); notifyAppsChanged(); }}
           onClose={() => setReviewing(null)}
         />
       )}
@@ -173,7 +184,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
                     </div>
                     <p className="text-label text-ink-400 mt-2">{c.listing?.tagline}</p>
                     <div className="flex items-center justify-end mt-3">
-                      <CardAction card={c} isOp={isOp} busy={busy[c.id]} onInstall={() => install(c.id)} onRequest={() => requestInstall(c.id)} />
+                      <CardAction card={c} isOp={isOp} busy={busy[c.id]} onInstall={() => install(c.id)} onRequest={() => requestInstall(c.id)} onRestore={() => restore(c)} />
                     </div>
                   </div>
                 ))}
@@ -197,7 +208,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
             ) : (
               <div className="cgrid grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
                 {items.map((c) => (
-                  <CatalogCardView key={c.id} card={c} isOp={isOp} busy={busy[c.id]} onInstall={() => install(c.id)} onRequest={() => requestInstall(c.id)} />
+                  <CatalogCardView key={c.id} card={c} isOp={isOp} busy={busy[c.id]} onInstall={() => install(c.id)} onRequest={() => requestInstall(c.id)} onRestore={() => restore(c)} />
                 ))}
               </div>
             )}
@@ -208,8 +219,8 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
   );
 }
 
-function CatalogCardView({ card, isOp, busy, onInstall, onRequest }: {
-  card: CatalogCard; isOp: boolean; busy?: boolean; onInstall: () => void; onRequest: () => void;
+function CatalogCardView({ card, isOp, busy, onInstall, onRequest, onRestore }: {
+  card: CatalogCard; isOp: boolean; busy?: boolean; onInstall: () => void; onRequest: () => void; onRestore: () => void;
 }) {
   return (
     <div className="card ccard p-4 flex flex-col gap-2" role="button" tabIndex={0}
@@ -226,8 +237,8 @@ function CatalogCardView({ card, isOp, busy, onInstall, onRequest }: {
       </div>
       <p className="text-label text-ink-400 flex-1">{card.listing?.tagline}</p>
       <div className="flex items-center justify-between mt-1">
-        <InstallStateChip state={card.state} />
-        <CardAction card={card} isOp={isOp} busy={busy} onInstall={onInstall} onRequest={onRequest} />
+        <InstallStateChip state={card.removed ? "removed" : card.state} />
+        <CardAction card={card} isOp={isOp} busy={busy} onInstall={onInstall} onRequest={onRequest} onRestore={onRestore} />
       </div>
       {isOp && (card.request_count ?? 0) > 0 && (
         <div className="text-micro text-ink-500">{card.request_count} teammate{card.request_count === 1 ? "" : "s"} asked for this</div>
@@ -238,10 +249,16 @@ function CatalogCardView({ card, isOp, busy, onInstall, onRequest }: {
 
 /** The one action a card's corner offers: Install (operator), Ask an
  * admin (member, then "Asked"), or Open when installed. */
-function CardAction({ card, isOp, busy, onInstall, onRequest }: {
-  card: CatalogCard; isOp: boolean; busy?: boolean; onInstall: () => void; onRequest: () => void;
+function CardAction({ card, isOp, busy, onInstall, onRequest, onRestore }: {
+  card: CatalogCard; isOp: boolean; busy?: boolean; onInstall: () => void; onRequest: () => void; onRestore: () => void;
 }) {
   if (busy) return <Button className="btn-sm btn-primary" disabled>Working…</Button>;
+  if (card.removed) {
+    if (!isOp) return <span className="text-micro text-ink-500">Removed</span>;
+    return card.restorable
+      ? <Button className="btn-sm" onClick={(e) => { e.stopPropagation(); onRestore(); }}>Restore</Button>
+      : <span className="text-micro text-ink-500">Restore window closed</span>;
+  }
   if (card.state === "installed" || card.state === "off") {
     return <Link className="btn btn-sm" href={`/app-installations/${card.install_id}`} onClick={(e) => e.stopPropagation()}>Open</Link>;
   }
@@ -264,11 +281,12 @@ function GitAdd({ onDone, onClose }: { onDone: () => void; onClose: () => void }
   const [checking, setChecking] = useState(false);
   const [found, setFound] = useState<CatalogCard | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  useEscape(true, onClose);
   const check = () => {
     setChecking(true); setErr(null); setFound(null);
     void appExplorer.gitCheck(url)
       .then((card) => setFound(card))
-      .catch((e: unknown) => setErr(e instanceof Error ? e.message : "That URL doesn't hold a Cadence app"))
+      .catch((e: unknown) => setErr(appErrorCopy(e, "That URL doesn't hold a Cadence app.")))
       .finally(() => setChecking(false));
   };
   return (

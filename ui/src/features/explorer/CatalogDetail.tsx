@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
-import { appExplorer, type CatalogCard } from "../workspace-apps/workspaceApps";
+import { appExplorer, notifyAppsChanged, type CatalogCard } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip } from "./shared";
 import InstallCheckPanel from "./InstallCheckPanel";
+import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
 import "./explorer.css";
 
 /**
@@ -22,13 +23,14 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   const [notice, setNotice] = useState<string | null>(null);
   const isOp = viewer.operator && !viewer.readOnly;
   const installed = card?.state === "installed" || card?.state === "off";
+  const removed = card?.removed === true;
 
   useEffect(() => {
     const controller = new AbortController();
     setError(null);
     void appExplorer.entry(id, controller.signal)
       .then((c) => { if (!controller.signal.aborted) setCard(c); })
-      .catch((e: unknown) => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : "Could not load the app"); });
+      .catch((e: unknown) => { if (!controller.signal.aborted) setError(appLoadErrorCopy(e, "Could not load the app. Try again in a moment.")); });
     return () => controller.abort();
   }, [id]);
 
@@ -40,7 +42,15 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
     setBusy(true);
     void appExplorer.requestInstall(card.id)
       .then(() => { setCard({ ...card, requested_by_me: true, state: "requested" }); setNotice("Asked — your admin will see the request."); })
-      .catch((e: unknown) => setNotice(e instanceof Error ? e.message : "Could not send the request"))
+      .catch((e: unknown) => setNotice(appErrorCopy(e, "Could not send the request. Try again in a moment.")))
+      .finally(() => setBusy(false));
+  };
+  const restore = () => {
+    if (!card?.install_id) return;
+    setBusy(true); setNotice(null);
+    void appExplorer.restore(card.install_id)
+      .then(() => { setNotice("Restored — it's live again."); setCard({ ...card, state: "installed", removed: false, restorable: undefined }); notifyAppsChanged(); })
+      .catch((e: unknown) => setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment.")))
       .finally(() => setBusy(false));
   };
 
@@ -81,17 +91,18 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
             <span>{card.listing?.category ?? "App"}</span>
             {installed && <span className="chip ok">Installed</span>}
             {card.state === "off" && <span className="chip">Access off</span>}
+            {removed && <span className="chip">Removed</span>}
           </div>
         </div>
       </div>
 
-      {isOp && reviewing && !installed && (
+      {isOp && reviewing && !installed && !removed && (
         <div className="mt-4">
           <InstallCheckPanel
             source={`builtin:${card.id}`}
             label={card.title}
             install={(digest) => appExplorer.installEntry(card.id, digest)}
-            onInstalled={() => { setReviewing(false); setNotice("Installed — it's in your apps now."); setCard({ ...card, state: "installed" }); }}
+            onInstalled={() => { setReviewing(false); setNotice("Installed — it's in your apps now."); setCard({ ...card, state: "installed" }); notifyAppsChanged(); }}
             onClose={() => setReviewing(false)}
           />
         </div>
@@ -99,6 +110,11 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
       {notice && <div className="alert info mt-4" role="status">{notice}</div>}
       {card.source_kind === "git" && (
         <div className="alert warn mt-4">Added from a Git URL by your team. Cadence checked its file list but hasn't reviewed what it does.</div>
+      )}
+      {removed && (
+        <div className="alert warn mt-4" role="status">
+          {card.title} was removed. {card.restorable ? "You can restore it, with the same data, for 30 days after it was removed." : "The 30-day restore window has closed, so it stays removed."}
+        </div>
       )}
       {card.state === "off" && (
         <div className="alert warn mt-4">Access is off — {card.title} can't run or use its connections until it's turned back on.</div>
@@ -179,6 +195,15 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
               {isOp && <Link className="btn" href={`/apps/manage/${card.install_id}`}>Manage</Link>}
               {!isOp && <span className="text-micro text-ink-500">Ask an admin to manage access.</span>}
             </>
+          ) : removed ? (
+            isOp && card.restorable ? (
+              <>
+                <Button className="btn-primary btn-lg" disabled={busy} onClick={restore}>{busy ? "Restoring…" : "Restore"}</Button>
+                <span className="text-micro text-ink-500">Brings back {card.title} with its data.</span>
+              </>
+            ) : (
+              <span className="text-micro text-ink-500">{isOp ? "The restore window has closed." : "This app was removed. Ask an admin."}</span>
+            )
           ) : card.requested_by_me || card.state === "requested" ? (
             <>
               <Button className="btn-lg" disabled>Asked</Button>

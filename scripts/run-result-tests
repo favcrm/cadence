@@ -1,6 +1,8 @@
 #!/bin/bash
-# CAD-1090/CAD-1105: run every cargo test target (scripts/result-test-args)
-# and the lib unit tests the same way in CI and in `scripts/pre-push --tests`.
+# CAD-1090/CAD-1105/CAD-1214: run every cargo test target
+# (scripts/result-test-args), the lib unit tests and the unit tests inside
+# binary targets (`--bins`: src/bin/*/ and the cadence binary) the same way
+# in CI and in `scripts/pre-push --tests`.
 #  - --features test-seam: some targets are cfg(feature = "test-seam") and
 #    would otherwise run 0 tests and pass.
 #  - fails when any selected target reports `running 0 tests`.
@@ -16,7 +18,11 @@
 #  - CARGO_TARGET_DIR is handed to cargo as CARGO_BUILD_TARGET_DIR, so the
 #    build lands in the same place but code under test that reads
 #    CARGO_TARGET_DIR (src/worktree.rs) sees a clean environment.
-#  - the lib suite runs with PATH limited to the cargo toolchain dir and the
+#  - CAD-1214: `--bins` runs #[cfg(test)] modules inside binary targets, which
+#    neither --test nor --lib reach. Most binaries have no unit tests and
+#    print `running 0 tests`, so that step fails only when NO binary ran a
+#    test (or none reported).
+#  - the lib and bins suites run with PATH limited to the cargo toolchain dir and the
 #    system dirs, and refuses to start if a provider CLI still resolves:
 #    `doctor::run` probes every registry provider with `--version`, and a
 #    host CLI writes under HOME and makes the result depend on the host.
@@ -88,6 +94,15 @@ zero_guard() {
   fi
 }
 
+# Fails only when no binary target ran any test: an individual binary with
+# no unit tests legitimately reports `running 0 tests`.
+bins_guard() {
+  if ! grep -q '^running [1-9]' "$1"; then
+    echo "::error::$2: no binary target ran any test (cfg-gated off?)" >&2
+    status=1
+  fi
+}
+
 echo "integration targets:" $(echo "$targets" | grep -v '^--test$')
 # shellcheck disable=SC2086
 cargo test --locked --features test-seam --no-fail-fast $targets -- --test-threads 2 \
@@ -98,4 +113,8 @@ echo "lib suite PATH: $lib_path"
 PATH=$lib_path cargo test --locked --features test-seam --lib --no-fail-fast -- --test-threads 2 \
   2>&1 | tee "$scratch/lib.log" || status=1
 zero_guard "$scratch/lib.log" lib
+
+PATH=$lib_path cargo test --locked --features test-seam --bins --no-fail-fast -- --test-threads 2 \
+  2>&1 | tee "$scratch/bins.log" || status=1
+bins_guard "$scratch/bins.log" bins
 exit "$status"

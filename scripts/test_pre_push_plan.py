@@ -21,10 +21,11 @@ class PlanTests(unittest.TestCase):
                 floor = [(name, argv) for name, argv, skip in steps if argv and not skip
                          and argv == ["scripts/run-result-tests"]]
                 self.assertEqual(len(floor), 1)
-                # CAD-1105: the shared runner covers the lib unit tests too.
-                self.assertEqual(floor[0][0], "tests integration+lib")
+                # CAD-1105: the shared runner covers the lib and bin unit tests too.
+                self.assertEqual(floor[0][0], "tests integration+lib+bins")
         runner = (ROOT / "scripts/run-result-tests").read_text()
         self.assertIn("cargo test --locked --features test-seam --lib --no-fail-fast", runner)
+        self.assertIn("cargo test --locked --features test-seam --bins --no-fail-fast", runner)
 
     def test_release_seam_proof_runs_for_rust_or_explicit_tests(self):
         for changed, with_tests in (

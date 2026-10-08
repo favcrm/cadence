@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Button from "../../ui/Button";
 import { appExplorer, type InstallCheck } from "../workspace-apps/workspaceApps";
+import { appErrorCopy } from "./appErrors";
 import "./explorer.css";
 
 /**
@@ -31,7 +32,7 @@ export default function InstallCheckPanel({ source, label, install, onInstalled,
     setChecking(true); setCheck(null); setCheckError(null); setInstallError(null);
     void appExplorer.installCheck(source)
       .then((c) => { if (!signal?.aborted) setCheck(c); })
-      .catch((e: unknown) => { if (!signal?.aborted) setCheckError(e instanceof Error ? e.message : "Could not check this app"); })
+      .catch((e: unknown) => { if (!signal?.aborted) setCheckError(appErrorCopy(e, "Could not check this app. Try again in a moment.")); })
       .finally(() => { if (!signal?.aborted) setChecking(false); });
   }, [source]);
 
@@ -46,7 +47,7 @@ export default function InstallCheckPanel({ source, label, install, onInstalled,
     setInstalling(true); setInstallError(null);
     install(check.digest)
       .then(onInstalled)
-      .catch((e: unknown) => setInstallError(e instanceof Error ? e.message : "Install didn't finish. Nothing was installed."))
+      .catch((e: unknown) => setInstallError(appErrorCopy(e, "Install didn't finish. Nothing was installed.")))
       .finally(() => setInstalling(false));
   };
 

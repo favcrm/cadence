@@ -1636,13 +1636,33 @@ pub(crate) fn start_inner(
             }
         }
         if Instant::now() >= deadline {
-            let _ = std::fs::remove_file(ready_file(state_dir));
+            // CAD-1207: the board this call spawned never proved itself —
+            // it must not outlive the failure that tells the caller to
+            // give up. Only our own `Child` handle is signalled (never a
+            // pid read from a file), and the pidfile goes only if it
+            // still names that child.
+            reap_unready_child(&mut child, state_dir);
             return Err(Error::internal(
-                "ui server did not prove its own start within 10s",
+                "ui server did not prove its own start within 10s — the board this \
+                 start spawned was stopped",
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Stop the board a timed-out `ui start` spawned: kill our own child,
+/// wait for it to exit, and drop `ui.pid` / `ui.ready` only while they
+/// still describe it (a concurrent start's files are not ours).
+fn reap_unready_child(child: &mut std::process::Child, state_dir: &Path) {
+    let pid = child.id();
+    let _ = child.kill();
+    let _ = child.wait();
+    let path = pid_file(state_dir);
+    if std::fs::read_to_string(&path).is_ok_and(|t| t.trim() == pid.to_string()) {
+        let _ = std::fs::remove_file(&path);
+    }
+    let _ = std::fs::remove_file(ready_file(state_dir));
 }
 
 /// SIGTERM the detached server and wait for exit — no output, for
@@ -2689,5 +2709,35 @@ mod tests {
         for exe in ["/x/a", "/x/cadencex", "/x/sleep", "/x/xcadence"] {
             assert!(super::board_argv_state_dir(&argv(exe)).is_none(), "{exe}");
         }
+    }
+
+    /// CAD-1207: the timeout cleanup stops exactly the child it holds and
+    /// deletes `ui.pid` only while that file still names the child.
+    #[test]
+    fn reap_unready_child_kills_own_child_and_keeps_a_foreign_pidfile() {
+        let dir = tempfile::Builder::new()
+            .prefix("c1207-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let spawn = || {
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap()
+        };
+        let mut ours = spawn();
+        std::fs::write(super::pid_file(dir.path()), ours.id().to_string()).unwrap();
+        let pid = ours.id() as i32;
+        super::reap_unready_child(&mut ours, dir.path());
+        assert!(!super::pid_file(dir.path()).exists());
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child still alive");
+
+        let mut other = spawn();
+        std::fs::write(super::pid_file(dir.path()), "999999").unwrap();
+        super::reap_unready_child(&mut other, dir.path());
+        assert_eq!(
+            std::fs::read_to_string(super::pid_file(dir.path())).unwrap(),
+            "999999"
+        );
     }
 }

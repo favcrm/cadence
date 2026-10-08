@@ -74,14 +74,6 @@ pub struct Entry {
     pub bundle_revision: Option<String>,
 }
 impl Entry {
-    /// Is this installation soft-removed? The mark lives on its
-    /// record, not the catalog — the caller reads the record itself
-    /// (CAD-1129 H5).
-    pub fn removed(&self) -> bool {
-        false
-    }
-}
-impl Entry {
     fn paths(&self, id: &InstallationId) -> (PathBuf, PathBuf) {
         match &self.storage {
             Storage::Legacy { project, name } => {
@@ -566,7 +558,8 @@ impl Catalog {
         let current: Catalog = decode(&required(root, Path::new(CATALOG), CATALOG_CAP)?)?;
         current.validate()?;
         if current != *self {
-            return Err(Error::rejected(
+            return Err(Error::invalid(
+                CATALOG_NOT_CURRENT,
                 "cached catalog generation is no longer published",
             ));
         }
@@ -658,21 +651,39 @@ fn record(text: &str, name: &str) -> Result<Record> {
     }
     Ok(record)
 }
+/// CAD-1212: stable codes for the refusals the lock-free read retry
+/// (`workspace::optimistic`) classifies. It matches these, never message
+/// text, so rewording a message cannot silently disable a retry.
+pub(crate) const PENDING_UPGRADE: &str = "app_upgrade_pending";
+pub(crate) const PENDING_INSTALL: &str = "app_install_pending";
+pub(crate) const PENDING_PUBLICATION: &str = "app_catalog_publication_pending";
+pub(crate) const CATALOG_NOT_CURRENT: &str = "app_catalog_not_current";
+pub(crate) const RECORD_CHANGED: &str = "app_record_changed_during_inspection";
+pub(crate) const ADMISSION_CHANGED: &str = "app_changed_during_runtime_admission";
+pub(crate) const LEGACY_CHANGED: &str = "app_legacy_files_changed_during_read";
+
 fn no_pending(root: &Root) -> Result<()> {
     if root
         .read(Path::new(".apps/upgrade-pending.yaml"), RECORD_CAP)?
         .is_some()
     {
-        return Err(Error::rejected("workspace upgrade is pending; use app catalog upgrade-recover with its installation ID and request ID"));
+        return Err(Error::invalid(
+            PENDING_UPGRADE,
+            "workspace upgrade is pending; use app catalog upgrade-recover with its installation ID and request ID",
+        ));
     }
     if root
         .read(Path::new(".apps/install-pending.yaml"), RECORD_CAP)?
         .is_some()
     {
-        return Err(Error::rejected("workspace installation is pending; use app catalog recover with the retained installation ID"));
+        return Err(Error::invalid(
+            PENDING_INSTALL,
+            "workspace installation is pending; use app catalog recover with the retained installation ID",
+        ));
     }
     if root.read(Path::new(PENDING), RECORD_CAP)?.is_some() {
-        return Err(Error::rejected(
+        return Err(Error::invalid(
+            PENDING_PUBLICATION,
             "app catalog publication is pending; recover its retained journal first",
         ));
     }

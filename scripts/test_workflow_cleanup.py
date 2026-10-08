@@ -162,6 +162,7 @@ class CleanupTests(unittest.TestCase):
         for needle in ("--features test-seam", "--no-fail-fast", "--test-threads 2",
                        "running 0 tests", "HOME=", "XDG_CONFIG_HOME=",
                        "--features test-seam --lib --no-fail-fast",
+                       "--features test-seam --bins --no-fail-fast",
                        "CARGO_BUILD_TARGET_DIR", "unset CARGO_TARGET_DIR"):
             self.assertIn(needle, runner)
         selected = subprocess.run([str(ROOT / "scripts/result-test-args")],
@@ -249,6 +250,11 @@ test)
   *" --lib "*)
     [ -n "${STUB_LIB_SILENT:-}" ] || echo "running ${STUB_LIB_N:-3} tests"
     exit "${STUB_LIB_RC:-0}" ;;
+  *" --bins "*)
+    # Most binaries have no unit tests: a 0 beside a non-zero is normal.
+    echo "running 0 tests"
+    [ -n "${STUB_BINS_SILENT:-}" ] || echo "running ${STUB_BINS_N:-4} tests"
+    exit "${STUB_BINS_RC:-0}" ;;
   *)
     echo "running 2 tests"
     [ -z "${STUB_INT_ZERO:-}" ] || echo "running 0 tests"
@@ -290,8 +296,8 @@ class RunResultTestsRunner(unittest.TestCase):
             result, calls, toolchain = self.run_runner(root, CARGO_TARGET_DIR="rel/tgt")
             out = result.stdout + result.stderr
             self.assertEqual(result.returncode, 0, out)
-            self.assertEqual(len(calls), 2, calls)
-            integration, lib = calls
+            self.assertEqual(len(calls), 3, calls)
+            integration, lib, bins = calls
             self.assertIn("--test floor", integration)
             self.assertNotIn("--lib", integration)
             for needle in ("test --locked --features test-seam --lib --no-fail-fast",
@@ -300,6 +306,10 @@ class RunResultTestsRunner(unittest.TestCase):
             # The lib suite's PATH is the toolchain dir plus system dirs only.
             self.assertIn(f"|PATH={toolchain}:{SYSTEM_PATH}|", lib)
             self.assertNotIn("host-bin", lib)
+            # CAD-1214: binary-target unit tests, same flags and isolation.
+            for needle in ("test --locked --features test-seam --bins --no-fail-fast",
+                           "-- --test-threads 2", f"|PATH={toolchain}:{SYSTEM_PATH}|"):
+                self.assertIn(needle, bins)
             for call in calls:
                 self.assertIn("|CTD=unset|", call)
                 self.assertIn(f"|CBTD={root}/rel/tgt|", call)
@@ -314,12 +324,13 @@ class RunResultTestsRunner(unittest.TestCase):
                 self.assertEqual(calls, [])
 
     def test_red_lib_or_red_integration_fails_and_both_still_run(self):
-        for env in ({"STUB_LIB_RC": "101"}, {"STUB_INT_RC": "101"}):
+        for env in ({"STUB_LIB_RC": "101"}, {"STUB_INT_RC": "101"}, {"STUB_BINS_RC": "101"}):
             with self.subTest(env=env), tempfile.TemporaryDirectory(dir="/tmp") as root:
                 result, calls, _ = self.run_runner(root, **env)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertEqual(len(calls), 2, calls)
+                self.assertEqual(len(calls), 3, calls)
                 self.assertIn("--lib", calls[1])
+                self.assertIn("--bins", calls[2])
 
     def test_target_that_runs_no_tests_fails(self):
         # One of several targets at 0 still fails; so does a lib with none.
@@ -328,7 +339,16 @@ class RunResultTestsRunner(unittest.TestCase):
                 result, calls, _ = self.run_runner(root, **env)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("ran 0 tests", result.stderr)
-                self.assertEqual(len(calls), 2, calls)
+                self.assertEqual(len(calls), 3, calls)
+
+    def test_bins_step_fails_only_when_no_binary_ran_a_test(self):
+        # CAD-1214: one binary at 0 beside others with tests passes; none fails.
+        for env in ({"STUB_BINS_N": "0"}, {"STUB_BINS_SILENT": "1"}):
+            with self.subTest(env=env), tempfile.TemporaryDirectory(dir="/tmp") as root:
+                result, calls, _ = self.run_runner(root, **env)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("no binary target ran any test", result.stderr)
+                self.assertEqual(len(calls), 3, calls)
 
 
 if __name__ == "__main__":

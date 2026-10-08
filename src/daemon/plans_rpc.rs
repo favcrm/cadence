@@ -523,6 +523,17 @@ impl Shared {
         if object.keys().any(|key| !allowed.contains(&key.as_str())) {
             return Err(Error::rejected("unknown workspace catalog parameter"));
         }
+        // A Git source is vetted exactly as the Explorer's check vets it,
+        // before the daemon opens the network.
+        if matches!(
+            method,
+            "app_workspace_install"
+                | "app_workspace_install_check"
+                | "app_workspace_upgrade"
+                | "app_workspace_upgrade_check"
+        ) {
+            super::app_explorer_rpc::vet_remote_source(required_str(params, "source")?)?;
+        }
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
         use crate::issue::app_catalog::workspace;

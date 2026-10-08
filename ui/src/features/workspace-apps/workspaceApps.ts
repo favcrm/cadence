@@ -9,6 +9,8 @@ export interface Installation {
   /** The install's recorded upstream — `kind` is path/git/builtin (CAD-1129). */
   source?: { kind?: string; url?: string; sha?: string; dir?: string; path?: string; id?: string };
   project_link: string | null; approved: boolean | null; executable: boolean;
+  /** CAD-1129 soft remove: epoch seconds of the mark, and when Restore stops working. */
+  removed?: number | null; restore_after?: number | null;
   approval: { state: string }; guide: string; files: string[];
   /** Declared slot contract from the live bundle manifest (CAD-585): typed capability slots. */
   capabilities: Record<string, SlotDeclaration> | null;
@@ -225,12 +227,20 @@ export const workspaceApps = {
 
 // ---------- CAD-1129: the apps Explorer ----------
 
+/** Fired after an install, remove or restore so the sidebar's app list
+ * re-reads at once instead of waiting for the next navigation. */
+export const APPS_CHANGED_EVENT = "cadence:apps-changed";
+export function notifyAppsChanged(): void {
+  try { window.dispatchEvent(new Event(APPS_CHANGED_EVENT)); } catch { /* no window in a test */ }
+}
+
+
 /** One catalog card (a built-in, or the operator's checked Git entry). */
 export interface CatalogCard {
   id: string; source_kind: "builtin" | "git"; name: string; title: string;
   version: string; tagline?: string; digest?: string; trust: "cadence" | "unreviewed";
   state?: "available" | "installed" | "off" | "requested" | "removed";
-  install_id?: string; requested_by_me?: boolean; request_count?: number;
+  install_id?: string; removed?: boolean; restorable?: boolean; requested_by_me?: boolean; request_count?: number;
   update_available?: boolean; featured?: boolean;
   /** Git check's resolved repository and commit. */
   source_url?: string; commit?: string; dir?: string;

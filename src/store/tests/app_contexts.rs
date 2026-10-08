@@ -188,3 +188,22 @@ fn cad690_context_migration_is_atomic_and_preserves_legacy_snapshots_and_authori
         before
     );
 }
+
+/// CAD-1212: the write-counter seam moves on a write and stays put on a
+/// read, so a check can assert a "read-only" callback wrote nothing.
+#[test]
+fn cad1212_total_changes_seam_counts_writes_not_reads() {
+    use crate::store::app_contexts::ContextConfig;
+    let (_dir, s, _legacy) = runtime_fixture();
+    let before = s.total_changes_for_test();
+    s.app_install_known("install-1").unwrap();
+    assert_eq!(
+        s.total_changes_for_test(),
+        before,
+        "a read moved the counter"
+    );
+    let config = ContextConfig::new("Client", std::collections::BTreeMap::new()).unwrap();
+    s.app_context_create("install-1", &config, "context-seam")
+        .unwrap();
+    assert!(s.total_changes_for_test() > before, "a write left it still");
+}

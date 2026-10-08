@@ -118,7 +118,7 @@ pub fn run_cli(state_dir: &Path, action: &SandboxAction) -> Result<i32> {
                 .unwrap_or(DEFAULT_NAME);
             let exe = match build {
                 Some(path) => runnable(path)?,
-                None => std::env::current_exe()?,
+                None => running_exe()?,
             };
             up(&Sandbox::open(name)?, *port, &exe)?
         }
@@ -1078,6 +1078,27 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
         "daemon": daemon["state"],
         "ui": ui["state"],
     }))
+}
+
+/// The binary `dev up` starts the sandbox from when no `--build` is
+/// given: the running one. Held to the same name rule as `--build`
+/// ([`runnable`]), checked before anything is started, so the default
+/// path cannot start a board `dev down` could never find (CAD-1207).
+fn running_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    if !exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(crate::ui::is_cadence_exe_name)
+    {
+        return Err(Error::rejected(format!(
+            "this binary {} is not named `cadence` or `cadence-<suffix>` — the board it \
+             would start is found again by that name, so `dev down` could not stop it. \
+             Nothing was started; run it under a conforming name or pass --build",
+            exe.display()
+        )));
+    }
+    Ok(exe)
 }
 
 /// A binary `--build` may name: an absolute, symlink-resolved regular
