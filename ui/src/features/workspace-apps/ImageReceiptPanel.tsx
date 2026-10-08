@@ -33,13 +33,6 @@ export async function retainedImage(receipt: ImageReceipt, run: WorkspaceRun, si
   return `data:${meta.media_type};base64,${asset.base64}`;
 }
 
-/** Exact integer micros in a fixed-scale `d.dddddd` minor-unit amount;
-  * comparing floats would call equal charges different. */
-function amountMicros(amount: string): number | null {
-  const match = /^([0-9]+)\.([0-9]{6})$/.exec(amount);
-  return match ? Number(match[1]) * 1_000_000 + Number(match[2]) : null;
-}
-
 export function imageSubject(run: WorkspaceRun) {
   return JSON.stringify([run.id, run.snapshot.capabilities?.image?.digest, run.snapshot.source?.receipt_id, run.snapshot.source?.post.id]);
 }
@@ -97,11 +90,5 @@ export function ImageReceiptPanel({ run, onDenied, onVerified }: { run: Workspac
       <figcaption>{visibleReceipt.asset.media_type} · {visibleReceipt.asset.size.toLocaleString()} bytes · {approved ? "Independent review pinned these bytes" : "Awaiting independent review"}</figcaption>
     </figure>}
     {visibleReceipt?.asset && <p className="wa-digest">Receipt {visibleReceipt.id}<br />{visibleReceipt.asset.digest}</p>}
-    {visibleReceipt?.result?.charge && <p className="wa-muted">
-      Billed USD {visibleReceipt.result.charge.amount} at the provider&rsquo;s actual charge
-      {amountMicros(visibleReceipt.result.charge.amount) !== visibleReceipt.result.quoted_micros
-        && ` — approved rate was USD ${(visibleReceipt.result.quoted_micros / 1_000_000).toFixed(6)}`}
-      .
-    </p>}
   </section>;
 }

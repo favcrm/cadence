@@ -690,7 +690,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            32,
+            33,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
@@ -1309,4 +1309,75 @@
             .unwrap();
         assert_eq!(epoch_count, 2, "replay cannot duplicate historical epochs");
         assert_eq!(binding_count, 2, "replay cannot discard versioned bindings");
+    }
+
+    #[test]
+    fn migration_v32_to_v33_adds_explorer_tables_and_is_idempotent() {
+        // v33 adds the CAD-1129 Explorer tables only — `app_favorites`,
+        // `app_install_requests`, `app_update_checks` — new tables, no
+        // existing row read or rewritten. A v32 store migrates in place;
+        // a half-applied v33 converges on reopen; pre-v33 rows survive.
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        // A genuine v32: everything but the three explorer tables.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE app_favorites;
+                 DROP TABLE app_install_requests;
+                 DROP TABLE app_update_checks;
+                 UPDATE schema_version SET version=32;",
+            )
+            .unwrap();
+        let has = |table: &str| -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        for t in ["app_favorites", "app_install_requests", "app_update_checks"] {
+            assert!(!has(t), "{t} unexpectedly present at v32");
+        }
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            for t in ["app_favorites", "app_install_requests", "app_update_checks"] {
+                assert!(has(t), "{t} missing after migrate");
+            }
+            assert_eq!(
+                Connection::open(&db)
+                    .unwrap()
+                    .query_row("SELECT version FROM schema_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                crate::rollout::SCHEMA_VERSION
+            );
+            // The migrated store keeps its pre-v33 rows.
+            assert!(s.agent("a1").unwrap().alias == "a1");
+        }
+        // Half-applied: one table present, the rest dropped, version
+        // rolled back — the reopen converges, not fails.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE app_install_requests;
+                 DROP TABLE app_update_checks;
+                 UPDATE schema_version SET version=32;",
+            )
+            .unwrap();
+        {
+            let _ = Store::open_for_schema_tests(&db).unwrap();
+        }
+        for t in ["app_favorites", "app_install_requests", "app_update_checks"] {
+            assert!(has(t), "{t} missing after half-applied converge");
+        }
     }

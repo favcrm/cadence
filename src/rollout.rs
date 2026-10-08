@@ -42,7 +42,9 @@ use crate::store::{self, Store};
 /// CAD-753 keeps app record data in per-installation SQLite files;
 /// this version tracks core tables only.
 /// The newest migration in `store` writes this number.
-pub const SCHEMA_VERSION: i64 = 32;
+/// v33 (CAD-1129): `app_favorites`, `app_install_requests` and
+/// `app_update_checks` for the apps Explorer — new tables only.
+pub const SCHEMA_VERSION: i64 = 33;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -3327,7 +3329,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 32);
+        assert_eq!(SCHEMA_VERSION, 33);
     }
 
     struct MigrationHolder;

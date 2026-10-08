@@ -1,5 +1,6 @@
 //! CAD-630 foundation: explicit single-workspace installation catalog.
 //! No daemon/HTTP routing, execution or grant translation is enabled here.
+pub mod builtin;
 mod fs;
 pub mod workspace;
 use serde::{Deserialize, Serialize};
@@ -59,18 +60,26 @@ impl<'de> Deserialize<'de> for InstallationId {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
-enum Storage {
+pub enum Storage {
     Legacy { project: String, name: String },
     Workspace,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Entry {
-    app: String,
-    project: Option<String>,
-    storage: Storage,
+pub struct Entry {
+    pub app: String,
+    pub project: Option<String>,
+    pub storage: Storage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    bundle_revision: Option<String>,
+    pub bundle_revision: Option<String>,
+}
+impl Entry {
+    /// Is this installation soft-removed? The mark lives on its
+    /// record, not the catalog — the caller reads the record itself
+    /// (CAD-1129 H5).
+    pub fn removed(&self) -> bool {
+        false
+    }
 }
 impl Entry {
     fn paths(&self, id: &InstallationId) -> (PathBuf, PathBuf) {
@@ -108,6 +117,16 @@ impl Default for Catalog {
             last_migration: None,
             installations: BTreeMap::new(),
         }
+    }
+}
+
+impl Catalog {
+    /// CAD-1129: the catalog's installations for the Explorer's read
+    /// paths — iterate, don't index by a name. The map is the only
+    /// enumeration the home and catalog need; the caller still reads
+    /// each installation's own record for its live `removed` mark.
+    pub fn entries(&self) -> &BTreeMap<InstallationId, Entry> {
+        &self.installations
     }
 }
 

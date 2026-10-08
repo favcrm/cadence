@@ -750,6 +750,19 @@ pub(crate) enum EffectAction {
         digest: String,
     },
 }
+/// The source the daemon installs from: a URL passes through, a local
+/// path is made absolute here because the daemon refuses relative ones.
+/// Shared by `install`, `install-check`, `upgrade-check`.
+fn install_source(source: &str) -> Result<String> {
+    if source.contains("://") || source.starts_with("git@") {
+        return Ok(source.to_string());
+    }
+    Ok(std::fs::canonicalize(source)
+        .map_err(|e| Error::rejected(format!("workspace app source: {e}")))?
+        .to_string_lossy()
+        .into_owned())
+}
+
 fn read_record_csv(path: &Path) -> Result<String> {
     use std::io::Read;
     const MAX_CSV_BYTES: usize = 256 * 1024;
@@ -1754,14 +1767,7 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     source,
                     expected_digest,
                 } => {
-                    let source = if source.contains("://") || source.starts_with("git@") {
-                        source.clone()
-                    } else {
-                        std::fs::canonicalize(source)
-                            .map_err(|e| Error::rejected(format!("workspace app source: {e}")))?
-                            .to_string_lossy()
-                            .into_owned()
-                    };
+                    let source = install_source(source)?;
                     let mut params = json!({"source":source});
                     if let Some(digest) = expected_digest {
                         params["expected_digest"] = json!(digest);
@@ -1769,14 +1775,7 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     ("app_workspace_install", params)
                 }
                 CatalogAction::InstallCheck { source } => {
-                    let source = if source.contains("://") || source.starts_with("git@") {
-                        source.clone()
-                    } else {
-                        std::fs::canonicalize(source)
-                            .map_err(|e| Error::rejected(format!("workspace app source: {e}")))?
-                            .to_string_lossy()
-                            .into_owned()
-                    };
+                    let source = install_source(source)?;
                     ("app_workspace_install_check", json!({"source":source}))
                 }
                 CatalogAction::Upgrade {
@@ -1822,14 +1821,7 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     expected_digest,
                     expected_generation,
                 } => {
-                    let source = if source.contains("://") || source.starts_with("git@") {
-                        source.clone()
-                    } else {
-                        std::fs::canonicalize(source)
-                            .map_err(|e| Error::rejected(format!("workspace app source: {e}")))?
-                            .to_string_lossy()
-                            .into_owned()
-                    };
+                    let source = install_source(source)?;
                     (
                         "app_workspace_upgrade_check",
                         json!({"install_id":install_id,"source":source,

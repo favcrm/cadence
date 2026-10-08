@@ -551,6 +551,70 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_workspace_show", Rule::Handler("operator_connection (CAD-667)")),
     ("app_workspace_migrate", Rule::Handler("operator_connection (CAD-667)")),
     ("app_workspace_recover", Rule::Handler("operator_connection (CAD-667)")),
+    // CAD-1129: the apps Explorer. Reads and member verbs take the
+    // operator connection OR a `member_as` the daemon re-proves against
+    // a live public member session; writes stay the operator's.
+    (
+        "app_catalog_list",
+        Rule::Handler("operator_connection (+ re-proven member_as for member scope) (CAD-1129)"),
+    ),
+    (
+        "app_catalog_show",
+        Rule::Handler("operator_connection (+ re-proven member_as for member scope) (CAD-1129)"),
+    ),
+    (
+        "app_catalog_git_check",
+        Rule::Handler("operator_connection (CAD-1129)"),
+    ),
+    ("app_home", Rule::Handler("operator_connection (+ re-proven member_as for member scope) (CAD-1129)")),
+    (
+        "app_favorites_get",
+        Rule::Handler("operator_connection (+ re-proven member_as for member scope) (CAD-1129)"),
+    ),
+    (
+        "app_favorites_put",
+        Rule::Handler("operator_connection (+ re-proven member_as for member scope) (CAD-1129)"),
+    ),
+    (
+        "app_favorites_put_default",
+        Rule::Handler("operator_connection (CAD-1129)"),
+    ),
+    (
+        "app_favorites_opened",
+        Rule::Handler("operator_connection (+ re-proven member_as for member scope) (CAD-1129)"),
+    ),
+    (
+        "app_install_request",
+        Rule::Handler("operator_connection + re-proven member_as requester (CAD-1129)"),
+    ),
+    (
+        "app_install_requests_list",
+        Rule::Handler("operator_connection (CAD-1129)"),
+    ),
+    (
+        "app_install_request_dismiss",
+        Rule::Handler("operator_connection (CAD-1129)"),
+    ),
+    (
+        "app_workspace_install_entry",
+        Rule::Handler("operator_connection (CAD-1129)"),
+    ),
+    (
+        "app_workspace_update_check",
+        Rule::Handler("operator_connection (CAD-1129)"),
+    ),
+    (
+        "app_workspace_remove_preview",
+        Rule::Handler("operator_connection (CAD-1129)"),
+    ),
+    (
+        "app_workspace_remove",
+        Rule::Handler("operator_connection (CAD-1129)"),
+    ),
+    (
+        "app_workspace_restore",
+        Rule::Handler("operator_connection (CAD-1129)"),
+    ),
     (
         "workflow_approve",
         Rule::Handler("operator_connection (CAD-487)"),
@@ -758,6 +822,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         ),
     ),
     ("board_session_check", Rule::Bearer),
+    // CAD-1129: a member's public session the board opens for
+    // `member_as` re-proof — the compact bearer is the credential,
+    // same class as `board_session_check`.
+    ("board_session_member", Rule::Bearer),
     (
         "operator_sessions",
         Rule::Handler("operator_with_secret: operator proof AND the operator secret (CAD-313)"),
@@ -1115,20 +1183,37 @@ mod tests {
         let body = &body[..body
             .find("other => Err(Error::rejected(format!(\"Unknown method")
             .expect("end")];
+        // rustfmt splits a long `"a" | "b" | "c" =>` arm across lines,
+        // so join each arm's continuation lines (they start with `|`)
+        // before reading its names — a wrapped arm still counts once.
         let mut out = Vec::new();
+        let mut arm_text = String::new();
+        let mut in_arm = false;
         for line in body.lines() {
             let t = line.trim_start();
-            if line.len() - t.len() != 12 || !t.starts_with('"') {
-                continue;
+            let indent = line.len() - t.len();
+            if in_arm && t.starts_with('|') {
+                // A wrapped `| "next"` continuation — same 12-space
+                // indent as the arm's first line.
+                arm_text.push_str(t);
+            } else {
+                in_arm = false;
             }
-            let Some((arms, _)) = t.split_once("=>") else {
-                continue;
-            };
-            for arm in arms.split('|') {
-                let name = arm.trim().trim_matches('"');
-                if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
-                    out.push(name.to_string());
+            if indent == 12 && t.starts_with('"') {
+                arm_text.clear();
+                arm_text.push_str(t);
+                in_arm = true;
+            }
+            if in_arm && arm_text.contains("=>") {
+                let (arms, _) = arm_text.split_once("=>").unwrap();
+                for arm in arms.split('|') {
+                    let name = arm.trim().trim_matches('"');
+                    if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                    {
+                        out.push(name.to_string());
+                    }
                 }
+                in_arm = false;
             }
         }
         out

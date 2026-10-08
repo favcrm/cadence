@@ -517,6 +517,17 @@ impl Shared {
         Ok(json!({"valid": session.is_some(), "session": session}))
     }
 
+    /// `board_session_member {handle}` — the daemon's proof that a
+    /// `member_as` claim names a live public member session
+    /// (CAD-1129). The bearer-caller board relays this so `member_as`
+    /// never rides an unchecked string; the answer is yes/no only.
+    pub(super) fn rpc_board_session_member(&self, params: &Value) -> Result<Value> {
+        let handle = required_str(params, "handle")?;
+        let now = self.operator_now();
+        let member = self.operator_auth().check_member(handle, now)?;
+        Ok(json!({"member": member}))
+    }
+
     /// A refused assertion is loud — `board_assertion_rejected` records
     /// the refusal's code (never the assertion or key material).
     fn board_rejected(&self, code: &'static str, message: &str) -> Error {

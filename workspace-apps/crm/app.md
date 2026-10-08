@@ -5,6 +5,29 @@ version: '0.1.0'
 summary: Draft one independently reviewed email brief from pasted facts; customer records, campaign content, SMTP custody and sending stay operator-run host actions.
 needs:
   connections: []
+listing:
+  tagline: Draft one reviewed email brief from pasted facts
+  icon: assets/crm.svg
+  category: customers
+  tags:
+    - email
+    - crm
+  publisher:
+    name: Cadence
+  about: CRM keeps your customer list, drafts a reviewed email brief and runs campaign sending through operator-run host controls. Customer records, content review and sending stay operator actions — the bundle's only workflow turns pasted facts into one brief a person reads.
+  can:
+    - Keep a customer list with segments and unsubscribes
+    - Draft one independently reviewed email brief per run
+    - Freeze an audience and run a test send before a campaign goes
+    - Keep unsubscriptions and send history for good
+  screenshots: []
+  setup: []
+  data:
+    stores:
+      - Your customer list, segments and unsubscribes
+      - Campaign content, audiences and send history
+      - Reviewed email-brief text
+    personal: true
 ---
 
 # CRM — reviewed email briefs

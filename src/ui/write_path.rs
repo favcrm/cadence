@@ -14,9 +14,9 @@ use tiny_http::{Header, Method, Request, Response, StatusCode};
 use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
-    app_assistant, app_audiences, app_content, app_contexts, app_records, app_release, app_runs,
-    app_screens, apps, connections, crm_send, crm_smtp, home, lane, operator, read_model,
-    social_publish, stages, threads, updates, wiki, workflows,
+    app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_records,
+    app_release, app_runs, app_screens, apps, connections, crm_send, crm_smtp, home, lane,
+    operator, read_model, social_publish, stages, threads, updates, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -1127,6 +1127,27 @@ pub(crate) fn write_route(
         send(request, resp);
         return;
     }
+    // CAD-1129: the apps Explorer's writes — catalog install/git-check,
+    // per-install update-check/remove/restore, and the member verbs
+    // (favorites, request). Classified in `WRITE_ROUTES`; the daemon's
+    // own caller rule is the second, strict layer.
+    if path == "/api/app-catalog/install"
+        || path == "/api/app-catalog/git-check"
+        || path == "/api/app-catalog/request"
+        || path == "/api/app-favorites"
+        || path == "/api/app-favorites/default"
+        || path == "/api/app-favorites/opened"
+        || path == "/api/app-requests/dismiss"
+        || path.starts_with("/api/app-installations/")
+            && (path.ends_with("/update-check")
+                || path.ends_with("/remove-preview")
+                || path.ends_with("/remove")
+                || path.ends_with("/restore"))
+    {
+        let response = app_explorer::write(&mut request, method, path, caller.as_ref(), state_dir);
+        send(request, response);
+        return;
+    }
     let catalog_recovery = path
         .strip_prefix("/api/app-installations/migrations/")
         .and_then(|tail| tail.strip_suffix("/recover"))
@@ -1172,6 +1193,18 @@ pub(crate) fn write_route(
             ("app_workspace_migrate", None)
         };
         let response = apps::workspace(&mut request, state_dir, operation, id);
+        send(request, response);
+        return;
+    }
+    // CAD-1194: the read-only install-check — operator-only in
+    // `WRITE_ROUTES`, relays `app_workspace_install_check`.
+    if path == "/api/app-installations/check" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response =
+            apps::workspace(&mut request, state_dir, "app_workspace_install_check", None);
         send(request, response);
         return;
     }

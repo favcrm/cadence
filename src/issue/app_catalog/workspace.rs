@@ -1,8 +1,11 @@
 //! Operator-owned workspace installation transport. Execution is deliberately absent.
 use super::*;
 use crate::issue::{app, app_view, workflow, write};
+use crate::store::Store;
 use serde_json::{json, Value};
 
+/// CAD-1194: the install-check source form that names a host built-in.
+const BUILTIN_SOURCE_PREFIX: &str = "builtin:";
 const INSTALL_PENDING: &str = ".apps/install-pending.yaml";
 const UPGRADE_PENDING: &str = ".apps/upgrade-pending.yaml";
 
@@ -156,7 +159,10 @@ struct InstallJournal {
 fn journal_path(id: &InstallationId) -> PathBuf {
     Path::new(".apps/install-journals").join(format!("{}.yaml", &**id))
 }
-fn bundle_digest(files: &BTreeMap<String, String>) -> String {
+/// CAD-1129: the bundle digest the explorer's catalog check and
+/// update-check compute — `pub(crate)` so the daemon's explorer RPC
+/// shares it.
+pub(crate) fn bundle_digest(files: &BTreeMap<String, String>) -> String {
     let mut digest = Sha256::new();
     for (name, body) in files {
         digest.update((name.len() as u64).to_be_bytes());
@@ -222,6 +228,10 @@ fn member_path_ok(name: &str) -> bool {
                     }
             })
         }
+        // CAD-1129: assets/<leaf>.svg — the catalog's flat SVG assets.
+        (2, Some("assets")) => normal(1).is_some_and(|leaf| {
+            !leaf.starts_with('.') && leaf.len() <= 128 && leaf.ends_with(".svg")
+        }),
         // screens/<tag>/<leaf> — tag-validated dir + package leaf grammar.
         (3, Some("screens")) => {
             normal(1).is_some_and(model::valid_tag)
@@ -348,7 +358,7 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
             Some(libc::S_IFDIR)
                 if matches!(
                     name.as_str(),
-                    "workflows" | "rubrics" | "templates" | "views"
+                    "workflows" | "rubrics" | "templates" | "views" | "assets"
                 ) =>
             {
                 for leaf in root.list(&path, &mut budget)? {
@@ -359,9 +369,10 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
                         // views/ holds exactly one file — the filename
                         // pins the descriptor contract version.
                         || (name == "views" && leaf != app_view::FILE)
+                        || (name == "assets" && (!leaf.ends_with(".svg") || leaf.len() > 128))
                     {
                         return Err(Error::rejected(
-                            "workflows must be named Markdown files, views/ holds exactly app-views-v1.json, and all bundle entries must be visible flat text files",
+                            "workflows must be named Markdown files, views/ holds exactly app-views-v1.json, assets flat *.svg, and all bundle entries must be visible flat text files",
                         ));
                     }
                     add(format!("{name}/{leaf}"), path.join(leaf))?;
@@ -446,8 +457,14 @@ fn check_expected_digest(expected: &str, actual: &str) -> Result<()> {
 /// Read-only install proposal (CAD-1186). Resolves and validates exactly as
 /// `install` does and returns the digest `--expected-digest` must carry. It
 /// writes nothing: no catalog, journal or lock file is created.
+///
+/// CAD-1194: `builtin:<catalog_id>` names a host built-in, so the board's
+/// built-in install pins a digest through this same check.
 pub(crate) fn install_check(pm: &Pm, source: &str) -> Result<Value> {
-    let (files, validated, provenance) = resolved_bundle(pm, source)?;
+    let (files, validated, provenance) = match source.strip_prefix(BUILTIN_SOURCE_PREFIX) {
+        Some(catalog_id) => builtin_bundle(pm, catalog_id)?,
+        None => resolved_bundle(pm, source)?,
+    };
     optimistic(pm, || {
         let root = Root::open(&pm.dir)?;
         let (catalog, _) = current(&root)?;
@@ -469,6 +486,20 @@ pub(crate) fn install(
 ) -> Result<Value> {
     let _ = state; // Caller must pass the daemon's connection-bound operator gate.
     let (files, validated, provenance) = resolved_bundle(pm, source)?;
+    install_resolved(pm, files, validated, provenance, expected_digest)
+}
+
+/// The one journaled install apply, shared by a source install and a
+/// built-in install: the digest gate runs first (before the lock, the
+/// catalog read or any write), then the same-name refusal, the journal
+/// and the apply.
+fn install_resolved(
+    pm: &Pm,
+    files: BTreeMap<String, String>,
+    validated: app::Validated,
+    provenance: app::Source,
+    expected_digest: Option<&str>,
+) -> Result<Value> {
     // Refuse a changed bundle before the lock, the catalog read or any write.
     if let Some(expected) = expected_digest {
         check_expected_digest(expected, &bundle_digest(&files))?;
@@ -488,6 +519,9 @@ pub(crate) fn install(
         installed_at: crate::issue::time::iso(crate::issue::time::now_epoch()),
         installed_by: "operator".into(),
         updated_at: None,
+        removed: None,
+        restore_after: None,
+        purge_after: None,
     };
     catalog.installations.insert(
         id.clone(),
@@ -1043,6 +1077,15 @@ pub(crate) fn recover(pm: &Pm, state: &Path, id: &str) -> Result<Value> {
     Ok(row)
 }
 
+/// CAD-1129: re-export `describe` so the explorer's `app_home` reads
+/// one install's row under the catalog, the same shape `show` returns.
+/// The daemon opens its own PM descriptor — `Root` stays catalog-
+/// private.
+pub(crate) fn describe_id(pm: &Pm, catalog: &Catalog, id: &InstallationId) -> Result<Value> {
+    let root = Root::open(&pm.dir)?;
+    describe(&root, catalog, id)
+}
+
 fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value> {
     catalog.require_current(root)?;
     catalog.installation(root, id)?;
@@ -1142,7 +1185,7 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
         })
         .collect::<Vec<_>>();
     Ok(
-        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"source":record.source,"installed_at":record.installed_at,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
+        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"source":record.source,"installed_at":record.installed_at,"removed":record.removed,"restore_after":record.restore_after,"purge_after":record.purge_after,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"listing":manifest.listing.as_ref().map(|l| l.value.clone()),"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
     )
 }
 /// CAD-1189: catalog reads take no lock. Every writer journals first
@@ -1325,6 +1368,13 @@ pub(crate) fn with_runtime_snapshot<T>(
     let catalog = Catalog::load(&pm.dir)?;
     no_pending(&root)?;
     let description = describe(&root, &catalog, &id)?;
+    // CAD-1129 H5: a soft-removed install admits no runtime snapshot —
+    // run creation, dispatch and consent checks all stop here.
+    if description["removed"].as_i64().is_some() {
+        return Err(Error::rejected(
+            "installation is removed — restore it before any app action",
+        ));
+    }
     let (bundle, _) = catalog.installations[&id].paths(&id);
     let files = snapshot(&root, &bundle, false)?;
     if bundle_digest(&files) != description["digest"].as_str().unwrap_or("") {
@@ -1388,6 +1438,13 @@ pub(crate) fn with_completed_bundle_snapshot<T>(
     let catalog = Catalog::load(&pm.dir)?;
     no_pending(&root)?;
     let current = describe(&root, &catalog, &id)?;
+    // A soft-removed install admits no historical snapshot either —
+    // completed-work receipts stop with the live install.
+    if current["removed"].as_i64().is_some() {
+        return Err(Error::rejected(
+            "installation is removed — restore it before any app action",
+        ));
+    }
     let entry = &catalog.installations[&id];
     if entry.storage != Storage::Workspace {
         return Err(Error::rejected(
@@ -1423,6 +1480,261 @@ pub(crate) fn with_completed_bundle_snapshot<T>(
         ));
     }
     callback(&json!({"digest":digest}), &files)
+}
+
+/// CAD-1129: the host's embedded built-in bundle `catalog_id`, resolved
+/// and validated like a source bundle. The bytes come from
+/// `include_str!`, never a checkout or a caller path.
+fn builtin_bundle(
+    pm: &Pm,
+    catalog_id: &str,
+) -> Result<(BTreeMap<String, String>, app::Validated, app::Source)> {
+    let entry =
+        super::builtin::get(catalog_id)?.ok_or_else(|| Error::rejected("unknown catalog entry"))?;
+    let files = entry.files;
+    let (agents, agent_sources) = workflow::known_agents(&pm.dir, None, &[]);
+    let validated = app::validate_texts(
+        files
+            .iter()
+            .map(|(name, text)| (name.clone(), text.clone()))
+            .collect(),
+        &agents,
+        &agent_sources,
+    )?;
+    let provenance = app::Source::Builtin {
+        id: entry.id.to_string(),
+        digest: bundle_digest(&files),
+    };
+    Ok((files, validated, provenance))
+}
+
+/// CAD-1129/1194: install the host's embedded built-in bundle
+/// `catalog_id` — `app_workspace_install_entry` with `source`
+/// pre-resolved by the daemon. The same journaled apply and the same
+/// digest gate as `install`; `expected_digest` is the pin the
+/// `builtin:<id>` install-check returned and is not optional here, so a
+/// board install of a built-in always consents to checked bytes. A
+/// second workspace install of the same app refuses.
+pub(crate) fn install_builtin(pm: &Pm, catalog_id: &str, expected_digest: &str) -> Result<Value> {
+    let (files, validated, provenance) = builtin_bundle(pm, catalog_id)?;
+    install_resolved(pm, files, validated, provenance, Some(expected_digest))
+}
+
+/// CAD-1129 H4: re-check the install's recorded `source` upstream —
+/// never a caller-chosen URL. For `Source::Git` the same URL + `dir`
+/// re-resolves `HEAD` to a commit and re-fetches; `Source::Builtin`
+/// answers "current" until a later built-in catalog version ships.
+/// A `Source::Path` is a local checkout — no upstream to check.
+pub(crate) fn update_check(pm: &Pm, install_id: &str) -> Result<Value> {
+    let id = InstallationId::parse(install_id)?;
+    let _lock = pm.lock()?;
+    let root = Root::open(&pm.dir)?;
+    let catalog = Catalog::load(&pm.dir)?;
+    let entry = catalog
+        .installations
+        .get(&id)
+        .ok_or_else(|| Error::rejected("unknown installation ID"))?;
+    if entry.storage != Storage::Workspace {
+        return Err(Error::rejected(
+            "update check needs a workspace installation",
+        ));
+    }
+    let desc = describe(&root, &catalog, &id)?;
+    let current_digest = desc["digest"].as_str().unwrap_or_default().to_string();
+    let record: Record = serde_json::from_value(desc["record"].clone())
+        .map_err(|e| Error::internal(format!("installation record is not readable: {e}")))?;
+    let source = record.source;
+    match source {
+        app::Source::Builtin { id: cat_id, digest } => {
+            let builtin = crate::issue::app_catalog::builtin::get(&cat_id)?
+                .ok_or_else(|| Error::rejected("the built-in catalog no longer ships this app"))?;
+            let files = builtin.files;
+            let new_digest = bundle_digest(&files);
+            let validated = app::validate_texts(
+                files.iter().map(|(n, t)| (n.clone(), t.clone())).collect(),
+                &Default::default(),
+                &[],
+            )?;
+            let has_update = new_digest != digest;
+            Ok(json!({"schema":1,"install_id":&*id,"source":"builtin",
+                "catalog_id":cat_id,"has_update":has_update,
+                "current_digest":digest,"digest":new_digest,
+                "version":validated.manifest.version}))
+        }
+        app::Source::Git { url, sha, dir } => {
+            let dir = dir.unwrap_or_default();
+            let selected = crate::issue::app_source::SelectedGitSource::new(&url, &sha, &dir)?;
+            let bundle = crate::issue::app_source::resolve(&selected)?;
+            let validated = app::validate_texts(
+                bundle
+                    .files
+                    .iter()
+                    .map(|(n, t)| (n.clone(), t.clone()))
+                    .collect(),
+                &Default::default(),
+                &[],
+            )?;
+            let new_digest = bundle_digest(&bundle.files);
+            let has_update = new_digest != current_digest;
+            Ok(json!({"schema":1,"install_id":&*id,"source":"git",
+                "url":url,"sha":sha,"dir":dir,"has_update":has_update,
+                "current_digest":current_digest,"digest":new_digest,
+                "version":validated.manifest.version}))
+        }
+        app::Source::Path { path } => Ok(json!({"schema":1,"install_id":&*id,
+            "source":"path","path":path,"has_update":false,
+            "note":"a local checkout is not upstream-tracked — check its own files"})),
+    }
+}
+
+/// CAD-1129 H5: preview a soft remove — the install's name, the
+/// `personal_data` flag and the data it keeps. Per-kind counts live
+/// in the store's own tables; the daemon's RPC reads those directly.
+/// Writes nothing; the operator confirms before `remove` commits.
+pub(crate) fn remove_preview(pm: &Pm, install_id: &str) -> Result<Value> {
+    let id = InstallationId::parse(install_id)?;
+    let _lock = pm.lock()?;
+    let root = Root::open(&pm.dir)?;
+    let catalog = Catalog::load(&pm.dir)?;
+    let entry = catalog
+        .installations
+        .get(&id)
+        .ok_or_else(|| Error::rejected("unknown installation ID"))?;
+    let desc = describe(&root, &catalog, &id)?;
+    let _record: Record = serde_json::from_value(desc["record"].clone())
+        .map_err(|e| Error::internal(format!("installation record is not readable: {e}")))?;
+    // `listing` is a manifest field; `describe` doesn't carry it —
+    // re-read the bundle's manifest for the personal-data flag.
+    let app_md = {
+        let (bundle, _) = catalog.installations[&id].paths(&id);
+        let files = snapshot(&root, &bundle, false)?;
+        files.get("app.md").cloned()
+    };
+    let listing = app_md
+        .and_then(|md| app::parse_manifest(&md).ok())
+        .and_then(|m| m.listing);
+    let personal_data = listing
+        .as_ref()
+        .and_then(|l| l.value["data"]["personal"].as_bool())
+        .unwrap_or(false)
+        || listing
+            .as_ref()
+            .and_then(|l| l.value["data"]["contacts"].as_bool())
+            .unwrap_or(false);
+    Ok(json!({
+        "schema":1,"install_id":&*id,"name":entry.app,
+        "title":desc["title"],"personal_data":personal_data,
+        "keeps":{"data":listing.as_ref().map(|l| l.value["data"]["keeps"].clone())},
+        "generation":desc["catalog_generation"],"digest":desc["digest"],
+    }))
+}
+
+/// CAD-1129 H5: journaled soft remove — mark the record, revoke
+/// consent, cancel queued publishes. The install stays in the catalog
+/// under `Removed` until a 30-day restore; after `restore_after` the
+/// restore refuses. Run creation refuses on the `removed` mark.
+pub(crate) fn remove(
+    pm: &Pm,
+    store: &Store,
+    install_id: &str,
+    expected_generation: &str,
+    expected_digest: &str,
+    request_id: &str,
+) -> Result<Value> {
+    let id = InstallationId::parse(install_id)?;
+    crate::proto::identifier(request_id, "remove request ID")?;
+    let _lock = pm.lock()?;
+    let root = Root::open(&pm.dir)?;
+    let catalog = Catalog::load(&pm.dir)?;
+    let entry = catalog
+        .installations
+        .get(&id)
+        .ok_or_else(|| Error::rejected("unknown installation ID"))?;
+    if hash(&yaml(&catalog)?) != expected_generation {
+        return Err(Error::rejected("workspace catalog generation is stale"));
+    }
+    let desc = describe(&root, &catalog, &id)?;
+    if desc["digest"].as_str() != Some(expected_digest) {
+        return Err(Error::rejected("workspace installation digest is stale"));
+    }
+    let mut record: Record = serde_json::from_value(desc["record"].clone())
+        .map_err(|e| Error::internal(format!("installation record is not readable: {e}")))?;
+    if record.removed.is_some() {
+        return Ok(json!({"schema":1,"install_id":&*id,"state":"removed",
+            "removed":record.removed,"restore_after":record.restore_after,
+            "request_id":request_id,"replayed":true}));
+    }
+    let now = crate::issue::time::now_epoch();
+    record.removed = Some(now);
+    record.restore_after = Some(now + 30 * 24 * 3600);
+    // Consent revocation rides the same record write — the digest is
+    // frozen, so revoke binds exactly these bytes.
+    store.app_install_revoke(install_id, expected_digest, "remove")?;
+    // Cancel queued publishes the store still holds for this install.
+    let cancelled = store.social_publish_cancel_install(&id)?;
+    let record_path = Path::new(".apps/installations")
+        .join(&*id)
+        .join("record.yaml");
+    root.put(&record_path, &yaml(&record)?)?;
+    let foreign = write::commit(
+        pm,
+        &[pm.dir.join(&record_path)],
+        &format!("workspace app {} removed ({})", entry.app, &*id),
+        &[],
+        "operator",
+    )?;
+    let _ = store.event_public(
+        "cadence",
+        "app_workspace_removed",
+        json!({"install_id":&*id,"app":entry.app,"request_id":request_id}),
+    );
+    Ok(json!({"schema":1,"install_id":&*id,"state":"removed",
+        "removed":now,"restore_after":record.restore_after,
+        "cancelled_publishes":cancelled,"request_id":request_id,
+        "foreign_files":foreign}))
+}
+
+/// CAD-1129 H5: clear the soft-remove mark and re-consent the same
+/// digest. Refused after `restore_after`; the record write replays
+/// idempotently. The operator's restore re-approves the exact bytes
+/// already on disk — no re-install.
+pub(crate) fn restore(pm: &Pm, install_id: &str) -> Result<Value> {
+    let id = InstallationId::parse(install_id)?;
+    let _lock = pm.lock()?;
+    let root = Root::open(&pm.dir)?;
+    let catalog = Catalog::load(&pm.dir)?;
+    let entry = catalog
+        .installations
+        .get(&id)
+        .ok_or_else(|| Error::rejected("unknown installation ID"))?;
+    let desc = describe(&root, &catalog, &id)?;
+    let mut record: Record = serde_json::from_value(desc["record"].clone())
+        .map_err(|e| Error::internal(format!("installation record is not readable: {e}")))?;
+    if record.removed.is_none() {
+        return Ok(json!({"schema":1,"install_id":&*id,"state":"live",
+            "digest":desc["digest"],"restored":false}));
+    }
+    let now = crate::issue::time::now_epoch();
+    if record.restore_after.is_some_and(|after| now > after) {
+        return Err(Error::rejected(
+            "the restore window closed — this install can only be removed",
+        ));
+    }
+    record.removed = None;
+    record.restore_after = None;
+    let record_path = Path::new(".apps/installations")
+        .join(&*id)
+        .join("record.yaml");
+    root.put(&record_path, &yaml(&record)?)?;
+    let foreign = write::commit(
+        pm,
+        &[pm.dir.join(&record_path)],
+        &format!("workspace app {} restored ({})", entry.app, &*id),
+        &[],
+        "operator",
+    )?;
+    Ok(json!({"schema":1,"install_id":&*id,"state":"live",
+        "digest":desc["digest"],"restored":true,"foreign_files":foreign}))
 }
 
 #[cfg(test)]

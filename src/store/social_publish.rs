@@ -505,6 +505,36 @@ impl Store {
         read_row(&self.conn(), intent_id)
     }
 
+    /// CAD-1129 H5: cancel every queued publish intent of one install
+    /// — the soft-remove path. Unlike `social_publish_cancel` this is
+    /// install-wide and idempotent; an install with nothing queued
+    /// returns 0. Queued-only is deliberate: a `processing` intent is
+    /// already committed at the platform and is never un-sent here.
+    pub fn social_publish_cancel_install(&self, install_id: &str) -> Result<i64> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let intents = tx.query_vec(
+                "SELECT intent_id FROM social_publish_intents WHERE install_id=? AND state='queued'",
+                [install_id],
+                |r| r.get::<_, String>(0),
+            )?;
+            let mut changed = 0i64;
+            for id in &intents {
+                changed += tx.execute(
+                    "UPDATE social_publish_intents SET state='cancelled',updated=? WHERE intent_id=? AND state='queued'",
+                    params![now(), id],
+                )? as i64;
+                Self::event(
+                    &tx,
+                    platform::PLATFORM_STREAM,
+                    SOCIAL_PUBLISH_CANCELLED_EVENT,
+                    json!({"intent_id": id}),
+                )?;
+            }
+            Ok(changed)
+        })
+    }
+
     pub fn social_publish_list(
         &self,
         install: Option<&str>,

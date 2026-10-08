@@ -232,6 +232,61 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/app-installations", RouteClass::OperatorOnly),
+    // CAD-1194: the install-check — read-only, but it fetches and
+    // validates a source on the host, so it is the operator's like install.
+    route(
+        "POST",
+        "/api/app-installations/check",
+        RouteClass::OperatorOnly,
+    ),
+    // CAD-1129: the apps Explorer. The catalog install/git-check and
+    // the per-install update-check/remove/restore are the operator's,
+    // like every install write; favorites, the workspace default and
+    // an install request are the member verbs (`AgentAllowed` admits a
+    // named member's session, which the daemon re-proves).
+    route("POST", "/api/app-catalog/install", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/app-catalog/git-check",
+        RouteClass::OperatorOnly,
+    ),
+    route("POST", "/api/app-catalog/request", RouteClass::AgentAllowed),
+    route("POST", "/api/app-favorites", RouteClass::AgentAllowed),
+    route(
+        "POST",
+        "/api/app-favorites/default",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-favorites/opened",
+        RouteClass::AgentAllowed,
+    ),
+    route(
+        "POST",
+        "/api/app-requests/dismiss",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/update-check",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/remove-preview",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/remove",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/restore",
+        RouteClass::OperatorOnly,
+    ),
     // CAD-996: bounded manual `{files}` bundle upload — operator-only like the
     // sibling install route it stages into.
     route(

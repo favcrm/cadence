@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "entries": [
+    { "id": "crm", "featured": true, "dir": "crm" },
+    { "id": "social-content", "featured": true, "dir": "social-content" }
+  ]
+}

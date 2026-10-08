@@ -72,6 +72,7 @@ pub mod app_bindings;
 pub mod app_capabilities;
 pub mod app_contexts;
 pub mod app_effects;
+pub mod app_explorer;
 pub mod app_records;
 pub mod app_runs;
 pub mod app_sends;
