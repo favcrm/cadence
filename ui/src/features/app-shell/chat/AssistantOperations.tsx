@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../../lib/api";
 import Button from "../../../ui/Button";
 import Link from "../../../ui/Link";
@@ -243,117 +243,155 @@ function emptyData(scopeKey: string): AssistantData {
   return { scopeKey, actions: [], operations: [], permissions: [], error: null };
 }
 
+/** Routine refresh cadence, counted from the end of the previous read. */
+const POLL_MS = 8_000;
+
+/** The one reader of one installation/context, as seen by the component. */
+interface Poller {
+  alive: () => boolean;
+  /** A decision, revoke or block was confirmed: reads begun before it are dropped, and one read follows it. */
+  written: () => Promise<void>;
+  refresh: () => Promise<void>;
+}
+
 export default function AssistantOperations({ installId, contextId, canDecide }: {
   installId: string;
   contextId: string;
   canDecide: boolean;
 }) {
   const scopeKey = JSON.stringify([installId, contextId]);
-  const currentScope = useRef(scopeKey);
-  const generation = useRef(0);
-  const querySequence = useRef(0);
-  const mounted = useRef(false);
-  if (currentScope.current !== scopeKey) {
-    currentScope.current = scopeKey;
-    generation.current += 1;
-    querySequence.current += 1;
-  }
+  const poller = useRef<Poller | null>(null);
   const [data, setData] = useState<AssistantData>(() => emptyData(scopeKey));
   const [busyState, setBusyState] = useState<{ scopeKey: string; id: string | null }>({ scopeKey, id: null });
   const [expanded, setExpanded] = useState(false);
   const visible = data.scopeKey === scopeKey ? data : emptyData(scopeKey);
   const busy = busyState.scopeKey === scopeKey ? busyState.id : null;
 
-  const query = useCallback(async () => {
-    const expectedScope = scopeKey;
-    const expectedGeneration = generation.current;
-    const requestNumber = ++querySequence.current;
-    const isCurrent = () => mounted.current && currentScope.current === expectedScope &&
-      generation.current === expectedGeneration && querySequence.current === requestNumber;
-    try {
-      const [actionResponse, operationResponse, permissionResponse] = await Promise.all([
-        api.assistantActions(installId, contextId),
-        api.assistantOperations(installId, contextId),
-        api.assistantPermissions(installId, contextId),
-      ]);
-      if (!isCurrent()) return;
-      if (!Array.isArray(actionResponse.actions) || !Array.isArray(operationResponse.operations) || !Array.isArray(permissionResponse.permissions)) {
-        throw new Error("The assistant service returned an invalid response.");
+  useEffect(() => {
+    // One effect run owns one scope. A scope change or unmount ends it, so
+    // its in-flight read can never render into the new scope.
+    let alive = true;
+    let inFlight: Promise<void> | null = null;
+    // Set when the in-flight read may predate a write, or was dropped by one.
+    let requeue = false;
+    // Bumped by every confirmed write; a read that began earlier is stale.
+    let epoch = 0;
+    let timer: number | null = null;
+    const stopTimer = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
+    };
+
+    const readOnce = async (): Promise<void> => {
+      const startedAt = epoch;
+      try {
+        const [actionResponse, operationResponse, permissionResponse] = await Promise.all([
+          api.assistantActions(installId, contextId),
+          api.assistantOperations(installId, contextId),
+          api.assistantPermissions(installId, contextId),
+        ]);
+        if (!alive) return;
+        if (epoch !== startedAt) { requeue = true; return; }
+        if (!Array.isArray(actionResponse.actions) || !Array.isArray(operationResponse.operations) || !Array.isArray(permissionResponse.permissions)) {
+          throw new Error("The assistant service returned an invalid response.");
+        }
+        setData({
+          scopeKey,
+          actions: actionResponse.actions.map(parseAction).filter((v): v is Action => v !== null),
+          operations: operationResponse.operations.map((row) => parseOperation(record(row)?.operation ?? row)).filter((v): v is Operation => v !== null),
+          permissions: permissionResponse.permissions.map((row) => parsePermission(record(row)?.permission ?? row)).filter((v): v is Permission => v !== null),
+          error: null,
+        });
+      } catch (e) {
+        if (!alive) return;
+        if (epoch !== startedAt) { requeue = true; return; }
+        if (e instanceof ApiError && e.status === 404) {
+          setData(emptyData(scopeKey));
+        } else {
+          setData((previous) => ({
+            ...(previous.scopeKey === scopeKey ? previous : emptyData(scopeKey)),
+            error: "Assistant activity could not be loaded. Please retry.",
+          }));
+        }
       }
-      setData({
-        scopeKey: expectedScope,
-        actions: actionResponse.actions.map(parseAction).filter((v): v is Action => v !== null),
-        operations: operationResponse.operations.map((row) => parseOperation(record(row)?.operation ?? row)).filter((v): v is Operation => v !== null),
-        permissions: permissionResponse.permissions.map((row) => parsePermission(record(row)?.permission ?? row)).filter((v): v is Permission => v !== null),
-        error: null,
-      });
-    } catch (e) {
-      if (!isCurrent()) return;
-      if (e instanceof ApiError && e.status === 404) {
-        setData(emptyData(expectedScope));
-      } else {
-        setData((previous) => ({
-          ...(previous.scopeKey === expectedScope ? previous : emptyData(expectedScope)),
-          error: "Assistant activity could not be loaded. Please retry.",
-        }));
+    };
+
+    const schedule = () => {
+      stopTimer();
+      // Hidden tabs do not poll; the visibility listener resumes the reads.
+      if (document.hidden) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        if (alive && !document.hidden) void poll();
+      }, POLL_MS);
+    };
+    const run = async (): Promise<void> => {
+      do {
+        requeue = false;
+        await readOnce();
+      } while (requeue && alive);
+      // Synchronous from here on: a request made after this starts a new read.
+      inFlight = null;
+      if (alive) schedule();
+    };
+    const start = (): Promise<void> => {
+      stopTimer();
+      const pending = run();
+      inFlight = pending;
+      return pending;
+    };
+    // Routine reads join the one in flight: at most one batch per scope.
+    const poll = (): Promise<void> => inFlight ?? start();
+    const written = (): Promise<void> => {
+      epoch += 1;
+      if (inFlight) {
+        requeue = true;
+        return inFlight;
       }
-    }
+      return start();
+    };
+    const onVisibility = () => {
+      if (!alive) return;
+      if (document.hidden) stopTimer();
+      else void poll();
+    };
+
+    const handle: Poller = { alive: () => alive, written, refresh: poll };
+    poller.current = handle;
+    document.addEventListener("visibilitychange", onVisibility);
+    void poll();
+    return () => {
+      alive = false;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisibility);
+      if (poller.current === handle) poller.current = null;
+    };
   }, [installId, contextId, scopeKey]);
 
-  useEffect(() => {
-    mounted.current = true;
-    void query();
-    const timer = window.setInterval(() => void query(), 8_000);
-    return () => {
-      window.clearInterval(timer);
-      mounted.current = false;
-      generation.current += 1;
-      querySequence.current += 1;
-    };
-  }, [query]);
-
-  const decide = async (operation: Operation, decision: "allow_once" | "allow_always" | "deny") => {
+  const runWrite = async (busyId: string, write: () => Promise<unknown>, failure: string) => {
+    const handle = poller.current;
+    if (!handle) return;
     const expectedScope = scopeKey;
-    const expectedGeneration = generation.current;
-    const isCurrent = () => mounted.current && currentScope.current === expectedScope && generation.current === expectedGeneration;
-    setBusyState({ scopeKey: expectedScope, id: operation.id });
+    setBusyState({ scopeKey: expectedScope, id: busyId });
     try {
-      await api.assistantDecision(installId, operation.id, { decision, expected_revision: operation.revision });
-      if (isCurrent()) await query();
+      await write();
+      // The write is confirmed: the list must be read again after it, not from an older read.
+      if (handle.alive()) await handle.written();
     } catch {
-      if (isCurrent()) setData((previous) => ({ ...(previous.scopeKey === expectedScope ? previous : emptyData(expectedScope)), error: "The permission decision could not be saved. Reload and try again." }));
+      if (handle.alive()) setData((previous) => ({ ...(previous.scopeKey === expectedScope ? previous : emptyData(expectedScope)), error: failure }));
     } finally {
-      if (isCurrent()) setBusyState({ scopeKey: expectedScope, id: null });
+      if (handle.alive()) setBusyState({ scopeKey: expectedScope, id: null });
     }
   };
-  const revoke = async (permission: Permission) => {
-    const expectedScope = scopeKey;
-    const expectedGeneration = generation.current;
-    const isCurrent = () => mounted.current && currentScope.current === expectedScope && generation.current === expectedGeneration;
-    setBusyState({ scopeKey: expectedScope, id: permission.id });
-    try {
-      await api.assistantRevoke(installId, permission.id, { expected_revision: permission.revision });
-      if (isCurrent()) await query();
-    } catch {
-      if (isCurrent()) setData((previous) => ({ ...(previous.scopeKey === expectedScope ? previous : emptyData(expectedScope)), error: "The permission could not be revoked. Reload and try again." }));
-    } finally {
-      if (isCurrent()) setBusyState({ scopeKey: expectedScope, id: null });
-    }
-  };
-  const block = async (permission: Permission) => {
-    const expectedScope = scopeKey;
-    const expectedGeneration = generation.current;
-    const isCurrent = () => mounted.current && currentScope.current === expectedScope && generation.current === expectedGeneration;
-    setBusyState({ scopeKey: expectedScope, id: `block:${permission.id}` });
-    try {
-      await api.assistantBlock(installId, contextId, { action_id: permission.action_id, resource_id: permission.resource_id });
-      if (isCurrent()) await query();
-    } catch {
-      if (isCurrent()) setData((previous) => ({ ...(previous.scopeKey === expectedScope ? previous : emptyData(expectedScope)), error: "The action could not be blocked. Reload and try again." }));
-    } finally {
-      if (isCurrent()) setBusyState({ scopeKey: expectedScope, id: null });
-    }
-  };
+  const decide = (operation: Operation, decision: "allow_once" | "allow_always" | "deny") =>
+    runWrite(operation.id, () => api.assistantDecision(installId, operation.id, { decision, expected_revision: operation.revision }),
+      "The permission decision could not be saved. Reload and try again.");
+  const revoke = (permission: Permission) =>
+    runWrite(permission.id, () => api.assistantRevoke(installId, permission.id, { expected_revision: permission.revision }),
+      "The permission could not be revoked. Reload and try again.");
+  const block = (permission: Permission) =>
+    runWrite(`block:${permission.id}`, () => api.assistantBlock(installId, contextId, { action_id: permission.action_id, resource_id: permission.resource_id }),
+      "The action could not be blocked. Reload and try again.");
 
   if (!visible.actions.length && !visible.operations.length && !visible.permissions.length && !visible.error) return null;
   return (
@@ -364,7 +402,7 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
           {expanded ? "Hide permissions and actions" : "Actions & permissions"}
         </button>
       </div>
-      {visible.error && <p className="text-micro text-fail" role="alert">{visible.error} <button className="lnk" type="button" onClick={() => void query()}>Retry</button></p>}
+      {visible.error && <p className="text-micro text-fail" role="alert">{visible.error} <button className="lnk" type="button" onClick={() => void poller.current?.refresh()}>Retry</button></p>}
       {visible.operations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} busy={busy === operation.id || !canDecide} decide={decide} />)}
       {expanded && (
         <div className="app-assistant-settings">
