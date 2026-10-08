@@ -2,8 +2,8 @@ export {};
 /**
  * CAD-784 CRM Campaigns: content wire grammar plus mounted
  * list/new/detail flow through the real AppShell — no inline builder
- * on the list, host previews, distinct test-send, attributed
- * Apply/Discard, and locked preview-only sender material.
+ * on the list, host previews, distinct test-send, attributed proposal
+ * Review/Use/Save and non-mutating Discard, and locked preview-only sender material.
  */
 declare function require(name: string): any;
 
@@ -770,8 +770,8 @@ async function mountedFlow() {
 
   await openTab("email");
   // Host-rendered preview (CAD-1008): the saved revision renders
-  // automatically — Visual default, HTML/Text tabs — beside the content
-  // summary card. A manual Refresh re-renders the same saved version.
+  // automatically. Editing offers exactly Visual and HTML; Text is not
+  // an editing mode. A manual Refresh re-renders the same saved version.
   await settle(() => {
     const frame = host.querySelector('iframe[data-preview="visual"]') as HTMLIFrameElement;
     assert(frame && (frame.getAttribute("srcdoc") ?? "").includes("HTML form"), "the saved revision auto-rendered");
@@ -781,9 +781,19 @@ async function mountedFlow() {
     const frame = host.querySelector('iframe[data-preview="visual"]') as HTMLIFrameElement;
     assert(frame && (frame.getAttribute("srcdoc") ?? "").includes("HTML form"), "refresh re-renders the saved revision");
   });
-  await click(byText("button", "Text"));
-  await flush();
-  assert((host.querySelector('pre[data-preview="text"]')?.textContent ?? "").includes("TEXT form"), "text tab shows the host text form");
+  equal(Array.from(host.querySelectorAll('[aria-label="Email editing mode"] button')).map((b) => b.textContent?.trim()), ["Visual", "HTML"], "saved email has exactly Visual and HTML modes");
+  await click(byText("button", "HTML"));
+  await settle(() => assert(host.querySelector("#cmp-html-source"), "HTML mode opens source editing"));
+  const htmlEditor = host.querySelector("#cmp-html-source") as HTMLTextAreaElement;
+  const firstSavedContent = contents[unsavedCampaignId];
+  assert(
+    firstSavedContent.html !== undefined
+      ? htmlEditor.value === firstSavedContent.html
+      : firstSavedContent.blocks.some((block: any) => htmlEditor.value.includes(block.text ?? block.label)),
+    "HTML editor starts from the current saved content",
+  );
+  assert(host.querySelector('iframe[data-preview="draft-html"]')?.getAttribute("sandbox") === "", "HTML draft preview is scriptless");
+  await click(byText("button", "Visual"));
   assert(text().includes("noreply@cadence.invalid"), "preview-only sender material renders");
 
   // CAD-1057 inline editing: the envelope's subject is editable in
@@ -801,9 +811,11 @@ async function mountedFlow() {
   await click(saveAs());
   await settle(() => assert(text().includes("Saved v2"), "the correction saved a new revision"));
 
-  // Approval is content-only; a proposal Apply invalidates it and a
-  // stale-source proposal refuses with Apply disabled.
+  // Approval is content-only and is a separate, collapsed Overview action.
   await openTab("overview");
+  const approvalGuard = host.querySelector('details[data-overview-guard="content-approval"]');
+  assert(approvalGuard && !((approvalGuard as HTMLDetailsElement).open), "content approval starts collapsed separately from the summary");
+  await click(approvalGuard.querySelector("summary"));
   await click(byText("button", "Approve r2 (content-only)"));
   await settle(() => assert(text().includes("Approved r2"), "approval lands content-only"));
   await openTab("email");
@@ -817,59 +829,83 @@ async function mountedFlow() {
   await click(saveAs());
   await settle(() => assert(text().includes("Saved v3"), "the correction saved r3"));
   await settle(() => assert(text().includes("Needs review (stale)"), "the drifted proposal renders stale"));
-  // The row's first button is "Preview draft" — the Apply control is a
-  // later button in the same row; find it by label, never by position.
-  const staleApply = Array.from(host.querySelectorAll('[data-proposal]'))
-    .flatMap((li) => Array.from(li.querySelectorAll("button")))
-    .find((b) => (b?.textContent ?? "").includes("Apply"));
-  assert(staleApply && (staleApply as HTMLButtonElement).disabled, "stale proposal's Apply is disabled");
+  // The stale source may be reviewed, but Use remains disabled and no
+  // proposal action can replace the newer saved revision.
+  const staleRow = Array.from(host.querySelectorAll('[data-proposal]'))
+    .find((li) => (li.textContent ?? "").includes("Assistant draft subject v2 draft"));
+  assert(staleRow, "the stale proposal row remains visible for review");
+  const staleUse = Array.from(staleRow.querySelectorAll("button"))
+    .find((b) => (b.textContent ?? "").trim() === "Use in editor");
+  assert(staleUse && (staleUse as HTMLButtonElement).disabled, "stale proposal Use is disabled");
+  await click(staleRow.querySelector('[data-proposal-preview]'));
+  await settle(() => assert(host.querySelector('[data-proposal-body]'), "stale proposal may be reviewed without being used"));
+  assert((Array.from(staleRow.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === "Use in editor") as HTMLButtonElement).disabled, "review does not enable Use for stale proposal");
+  await click(staleRow.querySelector('[data-version="saved"]'));
   // Discard clears it non-mutating.
+  const staleRevision = openDoc().revision;
   await click(byText("button", "Discard"));
   await settle(() => assert(text().includes("draft unchanged at r3"), "discard is non-mutating"));
+  equal(openDoc().revision, staleRevision, "discarding the stale proposal leaves saved revision r3 unchanged");
+  equal(openDoc().subject, "Assistant draft subject v3", "discarding the stale proposal leaves saved content unchanged");
 
   // ---- CAD-1013 pinned inline edit ----
-  // While the operator edits text, a concurrent agent Apply lands a
-  // newer revision. The editor must keep the local text, flag the edit
-  // stale and pin the save to the revision it began on — a conflict
-  // refuses instead of silently overwriting the agent's newer draft.
+  // A separate operator/server save advances the real fixture's content
+  // endpoint while this editor has local work. The editor's save must stay
+  // CAS-pinned to its original revision, refuse, and preserve local text;
+  // Discard then explicitly reloads the latest server version.
   const pinnedBase = openDoc().revision as number;
+  const pinnedCampaignId = openDoc().campaign_id as string;
   await fillInput("#cmp-subject", "My kept local correction");
-  // A concurrent assistant draft lands (scoped chat turn) and applies
-  // → doc r(N+1).
-  landAssistantDraft(openDoc().campaign_id as string, { subject: "Concurrent assistant draft" });
-  await click(byText("button", "Refresh drafts"));
-  await settle(() => assert(host.querySelectorAll('[data-proposal]').length > 0, "a fresh proposal pends"), 30000);
-  const freshLi = Array.from(host.querySelectorAll('[data-proposal]')).at(-1)!;
-  await click(Array.from(freshLi.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Apply")));
-  await settle(() => assert(openDoc().revision === pinnedBase + 1, "a concurrent apply bumped the doc mid-edit"));
-  // Local text is preserved and the stale flag shows.
-  assert(
-    (host.querySelector("#cmp-subject") as HTMLInputElement).value === "My kept local correction",
-    "the concurrent apply did not clobber the local edit",
+  const serverVersionSubject = `Concurrent server version from r${pinnedBase}`;
+  const independentSave = await globalThis.fetch(
+    "/api/app-installations/install-crm/contexts/ctx-a/content/campaigns",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        campaign_id: pinnedCampaignId,
+        subject: serverVersionSubject,
+        preheader: "Saved by the other operator",
+        blocks: [{ type: "paragraph", text: "Independent server edit" }],
+        expected_revision: pinnedBase,
+      }),
+    },
   );
-  assert(host.querySelector('[data-stale-edit]'), "the stale-edit warning renders");
-  // Saving stays pinned to the base revision → the backend conflicts.
+  assert(independentSave.ok, "the independent current-revision save succeeds through the campaign save route");
+  const independentReceipt = await independentSave.json() as { content: { revision: number; subject: string } };
+  equal(independentReceipt.content.revision, pinnedBase + 1, "the independent save advances exactly one revision");
+  equal(independentReceipt.content.subject, serverVersionSubject, "the server saved the independent operator's content");
+
+  // The local editor still submits the revision it began from; the fixture
+  // refuses that stale CAS, and the client fetches latest metadata without
+  // replacing the local draft.
   await click(saveAs());
-  await settle(() =>
-    assert(
-      text().includes("since you started editing"),
-      "the pinned save conflicts instead of overwriting the newer draft",
-    ),
-  );
+  await settle(() => assert(
+    text().includes(`saved email is now v${pinnedBase + 1}`),
+    "the pinned local save conflicts and reports the newer saved revision",
+  ));
+  equal(saveBodies.at(-2)?.expected_revision, pinnedBase, "the independent save was pinned to the current revision");
+  equal(saveBodies.at(-1)?.expected_revision, pinnedBase, "the refused local save remains pinned to its original revision");
+  equal(openDoc().revision, pinnedBase + 1, "the client observes the server's latest revision after refusal");
+  equal(openDoc().subject, serverVersionSubject, "latest server metadata arrives without overwriting saved content");
   assert(
     (host.querySelector("#cmp-subject") as HTMLInputElement).value === "My kept local correction",
-    "the refused save keeps the local text for a reload decision",
+    "the refused save keeps local text while latest metadata loads",
   );
+  assert(host.querySelector('[data-stale-edit]'), "the stale-edit warning renders after the CAS refusal");
   await click(Array.from(editorBar()!.querySelectorAll("button")).find((b) => b.textContent === "Discard"));
-  await settle(() => assert(!editorBar(), "Discard drops the unsaved edits"));
+  await settle(() => assert(!editorBar(), "Discard reloads and clears the unsaved local edits"));
+  equal((host.querySelector("#cmp-subject") as HTMLInputElement).value, serverVersionSubject, "Discard loads the latest saved subject from the other operator");
+  equal((host.querySelector("#cmp-preheader") as HTMLInputElement).value, "Saved by the other operator", "Discard reloads the latest saved preheader too");
+  equal(openDoc().revision, pinnedBase + 1, "Discard does not create another revision");
 
   // ---- CAD-1016: the verified assistant-draft seam (no manual mint) ----
   // The mint control is gone: an ordinary scoped chat message invokes the
   // assistant-draft turn, which lands an inert pending proposal. Isolate a
   // real no-scoped-message state first, assert there is no mint control and
   // no proposal request can leave the browser, then send a scoped message
-  // and land the agent's draft → the verified proposal appears and Apply
-  // bumps the revision + invalidates approval.
+  // and land the agent's draft → the verified proposal appears for Review,
+  // then Use in editor and an explicit Save create a revision.
   assert(!byText("button", "Ask assistant to draft"), "no manual mint control renders");
   const sendsAtSeam = sendBodies.length;
   await React.act(async () => {
@@ -898,10 +934,10 @@ async function mountedFlow() {
   await settle(() => assert(host.querySelector(`[data-proposal="${landed.proposal_id}"]`), "the landed draft appears in the pending list"), 30000);
   assert(text().includes("crm-writer"), "the badge names the receipt's agent");
 
-  // The pending draft's actual body previews BEFORE Apply — the REAL
-  // host proposal-render (Visual iframe + HTML + Text) of the inert
-  // draft, whose receipt carries source_revision (never a saved
-  // `revision`), preview_only, send_ready. No save, no unsaved render.
+  // Review the pending draft through the REAL host proposal-render
+  // (Visual iframe + HTML) of the inert draft, whose receipt carries
+  // source_revision (never a saved `revision`), preview_only, send_ready.
+  // No save and no third Text mode.
   await click(host.querySelector(`[data-proposal-preview="${landed.proposal_id}"]`));
   await settle(() => assert(host.querySelector(`[data-proposal-body="${landed.proposal_id}"]`), "the draft body preview opens"), 30000);
   const bodyPreview = host.querySelector(`[data-proposal-body="${landed.proposal_id}"]`);
@@ -910,28 +946,35 @@ async function mountedFlow() {
     assert(frame, "the pending draft's Visual iframe renders before Apply");
     assert((frame.getAttribute("srcdoc") ?? "").includes("Assistant draft subject"), "the real draft body renders in the Visual iframe");
   }, 30000);
-  // HTML + Text tabs render the same pending draft.
-  // The shared toolbar (Visual/HTML/Text) now drives the draft stage.
+  // Proposal review has the same exact Visual | HTML mode contract.
+  equal(Array.from(host.querySelectorAll('[aria-label="Email editing mode"] button')).map((b) => b.textContent?.trim()), ["Visual", "HTML"], "proposal review has exactly Visual and HTML modes");
   await click(byText("button", "HTML"));
-  await settle(() => assert((bodyPreview!.querySelector('pre[data-preview="html"]')?.textContent ?? "").includes("Assistant draft subject"), "HTML tab renders the pending draft"));
-  await click(byText("button", "Text"));
-  await settle(() => assert((bodyPreview!.querySelector('pre[data-preview="text"]')?.textContent ?? "").includes("Assistant copy"), "Text tab renders the pending draft body"));
+  await settle(() => assert((bodyPreview!.querySelector('pre[data-preview="html"]')?.textContent ?? "").includes("Assistant draft subject"), "HTML mode renders the pending draft"));
+  assert(!bodyPreview!.querySelector('[data-preview="text"]'), "proposal review has no Text mode surface");
 
-  // Apply the verified draft: expected_revision = current draft, the
-  // revision moves, approval invalidates and the stale row clears.
+  // Review is read-only; Use changes only the local editor draft. Explicit
+  // Save alone sends a revision-pinned content write and resets approval.
   const revisionBefore = openDoc().revision as number;
   const verifiedLi = host.querySelector(`[data-proposal="${landed.proposal_id}"]`);
   assert(verifiedLi, "the verified proposal row exists");
-  await click(Array.from(verifiedLi!.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Apply")));
-  await settle(() => assert(text().includes("Applied as revision"), "verified apply reports the new revision"));
-  assert(applyBodies.at(-1)?.expected_revision === revisionBefore, "verified apply sent the current revision");
-  assert(text().includes("approval invalidated"), "apply invalidated approval visibly");
-  await settle(() =>
-    assert(
-      !host.querySelector(`[data-proposal="${landed.proposal_id}"]`),
-      "the decided proposal leaves the pending list",
-    ),
-  );
+  const savesBeforeUse = saveBodies.length;
+  const appliesBeforeUse = applyBodies.length;
+  await click(Array.from(verifiedLi!.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === "Use in editor"));
+  await settle(() => assert(!host.querySelector(`[data-proposal-body="${landed.proposal_id}"]`) && host.querySelector("[data-unsaved-bar]"), "Use returns to the dirty local editor"));
+  equal(openDoc().revision, revisionBefore, "Use leaves the saved revision unchanged");
+  equal(saveBodies.length, savesBeforeUse, "Use makes no save request");
+  equal(applyBodies.length, appliesBeforeUse, "Use invokes no proposal Apply API");
+  equal(proposals[landed.proposal_id].state, "pending", "Use leaves the verified proposal undecided");
+  equal((host.querySelector("#cmp-subject") as HTMLInputElement).value, landed.subject, "Use copies the reviewed subject into the local draft");
+
+  await click(saveAs());
+  await settle(() => assert(openDoc().revision === revisionBefore + 1, "explicit Save creates the next content revision"));
+  equal(saveBodies.at(-1)?.expected_revision, revisionBefore, "explicit Save is pinned to the reviewed source revision");
+  equal(saveBodies.at(-1)?.subject, landed.subject, "explicit Save persists the used proposal subject");
+  assert(text().includes("approval reset"), "explicit Save visibly invalidates prior approval");
+  equal(applyBodies.length, appliesBeforeUse, "proposal Apply endpoint remains unused by Review/Use/Save");
+  equal(proposals[landed.proposal_id].state, "pending", "saving proposal content does not forge a proposal decision receipt");
+  await settle(() => assert(host.querySelector(`[data-proposal="${landed.proposal_id}"] [data-state="stale"]`), "saved proposal source displays as stale instead of disappearing as applied"));
 
 
   // Test-send is a real one-recipient SMTP send — the fixture's
@@ -986,9 +1029,12 @@ async function mountedFlow() {
         .map((el) => el.getAttribute("aria-label"));
     };
     const overview = await panelsOf("overview");
-    for (const label of ["Ready to send", "Campaign summary", "Content approval", "Test send", "Final send"]) {
+    for (const label of ["Next task", "Campaign summary", "Content approval", "Test send", "Final send"]) {
       assert(overview.includes(label), `Overview carries: ${label}`);
     }
+    const overviewGuards = Array.from(host.querySelectorAll('[data-panel="overview"] details[data-overview-guard]')) as HTMLDetailsElement[];
+    equal(overviewGuards.map((guard) => guard.getAttribute("data-overview-guard")), ["content-approval", "test-send", "final-send"], "approval, test and final-send surfaces remain separate");
+    assert(overviewGuards.every((guard) => !guard.open), "guarded action forms remain collapsed on the compact Overview");
     assert(!overview.includes("Frozen audience") && !overview.includes("Email preview"), "Overview mounts no other tab's panels");
     const email = await panelsOf("email");
     assert(email.includes("Email preview") && email.includes("Assistant proposals"), "Email carries the preview and the proposal strip");

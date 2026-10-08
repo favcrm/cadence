@@ -475,6 +475,13 @@ async function mountedFlow() {
     if (host.querySelector(`[data-tab="${name}"][aria-selected="true"]`)) return;
     await click(host.querySelector(`[data-tab="${name}"]`));
   };
+  const overviewGuard = (name: string) =>
+    host.querySelector(`details[data-overview-guard="${name}"]`) as HTMLDetailsElement | null;
+  const openOverviewGuard = async (name: string) => {
+    const guard = overviewGuard(name);
+    assert(guard, `the ${name} action remains available in its separate overview disclosure`);
+    if (!guard.open) await click(guard.querySelector("summary"));
+  };
   const byText = (tag: string, label: string) =>
     Array.from(host.querySelectorAll(tag)).find((el) => (el.textContent ?? "").trim() === label) ?? null;
   async function fillInput(selector: string, value: string) {
@@ -498,29 +505,34 @@ async function mountedFlow() {
     );
   });
 
-  // Detail page paints: sender bound, unsubscribe origin, test send
-  // armed, and the frozen-audience panel.
+  // Detail page paints a compact summary; the independently guarded
+  // approval, test and final-send actions start collapsed.
   await settle(() => assert(host.querySelector('section[aria-label="Campaign details"]'), "detail renders"));
   await settle(() => assert(text().includes("news@example.com"), "bound sender paints"));
-  // CAD-1059: the campaign shows one status line; the sender and the
-  // unsubscribe origin are chosen in Settings -> Email sending.
-  assert(host.querySelector('[data-sending-status="set"]')?.textContent?.includes("news@example.com"), "one status line names the sender");
-  assert(!text().includes("link r1") && !text().includes("auth r1"), "no link or auth revision in the main path");
+  const senderSummary = () => {
+    const summary = host.querySelector("[data-content-summary]");
+    const label = Array.from(summary?.querySelectorAll("dt") ?? []).find((dt) => dt.textContent?.trim() === "Sender");
+    return label?.nextElementSibling ?? null;
+  };
+  assert(senderSummary()?.textContent?.includes("news@example.com"), "the compact campaign summary names the sender");
+  assert(!Array.from(host.querySelectorAll("[data-content-summary]"))[0]?.textContent?.match(/\b(?:link|auth)\s+r\d/i), "the compact summary exposes no link or auth revision");
+  for (const name of ["content-approval", "test-send", "final-send"]) {
+    assert(overviewGuard(name) && !overviewGuard(name)!.open, `${name} stays a distinct collapsed overview action`);
+  }
 
-  // No "locked" copy anywhere.
-  assert(!text().includes("locked until"), "no locked-until copy remains");
-  assert(!text().includes("locked"), "nothing is described as locked");
-
-  // Prepare is gated on the remaining prerequisites. CAD-1178: the freeze
-  // check runs automatically, so the audience item is already satisfied and
-  // the missing list names what is still owed.
+  // Prepare is gated on remaining prerequisites. CAD-1178: the freeze
+  // check runs automatically; open its separate action to inspect the
+  // host-verified missing list and disabled control.
   const prepareButton = () => byText("button", "Prepare send") as HTMLButtonElement | null;
-  assert(prepareButton(), "the prepare control renders");
+  await openOverviewGuard("final-send");
+  assert(prepareButton(), "the prepare control renders in final-send details");
   await settle(() => assert(prepareButton()!.disabled, "prepare stays gated until the remaining prerequisites are met"));
-  assert(text().includes("missing"), "the missing prerequisites are named");
+  assert(host.querySelector('[data-prerequisites="missing"]')?.textContent?.includes("missing"), "the missing prerequisites are named");
 
   // An accepted test send of this exact content+binding is required
-  // before prepare — run one through the bound sender.
+  // before prepare — run one through its separately disclosed action.
+  await openOverviewGuard("final-send");
+  await openOverviewGuard("test-send");
   const sendTestBtn = byText("button", "Send test") as HTMLButtonElement | null;
   assert(sendTestBtn && !sendTestBtn.disabled, "the test send is armed on a live binding");
   await fillInput("#cmp-test-email", "operator@example.com");
@@ -542,7 +554,9 @@ async function mountedFlow() {
     }
   });
 
-  // Prepare: counts + masked sample + digest paint.
+  // Prepare: reopen its guarded section; counts + masked sample + digest paint.
+  await openOverviewGuard("test-send");
+  await openOverviewGuard("final-send");
   await click(prepareButton());
   await settle(() => assert(host.querySelector("[data-prepared]"), "the prepared view paints"));
   assert(text().includes("3 / ceiling 50"), "the final count paints against its ceiling");
@@ -633,7 +647,10 @@ async function mountedFlow() {
       React.createElement(AppShell, { installId: "install-crm", viewer: { operator: true, readOnly: false } }),
     );
   });
-  await settle(() => assert(host2.querySelector('[data-sending-status="unset"] a[href="/settings/email"]'), "Set up sending links to Settings -> Email sending"));
+  await settle(() => assert(host2.querySelector('[data-content-summary] a[href="/settings/email"]'), "the compact sender summary links setup to Settings -> Email sending"));
+  const testGuard2 = host2.querySelector('details[data-overview-guard="test-send"]') as HTMLDetailsElement | null;
+  assert(testGuard2 && !testGuard2.open, "test send remains a separate collapsed overview action without a sender");
+  testGuard2.open = true;
   const testButton2 = Array.from(host2.querySelectorAll("button")).find((b) => b.textContent === "Send test") as HTMLButtonElement | undefined;
   assert(testButton2 && testButton2.disabled, "test send disables without a sender");
   assert((host2.textContent ?? "").includes("a live SMTP sender binding"), "the missing sender is named");
@@ -659,7 +676,11 @@ async function mountedFlow() {
       React.createElement(AppShell, { installId: "install-crm", viewer: { operator: true, readOnly: false } }),
     );
   });
-  await settle(() => assert(host3.querySelector('[data-sending-status="set"]')?.textContent?.includes("acme@cadencecloud.app"), "hosted sender status line"));
+  const hostedSenderSummary = host3.querySelector("[data-content-summary]");
+  await settle(() => assert(hostedSenderSummary?.textContent?.includes("acme@cadencecloud.app"), "hosted sender appears in the compact campaign summary"));
+  const testGuard3 = host3.querySelector('details[data-overview-guard="test-send"]') as HTMLDetailsElement | null;
+  assert(testGuard3 && !testGuard3.open, "hosted test send remains a separate collapsed overview action");
+  testGuard3.open = true;
   const input3 = host3.querySelector("#cmp-test-email") as HTMLInputElement;
   await React.act(async () => {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input3, "operator@example.com");

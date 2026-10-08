@@ -871,6 +871,17 @@ pub struct BindingDraft<'a> {
     pub connection_id: Option<&'a str>,
 }
 
+/// Validated clone selection inputs; authority remains in the URL scope.
+#[derive(Clone, Copy)]
+pub struct CloneOptions<'a> {
+    pub expected_revision: i64,
+    pub name: &'a str,
+    pub copy_audience: bool,
+    pub source_freeze_id: Option<&'a str>,
+    pub copy_sender: bool,
+    pub source_binding_id: Option<&'a str>,
+}
+
 /// One saved binding row.
 struct BindingRecord {
     binding_id: String,
@@ -1121,6 +1132,137 @@ impl RecordStore {
             Ok(())
         })?;
         Ok(json!({"content":self.app_content_show(context,campaign)?["content"]}))
+    }
+
+    /// Clone saved content into a host-minted, initial-revision draft.
+    /// Selection references are explicitly supplied by the operator UI
+    /// because the content store has no canonical campaign-selection link;
+    /// they are re-resolved in this context and never copy frozen recipients.
+    pub fn app_content_clone(
+        &self,
+        context: &str,
+        source_campaign: &str,
+        options: &CloneOptions<'_>,
+    ) -> Result<Value> {
+        let CloneOptions {
+            expected_revision,
+            name,
+            copy_audience,
+            source_freeze_id,
+            copy_sender,
+            source_binding_id,
+        } = *options;
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(source_campaign, "campaign ID")?;
+        if expected_revision <= 0 {
+            return Err(Error::rejected(
+                "expected content revision must be positive",
+            ));
+        }
+        if copy_audience != source_freeze_id.is_some() || copy_sender != source_binding_id.is_some()
+        {
+            return Err(Error::rejected("campaign clone selections are malformed"));
+        }
+        if name.trim() != name
+            || name.chars().count() > NAME_CHARS
+            || name.contains(['{', '}'])
+            || reject_text(name, NAME_BYTES, false).is_err()
+        {
+            return Err(Error::rejected(
+                "campaign name exceeds its supported shape or bounds",
+            ));
+        }
+        if let Some(freeze) = source_freeze_id {
+            crate::proto::identifier(freeze, "freeze ID")?;
+        }
+        if let Some(binding) = source_binding_id {
+            crate::proto::identifier(binding, "sender binding ID")?;
+            if binding == PREVIEW_BINDING_ID {
+                return Err(Error::rejected("sender binding is unavailable for cloning"));
+            }
+        }
+
+        let (target, audience, sender_binding_id) = self.write_tx(|tx| {
+            let source = self.content_row(tx, context, source_campaign)?.ok_or_else(|| {
+                Error::rejected("email content is unavailable for this installation and context")
+            })?;
+            if source.revision != expected_revision {
+                return Err(Error::rejected("email content revision is stale"));
+            }
+            let audience = match source_freeze_id {
+                None => None,
+                Some(freeze) => {
+                    let found: Option<(String, Option<String>)> = tx
+                        .query_row(
+                            "SELECT base,exclusion_list_id FROM app_audience_freezes WHERE context_id=? AND freeze_id=?",
+                            params![context, freeze],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()
+                        .map_err(|e| Error::internal(e.to_string()))?;
+                    let (base, exclusion_list_id) = found.ok_or_else(|| {
+                        Error::rejected("audience selection is unavailable for this installation and context")
+                    })?;
+                    let base: Value = serde_json::from_str(&base)
+                        .map_err(|_| Error::rejected("audience selection is corrupt"))?;
+                    crate::store::app_audiences::AudienceBase::parse(&base)
+                        .map_err(|_| Error::rejected("audience selection is corrupt"))?;
+                    Some(json!({"base": base, "exclusion_list_id": exclusion_list_id}))
+                }
+            };
+            if let Some(binding) = source_binding_id {
+                let found: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM app_sender_bindings WHERE context_id=? AND binding_id=?)",
+                        params![context, binding],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                if !found {
+                    return Err(Error::rejected(
+                        "sender binding is unavailable for this installation and context",
+                    ));
+                }
+            }
+
+            // The clone uses exactly the saved format and payload bytes;
+            // source rows are host-sanitized and the original is untouched.
+            let mut draft = if let Some(html) = source.html.as_deref() {
+                Draft::parse_html(&source.subject, &source.preheader, html)?
+            } else {
+                let blocks = source.blocks.as_array().ok_or_else(|| {
+                    Error::rejected("stored email content is unavailable")
+                })?;
+                Draft::parse(&source.subject, &source.preheader, blocks)?
+            };
+            if let Some(html) = source.html {
+                draft.html = Some(html);
+            }
+            draft = draft.with_text(source.text.as_deref())?.with_name(Some(name))?;
+            let target = format!("campaign-{}", uuid::Uuid::new_v4().simple());
+            let blocks_text = serde_json::to_string(&draft.canonical_blocks())
+                .map_err(|e| Error::internal(e.to_string()))?;
+            let digest = content_digest(self.install(), context, &target, 1, &draft);
+            tx.execute(
+                "INSERT INTO app_content_docs(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,approval_revision,approval_digest,actor,created,updated,html,text_override,name) VALUES(?,?,1,?,?,?,?,NULL,NULL,'operator',?,?,?, ?,?)",
+                params![context, target, draft.subject, draft.preheader, blocks_text, digest, now(), now(), draft.html, draft.text, draft.name],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO app_content_revisions(context_id,campaign_id,revision,subject,preheader,blocks,content_digest,actor,origin,proposal_id,at,html,text_override) VALUES(?,?,1,?,?,?,?,'operator','operator',NULL,?,?,?)",
+                params![context, target, draft.subject, draft.preheader, blocks_text, digest, now(), draft.html, draft.text],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+            Ok((target, audience, source_binding_id.map(str::to_owned)))
+        })?;
+        let content = self.app_content_show(context, &target)?["content"].clone();
+        Ok(json!({
+            "content": content,
+            "starter_selection": {
+                "audience": audience,
+                "sender_binding_id": sender_binding_id,
+            }
+        }))
     }
 
     pub fn app_content_show(&self, context: &str, campaign: &str) -> Result<Value> {

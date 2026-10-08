@@ -49,6 +49,15 @@ export function newBlock(kind: CampaignBlock["type"]): EditorBlock {
   return { key: editorKey++, kind, text: "", label: "", url: kind === "button" ? "https://" : "" };
 }
 
+export function blocksFromProposal(blocks: CampaignBlock[]): EditorBlock[] {
+  return blocks.map((block) => {
+    const editorBlock = newBlock(block.type);
+    return block.type === "button"
+      ? { ...editorBlock, label: block.label, url: block.url }
+      : { ...editorBlock, text: block.text };
+  });
+}
+
 export function blocksToGrammar(blocks: EditorBlock[]): CampaignBlock[] {
   return blocks.map((block) => {
     if (block.kind === "heading") return { type: "heading", text: block.text };
@@ -111,6 +120,8 @@ export function useEmailDraft(
   const [source, setSource] = useState(doc?.revision ?? 0);
   const [stale, setStale] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [reloading, setReloading] = useState(false);
+  const [needsLatestReload, setNeedsLatestReload] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   /** CAD-1146: undo history for structural block ops (add/move/delete).
@@ -119,9 +130,22 @@ export function useEmailDraft(
    *  is UI-local: saves, discards and clean doc syncs reset it. */
   const blockHistory = useRef<EditorBlock[][]>([]);
 
-  const dirty = doc !== null && !sameDraft(draft, baseline);
-  const live = useRef({ dirty, doc });
-  live.current = { dirty, doc };
+  // A proposal can seed the revision-0 draft before any saved document
+  // exists. Changes there are still dirty and must be explicitly saved.
+  const dirty = !sameDraft(draft, baseline);
+  const sessionKey = `${scope.installId}:${scope.contextId}:${campaignId}`;
+  const live = useRef({ dirty, doc, sessionKey });
+  live.current = { dirty, doc, sessionKey };
+  const requestEpoch = useRef(0);
+  const editEpoch = useRef(0);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      requestEpoch.current += 1;
+    };
+  }, [sessionKey]);
 
   const identity = doc === null ? "none" : `${doc.revision}:${doc.contentDigest}`;
   useEffect(() => {
@@ -135,11 +159,15 @@ export function useEmailDraft(
     setBaseline(next);
     setSource(doc.revision);
     setStale(false);
+    setNeedsLatestReload(false);
     blockHistory.current = [];
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [identity]);
 
-  const patch = (change: Partial<EmailDraft>) => setDraft((prev) => ({ ...prev, ...change }));
+  const patch = (change: Partial<EmailDraft>) => {
+    editEpoch.current += 1;
+    setDraft((prev) => ({ ...prev, ...change }));
+  };
 
   /** Structural block change (add/move/delete): undoable. */
   const setBlocks = (blocks: EditorBlock[]) => {
@@ -156,16 +184,61 @@ export function useEmailDraft(
   const canUndo = blockHistory.current.length > 0;
 
   const discard = () => {
-    const next = draftFromDoc(doc);
-    setDraft(next);
-    setBaseline(next);
-    setSource(doc?.revision ?? 0);
-    setStale(false);
+    if (saving || reloading) return;
+    if (!needsLatestReload && !stale && (doc?.revision ?? 0) === source) {
+      const next = draftFromDoc(doc);
+      setDraft(next);
+      setBaseline(next);
+      setSource(doc?.revision ?? 0);
+      setStale(false);
+      setNeedsLatestReload(false);
+      setError(null);
+      setNote(null);
+      blockHistory.current = [];
+      return;
+    }
+
+    const epoch = ++requestEpoch.current;
+    const editsAtStart = editEpoch.current;
+    const requestedSession = sessionKey;
+    setReloading(true);
     setError(null);
-    blockHistory.current = [];
+    setNote(null);
+    void contentClient.show(scope, campaignId)
+      .then((value) => {
+        const latest = parseContentDoc(value);
+        if (!mounted.current || live.current.sessionKey !== requestedSession || requestEpoch.current !== epoch) return;
+        if (latest.campaignId !== campaignId || latest.revision <= source) {
+          throw new ApiError("the latest saved email could not be confirmed; your edits are kept", 409);
+        }
+        onDoc(latest);
+        if (editEpoch.current !== editsAtStart) {
+          setError("The draft changed while the latest version was loading. Your edits are kept; discard again to reload.");
+          return;
+        }
+        const next = draftFromDoc(latest);
+        setDraft(next);
+        setBaseline(next);
+        setSource(latest.revision);
+        setStale(false);
+        setNeedsLatestReload(false);
+        setError(null);
+        setNote(`Reloaded latest saved version v${latest.revision}.`);
+        blockHistory.current = [];
+      })
+      .catch((err: unknown) => {
+        if (!mounted.current || live.current.sessionKey !== requestedSession || requestEpoch.current !== epoch) return;
+        setError(`Could not reload the latest saved email. Your edits are kept. ${friendlyCampaignError(err)}`);
+      })
+      .finally(() => {
+        if (mounted.current && live.current.sessionKey === requestedSession && requestEpoch.current === epoch) {
+          setReloading(false);
+        }
+      });
   };
 
   const save = () => {
+    if (saving || reloading) return;
     setError(null);
     setNote(null);
     try {
@@ -209,22 +282,45 @@ export function useEmailDraft(
         setBaseline(synced);
         setSource(next.revision);
         setStale(false);
+        setNeedsLatestReload(false);
+        requestEpoch.current += 1;
         blockHistory.current = [];
         onDoc(next);
         setNote(`Saved v${next.revision} — approval reset. The preview below is the host render.`);
       })
       .catch((err: unknown) => {
-        // CAS conflict: keep the local edits and say what happened.
-        setError(
-          isConflict(err)
-            ? `Not saved — the email changed to a newer version since you started editing (v${source}). Your edits are kept here; Discard to reload the latest, or copy them out first.`
-            : friendlyCampaignError(err),
-        );
+        if (!isConflict(err)) {
+          setError(friendlyCampaignError(err));
+          return;
+        }
+        // A CAS refusal is evidence the cached doc is stale. Fetch it for
+        // the page, but never replace the operator's local draft here.
+        setNeedsLatestReload(true);
+        setStale(true);
+        const epoch = ++requestEpoch.current;
+        const requestedSession = sessionKey;
+        setError(`Not saved — the email changed after editing began (v${source}). Your edits are kept while the latest version loads.`);
+        void contentClient.show(scope, campaignId)
+          .then((value) => {
+            const latest = parseContentDoc(value);
+            if (!mounted.current || live.current.sessionKey !== requestedSession || requestEpoch.current !== epoch) return;
+            if (latest.campaignId !== campaignId || latest.revision <= source) {
+              throw new ApiError("the server did not return a newer saved version", 409);
+            }
+            onDoc(latest);
+            setNeedsLatestReload(true);
+            setStale(true);
+            setError(`Not saved — the saved email is now v${latest.revision}. Your edits are kept; choose Discard to reload the latest, or copy them out first.`);
+          })
+          .catch((refreshError: unknown) => {
+            if (!mounted.current || live.current.sessionKey !== requestedSession || requestEpoch.current !== epoch) return;
+            setError(`Not saved — the email changed after editing began (v${source}), but the latest version could not be loaded. Your edits are kept; retry Discard to reload. ${friendlyCampaignError(refreshError)}`);
+          });
       })
       .finally(() => setSaving(false));
   };
 
-  return { draft, patch, setBlocks, undoBlocks, canUndo, dirty, stale, source, saving, error, note, save, discard };
+  return { draft, patch, setBlocks, undoBlocks, canUndo, dirty, stale, source, saving, reloading, error, note, save, discard };
 }
 
 export type EmailDraftApi = ReturnType<typeof useEmailDraft>;

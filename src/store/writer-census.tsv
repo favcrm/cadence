@@ -68,8 +68,8 @@ store/app_bindings.rs	guarded-store-and-read-queries	prepare	1
 store/app_capabilities.rs	guarded-store-and-read-queries	execute	2
 store/app_capabilities.rs	guarded-store-and-read-queries	guarded_write	2
 store/app_capabilities.rs	guarded-store-and-read-queries	prepare	1
-store/app_content.rs	guarded-store-and-read-queries	execute	19
-store/app_content.rs	guarded-store-and-read-queries	guarded_write	6
+store/app_content.rs	guarded-store-and-read-queries	execute	21
+store/app_content.rs	guarded-store-and-read-queries	guarded_write	7
 store/app_content.rs	guarded-store-and-read-queries	prepare	4
 store/app_content.rs	separate-record-store-content-writers	transaction	1
 store/app_contexts.rs	guarded-store-and-read-queries	execute	3
@@ -187,4 +187,5 @@ daemon/cad1184_revision_acceptance.rs	independent-daemon-acceptance-fixtures	exe
 daemon/cad1184_revision_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	execute	3
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	open	2
+daemon/campaign_clone_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 store/social_publish.rs	guarded-store-and-read-queries	prepare	2

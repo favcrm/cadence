@@ -28,6 +28,7 @@ pub(super) enum Route<'a> {
     CampaignSave(&'a str, &'a str),
     CampaignList(&'a str, &'a str),
     CampaignShow(&'a str, &'a str, &'a str),
+    CampaignClone(&'a str, &'a str, &'a str),
     Render(&'a str, &'a str, &'a str),
     Approve(&'a str, &'a str, &'a str),
     TestPrepare(&'a str, &'a str, &'a str),
@@ -77,6 +78,9 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         ("campaigns", []) => Some(Route::CampaignSave(install, context)),
         ("campaigns", ["list"]) => Some(Route::CampaignList(install, context)),
         ("campaigns", [id]) if segment(id) => Some(Route::CampaignShow(install, context, id)),
+        ("campaigns", [id, "clone"]) if segment(id) => {
+            Some(Route::CampaignClone(install, context, id))
+        }
         ("campaigns", [id, "render"]) if segment(id) => Some(Route::Render(install, context, id)),
         ("campaigns", [id, "approve"]) if segment(id) => Some(Route::Approve(install, context, id)),
         ("campaigns", [id, "test-prepare"]) if segment(id) => {
@@ -144,6 +148,21 @@ struct ContentSave {
     name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_revision: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ContentClone {
+    expected_revision: u64,
+    name: String,
+    #[serde(default)]
+    copy_audience: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_freeze_id: Option<String>,
+    #[serde(default)]
+    copy_sender: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_binding_id: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -257,6 +276,32 @@ pub(super) fn handle(
             "app_content_show",
             json!({"install_id": install, "context_id": context, "campaign_id": id}),
         ),
+        Route::CampaignClone(install, context, id) => {
+            let body: ContentClone = match typed(request) {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            let expected = match revision(body.expected_revision) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let mut params = json!({
+                "install_id": install,
+                "context_id": context,
+                "campaign_id": id,
+                "expected_revision": expected,
+                "name": body.name,
+                "copy_audience": body.copy_audience,
+                "copy_sender": body.copy_sender,
+            });
+            if let Some(freeze) = body.source_freeze_id {
+                params["source_freeze_id"] = Value::String(freeze);
+            }
+            if let Some(binding) = body.source_binding_id {
+                params["source_binding_id"] = Value::String(binding);
+            }
+            ("app_content_clone", params)
+        }
         // Saves ride the collection path; the daemon validates the
         // body's campaign identifier grammar. Install/context stay
         // URL authority.
