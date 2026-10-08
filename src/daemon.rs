@@ -375,6 +375,10 @@ pub struct Shared {
     /// `"respawned"` — attachable kinds only), recorded before the
     /// identity write so a resume report can say which happened.
     open_attach: Mutex<HashMap<String, &'static str>>,
+    /// Recovery candidates whose actor has not yet settled its pane
+    /// proof, keyed by alias and exact (message, submission token).
+    adoptions_pending: Mutex<HashMap<String, Vec<(String, String)>>>,
+    adoptions_notify: Notify,
     /// Provider launch overrides for this daemon instance.
     provider_env: ProviderEnv,
     /// Unix epoch seconds when this daemon process came up — the
@@ -677,6 +681,21 @@ impl Shared {
         // `Arc` so `lease` can move into the struct.
         let wiki_pm_dir = pm_dir_of(&opts.provider_env)?;
         let wiki_pm_lease = lease.as_ref().map(|l| l.pm_lease());
+        // Actors consume Store candidates at open; retain an independent
+        // copy until adoption succeeds, refuses, or is skipped entirely.
+        let adoptions_pending = store
+            .adoption_snapshot()
+            .into_iter()
+            .map(|(alias, entries)| {
+                (
+                    alias,
+                    entries
+                        .into_iter()
+                        .map(|entry| (entry.message_id, entry.turn_id))
+                        .collect(),
+                )
+            })
+            .collect();
         let shared = Arc::new(Self {
             store,
             changed: Notify::new(),
@@ -699,6 +718,8 @@ impl Shared {
             state_dir: state_dir.to_path_buf(),
             agent_uid: opts.agent_uid,
             open_attach: Mutex::new(HashMap::new()),
+            adoptions_pending: Mutex::new(adoptions_pending),
+            adoptions_notify: Notify::new(),
             provider_env: opts.provider_env.clone(),
             started_at: epoch_secs(),
             stall_sample_secs: Arc::clone(&opts.stall_sample_secs),
@@ -1589,6 +1610,9 @@ impl Shared {
     /// outcomes, and stop cleanly on disable/shutdown.
     fn run_actor(self: &Arc<Self>, alias: &str, ctl: Arc<AgentCtl>) {
         let outcome = self.actor_inner(alias, &ctl);
+        // Also settles candidates when adapter construction or another
+        // pre-proof step fails before `open_adopted` can be reached.
+        self.adoptions_settle(alias);
         // Cleanup always runs: release the adapter, clear ctl, final
         // state. Detach — never kill — on daemon shutdown and on any
         // error exit (a fence): owned endpoints like a tmux pane
@@ -1683,6 +1707,51 @@ impl Shared {
         self.wake();
     }
 
+    /// Whether the exact recovered turn is still awaiting its actor's
+    /// adoption decision.
+    pub(super) fn adoption_pending(&self, alias: &str, message: &str, token: &str) -> bool {
+        self.adoptions_pending
+            .lock()
+            .unwrap()
+            .get(alias)
+            .is_some_and(|entries| entries.iter().any(|(m, t)| m == message && t == token))
+    }
+
+    /// Resolve every recovered turn for an alias and wake reports to
+    /// re-judge their message against the now-settled store state.
+    pub(super) fn adoptions_settle(&self, alias: &str) {
+        if self
+            .adoptions_pending
+            .lock()
+            .unwrap()
+            .remove(alias)
+            .is_some()
+        {
+            self.adoptions_notify.notify_all();
+        }
+    }
+
+    /// Wait at most the supplied deadline for this exact adoption to
+    /// settle. The pending map lock is never held while sleeping.
+    pub(super) fn wait_for_adoption(
+        &self,
+        alias: &str,
+        message: &str,
+        token: &str,
+        deadline: Instant,
+    ) -> bool {
+        while self.adoption_pending(alias, message, token) {
+            let ticket = self.adoptions_notify.ticket();
+            if !self.adoption_pending(alias, message, token) {
+                return true;
+            }
+            if !self.adoptions_notify.wait_if_unchanged(ticket, deadline) {
+                return !self.adoption_pending(alias, message, token);
+            }
+        }
+        true
+    }
+
     fn actor_inner(self: &Arc<Self>, alias: &str, ctl: &Arc<AgentCtl>) -> Result<()> {
         let agent = self.store.agent(alias)?;
         // A lost poll on a live Devin Cloud session is not a dead
@@ -1740,6 +1809,7 @@ impl Shared {
                                    "reason": reason}),
                         );
                     }
+                    self.adoptions_settle(alias);
                     return Err(error);
                 }
             },
@@ -1755,12 +1825,15 @@ impl Shared {
                 .insert(alias.to_string(), attach);
         }
         match &adoption {
-            Some(entries) => self.store.set_identity_adopted_with_quota(
-                alias,
-                &identity,
-                entries,
-                adapter.quota_snapshot(),
-            )?,
+            Some(entries) => {
+                self.store.set_identity_adopted_with_quota(
+                    alias,
+                    &identity,
+                    entries,
+                    adapter.quota_snapshot(),
+                )?;
+                self.adoptions_settle(alias);
+            }
             None => {
                 self.store
                     .set_identity_with_quota(alias, &identity, adapter.quota_snapshot())?;

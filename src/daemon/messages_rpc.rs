@@ -1121,20 +1121,27 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        // CAD-880 (I3): caller identity is connection-bound — an `alias`
-        // field would name whose turn a default resolves, so it is
-        // refused outright rather than ignored.
-        if params.get("alias").is_some() {
-            return Err(Error::rejected(
-                "message report: caller identity is connection-bound; request field \
-                 'alias' is not accepted",
-            ));
+        // CAD-880 (I3): caller identity is connection-bound. A CLI may
+        // carry its environment alias as a claim, but it is accepted only
+        // when the peer ancestry proves that exact agent; it never chooses
+        // whose turn is resolved.
+        if let Some(alias) = params.get("alias") {
+            let alias = alias.as_str().ok_or_else(|| {
+                Error::rejected("message report: request field 'alias' must be a string")
+            })?;
+            if !matches!(self.connection_caller(peer_pid)?, caller_rule::Who::Agent(ref actual) if actual == alias)
+            {
+                return Err(Error::rejected(
+                    "message report: caller identity is connection-bound; request field \
+                     'alias' does not match the proven agent",
+                ));
+            }
         }
         reject_identity_fields(params, "message report")?;
         let kind = required_str(params, "kind")?;
         let text = optional_str(params, "text");
         let (id, token) = self.report_target(params, peer_pid)?;
-        let message = self
+        let mut message = self
             .store
             .message(&id)?
             .ok_or_else(|| Error::rejected("Unknown message"))?;
@@ -1146,11 +1153,37 @@ impl Shared {
                 ));
             }
         }
-        let agent = self.store.agent(&message.alias)?;
+        let mut agent = self.store.agent(&message.alias)?;
         if message.turn_id.as_deref() != Some(token.as_str()) {
             return Err(Error::rejected(
                 "Token does not match the message's submission token",
             ));
+        }
+        // A recovered turn is neither stale nor valid until the actor
+        // has proved (or refused) its pane. Park only the exact recovered
+        // message/token, after all caller and identity checks, without
+        // holding the store lock or mutating message state.
+        if self.adoption_pending(&message.alias, &id, &token) {
+            if !self.wait_for_adoption(
+                &message.alias,
+                &id,
+                &token,
+                Instant::now() + Duration::from_secs(20),
+            ) {
+                return Err(Error::rejected(
+                    "Timed out waiting for running-turn re-adoption",
+                ));
+            }
+            message = self
+                .store
+                .message(&id)?
+                .ok_or_else(|| Error::rejected("Unknown message"))?;
+            if message.turn_id.as_deref() != Some(token.as_str()) {
+                return Err(Error::rejected(
+                    "Token does not match the message's submission token",
+                ));
+            }
+            agent = self.store.agent(&message.alias)?;
         }
         if !registry::turn_token_current(
             &agent.provider,

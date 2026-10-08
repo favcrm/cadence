@@ -362,6 +362,9 @@ pub(super) fn run_result(
     if let Some(t) = token {
         params["token"] = json!(t);
     }
+    if let Ok(alias) = std::env::var("CADENCE_ALIAS") {
+        params["alias"] = json!(alias);
+    }
     Ok((
         client::rpc_relay(state_dir, "message_report", params)?,
         false,

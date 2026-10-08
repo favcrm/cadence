@@ -810,6 +810,9 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
     // actor and keep their pseudo-endpoint across restarts.
     for agent in shared.store.agents()? {
         if !agent.enabled || !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+            // No actor can prove these recovered panes; release any
+            // matching report waiter to fail closed against recovery state.
+            shared.adoptions_settle(&agent.alias);
             continue;
         }
         // A fenced agent stays registered but must never churn on a
@@ -863,6 +866,9 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
                 "relaunch_skipped",
                 json!({"reason": reason}),
             );
+            // The recovery candidate was discarded with the fence; no
+            // actor will perform its adoption proof on this start.
+            shared.adoptions_settle(&agent.alias);
             continue;
         }
         shared.launch_actor(&agent.alias)?;
