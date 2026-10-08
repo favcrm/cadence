@@ -521,6 +521,8 @@ struct DaemonSlot {
     building: Option<Arc<Build>>,
     /// The last fetch failed (and left `kept` alone, or had nothing kept).
     refresh_failed: bool,
+    /// ...and it was `agent_list` that failed: the daemon is unreachable.
+    daemon_down: bool,
 }
 
 /// One daemon fetch shared by its callers. Ends `Done` with the snapshot,
@@ -610,6 +612,8 @@ pub(super) struct DaemonSnap {
     /// `agent_list` or `job_list` failed: the agents are an "unreachable"
     /// stand-in, never served in place of a good snapshot.
     failed: bool,
+    /// `agent_list` itself failed: `agents` says `unreachable`.
+    agents_down: bool,
 }
 
 /// Fields of an `agent_list` row (and of the board's agent row) that the
@@ -682,7 +686,8 @@ fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
             approvals.join().unwrap_or_default(),
         )
     });
-    let failed = list.is_none() || jobs.is_none();
+    let agents_down = list.is_none();
+    let failed = agents_down || jobs.is_none();
     let agents = agents_payload_from(state_dir, list.clone(), jobs.as_ref());
     let agents_fp =
         list.map(|l| value_fp(&json!([rows_fp(&l["agents"]), rows_fp(&agents["agents"])])));
@@ -698,6 +703,7 @@ fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
         agents_fp,
         approvals: Arc::new(approvals),
         failed,
+        agents_down,
     }
 }
 
@@ -964,8 +970,11 @@ impl Model {
             return snap;
         }
         slot.refresh_failed = snap.failed;
+        slot.daemon_down = snap.agents_down;
         if snap.failed {
-            return slot.kept.clone().unwrap_or(snap);
+            // Only a kept snapshot still current stands in for it.
+            let current = slot.kept.clone().filter(|k| self.after_change(k.at));
+            return current.unwrap_or(snap);
         }
         if slot.kept.as_ref().is_none_or(|old| old.at <= snap.at) {
             slot.kept = Some(snap.clone());
@@ -977,11 +986,17 @@ impl Model {
     /// the last change mark (a build a write overtook is fetched again,
     /// never published) and not older than `after`, the newest snapshot
     /// already published. `None` when a write keeps overtaking the fetch.
-    /// A failed snapshot (no good one to fall back on) comes back as is:
+    /// A failed snapshot (no current good one to fall back on) comes back
+    /// at once, never retried against a daemon that is down:
     /// the watcher publishes tracker changes from it, never daemon ones.
     fn fetch_current(&self, after: Option<Instant>) -> Option<Arc<DaemonSnap>> {
         for _ in 0..3 {
             let snap = self.fetch_shared();
+            if snap.failed {
+                // Nothing current to retry for: the caller publishes what
+                // needs no daemon.
+                return Some(snap);
+            }
             if !self.after_change(snap.at) {
                 continue;
             }
@@ -991,6 +1006,20 @@ impl Model {
             return Some(snap);
         }
         None
+    }
+
+    /// The `/api/agents` payload of `snap`, as served and as the stream's
+    /// `agent_meta` carries its daemon, totals and bindings: last-good rows
+    /// stay while `agent_list` is failing, but the daemon is reported
+    /// `unreachable` then, like a first-time failure, so the board shows
+    /// it offline.
+    fn served_agents(&self, snap: &DaemonSnap) -> Value {
+        let mut agents = snap.agents.clone();
+        if snap.agents_down || lock(&self.daemon).daemon_down {
+            agents["daemon"] = json!("unreachable");
+        }
+        merge_freshness(&mut agents, self.freshness(snap));
+        agents
     }
 
     /// Age, staleness and refresh error of `snap` as it is served, beside
@@ -1058,10 +1087,7 @@ impl Model {
     /// `snapshot_age_secs` is its age since its fetch started (the data is
     /// at least that old).
     pub(super) fn agents(&self) -> Value {
-        let snap = self.daemon_snap();
-        let mut agents = snap.agents.clone();
-        merge_freshness(&mut agents, self.freshness(&snap));
-        agents
+        self.served_agents(&self.daemon_snap())
     }
 
     /// A board write is about to answer — drop what the daemon side
@@ -1472,16 +1498,33 @@ impl Model {
             w.cards = fps(&cards);
             w.plans = fps(&plans);
         }
-        let refresh_error = self.freshness(&snap)["refresh_error"] == json!(true);
-        if !snap.failed && (jobs || agents || refresh_error != w.refresh_error) {
-            w.refresh_error = refresh_error;
+        let fresh = self.freshness(&snap);
+        let error_moved = (fresh["refresh_error"] == json!(true)) != w.refresh_error;
+        if error_moved {
+            w.refresh_error = !w.refresh_error;
+            if snap.failed {
+                // The error alone: no daemon data to diff, and a client
+                // that sees `agent_meta` refetches and shows it.
+                let mut meta = json!({});
+                if snap.agents_down {
+                    meta["daemon"] = json!("unreachable");
+                }
+                merge_freshness(&mut meta, fresh.clone());
+                frames.push(frame("agent_meta", &meta));
+            }
+        }
+        if !snap.failed && (jobs || agents || error_moved) {
             // Bindings and totals can move without an agent row moving.
-            let mut meta = json!({
-                "daemon": snap.agents["daemon"], "totals": snap.agents["totals"],
-                "by_issue": snap.agents["by_issue"]
-            });
-            merge_freshness(&mut meta, self.freshness(&snap));
-            frames.push(frame("agent_meta", &meta));
+            let served = self.served_agents(&snap);
+            frames.push(frame(
+                "agent_meta",
+                &json!({
+                    "daemon": served["daemon"], "totals": served["totals"],
+                    "by_issue": served["by_issue"],
+                    "snapshot_age_secs": served["snapshot_age_secs"],
+                    "stale": served["stale"], "refresh_error": served["refresh_error"],
+                }),
+            ));
             let rows = agent_rows(&snap);
             diff_frames("agent", &w.rows, &rows, frames);
             w.rows = fps(&rows);
@@ -1613,10 +1656,16 @@ mod tests {
                 at: Instant::now(),
                 outcomes: Default::default(),
                 jobs_fp: Some(n),
-                agents: json!({"daemon": "reachable", "agents": [], "v": n}),
+                // A failed fetch carries the real stand-in the fetcher builds.
+                agents: if fails(n) {
+                    agents_payload_from(Path::new("/nonexistent/state"), None, None)
+                } else {
+                    json!({"daemon": "reachable", "agents": [], "v": n})
+                },
                 agents_fp: Some(n),
                 approvals: Arc::new(Default::default()),
                 failed: fails(n),
+                agents_down: fails(n),
             }
         });
         (
@@ -1761,12 +1810,32 @@ mod tests {
         assert_eq!(failed.agents["v"], 1, "the failed fetch replaced last-good");
         let served = model.agents();
         assert_eq!(served["v"], 1);
+        assert_eq!(
+            served["daemon"], "unreachable",
+            "the board must show the daemon offline while last-good is served"
+        );
         assert_eq!(served["refresh_error"], true);
         assert_eq!(served["stale"], true);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         // The next good fetch clears the error.
         assert_eq!(model.fetch_shared().agents["v"], 3);
         assert_eq!(model.agents()["refresh_error"], false);
+    }
+
+    #[test]
+    fn the_stream_reports_an_unreachable_daemon_over_last_good_rows() {
+        let (model, _) = fake_daemon_failing(|_| Duration::ZERO, None, |n| n == 2);
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        let meta = frames
+            .iter()
+            .find(|f| f.starts_with("event: agent_meta\n"))
+            .unwrap_or_else(|| panic!("no agent_meta: {frames:?}"));
+        assert!(meta.contains("\"daemon\":\"unreachable\""), "{meta}");
+        assert!(meta.contains("\"refresh_error\":true"), "{meta}");
     }
 
     #[test]
@@ -1783,7 +1852,9 @@ mod tests {
         model.tick(&mut watch, &mut frames);
         assert_eq!(watch.agents, Some(1), "published an unreachable stand-in");
         assert!(
-            frames.iter().all(|f| !f.starts_with("event: agent")),
+            frames
+                .iter()
+                .all(|f| !f.starts_with("event: agent\n") && !f.contains("totals")),
             "{frames:?}"
         );
         model.tick(&mut watch, &mut frames);
@@ -1823,6 +1894,69 @@ mod tests {
         assert_ne!(published, Some(1), "published the pre-write build");
         assert_eq!(published, Some(3), "the watcher fetches a current view");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_daemon_outage_after_a_marked_change_still_streams_tracker_frames() {
+        // Fetch 1 (an HTTP read's) is slow and good; the tick joins it and
+        // marks the change it finds, so the kept snapshot predates the
+        // mark. The daemon then goes down: every later fetch fails.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = tmp.path().join("pm");
+        std::fs::create_dir_all(&pm).unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = calls.clone();
+        let fetch: Fetch = Box::new(move |_| {
+            let n = seen.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            DaemonSnap {
+                at: Instant::now(),
+                outcomes: Default::default(),
+                jobs_fp: (n == 1).then_some(n),
+                agents: if n > 1 {
+                    agents_payload_from(Path::new("/nonexistent/state"), None, None)
+                } else {
+                    json!({"daemon": "reachable", "agents": [], "v": n})
+                },
+                agents_fp: (n == 1).then_some(n),
+                approvals: Arc::new(Default::default()),
+                failed: n > 1,
+                agents_down: n > 1,
+            }
+        });
+        let model = Arc::new(Model::new(Path::new("/nonexistent/state"), &pm, fetch));
+        let reader = {
+            let m = model.clone();
+            std::thread::spawn(move || m.agents())
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let mut watch = blank_watch();
+        watch.tracker = dir_mtime(&pm);
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        reader.join().unwrap();
+        assert_eq!(watch.agents, Some(1));
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(pm.join("note.md"), "x").unwrap();
+        frames.clear();
+        let before = calls.load(Ordering::SeqCst);
+        model.tick(&mut watch, &mut frames);
+        assert!(
+            frames.iter().any(|f| f.starts_with("event: issues\n")),
+            "the outage silenced the tracker frames: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| f.starts_with("event: agent_meta\n")
+                && f.contains("\"refresh_error\":true")
+                && f.contains("\"daemon\":\"unreachable\"")),
+            "the refresh error was not streamed: {frames:?}"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) - before <= 1,
+            "a down daemon was fetched more than once in one tick"
+        );
     }
 
     #[test]
