@@ -9,7 +9,7 @@ items = ["dir_size", "dir_size_limited", "shell_quote", "fs_label", "file_locked
 items = ["fs_free", "fs_level", "check_disk", "eval_disk"]
 
 [provider_state]
-items = ["StoreMeasure", "store_level", "sqlite_store", "dir_store", "check_provider_state", "eval_provider_state"]
+items = ["StoreMeasure", "store_level", "sqlite_store", "dir_store", "check_provider_state", "eval_provider_state", "check_provider_commands"]
 
 [cadence_store]
 items = ["check_cadence_store"]
