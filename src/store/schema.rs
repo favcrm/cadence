@@ -1012,10 +1012,17 @@ impl Store {
                 // owner-attach rows ever carry 0, and none existed
                 // before v37). A half-applied/WIP store that already
                 // carries either claim column has its values copied by
-                // name — detected through `PRAGMA table_info`, never by
-                // parsing CREATE text — so a recorded undo floor or
-                // pending arm is never lost. The match is
-                // ASCII-case-insensitive like SQLite identifier
+                // name — detected through `PRAGMA table_xinfo`, never
+                // by parsing CREATE text — so a recorded undo floor or
+                // pending arm is never lost. `table_xinfo`, not
+                // `table_info`: the plain pragma omits generated and
+                // hidden columns, so a guard present as a generated
+                // column would look absent and its recorded fence
+                // would be silently defaulted — instead it is seen,
+                // and only a plain stored column (hidden == 0) rides
+                // the copy; a guard present in any other form refuses
+                // the open and leaves the version unchanged. The match
+                // is ASCII-case-insensitive like SQLite identifier
                 // resolution itself: a `CLAIM_ARMED` spelling still
                 // names the claim column, and its real spelling (quoted
                 // on the SELECT side) carries the recorded values into
@@ -1028,7 +1035,7 @@ impl Store {
                 // `social_publish_install` (its original v29
                 // definition — the store never changed it). No release
                 // ever shipped a trigger on this table.
-                let existing = table_column_names(&conn, "social_publish_intents")?;
+                let existing = table_column_kinds(&conn, "social_publish_intents")?;
                 // (target, source) column pairs: for every fixed v29
                 // column both sides are the canonical name. The claim
                 // columns ride the copy only when the old table really
@@ -1056,10 +1063,18 @@ impl Store {
                 .map(|c| (c.to_string(), c.to_string()))
                 .collect();
                 for claim in ["claim_after_epoch", "claim_armed"] {
-                    let mut found = existing.iter().filter(|c| c.eq_ignore_ascii_case(claim));
+                    let mut found = existing
+                        .iter()
+                        .filter(|(c, _)| c.eq_ignore_ascii_case(claim));
                     match (found.next(), found.next()) {
                         (None, _) => {}
-                        (Some(name), None) => pairs.push((claim.to_string(), name.clone())),
+                        (Some((name, 0)), None) => pairs.push((claim.to_string(), name.clone())),
+                        (Some((_, hidden)), None) => {
+                            return Err(Error::rejected(format!(
+                                "social_publish_intents carries claim column {claim} \
+                                 in a non-plain form (hidden={hidden}); refusing to default it"
+                            )))
+                        }
                         (Some(_), Some(_)) => {
                             return Err(Error::rejected(format!(
                                 "social_publish_intents carries ambiguous claim column {claim}"
@@ -1811,16 +1826,23 @@ impl std::fmt::Display for ShutdownDrainError {
     }
 }
 
-/// The column names `table` declares, in physical order — the
-/// `PRAGMA table_info` field a rebuild migration uses to decide whether
-/// an already-present (half-applied) claim column's values ride the
-/// row copy or the canonical DEFAULT applies. No CREATE-SQL text is
-/// ever parsed: shape is enforced by the named-column copy into the
-/// canonical table.
-fn table_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+/// `(name, hidden)` for every column `table` declares, in physical
+/// order — the `PRAGMA table_xinfo` fields a rebuild migration uses to
+/// decide whether an already-present (half-applied) claim column's
+/// values ride the row copy or the canonical DEFAULT applies.
+/// `table_xinfo`, not `table_info`: the plain pragma omits generated
+/// and hidden columns, so a guard that exists as a generated column
+/// would look absent and get silently defaulted. Callers carry a
+/// column only when `hidden == 0` (a plain stored column); a guard
+/// present in any other form refuses the open instead. No CREATE-SQL
+/// text is ever parsed: shape is enforced by the named-column copy
+/// into the canonical table.
+fn table_column_kinds(conn: &Connection, table: &str) -> Result<Vec<(String, i64)>> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_xinfo({table})"))?;
     let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(6)?))
+        })?
         .filter_map(std::result::Result::ok)
         .collect();
     Ok(columns)

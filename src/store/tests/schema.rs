@@ -1976,3 +1976,68 @@
             "v34->v38 upgrade index set"
         );
     }
+
+    #[test]
+    fn migration_v37_rebuild_refuses_a_generated_claim_column() {
+        // `PRAGMA table_info` omits generated columns, so a
+        // predecessor whose guard exists as `GENERATED ALWAYS AS`
+        // — virtual or stored — would look like it has no claim
+        // columns and the fence it enforces would be silently
+        // replaced by the canonical defaults. A present guard in any
+        // non-plain form must instead refuse the open: the version
+        // stays put and the row is untouched, never defaulted over.
+        for (name, epoch_ddl, arm_ddl) in [
+            (
+                "generated-stored",
+                ", claim_after_epoch INTEGER GENERATED ALWAYS AS(900) STORED",
+                ", claim_armed INTEGER GENERATED ALWAYS AS(0) STORED",
+            ),
+            (
+                "generated-virtual",
+                ", claim_after_epoch INTEGER GENERATED ALWAYS AS(900) VIRTUAL",
+                ", claim_armed INTEGER GENERATED ALWAYS AS(0) VIRTUAL",
+            ),
+            // A single generated guard refuses too — either column.
+            (
+                "generated-arm-only",
+                "",
+                ", claim_armed INTEGER GENERATED ALWAYS AS(0) STORED",
+            ),
+            (
+                "generated-epoch-only",
+                ", claim_after_epoch INTEGER GENERATED ALWAYS AS(900) VIRTUAL",
+                "",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let db = queued_intent_db(&dir, name);
+            fabricate_intents(&db, &format!("{epoch_ddl}{arm_ddl}"), 36);
+            Store::open_for_schema_tests(&db)
+                .err()
+                .expect("a generated claim column must refuse the open");
+            assert_eq!(
+                db_version(&db),
+                36,
+                "{name}: refusal must not bump the version"
+            );
+            // The transaction refused before the rename: the original
+            // table still stands with its row, unmigrated.
+            let c = Connection::open(&db).unwrap();
+            assert_eq!(
+                c.query_row(
+                    "SELECT due_epoch FROM social_publish_intents WHERE intent_id='i1'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+                10,
+                "{name}: the refused open disturbed the existing row"
+            );
+            c.query_row(
+                "SELECT due_epoch FROM social_publish_intents_v35 LIMIT 1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .expect_err("{name}: the refused open must not leave the rename behind");
+        }
+    }
