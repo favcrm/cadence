@@ -1427,6 +1427,9 @@ impl Pm {
 }
 
 #[cfg(test)]
+mod cad1190_acceptance;
+
+#[cfg(test)]
 mod tests {
     //! CAD-1190: blocking wait, cheap snapshot, hold-time report. The
     //! CAD-852 crash proofs stay in `lock_tests`.
