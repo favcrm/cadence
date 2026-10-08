@@ -524,6 +524,9 @@ fn open_leaf(v: &board::View) -> bool {
 }
 
 #[cfg(test)]
+mod cad1257_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::issue::write::{new_issue, project_add, save_front};
