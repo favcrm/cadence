@@ -606,7 +606,17 @@ impl Shared {
     /// reclaim pass is the bounded exception: `finish::with_probe_timeout`
     /// caps every probe it makes). A tracker write
     /// failure is logged, never escalated: the next tick retries.
-    pub(super) fn reconcile_tick(&self) {
+    ///
+    /// CAD-1241: `cursor` is the stall-watch-owned continuation — the
+    /// last evidence-bearing candidate the previous tick classified.
+    /// Each tick resumes strictly after it in natural id order and
+    /// wraps once, so a full batch of persistently unresolved older
+    /// issues cannot starve later merged ones. It is in-memory only:
+    /// a daemon restart resets the sweep to the head of the board (no
+    /// persistent schema, no coverage promise under continual
+    /// restart), a deleted cursor id resumes at its natural successor,
+    /// and an error leaves it where it was.
+    pub(super) fn reconcile_tick(&self, cursor: &mut Option<String>) {
         let pm = match self.pm() {
             Ok(pm) => pm,
             Err(e) => {
@@ -614,13 +624,15 @@ impl Shared {
                 return;
             }
         };
-        match crate::issue::reconcile::run_daemon(&pm, "daemon", RECONCILE_BATCH) {
+        match crate::issue::reconcile::run_daemon(&pm, "daemon", RECONCILE_BATCH, cursor.as_deref())
+        {
             Ok(out) => {
                 let done = out["done"].as_array().map(|d| d.len()).unwrap_or(0);
                 let held = out["held"].as_array().map(|h| h.len()).unwrap_or(0);
                 if done > 0 || held > 0 {
                     eprintln!("issue reconcile: {done} closed, {held} held");
                 }
+                *cursor = out["cursor"].as_str().map(String::from);
             }
             Err(e) => eprintln!("issue reconcile: {e}"),
         }

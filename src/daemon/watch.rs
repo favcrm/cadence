@@ -335,6 +335,12 @@ impl Shared {
         let mut checkup_at: Option<Instant> = None;
         let mut events_rolled: Option<Instant> = None;
         let mut reconcile_at: Option<Instant> = None;
+        // CAD-1241: in-memory continuation for the bounded reconcile —
+        // the last candidate the previous tick classified. In-memory
+        // only: a daemon restart restarts the sweep at the head (the
+        // cursor is not persisted; continual restarts do not promise
+        // coverage).
+        let mut reconcile_cursor: Option<String> = None;
         while !self.closing.load(Ordering::SeqCst) {
             self.stall_tick();
             // CAD-250 N3: a nudge still queued past its TTL is stale
@@ -384,8 +390,11 @@ impl Shared {
             // CAD-754: tracker reconcile — close doing/review issues
             // whose recorded work merged, hourly, a bounded batch per
             // tick so a backlog drains over hours not one stall-watch.
+            // CAD-1241: the batch is a rotating window over the board,
+            // not the first N every tick — `reconcile_cursor` resumes
+            // strictly after the last classified candidate.
             if reconcile_at.is_none_or(|at| at.elapsed() >= RECONCILE_EVERY) {
-                self.reconcile_tick();
+                self.reconcile_tick(&mut reconcile_cursor);
                 reconcile_at = Some(Instant::now());
             }
             std::thread::sleep(self.stall_tick);

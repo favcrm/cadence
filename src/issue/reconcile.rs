@@ -511,6 +511,7 @@ pub fn run(
         actor,
         Some(state_dir),
         limit,
+        None,
         &gh_list,
         &gh_view,
         CLI_CLOSE_LOCK_WAIT,
@@ -520,9 +521,17 @@ pub fn run(
 /// The daemon tick — same sweep without the finish pass: worktree
 /// liveness probes go through `client::rpc`, which the daemon must
 /// not call on itself unbounded (CAD-754; the CAD-1021 reclaim pass
-/// bounds its probes). `limit` caps issues per tick; the
-/// next tick takes the rest.
-pub fn run_daemon(pm: &Pm, actor: &str, limit: usize) -> Result<Value> {
+/// bounds its probes). `limit` caps issues per tick; `cursor` is the
+/// daemon-owned continuation: the id of the last evidence-bearing
+/// candidate the previous tick examined. The sweep resumes strictly
+/// after it in natural id order and wraps to the head once, so a
+/// persistently unresolved prefix can never starve later merged
+/// tickets (CAD-1241). The result carries `"cursor"` — the last
+/// candidate this run classified — for the caller to hold; a deleted
+/// cursor resumes at its natural successor, insertions are reached
+/// when the rotation wraps, and a failed run returns `Err`, leaving
+/// the caller's cursor untouched.
+pub fn run_daemon(pm: &Pm, actor: &str, limit: usize, cursor: Option<&str>) -> Result<Value> {
     run_inner(
         pm,
         None,
@@ -530,6 +539,7 @@ pub fn run_daemon(pm: &Pm, actor: &str, limit: usize) -> Result<Value> {
         actor,
         None,
         limit,
+        cursor,
         &gh_list,
         &gh_view,
         Duration::ZERO,
@@ -544,6 +554,7 @@ fn run_inner(
     actor: &str,
     state_dir: Option<&Path>,
     limit: usize,
+    cursor: Option<&str>,
     pr_list: PrLookup<'_>,
     pr_view: PrView<'_>,
     close_lock_wait: Duration,
@@ -555,7 +566,22 @@ fn run_inner(
     // or job derive doing|review — must still reach the probe, else a
     // merged PR strands it at review forever.
     let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
-    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    let mut views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    // CAD-1241 continuation: rotate the natural-ordered board so the
+    // sweep starts strictly after `cursor` and wraps once to the head.
+    // A bounded tick then spends its budget on the NEXT batch instead
+    // of re-examining the same unresolved prefix every run; one pass
+    // over the rotated list never revisits a candidate in the same
+    // tick. A cursor id that no longer exists lands on its natural
+    // successor; a cursor at or past the end wraps to the start.
+    if let Some(c) = cursor {
+        let key = board::natural_key(c);
+        let start = views
+            .iter()
+            .position(|v| board::natural_key(&v.issue.front.id) > key)
+            .unwrap_or(views.len());
+        views.rotate_left(start);
+    }
     // `status:` line times from tracker history — the note-driven arm
     // is only as fresh as the newest note vs the last status write
     // (a status move after the note is a deliberate park/reopen and
@@ -571,6 +597,11 @@ fn run_inner(
     let mut stalled = Vec::new();
     let mut errors = Vec::new();
     let mut classified = 0usize;
+    // The id of the last evidence-bearing candidate this run examined
+    // — advanced on every classify outcome (closed, held, stalled,
+    // open, skipped alike) so the next bounded tick resumes strictly
+    // after it instead of repeating the prefix.
+    let mut last_classified: Option<String> = None;
 
     for v in &views {
         let f = &v.issue.front;
@@ -595,6 +626,7 @@ fn run_inner(
                 break;
             }
             classified += 1;
+            last_classified = Some(p.id.clone());
         }
         let (verdict, detail) = classify(&p, pr_list, pr_view);
         let mut row = json!({"issue": p.id, "status": p.status});
@@ -677,6 +709,7 @@ fn run_inner(
         "dry_run": dry_run,
         "project": project,
         "classified": classified,
+        "cursor": last_classified,
         "rows": rows,
         "done": done,
         "held": held,
@@ -685,6 +718,9 @@ fn run_inner(
         "finish": finish,
     }))
 }
+
+#[cfg(test)]
+mod cad1241_acceptance;
 
 #[cfg(test)]
 mod tests {
@@ -876,7 +912,19 @@ mod tests {
     }
 
     fn sweep(rig: &Rig, dry: bool, pl: PrLookup<'_>, pv: PrView<'_>) -> Value {
-        run_inner(&rig.pm, None, dry, "op", None, 0, pl, pv, Duration::ZERO).unwrap()
+        run_inner(
+            &rig.pm,
+            None,
+            dry,
+            "op",
+            None,
+            0,
+            None,
+            pl,
+            pv,
+            Duration::ZERO,
+        )
+        .unwrap()
     }
 
     fn status(rig: &Rig, id: &str) -> String {
@@ -922,6 +970,7 @@ mod tests {
             "op",
             None,
             0,
+            None,
             &no_gh,
             &no_view,
             Duration::from_secs(10),
@@ -1187,6 +1236,7 @@ mod tests {
             "op",
             None,
             5,
+            None,
             &no_gh,
             &no_view,
             Duration::ZERO,
