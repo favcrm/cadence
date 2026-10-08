@@ -633,6 +633,9 @@ impl Shared {
             .get("app.md")
             .ok_or_else(|| Error::rejected("the repo holds no app.md — not a Cadence app"))?;
         let manifest = crate::issue::app::parse_manifest(app_md)?;
+        manifest
+            .requires
+            .check(&crate::issue::app::compat_host()?)?;
         let digest = workspace::bundle_digest(&bundle.files);
         let (holds_records, personal) = data_flags(&manifest);
         let access = app_access::access_rows(&manifest, None, holds_records, personal);

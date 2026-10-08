@@ -50,6 +50,11 @@ use crate::issue::model;
 use crate::issue::parse;
 use crate::issue::{app_view, board, plan, project, workflow, write, Pm};
 
+mod compat;
+pub use compat::{
+    host as compat_host, parse_requires, Compat, HostContracts, SemVer, SUPPORTED_CONTRACTS,
+};
+
 /// `<pm>/<project>/apps/` — beside PROJECT.md and `workflows/`.
 pub const DIR: &str = "apps";
 
@@ -132,6 +137,9 @@ pub struct Manifest {
     /// when the manifest declared it; the file and declaration pair up
     /// at `validate`/`validate_texts` (either alone refuses).
     pub view_contract: Option<String>,
+    /// Host requirements declared under `needs.requires`. Absent means
+    /// a legacy package; malformed declarations fail manifest parsing.
+    pub requires: Compat,
     /// CAD-1129 §3: the display-only catalog block (`listing:`), plain
     /// JSON already host-validated — it can declare no capability.
     pub listing: Option<crate::issue::app_listing::Listing>,
@@ -455,10 +463,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         };
         for key in needs.keys() {
             let k = key.as_str().unwrap_or_default();
-            if !matches!(k, "connections" | "capabilities" | "views") {
+            if !matches!(k, "connections" | "capabilities" | "views" | "requires") {
                 return Err(Error::rejected(format!(
                     "app.md `needs.{k}` is unknown — v0 knows `needs.connections`, \
-                     `needs.capabilities`, `needs.views`"
+                     `needs.capabilities`, `needs.views`, `needs.requires`"
                 )));
             }
         }
@@ -553,6 +561,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             Some(crate::issue::app_listing::parse(value, yaml_len, &slots)?)
         }
     };
+    let requires = compat::parse_requires(get("needs").and_then(serde_yaml::Value::as_mapping))?;
     Ok(Manifest {
         app,
         title,
@@ -561,6 +570,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         capabilities,
         summary,
         view_contract,
+        requires,
         listing,
         guide: body.to_string(),
     })
@@ -861,6 +871,7 @@ pub(crate) struct Validated {
     pub(crate) files: Vec<(String, String)>,
     pub(crate) secret_warnings: Vec<crate::secret::Finding>,
     pub(crate) notes: Vec<String>,
+    pub(crate) compatibility: Value,
 }
 
 /// Read a bundle's files as UTF-8 text and validate them: the manifest
@@ -950,6 +961,7 @@ fn validate_contents(
                     capabilities: BTreeMap::new(),
                     summary: None,
                     view_contract: None,
+                    requires: Compat::legacy(),
                     listing: None,
                     guide: String::new(),
                 }
@@ -963,6 +975,7 @@ fn validate_contents(
             capabilities: BTreeMap::new(),
             summary: None,
             view_contract: None,
+            requires: Compat::legacy(),
             listing: None,
             guide: String::new(),
         },
@@ -1079,6 +1092,13 @@ fn validate_contents(
     if workflow_count == 0 {
         errors.push("workflows/ holds no *.md workflow".to_string());
     }
+    let compatibility = match compat::host().and_then(|host| manifest.requires.check(&host)) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            errors.push(error.to_string());
+            Value::Null
+        }
+    };
     if !errors.is_empty() {
         return Err(Error::rejected(format!(
             "app is not installable — {}",
@@ -1090,6 +1110,7 @@ fn validate_contents(
         files,
         secret_warnings,
         notes,
+        compatibility,
     })
 }
 
@@ -1191,6 +1212,7 @@ fn digest_over(pm_dir: &Path, project: &str, name: &str, over: &[(&str, &str)]) 
             serde_json::to_string(&manifest.capabilities)?
         ));
     }
+    keys.push_str(&manifest.requires.digest_line());
     for slot in &manifest.connections {
         keys.push_str(&format!(
             "bind.{slot}={}\n",
@@ -1516,6 +1538,7 @@ pub fn install(
         files,
         secret_warnings,
         notes,
+        ..
     } = validate(&src_dir, &agents, &agent_sources)?;
     let name = manifest.app.clone();
     let apps = dir_of(&pm.dir, project_key)?;
@@ -1741,6 +1764,7 @@ pub fn update(
         files,
         secret_warnings,
         notes,
+        ..
     } = validate(&src_dir, &agents, &agent_sources)?;
     if manifest.app != name {
         return Err(Error::rejected(format!(

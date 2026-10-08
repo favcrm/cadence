@@ -474,7 +474,7 @@ pub(crate) fn install_check(pm: &Pm, source: &str) -> Result<Value> {
         "version":validated.manifest.version,"source":provenance,
         "digest":bundle_digest(&files),
         "files":files.keys().collect::<Vec<_>>(),
-        "committed":false,"notes":validated.notes,
+        "committed":false,"compatibility":validated.compatibility,"notes":validated.notes,
         "secret_warnings":crate::secret::warnings_json(&validated.secret_warnings)}))
 }
 
@@ -608,7 +608,7 @@ pub(crate) fn upgrade_check(
         "version":validated.manifest.version,"source":provenance,
         "expected_digest":expected_digest,"expected_generation":expected_generation,
         "digest":new_digest,"structural_diff":structural_diff(&old_files,&files),
-        "committed":false,"approved":false,"notes":validated.notes,
+        "committed":false,"approved":false,"compatibility":validated.compatibility,"notes":validated.notes,
         "secret_warnings":crate::secret::warnings_json(&validated.secret_warnings)}))
 }
 
@@ -1104,6 +1104,10 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
         ));
     }
     catalog.require_current(root)?;
+    let compatibility = match app::compat_host() {
+        Ok(host) => manifest.requires.report(&host),
+        Err(error) => manifest.requires.unknown_report(&error.to_string()),
+    };
     let reread: Record = decode(&required(root, &path, RECORD_CAP)?)?;
     if serde_yaml::to_value(&reread).map_err(|e| Error::internal(e.to_string()))?
         != serde_yaml::to_value(&record).map_err(|e| Error::internal(e.to_string()))?
@@ -1186,7 +1190,7 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
         })
         .collect::<Vec<_>>();
     Ok(
-        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"source":record.source,"installed_at":record.installed_at,"removed":record.removed,"restore_after":record.restore_after,"purge_after":record.purge_after,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"listing":manifest.listing.as_ref().map(|l| l.value.clone()),"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
+        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"compatibility":compatibility,"source":record.source,"installed_at":record.installed_at,"removed":record.removed,"restore_after":record.restore_after,"purge_after":record.purge_after,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"listing":manifest.listing.as_ref().map(|l| l.value.clone()),"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
     )
 }
 /// CAD-1189: catalog reads take no lock. Every writer journals first
