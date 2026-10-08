@@ -581,6 +581,12 @@ pub struct ServeOpts {
     /// `None` is this board's own binary. Never set from the command
     /// line — tests inject a fake helper.
     pub update_helper: Option<PathBuf>,
+    /// Explicit mode, independent of backend presence. Required with no
+    /// ordered tracker-v1 capability refuses before tracker mutation.
+    pub durability_mode: crate::issue::durability::Mode,
+    /// Boot bridge plus live private authority construct the real Store.
+    /// No caller endpoint, account, credential or generation election.
+    pub durability: Option<crate::issue::durability::Hosted>,
 }
 
 pub(crate) fn opts_file(state_dir: &Path) -> PathBuf {
@@ -970,6 +976,13 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         // CAD-561 r2: a real board spawns its own binary as the update
         // helper; only tests inject a fake.
         update_helper: None,
+        // CAD-1180: this resolver has no store-effect source — a hosted
+        // deployment attaches its AgenticOS store on the `ServeOpts` it
+        // builds (the same pattern as `gh`/`tailscaled_socket`/
+        // `delivery_sync`); tests inject a stub `Store`. `None` here
+        // keeps every write on the CAD-1179 local shape.
+        durability_mode: crate::issue::durability::Mode::Legacy,
+        durability: None,
     })
 }
 

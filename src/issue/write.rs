@@ -598,6 +598,7 @@ pub fn new_issue(
     body: Option<&str>,
     actor: &str,
 ) -> Result<Value> {
+    pm.check_durability()?;
     let project = project::resolve(&pm.dir, project_flag, cwd)?;
     let priority = priority.unwrap_or("P2");
     model::check_priority(priority)?;
@@ -676,6 +677,17 @@ pub fn new_issue(
     };
     let mut out = json!({"id": id, "project": project.key, "path": dir, "committed": true});
     attach_foreign(&mut out, &foreign);
+    // Freeze and reserve once under this ORIGINAL lock. The deliberate
+    // bounded network-under-lock tradeoff preserves origin order. Only
+    // accepted-token uploads/completion occur after releasing the guard.
+    if let Some(hosted) = pm.durability().cloned() {
+        let captured = crate::issue::durability::capture(pm, &lock, &hosted);
+        drop(lock);
+        let (receipt, durable) = crate::issue::durability::persist(&captured, &hosted);
+        out["applied"] = json!(true);
+        out["durability"] = json!(durable.as_str());
+        out["receipt"] = receipt;
+    }
     Ok(out)
 }
 
@@ -1344,6 +1356,7 @@ pub fn set_fields_if_rev(
     force: Option<&str>,
     if_rev: Option<&str>,
 ) -> Result<Value> {
+    pm.check_durability()?;
     if ids.is_empty() || pairs.is_empty() {
         return Err(Error::rejected(
             "set needs an id and key=value pairs — e.g. `cadence issue set CAD-16 status=doing`",
@@ -1399,6 +1412,16 @@ pub fn set_fields_if_rev(
     let mut out = json!({"id": ids[0], "ids": ids, "set": changed,
               "worktree_open": worktree_open, "committed": true});
     attach_foreign(&mut out, &foreign);
+    // Capture + one bounded reservation under this original guard;
+    // upload/complete only after release, with no token recovery.
+    if let Some(hosted) = pm.durability().cloned() {
+        let captured = crate::issue::durability::capture(pm, &lock, &hosted);
+        drop(lock);
+        let (receipt, durable) = crate::issue::durability::persist(&captured, &hosted);
+        out["applied"] = json!(true);
+        out["durability"] = json!(durable.as_str());
+        out["receipt"] = receipt;
+    }
     Ok(out)
 }
 
@@ -2100,6 +2123,7 @@ pub fn add_comment(
     if_rev: Option<&str>,
     actor: &str,
 ) -> Result<Value> {
+    pm.check_durability()?;
     let (_project, dir) = issue_dir(pm, id)?;
     let author_opt = author;
     let author = comment_author(author_opt)?;
@@ -2155,6 +2179,16 @@ pub fn add_comment(
         out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
     }
     attach_foreign(&mut out, &foreign);
+    // Capture + one bounded reservation under this original guard;
+    // upload/complete only after release, with no token recovery.
+    if let Some(hosted) = pm.durability().cloned() {
+        let captured = crate::issue::durability::capture(pm, &lock, &hosted);
+        drop(lock);
+        let (receipt, durable) = crate::issue::durability::persist(&captured, &hosted);
+        out["applied"] = json!(true);
+        out["durability"] = json!(durable.as_str());
+        out["receipt"] = receipt;
+    }
     Ok(out)
 }
 

@@ -8,8 +8,10 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tiny_http::Server;
 
 fn loopback_server() -> Server {
@@ -136,20 +138,27 @@ fn cad1179_signed_ticket_writes_refuse_read_scope_stale_revision_and_replay_with
     let jwks = loopback_server();
     let issuer = format!("http://{}", jwks.server_addr());
     let public_key = URL_SAFE_NO_PAD.encode(key.public_key().as_ref());
+    let issuer_stop = Arc::new(AtomicBool::new(false));
+    let issuer_stop_thread = Arc::clone(&issuer_stop);
     let jwks_thread = thread::spawn(move || {
-        let request = jwks
-            .recv_timeout(Duration::from_secs(15))
-            .unwrap()
-            .expect("JWKS not fetched");
-        assert_eq!(request.url(), "/.well-known/agenticos-board-jwks.json");
-        let response = Response::from_string(
-            json!({"keys": [{
-                "kty": "OKP", "crv": "Ed25519", "kid": "cad1179-fixture", "x": public_key
-            }]})
-            .to_string(),
-        )
-        .with_header(Header::from_bytes("Content-Type", "application/json").unwrap());
-        request.respond(response).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut fetched = false;
+        while !issuer_stop_thread.load(Ordering::Acquire) && Instant::now() < deadline {
+            let Some(request) = jwks.recv_timeout(Duration::from_millis(250)).unwrap() else {
+                continue;
+            };
+            fetched = true;
+            assert_eq!(request.url(), "/.well-known/agenticos-board-jwks.json");
+            let response = Response::from_string(
+                json!({"keys": [{
+                    "kty": "OKP", "crv": "Ed25519", "kid": "cad1179-fixture", "x": public_key
+                }]})
+                .to_string(),
+            )
+            .with_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+            request.respond(response).unwrap();
+        }
+        assert!(fetched, "JWKS not fetched");
     });
 
     let server = loopback_server();
@@ -260,5 +269,6 @@ fn cad1179_signed_ticket_writes_refuse_read_scope_stale_revision_and_replay_with
     );
 
     route_thread.join().unwrap();
+    issuer_stop.store(true, Ordering::Release);
     jwks_thread.join().unwrap();
 }

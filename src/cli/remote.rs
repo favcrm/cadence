@@ -522,5 +522,15 @@ pub(super) fn run(
             );
             Ok(5)
         }
+        cadence_agent::remote_cli::RemoteAnswer::Applied(body) => {
+            // CAD-1180: preserve a structured known-applied host verdict,
+            // whether publication is confirmed or not. Print its receipt
+            // and exit non-success; it is terminal and never replayed.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&body).unwrap_or_default()
+            );
+            Ok(1)
+        }
     }
 }
