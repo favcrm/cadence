@@ -88,13 +88,26 @@ fn execution_agent() -> String {
 }
 impl LocalWorkflow {
     pub fn parse(text: &str, inputs: &BTreeMap<String, String>) -> Result<Self> {
+        Self::parse_carry(text, inputs, &BTreeMap::new())
+    }
+
+    /// Parse with a run-owned carry map. CAD-1143 Redo: the retained
+    /// caption is digest-verified material, not a caller input, so its
+    /// bytes bypass the one-line input grammar via `render_with_carry`
+    /// while every other input still satisfies it. `carry` keys are
+    /// declared inputs that must not collide with `inputs`.
+    pub fn parse_carry(
+        text: &str,
+        inputs: &BTreeMap<String, String>,
+        carry: &BTreeMap<String, String>,
+    ) -> Result<Self> {
         let template = workflow::parse_template(text)?;
         let publication_slot = template.publication_slot;
         let capability_slots = template.capability_slots;
         let required_asset_slot = template.required_asset_slot;
         let execution = template.execution.as_str().to_string();
         let carries = template.carries;
-        let rendered = workflow::render(text, inputs)?;
+        let rendered = workflow::render_with_carry(text, inputs, carry)?;
         let parsed = plan::parse_plan(&rendered)?;
         let (_, body) =
             parse::split_front(&rendered).map_err(|e| Error::rejected(e.to_string()))?;
@@ -276,10 +289,16 @@ pub struct LocalRunProvenance<'a> {
 
 /// CAD-1143 Redo carry: `retain_image` names the untouched half — a
 /// retained image for Redo text, a retained caption for Redo image.
-#[derive(Debug, Clone, Copy)]
+/// `carry_inputs` are the run-owned, digest-verified material values the
+/// daemon resolved from durable history (`carry_caption` for a text
+/// retain, `carry_asset_receipt_id` for an image retain). They are not
+/// caller inputs: they never pass through the one-line input grammar, and
+/// the creation transaction asserts each byte against the derived
+/// material before it is frozen into `snapshot.inputs`.
 pub struct CarryRequest<'a> {
     pub from_run_id: &'a str,
     pub retain_image: bool,
+    pub carry_inputs: &'a BTreeMap<String, String>,
 }
 
 impl Store {
@@ -642,24 +661,39 @@ impl Store {
                                 "carry source input differs from frozen source facts",
                             ));
                         }
-                        if !request.retain_image
-                            && effective.get("carry_caption").map(String::as_str)
-                                != material["artifact"]["text"].as_str()
-                        {
+                        // The retained half travels in `carry_inputs` —
+                        // run-owned material resolved daemon-side, never a
+                        // caller input. Assert each carried byte against the
+                        // transaction's own derived material, then seed it
+                        // into the frozen inputs so the render reflects the
+                        // exact reviewed bytes. A text retain carries the
+                        // caption verbatim; an image retain carries the
+                        // pinned receipt id. Nothing else may be carried.
+                        let expected_carry: BTreeMap<String, String> = if !request.retain_image {
+                            let caption = material["artifact"]["text"]
+                                .as_str()
+                                .ok_or_else(|| {
+                                    Error::rejected("carry source caption is unavailable")
+                                })?;
+                            BTreeMap::from([("carry_caption".to_string(), caption.to_string())])
+                        } else {
+                            let receipt = material["asset"]["receipt_id"]
+                                .as_str()
+                                .ok_or_else(|| {
+                                    Error::rejected("carry source review pins no image")
+                                })?;
+                            BTreeMap::from([(
+                                "carry_asset_receipt_id".to_string(),
+                                receipt.to_string(),
+                            )])
+                        };
+                        if request.carry_inputs != &expected_carry {
                             return Err(Error::rejected(
-                                "carry caption input differs from frozen carry bytes",
+                                "carried material differs from frozen carry bytes",
                             ));
                         }
-                        // Seeded receipt id for reviewer discovery must equal
-                        // the derived pin; fetching it still needs the
-                        // carry-read branch (never the ordinary same-run path).
-                        if request.retain_image
-                            && effective.get("carry_asset_receipt_id").map(String::as_str)
-                                != material["asset"]["receipt_id"].as_str()
-                        {
-                            return Err(Error::rejected(
-                                "carry receipt input differs from frozen carry receipt",
-                            ));
+                        for (key, value) in request.carry_inputs {
+                            effective.insert(key.clone(), value.clone());
                         }
                         if let Some(subject) = material["source_subject"].as_str() {
                             effective.insert("subject".into(), subject.to_owned());

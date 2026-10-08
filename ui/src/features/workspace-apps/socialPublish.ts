@@ -414,10 +414,14 @@ function toPreparedOwnerIntent(
   const dueEpoch = descriptor?.due_epoch;
   const notBeforeEpoch = descriptor?.not_before_epoch;
   const expiresEpoch = descriptor?.expires_epoch;
+  // `descriptor_digest` is the host store's canonical material digest on
+  // the wire — exactly `sha256:` + 64 lowercase hex, matching
+  // `store::app_runs::material_digest`. `owner_intent.intent_digest` stays
+  // the AOS contract's bare 64-hex field (the JWS claim grammar is bare).
   if (!preparedId || preparedId !== intentId || !/^sprep-[0-9a-f]{32}$/.test(preparedId) ||
       !request || !/^[A-Za-z0-9_-]{8,128}$/.test(request) ||
       (state !== "prepared" && state !== "authorized") ||
-      !descriptorDigest || !/^[a-f0-9]{64}$/.test(descriptorDigest) ||
+      !descriptorDigest || !/^sha256:[a-f0-9]{64}$/.test(descriptorDigest) ||
       installId !== expected.installId || contextId !== expected.contextId ||
       runId !== expected.runId || mode !== expected.mode ||
       !Number.isSafeInteger(dueEpoch) || (dueEpoch as number) <= 0 ||

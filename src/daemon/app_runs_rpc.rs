@@ -253,7 +253,12 @@ impl Shared {
         // the rendered plan carries them (absent inputs render empty — the
         // frame must not reconstitute them). The creation transaction below
         // re-derives and asserts them before freezing; pre-read staleness
-        // is impossible (terminal runs and reviews are immutable).
+        // is impossible (terminal runs and reviews are immutable). The
+        // retained half is verified material, not a caller input, so it is
+        // resolved into `carry_inputs` and rendered through the carry
+        // channel — its bytes never pass the one-line input grammar but
+        // are byte-asserted against the transaction's own derived material.
+        let mut carry_inputs: BTreeMap<String, String> = BTreeMap::new();
         if let Some((from_run_id, retain_image)) = carry {
             let shown = self.store.app_run_show(from_run_id)?;
             // Scope BEFORE any foreign-run preload: no server facts from
@@ -282,7 +287,7 @@ impl Shared {
                 let caption = record["text"]
                     .as_str()
                     .ok_or_else(|| Error::rejected("carry source caption is unavailable"))?;
-                inputs.insert("carry_caption".into(), caption.to_owned());
+                carry_inputs.insert("carry_caption".into(), caption.to_owned());
             } else {
                 // Reviewer discovery for the retained image: seed its
                 // receipt id for the review instruction. The creation
@@ -292,7 +297,7 @@ impl Shared {
                     .store
                     .app_run_approved_asset_pin(from_run_id, &approved)?
                     .ok_or_else(|| Error::rejected("carry source review pins no image"))?;
-                inputs.insert("carry_asset_receipt_id".into(), pin.0);
+                carry_inputs.insert("carry_asset_receipt_id".into(), pin.0);
             }
         }
         let pm = self.pm_at(&self.pm_dir()?)?;
@@ -396,13 +401,14 @@ impl Shared {
                 )
                 .map_err(Error::rejected)?;
             }
-            let workflow = LocalWorkflow::parse(text, &inputs).map_err(|error| {
-                if context.is_some() {
-                    Error::rejected("contextual workflow inputs refused")
-                } else {
-                    error
-                }
-            })?;
+            let workflow =
+                LocalWorkflow::parse_carry(text, &inputs, &carry_inputs).map_err(|error| {
+                    if context.is_some() {
+                        Error::rejected("contextual workflow inputs refused")
+                    } else {
+                        error
+                    }
+                })?;
             // The workflow's `carries:` declaration and the request bind
             // both ways: a carry needs a workflow that declares its half,
             // and a carry workflow never starts without one.
@@ -501,6 +507,7 @@ impl Shared {
                     carry: carry.map(|(from_run_id, retain_image)| CarryRequest {
                         from_run_id,
                         retain_image,
+                        carry_inputs: &carry_inputs,
                     }),
                 },
             )

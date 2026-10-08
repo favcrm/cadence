@@ -880,6 +880,46 @@ fn render_values(text: &str, values: &BTreeMap<String, String>) -> Result<String
 /// metadata keys, `depends_on` edges) must match the template's own:
 /// defence in depth if the one-line rule is ever loosened.
 pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String> {
+    render_inner(text, provided, &BTreeMap::new())
+}
+
+/// Render with a run-owned carry map. CAD-1143 Redo: the retained caption
+/// is reviewed, digest-verified material the run itself carries — not a
+/// caller input — so its bytes bypass the one-line input grammar while
+/// every other input still satisfies it. `carry` keys must be declared
+/// inputs and never collide with a `provided` key; a carry-declared input
+/// counts as satisfied even when `provided` omits it. `check_rendered`
+/// re-parses the result and enforces the ticket skeleton exactly as for
+/// ordinary inputs: carried bytes may place multi-line body text but can
+/// never add, drop or reshape a ticket, an `agent:` line or a `depends_on`
+/// edge. The caller supplies already-verified bytes and asserts them
+/// against the frozen material.
+pub fn render_with_carry(
+    text: &str,
+    provided: &BTreeMap<String, String>,
+    carry: &BTreeMap<String, String>,
+) -> Result<String> {
+    let tpl = parse_template(text)?;
+    for key in carry.keys() {
+        if !tpl.inputs.contains_key(key) {
+            return Err(Error::rejected(format!(
+                "carry value '{key}' is not a declared workflow input"
+            )));
+        }
+        if provided.contains_key(key) {
+            return Err(Error::rejected(format!(
+                "carry value '{key}' collides with a supplied input"
+            )));
+        }
+    }
+    render_inner(text, provided, carry)
+}
+
+fn render_inner(
+    text: &str,
+    provided: &BTreeMap<String, String>,
+    carry: &BTreeMap<String, String>,
+) -> Result<String> {
     let tpl = parse_template(text)?;
     for k in provided.keys() {
         if !tpl.inputs.contains_key(k) {
@@ -896,7 +936,11 @@ pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String>
     let missing: Vec<String> = tpl
         .inputs
         .iter()
-        .filter(|(name, spec)| !spec.optional && !provided.contains_key(name.as_str()))
+        .filter(|(name, spec)| {
+            !spec.optional
+                && !provided.contains_key(name.as_str())
+                && !carry.contains_key(name.as_str())
+        })
         .map(|(name, spec)| match &spec.ask {
             Some(ask) => format!("'{name}' ({ask})"),
             None => format!("'{name}'"),
@@ -964,7 +1008,7 @@ pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String>
             }
         }
     }
-    let values: BTreeMap<String, String> = tpl
+    let mut values: BTreeMap<String, String> = tpl
         .inputs
         .keys()
         .map(|k| {
@@ -977,6 +1021,11 @@ pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String>
             (k.clone(), value)
         })
         .collect();
+    // Carry values override the default/empty resolution for their own
+    // declared inputs only; their bytes are the run's verified material.
+    for (key, value) in carry {
+        values.insert(key.clone(), value.clone());
+    }
     let rendered = render_values(text, &values)?;
     check_rendered(text, &tpl, &rendered)?;
     Ok(rendered)
