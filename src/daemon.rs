@@ -44,6 +44,8 @@ mod cad1184_revision_acceptance;
 mod cad1210_acceptance;
 #[cfg(test)]
 mod cad1212_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1218_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
