@@ -101,7 +101,7 @@ fn notice_id(key: &str, to: &str) -> String {
 
 fn send_to(state_dir: &Path, to: &str, text: &str, key: &str) -> Value {
     let id = notice_id(key, to);
-    match client::rpc_timeout(
+    match client::rpc_relay_timeout(
         state_dir,
         "agent_send",
         json!({"alias": to, "text": text, "message": id}),

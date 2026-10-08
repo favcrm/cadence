@@ -19,6 +19,7 @@
 mod agent_wait;
 mod agents_rpc;
 mod answer_rpc;
+mod app_assistant_rpc;
 mod app_audiences_rpc;
 mod app_bindings_rpc;
 mod app_capabilities_rpc;
@@ -26,14 +27,22 @@ mod app_chat_rpc;
 mod app_content_rpc;
 mod app_contexts_rpc;
 mod app_effects_rpc;
+mod app_explorer_rpc;
 mod app_records_rpc;
 mod app_runs_rpc;
 mod app_screens_rpc;
 mod app_teams_rpc;
 mod approvals_rpc;
 mod area_rpc;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1184_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1184_revision_acceptance;
 mod caller_rule;
+#[cfg(all(test, feature = "test-seam"))]
+mod campaign_clone_acceptance;
 mod checkup;
+mod connection_test;
 mod connections_rpc;
 #[cfg(all(test, feature = "test-seam"))]
 mod conversations_acceptance;
@@ -43,6 +52,8 @@ mod crm_smtp_rpc;
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;
+#[cfg(all(test, feature = "test-seam"))]
+mod explorer_acceptance;
 mod idea_rpc;
 mod identity;
 #[cfg(target_os = "linux")]
@@ -469,7 +480,7 @@ pub struct Shared {
     /// custody bytes disagreeing. One lock for every custody mutation:
     /// these verbs are operator-paced and rare, so a per-key map buys
     /// nothing here.
-    platform_custody_lock: Mutex<()>,
+    platform_custody_lock: &'static Mutex<()>,
     /// CAD-786: live send workers keyed `install/context/send` — at
     /// most one runner drains one send's queue.
     crm_send_workers: Mutex<std::collections::HashSet<String>>,
@@ -492,6 +503,8 @@ pub struct Shared {
     /// `test-seam`: parks the send worker between recipient rows.
     #[cfg(feature = "test-seam")]
     crm_send_row_gate: Option<Arc<crate::test_seam::SendRowGate>>,
+    connection_test_resolver: Arc<AtomicBool>,
+    connection_test_fenced: AtomicBool,
     /// CAD-506: the registered platform adapters the effect gate drives
     /// (`platform` name → adapter). A platform with none fails closed —
     /// no reviewed table means no classification, so no call.
@@ -536,6 +549,9 @@ pub struct Shared {
     /// Serializes an app's checked execution claim through bounded Local
     /// commit/readback against binding/context/custody mutations.
     app_release_lock: Mutex<()>,
+    /// Serializes local CRM assistant permission checks and their bounded
+    /// mutation/receipt writes. Never spans a network operation.
+    app_assistant_lock: Mutex<()>,
     app_release_claim_gate: Option<effect_rpc::EffectExecuteGate>,
     /// CAD-546: the `local` platform's outbox root — what
     /// `platform_outbox` lists. Set by `platform::local::register`
@@ -741,7 +757,7 @@ impl Shared {
                 .unwrap_or_else(|| Arc::new(crate::issue::time::now_epoch)),
             board_jwks: Mutex::new(crate::board_identity::JwksCache::default()),
             platform_custody: crate::platform::Custody::open(state_dir)?,
-            platform_custody_lock: Mutex::new(()),
+            platform_custody_lock: Box::leak(Box::new(Mutex::new(()))),
             crm_send_workers: Mutex::new(std::collections::HashSet::new()),
             crm_send_interval: Duration::from_millis(if opts.crm_send_interval_ms == 0 {
                 1000
@@ -758,6 +774,8 @@ impl Shared {
             unsubscribe_origin: opts.unsubscribe_origin.clone(),
             #[cfg(feature = "test-seam")]
             crm_send_row_gate: opts.crm_send_row_gate.clone(),
+            connection_test_resolver: Arc::new(AtomicBool::new(false)),
+            connection_test_fenced: AtomicBool::new(false),
             platforms: opts.platforms.clone(),
             effect_execute_gate: opts.effect_execute_gate.clone(),
             social_publish_sender: opts.social_publish_sender.clone(),
@@ -767,6 +785,7 @@ impl Shared {
             screen_caps: Mutex::new(HashMap::new()),
             screen_mint_rate: Mutex::new(HashMap::new()),
             app_release_lock: Mutex::new(()),
+            app_assistant_lock: Mutex::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
             smtp_test_ca: opts.smtp_test_ca_pem.clone(),
@@ -3343,6 +3362,7 @@ impl Shared {
             "app_sender_binding_list" => self.rpc_app_content(method, params, peer_pid),
             "app_content_save" => self.rpc_app_content(method, params, peer_pid),
             "app_content_show" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_clone" => self.rpc_app_content(method, params, peer_pid),
             "app_content_list" => self.rpc_app_content(method, params, peer_pid),
             "app_content_render" => self.rpc_app_content(method, params, peer_pid),
             "app_content_propose" => self.rpc_app_content(method, params, peer_pid),
@@ -3361,6 +3381,7 @@ impl Shared {
             "app_content_send_prepare" => self.rpc_app_content(method, params, peer_pid),
             "app_workspace_install" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade" => self.rpc_app_workspace(method, params, peer_pid),
+            "app_workspace_install_check" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade_check" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade_recover" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_list" => self.rpc_app_workspace(method, params, peer_pid),
@@ -3368,7 +3389,45 @@ impl Shared {
             "app_workspace_migrate" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_recover" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_migration_recover" => self.rpc_app_workspace(method, params, peer_pid),
+            "app_catalog_list"
+            | "app_catalog_show"
+            | "app_catalog_git_check"
+            | "app_home"
+            | "app_favorites_get"
+            | "app_favorites_put"
+            | "app_favorites_put_default"
+            | "app_favorites_opened"
+            | "app_install_request"
+            | "app_install_requests_list"
+            | "app_install_request_dismiss"
+            | "app_workspace_install_entry"
+            | "app_workspace_update_check"
+            | "app_workspace_remove_preview"
+            | "app_workspace_remove"
+            | "app_workspace_restore" => self.rpc_app_explorer(method, params, peer_pid),
             "app_chat_descriptor" => self.rpc_app_chat_descriptor(params, peer_pid),
+            "app_assistant_actions" => self.rpc_app_assistant_agent(method, params, peer_pid),
+            "app_assistant_invoke" => self.rpc_app_assistant_agent(method, params, peer_pid),
+            "app_assistant_operation_show" => {
+                self.rpc_app_assistant_agent(method, params, peer_pid)
+            }
+            "app_assistant_actions_operator" => {
+                self.rpc_app_assistant_operator(method, params, peer_pid)
+            }
+            "app_assistant_operations" => self.rpc_app_assistant_operator(method, params, peer_pid),
+            "app_assistant_operation_operator_show" => {
+                self.rpc_app_assistant_operator(method, params, peer_pid)
+            }
+            "app_assistant_decision" => self.rpc_app_assistant_operator(method, params, peer_pid),
+            "app_assistant_permissions" => {
+                self.rpc_app_assistant_operator(method, params, peer_pid)
+            }
+            "app_assistant_permission_revoke" => {
+                self.rpc_app_assistant_operator(method, params, peer_pid)
+            }
+            "app_assistant_permission_block" => {
+                self.rpc_app_assistant_operator(method, params, peer_pid)
+            }
             "app_screen_mint" => self.rpc_app_screen_mint(params, peer_pid),
             "app_screen_consume" => self.rpc_app_screen_consume(params, peer_pid),
             "app_approve" => self.rpc_app_approve(params, peer_pid),
@@ -3415,6 +3474,7 @@ impl Shared {
             "operator_session_check" => self.rpc_operator_session_check(params),
             "board_session_open" => self.rpc_board_session_open(params, peer_pid),
             "board_session_check" => self.rpc_board_session_check(params),
+            "board_session_member" => self.rpc_board_session_member(params, peer_pid),
             "operator_session_logout" => self.rpc_operator_session_logout(params),
             "operator_session_stolen" => self.rpc_operator_session_stolen(params),
             "device_login_config" => self.rpc_device_login_config(),
@@ -3430,6 +3490,7 @@ impl Shared {
             "connection_create" => self.rpc_connection(method, params, peer_pid),
             "connection_rotate" => self.rpc_connection(method, params, peer_pid),
             "connection_revoke" => self.rpc_connection(method, params, peer_pid),
+            "connection_test" => self.rpc_connection(method, params, peer_pid),
             "crm_smtp_bind" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_rebind" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_revoke" => self.rpc_crm_smtp(method, params, peer_pid),

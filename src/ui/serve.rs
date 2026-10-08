@@ -16,9 +16,10 @@ use super::write_path::{
     write_route, HttpResp,
 };
 use super::{
-    app_audiences, app_chat, app_content, app_contexts, app_records, app_release, app_runs,
-    app_screens, apps, cli_route, connections, crm_send, delivery_sync, home, lane, operator,
-    platform_account, read_model, social_publish, stages, threads, updates, wiki, workflows,
+    app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
+    app_release, app_runs, app_screens, apps, cli_route, connections, crm_send, delivery_sync,
+    home, lane, operator, platform_account, read_model, social_publish, stages, threads, updates,
+    wiki, workflows,
 };
 use super::{push_device_login_config, ready_file, tailnet_url, ServeOpts, READY_NONCE_ENV};
 use crate::adapter::registry;
@@ -1411,6 +1412,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 send(request, app_chat::handle(state_dir, install));
                 return;
             }
+            if let Some(route) = app_assistant::route(&path) {
+                if !route.is_read() {
+                    send(request, err_response(405, "method not allowed"));
+                    return;
+                }
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                let response = app_assistant::handle(&mut request, state_dir, route, raw_query);
+                send(request, response);
+                return;
+            }
             if let Some(route) = app_contexts::route(&path) {
                 if !route.is_read() {
                     send(request, err_response(405, "method not allowed"));
@@ -1562,6 +1576,20 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     "app_workspace_list"
                 };
                 let response = apps::workspace(&mut request, state_dir, method, id);
+                send(request, response);
+                return;
+            }
+            // CAD-1129: the apps Explorer — `/api/app-catalog`,
+            // `/api/app-home`, `/api/app-favorites`, `/api/app-requests`.
+            // Member-capable reads ride `board_caller` like `/api/wiki`;
+            // the daemon re-proves `member_as` before a member row leaves.
+            if path == "/api/app-catalog"
+                || path.starts_with("/api/app-catalog/")
+                || path == "/api/app-home"
+                || path == "/api/app-favorites"
+                || path == "/api/app-requests"
+            {
+                let response = app_explorer::read(&request, &path, &query, state_dir, opts);
                 send(request, response);
                 return;
             }

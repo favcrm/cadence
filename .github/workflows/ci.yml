@@ -222,6 +222,10 @@ jobs:
         run: python3 scripts/check-doc-links.py
       - name: Test contributor documentation checker
         run: python3 -m unittest discover -s scripts -p 'test_check_doc_links.py'
+      # CAD-833: the live-staging tick is mocked end-to-end — it must
+      # run in CI, not only on the deploying host.
+      - name: Test live-staging deploy tick
+        run: python3 -m unittest discover -s scripts -p 'test_staging_deploy.py'
       - name: Verify live doctor/host source inventory
         run: scripts/split-doctor-host --check
 

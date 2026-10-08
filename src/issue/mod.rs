@@ -6,9 +6,12 @@
 //! daemon socket.
 
 pub mod app;
+pub mod app_access;
 pub mod app_action;
+pub mod app_assistant;
 pub mod app_catalog;
 pub mod app_chat;
+pub mod app_listing;
 pub mod app_screen_decl;
 pub mod app_screen_pkg;
 pub mod app_source;
@@ -30,6 +33,7 @@ pub mod hooks;
 pub mod idea;
 pub mod line_times;
 pub mod lint;
+mod lockseam;
 pub mod model;
 pub mod notes;
 pub mod parse;
@@ -258,7 +262,25 @@ impl Pm {
     /// it. For a caller that must not stall behind a writer (the daemon
     /// under its own lock, CAD-449) and retries later instead.
     pub fn try_lock(&self) -> Result<Option<PmLock>> {
-        self.acquire(None)
+        self.acquire(None, None)
+    }
+
+    /// [`Self::lock`] scoped to `paths`: when a crashed writer left
+    /// the tracker mid-write, a write whose paths are disjoint from
+    /// the leftovers is admitted; an overlapping write is refused, and
+    /// git-level markers (`index.lock`, merge/rebase heads) refuse
+    /// every write. The returned guard's commit must stay inside the
+    /// declared paths — use [`Self::commit_scoped`], which enforces
+    /// it. `paths` follow [`Self::commit`]'s convention (absolute or
+    /// `pm.dir`-relative; outside the tracker is a caller bug).
+    pub fn lock_for_paths(&self, paths: &[PathBuf]) -> Result<PmLock> {
+        self.acquire_scoped_default(paths)
+    }
+
+    /// [`Self::lock_for_paths`] without the wait: `None` when another
+    /// writer holds it.
+    pub fn try_lock_for_paths(&self, paths: &[PathBuf]) -> Result<Option<PmLock>> {
+        self.acquire(None, Some(paths))
     }
 
     /// True when the worktree differs from HEAD.
@@ -301,8 +323,21 @@ impl Pm {
     /// fence trips — checked again here so a `PmLock` taken before the
     /// loss cannot sneak a commit past it — and the message gains a
     /// `Lease-Epoch:` trailer naming the writer generation.
-    pub fn commit(&self, paths: &[PathBuf], message: &str) -> Result<Vec<String>> {
-        self.fence_check()?;
+    /// `paths` (absolute, or `pm.dir`-relative) as repo-relative
+    /// strings, sorted and deduped. Shared by [`Self::commit`] and the
+    /// scoped lock admission: one derivation, one caller-bug rule.
+    ///
+    /// A `..` component is a caller bug and refused: git resolves
+    /// `dir/../../other` to `other` at commit time, which would let a
+    /// scoped write pass the overlap check as one path and commit
+    /// another. Git pathspec syntax is refused for the same reason —
+    /// git would expand the pattern beyond the literal string the
+    /// scope checked. `.` components and duplicate separators are normalized
+    /// away by reconstruction; the tracker root itself (`pm.dir`,
+    /// `.`) becomes the empty string, which the scope checks read as
+    /// the whole tracker.
+    fn rel_paths(&self, paths: &[PathBuf]) -> Result<Vec<String>> {
+        use std::path::Component;
         let mut rel = Vec::with_capacity(paths.len());
         for p in paths {
             let abs = if p.is_absolute() {
@@ -317,15 +352,59 @@ impl Pm {
                     self.dir.display()
                 ))
             })?;
-            rel.push(r.to_string_lossy().into_owned());
+            let mut norm = PathBuf::new();
+            for c in r.components() {
+                match c {
+                    Component::ParentDir => {
+                        return Err(Error::internal(format!(
+                            "tracker write {} escapes the PM dir (.. is refused)",
+                            p.display()
+                        )));
+                    }
+                    Component::CurDir => {}
+                    _ => norm.push(c.as_os_str()),
+                }
+            }
+            let rel_str = norm.to_string_lossy().into_owned();
+            if pmlock::has_pathspec_magic(&rel_str) {
+                return Err(Error::internal(format!(
+                    "tracker write {} uses git pathspec syntax (refused: \
+                     scope checks are literal)",
+                    p.display()
+                )));
+            }
+            rel.push(rel_str);
         }
+        rel.sort();
+        rel.dedup();
+        Ok(rel)
+    }
+
+    /// [`Self::commit`] through a scoped [`PmLock`]: the commit's paths
+    /// must stay inside the lock's admitted paths and clear of the
+    /// crashed writer's leftovers, or the commit is refused and nothing
+    /// is staged. A `Full` (unscoped) guard commits exactly like
+    /// [`Self::commit`]. Callers that took [`Self::lock_for_paths`]
+    /// must commit through here, never through [`Self::commit`].
+    pub fn commit_scoped(
+        &self,
+        lock: &PmLock,
+        paths: &[PathBuf],
+        message: &str,
+    ) -> Result<Vec<String>> {
+        self.fence_check()?;
+        lock.check_commit(&self.rel_paths(paths)?)?;
+        self.commit(paths, message)
+    }
+
+    pub fn commit(&self, paths: &[PathBuf], message: &str) -> Result<Vec<String>> {
+        self.fence_check()?;
+        let rel = self.rel_paths(paths)?;
         if rel.is_empty() {
             return Err(Error::internal(
                 "a tracker commit must name the paths it wrote",
             ));
         }
-        rel.sort();
-        rel.dedup();
         let unstage = |dir: &Path, rel: &[String]| {
             let mut args = vec!["reset", "-q", "--"];
             args.extend(rel.iter().map(String::as_str));

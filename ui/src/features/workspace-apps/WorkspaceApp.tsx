@@ -296,6 +296,12 @@ export default function WorkspaceApp({
     data?.contexts.filter((value) => value.state === "active") ?? [];
   const selectedContext = contexts.find(value => value.id === contextId);
   const workflowInputs = Object.fromEntries((data?.installation.workflows ?? []).map(value => [value.name, value.inputs]));
+  // CAD-1171: a host-executed workflow runs its capability step in-process
+  // for the operator's own click — no PM/reader team and no separate approve
+  // round. A missing field (older daemon) keeps the agent path unchanged.
+  const hostWorkflow = (name: string) =>
+    (data?.installation.workflows ?? []).some(value => value.name === name && value.execution === "host");
+  const hostSource = hostWorkflow("source-instagram");
   const supportsContentPrompt = Object.values(workflowInputs).some(inputs => inputs.some(input => input.name === "content_prompt"));
   const supportsImagePrompt = Object.values(workflowInputs).some(inputs => inputs.some(input => input.name === "image_prompt"));
   const agents = data?.agents ?? [];
@@ -462,14 +468,24 @@ export default function WorkspaceApp({
   const createSource = (values: SourceImportValues) =>
     void mutate(async () => {
       const requestKey = `${installId}.${contextId}.source.${JSON.stringify(values)}`;
-      const created = await workspaceApps.createRun({
+      // CAD-1171: a host workflow has no owner PM and no reader input, and
+      // the operator's click is the consent — the same gesture approves and
+      // dispatches it. A retry after a lost reply reuses the retained request
+      // ID and stops at the state the run already reached.
+      let created = await workspaceApps.createRun({
         install_id: installId,
         workflow: "source-instagram",
-        inputs: { profile_handle: values.profileHandle, writer: values.writer },
+        inputs: hostSource
+          ? { profile_handle: values.profileHandle }
+          : { profile_handle: values.profileHandle, writer: values.writer },
         request_id: retainedRequest(requestKey),
-        owner_pm: values.ownerPm,
+        ...(hostSource ? {} : { owner_pm: values.ownerPm }),
         ...(contextId ? { context_id: contextId } : {}),
       });
+      if (hostSource && created.state === "awaiting_approval")
+        created = await workspaceApps.approveRun(created.id, created.snapshot_digest);
+      if (hostSource && created.state === "approved")
+        created = await workspaceApps.dispatchRun(created.id);
       completeRequest(requestKey);
       if (identity.current !== installId) return;
       setImporting(false);
@@ -1090,6 +1106,7 @@ export default function WorkspaceApp({
           managers={options(managers)}
           busy={busy}
           error={actionError}
+          host={hostSource}
           onDenied={clearPrivate}
           onClose={() => { if (!busy) setImporting(false); }}
           onCreate={createSource}
@@ -1100,12 +1117,15 @@ export default function WorkspaceApp({
           <div className="wa-stack">
             {actionError && <p className="wa-alert" data-tone="fail" role="alert">{actionError}</p>}
             <div className="wa-row"><span className="wa-status" data-tone={statusTone(run.state)}>{statusText(run.state)}</span><span className="wa-kicker">{run.id}</span></div>
+            {run.failure && !actionError && <p className="wa-alert" data-tone="fail" role="status">{run.failure.kind === "uncertain" ? "The provider outcome is uncertain; no automatic retry was made." : "This source read was refused."} {run.failure.reason}</p>}
             <p className="wa-muted">This run reads public posts from the frozen @{run.snapshot.inputs.profile_handle} profile. It cannot publish or generate an image.</p>
             {run.snapshot.quotes?.source?.currency === "USD" && Number.isSafeInteger(run.snapshot.quotes.source.total_price_micros) ? <p className="wa-alert">Frozen provider charge: <strong>USD {(run.snapshot.quotes.source.total_price_micros / 1_000_000).toFixed(6)}</strong> for one read. Binding {run.snapshot.capabilities?.source?.digest || "unavailable"}. A changed quote or binding stops dispatch.</p> : <p className="wa-alert" data-tone="fail">This source plan has no verified provider quote. It cannot be approved.</p>}
             <details className="wa-details"><summary>Inspect the exact source plan</summary><pre>{JSON.stringify(run.snapshot, null, 2)}</pre><p className="wa-digest">{run.snapshot_digest}</p></details>
-            {run.state === "awaiting_approval" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.approveRun(run.id, run.snapshot_digest); })}>Approve source plan</Button>}
-            {run.state === "approved" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.dispatchRun(run.id); })}>Start source reader</Button>}
-            {run.state === "running" && <p className="wa-muted" role="status">Waiting for the assigned reader and provider receipt. Refresh Sources to see retained posts.</p>}
+            {/* CAD-1171: a host run already carries its consent — the click
+                that created it. Only an agent run shows the approve round. */}
+            {run.state === "awaiting_approval" && run.snapshot.workflow.execution !== "host" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.approveRun(run.id, run.snapshot_digest); })}>Approve source plan</Button>}
+            {run.state === "approved" && run.snapshot.workflow.execution !== "host" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.dispatchRun(run.id); })}>Start source reader</Button>}
+            {run.state === "running" && <p className="wa-muted" role="status">{run.snapshot.workflow.execution === "host" ? "The host is calling the frozen source binding and storing the provider receipt. Refresh Sources to see retained posts." : "Waiting for the assigned reader and provider receipt. Refresh Sources to see retained posts."}</p>}
             {run.state === "failed" && <p className="wa-alert" data-tone="fail">The source run failed. No posts will be fabricated. Inspect its exact plan and stored run for details.</p>}
             {run.state === "succeeded" && <p className="wa-muted">The provider receipt is available in Sources. Choose one post there to start a caption.</p>}
           </div>
@@ -1130,6 +1150,7 @@ export default function WorkspaceApp({
               </span>
               <span className="wa-kicker">{run.id}</span>
             </div>
+            {run.failure && !actionError && <p className="wa-alert" data-tone="fail" role="status">{run.failure.kind === "uncertain" ? "The provider outcome is uncertain; no automatic retry was made." : "This capability was refused."} {run.failure.reason}</p>}
             <p className="wa-muted">{run.snapshot.inputs.source}</p>
             {isImageRun(run) && (imagePlanPriced
               ? <p className="wa-alert">Current rate at approval: <strong>USD {(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}</strong> per image — billed at the provider's actual charge. This covers one square image draft from {run.snapshot.source ? "the selected post" : "pasted facts"}. Binding {run.snapshot.capabilities?.image?.digest}. A changed rate or binding stops dispatch.</p>

@@ -107,6 +107,10 @@ pub const MASTER_ALLOWED: &[&str] = &[
     // campaign's proposal list before the operator applies it.
     "app_content_assistant_proposals",
     "app_content_assistant_proposal_show",
+    // CAD-1184: generic host-registry actions, scoped by the same live turn.
+    "app_assistant_actions",
+    "app_assistant_invoke",
+    "app_assistant_operation_show",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for
@@ -209,7 +213,7 @@ pub(crate) fn master_may_call(method: &str) -> bool {
 
 /// CAD-1098 Gate 2: the daemon methods a master turn whose running
 /// message is in an APP conversation (or whose running message cannot be
-/// resolved — fail closed) may call: the nine scoped assistant verbs,
+/// resolved — fail closed) may call: the twelve scoped assistant verbs,
 /// `message_report` (own running message only — it finishes the turn) and
 /// `thread_read` (only the running message's own conversation). Nothing
 /// else: no `health` (fleet metadata), no permission verbs (so
@@ -218,6 +222,9 @@ pub(crate) fn master_may_call(method: &str) -> bool {
 /// escalate, interrupt or answer verbs. An allowlist, so a method added
 /// later is closed to app turns until it is listed here.
 pub const MASTER_APP_ALLOWED: &[&str] = &[
+    "app_assistant_actions",
+    "app_assistant_invoke",
+    "app_assistant_operation_show",
     "app_record_csv_assistant_import",
     "app_record_csv_assistant_preview",
     "app_segment_assistant_save",
@@ -717,14 +724,17 @@ impl Shared {
         let model = if provider == "pi" {
             let policy = crate::pi_policy::read(&pm.dir)?;
             let chosen = model.as_deref();
-            let resolved = crate::pi_policy::resolve_model(policy.as_ref(), "master", chosen)?;
+            let (resolved, fallback) =
+                crate::pi_policy::resolve_model_with_source(policy.as_ref(), "master", chosen)?;
             if chosen.is_none() {
                 // pm.yaml's role default filled the slot — `register_agent`
                 // will label it `explicit`, so restamp the real
                 // provenance after the row lands.
-                pi_selection = Some(crate::model_defaults::pi_policy_default_selection(
-                    "master", &resolved,
-                ));
+                pi_selection = Some(if fallback {
+                    crate::model_defaults::platform_default_selection("master", &resolved)
+                } else {
+                    crate::model_defaults::pi_policy_default_selection("master", &resolved)
+                });
             }
             Some(resolved)
         } else {
@@ -1852,6 +1862,13 @@ mod tests {
             "app_content_send",
             "app_audience_freeze",
             "app_campaign_freeze",
+            "app_assistant_actions_operator",
+            "app_assistant_operations",
+            "app_assistant_operation_operator_show",
+            "app_assistant_decision",
+            "app_assistant_permissions",
+            "app_assistant_permission_revoke",
+            "app_assistant_permission_block",
         ] {
             assert!(!master_may_call(operator_only), "{operator_only}");
         }
@@ -1864,6 +1881,9 @@ mod tests {
         assert_eq!(
             held,
             [
+                "app_assistant_actions",
+                "app_assistant_invoke",
+                "app_assistant_operation_show",
                 "app_content_assistant_draft",
                 "app_content_assistant_proposal_show",
                 "app_content_assistant_proposals",

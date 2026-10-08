@@ -225,8 +225,6 @@ fn resolve_rebase(dir: &Path, git_dir: &Path, side: Resolve) -> Result<()> {
 /// tree is back to its pre-sync state; precondition violations are
 /// refusals naming the offending paths.
 pub fn run(pm: &Pm, push: bool, dry_run: bool, resolve: Option<Resolve>) -> Result<Value> {
-    // The writers' lock — nothing may land in the tracker mid-sync.
-    let _lock = pm.lock()?;
     let dir = &pm.dir;
     let git_dir = hooks::git_dir(dir).ok_or_else(|| {
         Error::rejected(format!(
@@ -240,6 +238,16 @@ pub fn run(pm: &Pm, push: bool, dry_run: bool, resolve: Option<Resolve>) -> Resu
             dir.display()
         ))
     })?;
+    // CAD-1191: the fetch is network work and only moves `origin/*`
+    // refs, never the tracker's tree — it runs BEFORE the writers' lock.
+    // It may be stale by the time the lock is taken; everything below
+    // (ahead/behind, rebase) reads the refs again under the lock, so a
+    // stale fetch only means a later sync picks up the newer remote.
+    crate::issue::lockseam::outside_lock("sync-fetch");
+    git(dir, &["fetch", "origin"])?;
+
+    // The writers' lock — nothing may land in the tracker mid-rebase.
+    let lock = pm.lock()?;
     let markers = in_progress_markers(&git_dir);
     if !markers.is_empty() {
         return Err(Error::rejected(format!(
@@ -255,7 +263,6 @@ pub fn run(pm: &Pm, push: bool, dry_run: bool, resolve: Option<Resolve>) -> Resu
         )));
     }
     let branch = git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    git(dir, &["fetch", "origin"])?;
     let upstream = format!("origin/{branch}");
     let has_upstream = probe(
         dir,
@@ -343,9 +350,15 @@ pub fn run(pm: &Pm, push: bool, dry_run: bool, resolve: Option<Resolve>) -> Resu
         }));
     }
 
+    // CAD-1191: the push is network work — the lock goes back first.
+    // The rebased branch is final; a writer that commits meanwhile is
+    // simply pushed with it, and a concurrent sync that moved the remote
+    // makes this push reject, reported as `push_error` exactly as before.
+    drop(lock);
     let mut pushed = false;
     let mut push_error = Value::Null;
     if push {
+        crate::issue::lockseam::outside_lock("sync-push");
         // `pushed` means the remote actually moved — an up-to-date
         // push succeeds without changing anything.
         let before = probe(dir, &["rev-parse", &upstream]);

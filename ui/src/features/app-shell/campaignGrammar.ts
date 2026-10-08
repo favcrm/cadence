@@ -173,6 +173,8 @@ export interface ContentDoc {
   campaignId: string;
   /** CAD-1058: optional human name; null for campaigns without one. */
   name: string | null;
+  /** Saved draft hint only; it is not a frozen or committed audience. */
+  draftAudience?: { mode: "segment"; segmentId: string } | null;
   revision: number;
   subject: string;
   preheader: string;
@@ -193,6 +195,21 @@ export function parseContentDoc(value: unknown): ContentDoc {
   }
   const row = doc as Record<string, unknown>;
   const approval = (row.approval as Record<string, unknown> | null) ?? {};
+  let draftAudience: ContentDoc["draftAudience"];
+  if (Object.prototype.hasOwnProperty.call(row, "draft_audience")) {
+    const rawAudience = row.draft_audience;
+    if (rawAudience === null) {
+      draftAudience = null;
+    } else if (typeof rawAudience === "object" && !Array.isArray(rawAudience)) {
+      const audience = rawAudience as Record<string, unknown>;
+      if (audience.mode !== "segment" || typeof audience.segment_id !== "string" || audience.segment_id === "") {
+        throw new ApiError("The server returned an invalid campaign draft audience", 502);
+      }
+      draftAudience = { mode: "segment", segmentId: audience.segment_id };
+    } else {
+      throw new ApiError("The server returned an invalid campaign draft audience", 502);
+    }
+  }
   if (
     typeof row.campaign_id !== "string" ||
     typeof row.revision !== "number" ||
@@ -206,6 +223,7 @@ export function parseContentDoc(value: unknown): ContentDoc {
   return {
     campaignId: row.campaign_id,
     name: typeof row.name === "string" && row.name !== "" ? row.name : null,
+    ...(draftAudience !== undefined ? { draftAudience } : {}),
     revision: row.revision,
     subject: row.subject,
     preheader: row.preheader,

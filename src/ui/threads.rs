@@ -43,7 +43,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tiny_http::Request;
 
-use super::{err_response, header_value, json_response, parse_json, read_body, HttpResp};
+use super::{
+    busy_response, err_response, header_value, json_response, parse_json, read_body, HttpResp,
+};
 use crate::client;
 use crate::error::Error;
 
@@ -133,6 +135,9 @@ fn rpc_err(e: &Error) -> HttpResp {
         || text.contains("Unknown app installation")
     {
         return err_response(404, &text);
+    }
+    if let Some(resp) = busy_response(e) {
+        return resp;
     }
     match e {
         Error::Internal(_) => err_response(500, &text),
@@ -415,4 +420,9 @@ pub(super) fn post_conversation(
         Ok(created) => json_response(created),
         Err(e) => rpc_err(&e),
     }
+}
+
+#[cfg(test)]
+pub(super) fn busy_status_for_test(e: &Error) -> u16 {
+    rpc_err(e).status_code().0
 }

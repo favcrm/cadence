@@ -30,6 +30,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::io::{self, Read};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -59,6 +72,34 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Resolve HEAD's branch; symbolic-ref exit 1 is Git's detached-HEAD result.
+pub(crate) fn git_branch(dir: &Path) -> Result<Option<String>> {
+    let args = ["symbolic-ref", "--quiet", "--short", "HEAD"];
+    let out = git_out(dir, &args, &[])?;
+    match out.status.code() {
+        Some(0) => {
+            let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if branch.is_empty() {
+                Err(Error::rejected(format!(
+                    "git {} returned an empty branch in {}",
+                    args.join(" "),
+                    dir.display()
+                )))
+            } else {
+                Ok(Some(branch))
+            }
+        }
+        Some(1) => Ok(None),
+        code => Err(Error::rejected(format!(
+            "git {} failed in {} with status {:?}: {}",
+            args.join(" "),
+            dir.display(),
+            code,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))),
+    }
 }
 
 /// Raw bounded git output for probes that need stdout on any exit.
@@ -265,7 +306,6 @@ fn probe_rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
 /// this worktree.
 struct Target {
     front: Front,
-    body: String,
     dir: PathBuf,
     wt_dir: Option<PathBuf>,
     wt_name: Option<String>,
@@ -275,15 +315,100 @@ struct Target {
     cargo_target: Option<String>,
 }
 
-/// The branch a live worktree has checked out; `None` when the dir is
-/// gone, detached or not a git checkout.
-fn checked_out_branch(wt: &Path) -> Option<String> {
-    if !wt.is_dir() {
-        return None;
+fn verify_checkout_ownership(
+    root: &Path,
+    path: &Path,
+    issue: &str,
+    expected_branch: Option<&str>,
+) -> Result<Option<crate::worktree::lifecycle::Checkout>> {
+    let record = crate::worktree::lifecycle::managed_record(root, path)?;
+    if let Some(record) = &record {
+        if record.purpose != "development"
+            || record.issue.as_deref() != Some(issue)
+            || expected_branch.is_some_and(|branch| record.branch.as_deref() != Some(branch))
+            || record.state != "active"
+        {
+            return Err(Error::rejected(format!(
+                "checkout ownership for {} does not authorize issue {issue}, branch {:?}, purpose {}, state {} — refusing deletion",
+                path.display(), record.branch, record.purpose, record.state
+            )));
+        }
     }
-    git(wt, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .ok()
-        .filter(|name| !name.is_empty())
+    // Issue refs remain the development-lane authority for legacy checkouts;
+    // when lifecycle metadata exists it must agree and be active. In all cases
+    // resolve has already bound the candidate to a declared repo and layout.
+    let branch = expected_branch.or_else(|| record.as_ref().and_then(|r| r.branch.as_deref()));
+    if path.is_dir() {
+        let actual = checked_out_branch(path)?.ok_or_else(|| {
+            Error::rejected(format!(
+                "checkout {} has no registered branch; refusing deletion",
+                path.display()
+            ))
+        })?;
+        if branch.is_some_and(|branch| branch != actual) {
+            return Err(Error::rejected(format!(
+                "checkout {} is on branch {actual}, not the issue-owned branch {}; refusing deletion",
+                path.display(), branch.unwrap_or_default()
+            )));
+        }
+        crate::worktree::validate_registered_branch(root, path, &actual)?;
+    } else if let Some(branch) = branch {
+        let live = registered_branch_path(root, branch)?.filter(|live| !same_path(live, path));
+        if let Some(live) = live {
+            return Err(Error::rejected(format!(
+                "issue-owned branch {branch} is checked out at {}, not {}; refusing deletion",
+                live.display(),
+                path.display()
+            )));
+        }
+    }
+    Ok(record)
+}
+
+fn verify_refs_only_ownership(
+    root: &Path,
+    path: &Path,
+    issue: &str,
+    expected_branch: Option<&str>,
+) -> Result<()> {
+    let Some(record) = crate::worktree::lifecycle::managed_record(root, path)? else {
+        return Ok(());
+    };
+    if record.purpose != "development"
+        || record.issue.as_deref() != Some(issue)
+        || expected_branch.is_some_and(|branch| record.branch.as_deref() != Some(branch))
+    {
+        return Err(Error::rejected(format!(
+            "refs-only finish ownership for {} does not match issue {issue}, branch {:?}, purpose {}",
+            path.display(), record.branch, record.purpose
+        )));
+    }
+    if !matches!(record.state.as_str(), "active" | "released") {
+        let reason = record
+            .retention_reason
+            .as_deref()
+            .or(record.release_reason.as_deref())
+            .unwrap_or("no recorded lifecycle reason");
+        return Err(Error::rejected(format!(
+            "refs-only finish refuses {} recorded as {} ({reason})",
+            path.display(),
+            record.state
+        )));
+    }
+    Ok(())
+}
+
+/// The branch a live worktree has checked out; `None` only when it is absent
+/// or detached. Git and filesystem inspection errors remain errors.
+fn checked_out_branch(wt: &Path) -> Result<Option<String>> {
+    match std::fs::symlink_metadata(wt) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
+            Error::rejected(format!("{} is not a real worktree directory", wt.display())),
+        ),
+        Ok(_) => git_branch(wt),
+    }
 }
 
 /// The three ref states an issue can be in for finishing.
@@ -317,7 +442,7 @@ fn lane_list(lanes: &[&Ref]) -> String {
 /// (hand-edited history) is still finishable on its own.
 fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
     let (_project, dir) = write::issue_dir(pm, id)?;
-    let (front, body) = write::load_front(&dir)?;
+    let (front, _body) = write::load_front(&dir)?;
     let open_wts: Vec<&Ref> = front
         .refs
         .iter()
@@ -379,12 +504,19 @@ fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
     // or adopted) pairs by the branch it actually has checked out, when
     // that value is recorded as an open branch ref (CAD-166).
     let branch = match &wt_name {
-        Some(n) => open_branch(Some(&layout::branch(n)))
-            .or_else(|| {
-                let head = checked_out_branch(open_wt.as_deref()?)?;
-                open_branch(Some(&head))
-            })
-            .unwrap_or_default(),
+        Some(n) => {
+            if let Some(branch) = open_branch(Some(&layout::branch(n))) {
+                branch
+            } else {
+                let head = match open_wt.as_deref() {
+                    Some(path) => checked_out_branch(path)?,
+                    None => None,
+                };
+                head.as_deref()
+                    .and_then(|head| open_branch(Some(head)))
+                    .unwrap_or_default()
+            }
+        }
         None => open_branch(None).unwrap_or_default(),
     };
     // Tracker values reach git below — refuse one it would read as an
@@ -430,6 +562,53 @@ fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
                     .unwrap_or_default()
             ))
         })?;
+    let declared = start::declared_repos(&_project);
+    if !declared.contains(&root) {
+        return Err(Error::rejected(format!(
+            "Worktree {} has foreign ownership: repo {} is undeclared by project {} (declares: {}) — refusing deletion",
+            wt_dir
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            root.display(),
+            _project.key,
+            if declared.is_empty() {
+                "no local repo paths".to_string()
+            } else {
+                declared
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        )));
+    }
+    if let Some(path) = &wt_dir {
+        if same_path(path, &root) {
+            return Err(Error::rejected(format!(
+                "Worktree {} is not a linked worktree (the main checkout is never reclaimed)",
+                path.display()
+            )));
+        }
+        if layout::root_of(path).as_deref() != Some(root.as_path()) {
+            return Err(Error::rejected(format!(
+                "Worktree {} is outside the managed layout for repo {} — inventory and explicitly adopt unknown checkouts; issue finish will not delete them",
+                path.display(), root.display()
+            )));
+        }
+        if path.is_dir() {
+            let meta = std::fs::symlink_metadata(path)?;
+            if !meta.is_dir()
+                || meta.file_type().is_symlink()
+                || path.canonicalize()? != lexical_path(path)
+            {
+                return Err(Error::rejected(format!(
+                    "Worktree {} is symlinked or differs from its canonical managed path — refusing cleanup",
+                    path.display()
+                )));
+            }
+        }
+    }
     // Message refs bind the worktree they were dispatched against: a
     // ref carrying a `worktree` field scopes to that pair only, so a
     // re-start under `--name` doesn't inherit the earlier kickoff's
@@ -439,7 +618,6 @@ fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
     let msg_refs = bound_msg_refs(&front, wt_name.as_deref(), wt_dir.as_deref());
     Ok(Resolve::Target(Box::new(Target {
         front,
-        body,
         dir,
         wt_dir,
         wt_name,
@@ -487,35 +665,1175 @@ struct Check {
     blocks: Vec<Block>,
 }
 
-/// Pids whose `/proc/<pid>/cwd` resolves under `dir` — the "open
-/// shell in the worktree" check. /proc races are fine: a vanished pid
-/// or a denied read just doesn't report. The cadence process itself
-/// is excluded; a parent shell standing in the worktree is not — that
-/// is exactly the open-shell case.
-pub(crate) fn pids_cwd_under(dir: &Path) -> Vec<u32> {
-    let mut out = Vec::new();
-    let Ok(dir) = dir.canonicalize() else {
-        return out;
+#[cfg(test)]
+thread_local! {
+    static PROCESS_PROC_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ProcessProcRootGuard(Option<PathBuf>);
+
+#[cfg(test)]
+impl Drop for ProcessProcRootGuard {
+    fn drop(&mut self) {
+        PROCESS_PROC_ROOT.with(|root| *root.borrow_mut() = self.0.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn use_process_proc_root_for_test(root: PathBuf) -> ProcessProcRootGuard {
+    let previous = PROCESS_PROC_ROOT.with(|current| current.borrow_mut().replace(root));
+    ProcessProcRootGuard(previous)
+}
+
+fn process_proc_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = PROCESS_PROC_ROOT.with(|root| root.borrow().clone()) {
+        return root;
+    }
+    // Release builds reject `test-seam`; integration checks can isolate proc
+    // enumeration without weakening the production `/proc` path.
+    #[cfg(feature = "test-seam")]
+    if let Some(root) = std::env::var_os("CADENCE_TEST_PROC_ROOT") {
+        return PathBuf::from(root);
+    }
+    PathBuf::from("/proc")
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mountinfo_path(value: &str) -> Option<PathBuf> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            decoded.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let digits = bytes.get(i + 1..i + 4)?;
+        let escaped = match digits {
+            b"040" => b' ',
+            b"011" => b'\t',
+            b"012" => b'\n',
+            b"134" => b'\\',
+            _ => return None,
+        };
+        decoded.push(escaped);
+        i += 4;
+    }
+    if decoded.contains(&0) {
+        return None;
+    }
+    String::from_utf8(decoded).ok().map(PathBuf::from)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_proc_mount_options(options: &[&str]) -> std::result::Result<(), String> {
+    let mut hidepid_seen = false;
+    for option in options.iter().flat_map(|options| options.split(',')) {
+        if option.is_empty() {
+            return Err("mountinfo contains an empty mount option".into());
+        }
+        if option == "hidepid" {
+            return Err("proc mount has an unparseable hidepid option".into());
+        }
+        if let Some(value) = option.strip_prefix("hidepid=") {
+            if hidepid_seen {
+                return Err("proc mount has ambiguous duplicate hidepid options".into());
+            }
+            hidepid_seen = true;
+            if value != "0" {
+                return Err(format!(
+                    "proc mount restricts process visibility with hidepid={value}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+struct ProcView {
+    root: File,
+    canonical: PathBuf,
+    scan_root: PathBuf,
+    synthetic: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn proc_view_error(path: &Path, reason: impl std::fmt::Display) -> Error {
+    Error::rejected(format!(
+        "cannot prove complete procfs visibility for {}: {reason}",
+        path.display()
+    ))
+}
+
+#[cfg(target_os = "linux")]
+impl ProcView {
+    fn open(proc_root: &Path) -> Result<Self> {
+        let canonical = proc_root.canonicalize().map_err(|error| {
+            proc_view_error(proc_root, format!("cannot resolve proc root: {error}"))
+        })?;
+        let c_path = CString::new(canonical.as_os_str().as_bytes())
+            .map_err(|_| proc_view_error(&canonical, "proc root contains NUL"))?;
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(proc_view_error(
+                &canonical,
+                format!("cannot open proc root: {}", io::Error::last_os_error()),
+            ));
+        }
+        let root = unsafe { File::from_raw_fd(fd) };
+        let root_meta = root.metadata().map_err(|error| {
+            proc_view_error(&canonical, format!("cannot inspect opened root: {error}"))
+        })?;
+        if !root_meta.is_dir() {
+            return Err(proc_view_error(
+                &canonical,
+                "opened root is not a directory",
+            ));
+        }
+        let scan_root = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
+        let anchor_meta = std::fs::metadata(&scan_root).map_err(|error| {
+            proc_view_error(
+                &canonical,
+                format!(
+                    "cannot resolve held root through {}: {error}",
+                    scan_root.display()
+                ),
+            )
+        })?;
+        if !anchor_meta.is_dir()
+            || anchor_meta.dev() != root_meta.dev()
+            || anchor_meta.ino() != root_meta.ino()
+        {
+            return Err(proc_view_error(
+                &canonical,
+                "anchored scan path does not identify the opened root directory",
+            ));
+        }
+        let root_is_nonprocfs =
+            fstatfs_type(&root).is_ok_and(|kind| kind != libc::PROC_SUPER_MAGIC);
+        let synthetic = root_is_nonprocfs
+            && canonical != Path::new("/proc")
+            && (cfg!(test) || cfg!(feature = "test-seam"));
+        Ok(Self {
+            root,
+            canonical,
+            scan_root,
+            synthetic,
+        })
+    }
+
+    fn open_at(&self, relative: &str, flags: libc::c_int) -> io::Result<File> {
+        let relative = CString::new(relative)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "proc path contains NUL"))?;
+        let fd = unsafe { libc::openat(self.root.as_raw_fd(), relative.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn verify_proof_fd(
+        &self,
+        file: &File,
+        root_dev: u64,
+        root_mount_id: u64,
+        label: &str,
+        require_regular: bool,
+    ) -> Result<()> {
+        let metadata = file.metadata().map_err(|error| {
+            proc_view_error(&self.canonical, format!("cannot inspect {label}: {error}"))
+        })?;
+        if require_regular && !metadata.is_file() {
+            return Err(proc_view_error(
+                &self.canonical,
+                format!("{label} is not a regular file"),
+            ));
+        }
+        if !require_regular && !metadata.file_type().is_symlink() {
+            return Err(proc_view_error(
+                &self.canonical,
+                format!("{label} is not a namespace symlink"),
+            ));
+        }
+        if metadata.dev() != root_dev {
+            return Err(proc_view_error(
+                &self.canonical,
+                format!("{label} is on a different filesystem from the held proc root"),
+            ));
+        }
+        let fs_type = fstatfs_type(file).map_err(|error| {
+            proc_view_error(
+                &self.canonical,
+                format!("cannot inspect {label} filesystem: {error}"),
+            )
+        })?;
+        if !self.synthetic && fs_type != libc::PROC_SUPER_MAGIC {
+            return Err(proc_view_error(
+                &self.canonical,
+                format!("{label} is not on procfs"),
+            ));
+        }
+        let mount_id = statx_mount_id(file).map_err(|error| {
+            proc_view_error(
+                &self.canonical,
+                format!("cannot prove {label} mount identity: {error}"),
+            )
+        })?;
+        if mount_id != root_mount_id {
+            return Err(proc_view_error(
+                &self.canonical,
+                format!("{label} is not on the held proc-root mount"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_proof_file(&self, relative: &str, root_dev: u64, root_mount_id: u64) -> Result<File> {
+        let file = self
+            .open_at(
+                relative,
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+            .map_err(|error| {
+                proc_view_error(
+                    &self.canonical,
+                    format!("cannot open {relative} relative to held root: {error}"),
+                )
+            })?;
+        self.verify_proof_fd(&file, root_dev, root_mount_id, relative, true)?;
+        Ok(file)
+    }
+
+    fn read_namespace_link(
+        &self,
+        relative: &str,
+        root_dev: u64,
+        root_mount_id: u64,
+    ) -> Result<Option<u64>> {
+        let file = self
+            .open_at(relative, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .map_err(|error| {
+                proc_view_error(
+                    &self.canonical,
+                    format!("cannot open {relative} relative to held root: {error}"),
+                )
+            })?;
+        self.verify_proof_fd(&file, root_dev, root_mount_id, relative, false)?;
+        let empty = b"\0";
+        let mut bytes = [0u8; 64];
+        let count = unsafe {
+            libc::readlinkat(
+                file.as_raw_fd(),
+                empty.as_ptr().cast(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        if count < 0 {
+            return Err(proc_view_error(
+                &self.canonical,
+                format!(
+                    "cannot read {relative} through held link: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+        let count = count as usize;
+        if count == bytes.len() {
+            return Err(proc_view_error(
+                &self.canonical,
+                format!("{relative} namespace link was truncated"),
+            ));
+        }
+        // CAD-1196: the kernel answers a read of another uid's ns link with
+        // a successful, zero-length target instead of EACCES. That is
+        // "not readable by us", reported as None; any other target must be
+        // canonical.
+        if count == 0 {
+            return Ok(None);
+        }
+        let target = std::str::from_utf8(&bytes[..count]).map_err(|error| {
+            proc_view_error(
+                &self.canonical,
+                format!("{relative} has a non-UTF-8 target: {error}"),
+            )
+        })?;
+        parse_pid_namespace_link(target).map(Some).ok_or_else(|| {
+            proc_view_error(
+                &self.canonical,
+                format!("{relative} is not a canonical pid namespace link"),
+            )
+        })
+    }
+
+    fn read_status_at(&self, relative: &str) -> io::Result<String> {
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if self.synthetic { 0 } else { libc::O_NONBLOCK };
+        let file = self.open_at(relative, flags)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() && !(self.synthetic && metadata.file_type().is_fifo()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process status is not a regular file",
+            ));
+        }
+        let mut status = String::new();
+        let mut file = file;
+        file.read_to_string(&mut status)?;
+        Ok(status)
+    }
+
+    fn read_pid_status(&self, pid: u32) -> io::Result<String> {
+        self.read_status_at(&format!("{pid}/status"))
+    }
+
+    fn validate_completeness(&self) -> Result<()> {
+        let root_meta = self.root.metadata().map_err(|error| {
+            proc_view_error(
+                &self.canonical,
+                format!("cannot inspect held root: {error}"),
+            )
+        })?;
+        if !root_meta.is_dir() {
+            return Err(proc_view_error(
+                &self.canonical,
+                "held root is not a directory",
+            ));
+        }
+        let root_fs_type = fstatfs_type(&self.root).map_err(|error| {
+            proc_view_error(
+                &self.canonical,
+                format!("cannot inspect held root filesystem: {error}"),
+            )
+        })?;
+        if (!self.synthetic && root_fs_type != libc::PROC_SUPER_MAGIC)
+            || (self.synthetic && root_fs_type == libc::PROC_SUPER_MAGIC)
+        {
+            return Err(proc_view_error(
+                &self.canonical,
+                "held root filesystem does not match its proc-view adapter",
+            ));
+        }
+        let root_mount_id = statx_mount_id(&self.root).map_err(|error| {
+            proc_view_error(
+                &self.canonical,
+                format!("cannot prove held root mount identity: {error}"),
+            )
+        })?;
+
+        let mut mountinfo =
+            self.open_proof_file("self/mountinfo", root_meta.dev(), root_mount_id)?;
+        let mut mountinfo_text = String::new();
+        mountinfo
+            .read_to_string(&mut mountinfo_text)
+            .map_err(|error| {
+                proc_view_error(
+                    &self.canonical,
+                    format!("cannot read held self/mountinfo: {error}"),
+                )
+            })?;
+        validate_proc_mountinfo(
+            &mountinfo_text,
+            &self.canonical,
+            root_mount_id,
+            self.synthetic,
+        )?;
+
+        let release = if self.synthetic {
+            let mut file =
+                self.open_proof_file("self/kernel-release", root_meta.dev(), root_mount_id)?;
+            let mut release = String::new();
+            file.read_to_string(&mut release).map_err(|error| {
+                proc_view_error(
+                    &self.canonical,
+                    format!("cannot read synthetic kernel release: {error}"),
+                )
+            })?;
+            release
+        } else {
+            kernel_release().map_err(|error| {
+                proc_view_error(
+                    &self.canonical,
+                    format!("cannot read kernel release: {error}"),
+                )
+            })?
+        };
+        if !supported_kernel_abi(&release) {
+            return Err(proc_view_error(
+                &self.canonical,
+                format!("kernel release {release:?} has no frozen proc proof ABI"),
+            ));
+        }
+
+        let mut stat = self.open_proof_file("2/stat", root_meta.dev(), root_mount_id)?;
+        let mut stat_text = String::new();
+        stat.read_to_string(&mut stat_text).map_err(|error| {
+            proc_view_error(
+                &self.canonical,
+                format!("cannot read held PID 2 stat: {error}"),
+            )
+        })?;
+        if !is_initial_kernel_task(&stat_text) {
+            return Err(proc_view_error(
+                &self.canonical,
+                "PID 2 is not a live kthreadd kernel thread in the initial PID namespace",
+            ));
+        }
+        // The caller's own link is always readable; an unreadable one proves
+        // nothing and refuses.
+        let Some(self_pid_ns) =
+            self.read_namespace_link("self/ns/pid", root_meta.dev(), root_mount_id)?
+        else {
+            return Err(proc_view_error(
+                &self.canonical,
+                "caller's own pid namespace link is empty",
+            ));
+        };
+        match self.read_namespace_link("2/ns/pid", root_meta.dev(), root_mount_id)? {
+            Some(task_pid_ns) if task_pid_ns != self_pid_ns => {
+                return Err(proc_view_error(
+                    &self.canonical,
+                    "caller and PID 2 are not in the same PID namespace",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                // CAD-1196: PID 2 is root's, so an unprivileged caller reads
+                // its ns link as empty. The same fact is proven without it:
+                // PID 2 was just verified as kthreadd (PF_KTHREAD, parent 0),
+                // which exists only in the initial PID namespace, so this
+                // proc is the initial namespace's view; and the caller's own
+                // NSpid has a single entry, so the caller is in that same
+                // namespace as seen by this proc.
+                let status = self.read_status_at("self/status").map_err(|error| {
+                    proc_view_error(
+                        &self.canonical,
+                        format!("cannot read held self/status: {error}"),
+                    )
+                })?;
+                if !status_has_single_nspid(&status) {
+                    return Err(proc_view_error(
+                        &self.canonical,
+                        "caller is not provably in the PID namespace of this proc view",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fstatfs_type(file: &File) -> io::Result<libc::c_long> {
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat.f_type as libc::c_long)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn statx_mount_id(file: &File) -> io::Result<u64> {
+    let empty = b"\0";
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::statx(
+            file.as_raw_fd(),
+            empty.as_ptr().cast(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_MNT_ID,
+            &mut stat,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if stat.stx_mask & libc::STATX_MNT_ID == 0 || stat.stx_mnt_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "statx did not report STATX_MNT_ID",
+        ));
+    }
+    Ok(stat.stx_mnt_id)
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "gnu")))]
+fn statx_mount_id(_file: &File) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this libc target has no verified statx mount-id ABI",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_pid_namespace_link(target: &str) -> Option<u64> {
+    let value = target.strip_prefix("pid:[")?.strip_suffix(']')?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let inode = value.parse::<u64>().ok()?;
+    (inode != 0 && inode.to_string() == value).then_some(inode)
+}
+
+/// `NSpid:` lists the task's pid in each namespace from the proc mount's
+/// down to its own; exactly one entry means the task lives in the proc
+/// mount's namespace.
+#[cfg(target_os = "linux")]
+fn status_has_single_nspid(status: &str) -> bool {
+    let mut lines = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("NSpid:"));
+    let (Some(line), None) = (lines.next(), lines.next()) else {
+        return false;
+    };
+    let mut ids = line.split_whitespace();
+    matches!(
+        (ids.next().map(str::parse::<u32>), ids.next()),
+        (Some(Ok(pid)), None) if pid != 0
+    )
+}
+
+/// What the kernel's ptrace read-access rule is judged against.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct Caller {
+    euid: u32,
+    egid: u32,
+    /// `CapPrm` of the caller; `None` when it could not be read, which
+    /// disables the capability explanation (fail closed).
+    cap_prm: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn status_cap_prm(status: &str) -> Option<u64> {
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapPrm:"))?;
+    u64::from_str_radix(value.trim(), 16).ok()
+}
+
+/// CAD-1196: does the kernel's own access rule for `/proc/<pid>/{cwd,fd}`
+/// (ptrace read access) explain a PermissionDenied for this caller? The
+/// kernel itself marks the cases: it gives the process's `cwd` entry to the
+/// process's uid/gid only while the process is dumpable and (for a foreign
+/// uid) otherwise to root, so an entry owned by neither the caller's
+/// effective uid nor gid is a foreign or non-dumpable process. The other
+/// case is a target whose permitted capabilities exceed the caller's.
+/// Status credentials are never trusted for this: a PermissionDenied that
+/// neither the entry's ownership nor the capabilities explain is an
+/// unexplained gap and still refuses.
+#[cfg(target_os = "linux")]
+fn policy_denies_read(status: &str, caller: Caller, cwd_entry_owner: Option<(u32, u32)>) -> bool {
+    let extra_caps = match (status_cap_prm(status), caller.cap_prm) {
+        (Some(target), Some(own)) => target & !own != 0,
+        _ => false,
+    };
+    extra_caps || cwd_entry_owner.is_some_and(|(uid, gid)| uid != caller.euid || gid != caller.egid)
+}
+
+#[cfg(target_os = "linux")]
+fn kernel_release() -> io::Result<String> {
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut uts) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let bytes: Vec<u8> = uts
+        .release
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as u8)
+        .collect();
+    if bytes.len() == uts.release.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "uname release is not NUL-terminated",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(target_os = "linux")]
+fn supported_kernel_abi(release: &str) -> bool {
+    const SUPPORTED: &[(u32, u32)] = &[
+        (5, 8),
+        (5, 10),
+        (5, 15),
+        (6, 1),
+        (6, 6),
+        (6, 8),
+        (6, 11),
+        (6, 12),
+        (6, 14),
+        (6, 17),
+        (7, 0),
+    ];
+    let Some((major, rest)) = release.split_once('.') else {
+        return false;
+    };
+    if major.is_empty() || !major.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Some(minor) = rest.split(['.', '-']).next() else {
+        return false;
+    };
+    if minor.is_empty() || !minor.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+        return false;
+    };
+    SUPPORTED.contains(&(major, minor))
+}
+
+#[cfg(target_os = "linux")]
+fn is_initial_kernel_task(stat: &str) -> bool {
+    const PF_KTHREAD: u64 = 0x0020_0000;
+    let Some((pid, record)) = stat.split_once(' ') else {
+        return false;
+    };
+    if pid.parse::<u32>().ok() != Some(2) {
+        return false;
+    }
+    let Some(record) = record.strip_prefix('(') else {
+        return false;
+    };
+    let Some(close) = record.rfind(')') else {
+        return false;
+    };
+    if &record[..close] != "kthreadd" {
+        return false;
+    }
+    let fields: Vec<&str> = record[close + 1..].split_whitespace().collect();
+    if fields.len() < 7 || fields[0].len() != 1 {
+        return false;
+    }
+    let Some(state) = fields[0].chars().next() else {
+        return false;
+    };
+    let Some(parent) = fields[1].parse::<u32>().ok() else {
+        return false;
+    };
+    let Some(flags) = fields[6].parse::<u64>().ok() else {
+        return false;
+    };
+    valid_proc_state(state)
+        && !matches!(state, 'Z' | 'X' | 'x')
+        && parent == 0
+        && flags & PF_KTHREAD != 0
+}
+
+#[cfg(target_os = "linux")]
+fn sensitive_proc_submount(root: &Path, mount_point: &Path) -> bool {
+    let Ok(relative) = mount_point.strip_prefix(root) else {
+        return false;
+    };
+    let Some(std::path::Component::Normal(first)) = relative.components().next() else {
+        return false;
+    };
+    let first = first.as_bytes();
+    first == b"self"
+        || first == b"thread-self"
+        || (!first.is_empty() && first.iter().all(u8::is_ascii_digit))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_proc_mountinfo(
+    text: &str,
+    canonical: &Path,
+    root_mount_id: u64,
+    synthetic: bool,
+) -> Result<()> {
+    let mut exact_mounts = 0usize;
+    let mut mount_ids = std::collections::HashSet::new();
+    for (line_index, line) in text.lines().enumerate() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let separators: Vec<usize> = fields
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| (*field == "-").then_some(index))
+            .collect();
+        let Some(mount_id) = fields.first().and_then(|field| field.parse::<u64>().ok()) else {
+            return Err(proc_view_error(
+                canonical,
+                format!("malformed mountinfo line {}", line_index + 1),
+            ));
+        };
+        if line.is_empty()
+            || fields.len() < 10
+            || mount_id == 0
+            || fields[1].parse::<u64>().is_err()
+            || separators.len() != 1
+        {
+            return Err(proc_view_error(
+                canonical,
+                format!("malformed mountinfo line {}", line_index + 1),
+            ));
+        }
+        let separator = separators[0];
+        let device = fields[2].split_once(':');
+        if separator < 6
+            || fields.len() < separator + 4
+            || !mount_ids.insert(mount_id)
+            || device.is_none_or(|(major, minor)| {
+                major.parse::<u64>().is_err() || minor.parse::<u64>().is_err()
+            })
+        {
+            return Err(proc_view_error(
+                canonical,
+                format!("malformed mountinfo line {}", line_index + 1),
+            ));
+        }
+        let mount_root = decode_mountinfo_path(fields[3]);
+        let mount_point = decode_mountinfo_path(fields[4]);
+        let (Some(mount_root), Some(mount_point)) = (mount_root, mount_point) else {
+            return Err(proc_view_error(
+                canonical,
+                format!(
+                    "malformed escaped path on mountinfo line {}",
+                    line_index + 1
+                ),
+            ));
+        };
+        if !mount_point.is_absolute()
+            || (fields[separator + 1] != "nsfs" && !mount_root.is_absolute())
+        {
+            return Err(proc_view_error(
+                canonical,
+                format!("non-absolute mount path on line {}", line_index + 1),
+            ));
+        }
+        if fields[5].split(',').any(str::is_empty)
+            || fields[separator + 3].split(',').any(str::is_empty)
+        {
+            return Err(proc_view_error(
+                canonical,
+                format!("malformed mount options on line {}", line_index + 1),
+            ));
+        }
+        if sensitive_proc_submount(canonical, &mount_point) {
+            return Err(proc_view_error(
+                canonical,
+                format!(
+                    "sensitive proc subtree is overmounted at {}",
+                    mount_point.display()
+                ),
+            ));
+        }
+        if mount_point == canonical {
+            exact_mounts += 1;
+            if exact_mounts != 1 {
+                return Err(proc_view_error(canonical, "ambiguous stacked proc mounts"));
+            }
+            let expected_mount_id = if synthetic { 1 } else { root_mount_id };
+            if mount_id != expected_mount_id {
+                return Err(proc_view_error(
+                    canonical,
+                    "mountinfo root ID does not match the held root mount",
+                ));
+            }
+            if mount_root != Path::new("/") || fields[separator + 1] != "proc" {
+                return Err(proc_view_error(
+                    canonical,
+                    "mount is not a full procfs root",
+                ));
+            }
+            validate_proc_mount_options(&[fields[5], fields[separator + 3]])
+                .map_err(|reason| proc_view_error(canonical, reason))?;
+        }
+    }
+    if exact_mounts != 1 {
+        return Err(proc_view_error(
+            canonical,
+            "mountinfo has no unique full procfs root",
+        ));
+    }
+    Ok(())
+}
+
+/// Cwd and open-descriptor holders under a managed checkout. Any process that
+/// cannot be fully inspected leaves the scan incomplete; cleanup never infers
+/// that a process lacks an inherited or transferred checkout descriptor from
+/// its UID or path permissions.
+pub(crate) struct ProcessUse {
+    pub cwd: Vec<u32>,
+    pub fd: Vec<u32>,
+    pub enumeration_error: Option<String>,
+}
+
+pub(crate) type ProcessUseProbe = dyn Fn(&Path) -> Result<ProcessUse>;
+
+#[cfg(target_os = "linux")]
+fn proc_id_values(status: &str, key: &str, count: usize) -> Option<Vec<u32>> {
+    let line = status.lines().find_map(|line| line.strip_prefix(key))?;
+    line.split_whitespace()
+        .take(count)
+        .map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()
+        .filter(|values| values.len() == count)
+}
+
+#[cfg(target_os = "linux")]
+fn valid_proc_state(state: char) -> bool {
+    matches!(
+        state,
+        'R' | 'S' | 'D' | 'T' | 't' | 'Z' | 'X' | 'x' | 'K' | 'W' | 'P' | 'I'
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn proc_status_state(status: &str) -> Option<char> {
+    let mut states = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("State:"));
+    let state = states.next()?.split_whitespace().next()?;
+    if states.next().is_some() || state.len() != 1 {
+        return None;
+    }
+    let state = state.chars().next()?;
+    valid_proc_state(state).then_some(state)
+}
+
+// Validate the PID entry only; credentials are never used to skip cwd or FD
+// inspection or to infer that a process could not hold a checkout descriptor.
+#[cfg(target_os = "linux")]
+fn proc_status_is_complete(status: &str) -> bool {
+    let credentials_complete = proc_id_values(status, "Uid:", 4).is_some()
+        && proc_id_values(status, "Gid:", 4).is_some()
+        && status
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))
+            .is_some_and(|groups| {
+                groups
+                    .split_whitespace()
+                    .all(|group| group.parse::<u32>().is_ok())
+            });
+    let capabilities_complete = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .is_some_and(|caps| u64::from_str_radix(caps.trim(), 16).is_ok());
+    proc_status_state(status).is_some() && credentials_complete && capabilities_complete
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_process_status(status: &str) -> io::Result<bool> {
+    let state = proc_status_state(status).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process status has a missing or malformed State field",
+        )
+    })?;
+    if !proc_status_is_complete(status) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process status has incomplete credentials",
+        ));
+    }
+    Ok(!matches!(state, 'Z' | 'X'))
+}
+
+#[cfg(target_os = "linux")]
+struct PendingPidError {
+    kind: io::ErrorKind,
+    only_gone_resolves: bool,
+    operation: &'static str,
+    message: String,
+}
+
+#[cfg(target_os = "linux")]
+fn remember_pid_error(
+    pending: &mut Option<PendingPidError>,
+    what: &'static str,
+    error: io::Error,
+    allow_zombie_resolution: bool,
+) {
+    let kind = error.kind();
+    let only_gone_resolves = kind == io::ErrorKind::NotFound && !allow_zombie_resolution;
+    match pending {
+        None => {
+            *pending = Some(PendingPidError {
+                kind,
+                only_gone_resolves,
+                operation: what,
+                message: error.to_string(),
+            });
+        }
+        Some(previous)
+            if previous.kind == io::ErrorKind::NotFound && kind != io::ErrorKind::NotFound =>
+        {
+            *previous = PendingPidError {
+                kind,
+                only_gone_resolves,
+                operation: what,
+                message: error.to_string(),
+            };
+        }
+        Some(previous)
+            if previous.kind == io::ErrorKind::NotFound && kind == io::ErrorKind::NotFound =>
+        {
+            previous.only_gone_resolves |= only_gone_resolves;
+        }
+        Some(_) => {}
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_status(view: &ProcView, pid: u32) -> io::Result<bool> {
+    inspect_process_status(&view.read_pid_status(pid)?)
+}
+
+#[cfg(target_os = "linux")]
+fn pid_is_gone_or_dead(view: &ProcView, pid: u32, allow_zombie: bool) -> io::Result<bool> {
+    let proc_dir = view.scan_root.join(pid.to_string());
+    match std::fs::symlink_metadata(&proc_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "numeric proc entry is not a directory",
+            ));
+        }
+        Ok(_) => {}
+    }
+    if allow_zombie {
+        Ok(!process_status(view, pid)?)
+    } else {
+        Ok(false)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn aggregate_pid_error(use_: &mut ProcessUse, pid: u32, pending: Option<PendingPidError>) {
+    if let Some(error) = pending {
+        use_.enumeration_error.get_or_insert_with(|| {
+            format!(
+                "cannot {} for process {pid} during cleanup: {}",
+                error.operation, error.message
+            )
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn finish_pid_scan(
+    view: &ProcView,
+    pid: u32,
+    use_: &mut ProcessUse,
+    mut pending: Option<PendingPidError>,
+) {
+    if let Some(allow_zombie) = pending
+        .as_ref()
+        .filter(|error| error.kind == io::ErrorKind::NotFound)
+        .map(|error| !error.only_gone_resolves)
+    {
+        match pid_is_gone_or_dead(view, pid, allow_zombie) {
+            Ok(true) => {
+                pending = None;
+                use_.cwd.retain(|holder| *holder != pid);
+                use_.fd.retain(|holder| *holder != pid);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                remember_pid_error(&mut pending, "confirm process disappearance", error, true)
+            }
+        }
+    }
+    aggregate_pid_error(use_, pid, pending);
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_pid(view: &ProcView, dir: &Path, pid: u32, use_: &mut ProcessUse, caller: Caller) {
+    let proc_dir = view.scan_root.join(pid.to_string());
+    let mut pending = None;
+    match std::fs::symlink_metadata(&proc_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            remember_pid_error(&mut pending, "inspect proc entry", error, false);
+            finish_pid_scan(view, pid, use_, pending);
+            return;
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            remember_pid_error(
+                &mut pending,
+                "inspect proc entry",
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "numeric proc entry is not a directory",
+                ),
+                false,
+            );
+            finish_pid_scan(view, pid, use_, pending);
+            return;
+        }
+        Ok(_) => {}
+    }
+    let status = view
+        .read_pid_status(pid)
+        .and_then(|status| inspect_process_status(&status).map(|live| (status, live)));
+    let status = match status {
+        Ok((_, false)) => return,
+        Ok((status, true)) => status,
+        Err(error) => {
+            remember_pid_error(&mut pending, "establish process identity", error, true);
+            finish_pid_scan(view, pid, use_, pending);
+            return;
+        }
+    };
+    // CAD-1196: on a normal host many processes are unreadable to an
+    // unprivileged caller by kernel policy (root's, capability-bearing,
+    // non-dumpable). PermissionDenied that `policy_denies_read` explains is
+    // that policy, not an incomplete view; any other error, and a
+    // PermissionDenied nothing explains, still leaves the scan incomplete.
+    let cwd_entry_owner = std::fs::symlink_metadata(proc_dir.join("cwd"))
+        .ok()
+        .map(|metadata| (metadata.uid(), metadata.gid()));
+    let unreadable_by_policy = |error: &io::Error| {
+        error.kind() == io::ErrorKind::PermissionDenied
+            && policy_denies_read(&status, caller, cwd_entry_owner)
+    };
+
+    match std::fs::read_link(proc_dir.join("cwd")) {
+        Ok(cwd) if cwd.starts_with(dir) => use_.cwd.push(pid),
+        Ok(_) => {}
+        Err(error) if unreadable_by_policy(&error) => {}
+        Err(error) => remember_pid_error(&mut pending, "inspect cwd", error, true),
+    }
+    match std::fs::read_dir(proc_dir.join("fd")) {
+        Ok(fds) => {
+            let mut holds = false;
+            for fd in fds {
+                let fd = match fd {
+                    Ok(fd) => fd,
+                    Err(error) => {
+                        remember_pid_error(
+                            &mut pending,
+                            "enumerate file descriptors",
+                            error,
+                            false,
+                        );
+                        continue;
+                    }
+                };
+                let path = fd.path();
+                match std::fs::read_link(&path) {
+                    Ok(target) if target.starts_with(dir) => {
+                        holds = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        match std::fs::symlink_metadata(&path) {
+                            Err(metadata_error)
+                                if metadata_error.kind() == io::ErrorKind::NotFound => {}
+                            Err(metadata_error) => remember_pid_error(
+                                &mut pending,
+                                "confirm file descriptor entry disappearance",
+                                metadata_error,
+                                false,
+                            ),
+                            Ok(_) => remember_pid_error(
+                                &mut pending,
+                                "inspect file descriptor",
+                                error,
+                                false,
+                            ),
+                        }
+                    }
+                    Err(error) if unreadable_by_policy(&error) => {}
+                    Err(error) => {
+                        remember_pid_error(&mut pending, "inspect file descriptor", error, false)
+                    }
+                }
+            }
+            if holds {
+                use_.fd.push(pid);
+            }
+        }
+        Err(error) if unreadable_by_policy(&error) => {}
+        Err(error) => remember_pid_error(&mut pending, "enumerate file descriptors", error, true),
+    }
+    finish_pid_scan(view, pid, use_, pending);
+}
+
+pub(crate) fn process_use_under(dir: &Path) -> Result<ProcessUse> {
+    process_use_under_from_proc_root(dir, &process_proc_root())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_use_under_from_proc_root(dir: &Path, proc_root: &Path) -> Result<ProcessUse> {
+    let dir = dir.canonicalize().map_err(|error| {
+        Error::rejected(format!(
+            "cannot resolve live-use path {}: {error}",
+            dir.display()
+        ))
+    })?;
+    let view = ProcView::open(proc_root)?;
+    let completeness_error = view
+        .validate_completeness()
+        .err()
+        .map(|error| error.to_string());
+    let complete = completeness_error.is_none();
+    let mut use_ = ProcessUse {
+        cwd: Vec::new(),
+        fd: Vec::new(),
+        enumeration_error: completeness_error,
+    };
+    let procs = match std::fs::read_dir(&view.scan_root) {
+        Ok(procs) => procs,
+        Err(error) => {
+            use_.enumeration_error
+                .get_or_insert_with(|| format!("cannot enumerate anchored proc entries: {error}"));
+            return Ok(use_);
+        }
     };
     let me = std::process::id();
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return out;
+    let caller = Caller {
+        euid: unsafe { libc::geteuid() },
+        egid: unsafe { libc::getegid() },
+        cap_prm: view
+            .read_status_at("self/status")
+            .ok()
+            .and_then(|status| status_cap_prm(&status)),
     };
-    for entry in procs.flatten() {
+    for entry in procs {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                use_.enumeration_error.get_or_insert_with(|| {
+                    format!("cannot enumerate anchored proc entries: {error}")
+                });
+                continue;
+            }
+        };
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        if pid == me {
+        if complete && pid == me {
             continue;
         }
-        let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) else {
-            continue;
-        };
-        if cwd.starts_with(&dir) {
-            out.push(pid);
-        }
+        inspect_pid(&view, &dir, pid, &mut use_, caller);
     }
-    out
+    Ok(use_)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn process_use_under_from_proc_root(dir: &Path, proc_root: &Path) -> Result<ProcessUse> {
+    let _ = (dir, proc_root);
+    Err(Error::rejected(
+        "process cwd/open-fd enumeration requires a verified Linux proc view; refusing deletion",
+    ))
 }
 
 /// CAD-275: how long a worktree must sit untouched before `finish`
@@ -710,11 +2028,11 @@ pub(crate) fn lane_in_use(
     state_dir: &Path,
     front: &Front,
     lane: &Path,
+    process_use_probe: &ProcessUseProbe,
 ) -> Option<String> {
     let wt_name = lane.file_name().map(|n| n.to_string_lossy().into_owned());
     let t = Target {
         front: front.clone(),
-        body: String::new(),
         dir: PathBuf::new(),
         wt_dir: Some(lane.to_path_buf()),
         msg_refs: bound_msg_refs(front, wt_name.as_deref(), Some(lane)),
@@ -723,7 +2041,8 @@ pub(crate) fn lane_in_use(
         root: PathBuf::new(),
         cargo_target: None,
     };
-    let (mut blocks, deferred) = in_use_blocks(view, state_dir, &t);
+    let (mut blocks, deferred) =
+        in_use_blocks_with_process_probe(view, state_dir, &t, process_use_probe);
     blocks.extend(deferred);
     blocks.first().map(|b| b.reason.clone())
 }
@@ -1207,6 +2526,15 @@ fn inspect(view: &DaemonView, state_dir: &Path, t: &Target, ev: &Evidence) -> Ch
 /// bindings, pane trees and processes bound to this worktree. Returns
 /// the blocks and the deferred enumeration (meta) failures.
 fn in_use_blocks(view: &DaemonView, state_dir: &Path, t: &Target) -> (Vec<Block>, Vec<Block>) {
+    in_use_blocks_with_process_probe(view, state_dir, t, &process_use_under)
+}
+
+fn in_use_blocks_with_process_probe(
+    view: &DaemonView,
+    state_dir: &Path,
+    t: &Target,
+    process_use_probe: &ProcessUseProbe,
+) -> (Vec<Block>, Vec<Block>) {
     let mut blocks = Vec::new();
     let mut pane_pid = None;
     let mut unreachable = false;
@@ -1414,40 +2742,91 @@ fn in_use_blocks(view: &DaemonView, state_dir: &Path, t: &Target) -> (Vec<Block>
             }
         }
     }
-    // Any process standing in the worktree blocks it — an owner pane's
-    // descendants are named as such, everything else as a plain pid.
+    // Any process cwd or open descriptor in the worktree blocks removal.
+    // Enumeration failure is itself a refusal: an unreadable /proc entry
+    // cannot be interpreted as no live user.
     if let Some(d) = t.wt_dir.as_deref().filter(|d| d.is_dir()) {
-        let mut pane_hit = None;
-        let mut proc_hit = None;
-        for pid in pids_cwd_under(d) {
-            if pane_pid.is_some_and(|pp| pty::descends_from(pid, pp)) {
-                pane_hit.get_or_insert(pid);
-            } else {
-                proc_hit.get_or_insert(pid);
+        match process_use_probe(d) {
+            Err(e) => blocks.push(Block {
+                tag: "process-enumeration-failed".to_string(),
+                reason: format!(
+                    "Cannot fully enumerate process cwd/open-fd use for {} ({e}) — refusing deletion",
+                    d.display()
+                ),
+            }),
+            Ok(uses) => {
+                if let Some(error) = &uses.enumeration_error {
+                    let live = uses
+                        .fd
+                        .first()
+                        .map(|pid| {
+                            format!(
+                                "; process {pid} ({}) holds an open file descriptor inside {}",
+                                comm_of(*pid),
+                                d.display()
+                            )
+                        })
+                        .or_else(|| {
+                            uses.cwd.first().map(|pid| {
+                                format!(
+                                    "; process {pid} ({}) has cwd inside {}",
+                                    comm_of(*pid),
+                                    d.display()
+                                )
+                            })
+                        })
+                        .unwrap_or_default();
+                    blocks.push(Block {
+                        tag: "process-enumeration-failed".to_string(),
+                        reason: format!(
+                            "Cannot fully enumerate process cwd/open-fd use ({error}){live} — refusing deletion"
+                        ),
+                    });
+                }
+                let mut pane_hit = None;
+                let mut proc_hit = None;
+                for pid in uses.cwd {
+                    if pane_pid.is_some_and(|pp| pty::descends_from(pid, pp)) {
+                        pane_hit.get_or_insert(pid);
+                    } else {
+                        proc_hit.get_or_insert(pid);
+                    }
+                }
+                if let Some(pid) = pane_hit {
+                    blocks.push(Block {
+                        tag: "pane-cwd".to_string(),
+                        reason: format!(
+                            "Owner '{}' pane descendant pid {pid} ({}) has cwd \
+                             inside {} — wait for it or pass --force",
+                            t.front.owner.as_deref().unwrap_or("?"),
+                            comm_of(pid),
+                            d.display()
+                        ),
+                    });
+                }
+                if let Some(pid) = proc_hit {
+                    blocks.push(Block {
+                        tag: "proc-cwd".to_string(),
+                        reason: format!(
+                            "Process {pid} ({}) has cwd inside {} — close it or \
+                             cd out of the worktree, or pass --force",
+                            comm_of(pid),
+                            d.display()
+                        ),
+                    });
+                }
+                if let Some(pid) = uses.fd.first() {
+                    blocks.push(Block {
+                        tag: "proc-open-fd".to_string(),
+                        reason: format!(
+                            "Process {pid} ({}) holds an open file descriptor inside {} — \
+                             close it before removing the worktree",
+                            comm_of(*pid),
+                            d.display()
+                        ),
+                    });
+                }
             }
-        }
-        if let Some(pid) = pane_hit {
-            blocks.push(Block {
-                tag: "pane-cwd".to_string(),
-                reason: format!(
-                    "Owner '{}' pane descendant pid {pid} ({}) has cwd \
-                     inside {} — wait for it or pass --force",
-                    t.front.owner.as_deref().unwrap_or("?"),
-                    comm_of(pid),
-                    d.display()
-                ),
-            });
-        }
-        if let Some(pid) = proc_hit {
-            blocks.push(Block {
-                tag: "proc-cwd".to_string(),
-                reason: format!(
-                    "Process {pid} ({}) has cwd inside {} — close it or \
-                     cd out of the worktree, or pass --force",
-                    comm_of(pid),
-                    d.display()
-                ),
-            });
         }
     }
     (blocks, deferred)
@@ -1601,12 +2980,46 @@ pub(crate) fn run(
         }
         Resolve::Target(t) => t,
     };
+    if probe.wt_dir.is_none() && !probe.branch.is_empty() && args.keep_branch && !args.remote {
+        return Ok(json!({
+            "issue": id,
+            "finished": false,
+            "branch": probe.branch,
+            "kept_branch": true,
+            "deleted_branch": false,
+            "removed_worktree": false,
+            "reason": "no managed checkout path; branch/ref retained; use issue start with recorded lane/name to reattach before finishing"
+        }));
+    }
     // A gone directory under `--worktree` only closes refs: nothing
     // is removed or deleted, so no branch or remote is touched and
     // survivability has nothing to protect.
     let refs_only = args.close_if_gone && probe.wt_dir.as_deref().is_some_and(|d| !d.is_dir());
     let keep_branch = args.keep_branch || refs_only;
     let remote = args.remote && !refs_only;
+    if refs_only {
+        let path = probe.wt_dir.as_deref().ok_or_else(|| {
+            Error::rejected(format!("issue {id} has no path for refs-only finish"))
+        })?;
+        verify_refs_only_ownership(
+            &probe.root,
+            path,
+            id,
+            (!probe.branch.is_empty()).then_some(probe.branch.as_str()),
+        )?;
+    } else if let Some(path) = probe.wt_dir.as_deref() {
+        let _ = verify_checkout_ownership(
+            &probe.root,
+            path,
+            id,
+            (!probe.branch.is_empty()).then_some(probe.branch.as_str()),
+        )?;
+    } else if !probe.branch.is_empty() && (!keep_branch || remote) {
+        return Err(Error::rejected(format!(
+            "issue {id} has no managed checkout path for branch {}; refusing deletion",
+            probe.branch
+        )));
+    }
     let ev = evidence(&probe, remote);
     let (merged_how, tip, _) = survivability(&ev, &probe);
     // The --remote coverage decision is probe data too — `gh` runs
@@ -1631,6 +3044,19 @@ pub(crate) fn run(
         if refs_only && matches!(b.tag.as_str(), "not-started" | "unmerged-unpushed") {
             continue;
         }
+        let safety_probe_failed = matches!(
+            b.tag.as_str(),
+            "process-enumeration-failed"
+                | "daemon-unreachable"
+                | "agent-check-inconclusive"
+                | "activity-check-failed"
+        ) || b.tag.starts_with("dirty-check-failed:");
+        if safety_probe_failed && !refs_only {
+            return Err(Error::rejected(format!(
+                "{} — failed safety enumeration cannot be overridden with --force",
+                b.reason
+            )));
+        }
         if force {
             overridden.push(b.tag);
         } else {
@@ -1638,12 +3064,14 @@ pub(crate) fn run(
         }
     }
 
-    // Phase 2 — the commit phase, under the pm lock. Re-resolve so a
-    // tracker write that landed mid-probe is seen, then prove every
-    // input the probe's evidence depended on is unmoved — all local
-    // `rev-parse`s; nothing networked runs while holding the lock.
-    let _lock = pm.lock()?;
-    let mut t = match resolve(pm, id, args.worktree)? {
+    // Phase 2 — the decision, under the pm lock (CAD-1191: lock 1).
+    // Re-resolve so a tracker write that landed mid-probe is seen, then
+    // prove every input the probe's evidence depended on is unmoved — all
+    // local `rev-parse`s — and record the release intent in the lifecycle
+    // ledger. The lock is returned before anything is removed; lock 2
+    // below only closes the refs.
+    let lock = pm.lock()?;
+    let t = match resolve(pm, id, args.worktree)? {
         // A concurrent finish closed the pair mid-probe — the same
         // idempotent answer the unlocked probe would have given.
         Resolve::Finished => {
@@ -1670,6 +3098,44 @@ pub(crate) fn run(
     if let Some(reason) = stale_evidence_reason(&t.root, &t.branch, &ev) {
         return Err(Error::rejected(reason));
     }
+    // Local live-use is rechecked at the destructive boundary. Daemon and
+    // tracker bindings were probed unlocked above; new tracker refs make the
+    // stale-probe check fail, while process cwd/FD use can change without a
+    // tracker write.
+    if !refs_only {
+        if let Some(d) = t.wt_dir.as_deref().filter(|d| d.is_dir()) {
+            match process_use_under(d) {
+                Err(e) => {
+                    return Err(Error::rejected(format!(
+                        "Cannot revalidate process cwd/open-fd use for {} ({e}) — refusing deletion; --force cannot override failed enumeration",
+                        d.display()
+                    )))
+                }
+                Ok(uses) if uses.enumeration_error.is_some() => {
+                    return Err(Error::rejected(format!(
+                        "Cannot fully revalidate process cwd/open-fd use for {} ({}) — refusing deletion; --force cannot override failed enumeration",
+                        d.display(), uses.enumeration_error.as_deref().unwrap_or("unknown process enumeration failure")
+                    )))
+                }
+                Ok(uses) if !uses.cwd.is_empty() || !uses.fd.is_empty() => {
+                    let pid = uses.cwd.first().or_else(|| uses.fd.first()).copied().unwrap_or(0);
+                    let tag = if uses.cwd.contains(&pid) { "proc-cwd" } else { "proc-open-fd" };
+                    let reason = format!(
+                        "Process {pid} ({}) began using {} during finish — close it before deletion",
+                        comm_of(pid), d.display()
+                    );
+                    if force {
+                        if !overridden.iter().any(|old| old == tag) {
+                            overridden.push(tag.to_string());
+                        }
+                    } else {
+                        return Err(Error::rejected(reason));
+                    }
+                }
+                Ok(_) => {}
+            }
+        }
+    }
     let merged_by = merged_how.map_or(Value::Null, |h| json!(h));
     let dir = t.dir.clone();
     let wt_dir = t.wt_dir.clone();
@@ -1690,25 +3156,74 @@ pub(crate) fn run(
         && !force
         && merged_how.is_none()
         && tip.is_some();
+    let will_remove_worktree = wt_dir.as_deref().is_some_and(|d| d.is_dir());
+    let will_delete_branch =
+        !keep_branch && !branch.is_empty() && !keep_for_remote && tip.is_some();
+    let will_delete_remote = remote
+        && !branch.is_empty()
+        && ev.remote_note.is_none()
+        && ev.remote_tip.is_some()
+        && (remote_covered || force);
+    let mut lifecycle_release = if refs_only {
+        let path = wt_dir.as_deref().ok_or_else(|| {
+            Error::rejected(format!("issue {id} has no path for refs-only finish"))
+        })?;
+        Some(crate::worktree::lifecycle::begin_refs_only_finish(
+            &root,
+            path,
+            id,
+            (!branch.is_empty()).then_some(branch.as_str()),
+            &format!("issue finish {id} refs-only closure"),
+        )?)
+    } else if will_remove_worktree || will_delete_branch || will_delete_remote {
+        let path = wt_dir.as_deref().ok_or_else(|| {
+            Error::rejected(format!(
+                "issue {id} has no managed checkout path for branch {branch}; refusing deletion"
+            ))
+        })?;
+        verify_checkout_ownership(
+            &root,
+            path,
+            id,
+            (!branch.is_empty()).then_some(branch.as_str()),
+        )?;
+        Some(crate::worktree::lifecycle::begin_release(
+            &root,
+            path,
+            id,
+            (!branch.is_empty()).then_some(branch.as_str()),
+            &format!("issue finish {id} for branch {branch}"),
+        )?)
+    } else {
+        None
+    };
+
+    drop(lock);
+    crate::issue::lockseam::outside_lock("finish-remove");
 
     // Removal: the worktree first (frees the branch), then the branch
     // — and only the exact tip the evidence covered: a tip that moved
     // (or was never covered) keeps its commits, so an uncovered branch
     // is never `branch -D`'d even under --force.
-    let _ = git(&root, &["worktree", "prune"]);
     let mut removed_worktree = false;
-    if let Some(d) = wt_dir.as_deref().filter(|d| d.is_dir()) {
-        let target = d.to_string_lossy().into_owned();
-        let mut args = vec!["worktree", "remove"];
-        if force {
-            args.push("--force");
+    if !refs_only {
+        if let Some(d) = wt_dir.as_deref().filter(|d| d.is_dir()) {
+            let target = d.to_string_lossy().into_owned();
+            let mut args = vec!["worktree", "remove"];
+            if force {
+                args.push("--force");
+            }
+            args.push("--");
+            args.push(&target);
+            if let Err(e) = git(&root, &args) {
+                let reason = format!("git worktree remove {} failed: {e}", d.display());
+                if let Some(release) = lifecycle_release.as_mut() {
+                    let _ = release.cleanup_failed(&reason);
+                }
+                return Err(Error::rejected(reason));
+            }
+            removed_worktree = true;
         }
-        args.push("--");
-        args.push(&target);
-        git(&root, &args).map_err(|e| {
-            Error::rejected(format!("git worktree remove {} failed: {e}", d.display()))
-        })?;
-        removed_worktree = true;
     }
     let mut deleted_branch = false;
     let mut branch_note = Value::Null;
@@ -1757,10 +3272,31 @@ pub(crate) fn run(
     // One tracker commit marks the refs closed — kept as history. A
     // branch this finish left standing (`--keep-branch`, kept for its
     // remote, an uncovered or moved tip) keeps its ref open, so the
-    // surviving work stays on the board and finishable (CAD-145). The
-    // refs-only close of a gone dir closes both (CAD-274).
-    let branch_kept = !refs_only && !deleted_branch && branch_tip(&root, &branch).is_some();
-    for r in &mut t.front.refs {
+    // surviving work stays on the board and finishable (CAD-145). A
+    // refs-only close of a missing checkout closes only the worktree ref;
+    // any surviving branch ref remains open for recovery.
+    let branch_kept = !deleted_branch && !branch.is_empty() && branch_tip(&root, &branch).is_some();
+    let disposition = if branch_kept {
+        format!("checkout released; branch {branch} retained")
+    } else {
+        format!("checkout released; branch {branch} removed or already missing")
+    };
+    // The lifecycle transaction ends at the destructive boundary, before any
+    // tracker write can fail after the checkout has already been removed.
+    let release_warning = if refs_only {
+        None
+    } else {
+        lifecycle_release
+            .take()
+            .and_then(|mut release| release.released(&disposition).err())
+            .map(|e| e.to_string())
+    };
+    // CAD-1191 lock 2: close the refs on a fresh read of the issue, so a
+    // tracker write that landed during the removal is kept. The refs are
+    // matched by path, exactly as before.
+    let lock = pm.lock()?;
+    let (mut front, body) = write::load_front(&dir)?;
+    for r in &mut front.refs {
         if (r.kind == "worktree"
             && wt_dir
                 .as_deref()
@@ -1778,7 +3314,7 @@ pub(crate) fn run(
     // open on disk, not just in memory.
     let front_file = dir.join("issue.md");
     let front_prev = std::fs::read(&front_file).ok();
-    write::save_front(&dir, &t.front, &t.body)?;
+    write::save_front(&dir, &front, &body)?;
     let what = if branch.is_empty() {
         wt_name.as_deref().unwrap_or("worktree").to_string()
     } else {
@@ -1807,11 +3343,19 @@ pub(crate) fn run(
         }
         return Err(e);
     }
+    let lifecycle_warning = if refs_only {
+        lifecycle_release
+            .take()
+            .and_then(|mut release| release.released(&disposition).err())
+            .map(|e| e.to_string())
+    } else {
+        release_warning
+    };
     // The commit phase is done — the pm lock goes back before the
     // remote delete: a `push` can take seconds and the lock's spin
     // deadline is 15s. The lease below, not lock ordering, is what
     // makes the delete safe.
-    drop(_lock);
+    drop(lock);
 
     let mut remote_deleted = false;
     let mut remote_note = Value::Null;
@@ -1859,7 +3403,7 @@ pub(crate) fn run(
     // the shared dep cache it linked into survives untouched (rm
     // unlinks symlinks; it never follows them).
     let mut out = json!({
-        "issue": t.front.id,
+        "issue": front.id,
         "finished": true,
         "worktree": wt_dir,
         "branch": branch,
@@ -1875,7 +3419,9 @@ pub(crate) fn run(
         "merged_by": merged_by,
         "not_started": matches!(ev.state, Branch::NotStarted { .. }),
         "refs_only": refs_only,
-        "status": t.front.status,
+        "checkout_disposition": disposition,
+        "lifecycle_warning": lifecycle_warning,
+        "status": front.status,
     });
     if let Some(target) = &cargo_target {
         // `symlink_metadata` — a recorded path that is itself a
@@ -1931,23 +3477,27 @@ pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 /// The worktree path that currently has `branch` checked out, from
-/// `git worktree list --porcelain`. `None` when the branch is not
-/// registered to any worktree (including when the list cannot be read).
-fn branch_checkout_path(root: &Path, branch: &str) -> Option<PathBuf> {
+/// `git worktree list --porcelain`. Enumeration errors are returned to
+/// destructive callers so they fail closed.
+pub(crate) fn registered_branch_path(root: &Path, branch: &str) -> Result<Option<PathBuf>> {
     if branch.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let text = git(root, &["worktree", "list", "--porcelain"]).ok()?;
+    let text = git(root, &["worktree", "list", "--porcelain"])?;
     let want = format!("branch refs/heads/{branch}");
     let mut current: Option<PathBuf> = None;
     for line in text.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
             current = Some(PathBuf::from(path));
         } else if line == want {
-            return current;
+            return Ok(current);
         }
     }
-    None
+    Ok(None)
+}
+
+fn branch_checkout_path(root: &Path, branch: &str) -> Option<PathBuf> {
+    registered_branch_path(root, branch).ok().flatten()
 }
 
 fn path_preview(t: &Target) -> PathPreview {
@@ -2067,6 +3617,18 @@ fn sweep_row(
     if let Branch::Merged { how, .. } = &ev.state {
         row["merged_by"] = json!(how);
     }
+    if let Some(path) = t.wt_dir.as_deref() {
+        if let Err(e) = verify_checkout_ownership(
+            &t.root,
+            path,
+            id,
+            (!t.branch.is_empty()).then_some(t.branch.as_str()),
+        ) {
+            row["outcome"] = json!("refused");
+            row["reason"] = json!(e.to_string());
+            return (Some(row), true);
+        }
+    }
     if dry_run {
         return match inspect(view, state_dir, &t, &ev).blocks.first() {
             Some(b) => {
@@ -2162,6 +3724,65 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// CAD-1196: PID 2's empty ns link is replaced by the caller's NSpid
+    /// having exactly one entry; nested, absent, duplicated or zero fail.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nspid_proof_needs_exactly_one_entry() {
+        assert!(status_has_single_nspid(
+            "Name:\tx\nNSpid:\t1234\nSeccomp:\t0\n"
+        ));
+        assert!(!status_has_single_nspid("NSpid:\t1234\t7\n"));
+        assert!(!status_has_single_nspid("NSpid:\t0\n"));
+        assert!(!status_has_single_nspid("NSpid:\n"));
+        assert!(!status_has_single_nspid("NSpid:\tx\n"));
+        assert!(!status_has_single_nspid("Name:\tx\n"));
+        assert!(!status_has_single_nspid("NSpid:\t1\nNSpid:\t1\n"));
+    }
+
+    /// CAD-1196: PermissionDenied is explained only by a cwd entry the
+    /// kernel gave to another uid/gid (foreign or non-dumpable process) or
+    /// by extra permitted capabilities; status credentials never excuse.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn policy_explains_only_what_the_kernel_rule_denies() {
+        let caller = Caller {
+            euid: 1000,
+            egid: 1000,
+            cap_prm: Some(0),
+        };
+        let caps = |cap: &str| format!("CapPrm:\t{cap}\n");
+        let none = caps("0000000000000000");
+        assert!(!policy_denies_read(&none, caller, Some((1000, 1000))));
+        assert!(!policy_denies_read(&none, caller, None));
+        // Entry owned by root (non-dumpable) or by another uid or gid.
+        assert!(policy_denies_read(&none, caller, Some((0, 0))));
+        assert!(policy_denies_read(&none, caller, Some((1001, 1000))));
+        assert!(policy_denies_read(&none, caller, Some((1000, 4))));
+        // A status claiming a foreign uid does not excuse an own-owned entry.
+        let status = "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nCapPrm:\t0\n";
+        assert!(!policy_denies_read(status, caller, Some((1000, 1000))));
+        // Extra permitted capability; a subset is not an explanation.
+        let extra = caps("0000000800000000");
+        assert!(policy_denies_read(&extra, caller, Some((1000, 1000))));
+        let held = Caller {
+            cap_prm: Some(0x8_0000_0000),
+            ..caller
+        };
+        assert!(!policy_denies_read(&extra, held, Some((1000, 1000))));
+        // Unknown caller caps or a malformed target line never excuse.
+        let blind = Caller {
+            cap_prm: None,
+            ..caller
+        };
+        assert!(!policy_denies_read(&extra, blind, Some((1000, 1000))));
+        assert!(!policy_denies_read(
+            "CapPrm:\tzz\n",
+            caller,
+            Some((1000, 1000))
+        ));
+    }
+
     fn repo() -> TempDir {
         let tmp = TempDir::new().unwrap();
         let r = tmp.path();
@@ -2177,7 +3798,6 @@ mod tests {
     fn target(id: &str) -> Target {
         Target {
             front: Front::new(id, "t", "now"),
-            body: String::new(),
             dir: PathBuf::new(),
             wt_dir: None,
             wt_name: None,
@@ -2402,5 +4022,204 @@ mod tests {
         let mut probe2 = target("CAD-1");
         probe2.msg_refs.insert("gone".to_string());
         assert!(stale_probe_reason(&probe2, &target("CAD-1")).is_none());
+    }
+}
+
+/// CAD-1196 reviewer-written acceptance check for the process-enumeration
+/// gate: every refusal is driven through `process_use_under_from_proc_root`
+/// (the real guard) over a synthetic proc tree that starts from a state
+/// where the scan completes cleanly, so each case isolates one guard.
+#[cfg(all(test, target_os = "linux"))]
+mod cad1196_acceptance {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use tempfile::{Builder, TempDir};
+
+    struct Proc {
+        _root: TempDir,
+        proc_root: PathBuf,
+        lane: PathBuf,
+    }
+
+    impl Proc {
+        fn new() -> Self {
+            let root = Builder::new().prefix("c1196u-").tempdir_in("/tmp").unwrap();
+            let proc_root = root.path().join("proc");
+            let lane = root.path().join("lane");
+            std::fs::create_dir_all(&lane).unwrap();
+            std::fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+            std::fs::create_dir_all(proc_root.join("2/ns")).unwrap();
+            let canon = proc_root.canonicalize().unwrap();
+            let p = Self {
+                _root: root,
+                proc_root,
+                lane,
+            };
+            p.mountinfo(&canon, "rw");
+            std::fs::write(p.proc_root.join("self/kernel-release"), "7.0.0\n").unwrap();
+            p.kthreadd(2_097_152);
+            symlink("pid:[42]", p.proc_root.join("self/ns/pid")).unwrap();
+            symlink("pid:[42]", p.proc_root.join("2/ns/pid")).unwrap();
+            std::fs::write(
+                p.proc_root.join("self/status"),
+                "Name:\tt\nState:\tR (running)\nNSpid:\t7\nCapPrm:\t0000000000000000\n",
+            )
+            .unwrap();
+            p.process(2, Path::new("/"), &[]);
+            p
+        }
+
+        fn mountinfo(&self, canon: &Path, opts: &str) {
+            std::fs::write(
+                self.proc_root.join("self/mountinfo"),
+                format!(
+                    "1 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc {opts}\n",
+                    canon.display()
+                ),
+            )
+            .unwrap();
+        }
+
+        fn kthreadd(&self, flags: u64) {
+            std::fs::write(
+                self.proc_root.join("2/stat"),
+                format!("2 (kthreadd) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"),
+            )
+            .unwrap();
+        }
+
+        fn relink(&self, rel: &str, target: &str) {
+            let path = self.proc_root.join(rel);
+            let _ = std::fs::remove_file(&path);
+            symlink(target, path).unwrap();
+        }
+
+        /// An own-uid, fully readable process.
+        fn process(&self, pid: u32, cwd: &Path, fds: &[&Path]) -> PathBuf {
+            let dir = self.proc_root.join(pid.to_string());
+            std::fs::create_dir_all(dir.join("fd")).unwrap();
+            let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            std::fs::write(
+                dir.join("status"),
+                format!(
+                    "Name:\tfixture\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nGroups:\t{gid}\nCapEff:\t0000000000000000\nCapPrm:\t0000000000000000\n"
+                ),
+            )
+            .unwrap();
+            symlink(cwd, dir.join("cwd")).unwrap();
+            for (i, fd) in fds.iter().enumerate() {
+                symlink(fd, dir.join("fd").join((3 + i).to_string())).unwrap();
+            }
+            dir
+        }
+
+        fn scan(&self) -> ProcessUse {
+            process_use_under_from_proc_root(&self.lane, &self.proc_root).unwrap()
+        }
+
+        fn refused(&self, expect: &str) {
+            let uses = self.scan();
+            let err = uses.enumeration_error.expect("scan must be incomplete");
+            assert!(err.contains(expect), "expected {expect:?} in {err:?}");
+        }
+    }
+
+    #[test]
+    fn complete_synthetic_view_with_harmless_process_is_clean() {
+        let p = Proc::new();
+        p.process(900, Path::new("/"), &[]);
+        let uses = p.scan();
+        assert!(
+            uses.enumeration_error.is_none(),
+            "{:?}",
+            uses.enumeration_error
+        );
+        assert!(uses.cwd.is_empty() && uses.fd.is_empty());
+    }
+
+    #[test]
+    fn own_uid_cwd_or_fd_inside_the_lane_is_named() {
+        let p = Proc::new();
+        p.process(901, &p.lane.canonicalize().unwrap(), &[]);
+        p.process(902, Path::new("/"), &[&p.lane.canonicalize().unwrap()]);
+        let uses = p.scan();
+        assert_eq!(uses.cwd, vec![901]);
+        assert_eq!(uses.fd, vec![902]);
+    }
+
+    #[test]
+    fn own_uid_unexplained_permission_denied_is_an_incomplete_scan() {
+        // Entry (cwd) is owned by the caller, so the kernel policy cannot
+        // explain the EACCES on fd/: it must refuse, not excuse.
+        let p = Proc::new();
+        let dir = p.process(903, Path::new("/"), &[]);
+        std::fs::set_permissions(dir.join("fd"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let uses = p.scan();
+        std::fs::set_permissions(dir.join("fd"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            uses.enumeration_error.is_some(),
+            "unexplained EACCES on an own-uid process was excused"
+        );
+    }
+
+    #[test]
+    fn hidepid_hidden_view_is_refused() {
+        let p = Proc::new();
+        let canon = p.proc_root.canonicalize().unwrap();
+        p.mountinfo(&canon, "rw,hidepid=2");
+        p.refused("hidepid");
+    }
+
+    #[test]
+    fn non_canonical_or_other_pid2_namespace_link_is_refused() {
+        for bad in [
+            "pid:[042]",
+            "pid:[0]",
+            "net:[42]",
+            "pid:[43]",
+            "garbage",
+            "pid:[42]x",
+        ] {
+            let p = Proc::new();
+            p.relink("2/ns/pid", bad);
+            let uses = p.scan();
+            assert!(
+                uses.enumeration_error.is_some(),
+                "PID 2 link {bad:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn caller_namespace_link_must_parse() {
+        for bad in ["garbage", "pid:[0]", "pid:[042]"] {
+            let p = Proc::new();
+            p.relink("self/ns/pid", bad);
+            assert!(p.scan().enumeration_error.is_some(), "caller link {bad:?}");
+        }
+    }
+
+    #[test]
+    fn pid2_must_be_kthreadd() {
+        let p = Proc::new();
+        p.kthreadd(0); // no PF_KTHREAD
+        p.refused("kthreadd");
+        let p = Proc::new();
+        std::fs::write(
+            p.proc_root.join("2/stat"),
+            "2 (bash) S 0 0 0 0 -1 2097152 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        p.refused("kthreadd");
+    }
+
+    #[test]
+    fn nspid_proof_for_an_empty_pid2_link() {
+        // The synthetic seam cannot make an empty symlink, so the empty-link
+        // branch is driven through its two decisions directly.
+        assert!(status_has_single_nspid("NSpid:\t7\n"));
+        assert!(!status_has_single_nspid("NSpid:\t7\t1\n"));
+        assert!(!status_has_single_nspid("NSpid:\t7\t3\t1\n"));
+        assert!(!status_has_single_nspid(""));
     }
 }

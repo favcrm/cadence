@@ -70,14 +70,15 @@ async function main() {
   assert(verified.at(-1)?.receiptId === receipt.id && verified.at(-1)?.digest === digest, "Exact retained digest can unlock release");
   assert(verified.at(-1)?.subject === imageSubject(run), "Release pin binds the selected run, image binding and source");
   assert(host.textContent?.includes("Independent review pinned these bytes"), "Board explains the reviewer pin");
-  assert(host.textContent?.includes("Billed USD 0.031500"), "Receipt shows the actual billed charge");
-  assert(!host.textContent?.includes("approved rate was"), "An equal approved rate is not restated");
+  // CAD-1129: the receipt panel shows no billed charge or approved rate —
+  // spend stays in the host; a run state change still revalidates bytes.
+  assert(!host.textContent?.includes("Billed") && !host.textContent?.includes("USD") && !host.textContent?.includes("approved rate"), "Receipt shows no price or charge text");
   returnedReceipt = { ...receipt, result: { ...receipt.result, charge: { ...receipt.result.charge, amount: "0.040000" } } };
   await render({ ...run, state: "running" });
-  await settleUntil(() => !!host.textContent?.includes("approved rate was USD 0.031500"), "A billed charge above the approved rate must show the approved rate");
+  await settleUntil(() => verified.at(-1)?.receiptId === receipt.id && !!host.querySelector("img"), "A changed charge amount still revalidates the retained bytes");
   returnedReceipt = receipt;
   await render(run);
-  await settleUntil(() => verified.at(-1)?.receiptId === receipt.id && !host.textContent?.includes("approved rate was"), "Matching charge did not hide the approved-rate suffix");
+  await settleUntil(() => verified.at(-1)?.receiptId === receipt.id && !!host.querySelector("img"), "The matching charge still verifies the retained bytes");
   let releaseResults!: () => void;
   holdResults = new Promise(resolve => { releaseResults = resolve; });
   await render({ ...run, state: "failed" });

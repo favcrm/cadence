@@ -200,7 +200,9 @@ fn list_query(raw: &str) -> Result<Value, HttpResp> {
                 let limit: i64 = value
                     .parse()
                     .ok()
-                    .filter(|limit| (1..=crate::store::app_records::RECORD_LIMIT).contains(limit))
+                    .filter(|limit| {
+                        (1..=crate::store::app_records::RECORD_PAGE_MAX).contains(limit)
+                    })
                     .ok_or_else(|| err_response(400, "invalid app record request schema"))?;
                 params["limit"] = json!(limit);
             }

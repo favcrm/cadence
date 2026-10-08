@@ -57,6 +57,14 @@ pub struct LocalWorkflow {
     pub capability_slots: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_asset_slot: Option<String>,
+    /// CAD-1171: `agent` (default, every step runs through its worker) or
+    /// `host` (capability steps execute in-process for the operator's own
+    /// click — no owner PM, no assignments).
+    #[serde(default = "execution_agent")]
+    pub execution: String,
+}
+fn execution_agent() -> String {
+    "agent".into()
 }
 impl LocalWorkflow {
     pub fn parse(text: &str, inputs: &BTreeMap<String, String>) -> Result<Self> {
@@ -64,6 +72,7 @@ impl LocalWorkflow {
         let publication_slot = template.publication_slot;
         let capability_slots = template.capability_slots;
         let required_asset_slot = template.required_asset_slot;
+        let execution = template.execution.as_str().to_string();
         let rendered = workflow::render(text, inputs)?;
         let parsed = plan::parse_plan(&rendered)?;
         let (_, body) =
@@ -99,12 +108,24 @@ impl LocalWorkflow {
             let kind = match meta.get("action").map(String::as_str) {
                 Some("local.text.produce") => "produce_text",
                 Some("local.text.review") => "review_text",
-                _ => return Err(Error::rejected("unsupported execution capability: declare action: local.text.produce or local.text.review")),
+                // CAD-1171: the host itself calls the frozen capability
+                // slots; the step produces no text artifact.
+                Some("local.capability.call") => "capability",
+                _ => return Err(Error::rejected("unsupported execution capability: declare action: local.text.produce, local.text.review or local.capability.call")),
             };
-            let assignee = ticket.agent.clone().ok_or_else(|| {
-                Error::rejected("every local step needs an explicit assigned agent")
-            })?;
-            crate::proto::identifier(&assignee, "local step agent")?;
+            let assignee = match ticket.agent.clone() {
+                Some(assignee) => {
+                    crate::proto::identifier(&assignee, "local step agent")?;
+                    assignee
+                }
+                // A capability step runs on the host; it names no worker.
+                None if kind == "capability" => String::new(),
+                None => {
+                    return Err(Error::rejected(
+                        "every local step needs an explicit assigned agent",
+                    ))
+                }
+            };
             let dependencies = ticket
                 .depends_on
                 .iter()
@@ -138,6 +159,14 @@ impl LocalWorkflow {
                     ));
                 }
             }
+            if kind == "capability" && !assignee.is_empty() {
+                return Err(Error::rejected("a capability step names no agent"));
+            }
+            if kind == "capability" && !dependencies.is_empty() {
+                return Err(Error::rejected(
+                    "a host capability step takes no dependencies",
+                ));
+            }
             let instruction = format!("{}\n{}", ticket.title, ticket.description);
             if instruction.len() > 16 * 1024 {
                 return Err(Error::rejected(
@@ -152,6 +181,21 @@ impl LocalWorkflow {
                 instruction,
             });
         }
+        if execution == "host" && steps.iter().any(|step| step.kind != "capability") {
+            return Err(Error::rejected(
+                "a host-execution workflow runs capability steps only",
+            ));
+        }
+        if execution == "host" && steps.len() != 1 {
+            return Err(Error::rejected(
+                "a host-execution workflow declares exactly one step",
+            ));
+        }
+        if execution != "host" && steps.iter().any(|step| step.kind == "capability") {
+            return Err(Error::rejected(
+                "a capability step requires execution: host",
+            ));
+        }
         Ok(Self {
             source_digest: artifact_digest(text.as_bytes()),
             title: parsed.title,
@@ -159,6 +203,7 @@ impl LocalWorkflow {
             publication_slot,
             capability_slots,
             required_asset_slot,
+            execution,
         })
     }
 }
@@ -175,6 +220,10 @@ CREATE TABLE IF NOT EXISTS app_runs(
  state TEXT NOT NULL CHECK(state IN ('awaiting_approval','approved','running','succeeded','failed','cancelled')),
  approved_digest TEXT, created REAL NOT NULL, updated REAL NOT NULL,
  UNIQUE(install_id,request_id));
+CREATE TABLE IF NOT EXISTS app_run_failures(
+ run_id TEXT PRIMARY KEY REFERENCES app_runs(id), step_id TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('refused','uncertain')), reason TEXT NOT NULL,
+ created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS app_run_steps(
  run_id TEXT NOT NULL REFERENCES app_runs(id), step_id TEXT NOT NULL,
  task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id), spec TEXT NOT NULL,
@@ -248,6 +297,13 @@ impl Store {
             json!({"via": via, "capabilities": capabilities}),
         )
         .map(Some)
+    }
+    /// CAD-1129 H5: revoke this install's consent at its current
+    /// digest — the soft-remove path. `app_capability_decide_audited`
+    /// already writes the `revoked` epoch; this is the operator-facing
+    /// wrapper that never leaves an `approved` slot behind.
+    pub fn app_install_revoke(&self, id: &str, digest: &str, via: &str) -> Result<Value> {
+        self.app_capability_decide_audited(id, digest, false, json!({"via": via}))
     }
     fn app_capability_decide_audited(
         &self,
@@ -511,11 +567,23 @@ impl Store {
                         None
                     };
                     let epoch:i64=tx.query_opt("SELECT epoch FROM app_install_capabilities WHERE install_id=? AND digest=? AND state='approved'",params![install_id,bundle_digest],|r|r.get(0))?.ok_or_else(||Error::rejected("installation capability approval is absent or stale"))?;
+                    let mut assignments = BTreeMap::new();
+                    if workflow.execution == "host" {
+                        // CAD-1171: the operator's own click runs the
+                        // capability; there is no owner PM and no worker.
+                        if owner_pm.is_some() {
+                            return Err(Error::rejected(
+                                "a host-execution run has no owner PM",
+                            ));
+                        }
+                    } else {
+                    let owner_pm = owner_pm.ok_or_else(|| {
+                        Error::rejected("a run needs its owner PM")
+                    })?;
                     let owner = self.agent_in(&tx, owner_pm)?;
                     if owner.role != "pm" {
                         return Err(Error::rejected("run owner must be an existing PM"));
                     }
-                    let mut assignments = BTreeMap::new();
                     for step in &workflow.steps {
                         let agent = self.agent_in(&tx, &step.assignee)?;
                         if !(agent.enabled || Self::agent_auto_parked_in(&tx, &agent)?)
@@ -547,6 +615,7 @@ impl Store {
                             ));
                         }
                         assignments.insert(step.id.clone(),json!({"alias":agent.alias,"identity_digest":generation,"identity":Self::app_binding_identity(&agent),"role":agent.role,"provider":agent.provider,"endpoint_kind":agent.endpoint_kind}));
+                    }
                     }
                     let mut snapshot = json!({"schema":1,"install_id":install_id,"bundle_digest":bundle_digest,"epoch":epoch,"workflow":workflow,"inputs":inputs,"assignments":assignments,"owner_pm":owner_pm,"project_link":project_link,"artifact_policy":{"types":["text/plain","text/markdown"],"max_bytes":ARTIFACT_BYTES,"aggregate_bytes":RUN_ARTIFACT_BYTES}});
                     if !input_origins.is_empty() {
@@ -598,7 +667,10 @@ impl Store {
                         return Self::app_run_show_in(&tx, &id);
                     }
                     let id = format!("run-{}", uuid::Uuid::new_v4().simple());
-                    tx.execute("INSERT INTO jobs(id,title,spec_path,spec_sha256,pm_alias,state,max_revisions,created,updated) VALUES(?,?,?,?,?,'open',1,?,?)",params![id,"App run","app-run",digest,owner_pm,now(),now()])?;
+                    // CAD-1171: a host run stores an empty owner (its
+                    // snapshot carries `owner_pm: null`).
+                    let owner_row = owner_pm.unwrap_or_default();
+                    tx.execute("INSERT INTO jobs(id,title,spec_path,spec_sha256,pm_alias,state,max_revisions,created,updated) VALUES(?,?,?,?,?,'open',1,?,?)",params![id,"App run","app-run",digest,owner_row,now(),now()])?;
                     tx.execute(
                         "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,project_link,owner_pm,request_id,state,approved_digest,created,updated,context_id) VALUES(?,?,?,?,?,?,?,?,?,'awaiting_approval',NULL,?,?,?)",
                         params![
@@ -609,7 +681,7 @@ impl Store {
                             snapshot.to_string(),
                             digest,
                             project_link,
-                            owner_pm,
+                            owner_row,
                             request_id,
                             now(),
                             now(),
@@ -618,7 +690,12 @@ impl Store {
                     )?;
                     for step in &workflow.steps {
                         let task = format!("{id}-{}", step.id);
-                        let generation = assignments[&step.id]["identity_digest"].as_str().unwrap();
+                        // CAD-1171: a host capability step has no assignment.
+                        let generation = assignments
+                            .get(&step.id)
+                            .and_then(|row| row["identity_digest"].as_str())
+                            .unwrap_or_default()
+                            .to_string();
                         tx.execute("INSERT INTO tasks(id,job_id,role,assignee,state,created,updated) VALUES(?,?,?,?,'draft',?,?)",params![task,id,step.kind,step.assignee,now(),now()])?;
                         tx.execute(
                             "INSERT INTO app_run_steps VALUES(?,?,?,?,?,'pending',NULL,NULL)",
@@ -673,6 +750,22 @@ impl Store {
                 .and_then(|v| v["by"].as_str().map(str::to_string))
                 .unwrap_or_else(|| "operator".into());
             value["approval"] = json!({"by": by, "at": at as i64});
+        }
+        if let Some((kind, reason, step_id)) = conn
+            .query_row(
+                "SELECT kind,reason,step_id FROM app_run_failures WHERE run_id=?",
+                [id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            value["failure"] = json!({"kind":kind,"reason":reason,"step_id":step_id});
         }
         value["steps"]=Value::Array(conn.query_vec("SELECT step_id,task_id,state,message_id FROM app_run_steps WHERE run_id=? ORDER BY step_id",[id],|r|Ok(json!({"step_id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"message_id":r.get::<_,Option<String>>(3)?})))?);
         value["artifacts"]=Value::Array(conn.query_vec("SELECT id,step_id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? ORDER BY step_id",[id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"step_id":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"media_type":r.get::<_,String>(3)?,"size":r.get::<_,i64>(4)?})))?);
@@ -1034,6 +1127,150 @@ impl Store {
 impl Store {
     /// Called only while the daemon holds the installation's PM lock. SQL
     /// rechecks the epoch and dependency state in the enqueue transaction.
+    /// CAD-1171: complete the host step only after every declared capability
+    /// slot has a retained receipt. The operator's click ran the provider;
+    /// there is no worker, message or artifact.
+    pub fn app_run_host_step_succeeded(&self, run_id: &str, step_id: &str) -> Result<Value> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let run = Self::app_run_show_in(tx, run_id)?;
+            if run["state"] != "running"
+                || run["approved_digest"] != run["snapshot_digest"]
+                || run["snapshot"]["workflow"]["execution"] != "host"
+            {
+                return Err(Error::rejected("host run is not active and approved"));
+            }
+            let slots = run["snapshot"]["workflow"]["capability_slots"]
+                .as_array()
+                .ok_or_else(|| Error::rejected("host run has no required capability slots"))?;
+            if slots.is_empty() {
+                return Err(Error::rejected("host run has no required capability slots"));
+            }
+            let (task_id, step_state): (String, String) = tx
+                .query_row(
+                    "SELECT task_id,state FROM app_run_steps WHERE run_id=? AND step_id=?",
+                    params![run_id, step_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|_| Error::rejected("host step is absent"))?;
+            if step_state != "dispatched" {
+                return Err(Error::rejected("host step is not dispatched"));
+            }
+            let mut receipt_digests = Vec::with_capacity(slots.len());
+            for slot in slots {
+                let slot = slot
+                    .as_str()
+                    .ok_or_else(|| Error::rejected("host capability slot is invalid"))?;
+                let digest: Option<String> = tx.query_row(
+                    "SELECT result_digest FROM app_capability_results
+                     WHERE run_id=? AND step_id=? AND slot=?",
+                    params![run_id, step_id, slot],
+                    |r| r.get(0),
+                ).optional()?;
+                let digest = digest.ok_or_else(|| {
+                    Error::rejected("host step is missing a required capability receipt")
+                })?;
+                receipt_digests.push(json!({"slot":slot,"digest":digest}));
+            }
+            let result_digest = material_digest(&json!(receipt_digests));
+            let now = now();
+            tx.execute(
+                "UPDATE app_run_steps SET state='succeeded',result_digest=? WHERE run_id=? AND step_id=? AND state='dispatched'",
+                params![result_digest, run_id, step_id],
+            )?;
+            tx.execute(
+                "UPDATE tasks SET state='done',error=NULL,updated=? WHERE id=?",
+                params![now, task_id],
+            )?;
+            let pending: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM app_run_steps WHERE run_id=? AND state!='succeeded'",
+                [run_id],
+                |r| r.get(0),
+            )?;
+            if pending == 0 {
+                tx.execute(
+                    "UPDATE app_runs SET state='succeeded',updated=? WHERE id=? AND state='running'",
+                    params![now, run_id],
+                )?;
+                tx.execute(
+                    "UPDATE jobs SET state='done',updated=? WHERE id=?",
+                    params![now, run_id],
+                )?;
+            }
+            Self::event(
+                tx,
+                Self::DAEMON_STREAM,
+                if pending == 0 {
+                    "app_run_completed"
+                } else {
+                    "app_run_step_result_recorded"
+                },
+                json!({"run_id":run_id,"step_id":step_id,"host":true,"slots":slots.len()}),
+            )?;
+            Self::app_run_show_in(tx, run_id)
+        })
+    }
+
+    /// A host capability refusal or uncertain result is terminal. Retain the
+    /// claim and any earlier slot receipts, and never make it retryable via the
+    /// background advance tick.
+    pub fn app_run_host_step_failed(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        kind: &str,
+        reason: &str,
+    ) -> Result<Value> {
+        if !matches!(kind, "refused" | "uncertain") || reason.is_empty() || reason.len() > 1024 {
+            return Err(Error::rejected("host failure record is invalid"));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let run = Self::app_run_show_in(tx, run_id)?;
+            if run["state"] != "running"
+                || run["approved_digest"] != run["snapshot_digest"]
+                || run["snapshot"]["workflow"]["execution"] != "host"
+            {
+                return Err(Error::rejected("host run is not active and approved"));
+            }
+            let task_id: String = tx
+                .query_row(
+                    "SELECT task_id FROM app_run_steps WHERE run_id=? AND step_id=? AND state='dispatched'",
+                    params![run_id, step_id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| Error::rejected("host step is not dispatched"))?;
+            let now = now();
+            tx.execute(
+                "INSERT INTO app_run_failures(run_id,step_id,kind,reason,created) VALUES(?,?,?,?,?)",
+                params![run_id, step_id, kind, reason, now],
+            )?;
+            tx.execute(
+                "UPDATE app_run_steps SET state='failed' WHERE run_id=? AND step_id=? AND state='dispatched'",
+                params![run_id, step_id],
+            )?;
+            tx.execute(
+                "UPDATE tasks SET state='failed',error=?,updated=? WHERE id=?",
+                params![reason, now, task_id],
+            )?;
+            tx.execute(
+                "UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state='running'",
+                params![now, run_id],
+            )?;
+            tx.execute(
+                "UPDATE jobs SET state='failed',updated=? WHERE id=?",
+                params![now, run_id],
+            )?;
+            Self::event(
+                tx,
+                Self::DAEMON_STREAM,
+                "app_run_host_step_failed",
+                json!({"run_id":run_id,"step_id":step_id,"kind":kind}),
+            )?;
+            Self::app_run_show_in(tx, run_id)
+        })
+    }
+
     pub fn app_run_dispatch(&self, id: &str, current_bundle: &str) -> Result<Value> {
         self.write_tx(|conn| {
 
@@ -1072,6 +1309,20 @@ impl Store {
                             if let Some(artifact)=tx.query_opt("SELECT id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? AND step_id=?",params![id,dep],|r|Ok(json!({"artifact_id":r.get::<_,String>(0)?,"producer_step_id":dep,"revision":1,"sha256":r.get::<_,String>(1)?,"media_type":r.get::<_,String>(2)?,"size":r.get::<_,i64>(3)?})))? {dependencies.push(artifact);}
                         }
                         if !ready {
+                            continue;
+                        }
+                        // CAD-1171: a host capability step is dispatched
+                        // without a message — the daemon runs it
+                        // in-process for the operator's own click.
+                        if step.kind == "capability" {
+                            tx.execute("UPDATE tasks SET state='dispatched',revision=1,updated=? WHERE id=? AND state='draft'",params![now(),task_id])?;
+                            tx.execute("UPDATE app_run_steps SET state='dispatched' WHERE run_id=? AND step_id=? AND state='pending'",params![id,step_id])?;
+                            Self::event(
+                                &tx,
+                                Self::DAEMON_STREAM,
+                                "app_run_step_dispatched",
+                                json!({"run_id":id,"step_id":step_id,"host":true}),
+                            )?;
                             continue;
                         }
                         let worker = self.agent_in(&tx, &step.assignee)?;
@@ -1754,7 +2005,8 @@ pub struct LocalRunRequest<'a> {
     pub workflow: &'a LocalWorkflow,
     pub inputs: &'a BTreeMap<String, String>,
     pub request_id: &'a str,
-    pub owner_pm: &'a str,
+    /// CAD-1171: required for an agent run; absent (None) for a host run.
+    pub owner_pm: Option<&'a str>,
     pub project_link: Option<&'a str>,
 }
 
@@ -1904,7 +2156,10 @@ impl Store {
 
 impl LocalWorkflow {
     pub fn validate_template(text: &str) -> Result<()> {
-        workflow::parse_template(text)?;
+        let template = workflow::parse_template(text)?;
+        // CAD-1171: a host-execution workflow's one step is the host's own
+        // capability call; agent workflows keep the text actions.
+        let host = template.execution == crate::issue::workflow::Execution::Host;
         let (_, body) = parse::split_front(text).map_err(|e| Error::rejected(e.to_string()))?;
         let metadata = workflow::ticket_meta(body)?;
         if metadata.is_empty() || metadata.len() > 16 {
@@ -1914,13 +2169,21 @@ impl LocalWorkflow {
         }
         for step in metadata {
             let fields: BTreeMap<_, _> = step.into_iter().collect();
-            if fields.contains_key("uses")
-                || fields.contains_key("tries")
-                || fields.contains_key("reviewer")
-                || !matches!(
+            let supported = if host {
+                matches!(
+                    fields.get("action").map(String::as_str),
+                    Some("local.capability.call")
+                )
+            } else {
+                matches!(
                     fields.get("action").map(String::as_str),
                     Some("local.text.produce" | "local.text.review")
                 )
+            };
+            if fields.contains_key("uses")
+                || fields.contains_key("tries")
+                || fields.contains_key("reviewer")
+                || !supported
             {
                 return Err(Error::rejected("local capability approval requires explicit supported action steps; uses, tries and implicit reviewer are unsupported"));
             }

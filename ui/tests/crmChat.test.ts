@@ -149,6 +149,7 @@ await click(host.querySelector(".app-chat-rail"));
 assert(!grid().hasAttribute("data-chat-collapsed"), "rail expands the chat");
 assert(!host.querySelector(".app-chat-dot"), "dot clears once seen");
 assert(host.querySelector("aside, [data-chat-pane]")!.compareDocumentPosition(host.querySelector(".app-shell-outlet")!) & 4, "chat stays before (left of) the workspace");
+await React.act(async () => { root.unmount(); });
 console.log("crm chat checks passed");
 }
 void main();

@@ -5,7 +5,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -318,7 +318,7 @@ pub fn rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
 /// show.
 pub fn route_answer(state_dir: &Path, issue: &str, report: &str) -> Value {
     let params = serde_json::json!({"issue": issue, "report": report});
-    match rpc_timeout(state_dir, "answer_route", params, Duration::from_secs(10)) {
+    match rpc_relay_timeout(state_dir, "answer_route", params, Duration::from_secs(10)) {
         Ok(v) => v,
         Err(e) => serde_json::json!({"sent": false, "error": e.to_string()}),
     }
@@ -384,6 +384,66 @@ pub fn rpc_answer(state_dir: &Path, method: &str, params: Value) -> Result<Resul
     )?))
 }
 
+/// CAD-508 retry budget for connects across the daemon restart window.
+const RELAY_BUDGET: Duration = Duration::from_secs(60);
+const RELAY_STEP: Duration = Duration::from_millis(50);
+const RELAY_STEP_MAX: Duration = Duration::from_millis(500);
+
+fn retryable_connect_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Retry only the local socket connect for durable CLI operations. Once
+/// connected, [`rpc_exchange`] sends exactly one request and never replays it.
+pub fn rpc_relay(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
+    rpc_relay_timeout(state_dir, method, params, Duration::from_secs(700))
+}
+
+/// [`rpc_relay`] with a caller-selected response timeout.
+pub(crate) fn rpc_relay_timeout(
+    state_dir: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    proto::unwrap(rpc_frame_relay(
+        state_dir,
+        method,
+        params,
+        timeout,
+        RELAY_BUDGET,
+    )?)
+}
+
+fn rpc_frame_relay(
+    state_dir: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+    budget: Duration,
+) -> Result<Value> {
+    let socket = rpc_socket_path(state_dir)?;
+    let deadline = Instant::now() + budget;
+    let mut step = RELAY_STEP;
+    loop {
+        match UnixStream::connect(&socket) {
+            Ok(stream) => return rpc_exchange(stream, state_dir, method, params, timeout),
+            Err(error) if retryable_connect_error(error.kind()) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(daemon_unreachable(&socket));
+                }
+                std::thread::sleep(step.min(left));
+                step = (step * 2).min(RELAY_STEP_MAX);
+            }
+            Err(_) => return Err(daemon_unreachable(&socket)),
+        }
+    }
+}
+
 /// One request/response frame over the daemon socket.
 fn rpc_frame(state_dir: &Path, method: &str, params: Value, timeout: Duration) -> Result<Value> {
     let socket = rpc_socket_path(state_dir)?;
@@ -397,12 +457,24 @@ fn rpc_frame_on(
     params: Value,
     timeout: Duration,
 ) -> Result<Value> {
-    let mut stream = UnixStream::connect(socket).map_err(|_| {
-        Error::internal(format!(
-            "Daemon is not reachable at {} — start it with `cadence daemon start`",
-            socket.display()
-        ))
-    })?;
+    let stream = UnixStream::connect(socket).map_err(|_| daemon_unreachable(socket))?;
+    rpc_exchange(stream, state_dir, method, params, timeout)
+}
+
+fn daemon_unreachable(socket: &Path) -> Error {
+    Error::internal(format!(
+        "Daemon is not reachable at {} — start it with `cadence daemon start`",
+        socket.display()
+    ))
+}
+
+fn rpc_exchange(
+    mut stream: UnixStream,
+    state_dir: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
     stream.set_read_timeout(Some(timeout))?;
     let mut request = proto::request(method, params);
     // CAD-482: a test-seam caller asserts its identity on the frame —
@@ -424,6 +496,185 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Stdio};
     use std::time::Instant;
+
+    fn serve_later(
+        socket: PathBuf,
+        delay: Duration,
+        replies: Vec<Value>,
+    ) -> std::thread::JoinHandle<usize> {
+        use std::os::unix::net::UnixListener;
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let listener = UnixListener::bind(socket).unwrap();
+            let mut served = 0;
+            for reply in replies {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                served += 1;
+                let mut request = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut request);
+                let _ = writeln!(&stream, "{reply}");
+            }
+            served
+        })
+    }
+
+    #[test]
+    fn relay_retries_only_absent_or_refused_connects() {
+        assert!(retryable_connect_error(std::io::ErrorKind::NotFound));
+        assert!(retryable_connect_error(
+            std::io::ErrorKind::ConnectionRefused
+        ));
+        assert!(!retryable_connect_error(
+            std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(!retryable_connect_error(std::io::ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn relay_waits_for_late_socket_and_sends_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = serve_later(
+            dir.path().join("cadence.sock"),
+            Duration::from_millis(180),
+            vec![proto::ok(serde_json::json!("ok"))],
+        );
+        let started = Instant::now();
+        let out = rpc_frame_relay(
+            dir.path(),
+            "agent_send",
+            Value::Null,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(out["ok"], true);
+        assert!(started.elapsed() >= Duration::from_millis(180));
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn relay_retries_refused_stale_socket_then_accepts_once() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("cadence.sock");
+        drop(UnixListener::bind(&socket).unwrap());
+        let stale = socket.clone();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            std::fs::remove_file(&stale).unwrap();
+            let listener = UnixListener::bind(&stale).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut request);
+            writeln!(&stream, "{}", proto::ok(Value::Null)).unwrap();
+        });
+        rpc_frame_relay(
+            dir.path(),
+            "message_read",
+            Value::Null,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn relay_does_not_replay_after_server_accepts_and_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let refusal =
+            serde_json::json!({"ok": false, "error": {"kind": "rejected", "message": "no"}});
+        let server = serve_later(
+            dir.path().join("cadence.sock"),
+            Duration::ZERO,
+            vec![refusal.clone()],
+        );
+        let started = Instant::now();
+        assert_eq!(
+            rpc_frame_relay(
+                dir.path(),
+                "message_report",
+                Value::Null,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+            refusal
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn relay_does_not_replay_when_an_accepted_connection_loses_its_reply() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(dir.path().join("cadence.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut request);
+            drop(stream);
+            1
+        });
+        let error = rpc_frame_relay(
+            dir.path(),
+            "message_report",
+            Value::Null,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("Daemon is not reachable"));
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn concurrent_relays_connect_once_each_after_the_socket_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = serve_later(
+            dir.path().join("cadence.sock"),
+            Duration::from_millis(120),
+            vec![proto::ok(Value::Null); 4],
+        );
+        let calls: Vec<_> = (0..4)
+            .map(|_| {
+                let state = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    rpc_frame_relay(
+                        &state,
+                        "agent_send",
+                        Value::Null,
+                        Duration::from_secs(2),
+                        Duration::from_secs(2),
+                    )
+                })
+            })
+            .collect();
+        for call in calls {
+            assert_eq!(call.join().unwrap().unwrap()["ok"], true);
+        }
+        assert_eq!(server.join().unwrap(), 4);
+    }
+
+    #[test]
+    fn relay_budget_exhaustion_uses_existing_unreachable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let error = rpc_frame_relay(
+            dir.path(),
+            "agent_inbox",
+            Value::Null,
+            Duration::from_secs(2),
+            Duration::from_millis(120),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Daemon is not reachable"));
+        assert!(started.elapsed() >= Duration::from_millis(120));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn end_child_waits_for_a_child_that_exits_by_itself() {

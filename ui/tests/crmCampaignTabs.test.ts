@@ -1,11 +1,9 @@
 export {};
 /**
- * CAD-1055 campaign detail tabs (view only): the saved campaign is
- * Overview / Email / Audience / Activity — no Content tab, no single
- * scroll. The ready-to-send checklist is the Final send gate's own
- * list; the Email tab keeps the host-rendered preview, the pending
- * assistant proposal strip (saved/draft toggle, pinned Apply, plain
- * Discard) and every existing safety rule.
+ * CAD-1182 campaign workspace: compact Overview with one next task,
+ * separate guarded approval/test/final-send surfaces, Visual | HTML
+ * editing, and proposal Review → Use in editor → explicit Save. Keep
+ * revision, read-only, provenance, audience and receipt safeguards.
  */
 declare function require(name: string): any;
 
@@ -25,7 +23,7 @@ async function main() {
   console.log("crm campaign tabs checks passed");
 }
 
-/** The checklist and the Prepare gate read one list. */
+/** The compact workspace still derives its next task from the send prerequisites. */
 function readinessRules() {
   const { sendReadiness, missingReasons } = require("../src/features/app-shell/campaign/readiness") as typeof import(
     "../src/features/app-shell/campaign/readiness"
@@ -35,7 +33,7 @@ function readinessRules() {
     approval: { revision: 2, digest: "d2", valid: true, scope: "content-only" },
   };
   const binding: any = { state: "live", digest: "link1", sender: { name: "N", address: "a@b.c" } };
-  const test: any = { contentDigest: "d2", linkDigest: "link1" };
+  const test: any = { contentRevision: 2, contentDigest: "d2", linkDigest: "link1" };
   const all = sendReadiness({ doc, freezeId: "f", freeze: { valid: true }, binding, testEvidence: test });
   assert(all.every((item) => item.done), "every prerequisite met");
   equal(missingReasons(all), [], "nothing missing");
@@ -46,20 +44,25 @@ function readinessRules() {
   });
   equal(missingReasons(none), [
     "content approved at the current revision",
-    "freeze f rechecked below (its validity is unverified)",
+    "the audience frozen and rechecked (its validity is unverified)",
     "the sender binding read (still loading)",
     "an accepted test send of this content and binding",
   ], "unmet reasons keep their order and text");
   // A stale approval (older revision) is unmet; a drifted test send is named.
   const stale = sendReadiness({
     doc: { ...doc, revision: 3 }, freezeId: "f", freeze: { valid: false }, binding: null,
-    testEvidence: test,
+    testEvidence: { ...test, contentRevision: 3 },
   });
   equal(missingReasons(stale), [
     "content approved at the current revision",
-    "freeze f reporting valid",
+    "the audience frozen and reporting valid",
     "a live SMTP sender binding",
   ], "stale approval, invalid freeze and no sender are unmet");
+  const wrongRevisionTest = sendReadiness({
+    doc: { ...doc, revision: 3, approval: { revision: 3, digest: "d2", valid: true, scope: "content-only" } },
+    freezeId: "f", freeze: { valid: true }, binding, testEvidence: test,
+  });
+  equal(missingReasons(wrongRevisionTest), ["a test send accepted against this exact content revision and binding"], "same content digest from another revision is not accepted test evidence");
   const drifted = sendReadiness({ doc, freezeId: "f", freeze: { valid: true }, binding, testEvidence: { ...test, contentDigest: "old" } });
   equal(missingReasons(drifted), ["a test send accepted against this exact content revision and binding"], "a test of other bytes is not evidence");
   // The Fix targets point at the tab or panel that resolves each item.
@@ -124,6 +127,7 @@ async function mounted(readOnly: boolean) {
     },
   };
   const applyBodies: { id: string; body: any }[] = [];
+  const saveBodies: any[] = [];
   const discards: string[] = [];
   const renderBodies: any[] = [];
   const posts: string[] = [];
@@ -191,6 +195,21 @@ async function mounted(readOnly: boolean) {
       proposals[id].state = "discarded";
       return json({ proposal: proposals[id] });
     }
+    if (method === "POST" && url.pathname.endsWith("/content/campaigns")) {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      saveBodies.push(body);
+      if (body.expected_revision !== doc.revision) return refused("email revision is stale");
+      doc.revision += 1;
+      doc.subject = body.subject;
+      doc.preheader = body.preheader;
+      doc.blocks = body.blocks ?? [];
+      doc.mode = typeof body.html === "string" ? "html" : "blocks";
+      doc.html = typeof body.html === "string" ? body.html : null;
+      doc.text_override = body.text ?? null;
+      doc.content_digest = `content-digest-${doc.revision}`;
+      doc.approval = { revision: null, digest: null, valid: false, scope: "content-only" };
+      return json({ content: doc });
+    }
     if (method === "POST" && url.pathname.endsWith("/approve")) {
       const body = init?.body ? JSON.parse(String(init.body)) : {};
       if (body.expected_revision !== doc.revision) return refused("email revision is stale");
@@ -248,8 +267,6 @@ async function mounted(readOnly: boolean) {
     Array.from(scope.querySelectorAll(tag)).find((el) => (el.textContent ?? "").trim() === label) ?? null;
   const tabEl = (name: string) => host.querySelector(`[data-tab="${name}"]`);
   const openTab = async (name: string) => { await click(tabEl(name)); await settle(() => assert(tabEl(name)?.getAttribute("aria-selected") === "true", `${name} tab selected`)); };
-  const items = () => Array.from(host.querySelectorAll("[data-checklist] li[data-item]"));
-  const item = (key: string) => host.querySelector(`[data-checklist] li[data-item="${key}"]`);
   const buttonIn = (scope: ParentNode | null, label: string) => (scope ? (byText(scope, "button", label) as HTMLButtonElement | null) : null);
 
   win.sessionStorage.clear();
@@ -274,31 +291,34 @@ async function mounted(readOnly: boolean) {
   equal(tabEl("overview")!.getAttribute("tabindex"), "-1", "other tabs leave the tab order");
   await openTab("overview");
 
-  // ---- Overview: the checklist is driven by the same readiness list.
-  await settle(() => assert(items().length === 5, "five checklist rows"));
-  assert(item("draft")?.hasAttribute("data-done"), "a saved draft is done");
-  assert(!item("approval")?.hasAttribute("data-done"), "approval is not done");
-  const unmet = items().filter((li) => !li.hasAttribute("data-done")).length;
-  await settle(() => assert(host.querySelector('[data-prerequisites="missing"]'), "Final send names what is missing"));
-  equal(host.querySelectorAll('[data-prerequisites="missing"] li').length, unmet, "the checklist and the Prepare gate list the same unmet items");
-  assert(text().includes("1 of 5"), "progress counts done rows");
+  // ---- Overview: one useful next task, with guarded decisions kept separate.
+  assert(host.querySelector("[data-campaign-overview] [data-next-task]"), "Overview presents a next task");
+  assert(text().includes("Content approved"), "the unmet current-revision approval is the next task");
+  const overview = host.querySelector("[data-campaign-overview]")!;
+  assert(!overview.querySelector("[data-checklist], [data-prerequisites], [data-item]"), "Overview summary does not repeat the full readiness checklist");
+  assert(!overview.textContent?.includes(" of 5"), "Overview summary has no checklist progress parity counter");
+  const approvalGuard = host.querySelector('details[data-overview-guard="content-approval"]') as HTMLDetailsElement | null;
+  const testGuard = host.querySelector('details[data-overview-guard="test-send"]') as HTMLDetailsElement | null;
+  const finalGuard = host.querySelector('details[data-overview-guard="final-send"]') as HTMLDetailsElement | null;
+  assert(approvalGuard && testGuard && finalGuard, "approval, test and final-send remain distinct guarded surfaces");
+  assert(!approvalGuard.open && !testGuard.open && !finalGuard.open, "separate action surfaces start collapsed, not repeated as overview forms");
   if (!readOnly) {
-    assert((byText(host, "button", "Prepare send") as HTMLButtonElement).disabled, "Prepare send stays disabled while items are unmet");
-    // Fix links go to the owning tab or panel.
-    await click(buttonIn(item("approval"), "Approve"));
-    assert((document.activeElement as HTMLElement | null)?.id === "cmp-approval-section", "Approve focuses the approval panel");
-    await click(buttonIn(item("freeze"), "Fix"));
-    await settle(() => assert(tabEl("audience")!.getAttribute("aria-selected") === "true", "the freeze fix opens the Audience tab"));
+    await click(approvalGuard.querySelector("summary"));
+    await settle(() => assert(buttonIn(approvalGuard, "Approve r2 (content-only)"), "content-only approval is available in its separate surface"));
+    await click(buttonIn(approvalGuard, "Approve r2 (content-only)"));
+    await settle(() => assert(host.querySelector("[data-campaign-status]")?.textContent === "Approved", "approval updates the status without implying send readiness"));
+    assert(host.querySelector("[data-campaign-overview]")?.textContent?.includes("content approved only"), "summary labels approval as content-only");
+    await click(finalGuard.querySelector("summary"));
+    assert(buttonIn(finalGuard, "Prepare send")?.disabled, "Prepare send stays disabled while sender and exact-revision test prerequisites are missing");
+    await openTab("audience");
     assert(host.querySelector('section[aria-label="Frozen audience"]'), "the Audience tab mounts the audience panel");
     assert(!host.querySelector('section[aria-label="Final send"]'), "Audience mounts no send controls");
     await openTab("overview");
-    // Approval is content-only and relocated, not removed.
-    await click(byText(host, "button", "Approve r2 (content-only)"));
-    await settle(() => assert(item("approval")?.hasAttribute("data-done") && text().includes("2 of 5"), "approving ticks the checklist"));
-    assert(host.querySelector("[data-campaign-status]")?.textContent === "Approved", "the header says Approved");
   } else {
-    assert(!byText(host, "button", "Prepare send"), "a read-only viewer gets no send controls");
-    assert(!byText(host, "button", "Approve r2 (content-only)"), "a read-only viewer cannot approve");
+    assert(!buttonIn(approvalGuard, "Approve r2 (content-only)"), "a read-only viewer cannot approve");
+    assert(buttonIn(testGuard, "Send test")?.disabled, "a read-only viewer cannot send a test");
+    const prepare = buttonIn(finalGuard, "Prepare send");
+    assert(prepare === null || prepare.disabled, "a read-only viewer cannot prepare a send");
   }
 
   // ---- Email: toolbar, envelope, host-rendered preview.
@@ -317,11 +337,17 @@ async function mounted(readOnly: boolean) {
   equal(inbox().getAttribute("data-device"), "mobile", "Mobile narrows the stage");
   await click(byText(host, "button", "Desktop"));
   equal(inbox().getAttribute("data-device"), "desktop", "Desktop restores it");
+  equal(Array.from(host.querySelectorAll('[aria-label="Email editing mode"] button')).map((button) => button.textContent?.trim()), ["Visual", "HTML"], "editing offers exactly Visual and HTML modes");
   await click(byText(host, "button", "HTML"));
-  assert((host.querySelector('pre[data-preview="html"]')?.textContent ?? "").includes("HTML form"), "HTML shows host markup");
-  await click(byText(host, "button", "Text"));
-  assert((host.querySelector('pre[data-preview="text"]')?.textContent ?? "").includes("TEXT form"), "Text shows the host text form");
-  assert(byText(host, "button", "Text")!.getAttribute("aria-pressed") === "true", "the active format is exposed");
+  if (readOnly) {
+    assert((host.querySelector('pre[data-preview="html"]')?.textContent ?? "").includes("HTML form"), "read-only HTML mode displays host markup without an editor");
+    assert(!host.querySelector("#cmp-html-source"), "read-only viewers cannot edit HTML source");
+  } else {
+    await settle(() => assert(host.querySelector("#cmp-html-source"), "HTML mode mounts its source editor"));
+    assert((host.querySelector("#cmp-html-source") as HTMLTextAreaElement).value.includes("Hi there"), "HTML mode edits the current email source");
+    assert(host.querySelector('iframe[data-preview="draft-html"]')?.getAttribute("sandbox") === "", "HTML draft preview remains scriptless");
+  }
+  assert(byText(host, "button", "HTML")!.getAttribute("aria-pressed") === "true", "the active mode is exposed");
   await click(byText(host, "button", "Visual"));
   assert(host.querySelector('iframe[data-preview="visual"]'), "Visual returns to the iframe");
   assert(host.querySelector('iframe[data-preview="visual"]')!.getAttribute("sandbox") === "", "the preview stays scriptless");
@@ -335,9 +361,10 @@ async function mounted(readOnly: boolean) {
   await click(byText(host, "button", "Refresh preview"));
   await settle(() => assert(renderBodies.length > rendersBefore && renderBodies.at(-1).sample_first_name === "Zed", "the sample name is sent to the host render"));
   assert((envelope!.textContent ?? "").length > 0 && (host.querySelector('[aria-label="Email envelope"]')!.textContent ?? "").includes("Zed"), "the envelope names the sample recipient");
-  assert(!posts.some((p) => p.includes("/content/campaigns") && p.endsWith("/save")), "previews never save");
+  equal(saveBodies, [], "preview renders never save campaign content");
+  equal(doc.revision, 2, "preview renders leave the saved revision unchanged");
 
-  // ---- Assistant proposal strips: provenance, draft toggle, pinned apply, discard.
+  // ---- Assistant proposals: receipt provenance, Review/Use separation and explicit Save.
   const strip1 = () => host.querySelector('[data-proposal="prop-1"]');
   const strip2 = () => host.querySelector('[data-proposal="prop-2"]');
   await settle(() => assert(strip1() && strip2(), "both pending proposals render as strips"));
@@ -348,35 +375,79 @@ async function mounted(readOnly: boolean) {
   await click(strip1()!.querySelector('[data-version="draft"]'));
   await settle(() => assert(host.querySelector('[data-proposal-body="prop-1"] iframe[data-preview="visual"]')?.getAttribute("srcdoc")?.includes("Draft subject one"), "Draft shows the proposal's host render"));
   assert((host.querySelector('[aria-label="Email envelope"]')!.textContent ?? "").includes("Draft subject one"), "the envelope follows the draft");
-  assert(host.querySelector('[data-preview="draft-note"]'), "the stage says nothing is saved until Apply");
-  await click(byText(host, "button", "Text"));
-  await settle(() => assert((host.querySelector('[data-proposal-body="prop-1"] pre[data-preview="text"]')?.textContent ?? "").includes("TEXT draft"), "the toolbar drives the draft stage"));
-  await click(byText(host, "button", "Visual"));
+  assert(host.querySelector('[data-preview="draft-note"]'), "the stage says nothing is saved until explicit Save");
+  assert(Array.from(host.querySelectorAll('[aria-label="Email editing mode"] button')).length === 2, "proposal review also has only Visual and HTML modes");
   equal(applyBodies.length, 0, "viewing a draft never applies it");
   equal(doc.revision, 2, "viewing a draft never saves a revision");
   await click(strip1()!.querySelector('[data-version="saved"]'));
   await settle(() => assert(!host.querySelector("[data-proposal-body]") && (host.querySelector('iframe[data-preview="visual"]')?.getAttribute("srcdoc") ?? "").includes("HTML form"), "Saved returns to the saved render"));
   if (readOnly) {
-    assert(!buttonIn(strip1(), "Apply as r3") && !buttonIn(strip1(), "Discard"), "a read-only viewer sees no Apply or Discard");
-    assert(!byText(host, "button", "Edit subject / text"), "a read-only viewer cannot edit");
+    assert(!buttonIn(strip1(), "Use in editor") && !buttonIn(strip1(), "Discard"), "a read-only viewer sees no Use or Discard controls");
+    assert(!host.querySelector("#cmp-subject"), "a read-only viewer cannot edit the subject");
   } else {
-    // Discard is non-mutating.
+    // Discarding one proposal is non-mutating to saved content.
     await click(buttonIn(strip2(), "Discard"));
-    await settle(() => assert(!strip2() && text().includes("draft unchanged at r2"), "Discard drops the strip and says the draft is unchanged"));
+    await settle(() => assert(!strip2(), "Discard removes only the proposal strip"));
     equal(discards, ["prop-2"], "Discard hit the discard route for that proposal only");
-    equal(doc.revision, 2, "Discard never saves");
-    // Apply is pinned to the saved revision and resets approval.
-    await click(buttonIn(strip1(), "Apply as r3"));
-    await settle(() => assert(text().includes("Applied as revision 3") && text().includes("approval invalidated"), "Apply reports the new revision and the approval reset"));
-    equal(applyBodies, [{ id: "prop-1", body: { expected_revision: 2 } }], "Apply is pinned to the revision the strip showed");
-    await settle(() => assert(!strip1(), "the applied strip leaves"));
-    await settle(() => assert(((host.querySelector("#cmp-subject") as HTMLInputElement | null)?.value ?? "").includes("Draft subject one"), "the editable envelope follows the new revision"));
+    equal(doc.revision, 2, "Discard never saves a revision");
+
+    // Dirty local work must be protected before Use replaces the editor draft.
+    const setInput = async (selector: string, value: string) => {
+      const input = host.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement;
+      assert(input, `${selector} exists`);
+      await React.act(async () => {
+        Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), "value")!.set!.call(input, value);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await flush();
+    };
+    await setInput("#cmp-subject", "Locally edited subject");
+    await setInput("#cmp-preheader", "Local preheader");
+    await click(byText(host, "button", "HTML"));
+    const localHtml = '<!doctype html><html><head><title>Local source</title></head><body><p>LOCAL SOURCE</p></body></html>';
+    await setInput("#cmp-html-source", localHtml);
+    const writesBeforeReview = posts.length;
+    await click(strip1()!.querySelector('[data-proposal-preview="prop-1"]'));
+    await settle(() => assert(host.querySelector('[data-proposal-body="prop-1"]') && byText(strip1()!, "button", "Use in editor"), "Review selects the proposal without saving"));
+    equal(posts.length, writesBeforeReview, "Review makes no API writes");
+    equal(doc.revision, 2, "Review leaves the saved revision unchanged");
+
+    await click(buttonIn(strip1(), "Use in editor"));
+    const replacementDialog = () => host.querySelector('[role="dialog"][aria-label="Replace unsaved email changes?"]');
+    await settle(() => assert(replacementDialog(), "dirty Use requires an explicit replacement confirmation"));
+    assert((replacementDialog()!.textContent ?? "").includes("Saved content stays unchanged until you choose Save"), "confirmation explains that saved content remains unchanged until Save");
+    await click(buttonIn(replacementDialog(), "Cancel"));
+    await settle(() => assert(!replacementDialog() && strip1()!.querySelector('[data-version="draft"]')?.getAttribute("aria-pressed") === "true", "cancel closes only the dialog and leaves proposal review selected"));
+    equal(posts.length, writesBeforeReview, "cancelled Use makes no API writes");
+    equal(doc.revision, 2, "cancelled Use leaves saved content unchanged");
+    await click(strip1()!.querySelector('[data-version="saved"]'));
+    await settle(() => assert((host.querySelector("#cmp-subject") as HTMLInputElement).value === "Locally edited subject", "cancel preserves the local subject"));
+    assert((host.querySelector("#cmp-preheader") as HTMLInputElement).value === "Local preheader", "cancel preserves the local preheader");
+    assert((host.querySelector("#cmp-html-source") as HTMLTextAreaElement).value === localHtml, "cancel preserves full-document HTML source");
+    assert(host.querySelector("[data-unsaved-bar]"), "cancel preserves dirty local draft state");
+
+    await click(strip1()!.querySelector('[data-proposal-preview="prop-1"]'));
+    await settle(() => assert(host.querySelector('[data-proposal-body="prop-1"]'), "proposal can be reviewed again after cancellation"));
+    await click(buttonIn(strip1(), "Use in editor"));
+    await settle(() => assert(replacementDialog(), "replacement requires confirmation again after re-review"));
+    await click(buttonIn(replacementDialog(), "Replace local draft"));
+    await settle(() => assert(!host.querySelector("[data-proposal-body]") && (host.querySelector("#cmp-subject") as HTMLInputElement | null)?.value === "Draft subject one", "confirmed Use replaces the local draft with the reviewed suggestion"));
+    assert(host.querySelector("[data-unsaved-bar]"), "Use changes only the unsaved editor draft");
+    equal(doc.revision, 2, "Use does not save a revision");
+    equal(saveBodies, [], "Review and Use never call the save API");
+    equal(applyBodies, [], "Review and Use never invoke direct Apply");
+    assert(proposals["prop-1"].state === "pending", "using a suggestion does not decide or consume its proposal");
+
+    // Explicit Save is the sole write; it carries the observed revision and invalidates approval.
+    await click(byText(host, "button", "Save as v3"));
+    await settle(() => assert(doc.revision === 3 && !doc.approval.valid, "explicit Save creates r3 and resets content approval"));
+    equal(saveBodies, [{ campaign_id: "launch-1", subject: "Draft subject one", preheader: "", blocks: [{ type: "paragraph", text: "Draft copy one" }], expected_revision: 2 }], "Save uses the native contentClient payload pinned to the source revision");
+    assert(posts.some((post) => post === "POST /api/app-installations/install-crm/contexts/ctx-a/content/campaigns"), "Save uses the existing campaign-content HTTP route");
     await openTab("overview");
-    assert(!item("approval")?.hasAttribute("data-done"), "applying resets the approval row");
-    assert(host.querySelector("[data-campaign-status]")?.textContent === "Draft", "the header returns to Draft");
-    // Inline editing is reachable straight from the Email tab (CAD-1057).
+    assert(host.querySelector("[data-campaign-status]")?.textContent === "Draft", "saved revision returns to unapproved Draft status");
     await openTab("email");
-    await settle(() => assert(host.querySelector("#cmp-subject"), "inline subject editing sits in the Email tab envelope"));
+    await settle(() => assert(host.querySelector("#cmp-subject"), "inline subject editing remains available in Email"));
     assert(!host.querySelector('[aria-label="Assistant proposals"] [role="alert"]'), "no stray proposal errors");
   }
 
@@ -393,22 +464,23 @@ async function mounted(readOnly: boolean) {
   assert(advanced && !advanced.open, "Advanced is a closed disclosure");
   assert(advanced!.querySelector("#aud-exclusion") && advanced!.querySelector('section[aria-label="Suppressions"]'), "exclusions and suppressions live inside Advanced");
   assert(!Array.from(host.querySelectorAll("#aud-exclusion, section[aria-label=\"Suppressions\"]")).some((el) => !advanced!.contains(el)), "nothing from Advanced leaks onto the main path");
-  assert(!(host.querySelector('section[aria-label="Frozen audience"]')?.textContent ?? "").includes("audience-digest-frozen"), "the freeze digest is hidden until recheck");
   if (!readOnly) {
-    await click(byText(host, "button", "Recheck freeze"));
-    await settle(() => assert((host.querySelector('[aria-label="Freeze validity"]')?.textContent ?? "").includes("Valid"), "freeze recheck still reports validity"));
+    await settle(() => assert((host.querySelector('[aria-label="Freeze validity"]')?.textContent ?? "").includes("Valid"), "the automatic freeze check reports validity"));
     const freezeDetails = host.querySelector('section[aria-label="Frozen audience"] details') as HTMLDetailsElement;
     assert(freezeDetails && !freezeDetails.open && (freezeDetails.textContent ?? "").includes("audience-digest-frozen-0001"), "the freeze digest sits behind Technical details");
   }
 
   // ---- Activity: a plain timeline; ids and digests behind Technical details.
   await openTab("activity");
-  assert(host.querySelector('section[aria-label="Campaign sends"]'), "Activity carries the sends history");
+  const sendsHistory = host.querySelector('section[aria-label="Campaign sends"]');
+  assert(sendsHistory, "Activity carries the sends history");
+  assert((sendsHistory.textContent ?? "").includes("No sends") || (sendsHistory.textContent ?? "").includes("No campaign sends"), "empty history is reported honestly rather than as a receipt");
+  assert(!(sendsHistory.textContent ?? "").includes("delivered"), "Activity does not imply inbox delivery without delivery evidence");
   const events = Array.from(host.querySelectorAll("[data-timeline] li")).map((li) => li.getAttribute("data-event"));
   if (readOnly) {
     equal(events, ["proposal-pending", "proposal-pending", "approval", "revision"], "pending drafts lead the timeline");
   } else {
-    equal(events, ["approval", "revision", "proposal-applied", "proposal-discarded"], "applied and discarded drafts follow the saved version");
+    equal(events, ["proposal-pending", "approval", "revision", "proposal-discarded"], "activity reports the pending proposal, saved revision and actual discard without inventing an apply");
   }
   const timeline = host.querySelector("[data-timeline]")!.textContent ?? "";
   assert(!timeline.includes("content-digest") && !timeline.includes("prop-1") && !timeline.includes("launch-1"), "the timeline carries no ids or digests");
@@ -423,7 +495,6 @@ async function mounted(readOnly: boolean) {
   await React.act(async () => { root.unmount(); });
   globalThis.fetch = realFetch;
   host.remove();
-  void items;
 }
 
 void main();

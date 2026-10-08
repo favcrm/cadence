@@ -133,6 +133,34 @@ globalThis.fetch = async (input, init) => {
         workflows: [],
       })),
     });
+  // CAD-1129: the Apps home reads the workspace explorer projection,
+  // not the legacy /api/apps list.
+  if (url.pathname === "/api/app-home")
+    return json({
+      installations: [
+        {
+          install_id: "inst-site",
+          name: app.name,
+          title: app.title,
+          project: "site",
+          tagline: "Draft one reviewed post",
+          icon: null,
+          attention: { state: "ok", message: null, action: null, count: 0 },
+        },
+        {
+          install_id: "inst-campaign",
+          name: app.name,
+          title: app.title,
+          project: "campaign",
+          tagline: "Draft one reviewed post",
+          icon: null,
+          attention: { state: "ok", message: null, action: null, count: 0 },
+        },
+      ],
+    });
+  if (url.pathname === "/api/app-favorites")
+    return json({ owner: "operator", is_default: false, favorites: [] });
+  if (url.pathname === "/api/app-requests") return json({ requests: [] });
   throw new Error(`Unexpected request ${url.pathname}`);
 };
 function assert(value: unknown, what: string): asserts value {
@@ -341,14 +369,17 @@ async function main() {
       host.textContent?.includes("Project: campaign"),
     "same-name installations show their project associations",
   );
-  const openLinks = Array.from(host.querySelectorAll("a")).filter(
-    (a) => a.textContent === "Open app",
+  // CAD-1129: the home opens each installation's own page — distinct
+  // install ids, no shared route.
+  const instLinks = Array.from(host.querySelectorAll("a")).filter((a) =>
+    a.getAttribute("href")?.startsWith("/app-installations/"),
   );
   assert(
-    openLinks.length === 2 &&
-      openLinks[0].getAttribute("href") === "/apps/site/blog-post" &&
-      openLinks[1].getAttribute("href") === "/apps/campaign/blog-post",
-    "Open app preserves separate installation routes without opening an unready drawer",
+    instLinks.length === 2 &&
+      new Set(instLinks.map((a) => a.getAttribute("href"))).size === 2 &&
+      instLinks.some((a) => a.getAttribute("href") === "/app-installations/inst-site") &&
+      instLinks.some((a) => a.getAttribute("href") === "/app-installations/inst-campaign"),
+    "home preserves separate installation routes by install id",
   );
   assert(
     !host.textContent?.includes("New post"),

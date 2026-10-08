@@ -18,7 +18,7 @@ pub mod local;
 pub mod smtp;
 pub mod smtp_internal;
 
-pub use adapter::{AppArtifactError, PlatformAdapter};
+pub use adapter::{AppArtifactError, AppCapabilityError, PlatformAdapter};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -91,6 +91,233 @@ use crate::error::{Error, Result};
 use crate::store::{Grant, Store};
 
 pub use custody::{Custody, Key};
+
+pub struct OpDeadline {
+    end: std::time::Instant,
+}
+
+/// Whether an owned child has provably terminated. `Child::try_wait`
+/// caches the first `Some` status forever — a `WIFSTOPPED` trace stop
+/// reported once would mask the real later exit (and could also
+/// suppress `Child::kill`), so callers that must observe termination
+/// for custody serialization poll raw `waitpid` instead.
+#[cfg(unix)]
+pub enum ChildExit {
+    /// `waitpid` returned a positively terminal status
+    /// (`WIFEXITED`/`WIFSIGNALED`) — we observed and reaped the
+    /// exit ourselves — or a qualified `ECHILD` (the owned child's
+    /// status was already consumed; it did terminate and is
+    /// reaped). Either is a positively established termination.
+    Terminated,
+    /// Still tracked — `waitpid` returned 0, a `WIFSTOPPED`
+    /// trace/job-control report, or the task is still present
+    /// under `/proc` held by a tracer. A zombie whose task a
+    /// tracer still holds is observable to other processes, so
+    /// the serialization is not owed release yet.
+    Running,
+    /// Any `waitpid` or presence error — unobservable; the
+    /// custody serialization is retained and polling continues
+    /// rather than released on a guess.
+    Uncertain,
+}
+
+/// Fresh raw `waitpid(WNOHANG)` observation of `child`, qualified
+/// by tracer custody: a `WIFEXITED`/`WIFSIGNALED` report or a
+/// qualified `ECHILD` releases the serialization only when no
+/// tracer holds the task — a `TASK_TRACED` zombie stays present
+/// under `/proc` (observable to other processes) until its tracer
+/// releases it, so its "termination" does not settle custody.
+/// Stopped reports and running children keep holding; any other
+/// error — including a tracer-custody answer that procfs could
+/// not actually supply — retains the serialization rather than
+/// releasing on a guess.
+#[cfg(unix)]
+pub fn observe_child_exit(child: &std::process::Child) -> ChildExit {
+    #[cfg(target_os = "linux")]
+    {
+        match task_held_by_tracer(child.id()) {
+            TracerCustody::Held => return ChildExit::Running,
+            TracerCustody::Unknown => return ChildExit::Uncertain,
+            TracerCustody::Unheld => {}
+        }
+    }
+    let mut status: libc::c_int = 0;
+    let rc = unsafe {
+        libc::waitpid(
+            child.id() as libc::pid_t,
+            &mut status as *mut libc::c_int,
+            libc::WNOHANG,
+        )
+    };
+    if rc == child.id() as libc::pid_t {
+        // `waitpid` only ever reports an un-reaped child of this
+        // process — a recycled pid cannot surface here unless the
+        // kernel still owes us its status, so a terminal report is
+        // a positively established termination of our own child,
+        // never another task's stolen status.
+        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            ChildExit::Terminated
+        } else {
+            ChildExit::Running
+        }
+    } else if rc == 0 {
+        ChildExit::Running
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+        // `ECHILD` proves the owned child's status was already
+        // consumed — it terminated and is reaped — but a recycled
+        // pid in a foreign `/proc` view could still list a live
+        // task under that id, so a still-present task keeps the
+        // serialization held rather than releasing on it. An
+        // unvalidated procfs view or an unanswerable presence
+        // check is not an established termination either.
+        #[cfg(target_os = "linux")]
+        {
+            match procfs_task_present(child.id()) {
+                Some(true) => return ChildExit::Running,
+                Some(false) => {}
+                None => return ChildExit::Uncertain,
+            }
+        }
+        ChildExit::Terminated
+    } else {
+        ChildExit::Uncertain
+    }
+}
+
+/// Whether `/proc` can be trusted to reflect this process's PID
+/// namespace: `/proc/self/status` `Pid` must equal our own
+/// `getpid()`. A missing or unreadable procfs, or a foreign
+/// namespace view whose `Pid` field does not match, cannot prove
+/// any `/proc` answer — custody answers sourced there are
+/// `Unknown`/`Uncertain` rather than trusted.
+#[cfg(target_os = "linux")]
+fn procfs_view_valid() -> bool {
+    match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Pid:"))
+                .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+                == Some(unsafe { libc::getpid() })
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether `/proc` lists a task for `pid`: `Some(true)` present,
+/// `Some(false)` provably absent under a validated procfs view,
+/// `None` when the answer cannot be trusted (absent/foreign
+/// procfs, or an unqualified metadata error).
+#[cfg(target_os = "linux")]
+fn procfs_task_present(pid: u32) -> Option<bool> {
+    if !procfs_view_valid() {
+        return None;
+    }
+    match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// Raw `waitpid(WNOHANG)` for `child` returning the fresh wait
+/// status when the task is terminal (`WIFEXITED`/`WIFSIGNALED`),
+/// `Ok(None)` while it is still running or only stopped, and the
+/// `waitpid` error otherwise. Unlike `Child::try_wait` nothing is
+/// cached — a `WIFSTOPPED` report can never mask the later real
+/// exit — and the caller must not call `Child::try_wait`/`wait`
+/// after a terminal status has been consumed here.
+#[cfg(unix)]
+pub fn waitpid_terminal(child: &std::process::Child) -> std::io::Result<Option<libc::c_int>> {
+    let mut status: libc::c_int = 0;
+    let rc = unsafe {
+        libc::waitpid(
+            child.id() as libc::pid_t,
+            &mut status as *mut libc::c_int,
+            libc::WNOHANG,
+        )
+    };
+    if rc == child.id() as libc::pid_t {
+        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            Ok(Some(status))
+        } else {
+            Ok(None)
+        }
+    } else if rc == 0 {
+        Ok(None)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `/proc` tracer-custody answer for an owned task.
+#[cfg(target_os = "linux")]
+enum TracerCustody {
+    /// `TracerPid` nonzero (or the task's status could not prove
+    /// no tracer) — the task is still held and observable.
+    Held,
+    /// `/proc` answered: either no task remains, or `TracerPid`
+    /// is provably zero. `waitpid` may then settle the status.
+    Unheld,
+    /// `/proc` itself could not be validated — absent or a
+    /// different namespace view — so an absent child path cannot
+    /// be trusted; treat the observation as unanswered.
+    Unknown,
+}
+
+/// `/proc/<pid>/status` `TracerPid` — nonzero means another
+/// process still traces the task, which keeps even a dead
+/// (`WIFSIGNALED`) task present as a zombie that other processes
+/// can still observe; its custody serialization must stay held
+/// until the tracer releases it. `/proc` answers are trusted
+/// only when the procfs view is validated (`/proc/self/status`
+/// `Pid` == `getpid()`); an absent or foreign procfs view makes
+/// the answer `Unknown` rather than `Unheld` (fail closed). A
+/// status whose `TracerPid` field is missing or unreadable
+/// counts as held, and an unanswerable read of the task's status
+/// counts as held too — only a provably `TracerPid: 0` task
+/// under a validated view is `Unheld`.
+#[cfg(target_os = "linux")]
+fn task_held_by_tracer(pid: u32) -> TracerCustody {
+    if !procfs_view_valid() {
+        return TracerCustody::Unknown;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(status) => match status
+            .lines()
+            .find_map(|line| line.strip_prefix("TracerPid:"))
+            .and_then(|value| value.trim().parse::<u32>().ok())
+        {
+            Some(0) => TracerCustody::Unheld,
+            Some(_) => TracerCustody::Held,
+            // A present task whose TracerPid field is missing or
+            // unreadable cannot be proven unheld.
+            None => TracerCustody::Held,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // The task path is provably absent under a validated
+            // procfs view — nothing remains for a tracer to hold.
+            TracerCustody::Unheld
+        }
+        Err(_) => TracerCustody::Held,
+    }
+}
+
+impl OpDeadline {
+    pub fn in_seconds(seconds: u64) -> Self {
+        Self {
+            end: std::time::Instant::now() + std::time::Duration::from_secs(seconds),
+        }
+    }
+
+    pub fn remaining(&self) -> Option<std::time::Duration> {
+        self.end.checked_duration_since(std::time::Instant::now())
+    }
+
+    pub fn expired(&self) -> bool {
+        self.remaining().is_none()
+    }
+}
 
 /// The built-in account the `local` platform always exposes — no
 /// enrollment, no custody, no `--accept-same-uid-risk` (CAD-577). The

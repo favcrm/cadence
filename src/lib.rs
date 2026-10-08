@@ -10,6 +10,7 @@
 
 pub mod adapter;
 pub mod agent_uid;
+pub mod app_assistant;
 pub mod audit;
 pub mod backup;
 pub mod board_identity;

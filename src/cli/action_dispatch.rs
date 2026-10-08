@@ -703,9 +703,10 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             backup_dir,
             json,
             progress,
+            to,
             target,
         } => update::run(
-            state_dir, action, check, rollback, drain, now, keep, backup_dir, json, progress,
+            state_dir, action, check, rollback, drain, now, keep, backup_dir, json, progress, to,
             target,
         ),
         Commands::Sandbox { action } => sandbox::run(state_dir, action),

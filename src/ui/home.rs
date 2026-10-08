@@ -60,8 +60,8 @@ use serde_json::{json, Value};
 use tiny_http::Request;
 
 use super::{
-    agent_roots, coded_response, err_response, guard_fail, json_response, operator, parse_json,
-    read_body, tailnet_proxy, write_reply, HttpResp, ServeOpts,
+    agent_roots, busy_response, coded_response, err_response, guard_fail, json_response, operator,
+    parse_json, read_body, tailnet_proxy, write_reply, HttpResp, ServeOpts,
 };
 use crate::client;
 use crate::error::Error;
@@ -271,6 +271,9 @@ pub(super) fn rpc_err(e: &Error, method: &str) -> HttpResp {
     // The daemon's own operator gate refused the board's connection.
     if text.contains("operator action") || text.contains("not provably the operator") {
         return coded_response(403, "operator_proof", &text, None);
+    }
+    if let Some(resp) = busy_response(e) {
+        return resp;
     }
     match e {
         Error::Internal(_) => err_response(500, &text),
@@ -1084,5 +1087,36 @@ pub(super) fn post_kickoff(
             "kickoff": out,
         })),
         Err(e) => err_response(500, &e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod busy_status_tests {
+    use super::*;
+
+    /// A daemon `busy` refusal is transient on every app path: 503 with
+    /// `Retry-After`, never the 400 a bad request gets.
+    #[test]
+    fn busy_maps_to_503_on_the_operator_relay_and_the_thread_relay() {
+        let busy = Error::busy("another live writer holds the lock");
+        let relay = rpc_err(&busy, "app_workspace_list");
+        assert_eq!(relay.status_code().0, 503);
+        assert!(relay.headers().iter().any(|h| h
+            .field
+            .as_str()
+            .as_str()
+            .eq_ignore_ascii_case("Retry-After")));
+        assert_eq!(super::super::threads::busy_status_for_test(&busy), 503);
+        assert_eq!(
+            super::super::app_assistant::busy_status_for_test(&busy),
+            503
+        );
+        // A real rejection stays a 400.
+        assert_eq!(
+            rpc_err(&Error::Rejected("bad".into()), "app_workspace_list")
+                .status_code()
+                .0,
+            400
+        );
     }
 }

@@ -53,6 +53,16 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
               {NAV_ICONS[item.screen]}
               {item.label}
             </Link>
+            {item.screen === "apps" && appMenu?.notice && (
+              <div role="status" className="ml-[10px] border-l border-ink-700 pl-[6px] py-[3px] text-label text-ink-400">
+                {appMenu.notice.text}{" "}
+                {!appMenu.notice.retrying && (
+                  <button type="button" onClick={appMenu.notice.onRetry} className="text-accent hover:underline">
+                    Retry
+                  </button>
+                )}
+              </div>
+            )}
             {apps.length > 0 && (
               <div className="mt-[2px] mb-[2px] grid gap-[1px] ml-[10px] border-l border-ink-700 pl-[6px]">
                 {apps.map((app) => (

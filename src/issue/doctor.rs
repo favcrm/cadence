@@ -185,19 +185,23 @@ pub fn run(pm: &Pm) -> Result<Value> {
     let foreign_ok = foreign["ok"] == true;
     let lock = pm.lock_state();
     let write_lock = match &lock {
-        crate::issue::LockState::Held => json!({"ok": true, "state": "held"}),
+        crate::issue::LockState::Held { holder } => json!({
+            "ok": true, "state": "held", "holder": holder,
+            "next": "a live writer holds the tracker; the holder names it where the scan could",
+        }),
         crate::issue::LockState::Free => json!({"ok": true, "state": "free"}),
         crate::issue::LockState::Interrupted { paths, foreign } => json!({
             "ok": false, "state": "interrupted", "paths": paths, "foreign": foreign,
-            "next": "a crashed writer left these paths; every write is refused until \
-                     they are resolved. Check `git status` and `cadence issue lint`, \
-                     then commit or discard exactly those paths — never foreign ones",
+            "next": "a crashed writer left these paths; writes touching them are refused until \
+                     they are resolved, while writes to disjoint paths proceed. Check `git status` \
+                     and `cadence issue lint`, then commit or discard exactly those paths — \
+                     never foreign ones",
         }),
-        crate::issue::LockState::LegacyUnknown => json!({
-            "ok": false, "state": "legacy_unknown",
-            "next": "an older binary's .write.lock; its owner cannot be identified. \
-                     Do not delete it as routine: the rollout owner clears it in a \
-                     quiescent migration after every pre-flock cadence process stops",
+        crate::issue::LockState::LegacyUnknown { holder } => json!({
+            "ok": false, "state": "legacy_unknown", "holder": holder,
+            "next": "an older binary's .write.lock; the holder names it where the scan could, \
+                     but that never proves death. Do not delete it as routine: the rollout owner \
+                     clears it in a quiescent migration after every pre-flock cadence process stops",
         }),
         crate::issue::LockState::IoUnknown(_) => json!({"ok": false, "state": "io_unknown"}),
     };

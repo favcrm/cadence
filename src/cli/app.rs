@@ -41,6 +41,11 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: ContentAction,
     },
+    /// CRM app assistant discovery, consented action invocation, and durable receipt reads.
+    Assistant {
+        #[command(subcommand)]
+        action: AssistantAction,
+    },
     /// Stable workspace installation IDs; execution and approval are separate.
     Catalog {
         #[command(subcommand)]
@@ -745,6 +750,19 @@ pub(crate) enum EffectAction {
         digest: String,
     },
 }
+/// The source the daemon installs from: a URL passes through, a local
+/// path is made absolute here because the daemon refuses relative ones.
+/// Shared by `install`, `install-check`, `upgrade-check`.
+fn install_source(source: &str) -> Result<String> {
+    if source.contains("://") || source.starts_with("git@") {
+        return Ok(source.to_string());
+    }
+    Ok(std::fs::canonicalize(source)
+        .map_err(|e| Error::rejected(format!("workspace app source: {e}")))?
+        .to_string_lossy()
+        .into_owned())
+}
+
 fn read_record_csv(path: &Path) -> Result<String> {
     use std::io::Read;
     const MAX_CSV_BYTES: usize = 256 * 1024;
@@ -1300,6 +1318,45 @@ fn effect_params(action: &EffectAction) -> (&'static str, serde_json::Value) {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum AssistantAction {
+    Actions {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        token: String,
+    },
+    Invoke {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        action_id: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        input: PathBuf,
+    },
+    OperationShow {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        operation_id: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum CatalogAction {
     /// Approve the exact installed digest for supported local artifact steps.
     Approve {
@@ -1320,7 +1377,16 @@ pub(crate) enum CatalogAction {
         rollback: bool,
     },
     /// Install a validated bundle without creating a project or grants.
-    Install { source: String },
+    Install {
+        source: String,
+        /// Refuse unless the resolved bundle digest equals this value, as
+        /// returned by `install-check`. Omitted: install whatever resolves.
+        #[arg(long)]
+        expected_digest: Option<String>,
+    },
+    /// Read-only: resolve and validate a bundle exactly as install would and
+    /// return its digest, name, version and file list. Writes nothing.
+    InstallCheck { source: String },
     /// Replace one exact workspace bundle while keeping its installation ID.
     /// The current digest and catalog generation must match the inspected row.
     UpgradeCheck {
@@ -1374,9 +1440,10 @@ pub(crate) enum RunAction {
         /// Idempotency key; reuse with different inputs is refused.
         #[arg(long)]
         request_id: String,
-        /// Registered PM whose workers execute this run.
+        /// Registered PM whose workers execute this run. Omitted for a
+        /// host-execution workflow (CAD-1171), which runs no worker.
         #[arg(long)]
-        owner_pm: String,
+        owner_pm: Option<String>,
         /// Optional discovery link; confers no authority.
         #[arg(long)]
         project_link: Option<String>,
@@ -1471,6 +1538,36 @@ fn read_run_inputs(path: &Path) -> Result<serde_json::Value> {
     Ok(json!(inputs))
 }
 
+fn read_assistant_input(state_dir: &Path, path: &Path) -> Result<serde_json::Value> {
+    use std::io::Read;
+    const MAX_INPUT_BYTES: usize = 32 * 1024;
+    let file = cadence_agent::master::open_command_file(state_dir, path)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            Error::invalid(
+                "app_assistant_input",
+                format!("cannot read assistant input: {e}"),
+            )
+        })?;
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::invalid(
+            "app_assistant_input",
+            "assistant input JSON exceeds 32KiB",
+        ));
+    }
+    let input: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| Error::invalid("app_assistant_input", "input must be a JSON object"))?;
+    if !input.is_object() {
+        return Err(Error::invalid(
+            "app_assistant_input",
+            "input must be a JSON object",
+        ));
+    }
+    Ok(input)
+}
+
 fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
     Ok(match action {
         RunAction::Create {
@@ -1489,8 +1586,10 @@ fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
                 "workflow": workflow,
                 "inputs": read_run_inputs(inputs)?,
                 "request_id": request_id,
-                "owner_pm": owner_pm,
             });
+            if let Some(owner) = owner_pm {
+                params["owner_pm"] = json!(owner);
+            }
             if let Some(link) = project_link {
                 params["project_link"] = json!(link);
             }
@@ -1664,16 +1763,20 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     "app_local_install_revoke",
                     json!({"install_id":install_id,"digest":digest}),
                 ),
-                CatalogAction::Install { source } => {
-                    let source = if source.contains("://") || source.starts_with("git@") {
-                        source.clone()
-                    } else {
-                        std::fs::canonicalize(source)
-                            .map_err(|e| Error::rejected(format!("workspace app source: {e}")))?
-                            .to_string_lossy()
-                            .into_owned()
-                    };
-                    ("app_workspace_install", json!({"source":source}))
+                CatalogAction::Install {
+                    source,
+                    expected_digest,
+                } => {
+                    let source = install_source(source)?;
+                    let mut params = json!({"source":source});
+                    if let Some(digest) = expected_digest {
+                        params["expected_digest"] = json!(digest);
+                    }
+                    ("app_workspace_install", params)
+                }
+                CatalogAction::InstallCheck { source } => {
+                    let source = install_source(source)?;
+                    ("app_workspace_install_check", json!({"source":source}))
                 }
                 CatalogAction::Upgrade {
                     install_id,
@@ -1718,14 +1821,7 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     expected_digest,
                     expected_generation,
                 } => {
-                    let source = if source.contains("://") || source.starts_with("git@") {
-                        source.clone()
-                    } else {
-                        std::fs::canonicalize(source)
-                            .map_err(|e| Error::rejected(format!("workspace app source: {e}")))?
-                            .to_string_lossy()
-                            .into_owned()
-                    };
+                    let source = install_source(source)?;
                     (
                         "app_workspace_upgrade_check",
                         json!({"install_id":install_id,"source":source,
@@ -1771,6 +1867,42 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
         }
         AppAction::Content { action } => {
             let (method, params) = content_params(action)?;
+            client::rpc(state_dir, method, params)?
+        }
+        AppAction::Assistant { action } => {
+            let (method, params) = match action {
+                AssistantAction::Actions {
+                    install_id,
+                    context_id,
+                    message,
+                    token,
+                } => (
+                    "app_assistant_actions",
+                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token}),
+                ),
+                AssistantAction::Invoke {
+                    install_id,
+                    context_id,
+                    message,
+                    token,
+                    action_id,
+                    operation_id,
+                    input,
+                } => (
+                    "app_assistant_invoke",
+                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token,"action_id":action_id,"operation_id":operation_id,"input":read_assistant_input(state_dir, input)?}),
+                ),
+                AssistantAction::OperationShow {
+                    install_id,
+                    context_id,
+                    message,
+                    token,
+                    operation_id,
+                } => (
+                    "app_assistant_operation_show",
+                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token,"operation_id":operation_id}),
+                ),
+            };
             client::rpc(state_dir, method, params)?
         }
         AppAction::Dev {

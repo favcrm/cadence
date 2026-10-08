@@ -1,5 +1,5 @@
 export {};
-/** A selected retained post exposes a priced image plan only with an exact binding quote. */
+/** A selected retained post exposes an image plan only with an exact binding quote — the quote still resolves (CAD-1129) but no price text is shown. */
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/app-installations/install-a" });
@@ -64,7 +64,9 @@ async function fillPrompt(selector: string, value: string) {
 }
 async function main() {
   await React.act(async () => root.render(React.createElement(NewPost, props))); await flush();
-  assert(reads === 1 && host.textContent?.includes("USD 0.031500"), "Operator sees the live exact one-image price before choosing a plan");
+  assert(reads === 1 && host.textContent?.includes("image option is ready"), "Operator sees the image option resolve before choosing a plan");
+  // CAD-1129: no cost or price text anywhere in the board.
+  assert(!host.textContent?.includes("USD") && !host.textContent?.includes("price") && !host.textContent?.includes("billed"), "the board shows no price or cost text");
   await fill("#wa-post-title", "Customer follow-up");
   await choose("wa-workflow", "Instagram caption and image");
   assert((host.querySelector("#wa-post-source") as HTMLTextAreaElement).readOnly, "Selected source facts stay immutable");
@@ -94,7 +96,7 @@ async function main() {
   currentQuote = { ...quote, binding_digest: "stale-binding" };
   const badRoot = createRoot(badHost);
   await React.act(async () => badRoot.render(React.createElement(NewPost, props))); await flush();
-  assert(badHost.textContent?.includes("connection or current provider price changed"), "Stale binding quote is explained");
+  assert(badHost.textContent?.includes("image connection changed or is unavailable"), "Stale binding quote is explained");
   await React.act(async () => badRoot.unmount());
   console.log("social image priced plan flow passed");
 }

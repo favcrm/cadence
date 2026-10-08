@@ -140,9 +140,7 @@ impl Shared {
             .pm_dir()
             .and_then(|dir| self.pm_at(&dir))
             .and_then(|pm| {
-                crate::issue::app_catalog::workspace::with_runtime_snapshot(&pm, install, |_, _| {
-                    Ok(())
-                })
+                crate::issue::app_catalog::workspace::with_runtime_read(&pm, install, |_, _| Ok(()))
             })
             .is_ok();
         if !in_catalog {

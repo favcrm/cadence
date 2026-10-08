@@ -12,6 +12,7 @@ use crate::issue::{git, project};
 use crate::proto;
 
 pub mod layout;
+pub mod lifecycle;
 
 /// Keep `.cadence/` out of a repo's index: append the entry to its
 /// `.gitignore` when nothing already covers it.
@@ -48,6 +49,53 @@ pub fn main_root(dir: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
+/// Confirm that a development path is a canonical, registered worktree of
+/// `root` and has the expected branch before an idempotent reuse.
+pub(crate) fn validate_registered_branch(root: &Path, lane: &Path, branch: &str) -> Result<()> {
+    let meta = std::fs::symlink_metadata(lane)?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(Error::rejected(format!(
+            "Worktree path {} is not a real directory — refusing reuse",
+            lane.display()
+        )));
+    }
+    let actual_path = lane.canonicalize()?;
+    if actual_path.as_path() != lane {
+        return Err(Error::rejected(format!(
+            "Worktree path {} differs from its canonical identity — refusing reuse",
+            lane.display()
+        )));
+    }
+    let actual_root = main_root(&actual_path)?.canonicalize()?;
+    if actual_root != root.canonicalize()? {
+        return Err(Error::rejected(format!(
+            "Worktree {} belongs to repo {}, not {} — refusing reuse",
+            lane.display(),
+            actual_root.display(),
+            root.display()
+        )));
+    }
+    let registered = git(root, &["worktree", "list", "--porcelain"])?;
+    if !registered
+        .lines()
+        .any(|line| line == format!("worktree {}", actual_path.display()))
+    {
+        return Err(Error::rejected(format!(
+            "Worktree {} is not registered by repo {} — refusing reuse",
+            lane.display(),
+            root.display()
+        )));
+    }
+    if crate::issue::finish::git_branch(&actual_path)?.as_deref() != Some(branch) {
+        return Err(Error::rejected(format!(
+            "Worktree {} is not checked out on expected branch {} — refusing reuse",
+            lane.display(),
+            branch
+        )));
+    }
+    Ok(())
+}
+
 /// `git worktree add <dir> [-b <branch>] <base>` — the bare plumbing;
 /// existence and idempotency decisions are the caller's.
 pub fn add(root: &Path, dir: &Path, branch: Option<&str>, base: &str) -> Result<()> {
@@ -67,32 +115,121 @@ pub fn add(root: &Path, dir: &Path, branch: Option<&str>, base: &str) -> Result<
 /// under `base`, a pre-existing worktree dir, or a branch collision.
 pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
     proto::identifier(name, "Worktree name")?;
-    let root = match git(base, &["rev-parse", "--show-toplevel"]) {
-        Ok(root) => PathBuf::from(root),
-        Err(_) => {
-            return Err(Error::rejected(format!(
-                "--worktree requires a git repository — '{}' is not inside one",
-                base.display()
-            )))
-        }
-    };
+    let root = main_root(base)?;
     let dir = layout::worktree_dir(&root, name);
-    if dir.exists() {
+    let branch = layout::branch(name);
+    let recovery = lifecycle::recoverable_record(
+        &root,
+        &dir,
+        "development",
+        "cadence agent worktree",
+        Some(&branch),
+        None,
+    )?;
+    let branch_exists = git(
+        &root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_ok();
+    let actor = std::env::var("CADENCE_ALIAS").unwrap_or_else(|_| "operator".to_string());
+    let (pinned_sha, owner) = if let Some(record) = &recovery {
+        if record.owner != actor {
+            return Err(Error::rejected(format!(
+                "managed worktree {} is owned by '{}', not '{}'; inventory it before recovery",
+                dir.display(),
+                record.owner,
+                actor
+            )));
+        }
+        (record.pinned_sha.clone(), record.owner.clone())
+    } else {
+        if dir.exists() {
+            return Err(Error::rejected(format!(
+                "Worktree '{name}' already exists at {} — inventory it and explicitly adopt it before reuse",
+                dir.display()
+            )));
+        }
+        if branch_exists {
+            return Err(Error::rejected(format!(
+                "Branch '{branch}' already exists without matching lifecycle ownership — refusing reuse"
+            )));
+        }
+        (crate::issue::start::resolve_base(&root, None)?.1, actor)
+    };
+    ensure_cadence_ignored(&root)?;
+    // The recovery branches below add a checkout without `begin`; refuse a
+    // symlinked destination parent before Git creates anything.
+    lifecycle::validate_creation_parent(&root, &dir)?;
+    if let Some(record) = recovery {
+        if dir.exists() {
+            validate_registered_branch(&root, &dir, &branch)?;
+        } else if branch_exists {
+            if let Err(e) = add(&root, &dir, None, &branch) {
+                let _ = lifecycle::transition(&root, &dir, "setup-failed", Some(&e.to_string()));
+                return Err(e);
+            }
+        } else if matches!(record.state.as_str(), "preparing" | "setup-failed") {
+            let pinned = git(
+                &root,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("{}^{{commit}}", record.pinned_sha),
+                ],
+            )?;
+            if pinned != record.pinned_sha {
+                return Err(Error::rejected(format!(
+                    "recorded base {} no longer resolves to the same commit",
+                    record.pinned_sha
+                )));
+            }
+            if let Err(e) = add(&root, &dir, Some(&branch), &pinned) {
+                let _ = lifecycle::transition(&root, &dir, "setup-failed", Some(&e.to_string()));
+                return Err(e);
+            }
+        } else {
+            return Err(Error::rejected(format!(
+                "managed worktree {} and branch {branch} are both missing; refusing to recreate active work",
+                dir.display()
+            )));
+        }
+        if let Err(e) = setup_development(&dir, &root, true)
+            .and_then(|_| lifecycle::activate(&root, record.clone()))
+        {
+            let _ = lifecycle::transition(&root, &dir, "setup-failed", Some(&e.to_string()));
+            return Err(e);
+        }
+        return Ok(dir);
+    }
+
+    let record = lifecycle::new_record(lifecycle::CheckoutSpec {
+        repo: &root,
+        purpose: "development",
+        tool: "cadence agent worktree",
+        owner: &owner,
+        path: &dir,
+        branch: Some(&branch),
+        pinned_sha: &pinned_sha,
+        issue: None,
+    });
+    lifecycle::begin(&root, record.clone())?;
+    if let Err(e) = add(&root, &dir, Some(&branch), &pinned_sha) {
+        let _ = lifecycle::transition(&root, &dir, "setup-failed", Some(&e.to_string()));
         return Err(Error::rejected(format!(
-            "Worktree '{name}' already exists at {} — reuse it with \
-             --cwd {}",
-            dir.display(),
-            dir.display()
+            "{e} — inspect lifecycle inventory before retrying the named checkout"
         )));
     }
-    let branch = layout::branch(name);
-    add(&root, &dir, Some(&branch), "HEAD").map_err(|e| {
-        Error::rejected(format!(
-            "{e} — if branch '{branch}' already exists, reuse the checkout \
-             with --cwd or pick another --worktree name"
-        ))
-    })?;
-    ensure_cadence_ignored(&root)?;
+    if let Err(e) =
+        setup_development(&dir, &root, true).and_then(|_| lifecycle::activate(&root, record))
+    {
+        let _ = lifecycle::transition(&root, &dir, "setup-failed", Some(&e.to_string()));
+        return Err(e);
+    }
     Ok(dir)
 }
 
@@ -198,6 +335,15 @@ pub fn install_pre_push_hook(wt_dir: &Path) -> Result<PathBuf> {
     )?;
     install_cargo_shim(wt_dir)?;
     Ok(script)
+}
+
+/// Apply shared cargo-target and pre-push setup to a development checkout.
+/// Ownership, tracker binding and rollback remain with the caller.
+pub fn setup_development(wt_dir: &Path, root: &Path, shared: bool) -> Result<Option<PathBuf>> {
+    ensure_cadence_ignored(root)?;
+    let target = configure_cargo_target(wt_dir, root, shared)?;
+    install_pre_push_hook(wt_dir)?;
+    Ok(target)
 }
 
 /// CAD-1021 slice 3: the lane's `cargo` shim, at

@@ -11,6 +11,7 @@ import type {
   ConnectionPayload,
   ConnectionProvidersPayload,
   ConnectionsPayload,
+  ConnectionVerificationPayload,
   Health,
   IssueCard,
   IssueDetail,
@@ -396,6 +397,38 @@ export const api = {
     get<{ descriptor: unknown; digest: unknown; app: unknown }>(
       `/api/app-installations/${encodeURIComponent(installId)}/chat-descriptor`,
     ),
+  /** Generic app-assistant/v1 discovery, durable operations and scoped permissions. */
+  assistantActions: (installId: string, contextId: string) =>
+    get<{ contract: "app-assistant/v1"; actions: unknown[]; descriptor_digest: string }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/actions?context_id=${encodeURIComponent(contextId)}`,
+    ),
+  assistantOperations: (installId: string, contextId: string) =>
+    get<{ operations: unknown[] }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/operations?context_id=${encodeURIComponent(contextId)}`,
+    ),
+  assistantOperation: (installId: string, operationId: string) =>
+    get<{ operation: unknown }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/operations/${encodeURIComponent(operationId)}`,
+    ),
+  assistantDecision: (installId: string, operationId: string, body: { decision: "allow_once" | "allow_always" | "deny"; expected_revision: number }) =>
+    post<{ operation: unknown }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/operations/${encodeURIComponent(operationId)}/decision`,
+      body,
+    ),
+  assistantPermissions: (installId: string, contextId: string) =>
+    get<{ permissions: unknown[] }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/permissions?context_id=${encodeURIComponent(contextId)}`,
+    ),
+  assistantRevoke: (installId: string, permissionId: string, body: { expected_revision: number }) =>
+    post<{ permission: unknown }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/permissions/${encodeURIComponent(permissionId)}/revoke`,
+      body,
+    ),
+  assistantBlock: (installId: string, contextId: string, body: { action_id: string; resource_id: string }) =>
+    post<{ permission: unknown }>(
+      `/api/app-installations/${encodeURIComponent(installId)}/assistant/permissions/block?context_id=${encodeURIComponent(contextId)}`,
+      body,
+    ),
   /** `GET /api/app-installations/<id>/conversations` (CAD-1098; wire shape owned by conversationClient). */
   conversationList: (installId: string) =>
     get<Record<string, unknown>>(`/api/app-installations/${encodeURIComponent(installId)}/conversations`),
@@ -629,6 +662,27 @@ export const api = {
    */
   connectionCheck: (id: string) =>
     post<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}/status`, {}),
+  /**
+   * `POST /api/connections/<id>/test` — the approved SMTP no-send login
+   * verification (CAD-1065/CAD-1085). Operator-only. Sends exactly the
+   * two required expected keys, explicitly including null — no token,
+   * secret, host, provider, actor, timeout or recipient. The returned
+   * receipt is typed evidence only: a success proves an authenticated
+   * login and clean close, never a delivery, sender entitlement or
+   * execution authority, and a `stale` receipt is not
+   * replacement-current evidence.
+   */
+  connectionTest: (
+    id: string,
+    expected: {
+      expected_revision: number | null;
+      expected_registration_digest: string | null;
+    },
+  ) =>
+    post<ConnectionVerificationPayload>(
+      `/api/connections/${encodeURIComponent(id)}/test`,
+      expected,
+    ),
   /**
    * `GET /api/projects/<key>/workflows/<name>/preview?inputs=<json>` —
    * what `plan propose --workflow` renders for these inputs. The query

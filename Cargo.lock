@@ -217,6 +217,7 @@ dependencies = [
  "ureq",
  "uuid",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

@@ -3,9 +3,12 @@ import { api, ApiError, type WriteResp } from "./lib/api";
 import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
 import AppDetail from "./features/apps/AppDetail";
+import Explorer from "./features/explorer/Explorer";
+import CatalogDetail from "./features/explorer/CatalogDetail";
+import ManageApp from "./features/explorer/ManageApp";
 import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
-import { workspaceApps } from "./features/workspace-apps/workspaceApps";
+import { useInstallations } from "./features/workspace-apps/useInstallations";
 import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
@@ -95,6 +98,9 @@ const SCREEN_LABEL: Record<Screen, string> = {
   overview: "overview",
   projects: "projects",
   apps: "apps",
+  appsExplore: "explore",
+  appsCatalog: "app",
+  appsManage: "manage",
   workspaceApp: "app",
   agents: "agents",
   wiki: "wiki",
@@ -584,18 +590,13 @@ export default function App() {
       return info;
     });
   }, []);
-  const [installed, setInstalled] = useState<VerifiedApp[]>([]);
-  useEffect(() => {
-    const controller = new AbortController();
-    workspaceApps
-      .installations(controller.signal)
-      .then((list) => {
-        if (controller.signal.aborted || !Array.isArray(list)) return;
-        setInstalled(list.map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })));
-      })
-      .catch(() => undefined); // keep the last good list
-    return () => controller.abort();
-  }, [route.screen]);
+  // Loading, error and ready stay separate: a failed refresh keeps the last
+  // good list and says so; a busy daemon is retried before it does.
+  const installations = useInstallations(true, route.screen);
+  const installed: VerifiedApp[] = useMemo(
+    () => (installations.list ?? []).map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
+    [installations.list],
+  );
   const onAppScreen = route.screen === "workspaceApp";
   const receipt = onAppScreen && activeApp !== null && activeApp.installId === route.installId ? activeApp : null;
   const menuApps =
@@ -616,14 +617,21 @@ export default function App() {
       return next;
     });
   }, [activeId, activeSection]);
-  const appMenu = buildAppNav({
-    apps: menuApps,
-    onAppScreen,
-    activeId,
-    activeHref: href,
-    last,
-    installHref: (installId) => hrefFor({ screen: "workspaceApp", installId }),
-  });
+  const appMenu = {
+    ...buildAppNav({
+      apps: menuApps,
+      onAppScreen,
+      activeId,
+      activeHref: href,
+      last,
+      installHref: (installId) => hrefFor({ screen: "workspaceApp", installId }),
+    }),
+    notice: installations.retrying
+      ? { text: "The workspace is busy. Retrying the app list…", retrying: true, onRetry: installations.retry }
+      : installations.error !== null
+        ? { text: installations.error, retrying: false, onRetry: installations.retry }
+        : null,
+  };
   // One element for both account menus (sidebar row, header avatar) so they cannot drift.
   const versionLine = (
     <VersionLine
@@ -931,6 +939,15 @@ export default function App() {
         )}
         {route.screen === "apps" && !route.project && (
           <Apps project={project} viewer={{ readOnly, operator: meta?.operator === true }} />
+        )}
+        {route.screen === "appsExplore" && (
+          <Explorer viewer={{ readOnly, operator: meta?.operator === true }} />
+        )}
+        {route.screen === "appsCatalog" && (
+          <CatalogDetail id={route.id} viewer={{ readOnly, operator: meta?.operator === true }} />
+        )}
+        {route.screen === "appsManage" && (
+          <ManageApp installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
         {route.screen === "workspaceApp" && (
           <AppShell installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} onInstallation={reportInstallation}>

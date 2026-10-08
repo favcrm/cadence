@@ -47,9 +47,11 @@ export function sendReadiness(input: ReadinessInput): ReadinessItem[] {
   const approved = doc !== null && doc.approval.valid && doc.approval.revision === doc.revision;
 
   let freezeReason: string | null = null;
-  if (frozen === "") freezeReason = "a named audience freeze";
-  else if (freeze === null) freezeReason = `freeze ${frozen} rechecked below (its validity is unverified)`;
-  else if (freeze.valid !== true) freezeReason = `freeze ${frozen} reporting valid`;
+  // CAD-1178: the reasons name the state, never the freeze id — the id is an
+  // address, not a fact the operator needs to read.
+  if (frozen === "") freezeReason = "a frozen audience";
+  else if (freeze === null) freezeReason = "the audience frozen and rechecked (its validity is unverified)";
+  else if (freeze.valid !== true) freezeReason = "the audience frozen and reporting valid";
 
   let senderReason: string | null = null;
   if (binding === undefined) senderReason = "the sender binding read (still loading)";
@@ -61,7 +63,9 @@ export function sendReadiness(input: ReadinessInput): ReadinessItem[] {
     doc !== null &&
     binding !== null &&
     binding !== undefined &&
-    (testEvidence.contentDigest !== doc.contentDigest || testEvidence.linkDigest !== binding.digest)
+    (testEvidence.contentRevision !== doc.revision ||
+      testEvidence.contentDigest !== doc.contentDigest ||
+      testEvidence.linkDigest !== binding.digest)
   ) {
     testReason = "a test send accepted against this exact content revision and binding";
   }

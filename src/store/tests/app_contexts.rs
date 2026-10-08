@@ -36,7 +36,7 @@ fn cad690_context_receipt_is_rechecked_in_create_and_execution_transactions() {
         workflow: &workflow,
         inputs: &inputs,
         request_id: key,
-        owner_pm: "lead",
+        owner_pm: Some("lead"),
         project_link: None,
     };
     let contextual = s

@@ -87,7 +87,7 @@ impl Shared {
         let install = required_str(params, "install_id")?;
         crate::proto::identifier(install, "installation ID")?;
         let pm = self.pm_at(&self.pm_dir()?)?;
-        workspace::with_runtime_snapshot(&pm, install, |_, _| Ok(()))?;
+        workspace::with_runtime_read(&pm, install, |_, _| Ok(()))?;
         if method == "app_install_team_show" {
             return Ok(view(team_of(&self.state_dir, install)?.as_ref()));
         }

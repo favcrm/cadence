@@ -280,7 +280,7 @@ fn approved_intent(store: &Store, tag: &str, due: i64) -> Value {
         workflow: &workflow,
         inputs: &inputs,
         request_id: &format!("run-{tag}"),
-        owner_pm: "lead",
+        owner_pm: Some("lead"),
         project_link: None,
     };
     let run = store

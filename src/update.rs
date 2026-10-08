@@ -656,6 +656,13 @@ pub trait UpdateHost {
     }
     fn now(&self) -> f64;
     fn sleep(&self, duration: Duration);
+    /// CAD-1187: `--to <full-sha>` — the commit the operator pinned
+    /// instead of the approved production candidate. The install still
+    /// goes through [`upgrade::run`]'s checks (on main, CI green on that
+    /// sha, sha256, manifest, build-provenance attestation).
+    fn pin(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// What `cadence update` did, for `--json` and the report.
@@ -738,22 +745,33 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
         Current::Link { sha, .. } => sha.clone(),
         _ => None,
     };
-    src.check_auth()?;
-    let run = src.latest_green_main()?.ok_or_else(|| {
-        Error::rejected(format!(
-            "no approved production candidate in {} — stage a successful main CI artifact \
-             and approve the production job in `{}`",
-            src.repo(),
-            upgrade::STAGING_WORKFLOW
-        ))
-    })?;
-    let target = run.head_sha.clone();
-    if !upgrade::is_full_sha(&target) {
-        return Err(Error::internal(format!(
-            "run {} reports head sha `{target}`, not a full commit id",
-            run.id
+    if let Some(pin) = host.pin().filter(|p| !upgrade::is_full_sha(p)) {
+        return Err(Error::rejected(format!(
+            "--to must be a full 40-character lowercase commit id, got `{pin}` \
+             (copy it from `git rev-parse` or `gh run list`)"
         )));
     }
+    src.check_auth()?;
+    let target = match host.pin() {
+        Some(pin) => pin.to_string(),
+        None => {
+            let run = src.latest_green_main()?.ok_or_else(|| {
+                Error::rejected(format!(
+                    "no approved production candidate in {} — stage a successful main CI artifact \
+                     and approve the production job in `{}`",
+                    src.repo(),
+                    upgrade::STAGING_WORKFLOW
+                ))
+            })?;
+            if !upgrade::is_full_sha(&run.head_sha) {
+                return Err(Error::internal(format!(
+                    "run {} reports head sha `{}`, not a full commit id",
+                    run.id, run.head_sha
+                )));
+            }
+            run.head_sha
+        }
+    };
     let up_to_date = current_sha.as_deref() == Some(target.as_str());
     // A target that is not on main can never be installed; refuse here,
     // before the lease and the backup, not deep inside the install.
@@ -823,6 +841,23 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
         waiters,
         blockers,
     })
+}
+
+/// CAD-1187: `update --check --to <sha>` also proves the pinned build is
+/// installable: [`upgrade::run`] as a dry run verifies main, the green CI
+/// `test` job on that sha, the sha256, the manifest and the attestation,
+/// and installs nothing. Its refusal sentence is the reason.
+pub fn verify_pinned(host: &dyn UpdateHost, sha: &str) -> Result<Value> {
+    upgrade::run(
+        host.source(),
+        host.layout(),
+        &upgrade::Request {
+            target: upgrade::Target::Sha(sha.to_string()),
+            dry_run: true,
+            allow_unattested: false,
+            backup_state_dir: None,
+        },
+    )
 }
 
 fn fmt_duration(_host: &dyn UpdateHost, d: Duration) -> String {

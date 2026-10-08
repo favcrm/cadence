@@ -42,7 +42,9 @@ use crate::store::{self, Store};
 /// CAD-753 keeps app record data in per-installation SQLite files;
 /// this version tracks core tables only.
 /// The newest migration in `store` writes this number.
-pub const SCHEMA_VERSION: i64 = 32;
+/// v33 (CAD-1129): `app_favorites`, `app_install_requests` and
+/// `app_update_checks` for the apps Explorer — new tables only.
+pub const SCHEMA_VERSION: i64 = 33;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -511,11 +513,15 @@ pub fn authorize_direct_run(state_dir: &Path) -> Result<()> {
     authorize_spawn_for(state_dir, process_caller()).map(|_| ())
 }
 
-/// A sandbox's own state dir (`<root>/state` beside its marker) takes
-/// no part in a rollout: it is disposable, so a rebuilt binary starts
-/// it, and migrates it, without the lease (CAD-310).
+/// A dev store takes no part in a rollout: it is disposable, so a
+/// rebuilt binary starts it, and migrates it, without the lease
+/// (CAD-310). CAD-1187: the mode is the store's — it must hold the dev
+/// marker `cadence dev up` writes into it and sit under the sandbox
+/// base (`sandbox::dev_owner`). The caller's `CADENCE_PROFILE` is not
+/// consulted, so a hand-set profile on any other store unlocks nothing;
+/// production's rules are unchanged.
 pub fn sandbox_exempt(state_dir: &Path) -> bool {
-    matches!(crate::sandbox::owner_of(state_dir), Ok(Some(_)))
+    matches!(crate::sandbox::dev_owner(state_dir), Ok(Some(_)))
 }
 
 pub fn authorize_spawn_for(state_dir: &Path, caller: Result<Caller>) -> Result<Option<String>> {
@@ -3167,6 +3173,30 @@ mod tests {
         assert!(err.to_string().contains("backup"), "{err}");
     }
 
+    /// Sets an env var for one test and restores it on drop, so a panic
+    /// cannot leak it into the tests that run after.
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     /// CAD-310: a sandbox's own state dir starts a different build and
     /// crosses a schema with no identity and no lease; the same dir
     /// without its marker still refuses both.
@@ -3182,7 +3212,16 @@ mod tests {
         drop(conn);
         let nobody = || Err(Error::rejected("no rollout identity"));
         assert!(authorize_spawn_for(&state, nobody()).is_err());
+        // CAD-1187: the root marker alone no longer exempts — the store
+        // must hold the dev marker and sit under the sandbox base.
         std::fs::write(root.join(".cadence-sandbox"), r#"{"name":"sbx"}"#).unwrap();
+        let _base = EnvGuard::set("CADENCE_SANDBOX_ROOT", dir.path());
+        assert!(!sandbox_exempt(&state));
+        assert!(authorize_spawn_for(&state, nobody()).is_err());
+        let dev = serde_json::json!({
+            "v": 1, "name": "sbx", "state_dir": crate::sandbox::resolved(&state),
+        });
+        std::fs::write(state.join(crate::sandbox::DEV_MARKER), dev.to_string()).unwrap();
         assert!(sandbox_exempt(&state));
         assert!(authorize_spawn_for(&state, nobody()).is_ok());
         let db = downgrade_to_v11(&state);
@@ -3290,7 +3329,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 32);
+        assert_eq!(SCHEMA_VERSION, 33);
     }
 
     struct MigrationHolder;

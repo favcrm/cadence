@@ -14,7 +14,8 @@ CAD-631/CAD-632 work. Custom app UI remains separate CAD-633 work.
 
 | Command | Behavior |
 | --- | --- |
-| `cadence app catalog install <source>` | Validate and copy a local bundle or Git repository root into the workspace; return a new immutable installation ID. |
+| `cadence app catalog install-check <source>` | Read-only. Resolve and validate the bundle exactly as install would; return `schema`, `name`, `version`, `source`, `digest`, the `files` list, `committed` (always `false`), `notes` and `secret_warnings`. Writes no catalog, journal or record. |
+| `cadence app catalog install <source> [--expected-digest sha256:…]` | Validate and copy a local bundle or Git repository root into the workspace; return a new immutable installation ID. With `--expected-digest` the install is refused, before any write, unless the resolved bytes hash to that digest. |
 | `cadence app catalog ls` | Return an array of catalogued installation descriptions. Never initializes or migrates the catalog. |
 | `cadence app catalog show <install-id>` | Inspect one exact installation ID. An app name is not a substitute. |
 | `cadence app catalog migrate` | Explicitly catalogue legacy installations and backfill missing IDs, using the PM mutation and Git delivery path. |
@@ -25,6 +26,40 @@ These commands do not accept `--project`. New workspace installations have
 `project: null` and `project_link: null`; no project is created. Catalogued legacy
 installations retain their project metadata. A project link does not grant
 authority.
+
+## Pin the exact bytes you consented to
+
+Install is consent, so consent must be to exact bytes. Check first, then pin:
+
+```sh
+cadence app catalog install-check ./apps/blog-post      # returns "digest"
+cadence app catalog install ./apps/blog-post --expected-digest 'sha256:…'
+```
+
+The digest is the same bundle digest `upgrade-check`/`upgrade
+--expected-new-digest` use, and the one `show` reports after install. If the
+source changed after the check (including a moved Git HEAD) the install is
+refused with the catalog, journal and records untouched. Omitting
+`--expected-digest` keeps the unpinned behavior for local development. The board
+relay `POST /api/app-installations` (and `/upload`) accepts the same optional
+`expected_digest` field with the same refusal.
+
+The board's install review (Explorer, app detail and "Add from Git URL") is
+never unpinned: it calls `POST /api/app-installations/check` first, shows the
+name, version, digest, file list, notes and secret warnings, and then installs
+with the checked digest. The check route takes exactly `{"source"}` (a repeated
+or unknown key is refused), is operator-only like install, and relays
+`app_workspace_install_check`; it creates no catalog. A built-in is checked as
+source `builtin:<catalog id>` and installed through `POST /api/app-catalog/install`
+`{catalog_id, expected_digest}`, where the digest is required. A bundle that
+changed after the check is refused and the review asks for a fresh check.
+
+Legacy rule: while no workspace catalog exists, any unmigrated legacy
+`<project>/apps/<name>` installation blocks every workspace install, not only
+one of the same name, until `cadence app catalog migrate` has catalogued it.
+After migration a legacy installation has its own ID and never blocks a
+workspace install of the same name. The refusal names this rule and the
+`migrate` command.
 
 ## Install a local bundle
 

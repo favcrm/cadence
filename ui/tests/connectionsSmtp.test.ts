@@ -162,26 +162,34 @@ async function main() {
   });
   await settle(() => assert(host.querySelector('section[aria-label="add connection"]'), "add connection renders"));
 
-  // Pick the SMTP provider, then the form is SMTP-focused.
+  // Pick the SMTP provider, then the form is SMTP-focused. The guided
+  // form leads with email address + app password behind presets; the
+  // custom host/port/security live behind "Other".
   const providerSelect = host.querySelector("select") as HTMLSelectElement;
   act(() => {
     const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value")!.set!;
     setter.call(providerSelect, "smtp");
     providerSelect.dispatchEvent(new Event("change", { bubbles: true }));
   });
-  await settle(() => assert(field("Server host"), "SMTP host field renders"));
+  await settle(() => assert(field("Your email address"), "SMTP email field renders"));
   assert(field("Email account name"), "account is labelled for email");
-  assert(field("Port & security"), "port & security select renders");
-  assert(field("Password"), "password field renders");
+  assert(field("App password"), "app password field renders");
   assert(field("Sender address"), "sender address renders");
   assert(!field("Scopes"), "no raw Scopes grant field in the SMTP form");
+  assert(byText("button", "Gmail / Google Workspace"), "Gmail preset renders");
+  assert(byText("button", "Other"), "Other preset renders");
+  // Advanced host + paired port/security only under the Other preset.
+  assert(!field("Mail server"), "custom host hidden until Other");
+  act(() => (byText("button", "Other") as HTMLButtonElement).click());
+  await settle(() => assert(field("Mail server"), "Other opens the custom mail server"));
+  assert(field("Port & security"), "paired port & security select renders");
 
   // Fill the SMTP form and submit: the body carries ONLY email:send —
   // never the union including email:read.
   fill("Email account name", "newsletter");
-  fill("Server host", "mail.example.com");
-  fill("Username", "mailer");
-  fill("Password", "s3cret-password");
+  fill("Mail server", "mail.example.com");
+  fill("Your email address", "mailer");
+  fill("App password", "s3cret-password");
   fill("Sender address", "news@example.com");
   const addBtn = () => byText("button", "Add connection") as HTMLButtonElement | null;
   await act(async () => addBtn()!.click());
@@ -191,7 +199,7 @@ async function main() {
   assert(posts[0].body.secret === undefined || posts[0].body.secret === "s3cret-password", "secret crosses only in the request body");
 
   // Password cleared from the form on settle.
-  const pw = field("Password")!.parentElement!.querySelector("input") as HTMLInputElement;
+  const pw = field("App password")!.parentElement!.querySelector("input") as HTMLInputElement;
   assert(pw.value === "", "password field is cleared after submit");
 
   // custody_unprotected → visible explicit consent beside Save, not pre-checked.
@@ -200,7 +208,7 @@ async function main() {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
-  fill("Password", "s3cret-password");
+  fill("App password", "s3cret-password");
   await act(async () => addBtn()!.click());
   await settle(() => {
     assert(text().includes("nothing was stored"), "custody_unprotected reports nothing was stored");
@@ -218,20 +226,29 @@ async function main() {
   act(() => {
     consent.checked && consent.click();
   });
-  fill("Password", "s3cret-password");
+  fill("App password", "s3cret-password");
   await act(async () => addBtn()!.click());
   await settle(() => assert(text().includes("Could not confirm the connection was added"), "unknown failure is honest"));
   assert(!text().includes("s3cret"), "the credential never echoes back in the error");
   assert(!text().includes("nothing was saved") || text().includes("Could not confirm"), "no fake 'nothing saved' on an unknown outcome");
 
-  // Token provider path unchanged: raw Scopes field is present there.
+  // Token provider: permissions are explicit labeled checkboxes derived
+  // from the reviewed scope hint, not a raw text field and never a union.
   act(() => {
     const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value")!.set!;
     setter.call(providerSelect, "agenticos_external");
     providerSelect.dispatchEvent(new Event("change", { bubbles: true }));
   });
-  await settle(() => assert(field("Scopes"), "token provider keeps its scope field"));
-  assert(!field("Server host"), "token provider has no SMTP fields");
+  await settle(() => assert(text().includes("provider.read"), "token provider shows its reviewed scope as a choice"));
+  assert(!field("Mail server"), "token provider has no SMTP fields");
+  assert(!field("Scopes"), "token provider has no raw Scopes text field");
+  const scopeBox = Array.from(host.querySelectorAll('input[type="checkbox"]')).find((c) =>
+    (c.parentElement?.textContent ?? "").includes("provider.read"),
+  ) as HTMLInputElement | undefined;
+  assert(scopeBox, "provider.read is a checkbox choice");
+  assert(!scopeBox!.checked, "permissions are never pre-checked");
+  act(() => scopeBox!.click());
+  await settle(() => assert(scopeBox!.checked, "the chosen scope checks on"));
 
   globalThis.fetch = innerFetch;
   await act(async () => root.unmount());
@@ -428,7 +445,124 @@ async function main() {
   globalThis.fetch = innerFetch3;
   await act(async () => root4.unmount());
 
+  // ---- CAD-1166: the page groups by service (mockup C), keeps a
+  // provider-list failure from blanking loaded accounts, renders the
+  // built-in non-editable, and never advertises remote verification. ----
+  const { default: ConnectionsPage } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
+  const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
+
+  const conns: any[] = [
+    { id: "builtin-local", provider: "local", account: "local", kind: "builtin", revision: null, registration_digest: null, scopes: [], status: { adapter_registered: true, descriptor_available: true, custody_available: true, manifest_status: "missing", reviewed_pin: null, reported_pin: null, execution_authority: false, network_checked: false } },
+    { id: "c-smtp", provider: "smtp", account: "news", kind: "enrolled", revision: 2, registration_digest: "sha256:x", scopes: ["email:send"], smtp_sender: true, smtp: { host: "mail.example.com", port: 465, tls_mode: "implicit", username: "mailer", sender: "news@example.com", sender_name: "News" }, status: { adapter_registered: true, descriptor_available: true, custody_available: true, manifest_status: "matched", reviewed_pin: "smtp@1", reported_pin: "smtp@1", execution_authority: false, network_checked: false } },
+    { id: "c-tok", provider: "agenticos_external", account: "ws_12345678-1234-1234-1234-123456789012", kind: "enrolled", revision: 1, registration_digest: "sha256:y", scopes: ["provider.read"], status: { adapter_registered: true, descriptor_available: true, custody_available: true, manifest_status: "matched", reviewed_pin: "a@1", reported_pin: "a@1", execution_authority: false, network_checked: false } },
+    // A connection whose provider is NOT in the registered list — kept
+    // under its own name, never dropped or folded into built-ins.
+    { id: "c-stale", provider: "ghost_provider", account: "leftover", kind: "enrolled", revision: 1, registration_digest: "sha256:z", scopes: ["x"], status: { adapter_registered: false, descriptor_available: false, custody_available: true, manifest_status: "missing", reviewed_pin: null, reported_pin: null, execution_authority: false, network_checked: false } },
+  ];
+  const provs: any[] = [
+    { provider: "local", descriptor: { schema: 1, provider: "local", revision: "l@1", enrollment_shapes: [], builtin_accounts: ["local"], capabilities: [] }, descriptor_available: true, manifest_status: "missing", reviewed_pin: null, reported_pin: null, network_checked: false, registration_digest: null },
+    { provider: "smtp", descriptor: { schema: 1, provider: "smtp", revision: "s@1", enrollment_shapes: ["smtp"], builtin_accounts: [], capabilities: [{ id: "email.send", version: 1, tools: ["email.send"], scopes: ["email:send"], effect: "send", semantics: "email" }] }, descriptor_available: true, manifest_status: "matched", reviewed_pin: "smtp@1", reported_pin: "smtp@1", network_checked: false, registration_digest: "sha256:smtp" },
+    { provider: "agenticos_external", descriptor: { schema: 1, provider: "agenticos_external", revision: "a@1", enrollment_shapes: ["token"], builtin_accounts: [], capabilities: [{ id: "social.read", version: 1, tools: ["read"], scopes: ["provider.read"], effect: "read", semantics: "read" }] }, descriptor_available: true, manifest_status: "matched", reviewed_pin: "a@1", reported_pin: "a@1", network_checked: false, registration_digest: "sha256:a" },
+    // A registered provider with no accounts — still gets a group.
+    { provider: "empty_svc", descriptor: { schema: 1, provider: "empty_svc", revision: "e@1", enrollment_shapes: ["token"], builtin_accounts: [], capabilities: [] }, descriptor_available: true, manifest_status: "matched", reviewed_pin: "e@1", reported_pin: "e@1", network_checked: false, registration_digest: "sha256:e" },
+  ];
+
+  let failProviders = false;
+  const innerFetch4 = globalThis.fetch;
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/api/connection-providers")) {
+      if (failProviders) return new Response(JSON.stringify({ error: "boom" }), { status: 503, headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({ providers: provs }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url.endsWith("/api/connections")) {
+      return new Response(JSON.stringify({ connections: conns }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return innerFetch4(input as RequestInfo | URL, init);
+  }) as typeof fetch;
+
+  const host5 = document.createElement("div");
+  document.body.appendChild(host5);
+  const root5 = createRoot(host5);
+  const sections = () => Array.from(host5.querySelectorAll('section[aria-label$=" connections"]'));
+  const groupLabel = (el: Element) => el.getAttribute("aria-label") ?? "";
+
+  act(() => {
+    root5.render(React.createElement(ConnectionsPage, { viewer: { operator: true, readOnly: false } }));
+  });
+  // Drive the two resources through their real stores.
+  await act(async () => {
+    await Promise.all([resources.connections.refresh(), resources.connectionProviders.refresh()]);
+  });
+  await settle(() => {
+    const labels = sections().map(groupLabel);
+    assert(labels.includes("Email (SMTP) connections"), "smtp service group renders under its friendly label");
+    assert(labels.includes("AgenticOS connections"), "token service group renders under AgenticOS");
+    assert(labels.includes("Local outbox connections"), "built-in Local outbox group renders");
+    assert(labels.includes("empty_svc connections"), "registered-but-empty provider keeps a group");
+    assert(labels.includes("ghost_provider connections"), "unregistered provider keeps its own group");
+  }, 30000);
+
+  const text5 = () => host5.textContent ?? "";
+  // Contextual setup on enrollable services only; explicit unsupported
+  // reason on the empty/built-in ones; built-in outbox not editable.
+  assert(byTextIn(host5, "button", "Set up Email (SMTP)"), "smtp service has a Set up action");
+  assert(byTextIn(host5, "button", "Set up AgenticOS"), "token service has a Set up action");
+  assert(text5().includes("No empty_svc account connected yet"), "empty provider names its setup state");
+  assert(
+    text5().includes("could not be loaded") || text5().includes("not proof") || text5().includes("may be stale") || text5().includes("not registered"),
+    "unregistered provider is honest — metadata-missing is not deregistration",
+  );
+
+  // Expand the smtp row: its detail lands in place with the local-only
+  // check and the honest unsupported remote-verification line.
+  const smtpRowBtn = Array.from(host5.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("news"));
+  assert(smtpRowBtn, "smtp account row renders");
+  await act(async () => smtpRowBtn!.click());
+  await settle(() => {
+    assert(text5().includes("Check configuration"), "local check action present");
+    assert(text5().includes("Technical details"), "technical disclosure present");
+    assert(text5().includes("Update credentials"), "enrolled account offers update");
+    assert(text5().includes("Disconnect"), "enrolled account offers disconnect");
+  });
+  // Open the technical disclosure to find the remote-verification line.
+  const summary = host5.querySelector("summary");
+  await act(async () => (summary as HTMLElement)?.click?.() ?? summary?.dispatchEvent(new Event("click", { bubbles: true })));
+  await settle(() => {
+    assert(text5().includes("Remote verification"), "disclosure carries a remote-verification line");
+    assert(text5().includes("unsupported"), "remote verification reports unsupported, never a fake success");
+    assert(!text5().includes("Login verified"), "no simulated success ships");
+  });
+
+  // The built-in Local outbox row expands to NO edit/disconnect actions.
+  const outboxRowBtn = Array.from(host5.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Local outbox"));
+  assert(outboxRowBtn, "local outbox row renders");
+  await act(async () => outboxRowBtn!.click());
+  await settle(() => {
+    const detail = host5.querySelector('section[aria-label="Local outbox detail"]');
+    assert(detail, "outbox detail expands");
+    const dt = detail!.textContent ?? "";
+    assert(!dt.includes("Update credentials") && !dt.includes("Disconnect"), "built-in has no edit/disconnect");
+    assert(dt.includes("cannot be") || dt.includes("always present"), "built-in explains why");
+  });
+
+  // Provider-list failure must NOT blank the loaded account list.
+  failProviders = true;
+  await act(async () => { await resources.connectionProviders.refresh(); });
+  await settle(() => {
+    assert(text5().includes("could not load") || text5().includes("stale") || text5().includes("unavailable"), "provider failure is surfaced");
+    assert(text5().includes("news"), "accounts still render after provider failure");
+  });
+
+  globalThis.fetch = innerFetch4;
+  await act(async () => root5.unmount());
+
   console.log("connections smtp form checks passed");
+}
+
+/** Text search helper scoped to a host (kept near the bottom for reuse). */
+function byTextIn(host: HTMLElement, tag: string, label: string): Element | null {
+  return Array.from(host.querySelectorAll(tag)).find((el) => (el.textContent ?? "").includes(label)) ?? null;
 }
 
 void main();

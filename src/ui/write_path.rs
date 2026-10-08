@@ -14,9 +14,9 @@ use tiny_http::{Header, Method, Request, Response, StatusCode};
 use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
-    app_audiences, app_content, app_contexts, app_records, app_release, app_runs, app_screens,
-    apps, connections, crm_send, crm_smtp, home, lane, operator, read_model, social_publish,
-    stages, threads, updates, wiki, workflows,
+    app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_records,
+    app_release, app_runs, app_screens, apps, connections, crm_send, crm_smtp, home, lane,
+    operator, read_model, social_publish, stages, threads, updates, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -41,7 +41,7 @@ pub(crate) fn header_value(request: &Request, name: &'static str) -> Option<Stri
     request
         .headers()
         .iter()
-        .find(|h| h.field.equiv(name))
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
         .map(|h| h.value.as_str().to_string())
 }
 
@@ -579,6 +579,26 @@ pub(crate) fn coded_response(
     resp
 }
 
+/// Seconds a client should wait before retrying a busy daemon.
+pub(crate) const BUSY_RETRY_AFTER_SECS: u32 = 2;
+
+/// A daemon `busy` refusal (`resource_busy`: another writer holds the PM
+/// lock) is transient, not a bad request: 503 with `Retry-After`, the
+/// daemon's own code kept in the body. `None` for every other error.
+pub(crate) fn busy_response(e: &Error) -> Option<HttpResp> {
+    if e.kind() != "busy" {
+        return None;
+    }
+    let mut resp = coded_response(
+        503,
+        e.code().unwrap_or("resource_busy"),
+        &e.to_string(),
+        None,
+    );
+    resp.add_header(Header::from_bytes("Retry-After", BUSY_RETRY_AFTER_SECS.to_string()).unwrap());
+    Some(resp)
+}
+
 pub(crate) fn health_supports_model_defaults(health: &Value) -> bool {
     health["capabilities"].as_array().is_some_and(|caps| {
         caps.iter()
@@ -968,6 +988,18 @@ pub(crate) fn write_route(
         send(request, resp);
         return;
     }
+    if let Some(route) = app_assistant::route(path) {
+        if route.is_read() {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let context = query("context_id")
+            .map(|value| format!("context_id={value}"))
+            .unwrap_or_default();
+        let response = app_assistant::handle(&mut request, state_dir, route, &context);
+        send(request, response);
+        return;
+    }
     if let Some(route) = app_contexts::route(path) {
         let writable = matches!(route, app_contexts::Route::List(_)) || !route.is_read();
         if *method != Method::Post || !writable {
@@ -1095,6 +1127,27 @@ pub(crate) fn write_route(
         send(request, resp);
         return;
     }
+    // CAD-1129: the apps Explorer's writes — catalog install/git-check,
+    // per-install update-check/remove/restore, and the member verbs
+    // (favorites, request). Classified in `WRITE_ROUTES`; the daemon's
+    // own caller rule is the second, strict layer.
+    if path == "/api/app-catalog/install"
+        || path == "/api/app-catalog/git-check"
+        || path == "/api/app-catalog/request"
+        || path == "/api/app-favorites"
+        || path == "/api/app-favorites/default"
+        || path == "/api/app-favorites/opened"
+        || path == "/api/app-requests/dismiss"
+        || path.starts_with("/api/app-installations/")
+            && (path.ends_with("/update-check")
+                || path.ends_with("/remove-preview")
+                || path.ends_with("/remove")
+                || path.ends_with("/restore"))
+    {
+        let response = app_explorer::write(&mut request, method, path, caller.as_ref(), state_dir);
+        send(request, response);
+        return;
+    }
     let catalog_recovery = path
         .strip_prefix("/api/app-installations/migrations/")
         .and_then(|tail| tail.strip_suffix("/recover"))
@@ -1140,6 +1193,18 @@ pub(crate) fn write_route(
             ("app_workspace_migrate", None)
         };
         let response = apps::workspace(&mut request, state_dir, operation, id);
+        send(request, response);
+        return;
+    }
+    // CAD-1194: the read-only install-check — operator-only in
+    // `WRITE_ROUTES`, relays `app_workspace_install_check`.
+    if path == "/api/app-installations/check" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response =
+            apps::workspace(&mut request, state_dir, "app_workspace_install_check", None);
         send(request, response);
         return;
     }
@@ -1658,4 +1723,32 @@ pub(crate) fn with_agents(mut payload: Value, by_issue: &Value, id: &str) -> Val
         payload["agents"] = agents.clone();
     }
     payload
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+
+    fn header<'a>(resp: &'a HttpResp, name: &str) -> Option<&'a str> {
+        resp.headers()
+            .iter()
+            .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_str())
+    }
+
+    #[test]
+    fn busy_is_503_retry_after_with_code() {
+        let resp = busy_response(&Error::busy("another live writer holds the lock")).unwrap();
+        assert_eq!(resp.status_code().0, 503);
+        assert_eq!(header(&resp, "Retry-After"), Some("2"));
+        let mut body = String::new();
+        resp.into_reader().read_to_string(&mut body).unwrap();
+        assert!(body.contains("\"code\": \"resource_busy\""), "{body}");
+    }
+
+    #[test]
+    fn other_errors_are_not_busy() {
+        assert!(busy_response(&Error::Rejected("no".into())).is_none());
+        assert!(busy_response(&Error::gate_coded("x", "standing")).is_none());
+    }
 }

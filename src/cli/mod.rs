@@ -392,7 +392,7 @@ pub(crate) fn report_result_text(
     if let Some(t) = token {
         check_params["token"] = json!(t);
     }
-    let check = client::rpc(state_dir, "message_report", check_params)?;
+    let check = client::rpc_relay(state_dir, "message_report", check_params)?;
     match check["issue"].as_str() {
         Some(bound) if bound == prepared.task() => {}
         Some(bound) => {
@@ -497,14 +497,14 @@ pub(crate) fn send_message(
             agent["endpoint_kind"].as_str().unwrap_or_default(),
         ) {
             let by = std::env::var("CADENCE_ALIAS").ok();
-            client::rpc(
+            client::rpc_relay(
                 state_dir,
                 "agent_ready",
                 json!({"alias": alias, "by": by, "force": force}),
             )?;
         }
     }
-    let receipt = client::rpc(
+    let receipt = client::rpc_relay(
         state_dir,
         "agent_send",
         json!({"alias": alias, "text": body,
@@ -1317,7 +1317,7 @@ pub(crate) fn run_inbox_exec(
             let seq = m["seq"].as_i64().unwrap_or_default();
             match inbox_exec_once(argv, &m, timeout_ms) {
                 Ok(()) => {
-                    client::rpc(
+                    client::rpc_relay(
                         state_dir,
                         "agent_inbox_ack",
                         json!({"alias": alias, "through": seq, "reader": reader}),
@@ -1332,7 +1332,7 @@ pub(crate) fn run_inbox_exec(
                         *a += 1;
                         *a
                     };
-                    client::rpc(
+                    client::rpc_relay(
                         state_dir,
                         "agent_inbox_ack",
                         json!({"alias": alias, "reader": reader,
@@ -1343,7 +1343,7 @@ pub(crate) fn run_inbox_exec(
                         // Poison: park it for this reader — queued and
                         // unread still, but no longer head-of-line.
                         let reason = format!("exec failed {a} times; last: {why}");
-                        client::rpc(
+                        client::rpc_relay(
                             state_dir,
                             "agent_inbox_ack",
                             json!({"alias": alias, "reader": reader,
@@ -1372,7 +1372,7 @@ pub(crate) fn run_inbox_exec(
         // Queue empty — long-poll for arrivals. Peek changes nothing:
         // an un-acked message comes back every round until exec
         // succeeds.
-        let page = client::rpc(
+        let page = client::rpc_relay(
             state_dir,
             "agent_inbox",
             json!({"alias": alias, "peek": true, "reader": reader, "wait": 25}),

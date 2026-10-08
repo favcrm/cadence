@@ -75,7 +75,7 @@ pub(super) fn run(
         if let Some(r) = reader {
             req["reader"] = json!(r);
         }
-        let r = client::rpc(&state_dir, "agent_inbox_ack", req)?;
+        let r = client::rpc_relay(&state_dir, "agent_inbox_ack", req)?;
         print_json(&r);
         return Ok(0);
     }
@@ -111,7 +111,7 @@ pub(super) fn run(
         if let Some(a) = after {
             req["after"] = json!(a);
         }
-        let page = client::rpc(&state_dir, "agent_inbox", req)?;
+        let page = client::rpc_relay(&state_dir, "agent_inbox", req)?;
         let messages = page["messages"].as_array().cloned().unwrap_or_default();
         for m in &messages {
             println!("{}", serde_json::to_string(m).unwrap_or_default());

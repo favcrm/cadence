@@ -27,6 +27,41 @@ needs:
       action: publish
       resource_kind: connection_account
       effect: send
+listing:
+  tagline: Draft a reviewed caption and optional image from real source posts
+  icon: assets/social-content.svg
+  category: marketing
+  tags:
+    - social
+    - instagram
+  publisher:
+    name: Cadence
+  about: Social Content turns a real Instagram or Facebook source — or pasted facts — into one reviewed caption per run, with optional image generation. Drafting and review happen before any release; nothing posts without an explicit operator approval on the exact post.
+  can:
+    - Pull one public Instagram post as the source for a caption
+    - Draft a zh-HK or English caption a reviewer pins before release
+    - Generate one image per run through the bound provider
+    - Release to Local only after an operator approves the exact post
+  screenshots: []
+  setup:
+    - slot: source
+      label: Public Instagram read
+      help: Reads the public profile you name — never DMs or a private account.
+    - slot: image
+      label: Image generation
+      help: Makes one image per run through the bound provider.
+    - slot: publication
+      label: Local release
+      help: Releases one reviewed post to Local after you approve it.
+  data:
+    stores:
+      - Caption drafts, generated images and review history
+      - Release history — each release approved on its own
+    personal: false
+  access_notes:
+    source: Reads a public Instagram profile — never a private account or your DMs.
+    image: Makes one image per run; the worker can't change model, count or destination.
+    publication: Releases one reviewed post to Local — only after you approve that exact post.
 ---
 
 # Social Content — reviewed captions

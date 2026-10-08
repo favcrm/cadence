@@ -128,7 +128,8 @@ audience and live bearer before any runtime is resolved or woken; the
 container independently re-verifies the envelope before dispatching the
 verb. `verb` is one of a fixed allowlist — `status`, `agent_list`,
 `agent_show`, `issue_ls`, `issue_show`, `issue_history`, `message_read`,
-`message_inbox` — and `arguments` is a strict per-verb payload. Any
+`message_inbox`, `issue_new`, `issue_comment`, `issue_set` — and
+`arguments` is a strict per-verb payload. Any
 other command is refused locally and never sent.
 
 A sleeping company answers `503 {"state":"waking","retry_after_s":N}`
@@ -139,7 +140,48 @@ unavailable remote, a redirect, or a refused credential (`401`/`403`)
 end the command with a `cadence login` hint — there is never a fallback
 to local or another org, and no token is ever printed. Operator-only
 and every unlisted verb stay refused remotely; the remote path carries
-no operator proof.
+no operator proof, and the hosted `issue_set` verb accepts no `force`
+field — the `status=done` evidence gate has no remote override.
+
+### Remote ticket writes (CAD-1179)
+
+Three write verbs run on a remote org. Authorship and provenance are the
+enrolled identity inside the verified envelope — a caller can never name
+an author, actor or operator in the request.
+
+```sh
+cadence --org acme issue new "title" --project key      # --project required
+cadence --org acme issue comment CAD-1 -m "text"        # author = enrolled identity
+cadence --org acme issue show CAD-1                      # reports the `rev` token
+cadence --org acme issue set CAD-1 status=doing --if-rev fnv1a:0123…
+```
+
+Refusals happen locally, before a byte is sent: `issue new` without
+`--project` (the hosted tracker has no cwd to derive one from) or with
+`--id`/`--status`; `issue comment` with `--author` or `--kind`; `issue
+set` without `--if-rev`, with an empty revision, with `--force`, or
+naming more than one ticket. `--file` bodies are read client-side (`-` = stdin) and
+bounded by the 32 KB cap — never remote paths. `message send`, `issue
+edit/attach`, provider verbs and operator verbs are not on the wire.
+
+`issue set` is compare-and-swap: send the `rev` from `issue show`
+(`--if-rev`); a stale revision answers the conflict payload (HTTP 409
+at the route, `{conflict, current_rev, card}` in the body) and writes
+nothing. `--if-rev` is also accepted locally, where it uses the same
+under-lock check; without it, local `issue set` keeps its existing
+unconditional behavior.
+
+A wake retry is the only automatic retry — it fires only on the
+pre-forward `waking` verdict. A timeout, dropped connection or error
+after forward is an explicitly unresolved outcome: the mutation may or
+may not have landed, so reconcile with `issue show`/`issue log` rather
+than re-issuing blindly. A 200 confirms the write was accepted — not
+that the tracker survived a later hard loss; durability is a hosted
+operational concern outside this client feature.
+
+Each collaborating writer enrolls independently: a separate
+`XDG_CONFIG_HOME` (or separate account/machine) per identity, its own
+`cadence login` grant — credentials are never copied between homes.
 
 ## Issuer-bound service enrollment (CAD-717)
 

@@ -1,24 +1,16 @@
 import { useState } from "react";
 import Button from "../../../ui/Button";
-import { contentClient } from "../contentClient";
 import type { AudienceScope } from "../audienceClient";
+import { contentClient } from "../contentClient";
 import {
   friendlyCampaignError,
-  parseContentDoc,
-  type ContentDoc,
   type ProposalDoc,
 } from "../campaignGrammar";
 
 /**
- * The assistant's pending proposal as a strip above the email preview
- * (CAD-1055). Same safety rules as the old Proposals card, same APIs:
- * - the verified badge needs `actor == "assistant"` AND a non-null
- *   receipt (CAD-813); anything else reads operator-submitted;
- * - Apply is pinned to the saved revision and disabled when the
- *   proposal's stamped source drifted behind it (stale);
- * - Discard never mutates the saved version.
- * The saved/draft toggle only chooses which host render the stage
- * shows — it never saves.
+ * A host-attributed proposal remains separate until the operator moves
+ * its body into the local editor draft. Saving that draft is a separate
+ * revision-pinned action; loading a suggestion never mutates saved content.
  */
 export default function ProposalStrip({
   scope,
@@ -27,8 +19,9 @@ export default function ProposalStrip({
   canWrite,
   replacesHtml,
   viewingDraft,
+  canUseInEditor,
   onViewDraft,
-  onApplied,
+  onUseInEditor,
   onDiscarded,
   onError,
 }: {
@@ -36,15 +29,16 @@ export default function ProposalStrip({
   proposal: ProposalDoc;
   expectedRevision: number;
   canWrite: boolean;
-  /** The saved body is operator HTML; Apply swaps it for blocks. */
+  /** The saved body uses HTML; using this proposal converts the unsaved body to blocks. */
   replacesHtml: boolean;
   viewingDraft: boolean;
+  canUseInEditor: boolean;
   onViewDraft: (view: boolean) => void;
-  onApplied: (doc: ContentDoc) => void;
+  onUseInEditor: () => void;
   onDiscarded: (proposalId: string) => void;
   onError: (message: string | null) => void;
 }) {
-  const [pending, setPending] = useState<"apply" | "discard" | null>(null);
+  const [pending, setPending] = useState<"discard" | null>(null);
   const receipt = proposal.assistantReceipt;
   const verified = proposal.actor === "assistant" && receipt !== null;
   const stale = proposal.sourceRevision !== expectedRevision;
@@ -94,7 +88,7 @@ export default function ProposalStrip({
             data-proposal-preview={proposal.proposalId}
             onClick={() => onViewDraft(true)}
           >
-            Draft
+            Review
           </button>
         </span>
         {canWrite && (
@@ -102,30 +96,17 @@ export default function ProposalStrip({
             <Button
               size="sm"
               variant="primary"
-              loading={pending === "apply"}
-              disabled={pending !== null || stale}
+              disabled={pending !== null || stale || !viewingDraft || !canUseInEditor}
               title={
                 stale
-                  ? "Apply is disabled: the proposal's stamped source revision is behind the current draft"
-                  : `Apply as a new revision (expects the draft at r${expectedRevision})`
+                  ? "This suggestion was based on an older saved revision; review it again before use"
+                  : viewingDraft
+                    ? "Copy this host-attributed suggestion into the unsaved editor draft"
+                    : "Review the suggestion before using it in the editor"
               }
-              onClick={() => {
-                onError(null);
-                setPending("apply");
-                // An unsaved campaign applies a source_revision=0 proposal
-                // to CREATE revision 1 — nothing to pin, so omit the check.
-                void contentClient
-                  .proposalApply(
-                    scope,
-                    proposal.proposalId,
-                    expectedRevision === 0 ? undefined : expectedRevision,
-                  )
-                  .then((value) => onApplied(parseContentDoc(value)))
-                  .catch((err: unknown) => onError(friendlyCampaignError(err)))
-                  .finally(() => setPending(null));
-              }}
+              onClick={onUseInEditor}
             >
-              Apply as r{expectedRevision + 1}
+              Use in editor
             </Button>
             <Button
               size="sm"
@@ -158,7 +139,7 @@ export default function ProposalStrip({
       </div>
       {replacesHtml && canWrite && (
         <p className="text-label text-warn" data-state="replaces-html">
-          Apply replaces this email&apos;s HTML body with the assistant&apos;s blocks.
+          Using this suggestion changes the unsaved draft body format; it does not save until you choose Save.
         </p>
       )}
       {stale && (

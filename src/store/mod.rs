@@ -72,6 +72,7 @@ pub mod app_bindings;
 pub mod app_capabilities;
 pub mod app_contexts;
 pub mod app_effects;
+pub mod app_explorer;
 pub mod app_records;
 pub mod app_runs;
 pub mod app_sends;
@@ -277,6 +278,12 @@ impl Store {
                 guard
             }
         }
+    }
+
+    pub(crate) fn try_conn(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.conn
+            .try_lock()
+            .map_err(|_| Error::busy("store is busy"))
     }
 
     /// CAD-1011: the ONLY producer write lane. `f` runs inside

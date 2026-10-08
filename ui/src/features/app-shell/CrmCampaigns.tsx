@@ -17,6 +17,8 @@ import {
 } from "./audienceClient";
 import {
   campaignTitle,
+  checkCampaignName,
+  CAMPAIGN_NAME_MAX,
   friendlyCampaignError,
   parseContentDoc,
   parseContentList,
@@ -30,6 +32,7 @@ import {
 } from "./campaignGrammar";
 import { contentClient } from "./contentClient";
 import { useMaybeResource } from "../../lib/useResource";
+import { navigate } from "../../lib/useLocation";
 import { autoSelectCampaignConversation, useActiveConversation } from "./conversationClient";
 import {
   DELIVERY_CLAIM,
@@ -60,7 +63,7 @@ import OverviewPane from "./campaign/OverviewPane";
 import EligibilityFunnel from "./campaign/EligibilityFunnel";
 import ActivityPane from "./campaign/ActivityPane";
 import NewCampaignDialog from "./campaign/NewCampaignDialog";
-import { clearLanding, peekLanding } from "./campaign/landing";
+import { clearLanding, peekLanding, setLanding } from "./campaign/landing";
 import { audienceSummary } from "./campaign/audienceSummary";
 import {
   APPROVAL_ANCHOR,
@@ -126,10 +129,12 @@ export default function CrmCampaigns({
     <div className="crm-list" data-section="campaigns">
       {recordId !== null ? (
         <CampaignDetail
+          key={`${scope.installId}:${scope.contextId}:${recordId}`}
           scope={scope}
           viewer={viewer}
           campaignId={recordId}
           onBack={() => onSelect(null)}
+          onCloned={onSelect}
         />
       ) : (
         <>
@@ -436,6 +441,26 @@ export interface AudiencePick {
   exclusionListId: string | null;
 }
 
+/** CAD-1178: the freeze id is derived from the audience, never typed. The
+ *  same base + exclusions maps to the same freeze (stable across reloads);
+ *  a changed audience maps to a new id — exactly when a refreeze is due —
+ *  and re-freezing the same audience replays the same id server-side. */
+export function audienceFreezeId(campaignId: string, pick: AudiencePick): string {
+  const base =
+    pick.base.mode === "segment"
+      ? `segment:${pick.base.segmentId}`
+      : pick.base.mode === "custom"
+        ? `custom:${[...pick.base.customerIds].sort().join(",")}`
+        : "all";
+  const key = `${base}|${pick.exclusionListId ?? ""}`;
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < key.length; i += 1) {
+    hash ^= key.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `${campaignId}-freeze-${hash.toString(16).padStart(8, "0")}`;
+}
+
 function parseIds(raw: string): string[] {
   return [...new Set(raw.split(/[\s,]+/).map((id) => id.trim()).filter((id) => id !== ""))];
 }
@@ -467,6 +492,8 @@ function AudienceSection({
   const [customIds, setCustomIds] = useState("");
   const [listsError, setListsError] = useState<string | null>(null);
   const [preview, setPreview] = useState<AudiencePreview | null>(null);
+  const [previewForKey, setPreviewForKey] = useState<string | null>(null);
+  const previewGeneration = useRef(0);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewToken, setPreviewToken] = useState(0);
@@ -560,43 +587,55 @@ function AudienceSection({
   // Debounced host preview: exact counts and a bounded sample for the
   // one chosen base mode plus the saved exclusion list.
   const previewKey = JSON.stringify({ base: pick.base, exclusion: pick.exclusionListId });
+  const currentPreview = previewForKey === previewKey ? preview : null;
   useEffect(() => {
+    const generation = ++previewGeneration.current;
     if (scope.contextId === "" || !viewer.operator) {
       setPreview(null);
+      setPreviewForKey(null);
       onPreview(null);
       return;
     }
     if (pick.base.mode === "custom" && pick.base.customerIds.length === 0) {
       setPreview(null);
+      setPreviewForKey(null);
       onPreview(null);
       setPreviewLoading(false);
       setPreviewError(null);
       return;
     }
+    setPreview(null);
+    setPreviewForKey(null);
+    onPreview(null);
     setPreviewLoading(true);
+    setPreviewError(null);
+    const controller = new AbortController();
     const timer = setTimeout(() => {
-      const controller = new AbortController();
       audienceClient
         .preview(scope, pick.base, pick.exclusionListId ?? undefined)
         .then((value) => {
-          if (controller.signal.aborted) return;
+          if (controller.signal.aborted || generation !== previewGeneration.current) return;
           const parsed = parsePreview(value);
           setPreview(parsed);
+          setPreviewForKey(previewKey);
           onPreview(parsed);
           setPreviewError(null);
         })
         .catch((e: unknown) => {
-          if (controller.signal.aborted) return;
+          if (controller.signal.aborted || generation !== previewGeneration.current) return;
           setPreviewError(friendlyAudienceError(e));
           setPreview(null);
+          setPreviewForKey(null);
           onPreview(null);
         })
         .finally(() => {
-          if (!controller.signal.aborted) setPreviewLoading(false);
+          if (!controller.signal.aborted && generation === previewGeneration.current) setPreviewLoading(false);
         });
-      return () => controller.abort();
     }, 400);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [previewKey, listsToken, previewToken]);
 
@@ -681,7 +720,7 @@ function AudienceSection({
       {layout === "detail" ? (
         <>
           <EligibilityFunnel
-            preview={preview}
+            preview={currentPreview}
             loading={previewLoading}
             error={previewError}
             onRetry={() => setPreviewToken((count) => count + 1)}
@@ -797,7 +836,7 @@ function AudienceSection({
             </button>
           </p>
         ) : suppressions.length === 0 ? (
-          <p className="text-label text-ink-400">No suppressions in this context.</p>
+          <p className="text-label text-ink-400">No suppressions yet.</p>
         ) : (
           <ol className="crm-history">
             {suppressions.slice(0, 10).map((row) => (
@@ -979,7 +1018,7 @@ function AudienceSection({
         </form>
       )}
       <PreviewPanel
-        preview={preview}
+        preview={currentPreview}
         loading={previewLoading}
         error={previewError}
         onRetry={() => setPreviewToken((count) => count + 1)}
@@ -997,7 +1036,7 @@ function AudienceSection({
             </button>
           </p>
         ) : suppressions.length === 0 ? (
-          <p className="text-label text-ink-400">No suppressions in this context.</p>
+          <p className="text-label text-ink-400">No suppressions yet.</p>
         ) : (
           <ol className="crm-history">
             {suppressions.slice(0, 10).map((row) => (
@@ -1397,7 +1436,7 @@ function FinalSendPanel({
   };
 
   return (
-    <section aria-label="Final send" className="card px-4 py-4 grid gap-3 crm-send">
+    <section id="cmp-final-send" tabIndex={-1} aria-label="Final send" className="card px-4 py-4 grid gap-3 crm-send">
       <h4 className="text-cardtitle font-medium text-ink-100">
         Final send — approved, bounded, no resend
       </h4>
@@ -1420,8 +1459,8 @@ function FinalSendPanel({
         </div>
       ) : (
         <p className="text-label text-ok" data-prerequisites="met">
-          Every prerequisite is in place — approved r{doc.revision}, freeze {freezeId.trim()},
-          sender {binding?.sender.address}, accepted test send of this content.
+          Every prerequisite is in place — approved r{doc.revision}, the frozen audience
+          (checked just now), sender {binding?.sender.address}, accepted test send of this content.
         </p>
       )}
       {error && (
@@ -1602,6 +1641,9 @@ function CampaignWorkspace({
   campaignId,
   doc,
   onDoc,
+  onCloned,
+  onDirtyChange,
+  starterSenderBindingId,
   freezeId,
   freeze,
   audienceSlot,
@@ -1615,6 +1657,9 @@ function CampaignWorkspace({
   campaignId: string;
   doc: ContentDoc | null;
   onDoc: (doc: ContentDoc) => void;
+  onCloned?: (campaignId: string) => void;
+  onDirtyChange?: (dirty: boolean) => void;
+  starterSenderBindingId?: string | null;
   /** The detail page's named freeze + its last validity recheck —
    *  the final-send gate reads both. */
   freezeId?: string;
@@ -1633,6 +1678,17 @@ function CampaignWorkspace({
 }) {
   const canWrite = viewer.operator && !viewer.readOnly;
   const emailDraft = useEmailDraft(scope, campaignId, doc, onDoc);
+  const [contentBindings, setContentBindings] = useState<{ id: string; name: string; address: string }[]>([]);
+  const [contentBindingError, setContentBindingError] = useState<string | null>(null);
+  const [contentBindingId, setContentBindingId] = useState<string | null>(starterSenderBindingId ?? null);
+  useEffect(() => onDirtyChange?.(emailDraft.dirty), [emailDraft.dirty, onDirtyChange]);
+  const [cloneOpen, setCloneOpen] = useState(false);
+  const [cloneName, setCloneName] = useState("");
+  const [cloneAudience, setCloneAudience] = useState(false);
+  const [cloneSender, setCloneSender] = useState(false);
+  const [clonePending, setClonePending] = useState(false);
+  const [cloneError, setCloneError] = useState<string | null>(null);
+  const cloneDialogRef = useRef<HTMLDialogElement | null>(null);
   const [render, setRender] = useState<ContentRender | null>(null);
   const [renderPending, setRenderPending] = useState(false);
   const [renderError, setRenderError] = useState<string | null>(null);
@@ -1659,6 +1715,13 @@ function CampaignWorkspace({
   // A newly saved revision (create, Apply, save) invalidates test-send
   // evidence; the editor follows it inside `useEmailDraft`.
   const docIdentity = doc === null ? "none" : `${doc.revision}:${doc.contentDigest}`;
+  const renderIdentity = `${docIdentity}:${contentBindingId ?? "preview"}`;
+  useEffect(() => {
+    const dialog = cloneDialogRef.current;
+    if (dialog === null) return;
+    if (cloneOpen && !dialog.open) dialog.showModal();
+    if (!cloneOpen && dialog.open) dialog.close();
+  }, [cloneOpen]);
   useEffect(() => {
     setTestReceipt(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1672,11 +1735,11 @@ function CampaignWorkspace({
   // saved revision.
   const renderLive = useRef<{ campaign: string; doc: string; seq: number }>({
     campaign: campaignId,
-    doc: docIdentity,
+    doc: renderIdentity,
     seq: 0,
   });
   renderLive.current.campaign = campaignId;
-  renderLive.current.doc = docIdentity;
+  renderLive.current.doc = renderIdentity;
   useEffect(() => {
     if (doc === null) {
       setRender(null);
@@ -1685,7 +1748,7 @@ function CampaignWorkspace({
       return;
     }
     const seq = ++renderLive.current.seq;
-    const key = { campaign: campaignId, doc: docIdentity };
+    const key = { campaign: campaignId, doc: renderIdentity };
     // The revision+digest the render is asked for — a server-side
     // concurrent save can answer with newer content even when the
     // client generation still matches, so the receipt is validated
@@ -1698,11 +1761,17 @@ function CampaignWorkspace({
     contentClient
       .render(scope, campaignId, {
         sampleFirstName: sampleName.trim() === "" ? undefined : sampleName.trim(),
+        bindingId: contentBindingId ?? undefined,
       })
       .then((value) => {
         const live = renderLive.current;
         if (controller.signal.aborted || live.seq !== seq || live.campaign !== key.campaign || live.doc !== key.doc) return;
         const next = parseRender(value);
+        if (next.bindingId !== (contentBindingId ?? "preview")) {
+          setRender(null);
+          setRenderError("The rendered sender selection changed while rendering — retry to refresh the preview.");
+          return;
+        }
         if (expected !== null && (next.revision !== expected.revision || next.contentDigest !== expected.digest)) {
           // A concurrent save moved the revision past the request:
           // surface the mismatch as a reload-needed state, never as
@@ -1728,11 +1797,33 @@ function CampaignWorkspace({
       });
     return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope.installId, scope.contextId, campaignId, docIdentity, renderToken]);
+  }, [scope.installId, scope.contextId, campaignId, docIdentity, contentBindingId, renderToken]);
 
-  // The sender binding is host state — read on mount and whenever a
-  // bind/rebind/revoke lands (`bindingToken`). A none-bound refusal
-  // reads as `null`, everything else surfaces verbatim.
+  // These app-content sender rows are render metadata, not live SMTP
+  // authority. Keep their binding IDs distinct from SmtpBinding.connectionId.
+  useEffect(() => {
+    if (!viewer.operator || scope.contextId === "") return;
+    const controller = new AbortController();
+    contentClient.bindingList(scope).then((value) => {
+      if (controller.signal.aborted) return;
+      const rows = (value as { bindings?: unknown } | null)?.bindings;
+      setContentBindings(Array.isArray(rows) ? rows.flatMap((raw) => {
+        if (!raw || typeof raw !== "object") return [];
+        const row = raw as Record<string, unknown>;
+        const sender = row.sender as Record<string, unknown> | null;
+        return typeof row.binding_id === "string" && typeof sender?.name === "string" && typeof sender.address === "string"
+          ? [{ id: row.binding_id, name: sender.name, address: sender.address }]
+          : [];
+      }) : []);
+      setContentBindingError(null);
+    }).catch((error: unknown) => {
+      if (!controller.signal.aborted) setContentBindingError(friendlyCampaignError(error));
+    });
+    return () => controller.abort();
+  }, [scope.installId, scope.contextId, viewer.operator]);
+
+  // The SMTP connection is context-global send authority. Keep it
+  // separate from the preview-only app-content sender selection above.
   useEffect(() => {
     if (scope.contextId === "" || !viewer.operator) return;
     const controller = new AbortController();
@@ -2254,6 +2345,54 @@ function CampaignWorkspace({
     />
   );
 
+  const canCopyAudience = freezeId !== undefined && freeze?.valid === true;
+  const canCopySender = contentBindingId !== null && render !== null && !renderPending && render.bindingId === contentBindingId && render.bindingId !== "preview";
+  const cloneSavedCampaign = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!canWrite || doc === null || onCloned === undefined) return;
+    const name = cloneName.trim();
+    try {
+      checkCampaignName(name);
+    } catch (error) {
+      setCloneError(friendlyCampaignError(error));
+      return;
+    }
+    if ((cloneAudience && !canCopyAudience) || (cloneSender && !canCopySender)) {
+      setCloneError("A selected starter setting is no longer available. Recheck it and try again.");
+      return;
+    }
+    setClonePending(true);
+    setCloneError(null);
+    void contentClient.clone(scope, campaignId, {
+      expectedRevision: doc.revision,
+      name,
+      ...(cloneAudience && freezeId !== undefined ? { copyAudience: { sourceFreezeId: freezeId } } : {}),
+      ...(cloneSender && canCopySender && render !== null && render.bindingId !== "preview"
+        ? { copySender: { sourceBindingId: render.bindingId } }
+        : {}),
+    }).then((result) => {
+      const newId = result.content.campaign_id;
+      const starterBase = result.starterSelection.audience?.base;
+      const audienceBase: AudienceBaseInput | null = starterBase === undefined
+        ? null
+        : starterBase.mode === "all"
+          ? { mode: "all" }
+          : starterBase.mode === "segment"
+            ? { mode: "segment", segmentId: starterBase.segment_id }
+            : { mode: "custom", customerIds: starterBase.customer_ids };
+      setLanding({
+        campaignId: newId,
+        tab: "email",
+        segmentId: null,
+        audienceBase,
+        exclusionListId: result.starterSelection.audience?.exclusionListId ?? null,
+        senderBindingId: result.starterSelection.senderBindingId,
+      });
+      setCloneOpen(false);
+      onCloned(newId);
+    }).catch((error: unknown) => setCloneError(friendlyCampaignError(error))).finally(() => setClonePending(false));
+  };
+
   // New campaign (or a host without an audience slot): content first
   // with the always-mounted preview beside it; the audience picker
   // stays on the new page itself. Saved campaigns take the ordered
@@ -2272,11 +2411,9 @@ function CampaignWorkspace({
       </div>
     );
   }
-  // CAD-1055 saved campaign: four tabs instead of one long scroll.
-  // Overview carries the ready-to-send checklist plus the approval,
-  // sender, test-send and final-send controls; Email is the view-only
-  // preview with the assistant proposal strip; Audience and Activity
-  // come from the owning page.
+  // CAD-1055 saved campaign: four tabs. Overview stays compact; the
+  // revision-bound approval, test and final-send controls remain distinct
+  // guarded actions. Email owns editing and assistant proposal review.
   const activeTab = tab ?? "overview";
   const setTab = onTab ?? (() => {});
   const readiness = sendReadiness({
@@ -2289,7 +2426,55 @@ function CampaignWorkspace({
   const pendingProposals = proposals.filter((row) => row.state === "pending");
   const emailBadge = pendingProposals.length > 0 ? `${pendingProposals.length} draft` : null;
   return (
-    <CampaignTabs
+    <>
+      {onCloned !== undefined && doc !== null && (
+        <div className="flex justify-end">
+          <Button
+            size="sm"
+            disabled={!canWrite}
+            onClick={() => {
+              setCloneName(`${campaignTitle(doc)} — Copy`);
+              setCloneAudience(canCopyAudience);
+              setCloneSender(canCopySender);
+              setCloneError(null);
+              setCloneOpen(true);
+            }}
+          >
+            Clone campaign
+          </Button>
+        </div>
+      )}
+      <dialog
+        ref={cloneDialogRef}
+        className="crm-clone-dialog"
+        aria-labelledby="cmp-clone-title"
+        onCancel={(event) => { event.preventDefault(); setCloneOpen(false); }}
+        onClose={() => setCloneOpen(false)}
+      >
+        <form className="grid gap-3 p-4" onSubmit={cloneSavedCampaign}>
+          <h2 id="cmp-clone-title" className="text-cardtitle font-medium text-ink-100">Clone campaign</h2>
+          <p className="text-label text-ink-300">Creates a new draft from this campaign&apos;s saved revision. Approval, frozen recipients, proposals, test receipts, preparation and send history are not copied. Sender selection is context-shared preview metadata only; it never rebinds SMTP or authorizes sending.</p>
+          <label className="grid gap-1 text-label text-ink-300" htmlFor="cmp-clone-name">
+            New campaign name
+            <input id="cmp-clone-name" className="field" value={cloneName} maxLength={CAMPAIGN_NAME_MAX} required disabled={clonePending} onChange={(event) => setCloneName(event.target.value)} />
+          </label>
+          <label className="flex items-center gap-2 text-label text-ink-300">
+            <input type="checkbox" checked={cloneAudience} disabled={!canCopyAudience || clonePending} onChange={(event) => setCloneAudience(event.target.checked)} />
+            Copy audience criteria {canCopyAudience ? "from the current valid freeze" : "(no valid source freeze)"}
+          </label>
+          <label className="flex items-center gap-2 text-label text-ink-300">
+            <input type="checkbox" checked={cloneSender} disabled={!canCopySender || clonePending} onChange={(event) => setCloneSender(event.target.checked)} />
+            Copy selected sender preview {canCopySender ? `(${render?.sender.name})` : "(select a non-preview sender in Email first)"}
+          </label>
+          {emailDraft.dirty && <p className="text-label text-warn" role="status">Unsaved edits are not included. Save them first if you want to clone the changes.</p>}
+          {cloneError !== null && <p className="text-label text-fail" role="alert">{cloneError}</p>}
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="ghost" disabled={clonePending} onClick={() => setCloneOpen(false)}>Cancel</Button>
+            <Button type="submit" variant="primary" loading={clonePending} disabled={clonePending || !canWrite || doc === null}>Clone as new draft</Button>
+          </div>
+        </form>
+      </dialog>
+      <CampaignTabs
       tabs={[
         { id: "overview", label: "Overview" },
         { id: "email", label: "Email", badge: emailBadge },
@@ -2308,9 +2493,24 @@ function CampaignWorkspace({
             audienceLabel={audienceLabel ?? "—"}
             onTab={setTab}
           />
-          {approvalSection}
-            {testSection}
-          {finalSend}
+          {approvalSection !== null && (
+            <details className="crm-diag" data-overview-guard="content-approval">
+              <summary className="text-label text-ink-300">Content approval — separate decision</summary>
+              {approvalSection}
+            </details>
+          )}
+          {testSection !== null && (
+            <details className="crm-diag" data-overview-guard="test-send">
+              <summary className="text-label text-ink-300">Test email — separate action</summary>
+              {testSection}
+            </details>
+          )}
+          {finalSend !== null && (
+            <details className="crm-diag" data-overview-guard="final-send">
+              <summary className="text-label text-ink-300">Final send — separate operator review</summary>
+              {finalSend}
+            </details>
+          )}
         </>
       )}
       {activeTab === "email" && (
@@ -2324,16 +2524,19 @@ function CampaignWorkspace({
           onRefresh={() => setRenderToken((count) => count + 1)}
           sampleName={sampleName}
           onSampleName={setSampleName}
+          senderBindings={contentBindings}
+          senderBindingId={contentBindingId}
+          onSenderBindingId={(id) => { setContentBindingId(id); setRender(null); }}
+          senderBindingError={contentBindingError}
           dirty={dirty}
           proposals={pendingProposals}
           proposalsError={proposalsError}
           proposalError={proposalError}
           proposalNote={proposalNote}
           onRefreshDrafts={() => setProposalToken((count) => count + 1)}
-          onApplied={applyProposal}
           onDiscarded={discardProposal}
           onProposalError={setProposalError}
-          edit={canWrite && doc !== null ? emailDraft : null}
+          edit={canWrite ? emailDraft : null}
         />
       )}
       {activeTab === "audience" && audienceSlot}
@@ -2348,7 +2551,8 @@ function CampaignWorkspace({
           sends={activitySlot}
         />
       )}
-    </CampaignTabs>
+      </CampaignTabs>
+    </>
   );
 }
 
@@ -2640,14 +2844,20 @@ function CampaignDetail({
   viewer,
   campaignId,
   onBack,
+  onCloned,
 }: {
   scope: AudienceScope;
   viewer: Viewer;
   campaignId: string;
   onBack: () => void;
+  onCloned: (campaignId: string) => void;
 }) {
+  const canWrite = viewer.operator && !viewer.readOnly;
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const [doc, setDoc] = useState<ContentDoc | null>(null);
+  const [unsaved, setUnsaved] = useState(false);
+  const [confirmLeave, setConfirmLeave] = useState(false);
+  const [pendingNavigation, setPendingNavigation] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // CAD-1016: a campaign that exists only as a pending assistant draft
@@ -2658,16 +2868,31 @@ function CampaignDetail({
   // CAD-1058: a campaign just created from the dialog lands on its Email
   // tab, with the segment the operator picked there (if any). Peeked on
   // mount and cleared in an effect, so the hand-off is one-shot.
+  const [landingSegmentId] = useState(() => peekLanding(campaignId)?.segmentId ?? null);
+  const [starterSenderBindingId] = useState(() => peekLanding(campaignId)?.senderBindingId ?? null);
+  // A clone starter audience counts as an explicit pick: the saved draft
+  // audience must never replace what the operator chose to copy.
+  const pickEdited = useRef(peekLanding(campaignId)?.audienceBase != null);
   const [pick, setPick] = useState<AudiencePick>(() => {
-    const segmentId = peekLanding(campaignId)?.segmentId ?? null;
+    const landing = peekLanding(campaignId);
     return {
-      base: segmentId !== null ? { mode: "segment", segmentId } : { mode: "all" },
-      exclusionListId: null,
+      base:
+        landing?.audienceBase ??
+        (landingSegmentId !== null ? { mode: "segment", segmentId: landingSegmentId } : { mode: "all" }),
+      exclusionListId: landing?.exclusionListId ?? null,
     };
   });
-  const [audiencePreview, setAudiencePreview] = useState<AudiencePreview | null>(null);
+  const [audiencePreviewState, setAudiencePreviewState] = useState<{ key: string; preview: AudiencePreview } | null>(null);
+  const audiencePickKey = JSON.stringify({ base: pick.base, exclusion: pick.exclusionListId });
+  const audiencePreview = audiencePreviewState?.key === audiencePickKey ? audiencePreviewState.preview : null;
+  const recordAudiencePreview = (preview: AudiencePreview | null) => {
+    setAudiencePreviewState(preview === null ? null : { key: audiencePickKey, preview });
+  };
   const [tab, setTab] = useState<CampaignTab>(() => peekLanding(campaignId)?.tab ?? "overview");
-  const [freezeId, setFreezeId] = useState(`${campaignId}-freeze-1`);
+  // CAD-1178: derived, never typed — the operator's audience choice *is*
+  // the freeze identity. A changed audience is a new id, so the status line
+  // reads "not frozen yet" until the operator freezes it.
+  const freezeId = audienceFreezeId(campaignId, pick);
   const [freeze, setFreeze] = useState<{
     finalCount: number;
     digest: string;
@@ -2677,6 +2902,40 @@ function CampaignDetail({
   } | null>(null);
   const [freezePending, setFreezePending] = useState(false);
   const [freezeError, setFreezeError] = useState<string | null>(null);
+  // No freeze row for this derived id yet — the honest "not frozen" state,
+  // distinct from an error.
+  const [freezeMissing, setFreezeMissing] = useState(false);
+
+  useEffect(() => {
+    if (!unsaved) return;
+    const guardInternalLink = (event: MouseEvent) => {
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      const target = event.target instanceof Element ? event.target.closest("a[href]") : null;
+      if (!(target instanceof HTMLAnchorElement) || target.target !== "" || target.hasAttribute("download")) return;
+      const destination = new URL(target.href, window.location.href);
+      if (destination.origin !== window.location.origin || destination.href === window.location.href) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setPendingNavigation(`${destination.pathname}${destination.search}${destination.hash}`);
+    };
+    document.addEventListener("click", guardInternalLink, true);
+    return () => document.removeEventListener("click", guardInternalLink, true);
+  }, [unsaved]);
+
+  useEffect(() => {
+    if (!unsaved) return;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [unsaved]);
+
+  const requestBack = () => {
+    if (unsaved) setConfirmLeave(true);
+    else onBack();
+  };
 
   useEffect(() => {
     headRef.current?.focus();
@@ -2693,7 +2952,19 @@ function CampaignDetail({
     contentClient
       .show(scope, campaignId)
       .then((value) => {
-        if (!controller.signal.aborted) setDoc(parseContentDoc(value));
+        if (controller.signal.aborted) return;
+        const nextDoc = parseContentDoc(value);
+        const draftAudience = nextDoc.draftAudience;
+        setDoc(nextDoc);
+        if (landingSegmentId === null && !pickEdited.current && draftAudience?.mode === "segment") {
+          setPick((current) => {
+            if (pickEdited.current) return current;
+            return {
+              ...current,
+              base: { mode: "segment", segmentId: draftAudience.segmentId },
+            };
+          });
+        }
       })
       .catch((e: unknown) => {
         if (controller.signal.aborted) return;
@@ -2725,18 +2996,21 @@ function CampaignDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadToken]);
 
+  // Every check carries a generation: an older lookup resolving after a
+  // newer one (audience changed mid-flight) can never paint its row.
+  const freezeGeneration = useRef(0);
+
   const checkFreeze = () => {
-    if (freezeId.trim() === "") {
-      setFreezeError("a freeze ID is required to recheck validity");
-      return;
-    }
+    const generation = (freezeGeneration.current += 1);
     setFreezePending(true);
     setFreezeError(null);
     void audienceClient
-      .freezeShow(scope, freezeId.trim())
+      .freezeShow(scope, freezeId)
       .then((value) => {
+        if (generation !== freezeGeneration.current) return;
         const root = (value as Record<string, unknown> | null) ?? {};
         const row = (root.freeze as Record<string, unknown> | null) ?? {};
+        setFreezeMissing(false);
         setFreeze({
           finalCount: typeof row.final_count === "number" ? row.final_count : -1,
           digest: typeof row.digest === "string" ? row.digest : "",
@@ -2745,6 +3019,44 @@ function CampaignDetail({
           currentCount: typeof root.current_final_count === "number" ? root.current_final_count : null,
         });
       })
+      .catch((err: unknown) => {
+        if (generation !== freezeGeneration.current) return;
+        // CAD-1178: a missing freeze is the normal "not frozen yet" state,
+        // not an error the operator has to decode (the board maps it to 404).
+        if (err instanceof ApiError && err.status === 404) {
+          setFreeze(null);
+          setFreezeMissing(true);
+          return;
+        }
+        setFreezeError(friendlyAudienceError(err));
+      })
+      .finally(() => setFreezePending(false));
+  };
+
+  // Auto-recheck on load and whenever the derived id changes (the audience
+  // base, the exclusions, or the campaign itself): the status line is always
+  // the current truth, never a stale click's memory.
+  useEffect(() => {
+    checkFreeze();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [freezeId]);
+
+  const freezeAudience = () => {
+    if (!canWrite || audiencePreview === null || audiencePreview.finalCount === 0) return;
+    setFreezePending(true);
+    setFreezeError(null);
+    // The ceiling is derived from the previewed size with headroom, never
+    // typed: it bounds an unexpected growth spurt without constraining the
+    // audience the operator just previewed.
+    const ceiling = Math.max(10, Math.ceil(audiencePreview.finalCount * 1.25) + 10);
+    void audienceClient
+      .prepare(scope, {
+        freezeId,
+        base: pick.base,
+        exclusionListId: pick.exclusionListId ?? undefined,
+        maxRecipients: ceiling,
+      })
+      .then(() => checkFreeze())
       .catch((err: unknown) => setFreezeError(friendlyAudienceError(err)))
       .finally(() => setFreezePending(false));
   };
@@ -2761,7 +3073,7 @@ function CampaignDetail({
           )}
         </h3>
         <p className="text-label text-ink-400 mt-1">
-          <button type="button" className="lnk" onClick={onBack}>
+          <button type="button" className="lnk" onClick={requestBack}>
             ← Campaigns
           </button>
         </p>
@@ -2811,6 +3123,9 @@ function CampaignDetail({
             campaignId={campaignId}
             doc={doc}
             onDoc={setDoc}
+            onCloned={onCloned}
+            onDirtyChange={setUnsaved}
+            starterSenderBindingId={starterSenderBindingId}
             freezeId={freezeId}
             freeze={freeze}
             tab={tab}
@@ -2823,46 +3138,53 @@ function CampaignDetail({
                   scope={scope}
                   viewer={viewer}
                   pick={pick}
-                  onPick={setPick}
-                  onPreview={setAudiencePreview}
+                  onPick={(next) => {
+                    pickEdited.current = true;
+                    setPick(next);
+                    setAudiencePreviewState(null);
+                  }}
+                  onPreview={recordAudiencePreview}
                   layout="detail"
                 />
                 <section aria-label="Frozen audience" className="card px-4 py-4 grid gap-3">
                   <h4 className="text-cardtitle font-medium text-ink-100">Freeze</h4>
                   <p className="text-label text-ink-400">
                     A freeze snapshots exactly who receives this campaign, so later customer
-                    changes do not affect it. Name the freeze this campaign sends to and recheck
-                    that it is still valid before sending.
+                    changes cannot alter it. The audience above is the freeze — no ids to
+                    handle: freeze it, and recheck whenever the audience changes.
                   </p>
-                  <div className="crm-field-row">
-                    <div className="crm-field">
-                      <label className="text-label text-ink-300" htmlFor="cmp-detail-freeze">
-                        Freeze ID to recheck
-                      </label>
-                      <input
-                        id="cmp-detail-freeze"
-                        className="field"
-                        value={freezeId}
-                        onChange={(e) => setFreezeId(e.target.value)}
-                        maxLength={128}
-                        autoComplete="off"
-                        disabled={freezePending}
-                      />
-                    </div>
-                    <div>
-                      <span className="text-label text-ink-300">Validity</span>
-                      <div className="mt-1">
-                        <Button size="sm" loading={freezePending} disabled={freezePending} onClick={checkFreeze}>
-                          Recheck freeze
-                        </Button>
-                      </div>
-                    </div>
-                  </div>
                   {freezeError && (
                     <p className="text-label text-fail" role="alert">
                       {freezeError}
                     </p>
                   )}
+                  <p className="text-label text-ink-100" data-freeze-state={
+                    freeze === null ? "unfrozen" : freeze.valid === true ? "valid" : "drifted"
+                  }>
+                    {freeze === null
+                      ? freezeMissing
+                        ? "This audience is not frozen yet. Freezing snapshots exactly who receives the campaign, so later customer changes cannot alter it."
+                        : "Checking the freeze…"
+                      : freeze.valid === true
+                        ? `Audience frozen · ${freeze.finalCount} recipient${freeze.finalCount === 1 ? "" : "s"} · checked just now`
+                        : `Audience changed since you froze it (was ${freeze.finalCount}, now ${freeze.currentCount ?? "—"}) — refreeze to continue.`}
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      loading={freezePending}
+                      disabled={freezePending || !canWrite || audiencePreview === null || audiencePreview.finalCount === 0}
+                      onClick={freezeAudience}
+                    >
+                      {freeze !== null && freeze.valid === false ? "Use audience · refresh snapshot" : freeze === null ? "Use audience · create snapshot" : "Use audience · refresh snapshot"}
+                    </Button>
+                    {freeze !== null && (
+                      <Button size="sm" loading={freezePending} disabled={freezePending} onClick={checkFreeze}>
+                        Recheck
+                      </Button>
+                    )}
+                  </div>
                   {freeze && (
                     <>
                       <dl className="crm-detail" aria-label="Freeze validity">
@@ -2888,6 +3210,9 @@ function CampaignDetail({
                       </dl>
                       <details className="crm-diag">
                         <summary className="text-micro text-ink-500">Technical details</summary>
+                        <p className="num text-micro text-ink-500 mt-1" title="Freeze ID (derived from the audience)">
+                          Freeze {freezeId}
+                        </p>
                         <p className="num text-micro text-ink-500 mt-1" title="Frozen audience digest">
                           Digest {freeze.digest}
                         </p>
@@ -2899,6 +3224,24 @@ function CampaignDetail({
             }
           />
         </>
+      )}
+      {(confirmLeave || pendingNavigation !== null) && (
+        <ConfirmDialog
+          title="Leave with unsaved email changes?"
+          body={<p>Your email draft has not been saved. Leave this campaign and discard those local edits?</p>}
+          confirmLabel={pendingNavigation === null ? "Leave campaign" : "Leave page"}
+          pending={false}
+          error={null}
+          onCancel={() => { setConfirmLeave(false); setPendingNavigation(null); }}
+          onConfirm={() => {
+            setConfirmLeave(false);
+            if (pendingNavigation !== null) {
+              const destination = pendingNavigation;
+              setPendingNavigation(null);
+              navigate(destination);
+            } else onBack();
+          }}
+        />
       )}
     </section>
   );

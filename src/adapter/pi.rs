@@ -659,6 +659,199 @@ fn package_root(program: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Read a small regular file without following a final-component symlink
+/// and with a hard allocation/read cap, even if it changes during the read.
+fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let before = std::fs::symlink_metadata(path).ok()?;
+    if !before.file_type().is_file() || before.len() > max_bytes {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if !after.file_type().is_file() || after.len() > max_bytes {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(max_bytes as usize);
+    file.take(max_bytes + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= max_bytes).then_some(bytes)
+}
+
+/// Resolve only the known managed launcher layout. The wrapper is never
+/// executed during policy discovery: its version pointer and expected
+/// release paths are read and checked as data instead.
+fn managed_pi_dependencies(program: &Path, env: &ProviderEnv) -> Vec<PathBuf> {
+    let Some(real) = program.canonicalize().ok() else {
+        return Vec::new();
+    };
+    let Some(bin) = real.parent() else {
+        return Vec::new();
+    };
+    if real.file_name().is_none_or(|name| name != "pi")
+        || bin.file_name().is_none_or(|name| name != "bin")
+    {
+        return Vec::new();
+    }
+    let Some(agent_root) = bin.parent() else {
+        return Vec::new();
+    };
+    if agent_root.file_name().is_none_or(|name| name != "agent")
+        || agent_root
+            .parent()
+            .and_then(Path::file_name)
+            .is_none_or(|name| name != ".pi")
+    {
+        return Vec::new();
+    }
+    // A managed install has exactly <agent>/bin/pi and a sibling
+    // <agent>/install tree. Do not infer this from an arbitrary script.
+    if agent_root
+        .join("bin")
+        .join("pi")
+        .canonicalize()
+        .ok()
+        .as_deref()
+        != Some(real.as_path())
+    {
+        return Vec::new();
+    }
+    let install = agent_root.join("install");
+    let Ok(real_install) = install.canonicalize() else {
+        return Vec::new();
+    };
+    if real_install != install || !real_install.is_dir() {
+        return Vec::new();
+    }
+
+    let pointer = install.join("current-version");
+    const MAX_POINTER_BYTES: u64 = 130; // 128 safe version bytes plus CRLF.
+    let Some(pointer_bytes) = read_bounded_regular_file(&pointer, MAX_POINTER_BYTES) else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::str::from_utf8(&pointer_bytes) else {
+        return Vec::new();
+    };
+    let version = contents
+        .strip_suffix("\r\n")
+        .or_else(|| contents.strip_suffix('\n'))
+        .unwrap_or(contents);
+    if version.is_empty()
+        || version.len() > 128
+        || version == "."
+        || version == ".."
+        || !version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+    {
+        return Vec::new();
+    }
+
+    let releases = install.join("releases");
+    let Ok(real_releases) = releases.canonicalize() else {
+        return Vec::new();
+    };
+    if real_releases != releases || !real_releases.is_dir() {
+        return Vec::new();
+    }
+    let release = releases.join(version);
+    let Ok(real_release) = release.canonicalize() else {
+        return Vec::new();
+    };
+    // Reject a version entry that is a symlink or escapes the exact
+    // current-release directory; never grant a neighboring release.
+    if real_release != release || real_release.parent() != Some(real_releases.as_path()) {
+        return Vec::new();
+    }
+    let executable = release.join("node_modules/.bin/pi");
+    let Some(package) = package_root(&executable) else {
+        return Vec::new();
+    };
+    let Ok(real_package) = package.canonicalize() else {
+        return Vec::new();
+    };
+    if !real_package.starts_with(&real_release)
+        || executable
+            .canonicalize()
+            .ok()
+            .is_none_or(|target| !target.starts_with(&real_release))
+    {
+        return Vec::new();
+    }
+    let manifest = real_package.join("package.json");
+    let Some(manifest_bytes) = read_bounded_regular_file(&manifest, 1024 * 1024) else {
+        return Vec::new();
+    };
+    let Ok(manifest_json) = serde_json::from_slice::<serde_json::Value>(&manifest_bytes) else {
+        return Vec::new();
+    };
+    if manifest_json
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        != Some("@earendil-works/pi-coding-agent")
+    {
+        return Vec::new();
+    }
+
+    let mut roots = vec![pointer, real_release];
+    // The managed wrapper uses ${XDG_DATA_HOME:-$HOME/.local/share} for
+    // its optional Node. Match that environment, then accept only a direct
+    // version child of the canonical pi-node anchor.
+    let data_home = env
+        .var("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env.var("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/share"))
+        });
+    if let Some(data_home) = data_home {
+        if let Ok(real_data_home) = data_home.canonicalize() {
+            let node_root = real_data_home.join("pi-node");
+            if let (Ok(node_root_meta), Ok(real_node_root)) = (
+                std::fs::symlink_metadata(&node_root),
+                node_root.canonicalize(),
+            ) {
+                if node_root_meta.file_type().is_dir() && real_node_root == node_root {
+                    let node = node_root.join("current/bin/node");
+                    if let Ok(real_node) = node.canonicalize() {
+                        if let Some(node_version) = real_node
+                            .parent()
+                            .and_then(Path::parent)
+                            .map(Path::to_path_buf)
+                        {
+                            if let Ok(real_node_version) = node_version.canonicalize() {
+                                use std::os::unix::fs::PermissionsExt;
+                                if real_node.is_file()
+                                    && real_node_version.parent() == Some(real_node_root.as_path())
+                                    && real_node
+                                        .metadata()
+                                        .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+                                    && real_node_version
+                                        .join("bin/node")
+                                        .canonicalize()
+                                        .ok()
+                                        .as_deref()
+                                        == Some(real_node.as_path())
+                                {
+                                    roots.push(real_node_version);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    roots
+}
+
 /// What the Pi master's confinement is computed from — same shape as
 /// Claude's inputs, plus Pi's package dir, the guard extension and its
 /// private `PI_CODING_AGENT_DIR`.
@@ -685,6 +878,9 @@ fn pi_confine_inputs(
     // but never write it. Its own provider dir is `master/pi`: nothing
     // of `master/claude` (or its `.credentials.json`) is in the policy.
     let mut extra_read = split_paths(env.var(crate::master::CONFINE_EXTRA_READ_ENV));
+    if let Some(program) = command.first().and_then(|c| which(c, path.as_deref())) {
+        extra_read.extend(managed_pi_dependencies(&program, env));
+    }
     extra_read.push(pi_guard_path(state_dir));
     if let Ok(path) = pi_turn_guard_path(state_dir, crate::master::ALIAS) {
         extra_read.push(path);
@@ -2833,6 +3029,10 @@ impl ProviderAdapter for PiAdapter {
         self.shared.on_disconnect();
     }
 }
+
+#[cfg(test)]
+#[path = "pi/cad1195_acceptance.rs"]
+mod cad1195_acceptance;
 
 #[cfg(test)]
 mod cad1098_tests {

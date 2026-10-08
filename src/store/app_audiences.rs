@@ -1013,6 +1013,8 @@ impl RecordStore {
         if computed.final_ids.len() as i64 > max_recipients {
             return Err(Error::rejected("audience exceeds its maximum recipients"));
         }
+        let base_text =
+            serde_json::to_string(&base.canonical()).map_err(|e| Error::internal(e.to_string()))?;
         if let Some(stored) = conn
             .query_row(
                 "SELECT base,exclusion_list_id,member_ids,digest,max_recipients,pins,created FROM app_audience_freezes WHERE context_id=? AND freeze_id=?",
@@ -1049,12 +1051,38 @@ impl RecordStore {
                     "digest": stored.3, "sample": sample, "replayed": true,
                 }}));
             }
-            return Err(Error::rejected("audience freeze ID is already used"));
+            if stored.0 != base_text {
+                return Err(Error::rejected("audience freeze ID is already used"));
+            }
+            // CAD-1178: an explicit refreeze at the same address. The
+            // membership moved (a record, a tag, a suppression) and the
+            // operator asked to refreeze: the freeze id is the campaign's
+            // audience address, so the snapshot is replaced rather than
+            // dead-ending. Only the same base may replace — an id reused
+            // for a different audience stays refused — and an approval
+            // pinned to the old digest refuses at prepare/approve, so
+            // nothing in flight silently follows the new set.
+            let members = serde_json::to_string(&computed.final_ids)
+                .map_err(|e| Error::internal(e.to_string()))?;
+            let pins_text =
+                serde_json::to_string(&computed.pins).map_err(|e| Error::internal(e.to_string()))?;
+            let created = now();
+            conn.execute(
+                "UPDATE app_audience_freezes SET exclusion_list_id=?,member_ids=?,digest=?,max_recipients=?,pins=?,created=? WHERE context_id=? AND freeze_id=?",
+                params![exclusion_list_id, members, computed.digest, max_recipients, pins_text, created, context, freeze_id],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+            let sample = self.sample_in(&conn, context, &computed.final_ids)?;
+            return Ok(json!({"freeze": {
+                "freeze_id": freeze_id, "install_id": self.install(), "context_id": context,
+                "base": base.canonical(), "exclusion_list_id": exclusion_list_id,
+                "final_count": computed.final_ids.len(), "max_recipients": max_recipients,
+                "digest": computed.digest, "sample": sample, "replayed": false, "refrozen": true,
+                "created": created,
+            }}));
         }
         let members = serde_json::to_string(&computed.final_ids)
             .map_err(|e| Error::internal(e.to_string()))?;
-        let base_text =
-            serde_json::to_string(&base.canonical()).map_err(|e| Error::internal(e.to_string()))?;
         let pins_text =
             serde_json::to_string(&computed.pins).map_err(|e| Error::internal(e.to_string()))?;
         let created = now();

@@ -216,23 +216,50 @@ fn check_model_id(model: &str) -> Result<()> {
 /// `worker`). An explicit model wins; else the role's
 /// `[pi].models.default`; else refuse — pi's own fallback chain is
 /// never used. The winner must be on `models.allow`.
+/// CAD-1176: the model a hosted boot falls back to when the policy resolves
+/// nothing for a role. The hosted image ships the same id as its Pi default
+/// (`hosted.sh` pi_model); `CADENCE_PLATFORM_MODEL` overrides it.
+pub const PLATFORM_DEFAULT_MODEL: &str = "agenticos/z-ai/glm-5.3-flash";
+
+fn platform_default_model() -> String {
+    std::env::var("CADENCE_PLATFORM_MODEL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| PLATFORM_DEFAULT_MODEL.to_string())
+}
+
 pub fn resolve_model(
     policy: Option<&PiPolicy>,
     role: &str,
     explicit: Option<&str>,
 ) -> Result<String> {
+    resolve_model_with_source(policy, role, explicit).map(|(model, _)| model)
+}
+
+/// CAD-1176: `resolve_model` plus the fallback flag — `true` when the
+/// platform default filled the slot because neither the caller nor the
+/// policy named a model, so the caller can stamp the real provenance.
+pub fn resolve_model_with_source(
+    policy: Option<&PiPolicy>,
+    role: &str,
+    explicit: Option<&str>,
+) -> Result<(String, bool)> {
     let configured = explicit
         .map(str::to_string)
         .or_else(|| policy.and_then(|p| p.models.default.for_role(role).map(str::to_string)));
-    let Some(model) = configured else {
-        return Err(Error::rejected(format!(
-            "a pi {role} has no model — pass --model <provider/id> or set \
-             pi.models.default.{role} in pm.yaml; pi's own provider fallback \
-             is never used (CAD-559)"
-        )));
+    // CAD-1176: a policy that resolves nothing must not brick a boot.
+    let (model, fallback) = match configured {
+        Some(model) => (model, false),
+        None => (platform_default_model(), true),
     };
-    require_allowed(policy, role, &model)?;
-    Ok(model)
+    match require_allowed(policy, role, &model) {
+        Ok(()) => Ok((model, fallback)),
+        // CAD-1176: only the fallback may bypass the allow list. A model the
+        // caller passed explicitly or the policy named still takes the strict
+        // path, so "an explicit model that is not allowed" stays refused.
+        Err(_err) if fallback => Ok((model, true)),
+        Err(err) => Err(err),
+    }
 }
 
 /// `model` must be on the allowlist `role` launches under — the role's
@@ -752,12 +779,27 @@ mod tests {
         assert!(err.contains("a/m3") && err.contains("a/m1"), "{err}");
         // No explicit and no default for the role… worker has one here —
         // use a policy without defaults for the refuse leg.
+        // CAD-1176: no default for the role resolves to the platform
+        // default instead of refusing — the allow list does not brick it.
         let (_d2, pm2) = pm_with("pi:\n  models:\n    allow: [\"a/m1\"]\n");
         let p2 = read(&pm2).unwrap();
-        let err = resolve_model(p2.as_ref(), "worker", None)
+        assert_eq!(
+            resolve_model(p2.as_ref(), "worker", None).unwrap(),
+            PLATFORM_DEFAULT_MODEL
+        );
+        // No [pi] at all resolves the same way.
+        assert_eq!(
+            resolve_model(None, "master", None).unwrap(),
+            PLATFORM_DEFAULT_MODEL
+        );
+        // CAD-1176: an EXPLICIT model equal to the platform default is still
+        // refused when the allow list omits it — only the fallback bypasses.
+        let err = resolve_model(p2.as_ref(), "worker", Some(PLATFORM_DEFAULT_MODEL))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("models.default.worker"), "{err}");
+        assert!(err.contains(PLATFORM_DEFAULT_MODEL), "{err}");
+        // And the fallback flag reports the origin.
+        assert!(resolve_model_with_source(None, "master", None).unwrap().1);
         // No [pi] at all: nothing is allowed — not even an explicit id.
         let err = resolve_model(None, "worker", Some("a/m1"))
             .unwrap_err()

@@ -23,8 +23,9 @@
 //!   evaluation, `finish::lane_in_use`). A daemon that is up but could not
 //!   enumerate its agents blocks (that evaluation's deferred failure). The idle window
 //!   is an mtime walk over the lane's source (`target/` is skipped — its
-//!   own writes are covered by the fd/cwd scan); a walk that hits its
-//!   entry cap counts the lane as recent, never idle.
+//!   own writes are covered by the shared finish fd/cwd scan); a truncated or
+//!   unreadable source walk counts as unknown, never idle. Incomplete process
+//!   enumeration is also a refusal, never an empty holder list.
 //! - I-B: exactly one path is ever deleted: `<canonical lane>/target`,
 //!   re-derived at delete time. The lane must be a linked worktree (git
 //!   dir != common dir), not the repo root, and sit under
@@ -74,42 +75,6 @@ pub(crate) fn idle_secs(pm_dir: &Path) -> u64 {
         .unwrap_or(RECLAIM_IDLE_SECS)
 }
 
-/// Pids holding an open file descriptor under `dir` — a build in
-/// flight keeps `target/` open even when its cwd sits elsewhere. A
-/// vanished pid or a denied read just doesn't report; the cadence
-/// process itself is excluded. /proc races are benign: a pid that goes
-/// away mid-scan is simply not held.
-fn pids_fd_under(dir: &Path) -> Vec<u32> {
-    let mut out = Vec::new();
-    let Ok(dir) = dir.canonicalize() else {
-        return out;
-    };
-    let me = std::process::id();
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return out;
-    };
-    for entry in procs.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        if pid == me {
-            continue;
-        }
-        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-            continue;
-        };
-        for fd in fds.flatten() {
-            if let Ok(target) = std::fs::read_link(fd.path()) {
-                if target.starts_with(&dir) {
-                    out.push(pid);
-                    break;
-                }
-            }
-        }
-    }
-    out
-}
-
 /// What the idle walk over a lane's source saw.
 #[derive(Debug, PartialEq)]
 enum Walk {
@@ -119,6 +84,8 @@ enum Walk {
     Recent(Duration),
     /// The entry cap was hit first — the rest is unknown, so not idle.
     Truncated,
+    /// A directory or entry could not be inspected completely.
+    Unknown(String),
 }
 
 /// The most recent write under the lane's source within `window`. The
@@ -132,10 +99,15 @@ fn walk_writes(lane: &Path, window: Duration, cap: usize) -> Walk {
     let mut stack = vec![lane.to_path_buf()];
     let mut visited = 0usize;
     while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
+        let entries = match std::fs::read_dir(&d) {
+            Ok(entries) => entries,
+            Err(e) => return Walk::Unknown(format!("cannot enumerate {}: {e}", d.display())),
         };
-        for ent in entries.flatten() {
+        for ent in entries {
+            let ent = match ent {
+                Ok(ent) => ent,
+                Err(e) => return Walk::Unknown(format!("cannot enumerate {}: {e}", d.display())),
+            };
             if d == lane && ent.file_name() == "target" {
                 continue;
             }
@@ -143,17 +115,27 @@ fn walk_writes(lane: &Path, window: Duration, cap: usize) -> Walk {
             if visited > cap {
                 return Walk::Truncated;
             }
-            let Ok(meta) = ent.metadata() else {
-                continue;
+            let meta = match ent.metadata() {
+                Ok(meta) => meta,
+                Err(e) => {
+                    return Walk::Unknown(format!("cannot inspect {}: {e}", ent.path().display()))
+                }
             };
             if meta.is_dir() {
                 stack.push(ent.path());
             }
-            if let Ok(m) = meta.modified() {
-                let age = now.duration_since(m).unwrap_or(Duration::ZERO);
-                if age < window && newest.is_none_or(|a| age < a) {
-                    newest = Some(age);
+            let modified = match meta.modified() {
+                Ok(modified) => modified,
+                Err(e) => {
+                    return Walk::Unknown(format!(
+                        "cannot inspect modification time for {}: {e}",
+                        ent.path().display()
+                    ))
                 }
+            };
+            let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+            if age < window && newest.is_none_or(|a| age < a) {
+                newest = Some(age);
             }
         }
     }
@@ -191,9 +173,19 @@ fn git_path(dir: &Path, flag: &str) -> Option<PathBuf> {
 /// path — the recorded string is never trusted as a delete target.
 fn reclaim_target(lane: &Path, cargo_target: Option<&str>) -> Result<Option<PathBuf>> {
     let refuse = |why: String| Err(Error::rejected(format!("{}: {why}", lane.display())));
+    match std::fs::symlink_metadata(lane) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+        Ok(_) => return refuse("lane path is not a real directory".into()),
+        Err(e) => return refuse(format!("cannot inspect lane path ({e})")),
+    }
     let lane_c = lane
         .canonicalize()
         .map_err(|e| Error::rejected(format!("{}: cannot resolve ({e})", lane.display())))?;
+    if finish::lexical_path(lane) != lane_c {
+        return refuse(
+            "lane path traverses a symlink or differs from its canonical identity".into(),
+        );
+    }
     let root = crate::worktree::main_root(&lane_c)
         .map_err(|e| Error::rejected(format!("{}: no main root ({e})", lane.display())))?;
     let root_c = root.canonicalize().unwrap_or(root);
@@ -209,6 +201,18 @@ fn reclaim_target(lane: &Path, cargo_target: Option<&str>) -> Result<Option<Path
     let wt_parent = crate::worktree::layout::worktrees_dir(&root_c);
     if lane_c == wt_parent || !lane_c.starts_with(&wt_parent) {
         return refuse(format!("not under {}", wt_parent.display()));
+    }
+    let registered = finish::git(&root_c, &["worktree", "list", "--porcelain"]).map_err(|e| {
+        Error::rejected(format!(
+            "{}: cannot enumerate registered checkouts ({e})",
+            lane.display()
+        ))
+    })?;
+    if !registered
+        .lines()
+        .any(|line| line == format!("worktree {}", lane_c.display()))
+    {
+        return refuse("path is not a registered worktree of its claimed repo".into());
     }
     let target = lane_c.join("target");
     if let Some(ct) = cargo_target {
@@ -239,28 +243,40 @@ fn reclaim_target(lane: &Path, cargo_target: Option<&str>) -> Result<Option<Path
 /// daemon enumeration, a registered agent whose cwd is bound to it, or
 /// a live/unknown message or task bound to it (finish's in-use
 /// evaluation). Re-run against a fresh `view` right before the delete.
-fn live_reason(
+type ProcessUseProbe = finish::ProcessUseProbe;
+
+fn live_reason_with_process_probe(
     view: &finish::DaemonView,
     state_dir: &Path,
     front: &crate::issue::model::Front,
     lane: &Path,
+    process_use_probe: &ProcessUseProbe,
 ) -> Option<String> {
-    if let Some(pid) = finish::pids_cwd_under(lane).first() {
+    if view.up && !finish::cwd_holder_aliases(view, Some(lane)).is_empty() {
+        return Some("a registered agent's cwd is on the lane".to_string());
+    }
+    if let Some(reason) = finish::lane_in_use(view, state_dir, front, lane, process_use_probe) {
+        return Some(reason);
+    }
+    let process_use = match process_use_probe(lane) {
+        Ok(process_use) => process_use,
+        Err(e) => return Some(format!("cannot enumerate process cwd/open-fd use: {e}")),
+    };
+    if let Some(pid) = process_use.cwd.first() {
         return Some(format!(
             "process {pid} ({}) cwd inside",
             finish::comm_of(*pid)
         ));
     }
-    if let Some(pid) = pids_fd_under(lane).first() {
+    if let Some(pid) = process_use.fd.first() {
         return Some(format!(
             "process {pid} ({}) holds an open fd inside",
             finish::comm_of(*pid)
         ));
     }
-    if view.up && !finish::cwd_holder_aliases(view, Some(lane)).is_empty() {
-        return Some("a registered agent's cwd is on the lane".to_string());
-    }
-    finish::lane_in_use(view, state_dir, front, lane)
+    process_use
+        .enumeration_error
+        .map(|error| format!("Cannot fully enumerate process cwd/open-fd use: {error}"))
 }
 
 /// The reason a lane's `target/` is NOT reclaimable, or `None` when the
@@ -273,7 +289,28 @@ fn blocked_reason(
     idle: Duration,
     cap: usize,
 ) -> Option<String> {
-    if let Some(r) = live_reason(view, state_dir, front, lane) {
+    blocked_reason_with_process_probe(
+        view,
+        state_dir,
+        front,
+        lane,
+        idle,
+        cap,
+        &finish::process_use_under,
+    )
+}
+
+fn blocked_reason_with_process_probe(
+    view: &finish::DaemonView,
+    state_dir: &Path,
+    front: &crate::issue::model::Front,
+    lane: &Path,
+    idle: Duration,
+    cap: usize,
+    process_use_probe: &ProcessUseProbe,
+) -> Option<String> {
+    if let Some(r) = live_reason_with_process_probe(view, state_dir, front, lane, process_use_probe)
+    {
         return Some(r);
     }
     match walk_writes(lane, idle, cap) {
@@ -283,6 +320,7 @@ fn blocked_reason(
             idle.as_secs() / 3600
         )),
         Walk::Truncated => Some("idle walk truncated — treating as recent".to_string()),
+        Walk::Unknown(reason) => Some(format!("idle walk incomplete — {reason}")),
     }
 }
 
@@ -301,18 +339,90 @@ pub fn run(pm: &Pm, state_dir: &Path, actor: &str) -> Result<Value> {
 /// (`pm.yaml [host] reclaim_target_idle_secs`, default 6 h). Tests pass a
 /// short window instead of aging a fixture for hours.
 pub fn run_with_idle(pm: &Pm, state_dir: &Path, actor: &str, idle_secs: u64) -> Result<Value> {
+    run_with_process_probe(pm, state_dir, actor, idle_secs, &finish::process_use_under)
+}
+
+/// Test-only process-scan inputs for exercising the real target-reclaim path.
+/// This type exists only with the crate's `test-seam` feature, which is refused
+/// by release builds.
+#[cfg(feature = "test-seam")]
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReclaimTestProcessUse {
+    /// A complete scan with no process cwd or open descriptor under the lane.
+    CompleteNoUse,
+    /// A partial scan that could not enumerate all process use.
+    Incomplete(String),
+    /// Run the real proc scanner against an isolated proc-tree fixture.
+    ScanProcRoot(PathBuf),
+}
+
+/// Run the normal reclaim path with a deterministic process-scan result.
+/// The merged-checkout sweep keeps its production probes; only lane target
+/// reclamation uses this test input. Intended for isolated integration tests.
+#[cfg(feature = "test-seam")]
+#[doc(hidden)]
+pub fn run_with_idle_test_process_use(
+    pm: &Pm,
+    state_dir: &Path,
+    actor: &str,
+    idle_secs: u64,
+    test_process_use: ReclaimTestProcessUse,
+) -> Result<Value> {
+    let probe = move |lane: &Path| match &test_process_use {
+        ReclaimTestProcessUse::CompleteNoUse => Ok(finish::ProcessUse {
+            cwd: Vec::new(),
+            fd: Vec::new(),
+            enumeration_error: None,
+        }),
+        ReclaimTestProcessUse::Incomplete(reason) => Ok(finish::ProcessUse {
+            cwd: Vec::new(),
+            fd: Vec::new(),
+            enumeration_error: Some(reason.clone()),
+        }),
+        ReclaimTestProcessUse::ScanProcRoot(proc_root) => {
+            finish::process_use_under_from_proc_root(lane, proc_root)
+        }
+    };
+    run_with_process_probe(pm, state_dir, actor, idle_secs, &probe)
+}
+
+fn run_with_process_probe(
+    pm: &Pm,
+    state_dir: &Path,
+    actor: &str,
+    idle_secs: u64,
+    process_use_probe: &ProcessUseProbe,
+) -> Result<Value> {
     finish::with_probe_timeout(PROBE_TIMEOUT, || {
-        run_bounded(pm, state_dir, actor, idle_secs)
+        run_bounded(pm, state_dir, actor, idle_secs, process_use_probe)
     })
 }
 
-fn run_bounded(pm: &Pm, state_dir: &Path, actor: &str, idle_secs: u64) -> Result<Value> {
+fn run_bounded(
+    pm: &Pm,
+    state_dir: &Path,
+    actor: &str,
+    idle_secs: u64,
+    process_use_probe: &ProcessUseProbe,
+) -> Result<Value> {
     let mut out = json!({"swept": 0, "reclaimed": [], "skipped": []});
     // Part 1: the merged sweep. dry_run=false — this runs the real
     // `finish` guards; a candidate that fails them is `skipped`/`refused`,
     // never removed.
     match finish::sweep(pm, None, false, false, actor, state_dir) {
-        Ok(s) => out["swept"] = json!(s["rows"].as_array().map(|r| r.len()).unwrap_or(0)),
+        Ok(s) => {
+            let rows = s["rows"].as_array().cloned().unwrap_or_default();
+            out["swept"] = json!(rows.len());
+            for row in rows.into_iter().filter(|row| row["outcome"] == "refused") {
+                out["skipped"].as_array_mut().unwrap().push(json!({
+                    "issue": row["issue"],
+                    "lane": row["worktree"],
+                    "reason_code": "merged-checkout-refused",
+                    "reason": row["reason"],
+                }));
+            }
+        }
         Err(e) => {
             tracing::warn!(event = "reclaim_sweep_failed", error = e.to_string());
         }
@@ -322,29 +432,247 @@ fn run_bounded(pm: &Pm, state_dir: &Path, actor: &str, idle_secs: u64) -> Result
     // /proc scans still carry the guard.
     let view = finish::daemon_view(state_dir);
     let idle = Duration::from_secs(idle_secs);
+    let context = ReclaimContext {
+        view: &view,
+        state_dir,
+        pm,
+        idle,
+        actor,
+        process_use_probe,
+    };
     let issues = board::load_all(&pm.dir, None)?;
     for issue in issues {
         let id = issue.front.id.clone();
         for lane in crate::issue::start::open_worktrees(&issue.front) {
-            let res = reclaim_lane(&view, state_dir, pm, &issue, &lane, idle, actor);
+            let res = reclaim_lane_with_context(&context, &issue, &lane);
             match res {
-                Ok(Some(bytes)) => out["reclaimed"]
+                Ok(ReclaimAttempt::Reclaimed(bytes)) => out["reclaimed"]
                     .as_array_mut()
                     .unwrap()
                     .push(json!({"issue": id, "lane": lane, "bytes_freed": bytes})),
-                Ok(None) => {}
+                Ok(ReclaimAttempt::Absent) => {}
+                Ok(ReclaimAttempt::Skipped(reason)) => out["skipped"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"issue": id, "lane": lane, "reason_code": "retained-by-safety-policy", "reason": reason})),
                 Err(e) => out["skipped"]
                     .as_array_mut()
                     .unwrap()
-                    .push(json!({"issue": id, "lane": lane, "reason": e.to_string()})),
+                    .push(json!({"issue": id, "lane": lane, "reason_code": "cleanup-check-failed", "reason": e.to_string()})),
             }
         }
     }
     Ok(out)
 }
 
-/// One lane's reclaim decision + delete. `Ok(Some(bytes))` reclaimed,
-/// `Ok(None)` eligible-but-absent or in use, `Err` refused.
+/// Read-only manual plan. The same `reclaim_target` confinement and
+/// `blocked_reason` policy is used by the scheduled actor below; dry-run does
+/// not delete, write tracker comments or notify owners.
+pub fn plan(pm: &Pm, state_dir: &Path, idle_secs: u64) -> Result<Value> {
+    finish::with_probe_timeout(PROBE_TIMEOUT, || plan_bounded(pm, state_dir, idle_secs))
+}
+
+pub fn plan_for_repo(pm: &Pm, state_dir: &Path, idle_secs: u64, repo: &Path) -> Result<Value> {
+    let root = crate::worktree::main_root(repo)?.canonicalize()?;
+    let mut plan = plan(pm, state_dir, idle_secs)?;
+    if let Some(rows) = plan["merged_checkouts"].as_array_mut() {
+        rows.retain(|row| {
+            row["worktree"]
+                .as_str()
+                .and_then(|path| lane_repo(Path::new(path)))
+                .as_deref()
+                == Some(root.as_path())
+        });
+    }
+    if let Some(rows) = plan["cache_resources"].as_array_mut() {
+        rows.retain(|row| {
+            row["resource"]["path"]
+                .as_str()
+                .and_then(|path| lane_repo(Path::new(path)))
+                .as_deref()
+                == Some(root.as_path())
+        });
+    }
+    plan["repo"] = json!(root);
+    plan["scope"] = json!("repository");
+    Ok(plan)
+}
+
+fn lane_repo(lane: &Path) -> Option<PathBuf> {
+    crate::worktree::main_root(lane)
+        .ok()
+        .and_then(|root| root.canonicalize().ok())
+        .or_else(|| crate::worktree::layout::assumed_root(lane))
+}
+
+fn declared_lane_root(pm: &Pm, issue: &board::Issue, lane: &Path) -> Result<PathBuf> {
+    let project = crate::issue::project::load(&pm.dir.join(&issue.project).join("project.yaml"))?;
+    let root = crate::worktree::main_root(lane)?.canonicalize()?;
+    if !crate::issue::start::declared_repos(&project).contains(&root) {
+        return Err(Error::rejected(format!(
+            "lane {} has foreign ownership: repo {} is not declared by project {}",
+            lane.display(),
+            root.display(),
+            project.key
+        )));
+    }
+    Ok(root)
+}
+
+fn declared_issue_branch(issue: &board::Issue, lane: &Path) -> Result<String> {
+    let name = lane
+        .file_name()
+        .ok_or_else(|| Error::rejected(format!("{} has no lane name", lane.display())))?
+        .to_string_lossy();
+    let layout_branch = crate::worktree::layout::branch(&name);
+    if issue.front.refs.iter().any(|reference| {
+        reference.kind == "branch"
+            && reference.closed != Some(true)
+            && reference.path.as_deref() == Some(layout_branch.as_str())
+    }) {
+        return Ok(layout_branch);
+    }
+    let actual_branch = finish::git_branch(lane)?.ok_or_else(|| {
+        Error::rejected(format!(
+            "target lane {} has no checked-out branch to match its issue ref",
+            lane.display()
+        ))
+    })?;
+    if issue.front.refs.iter().any(|reference| {
+        reference.kind == "branch"
+            && reference.closed != Some(true)
+            && reference.path.as_deref() == Some(actual_branch.as_str())
+    }) {
+        return Ok(actual_branch);
+    }
+    Err(Error::rejected(format!(
+        "issue {} has no open branch ref matching target lane {} ({layout_branch} or {actual_branch})",
+        issue.front.id,
+        lane.display()
+    )))
+}
+
+fn plan_bounded(pm: &Pm, state_dir: &Path, idle_secs: u64) -> Result<Value> {
+    let merged = finish::sweep(pm, None, false, true, "", state_dir)?;
+    let view = finish::daemon_view(state_dir);
+    let idle = Duration::from_secs(idle_secs);
+    let issues = board::load_all(&pm.dir, None)?;
+    let mut resources = Vec::new();
+    for issue in &issues {
+        for lane in crate::issue::start::open_worktrees(&issue.front) {
+            resources.push(target_plan(pm, &view, state_dir, issue, &lane, idle));
+        }
+    }
+    Ok(json!({
+        "schema": "cadence.reclaim-plan/1",
+        "dry_run": true,
+        "cleanup_mode": "report-only-for-checkout-removal",
+        "merged_checkouts": merged["rows"],
+        "cache_resources": resources,
+    }))
+}
+
+fn target_plan(
+    pm: &Pm,
+    view: &finish::DaemonView,
+    state_dir: &Path,
+    issue: &board::Issue,
+    lane: &Path,
+    idle: Duration,
+) -> Value {
+    let branch = lane
+        .file_name()
+        .map(|name| crate::worktree::layout::branch(&name.to_string_lossy()));
+    let mut base = json!({"issue": issue.front.id, "path": lane, "branch": branch.clone()});
+    if !lane.is_dir() {
+        return json!({"resource": base, "status": "missing", "reason_code": "checkout-missing",
+            "reason": "checkout is missing; branch and tracker refs are preserved", "reclaimable_bytes": 0});
+    }
+    let root = match declared_lane_root(pm, issue, lane) {
+        Ok(root) => root,
+        Err(e) => {
+            return json!({"resource": base, "status": "refused",
+                "reason_code": "foreign-or-undeclared-project-repo", "reason": e.to_string(), "reclaimable_bytes": null});
+        }
+    };
+    let cargo_target = issue
+        .front
+        .refs
+        .iter()
+        .filter(|r| r.kind == "worktree" && r.closed != Some(true))
+        .filter(|r| finish::same_path(Path::new(r.path.as_deref().unwrap_or_default()), lane))
+        .find_map(|r| r.cargo_target.clone());
+    let target = match reclaim_target(lane, cargo_target.as_deref()) {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            return json!({"resource": base, "status": "retained",
+            "reason_code": "target-not-lane-local", "reason": "recorded cargo target is not the lane-local target; no deletion", "reclaimable_bytes": null})
+        }
+        Err(e) => {
+            return json!({"resource": base, "status": "refused",
+            "reason_code": "path-confinement-or-symlink-refused", "reason": e.to_string(), "reclaimable_bytes": null})
+        }
+    };
+    let branch = match declared_issue_branch(issue, lane) {
+        Ok(branch) => branch,
+        Err(e) => {
+            return json!({"resource": base, "status": "retained",
+                "reason_code": "issue-branch-ref-mismatch", "reason": e.to_string(), "reclaimable_bytes": null});
+        }
+    };
+    base["branch"] = json!(branch.clone());
+    if let Err(e) =
+        crate::worktree::lifecycle::validate_target_reclaim(&root, lane, &issue.front.id, &branch)
+    {
+        let record = crate::worktree::lifecycle::managed_record(&root, lane)
+            .ok()
+            .flatten();
+        let lifecycle = record.as_ref().map(|record| {
+            json!({
+                "state": record.state,
+                "reason": record.retention_reason.as_deref()
+                    .or(record.release_reason.as_deref()),
+            })
+        });
+        return json!({"resource": base, "status": "retained",
+            "reason_code": "lifecycle-ownership-or-state-refused", "reason": e.to_string(),
+            "lifecycle": lifecycle, "reclaimable_bytes": null});
+    }
+    if let Some(reason) = blocked_reason(view, state_dir, &issue.front, lane, idle, WALK_CAP) {
+        let code = if reason.contains("written within") {
+            "source-recent"
+        } else if reason.contains("truncated")
+            || reason.contains("cannot")
+            || reason.contains("enumerat")
+        {
+            "live-use-or-idle-probe-unknown"
+        } else {
+            "live-use-blocked"
+        };
+        return json!({"resource": base, "status": "retained", "target": target,
+            "reason_code": code, "reason": reason, "reclaimable_bytes": null});
+    }
+    let (size, truncated) = crate::doctor::host::dir_size(&target);
+    json!({
+        "resource": base,
+        "status": "reclaimable-cache-only",
+        "target": target,
+        "reason_code": if truncated { "size-estimate-unknown" } else { "idle-target-cache" },
+        "reason": "only the confined lane-local target cache may be reclaimed; source and branch are retained",
+        "reclaimable_bytes": if truncated { Value::Null } else { json!(size) },
+        "retained_branch": branch,
+        "retained_artifacts": [],
+    })
+}
+
+enum ReclaimAttempt {
+    Reclaimed(u64),
+    Absent,
+    Skipped(String),
+}
+
+/// Compatibility wrapper used by focused guard checks.
+#[cfg(test)]
 fn reclaim_lane(
     view: &finish::DaemonView,
     state_dir: &Path,
@@ -354,9 +682,53 @@ fn reclaim_lane(
     idle: Duration,
     actor: &str,
 ) -> Result<Option<u64>> {
-    if !lane.is_dir() {
-        return Ok(None);
+    match reclaim_lane_detailed(view, state_dir, pm, issue, lane, idle, actor)? {
+        ReclaimAttempt::Reclaimed(bytes) => Ok(Some(bytes)),
+        ReclaimAttempt::Absent | ReclaimAttempt::Skipped(_) => Ok(None),
     }
+}
+
+/// One lane's shared reclaim decision + delete. Refusals are returned to the
+/// scheduled report rather than silently disappearing.
+#[cfg(test)]
+fn reclaim_lane_detailed(
+    view: &finish::DaemonView,
+    state_dir: &Path,
+    pm: &Pm,
+    issue: &board::Issue,
+    lane: &Path,
+    idle: Duration,
+    actor: &str,
+) -> Result<ReclaimAttempt> {
+    let context = ReclaimContext {
+        view,
+        state_dir,
+        pm,
+        idle,
+        actor,
+        process_use_probe: &finish::process_use_under,
+    };
+    reclaim_lane_with_context(&context, issue, lane)
+}
+
+struct ReclaimContext<'a> {
+    view: &'a finish::DaemonView,
+    state_dir: &'a Path,
+    pm: &'a Pm,
+    idle: Duration,
+    actor: &'a str,
+    process_use_probe: &'a ProcessUseProbe,
+}
+
+fn reclaim_lane_with_context(
+    context: &ReclaimContext<'_>,
+    issue: &board::Issue,
+    lane: &Path,
+) -> Result<ReclaimAttempt> {
+    if !lane.is_dir() {
+        return Ok(ReclaimAttempt::Absent);
+    }
+    let root = declared_lane_root(context.pm, issue, lane)?;
     // The recorded cargo_target for this lane's open ref, if any — only
     // ever compared against the derived path, never deleted.
     let cargo_target = issue
@@ -367,11 +739,27 @@ fn reclaim_lane(
         .filter(|r| finish::same_path(Path::new(r.path.as_deref().unwrap_or_default()), lane))
         .find_map(|r| r.cargo_target.clone());
     let Some(target) = reclaim_target(lane, cargo_target.as_deref())? else {
-        return Ok(None);
+        return Ok(ReclaimAttempt::Absent);
     };
-    if blocked_reason(view, state_dir, &issue.front, lane, idle, WALK_CAP).is_some() {
-        // Eligible lane but currently in use — skip silently.
-        return Ok(None);
+    let branch = match declared_issue_branch(issue, lane) {
+        Ok(branch) => branch,
+        Err(reason) => return Ok(ReclaimAttempt::Skipped(reason.to_string())),
+    };
+    if let Err(reason) =
+        crate::worktree::lifecycle::validate_target_reclaim(&root, lane, &issue.front.id, &branch)
+    {
+        return Ok(ReclaimAttempt::Skipped(reason.to_string()));
+    }
+    if let Some(reason) = blocked_reason_with_process_probe(
+        context.view,
+        context.state_dir,
+        &issue.front,
+        lane,
+        context.idle,
+        WALK_CAP,
+        context.process_use_probe,
+    ) {
+        return Ok(ReclaimAttempt::Skipped(reason));
     }
     // Measure before the re-scan so nothing slow sits between the
     // re-scan and the delete.
@@ -380,23 +768,41 @@ fn reclaim_lane(
     // check→delete gap, proving the re-scan below catches it.
     #[cfg(test)]
     tests::before_rescan(lane);
+    let reclaim_guard = match crate::worktree::lifecycle::begin_target_reclaim(
+        &root,
+        lane,
+        &issue.front.id,
+        &branch,
+    ) {
+        Ok(guard) => guard,
+        Err(reason) => return Ok(ReclaimAttempt::Skipped(reason.to_string())),
+    };
     // I-C: re-fetch the daemon snapshot and re-run the live-use scan.
-    let fresh = finish::daemon_view(state_dir);
-    if let Some(appeared) = live_reason(&fresh, state_dir, &issue.front, lane) {
+    let fresh = finish::daemon_view(context.state_dir);
+    if let Some(appeared) = live_reason_with_process_probe(
+        &fresh,
+        context.state_dir,
+        &issue.front,
+        lane,
+        context.process_use_probe,
+    ) {
         tracing::info!(
             event = "reclaim_rescan_skip",
             lane = %lane.display(),
             reason = %appeared
         );
-        return Ok(None);
+        drop(reclaim_guard);
+        return Ok(ReclaimAttempt::Skipped(appeared));
     }
     // Re-derive the one deletable path and re-verify it is still a real
     // dir immediately before the delete — a swap to a symlink must never
     // be followed.
     let Some(target) = reclaim_target(lane, cargo_target.as_deref())? else {
-        return Ok(None);
+        drop(reclaim_guard);
+        return Ok(ReclaimAttempt::Absent);
     };
     std::fs::remove_dir_all(&target)?;
+    drop(reclaim_guard);
     // Log the freed bytes on the issue — a reclaim is recorded, never
     // silent.
     let text = format!(
@@ -406,15 +812,15 @@ fn reclaim_lane(
         bytes
     );
     let _ = write::add_comment(
-        pm,
+        context.pm,
         &issue.front.id,
         &text,
         None,
         Some("reclaim"),
         None,
-        actor,
+        context.actor,
     );
-    Ok(Some(bytes))
+    Ok(ReclaimAttempt::Reclaimed(bytes))
 }
 
 #[cfg(test)]
@@ -494,6 +900,10 @@ mod tests {
         finish::daemon_view(&no_daemon())
     }
 
+    fn process_enumeration_uncertain(reason: &str) -> bool {
+        reason.contains("Cannot fully enumerate process cwd/open-fd use")
+    }
+
     fn age(dir: &Path, secs: u64) {
         let epoch = (SystemTime::now() - Duration::from_secs(secs))
             .duration_since(std::time::UNIX_EPOCH)
@@ -508,10 +918,30 @@ mod tests {
             .status();
     }
 
-    fn pm_stub(tmp: &Tmp) -> Pm {
+    fn pm_stub(tmp: &Tmp, repo: &Path) -> Pm {
         let pm_dir = tmp.0.join("pm");
-        std::fs::create_dir_all(&pm_dir).unwrap();
+        let project_dir = pm_dir.join("demo");
+        std::fs::create_dir_all(&project_dir).unwrap();
         std::fs::write(pm_dir.join("pm.yaml"), "schema: 1\n").unwrap();
+        let project = crate::issue::project::Project {
+            key: "demo".to_string(),
+            prefix: "D".to_string(),
+            repos: vec![crate::issue::project::Repo {
+                path: Some(repo.display().to_string()),
+                remote: None,
+            }],
+            components: Vec::new(),
+            tags: Vec::new(),
+            default_owner: None,
+            build: None,
+            memory: None,
+            intake: None,
+        };
+        std::fs::write(
+            project_dir.join("project.yaml"),
+            serde_yaml::to_string(&project).unwrap(),
+        )
+        .unwrap();
         Pm::at(&pm_dir).unwrap()
     }
 
@@ -538,10 +968,11 @@ mod tests {
     }
 
     fn reclaim(tmp: &Tmp, lane: &Path, cargo_target: Option<&str>) -> Result<Option<u64>> {
+        let repo = crate::worktree::main_root(lane).unwrap();
         reclaim_lane(
             &down_view(),
             &no_daemon(),
-            &pm_stub(tmp),
+            &pm_stub(tmp, &repo),
             &issue_with(lane, cargo_target),
             lane,
             Duration::from_secs(6 * 3600),
@@ -549,10 +980,49 @@ mod tests {
         )
     }
 
+    fn ensure_fixture_symlink(target: impl AsRef<Path>, link: &Path) {
+        match std::fs::symlink_metadata(link) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => panic!("fixture path {} is not a symlink", link.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::os::unix::fs::symlink(target, link).unwrap();
+            }
+            Err(error) => panic!("cannot inspect fixture link {}: {error}", link.display()),
+        }
+    }
+
+    fn seed_synthetic_proc_view(proc_root: &Path) {
+        let root = proc_root.canonicalize().unwrap();
+        std::fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+        std::fs::create_dir_all(proc_root.join("2/fd")).unwrap();
+        std::fs::create_dir_all(proc_root.join("2/ns")).unwrap();
+        std::fs::write(proc_root.join("self/kernel-release"), "7.0.0\n").unwrap();
+        std::fs::write(
+            proc_root.join("self/mountinfo"),
+            format!("1 0 0:1 / {} rw - proc proc rw\n", root.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            proc_root.join("2/stat"),
+            "2 (kthreadd) S 0 0 0 0 -1 2097152 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proc_root.join("2/status"),
+            "Name:\tkthreadd\nState:\tS (sleeping)\nUid:\t0 0 0 0\nGid:\t0 0 0 0\nGroups:\t0\nCapEff:\t0000000000000000\n",
+        )
+        .unwrap();
+        ensure_fixture_symlink("/", &proc_root.join("2/cwd"));
+        ensure_fixture_symlink("pid:[42]", &proc_root.join("self/ns/pid"));
+        ensure_fixture_symlink("pid:[42]", &proc_root.join("2/ns/pid"));
+    }
+
     thread_local! {
         static PLANT: std::cell::RefCell<Option<std::process::Child>> =
             const { std::cell::RefCell::new(None) };
         static PLANT_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static PLANT_PROC_ROOT: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// Test seam called by `reclaim_lane` between the idleness check and
@@ -568,6 +1038,16 @@ mod tests {
             .spawn()
             .expect("plant a build");
         let want = dir.canonicalize().unwrap();
+        if let Some(proc_root) = PLANT_PROC_ROOT.with(|root| root.borrow().clone()) {
+            let fake_proc = proc_root.join(child.id().to_string());
+            std::fs::create_dir_all(fake_proc.join("fd")).unwrap();
+            std::fs::write(
+                fake_proc.join("status"),
+                "Name:\tsleep\nState:\tS (sleeping)\nUid:\t1000 1000 1000 1000\nGid:\t1000 1000 1000 1000\nGroups:\t1000\nCapEff:\t0000000000000000\n",
+            )
+            .unwrap();
+            ensure_fixture_symlink(&want, &fake_proc.join("cwd"));
+        }
         let link = format!("/proc/{}/cwd", child.id());
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline
@@ -580,7 +1060,7 @@ mod tests {
 
     /// Critical 1: a recorded `cargo_target` that is the lane itself, or a
     /// path inside it, is never deleted — and refuses the lane's real
-    /// `target/` too (control: with no recorded path it is reclaimed).
+    /// `target/` too (control: reclaimed when the live-use scan completes).
     #[test]
     fn a_forged_cargo_target_deletes_nothing() {
         let tmp = Tmp::new("forged");
@@ -595,8 +1075,50 @@ mod tests {
             assert!(lane.join("src/keep.rs").is_file(), "source deleted");
             assert!(target.is_dir(), "forged {} was accepted", forged.display());
         }
-        assert!(reclaim(&tmp, &lane, None).unwrap().is_some(), "control");
-        assert!(lane.join("src/keep.rs").is_file() && !target.exists());
+        match blocked_reason(
+            &down_view(),
+            &no_daemon(),
+            &issue_with(&lane, None).front,
+            &lane,
+            Duration::from_secs(6 * 3600),
+            WALK_CAP,
+        ) {
+            Some(reason) => {
+                assert!(
+                    process_enumeration_uncertain(&reason),
+                    "unexpected blocker: {reason}"
+                );
+                assert!(target.is_dir(), "uncertain enumeration must retain target");
+            }
+            None => {
+                // The fixture issue needs its open branch ref for the lane to
+                // be a reclaim candidate at all (CAD-1196: reached once the
+                // live-use scan can complete on this host).
+                let mut issue = issue_with(&lane, None);
+                issue.front.refs.push(crate::issue::model::Ref {
+                    kind: "branch".to_string(),
+                    url: None,
+                    path: Some("x-lane".to_string()),
+                    label: None,
+                    closed: None,
+                    worktree: None,
+                    cargo_target: None,
+                    agent: None,
+                });
+                let repo = crate::worktree::main_root(&lane).unwrap();
+                let r = reclaim_lane(
+                    &down_view(),
+                    &no_daemon(),
+                    &pm_stub(&tmp, &repo),
+                    &issue,
+                    &lane,
+                    Duration::from_secs(6 * 3600),
+                    "test",
+                );
+                assert!(r.unwrap().is_some(), "control");
+                assert!(lane.join("src/keep.rs").is_file() && !target.exists());
+            }
+        }
     }
 
     /// Important 2: the main checkout, and a linked worktree outside
@@ -660,7 +1182,33 @@ mod tests {
         assert_eq!(walk_writes(&lane, idle, 3), Walk::Truncated);
         let front = issue_with(&lane, None).front;
         assert!(blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, 3).is_some());
-        assert!(blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, 1000).is_none());
+        if let Some(reason) = blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, 1000)
+        {
+            assert!(
+                process_enumeration_uncertain(&reason),
+                "unexpected blocker: {reason}"
+            );
+        }
+    }
+
+    /// An unreadable process entry is unknown live use, never an empty
+    /// holder list, and the real target-delete path must retain the cache.
+    #[test]
+    fn incomplete_process_enumeration_blocks_target_deletion() {
+        let tmp = Tmp::new("proc-unknown");
+        let (_repo, lane) = repo_with_lane(&tmp);
+        let target = lane_target(&lane);
+        age(&lane, 7 * 3600);
+        let proc_root = tmp.0.join("proc");
+        std::fs::create_dir_all(proc_root.join("4294967294")).unwrap();
+        let _proc_root = finish::use_process_proc_root_for_test(proc_root);
+        let front = issue_with(&lane, None).front;
+        let idle = Duration::from_secs(6 * 3600);
+        let reason = blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, WALK_CAP)
+            .expect("incomplete process enumeration blocks");
+        assert!(process_enumeration_uncertain(&reason), "{reason}");
+        assert_eq!(reclaim(&tmp, &lane, None).unwrap(), None);
+        assert!(target.is_dir(), "unknown process use must retain target");
     }
 
     /// Important 4: a daemon that is up but could not enumerate agents
@@ -749,10 +1297,14 @@ mod tests {
         age(&lane, 7 * 3600);
         let idle = Duration::from_secs(6 * 3600);
         let front = issue_with(&lane, None).front;
-        assert!(
-            blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, WALK_CAP).is_none(),
-            "control: a down daemon leaves the aged lane free"
-        );
+        if let Some(reason) =
+            blocked_reason(&down_view(), &no_daemon(), &front, &lane, idle, WALK_CAP)
+        {
+            assert!(
+                process_enumeration_uncertain(&reason),
+                "unexpected control blocker: {reason}"
+            );
+        }
         let state = tmp.0.join("state");
         let server = fake_daemon(
             &state,
@@ -778,9 +1330,15 @@ mod tests {
         let (_repo, lane) = repo_with_lane(&tmp);
         let target = lane_target(&lane);
         age(&lane, 7 * 3600);
+        let proc_root = tmp.0.join("proc");
+        std::fs::create_dir_all(&proc_root).unwrap();
+        seed_synthetic_proc_view(&proc_root);
+        let _proc_root = finish::use_process_proc_root_for_test(proc_root.clone());
+        PLANT_PROC_ROOT.with(|root| *root.borrow_mut() = Some(proc_root));
         PLANT_ARMED.with(|a| a.set(true));
         let bytes = reclaim(&tmp, &lane, None);
         PLANT_ARMED.with(|a| a.set(false));
+        PLANT_PROC_ROOT.with(|root| *root.borrow_mut() = None);
         if let Some(mut c) = PLANT.with(|p| p.borrow_mut().take()) {
             let _ = c.kill();
             let _ = c.wait();

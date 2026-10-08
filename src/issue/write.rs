@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::model::{self, Front, Ref};
-use crate::issue::{board, parse, project, time, Pm};
+use crate::issue::{board, parse, project, time, Pm, PmLock};
 
 /// `Actor:` trailer resolution, in order: an explicit `--author`/`--by`
 /// (`who`), the API actor string (`actor`), `CADENCE_ALIAS`, else
@@ -51,6 +51,11 @@ pub(crate) fn commit_who(
     actor: &str,
     who: Option<&str>,
 ) -> Result<Vec<String>> {
+    let full = commit_message(message, ids, actor, who);
+    pm.commit(paths, &full)
+}
+
+fn commit_message(message: &str, ids: &[&str], actor: &str, who: Option<&str>) -> String {
     let subject = if actor.is_empty() {
         message.to_string()
     } else {
@@ -61,7 +66,36 @@ pub(crate) fn commit_who(
         trailers.push_str(&format!("Issue: {id}\n"));
     }
     trailers.push_str(&format!("Actor: {}\n", actor_who(actor, who)));
-    pm.commit(paths, &format!("{subject}\n\n{trailers}"))
+    format!("{subject}\n\n{trailers}")
+}
+
+/// [`commit`] through a scoped [`PmLock`]: the commit's paths must
+/// stay inside the lock's admitted paths (see
+/// [`Pm::commit_scoped`]). Callers that took
+/// [`Pm::lock_for_paths`](Pm::lock_for_paths) commit through here.
+pub(crate) fn commit_scoped(
+    pm: &Pm,
+    lock: &PmLock,
+    paths: &[PathBuf],
+    message: &str,
+    ids: &[&str],
+    actor: &str,
+) -> Result<Vec<String>> {
+    commit_who_scoped(pm, lock, paths, message, ids, actor, None)
+}
+
+/// [`commit_who`] through a scoped [`PmLock`].
+pub(crate) fn commit_who_scoped(
+    pm: &Pm,
+    lock: &PmLock,
+    paths: &[PathBuf],
+    message: &str,
+    ids: &[&str],
+    actor: &str,
+    who: Option<&str>,
+) -> Result<Vec<String>> {
+    let full = commit_message(message, ids, actor, who);
+    pm.commit_scoped(lock, paths, &full)
 }
 
 /// Content hash of `issue.md` — the optimistic-concurrency token the
@@ -369,14 +403,15 @@ pub fn set_acceptance(pm: &Pm, id: &str, source: &Path, actor: &str) -> Result<V
     })?;
     let items = parse::parse_acceptance_input(&input)?;
     let (_project, dir) = issue_dir(pm, id)?;
-    let _lock = pm.lock()?;
+    let file = dir.join("issue.md");
+    let lock = pm.lock_for_paths(std::slice::from_ref(&file))?;
     let (front, body) = load_front(&dir)?;
     let body = parse::replace_acceptance(&body, &items)?;
-    let file = dir.join("issue.md");
     let prev = file_preimage(&file);
     save_front(&dir, &front, &body)?;
-    let foreign = match commit(
+    let foreign = match commit_scoped(
         pm,
+        &lock,
         std::slice::from_ref(&file),
         &format!("{id}: acceptance replaced"),
         &[id],
@@ -416,7 +451,7 @@ pub fn project_add(
     let tags = model::normalize_tags(tags)?;
     let prefix = prefix.to_ascii_uppercase();
     crate::issue::project_new::check_prefix(&prefix)?;
-    let _lock = pm.lock()?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&pm.dir.join(key)))?;
     let projects = project::list(&pm.dir)?;
     if projects.iter().any(|p| p.key == key) {
         return Err(Error::rejected(format!(
@@ -474,8 +509,9 @@ pub fn project_add(
         .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
     let yaml_path = dir.join("project.yaml");
     std::fs::write(&yaml_path, yaml)?;
-    let foreign = match commit(
+    let foreign = match commit_scoped(
         pm,
+        &lock,
         std::slice::from_ref(&yaml_path),
         &format!("project {key} added"),
         &[],
@@ -578,7 +614,7 @@ pub fn new_issue(
         check_component(&project, component)?;
     }
     let tags = check_tags(&project, tags)?;
-    let _lock = pm.lock()?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&pm.dir.join(&project.key)))?;
     let id = match explicit_id {
         Some(id) => id.to_string(),
         None => format!(
@@ -624,8 +660,9 @@ pub fn new_issue(
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
     }
-    let foreign = match commit(
+    let foreign = match commit_scoped(
         pm,
+        &lock,
         &[dir.join("issue.md")],
         &format!("{id}: created"),
         &[&id],
@@ -664,8 +701,8 @@ pub fn create_plan(
             ))
         })?;
     let proposer = actor_who(actor, None);
-    let _lock = pm.lock()?;
     let root = pm.dir.join(&project.key);
+    let lock = pm.lock_for_paths(std::slice::from_ref(&root))?;
     let first = next_id(&root, &project.prefix)?;
     let id_at = |n: u64| format!("{}-{}", project.prefix, first + n);
     let epic = id_at(0);
@@ -739,8 +776,9 @@ pub fn create_plan(
             .iter()
             .map(|(dir, _, _)| dir.join("issue.md"))
             .collect();
-        commit(
+        commit_scoped(
             pm,
+            &lock,
             &paths,
             &format!(
                 "{epic}: plan proposed — {} ({} tickets)",
@@ -793,7 +831,7 @@ pub fn decide_plan(
         crate::secret::guard(&format!("{epic}: plan reason"), reason)?;
     }
     let (project, dir) = issue_dir(pm, epic)?;
-    let _lock = pm.lock()?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&pm.dir.join(&project.key)))?;
     let (mut front, body) = load_front(&dir)?;
     let Some(plan) = front.plan.as_mut() else {
         return Err(Error::rejected(format!(
@@ -854,7 +892,7 @@ pub fn decide_plan(
     let written = writes
         .iter()
         .try_for_each(|(dir, front, body)| save_front(dir, front, body))
-        .and_then(|_| commit_who(pm, &paths, &subject, &ids, "", Some(by)));
+        .and_then(|_| commit_who_scoped(pm, &lock, &paths, &subject, &ids, "", Some(by)));
     let foreign = match written {
         Ok(f) => f,
         Err(e) => {
@@ -1102,6 +1140,29 @@ pub(crate) fn commit_staged(
     summary: &str,
     actor: &str,
 ) -> Result<(Vec<String>, Vec<String>)> {
+    commit_staged_inner(pm, None, staged, summary, actor)
+}
+
+/// [`commit_staged`] through a scoped [`PmLock`]: every staged file
+/// must stay inside the lock's admitted paths. Callers that took
+/// [`Pm::lock_for_paths`](Pm::lock_for_paths) commit through here.
+pub(crate) fn commit_staged_scoped(
+    pm: &Pm,
+    lock: &PmLock,
+    staged: &[Staged],
+    summary: &str,
+    actor: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    commit_staged_inner(pm, Some(lock), staged, summary, actor)
+}
+
+fn commit_staged_inner(
+    pm: &Pm,
+    lock: Option<&PmLock>,
+    staged: &[Staged],
+    summary: &str,
+    actor: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
     if staged.is_empty() {
         return Ok((vec![], vec![]));
     }
@@ -1118,14 +1179,22 @@ pub(crate) fn commit_staged(
     let written = staged
         .iter()
         .try_for_each(|s| save_front(&s.dir, &s.front, &s.body))
-        .and_then(|_| {
-            commit(
+        .and_then(|_| match lock {
+            Some(l) => commit_scoped(
+                pm,
+                l,
+                &paths,
+                &format!("{}: {summary}", ids.join(", ")),
+                &ids,
+                actor,
+            ),
+            None => commit(
                 pm,
                 &paths,
                 &format!("{}: {summary}", ids.join(", ")),
                 &ids,
                 actor,
-            )
+            ),
         });
     match written {
         Ok(foreign) => Ok((ids.iter().map(|i| i.to_string()).collect(), foreign)),
@@ -1280,7 +1349,11 @@ pub fn set_fields_if_rev(
             "set needs an id and key=value pairs — e.g. `cadence issue set CAD-16 status=doing`",
         ));
     }
-    let _lock = pm.lock()?;
+    let dirs: Vec<PathBuf> = ids
+        .iter()
+        .map(|id| issue_dir(pm, id).map(|(_, dir)| dir))
+        .collect::<Result<_>>()?;
+    let lock = pm.lock_for_paths(&dirs)?;
     if let Some(want) = if_rev {
         for id in ids {
             let (_, dir) = issue_dir(pm, id)?;
@@ -1305,7 +1378,7 @@ pub fn set_fields_if_rev(
         Some(r) => format!("set {} (forced: {r})", changed.join(" ")),
         None => format!("set {}", changed.join(" ")),
     };
-    let (ids, foreign) = commit_staged(pm, &staged, &summary, actor)?;
+    let (ids, foreign) = commit_staged_scoped(pm, &lock, &staged, &summary, actor)?;
     // The post-merge reminder (CAD-94): when this set marks an issue
     // done while a worktree ref is still open, the CLI prints the
     // one-line `issue finish` hint for each of these ids.
@@ -1506,7 +1579,7 @@ pub fn move_stage(
         None => None,
     };
     let (project, dir) = issue_dir(pm, epic)?;
-    let _lock = pm.lock()?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     let (mut front, body) = load_front(&dir)?;
     let (cfg, unapproved) = work::effective(
         &project.key,
@@ -1538,8 +1611,9 @@ pub fn move_stage(
         subject.push_str(&format!(" — {n}"));
     }
     let written = save_front(&dir, &front, &body).and_then(|_| {
-        commit_who(
+        commit_who_scoped(
             pm,
+            &lock,
             std::slice::from_ref(&file),
             &subject,
             &[epic],
@@ -1585,7 +1659,11 @@ pub fn tag_edit(pm: &Pm, ids: &[String], add: bool, tags: &[String], actor: &str
         ));
     }
     let tags = model::normalize_tags(tags)?;
-    let _lock = pm.lock()?;
+    let dirs: Vec<PathBuf> = ids
+        .iter()
+        .map(|id| issue_dir(pm, id).map(|(_, dir)| dir))
+        .collect::<Result<_>>()?;
+    let lock = pm.lock_for_paths(&dirs)?;
     let staged = stage(pm, ids, |project, front| {
         let before = front.tags.clone();
         if add {
@@ -1607,8 +1685,9 @@ pub fn tag_edit(pm: &Pm, ids: &[String], add: bool, tags: &[String], actor: &str
         .iter()
         .map(|s| json!({"id": s.id, "tags": s.front.tags}))
         .collect();
-    let (ids, foreign) = commit_staged(
+    let (ids, foreign) = commit_staged_scoped(
         pm,
+        &lock,
         &staged,
         &format!("tag {verb} {}", tags.join(" ")),
         actor,
@@ -1644,7 +1723,7 @@ pub fn patch_issue(
     state_dir: Option<&Path>,
 ) -> Result<Value> {
     let (project, dir) = issue_dir(pm, id)?;
-    let _lock = pm.lock()?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     if let Some(conflict) = check_rev(&dir, if_rev)? {
         return Ok(conflict);
     }
@@ -1720,8 +1799,9 @@ pub fn patch_issue(
     let file = dir.join("issue.md");
     let prev = file_preimage(&file);
     save_front(&dir, &front, &body)?;
-    let foreign = match commit(
+    let foreign = match commit_scoped(
         pm,
+        &lock,
         std::slice::from_ref(&file),
         &format!("{id}: set {}", changed.join(" ")),
         &[id],
@@ -1833,7 +1913,7 @@ pub fn link(
     model::check_link_kind(kind)?;
     model::check_id(target)?;
     let (_project, dir) = issue_dir(pm, id)?;
-    let _lock = pm.lock()?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     if let Some(conflict) = check_rev(&dir, if_rev)? {
         return Ok(conflict);
     }
@@ -1851,8 +1931,9 @@ pub fn link(
     let file = dir.join("issue.md");
     let prev = file_preimage(&file);
     save_front(&dir, &front, &body)?;
-    let foreign = match commit(
+    let foreign = match commit_scoped(
         pm,
+        &lock,
         std::slice::from_ref(&file),
         &format!("{id}: {verb} {kind} {target}"),
         &[id, target],
@@ -1920,7 +2001,7 @@ pub fn add_ref(
     model::check_ref_kind(kind)?;
     model::check_ref_value(target)?;
     let (_project, dir) = issue_dir(pm, id)?;
-    let _lock = pm.lock()?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     if let Some(conflict) = check_rev(&dir, if_rev)? {
         return Ok(conflict);
     }
@@ -1931,8 +2012,9 @@ pub fn add_ref(
     let file = dir.join("issue.md");
     let prev = file_preimage(&file);
     save_front(&dir, &front, &body)?;
-    let foreign = match commit(
+    let foreign = match commit_scoped(
         pm,
+        &lock,
         std::slice::from_ref(&file),
         &format!("{id}: ref {kind}"),
         &[id],
@@ -1958,7 +2040,7 @@ pub fn add_ref(
 /// reason) to a concurrent finish.
 pub fn close_ref(pm: &Pm, id: &str, kind: &str, target: &str, actor: &str) -> Result<()> {
     let (_project, dir) = issue_dir(pm, id)?;
-    let _lock = pm.lock()?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     let (mut front, body) = load_front(&dir)?;
     let mut hit = false;
     for r in &mut front.refs {
@@ -1971,8 +2053,9 @@ pub fn close_ref(pm: &Pm, id: &str, kind: &str, target: &str, actor: &str) -> Re
         let file = dir.join("issue.md");
         let prev = file_preimage(&file);
         save_front(&dir, &front, &body)?;
-        if let Err(e) = commit(
+        if let Err(e) = commit_scoped(
             pm,
+            &lock,
             std::slice::from_ref(&file),
             &format!("{id}: ref {kind} closed"),
             &[id],
@@ -2026,7 +2109,7 @@ pub fn add_comment(
     // CAD-109: a credential-shaped body is refused before anything is
     // written; warn-only findings ride along in the result.
     let secret_warnings = crate::secret::guard(&format!("{id}: comment"), body)?;
-    let _lock = pm.lock()?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     if let Some(conflict) = check_rev(&dir, if_rev)? {
         return Ok(conflict);
     }
@@ -2051,8 +2134,9 @@ pub fn add_comment(
     )?;
     // A failed commit leaves no comment file behind — an orphan would
     // sit foreign and uncommitted under the next writer's eye.
-    let foreign = match commit_who(
+    let foreign = match commit_who_scoped(
         pm,
+        &lock,
         std::slice::from_ref(&path),
         &format!("{id}: comment by {author}"),
         &[id],
@@ -2151,7 +2235,7 @@ pub fn add_report(
     let agent = front.agent.clone().unwrap_or_default();
     let kind = front.kind.map(|k| k.as_str()).unwrap_or_default();
     let text = parse::render(front, body)?;
-    let _lock = pm.lock()?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     let reports = dir.join(DIR);
     if reports.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
         return Err(Error::rejected(format!(
@@ -2176,8 +2260,9 @@ pub fn add_report(
     )?;
     // A failed commit must not leave the file behind: a retry would hit
     // the duplicate short-circuit and never commit it.
-    let foreign = match commit_who(
+    let foreign = match commit_who_scoped(
         pm,
+        &lock,
         std::slice::from_ref(&path),
         &format!("{id}: report {kind} by {agent}"),
         &[id],
@@ -2249,7 +2334,7 @@ pub fn attach_bytes(
             pm.config.artifact_max_bytes
         )));
     }
-    let _lock = pm.lock()?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     let artifacts = dir.join("artifacts");
     if artifacts.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
         return Err(Error::rejected(format!(
@@ -2269,8 +2354,9 @@ pub fn attach_bytes(
             Err(e) => return Err(e.into()),
         }
     };
-    let foreign = match commit(
+    let foreign = match commit_scoped(
         pm,
+        &lock,
         std::slice::from_ref(&path),
         &format!("{id}: attach {name}"),
         &[id],

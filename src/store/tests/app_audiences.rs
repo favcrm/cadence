@@ -270,6 +270,50 @@ fn cad780_freeze_drift_invalidates() {
 }
 
 #[test]
+fn cad1178_refreeze_replaces_the_snapshot_at_the_same_address() {
+    let dir = TempDir::new().unwrap();
+    let store = audience_file(&dir, "install-a");
+    seed_valid(&store, "ctx-1");
+    store
+        .app_segment_save("ctx-1", "seg-vip", None, "VIP", &vip_segment())
+        .unwrap();
+    let base = AudienceBase::parse(&json!({"mode": "segment", "segment_id": "seg-vip"})).unwrap();
+    let prepared = store
+        .app_audience_prepare("ctx-1", "freeze-1", &base, None, 50)
+        .unwrap();
+    assert_eq!(prepared["freeze"]["final_count"], 1);
+
+    // Membership moves: the frozen member withdraws consent.
+    let denied = profile("Amina", Some("amina@example.com"), "denied", &["vip"]);
+    store
+        .app_record_update("ctx-1", "customer-a", 1, &denied, None)
+        .unwrap();
+    assert_eq!(
+        store.app_audience_show("ctx-1", "freeze-1").unwrap()["valid"],
+        false
+    );
+
+    // CAD-1178: an explicit refreeze at the same address replaces the
+    // snapshot — the campaign's audience address stays stable, only the
+    // moved membership is re-pinned — instead of dead-ending the one
+    // Refreeze button the audience surface offers.
+    let refrozen = store
+        .app_audience_prepare("ctx-1", "freeze-1", &base, None, 50)
+        .unwrap();
+    assert_eq!(refrozen["freeze"]["refrozen"], true);
+    assert_eq!(refrozen["freeze"]["final_count"], 0);
+    assert_eq!(
+        store.app_audience_show("ctx-1", "freeze-1").unwrap()["valid"],
+        true
+    );
+
+    // A reused id for a DIFFERENT audience still refuses.
+    assert!(store
+        .app_audience_prepare("ctx-1", "freeze-1", &base_all(), None, 50)
+        .is_err());
+}
+
+#[test]
 fn cad780_max_recipients_bound() {
     let dir = TempDir::new().unwrap();
     let store = audience_file(&dir, "install-a");
