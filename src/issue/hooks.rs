@@ -27,6 +27,7 @@ fi\n";
 const POST_COMMIT: &str = "#!/bin/sh\n\
 # cadence board tracker: keep the private remote current after every write.\n\
 # No-op until an `origin` remote exists; runs in the background so writers never wait.\n\
+# The subshell drops git's stdout/stderr (a captured commit would otherwise read them to EOF).\n\
 git remote get-url origin >/dev/null 2>&1 || exit 0\n\
 gd=$(git rev-parse --git-dir 2>/dev/null) || exit 0\n\
 # A rebase, merge or cherry-pick is mid-sequence — whoever drives it\n\
@@ -38,7 +39,7 @@ if [ -d \"$gd/rebase-merge\" ] || [ -d \"$gd/rebase-apply\" ] || \\\n\
 fi\n\
 # A detached HEAD has no branch to push — leave it alone.\n\
 branch=$(git symbolic-ref --quiet --short HEAD) || exit 0\n\
-( git push -q origin \"$branch\" >/dev/null 2>&1 || echo \"$(date -u +%FT%TZ) push failed\" >> \"$gd/push-failures.log\" ) &\n";
+( git push -q origin \"$branch\" >/dev/null 2>&1 || echo \"$(date -u +%FT%TZ) push failed\" >> \"$gd/push-failures.log\" ) >/dev/null 2>&1 </dev/null &\n";
 
 /// The hooks init manages: name → content.
 const HOOKS: [(&str, &str); 2] = [("pre-commit", PRE_COMMIT), ("post-commit", POST_COMMIT)];
@@ -142,4 +143,77 @@ pub fn install(pm_dir: &Path) -> Result<Value> {
         map.insert(name.to_string(), state);
     }
     Ok(Value::Object(map))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// CAD-1255: the post-commit push must not hold git's captured
+    /// stdout/stderr, or `reaper::output` waits for the whole push.
+    #[test]
+    fn commit_does_not_wait_for_slow_background_push() {
+        let root = PathBuf::from(format!("/tmp/c1255-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (origin, pm) = (root.join("o.git"), root.join("pm"));
+        std::fs::create_dir_all(&pm).unwrap();
+        git(&root, &["init", "-q", "--bare", "o.git"]);
+        let pre = origin.join("hooks/pre-receive");
+        std::fs::write(&pre, "#!/bin/sh\nsleep 3\n").unwrap();
+        std::fs::set_permissions(&pre, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&pm, &["init", "-q", "-b", "main"]);
+        git(&pm, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        install(&pm).unwrap();
+        // pre-commit shells out to whatever `cadence` is on PATH; only the
+        // post-commit push is under test.
+        std::fs::remove_file(pm.join(".git/hooks/pre-commit")).unwrap();
+        std::fs::write(pm.join("f"), "x").unwrap();
+        git(&pm, &["add", "f"]);
+
+        let start = Instant::now();
+        let out = crate::reaper::output(
+            Command::new("git")
+                .arg("-C")
+                .arg(&pm)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["commit", "-q", "-m", "x"]),
+        )
+        .unwrap();
+        let took = start.elapsed();
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            took < Duration::from_millis(1500),
+            "commit waited for the push: {took:?}"
+        );
+        // The background push finishes on its own; let it before cleanup.
+        std::thread::sleep(Duration::from_secs(4));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_rewrites_stale_managed_post_commit() {
+        let root = PathBuf::from(format!("/tmp/c1255h-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        let hook = root.join(".git/hooks/post-commit");
+        std::fs::write(&hook, format!("#!/bin/sh\n# {MARKER}: old\n")).unwrap();
+        let rep = install(&root).unwrap();
+        assert_eq!(rep["post-commit"]["action"], "updated");
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), POST_COMMIT);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
