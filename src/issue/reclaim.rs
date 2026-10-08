@@ -1091,7 +1091,31 @@ mod tests {
                 assert!(target.is_dir(), "uncertain enumeration must retain target");
             }
             None => {
-                assert!(reclaim(&tmp, &lane, None).unwrap().is_some(), "control");
+                // The fixture issue needs its open branch ref for the lane to
+                // be a reclaim candidate at all (CAD-1196: reached once the
+                // live-use scan can complete on this host).
+                let mut issue = issue_with(&lane, None);
+                issue.front.refs.push(crate::issue::model::Ref {
+                    kind: "branch".to_string(),
+                    url: None,
+                    path: Some("x-lane".to_string()),
+                    label: None,
+                    closed: None,
+                    worktree: None,
+                    cargo_target: None,
+                    agent: None,
+                });
+                let repo = crate::worktree::main_root(&lane).unwrap();
+                let r = reclaim_lane(
+                    &down_view(),
+                    &no_daemon(),
+                    &pm_stub(&tmp, &repo),
+                    &issue,
+                    &lane,
+                    Duration::from_secs(6 * 3600),
+                    "test",
+                );
+                assert!(r.unwrap().is_some(), "control");
                 assert!(lane.join("src/keep.rs").is_file() && !target.exists());
             }
         }

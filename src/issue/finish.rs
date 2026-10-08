@@ -918,7 +918,7 @@ impl ProcView {
         relative: &str,
         root_dev: u64,
         root_mount_id: u64,
-    ) -> Result<u64> {
+    ) -> Result<Option<u64>> {
         let file = self
             .open_at(relative, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .map_err(|error| {
@@ -954,13 +954,20 @@ impl ProcView {
                 format!("{relative} namespace link was truncated"),
             ));
         }
+        // CAD-1196: the kernel answers a read of another uid's ns link with
+        // a successful, zero-length target instead of EACCES. That is
+        // "not readable by us", reported as None; any other target must be
+        // canonical.
+        if count == 0 {
+            return Ok(None);
+        }
         let target = std::str::from_utf8(&bytes[..count]).map_err(|error| {
             proc_view_error(
                 &self.canonical,
                 format!("{relative} has a non-UTF-8 target: {error}"),
             )
         })?;
-        parse_pid_namespace_link(target).ok_or_else(|| {
+        parse_pid_namespace_link(target).map(Some).ok_or_else(|| {
             proc_view_error(
                 &self.canonical,
                 format!("{relative} is not a canonical pid namespace link"),
@@ -968,12 +975,12 @@ impl ProcView {
         })
     }
 
-    fn read_pid_status(&self, pid: u32) -> io::Result<String> {
+    fn read_status_at(&self, relative: &str) -> io::Result<String> {
         let flags = libc::O_RDONLY
             | libc::O_CLOEXEC
             | libc::O_NOFOLLOW
             | if self.synthetic { 0 } else { libc::O_NONBLOCK };
-        let file = self.open_at(&format!("{pid}/status"), flags)?;
+        let file = self.open_at(relative, flags)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() && !(self.synthetic && metadata.file_type().is_fifo()) {
             return Err(io::Error::new(
@@ -985,6 +992,10 @@ impl ProcView {
         let mut file = file;
         file.read_to_string(&mut status)?;
         Ok(status)
+    }
+
+    fn read_pid_status(&self, pid: u32) -> io::Result<String> {
+        self.read_status_at(&format!("{pid}/status"))
     }
 
     fn validate_completeness(&self) -> Result<()> {
@@ -1079,14 +1090,45 @@ impl ProcView {
                 "PID 2 is not a live kthreadd kernel thread in the initial PID namespace",
             ));
         }
-        let self_pid_ns =
-            self.read_namespace_link("self/ns/pid", root_meta.dev(), root_mount_id)?;
-        let task_pid_ns = self.read_namespace_link("2/ns/pid", root_meta.dev(), root_mount_id)?;
-        if self_pid_ns != task_pid_ns {
+        // The caller's own link is always readable; an unreadable one proves
+        // nothing and refuses.
+        let Some(self_pid_ns) =
+            self.read_namespace_link("self/ns/pid", root_meta.dev(), root_mount_id)?
+        else {
             return Err(proc_view_error(
                 &self.canonical,
-                "caller and PID 2 are not in the same PID namespace",
+                "caller's own pid namespace link is empty",
             ));
+        };
+        match self.read_namespace_link("2/ns/pid", root_meta.dev(), root_mount_id)? {
+            Some(task_pid_ns) if task_pid_ns != self_pid_ns => {
+                return Err(proc_view_error(
+                    &self.canonical,
+                    "caller and PID 2 are not in the same PID namespace",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                // CAD-1196: PID 2 is root's, so an unprivileged caller reads
+                // its ns link as empty. The same fact is proven without it:
+                // PID 2 was just verified as kthreadd (PF_KTHREAD, parent 0),
+                // which exists only in the initial PID namespace, so this
+                // proc is the initial namespace's view; and the caller's own
+                // NSpid has a single entry, so the caller is in that same
+                // namespace as seen by this proc.
+                let status = self.read_status_at("self/status").map_err(|error| {
+                    proc_view_error(
+                        &self.canonical,
+                        format!("cannot read held self/status: {error}"),
+                    )
+                })?;
+                if !status_has_single_nspid(&status) {
+                    return Err(proc_view_error(
+                        &self.canonical,
+                        "caller is not provably in the PID namespace of this proc view",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -1142,6 +1184,62 @@ fn parse_pid_namespace_link(target: &str) -> Option<u64> {
     }
     let inode = value.parse::<u64>().ok()?;
     (inode != 0 && inode.to_string() == value).then_some(inode)
+}
+
+/// `NSpid:` lists the task's pid in each namespace from the proc mount's
+/// down to its own; exactly one entry means the task lives in the proc
+/// mount's namespace.
+#[cfg(target_os = "linux")]
+fn status_has_single_nspid(status: &str) -> bool {
+    let mut lines = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("NSpid:"));
+    let (Some(line), None) = (lines.next(), lines.next()) else {
+        return false;
+    };
+    let mut ids = line.split_whitespace();
+    matches!(
+        (ids.next().map(str::parse::<u32>), ids.next()),
+        (Some(Ok(pid)), None) if pid != 0
+    )
+}
+
+/// What the kernel's ptrace read-access rule is judged against.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct Caller {
+    euid: u32,
+    egid: u32,
+    /// `CapPrm` of the caller; `None` when it could not be read, which
+    /// disables the capability explanation (fail closed).
+    cap_prm: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn status_cap_prm(status: &str) -> Option<u64> {
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapPrm:"))?;
+    u64::from_str_radix(value.trim(), 16).ok()
+}
+
+/// CAD-1196: does the kernel's own access rule for `/proc/<pid>/{cwd,fd}`
+/// (ptrace read access) explain a PermissionDenied for this caller? The
+/// kernel itself marks the cases: it gives the process's `cwd` entry to the
+/// process's uid/gid only while the process is dumpable and (for a foreign
+/// uid) otherwise to root, so an entry owned by neither the caller's
+/// effective uid nor gid is a foreign or non-dumpable process. The other
+/// case is a target whose permitted capabilities exceed the caller's.
+/// Status credentials are never trusted for this: a PermissionDenied that
+/// neither the entry's ownership nor the capabilities explain is an
+/// unexplained gap and still refuses.
+#[cfg(target_os = "linux")]
+fn policy_denies_read(status: &str, caller: Caller, cwd_entry_owner: Option<(u32, u32)>) -> bool {
+    let extra_caps = match (status_cap_prm(status), caller.cap_prm) {
+        (Some(target), Some(own)) => target & !own != 0,
+        _ => false,
+    };
+    extra_caps || cwd_entry_owner.is_some_and(|(uid, gid)| uid != caller.euid || gid != caller.egid)
 }
 
 #[cfg(target_os = "linux")]
@@ -1556,7 +1654,7 @@ fn finish_pid_scan(
 }
 
 #[cfg(target_os = "linux")]
-fn inspect_pid(view: &ProcView, dir: &Path, pid: u32, use_: &mut ProcessUse) {
+fn inspect_pid(view: &ProcView, dir: &Path, pid: u32, use_: &mut ProcessUse, caller: Caller) {
     let proc_dir = view.scan_root.join(pid.to_string());
     let mut pending = None;
     match std::fs::symlink_metadata(&proc_dir) {
@@ -1581,19 +1679,35 @@ fn inspect_pid(view: &ProcView, dir: &Path, pid: u32, use_: &mut ProcessUse) {
         }
         Ok(_) => {}
     }
-    match process_status(view, pid) {
-        Ok(true) => {}
-        Ok(false) => return,
+    let status = view
+        .read_pid_status(pid)
+        .and_then(|status| inspect_process_status(&status).map(|live| (status, live)));
+    let status = match status {
+        Ok((_, false)) => return,
+        Ok((status, true)) => status,
         Err(error) => {
             remember_pid_error(&mut pending, "establish process identity", error, true);
             finish_pid_scan(view, pid, use_, pending);
             return;
         }
-    }
+    };
+    // CAD-1196: on a normal host many processes are unreadable to an
+    // unprivileged caller by kernel policy (root's, capability-bearing,
+    // non-dumpable). PermissionDenied that `policy_denies_read` explains is
+    // that policy, not an incomplete view; any other error, and a
+    // PermissionDenied nothing explains, still leaves the scan incomplete.
+    let cwd_entry_owner = std::fs::symlink_metadata(proc_dir.join("cwd"))
+        .ok()
+        .map(|metadata| (metadata.uid(), metadata.gid()));
+    let unreadable_by_policy = |error: &io::Error| {
+        error.kind() == io::ErrorKind::PermissionDenied
+            && policy_denies_read(&status, caller, cwd_entry_owner)
+    };
 
     match std::fs::read_link(proc_dir.join("cwd")) {
         Ok(cwd) if cwd.starts_with(dir) => use_.cwd.push(pid),
         Ok(_) => {}
+        Err(error) if unreadable_by_policy(&error) => {}
         Err(error) => remember_pid_error(&mut pending, "inspect cwd", error, true),
     }
     match std::fs::read_dir(proc_dir.join("fd")) {
@@ -1637,6 +1751,7 @@ fn inspect_pid(view: &ProcView, dir: &Path, pid: u32, use_: &mut ProcessUse) {
                             ),
                         }
                     }
+                    Err(error) if unreadable_by_policy(&error) => {}
                     Err(error) => {
                         remember_pid_error(&mut pending, "inspect file descriptor", error, false)
                     }
@@ -1646,6 +1761,7 @@ fn inspect_pid(view: &ProcView, dir: &Path, pid: u32, use_: &mut ProcessUse) {
                 use_.fd.push(pid);
             }
         }
+        Err(error) if unreadable_by_policy(&error) => {}
         Err(error) => remember_pid_error(&mut pending, "enumerate file descriptors", error, true),
     }
     finish_pid_scan(view, pid, use_, pending);
@@ -1683,6 +1799,14 @@ pub(crate) fn process_use_under_from_proc_root(dir: &Path, proc_root: &Path) -> 
         }
     };
     let me = std::process::id();
+    let caller = Caller {
+        euid: unsafe { libc::geteuid() },
+        egid: unsafe { libc::getegid() },
+        cap_prm: view
+            .read_status_at("self/status")
+            .ok()
+            .and_then(|status| status_cap_prm(&status)),
+    };
     for entry in procs {
         let entry = match entry {
             Ok(entry) => entry,
@@ -1699,7 +1823,7 @@ pub(crate) fn process_use_under_from_proc_root(dir: &Path, proc_root: &Path) -> 
         if complete && pid == me {
             continue;
         }
-        inspect_pid(&view, &dir, pid, &mut use_);
+        inspect_pid(&view, &dir, pid, &mut use_, caller);
     }
     Ok(use_)
 }
@@ -3600,6 +3724,65 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// CAD-1196: PID 2's empty ns link is replaced by the caller's NSpid
+    /// having exactly one entry; nested, absent, duplicated or zero fail.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nspid_proof_needs_exactly_one_entry() {
+        assert!(status_has_single_nspid(
+            "Name:\tx\nNSpid:\t1234\nSeccomp:\t0\n"
+        ));
+        assert!(!status_has_single_nspid("NSpid:\t1234\t7\n"));
+        assert!(!status_has_single_nspid("NSpid:\t0\n"));
+        assert!(!status_has_single_nspid("NSpid:\n"));
+        assert!(!status_has_single_nspid("NSpid:\tx\n"));
+        assert!(!status_has_single_nspid("Name:\tx\n"));
+        assert!(!status_has_single_nspid("NSpid:\t1\nNSpid:\t1\n"));
+    }
+
+    /// CAD-1196: PermissionDenied is explained only by a cwd entry the
+    /// kernel gave to another uid/gid (foreign or non-dumpable process) or
+    /// by extra permitted capabilities; status credentials never excuse.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn policy_explains_only_what_the_kernel_rule_denies() {
+        let caller = Caller {
+            euid: 1000,
+            egid: 1000,
+            cap_prm: Some(0),
+        };
+        let caps = |cap: &str| format!("CapPrm:\t{cap}\n");
+        let none = caps("0000000000000000");
+        assert!(!policy_denies_read(&none, caller, Some((1000, 1000))));
+        assert!(!policy_denies_read(&none, caller, None));
+        // Entry owned by root (non-dumpable) or by another uid or gid.
+        assert!(policy_denies_read(&none, caller, Some((0, 0))));
+        assert!(policy_denies_read(&none, caller, Some((1001, 1000))));
+        assert!(policy_denies_read(&none, caller, Some((1000, 4))));
+        // A status claiming a foreign uid does not excuse an own-owned entry.
+        let status = "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nCapPrm:\t0\n";
+        assert!(!policy_denies_read(status, caller, Some((1000, 1000))));
+        // Extra permitted capability; a subset is not an explanation.
+        let extra = caps("0000000800000000");
+        assert!(policy_denies_read(&extra, caller, Some((1000, 1000))));
+        let held = Caller {
+            cap_prm: Some(0x8_0000_0000),
+            ..caller
+        };
+        assert!(!policy_denies_read(&extra, held, Some((1000, 1000))));
+        // Unknown caller caps or a malformed target line never excuse.
+        let blind = Caller {
+            cap_prm: None,
+            ..caller
+        };
+        assert!(!policy_denies_read(&extra, blind, Some((1000, 1000))));
+        assert!(!policy_denies_read(
+            "CapPrm:\tzz\n",
+            caller,
+            Some((1000, 1000))
+        ));
+    }
+
     fn repo() -> TempDir {
         let tmp = TempDir::new().unwrap();
         let r = tmp.path();
@@ -3839,5 +4022,204 @@ mod tests {
         let mut probe2 = target("CAD-1");
         probe2.msg_refs.insert("gone".to_string());
         assert!(stale_probe_reason(&probe2, &target("CAD-1")).is_none());
+    }
+}
+
+/// CAD-1196 reviewer-written acceptance check for the process-enumeration
+/// gate: every refusal is driven through `process_use_under_from_proc_root`
+/// (the real guard) over a synthetic proc tree that starts from a state
+/// where the scan completes cleanly, so each case isolates one guard.
+#[cfg(all(test, target_os = "linux"))]
+mod cad1196_acceptance {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use tempfile::{Builder, TempDir};
+
+    struct Proc {
+        _root: TempDir,
+        proc_root: PathBuf,
+        lane: PathBuf,
+    }
+
+    impl Proc {
+        fn new() -> Self {
+            let root = Builder::new().prefix("c1196u-").tempdir_in("/tmp").unwrap();
+            let proc_root = root.path().join("proc");
+            let lane = root.path().join("lane");
+            std::fs::create_dir_all(&lane).unwrap();
+            std::fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+            std::fs::create_dir_all(proc_root.join("2/ns")).unwrap();
+            let canon = proc_root.canonicalize().unwrap();
+            let p = Self {
+                _root: root,
+                proc_root,
+                lane,
+            };
+            p.mountinfo(&canon, "rw");
+            std::fs::write(p.proc_root.join("self/kernel-release"), "7.0.0\n").unwrap();
+            p.kthreadd(2_097_152);
+            symlink("pid:[42]", p.proc_root.join("self/ns/pid")).unwrap();
+            symlink("pid:[42]", p.proc_root.join("2/ns/pid")).unwrap();
+            std::fs::write(
+                p.proc_root.join("self/status"),
+                "Name:\tt\nState:\tR (running)\nNSpid:\t7\nCapPrm:\t0000000000000000\n",
+            )
+            .unwrap();
+            p.process(2, Path::new("/"), &[]);
+            p
+        }
+
+        fn mountinfo(&self, canon: &Path, opts: &str) {
+            std::fs::write(
+                self.proc_root.join("self/mountinfo"),
+                format!(
+                    "1 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc {opts}\n",
+                    canon.display()
+                ),
+            )
+            .unwrap();
+        }
+
+        fn kthreadd(&self, flags: u64) {
+            std::fs::write(
+                self.proc_root.join("2/stat"),
+                format!("2 (kthreadd) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"),
+            )
+            .unwrap();
+        }
+
+        fn relink(&self, rel: &str, target: &str) {
+            let path = self.proc_root.join(rel);
+            let _ = std::fs::remove_file(&path);
+            symlink(target, path).unwrap();
+        }
+
+        /// An own-uid, fully readable process.
+        fn process(&self, pid: u32, cwd: &Path, fds: &[&Path]) -> PathBuf {
+            let dir = self.proc_root.join(pid.to_string());
+            std::fs::create_dir_all(dir.join("fd")).unwrap();
+            let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            std::fs::write(
+                dir.join("status"),
+                format!(
+                    "Name:\tfixture\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nGroups:\t{gid}\nCapEff:\t0000000000000000\nCapPrm:\t0000000000000000\n"
+                ),
+            )
+            .unwrap();
+            symlink(cwd, dir.join("cwd")).unwrap();
+            for (i, fd) in fds.iter().enumerate() {
+                symlink(fd, dir.join("fd").join((3 + i).to_string())).unwrap();
+            }
+            dir
+        }
+
+        fn scan(&self) -> ProcessUse {
+            process_use_under_from_proc_root(&self.lane, &self.proc_root).unwrap()
+        }
+
+        fn refused(&self, expect: &str) {
+            let uses = self.scan();
+            let err = uses.enumeration_error.expect("scan must be incomplete");
+            assert!(err.contains(expect), "expected {expect:?} in {err:?}");
+        }
+    }
+
+    #[test]
+    fn complete_synthetic_view_with_harmless_process_is_clean() {
+        let p = Proc::new();
+        p.process(900, Path::new("/"), &[]);
+        let uses = p.scan();
+        assert!(
+            uses.enumeration_error.is_none(),
+            "{:?}",
+            uses.enumeration_error
+        );
+        assert!(uses.cwd.is_empty() && uses.fd.is_empty());
+    }
+
+    #[test]
+    fn own_uid_cwd_or_fd_inside_the_lane_is_named() {
+        let p = Proc::new();
+        p.process(901, &p.lane.canonicalize().unwrap(), &[]);
+        p.process(902, Path::new("/"), &[&p.lane.canonicalize().unwrap()]);
+        let uses = p.scan();
+        assert_eq!(uses.cwd, vec![901]);
+        assert_eq!(uses.fd, vec![902]);
+    }
+
+    #[test]
+    fn own_uid_unexplained_permission_denied_is_an_incomplete_scan() {
+        // Entry (cwd) is owned by the caller, so the kernel policy cannot
+        // explain the EACCES on fd/: it must refuse, not excuse.
+        let p = Proc::new();
+        let dir = p.process(903, Path::new("/"), &[]);
+        std::fs::set_permissions(dir.join("fd"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let uses = p.scan();
+        std::fs::set_permissions(dir.join("fd"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            uses.enumeration_error.is_some(),
+            "unexplained EACCES on an own-uid process was excused"
+        );
+    }
+
+    #[test]
+    fn hidepid_hidden_view_is_refused() {
+        let p = Proc::new();
+        let canon = p.proc_root.canonicalize().unwrap();
+        p.mountinfo(&canon, "rw,hidepid=2");
+        p.refused("hidepid");
+    }
+
+    #[test]
+    fn non_canonical_or_other_pid2_namespace_link_is_refused() {
+        for bad in [
+            "pid:[042]",
+            "pid:[0]",
+            "net:[42]",
+            "pid:[43]",
+            "garbage",
+            "pid:[42]x",
+        ] {
+            let p = Proc::new();
+            p.relink("2/ns/pid", bad);
+            let uses = p.scan();
+            assert!(
+                uses.enumeration_error.is_some(),
+                "PID 2 link {bad:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn caller_namespace_link_must_parse() {
+        for bad in ["garbage", "pid:[0]", "pid:[042]"] {
+            let p = Proc::new();
+            p.relink("self/ns/pid", bad);
+            assert!(p.scan().enumeration_error.is_some(), "caller link {bad:?}");
+        }
+    }
+
+    #[test]
+    fn pid2_must_be_kthreadd() {
+        let p = Proc::new();
+        p.kthreadd(0); // no PF_KTHREAD
+        p.refused("kthreadd");
+        let p = Proc::new();
+        std::fs::write(
+            p.proc_root.join("2/stat"),
+            "2 (bash) S 0 0 0 0 -1 2097152 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        p.refused("kthreadd");
+    }
+
+    #[test]
+    fn nspid_proof_for_an_empty_pid2_link() {
+        // The synthetic seam cannot make an empty symlink, so the empty-link
+        // branch is driven through its two decisions directly.
+        assert!(status_has_single_nspid("NSpid:\t7\n"));
+        assert!(!status_has_single_nspid("NSpid:\t7\t1\n"));
+        assert!(!status_has_single_nspid("NSpid:\t7\t3\t1\n"));
+        assert!(!status_has_single_nspid(""));
     }
 }
