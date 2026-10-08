@@ -8,6 +8,7 @@ import type {
   AppWorkflow,
   WorkflowRow,
 } from "../../lib/types";
+import type { Installation } from "../workspace-apps/workspaceApps";
 import type { HomeNeed } from "../home/needs";
 import type { Viewer } from "../projects/work";
 
@@ -30,6 +31,26 @@ export type GateRow = Pick<AppRow, "error" | "approval" | "connections" | "sourc
 /** `/apps/<project>/<name>` — one app's detail route. */
 export function appHref(project: string, name: string): string {
   return `/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}`;
+}
+
+/**
+ * The v3 app screen (`/app-installations/<id>`) of the installation a
+ * project app card stands for, or null: the card keeps its legacy link
+ * unless exactly one installation of that project and name declares a
+ * supported screen (CAD-1253). Whether the screen mounts stays the
+ * host's own approval check.
+ */
+export function screenInstallHref(
+  installs: Pick<Installation, "install_id" | "name" | "project_link" | "files" | "removed">[] | null,
+  project: string,
+  name: string,
+): string | null {
+  const hits = (installs ?? []).filter(
+    (i) =>
+      i.removed == null && i.name === name && i.project_link === project &&
+      i.files.some((f) => /^screens\/[a-z0-9][a-z0-9-]{0,31}\/screens\.json$/.test(f)),
+  );
+  return hits.length === 1 ? `/app-installations/${encodeURIComponent(hits[0].install_id)}` : null;
 }
 
 /**

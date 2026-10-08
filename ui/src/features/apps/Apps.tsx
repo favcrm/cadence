@@ -3,13 +3,14 @@ import { resources } from "../../lib/resources";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import { homeNeeds, type HomeNeed } from "../home/needs";
-import { appApprovalChip, appHref, appPurpose, runsSummary } from "./appViewModel";
+import { appApprovalChip, appHref, appPurpose, runsSummary, screenInstallHref } from "./appViewModel";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
+import { useInstallations } from "../workspace-apps/useInstallations";
 import { ResourceGate } from "../../ui/ResourceStatus";
 import "./apps.css";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
-import { appExplorer, notifyAppsChanged, type HomeInstallation, type FavoritesPayload } from "../workspace-apps/workspaceApps";
+import { appExplorer, notifyAppsChanged, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
 import { appErrorCopy, appLoadErrorCopy } from "../explorer/appErrors";
 import type { Viewer } from "../projects/work";
 import { AppGlyph } from "../explorer/shared";
@@ -54,6 +55,8 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   const projectApps = useQuery(resources.apps);
   const overview = useResource(resources.overview);
   const needs = homeNeeds(overview.data?.needs_me);
+  // Only the operator may read the installation list; others keep the legacy link.
+  const installs = useInstallations(isOp, revision).list;
   const projectRows = (projectApps.data ?? []).filter((r) => project === "all" || r.project === project);
 
   const byId = useMemo(() => {
@@ -286,7 +289,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
         )}
         <ul className="space-y-2.5">
           {projectRows.map((row, i) => (
-            <AppCard key={`${row.project}/${row.name ?? i}`} row={row} needs={needs} showProject={project === "all"} />
+            <AppCard key={`${row.project}/${row.name ?? i}`} row={row} installs={installs} needs={needs} showProject={project === "all"} />
           ))}
         </ul>
       </section>
@@ -309,17 +312,21 @@ function AppIcon({ label }: { label: string }) {
 
 function AppCard({
   row,
+  installs,
   needs,
   showProject,
 }: {
   row: AppRow;
+  installs: Installation[] | null;
   needs: HomeNeed[];
   showProject: boolean;
 }) {
   const approval = appApprovalChip(row);
   const title = row.title?.trim() || row.name || "App";
   const appName = row.name;
-  const href = appName ? appHref(row.project, appName) : null;
+  const legacyHref = appName ? appHref(row.project, appName) : null;
+  const screenHref = appName ? screenInstallHref(installs, row.project, appName) : null;
+  const href = screenHref ?? legacyHref;
   return (
     <li className="card px-3.5 py-3 min-w-0" data-app={row.name ?? undefined}>
       <div className="app-card-layout">
@@ -348,6 +355,7 @@ function AppCard({
           </p>
         </div>
         {href && <Button href={href} className="app-card-action" aria-label={`Open ${title} in ${row.project}`}>Open app</Button>}
+        {screenHref && legacyHref && <Link href={legacyHref} className="text-micro text-ink-500 hover:text-accent">Legacy page</Link>}
       </div>
     </li>
   );
