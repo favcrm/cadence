@@ -14,14 +14,15 @@ use std::time::{Duration, Instant};
 
 const PASSWORD: &str = "cad1065-synthetic-only-password";
 const SMTP_RIG: &str = r#"
-import base64, json, pathlib, socket, ssl, sys
+import base64, json, os, pathlib, socket, ssl, sys
 root = pathlib.Path(sys.argv[1])
 tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 tls.load_cert_chain(root / "certificate.pem", root / "key.pem")
 listener = socket.socket()
 listener.bind(("127.0.0.1", 0))
 listener.listen(8)
-(root / "port").write_text(str(listener.getsockname()[1]))
+(root / "port.tmp").write_text(str(listener.getsockname()[1]))
+os.replace(root / "port.tmp", root / "port")
 def record(kind):
     with (root / "observed").open("a") as out:
         out.write(kind + "\n")
@@ -1191,14 +1192,15 @@ fn cad1065_reply_total_bound_and_utf8_refusal_leave_verifier_usable() {
 #[test]
 fn cad1065_tls_drip_cannot_reset_the_total_operation_budget() {
     let script = r#"
-import pathlib, socket, ssl, sys, time
+import os, pathlib, socket, ssl, sys, time
 root = pathlib.Path(sys.argv[1])
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(root / "certificate.pem", root / "key.pem")
 listener = socket.socket()
 listener.bind(("127.0.0.1", 0))
 listener.listen(8)
-(root / "port").write_text(str(listener.getsockname()[1]))
+(root / "port.tmp").write_text(str(listener.getsockname()[1]))
+os.replace(root / "port.tmp", root / "port")
 while True:
     raw, _ = listener.accept()
     with (root / "observed").open("a") as out:
