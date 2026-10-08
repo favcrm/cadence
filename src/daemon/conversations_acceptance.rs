@@ -2114,3 +2114,508 @@ fn thread_send_attachments_resolve_refuse_and_ride() {
     );
     assert!(body.ends_with("review this"), "{body}");
 }
+
+// ---------- CAD-1168 independent acceptance check (reviewer-authored) ----------
+
+/// CAD-1168 acceptance item 9, written by the Spec/security reviewer
+/// (cc-rev-spec) from the ticket, not by the implementer — the
+/// implementer must not edit or weaken it.
+///
+/// Control: a same-scope ready CSV uploaded into a CRM conversation is
+/// referenced by a real app-bound `thread_send`, and the master's live
+/// turn reads its bounded text back. Refused, each by its own reason
+/// and without bytes or an effect (no new message, no new row):
+/// cross-installation, cross-company (context) and cross-conversation
+/// references; a home row on an app send and an app row on a home
+/// send; an unknown id; a forged row that claims ready text without
+/// custody bytes; a forged PDF row over real text bytes; a client
+/// `ready`/`sha256` field; a master read of an id not on its turn's
+/// envelope, under a finished turn, from a worker or an underivable
+/// caller; and an agent (the master itself, a worker, a detached child)
+/// trying the operator's upload or attach authority. The same cases are
+/// then run on the board's HTTP peer.
+///
+/// Guards: `rpc_chat_file_upload` / `rpc_chat_file_read`
+/// (daemon/chat_files_rpc.rs), `thread_attachments` (daemon.rs),
+/// `ChatFile::scope_matches` / `home_scope` / readiness checks
+/// (store/chat_files.rs), `WRITE_ROUTES` + `post_upload` /
+/// `post_message` (ui/operator.rs, ui/threads.rs).
+#[test]
+fn cad1168_independent_attachment_scope_refusals() {
+    const SECRETLESS: &str = "name,email\nZed Sentinel,zed@example.test\n";
+    let gx = gx();
+    let staged = |gx: &Gx, bytes: &[u8]| {
+        let dir = gx.dir.path().join(crate::wiki::UPLOAD_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(format!("upload-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&tmp, bytes).unwrap();
+        tmp.to_string_lossy().into_owned()
+    };
+    let upload = |gx: &Gx, name: &str, bytes: &[u8], scope: Option<(&str, &str, &str)>| {
+        let mut params = json!({"name": name, "tmp": staged(gx, bytes)});
+        if let Some((install, context, conversation)) = scope {
+            params["app"] = json!({"install_id": install, "context_id": context});
+            params["conversation"] = json!(conversation);
+        }
+        gx.operator("chat_file_upload", params).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let send = |gx: &Gx, msg: &str, scope: Option<(&str, &str, &str)>, ids: Value| {
+        let mut params = json!({"alias": "master", "text": format!("read {msg}"),
+                                "message": msg, "attachments": ids});
+        if let Some((install, context, conversation)) = scope {
+            params["app"] = json!({"install_id": install, "context_id": context});
+            params["conversation"] = json!(conversation);
+        }
+        gx.operator("thread_send", params)
+    };
+    let (crm, social) = (gx.crm.clone(), gx.social.clone());
+    let (crm_a, crm_b, social_ctx) = (gx.crm_a.clone(), gx.crm_b.clone(), gx.social_ctx.clone());
+    let conv_a = gx.conversation(&crm, &crm_a, json!({"general": true}));
+    let conv_a2 = gx.conversation(&crm, &crm_a, json!({}));
+    let conv_b = gx.conversation(&crm, &crm_b, json!({"general": true}));
+    let conv_s = gx.general_of(&social, &social_ctx);
+    let scope_a = Some((crm.as_str(), crm_a.as_str(), conv_a.as_str()));
+
+    // ---- Control: same-scope ready file, real send, guarded read. ----
+    let file_a = upload(&gx, "leads.csv", SECRETLESS.as_bytes(), scope_a);
+    let sent = send(&gx, "m-ctl", scope_a, json!([{"id": file_a}])).unwrap();
+    assert_eq!(sent["state"], json!("queued"), "{sent}");
+    let token = gx.run("m-ctl");
+    let read = gx
+        .verb("chat_file_read", json!({"id": file_a}), "m-ctl", &token)
+        .unwrap();
+    assert_eq!(read["text"], json!(SECRETLESS), "control read: {read}");
+    assert_eq!(read["extractable"], json!(true), "{read}");
+
+    // Fixture rows in other scopes — same bytes, so only scope differs.
+    let file_a2 = upload(&gx, "other.txt", b"second file in A", scope_a);
+    let file_b = upload(
+        &gx,
+        "leads.csv",
+        SECRETLESS.as_bytes(),
+        Some((&crm, &crm_b, &conv_b)),
+    );
+    let file_s = upload(
+        &gx,
+        "leads.csv",
+        SECRETLESS.as_bytes(),
+        Some((&social, &social_ctx, &conv_s)),
+    );
+    let file_conv2 = upload(
+        &gx,
+        "leads.csv",
+        SECRETLESS.as_bytes(),
+        Some((&crm, &crm_a, &conv_a2)),
+    );
+    let file_home = upload(&gx, "leads.csv", SECRETLESS.as_bytes(), None);
+    for id in [&file_b, &file_s, &file_conv2, &file_home] {
+        assert_ne!(id, &file_a, "a different scope must mint a different row");
+    }
+
+    let rows = || gx.count("SELECT count(*) FROM chat_files");
+    let messages = || gx.count("SELECT count(*) FROM messages");
+    let no_bytes = |what: &str, err: &str| {
+        assert!(
+            !err.contains("Zed Sentinel") && !err.contains("second file"),
+            "{what}: a refusal exposed bytes: {err}"
+        );
+    };
+
+    // ---- Forged rows: ready claimed without bytes; PDF over text. ----
+    let forged_ready = "chf-00000000000000000000000000000f0e";
+    let forged_pdf = "chf-00000000000000000000000000000f0f";
+    let sha_a: String = gx
+        .db()
+        .query_row("SELECT sha256 FROM chat_files WHERE id=?", [&file_a], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    // Real custody bytes that no scope-A row names yet (uploaded under
+    // Home), so a forged scope-A PDF row can point at a present blob.
+    let file_carrier = upload(&gx, "carrier.txt", b"carrier bytes", None);
+    let sha_carrier: String = gx
+        .db()
+        .query_row(
+            "SELECT sha256 FROM chat_files WHERE id=?",
+            [&file_carrier],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let scope_label = format!("app:{crm}@{conv_a}");
+    for (id, sha, mime) in [
+        (forged_ready, "ab".repeat(32), "text/csv"),
+        (forged_pdf, sha_carrier, "application/pdf"),
+    ] {
+        gx.db()
+            .execute(
+                "INSERT INTO chat_files(id,sha256,size,mime,name,scope,context_id,uploader,created)
+                 VALUES(?,?,?,?,?,?,?,'operator',1.0)",
+                rusqlite::params![
+                    id,
+                    sha,
+                    if mime == "application/pdf" {
+                        13
+                    } else {
+                        SECRETLESS.len() as i64
+                    },
+                    mime,
+                    "forged.csv",
+                    scope_label,
+                    crm_a
+                ],
+            )
+            .unwrap();
+    }
+
+    let (rows0, messages0) = (rows(), messages());
+
+    // ---- Daemon: refused references at send. ----
+    let not_scoped = "is not scoped to this installation, context and conversation";
+    /// (what, app scope or Home, attachments, refusal reason)
+    type Scope<'a> = Option<(&'a str, &'a str, &'a str)>;
+    let cases: Vec<(&str, Scope, Value, &str)> = vec![
+        // cross-installation: a Social row on a CRM conversation
+        (
+            "cross-install",
+            scope_a,
+            json!([{"id": file_s}]),
+            not_scoped,
+        ),
+        // cross-company: company A's row on company B's conversation
+        (
+            "cross-company",
+            Some((&crm, &crm_b, &conv_b)),
+            json!([{"id": file_a}]),
+            not_scoped,
+        ),
+        // another conversation of the same installation and company
+        (
+            "cross-conversation",
+            Some((&crm, &crm_a, &conv_a2)),
+            json!([{"id": file_a}]),
+            not_scoped,
+        ),
+        // a home row cannot ride an app conversation
+        (
+            "home-on-app",
+            scope_a,
+            json!([{"id": file_home}]),
+            not_scoped,
+        ),
+        // an app row cannot ride the home thread
+        (
+            "app-on-home",
+            None,
+            json!([{"id": file_a}]),
+            "is not a home-scope file",
+        ),
+        // never minted
+        (
+            "unknown",
+            scope_a,
+            json!([{"id": "chf-0123456789abcdef0123456789abcdef"}]),
+            "unknown attachment",
+        ),
+        // a row claiming ready text with no custody bytes
+        (
+            "forged-ready-row",
+            scope_a,
+            json!([{"id": forged_ready}]),
+            "blob is missing",
+        ),
+        // a non-text row over genuine bytes is never ready text
+        (
+            "forged-pdf-row",
+            scope_a,
+            json!([{"id": forged_pdf}]),
+            "is not a ready text source",
+        ),
+        // client-forged readiness or digest fields refuse whole
+        (
+            "client-ready-field",
+            scope_a,
+            json!([{"id": file_a, "ready": true}]),
+            "takes id only",
+        ),
+        (
+            "client-sha-field",
+            scope_a,
+            json!([{"id": file_a, "sha256": sha_a}]),
+            "takes id only",
+        ),
+    ];
+    for (i, (what, scope, ids, reason)) in cases.into_iter().enumerate() {
+        let err = err_text(send(&gx, &format!("m-bad-{i}"), scope, ids));
+        assert!(err.contains(reason), "{what}: {err}");
+        no_bytes(what, &err);
+        assert_eq!(messages(), messages0, "{what}: a refused send queued");
+    }
+    // A forged ready state on upload refuses whole too.
+    for field in ["ready", "state", "scope", "context_id"] {
+        let mut params = json!({"name": "x.csv", "tmp": staged(&gx, b"a,b\n1,2\n")});
+        params[field] = json!("ready");
+        let err = err_text(gx.operator("chat_file_upload", params));
+        assert!(
+            err.contains(&format!("field '{field}' is not accepted")),
+            "{field}: {err}"
+        );
+    }
+
+    // ---- Daemon: refused reads. ----
+    // An id not on THIS turn's envelope — even one in the same scope,
+    // and even the forged rows — is refused under a live token.
+    for id in [&file_a2, &file_b, &file_s, &file_home, &file_conv2] {
+        let err = err_text(gx.verb("chat_file_read", json!({"id": id}), "m-ctl", &token));
+        assert!(err.contains("not on your turn's envelope"), "{id}: {err}");
+        no_bytes("off-envelope read", &err);
+    }
+    // A worker, an underivable caller and a forged token are refused.
+    let err = err_text(gx.call(
+        Asserted::Agent("w1".into()),
+        "chat_file_read",
+        json!({"id": file_a, "message": "m-ctl", "token": token}),
+    ));
+    assert!(err.contains("only the master"), "{err}");
+    no_bytes("worker read", &err);
+    let err = err_text(gx.call(Asserted::Unproven, "chat_file_read", json!({"id": file_a})));
+    assert!(err.contains("not provably the operator"), "{err}");
+    let err = err_text(gx.verb(
+        "chat_file_read",
+        json!({"id": file_a}),
+        "m-ctl",
+        "forged-token",
+    ));
+    assert!(err.contains("active assigned turn"), "{err}");
+    no_bytes("forged-token read", &err);
+    // Once the turn finishes, the same token no longer reads.
+    gx.finish("m-ctl", 5.0);
+    let err = err_text(gx.verb("chat_file_read", json!({"id": file_a}), "m-ctl", &token));
+    assert!(err.contains("active assigned turn"), "{err}");
+    no_bytes("finished-turn read", &err);
+
+    // ---- Daemon: no agent acquires operator upload/attach authority. ----
+    for who in [
+        Asserted::Agent("master".into()),
+        Asserted::Agent("w1".into()),
+        Asserted::Unproven,
+    ] {
+        let label = format!("{who:?}");
+        let err = err_text(gx.call(
+            who.clone(),
+            "chat_file_upload",
+            json!({"name": "x.csv", "tmp": staged(&gx, b"a,b\n1,2\n")}),
+        ));
+        // The master is stopped earlier, by its own call policy (an app
+        // turn may call only the scoped verbs) — still a refusal naming
+        // the verb; workers and detached children by the operator proof.
+        let refused = |err: &str, verb: &str| {
+            err.contains("operator's chat")
+                || err.contains("not provably the operator")
+                || err.contains(&format!("not {verb}"))
+        };
+        assert!(refused(&err, "chat_file_upload"), "{label} upload: {err}");
+        let err = err_text(gx.call(
+            who,
+            "thread_send",
+            json!({"alias": "master", "text": "x", "message": "m-agent",
+                   "attachments": [{"id": file_home}]}),
+        ));
+        assert!(refused(&err, "thread_send"), "{label} attach: {err}");
+    }
+    // A worker's plain `agent_send` cannot carry attachments either.
+    let err = err_text(gx.call(
+        Asserted::Agent("w1".into()),
+        "agent_send",
+        json!({"alias": "master", "text": "x", "attachments": [{"id": file_home}]}),
+    ));
+    assert!(
+        err.contains("attachments") || err.contains("not accepted"),
+        "agent_send: {err}"
+    );
+    assert_eq!(rows(), rows0, "a refused call minted a chat_files row");
+    assert_eq!(messages(), messages0, "a refused call queued a message");
+    drop(gx);
+
+    // ---- The board's HTTP peer: the same control and refusals. ----
+    let (board, state, rest) = http::start(gx_with(true));
+    let db = || rusqlite::Connection::open(crate::rollout::db_file(&state)).unwrap();
+    let count = |sql: &str| -> i64 { db().query_row(sql, [], |r| r.get(0)).unwrap() };
+    let crm = rest.crm.clone();
+    let make_conv = |context: &str| -> String {
+        let (status, reply) = board.call(
+            "operator",
+            "POST",
+            &format!("/api/app-installations/{crm}/conversations"),
+            Some(json!({"context_id": context, "general": true})),
+        );
+        assert_eq!(status, 200, "{reply}");
+        reply["conversation"]["id"].as_str().unwrap().to_string()
+    };
+    let conv_a = make_conv(&rest.crm_a);
+    let conv_b = make_conv(&rest._crm_b);
+    let boundary = "----cad1168rev";
+    let multipart = |fields: &[(&str, &str)], filename: &str, bytes: &[u8]| -> Vec<u8> {
+        let mut body = Vec::new();
+        for (k, v) in fields {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    };
+    let post_upload = |who: &str, body: Vec<u8>| -> (u16, Value) {
+        let url = format!("{}/api/chat/upload", board.base);
+        let resp = board
+            .decorate(who, board.agent.post(&url))
+            .header(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
+            .send(body)
+            .unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.into_body().read_json().unwrap_or(Value::Null))
+    };
+    let scoped_fields = |context: &str, conversation: &str| -> Vec<(String, String)> {
+        vec![
+            ("install_id".into(), crm.clone()),
+            ("context_id".into(), context.to_string()),
+            ("conversation".into(), conversation.to_string()),
+        ]
+    };
+    fn as_refs(v: &[(String, String)]) -> Vec<(&str, &str)> {
+        v.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect()
+    }
+    let fields_a = scoped_fields(&rest.crm_a, &conv_a);
+    // Control upload through the board, scoped to company A's conversation.
+    let (status, row) = post_upload(
+        "operator",
+        multipart(&as_refs(&fields_a), "leads.csv", SECRETLESS.as_bytes()),
+    );
+    assert_eq!(status, 200, "{row}");
+    let http_a = row["id"].as_str().unwrap().to_string();
+    assert_eq!(row["scope"], json!(format!("app:{crm}@{conv_a}")), "{row}");
+    let (rows0, messages0) = (
+        count("SELECT count(*) FROM chat_files"),
+        count("SELECT count(*) FROM messages"),
+    );
+    // Agents and a sessionless caller cannot upload through the board.
+    for (who, check) in [
+        ("agent:master", "operator_only"),
+        ("agent:w1", "operator_only"),
+        ("unproven", "caller_identity"),
+    ] {
+        let (status, reply) =
+            post_upload(who, multipart(&as_refs(&fields_a), "x.csv", b"a,b\n1,2\n"));
+        assert_eq!(status, 403, "{who}: {reply}");
+        assert_eq!(reply["check"], json!(check), "{who}: {reply}");
+    }
+    // A forged readiness / scope field on the upload refuses whole.
+    for field in ["ready", "scope", "sha256"] {
+        let mut fields = as_refs(&fields_a);
+        fields.push((field, "1"));
+        let (status, reply) = post_upload("operator", multipart(&fields, "x.csv", b"a,b\n1,2\n"));
+        assert_eq!(status, 400, "{field}: {reply}");
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!("field '{field}' is not accepted")),
+            "{field}: {reply}"
+        );
+    }
+    let post_msg = |who: &str, msg: &str, context: &str, conversation: &str, ids: Value| {
+        board.call(
+            who,
+            "POST",
+            "/api/threads/master/messages",
+            Some(json!({"text": "read it", "message": msg,
+                        "app": {"install_id": crm, "context_id": context},
+                        "conversation": conversation, "attachments": ids})),
+        )
+    };
+    // Agents cannot attach through the board.
+    for who in ["agent:master", "agent:w1"] {
+        let (status, reply) = post_msg(
+            who,
+            "h-agent",
+            &rest.crm_a,
+            &conv_a,
+            json!([{"id": http_a}]),
+        );
+        assert_eq!(status, 403, "{who}: {reply}");
+        assert_eq!(reply["check"], json!("operator_only"), "{who}: {reply}");
+    }
+    // Forged cross-company, unknown and client-ready references refuse.
+    let http_cases: Vec<(&str, &str, &str, Value, &str)> = vec![
+        (
+            "cross-company",
+            &rest._crm_b,
+            &conv_b,
+            json!([{"id": http_a}]),
+            not_scoped,
+        ),
+        (
+            "unknown",
+            &rest.crm_a,
+            &conv_a,
+            json!([{"id": "chf-0123456789abcdef0123456789abcdef"}]),
+            "unknown attachment",
+        ),
+        (
+            "client-ready-field",
+            &rest.crm_a,
+            &conv_a,
+            json!([{"id": http_a, "ready": true}]),
+            "unknown field",
+        ),
+    ];
+    for (i, (what, context, conversation, ids, reason)) in http_cases.into_iter().enumerate() {
+        let (status, reply) = post_msg(
+            "operator",
+            &format!("h-bad-{i}"),
+            context,
+            conversation,
+            ids,
+        );
+        assert_eq!(status, 400, "{what}: {reply}");
+        let err = reply["error"].as_str().unwrap_or_default().to_string();
+        assert!(err.contains(reason), "{what}: {reply}");
+        no_bytes(what, &err);
+    }
+    assert_eq!(
+        count("SELECT count(*) FROM chat_files"),
+        rows0,
+        "HTTP refusal minted a row"
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM messages"),
+        messages0,
+        "HTTP refusal queued"
+    );
+    // Control: the same-scope reference is accepted through the board.
+    let (status, reply) = post_msg(
+        "operator",
+        "h-ok",
+        &rest.crm_a,
+        &conv_a,
+        json!([{"id": http_a}]),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("queued"), "{reply}");
+    assert_eq!(count("SELECT count(*) FROM messages"), messages0 + 1);
+}
