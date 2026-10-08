@@ -553,11 +553,18 @@ fn poll_deadline(fd: RawFd, events: libc::c_short, deadline: Instant) -> Result<
 /// block far past a read bound on a full listen backlog — this waits
 /// on POLLOUT and reads the verdict from SO_ERROR.
 fn connect_bounded(socket: &Path, deadline: Instant) -> Result<UnixStream> {
-    // Plain SOCK_STREAM: SOCK_NONBLOCK/SOCK_CLOEXEC are not portable
-    // (absent from Darwin's socket(2) API in libc); the descriptor's
-    // O_NONBLOCK + FD_CLOEXEC go on right after, portably.
+    // Linux/Android: SOCK_NONBLOCK | SOCK_CLOEXEC create the
+    // descriptor already nonblocking and close-on-exec — atomic, so a
+    // multithreaded board has no window where an exec'ing child could
+    // inherit a live peer connection. Darwin's libc has no such
+    // flags: plain SOCK_STREAM, with fcntl applying both flags
+    // immediately after (see `arm_socket`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const SOCK_TYPE: libc::c_int = libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const SOCK_TYPE: libc::c_int = libc::SOCK_STREAM;
     // SAFETY: fixed, valid socket(2) arguments.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    let fd = unsafe { libc::socket(libc::AF_UNIX, SOCK_TYPE, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -579,7 +586,10 @@ fn connect_bounded(socket: &Path, deadline: Instant) -> Result<UnixStream> {
 
 /// Set O_NONBLOCK + FD_CLOEXEC on `fd` the portable way — fcntl
 /// exists on every unix target; SOCK_NONBLOCK/SOCK_CLOEXEC socket(2)
-/// flags do not (Darwin lacks them).
+/// flags do not (Darwin lacks them, so `connect_bounded` creates a
+/// plain SOCK_STREAM there and this does the arming). On
+/// Linux/Android the socket(2) flags already made this atomic — this
+/// call then only re-asserts the same bits.
 fn arm_socket(fd: RawFd) -> Result<()> {
     // SAFETY: fcntl(2) on a live descriptor with valid flag args.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
