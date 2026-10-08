@@ -3,6 +3,13 @@
 //! least as strict as the RPC they relay. A real in-process daemon and board
 //! (CAD-482 test seam); each refusal is compared against a whole-tracker byte
 //! snapshot, and every case has a positive control.
+//!
+//! Note on the seam: the test seam forwards the HTTP caller's asserted
+//! identity into the relayed RPC, so here an agent is refused by BOTH the
+//! board route class and the daemon. In production the board relays over its
+//! own operator connection and carries no agent identity, so the route class
+//! is the only board-side guard; it is pinned on its own by
+//! `ui::operator::tests::explorer_routes_are_operator_only_except_the_member_verbs`.
 #![cfg(all(feature = "test-seam", target_os = "linux"))]
 
 use cadence_agent::test_seam::{scoped, Asserted, Seam, AS_HEADER, TOKEN_HEADER};

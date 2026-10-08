@@ -2131,6 +2131,62 @@ mod tests {
         );
     }
 
+    /// CAD-1129 / CAD-1194 acceptance (reviewer-written, cc13-sonnet-spec794).
+    /// In production the board relays every write over ITS OWN daemon
+    /// connection, which proves operator and carries no agent identity, so
+    /// this table is the only thing that keeps an agent off the install,
+    /// check, git-check, remove and restore routes. The class of every
+    /// explorer route is pinned here: only the three member verbs are
+    /// `AgentAllowed`; everything else is `OperatorOnly`.
+    #[test]
+    fn explorer_routes_are_operator_only_except_the_member_verbs() {
+        for path in [
+            "/api/app-installations/check",
+            "/api/app-installations",
+            "/api/app-installations/upload",
+            "/api/app-catalog/install",
+            "/api/app-catalog/git-check",
+            "/api/app-favorites/default",
+            "/api/app-requests/dismiss",
+            "/api/app-installations/inst-1/update-check",
+            "/api/app-installations/inst-1/remove-preview",
+            "/api/app-installations/inst-1/remove",
+            "/api/app-installations/inst-1/restore",
+            "/api/app-catalog/unlisted-future-route",
+        ] {
+            assert_eq!(
+                route_class("POST", path),
+                RouteClass::OperatorOnly,
+                "{path} must be operator-only"
+            );
+        }
+        for path in [
+            "/api/app-catalog/request",
+            "/api/app-favorites",
+            "/api/app-favorites/opened",
+        ] {
+            assert_eq!(
+                route_class("POST", path),
+                RouteClass::AgentAllowed,
+                "{path} is a member verb"
+            );
+        }
+        // no explorer write may be read as a GET-class or session route.
+        for path in [
+            "/api/app-installations/check",
+            "/api/app-catalog/install",
+            "/api/app-installations/inst-1/remove",
+        ] {
+            for method in ["PUT", "PATCH", "DELETE"] {
+                assert_eq!(
+                    route_class(method, path),
+                    RouteClass::OperatorOnly,
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn route_table_classifies_and_fails_closed() {
         let operator_only = WRITE_ROUTES
