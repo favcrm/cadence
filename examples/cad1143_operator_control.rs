@@ -413,6 +413,7 @@ fn refuse_unless_operator_origin() {
     }
 }
 
+#[cfg(feature = "test-seam")]
 fn main() {
     refuse_unless_operator_origin();
     let mut fx = Fx::new();
