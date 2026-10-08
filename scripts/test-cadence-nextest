@@ -201,6 +201,40 @@ attempts=$(wc -l <"$TMP/retry.count" | tr -d ' ')
     die "NEXTEST_RETRIES override was not neutralized (attempts=$attempts)"
 }
 
+# CAD-1227: the wrapper drops caller CADENCE_PM_DIR/CADENCE_STATE_DIR (and
+# any other CADENCE_* routing) before the tests run, so a pane's production
+# routing never reaches a test binary. The fixture test fails if any is
+# visible. Fake values only; nothing here names a real path.
+mkdir -p "$TMP/scrub-workspace/src"
+cat >"$TMP/scrub-workspace/Cargo.toml" <<'EOF'
+[package]
+name = "cadence-nextest-scrub-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+cat >"$TMP/scrub-workspace/src/lib.rs" <<'EOF'
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn routing_vars_are_absent() {
+        for k in ["CADENCE_PM_DIR", "CADENCE_STATE_DIR", "CADENCE_HOME"] {
+            assert!(std::env::var_os(k).is_none(), "{k} reached the test");
+        }
+    }
+}
+EOF
+if ! CADENCE_PM_DIR="$TMP/fake-pm" CADENCE_STATE_DIR="$TMP/fake-state" \
+    CADENCE_HOME="$TMP/fake-home" CARGO_BUILD_JOBS=4 \
+    CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$TMP/scrub.lock" \
+    "$FXRUNNER" --manifest-path "$TMP/scrub-workspace/Cargo.toml" \
+    >"$TMP/scrub.out" 2>"$TMP/scrub.err"; then
+    cat "$TMP/scrub.out" "$TMP/scrub.err" >&2
+    die "cadence-nextest forwarded CADENCE_PM_DIR/CADENCE_STATE_DIR/CADENCE_HOME to the tests"
+fi
+
 # The outer flock must be held before the nextest child starts. A temporary
 # two-second test gives a separate non-blocking probe time to observe that
 # startup ownership, without touching the repository suite lock.
