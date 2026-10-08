@@ -452,6 +452,25 @@ ownership quality, implementation/resource practice, QA misses or false alarms,
 and acceptance gaps only where evidence warrants it. Do not generate a generic
 checklist report for every trivial edit or spend model turns on empty retros.
 
+## Asking for a production deploy
+
+Never restart the daemon. When production needs a new build, send the
+operator exactly these two lines and nothing else:
+
+```
+cadence update --check --as operator:<name>
+cadence update --as operator:<name>
+```
+
+Only when the operator asks to pin a specific commit, use
+`--to <full main sha>` on both lines. That skips the production-candidate
+receipt and runs the `upgrade --sha` checks instead.
+
+Never relay `rollout claim|backup|handoff|grant` or `upgrade` recipes;
+those are recovery internals (docs/CLI.md). If `--check` refuses, report
+the refusal text and stop. For dev work use `cadence dev up|reload|down`
+on a disposable instance, never production.
+
 ## Refresh a delegated staging instance
 
 An operator can grant an agent a scoped, expiring delegation over a

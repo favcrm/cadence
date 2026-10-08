@@ -365,8 +365,20 @@ Only an explicit operator-approved ticket can open one; the rules are in
   `~/.local/state/cadence`, `~/pm` (apart from `cadence issue …`
   commands), port 3010, the installed `~/.local/bin/cadence`, or the
   tailnet.
-- Never restart the daemon. The rollout has a single owner; see
-  `cadence rollout status` and CAD-236.
+- Never restart the daemon. When a production deploy is needed, send the
+  operator exactly these two lines and nothing else:
+
+  ```
+  cadence update --check --as operator:<name>
+  cadence update --as operator:<name>
+  ```
+
+  Only when the operator asks to pin a specific commit, use
+  `--to <full main sha>` on both lines. That skips the production-candidate
+  receipt and runs the `upgrade --sha` checks instead. Never relay
+  `rollout claim|backup|handoff|grant` or `upgrade` recipes; those are
+  recovery internals (docs/CLI.md). If `--check` refuses, report the
+  refusal text and stop.
 - Boards and daemons you start use a temp state dir and a port in
   3110–3199.
 - Never signal or kill a process you did not start.
