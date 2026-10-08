@@ -18,7 +18,7 @@ CAD-631/CAD-632 work. Custom app UI remains separate CAD-633 work.
 | --- | --- |
 | `cadence app catalog install-check <source>` | Read-only. Resolve and validate the bundle exactly as install would; return `schema`, `name`, `version`, `source`, `digest`, the `files` list, `committed` (always `false`), `notes` and `secret_warnings`. Writes no catalog, journal or record. |
 | `cadence app catalog approve <install-id> --digest <digest>` | Operator-only. Approve the exact current installed digest for supported local artifact steps, after validating its local execution contract. Refuses a stale digest. |
-| `cadence app catalog revoke <install-id> --digest <digest>` | Operator-only. Revoke local capabilities for the exact current digest. Does not change legacy project approvals; refuses a stale digest. |
+| `cadence app catalog revoke <install-id> --digest <digest>` | Operator-only. The digest pins the request to the current installed bundle; stale digests are refused. Revoke removes local capability authority installation-wide, revoking historical epochs and invalidating effects for every version, including completed historical work. Does not change legacy project approvals. |
 | `cadence app catalog install <source> [--expected-digest sha256:…]` | Validate and copy a local bundle or Git repository root into the workspace; return a new immutable installation ID. With `--expected-digest` the install is refused, before any write, unless the resolved bytes hash to that digest. |
 | `cadence app catalog ls` | Return an array of catalogued installation descriptions. Never initializes or migrates the catalog. |
 | `cadence app catalog show <install-id>` | Inspect one exact installation ID. An app name is not a substitute. |
@@ -151,7 +151,7 @@ objects. Useful fields include:
 | `install_id`, `name`, `title`, `version`, `summary` | Stable identity and manifest metadata. |
 | `project`, `project_link`, `storage_kind` | Optional legacy project metadata and `workspace` or `legacy` storage. |
 | `source`, `digest`, `installed_at` | Recorded source provenance, copied content digest, and installation time. |
-| `approval.state`, `approved`, `executable` | Reflect the current local-capability approval for the installed digest. An operator install or update records consent when local execution checks pass; otherwise the result reports that consent was not recorded. Legacy catalog rows report approval `unknown` and `approved: null`; consult the existing legacy surface for approval verification. |
+| `approval.state`, `approved`, `executable` | Coarse catalog projections: the daemon overlays an approved status and `approved: true`, `executable: true` only when live capability status for this installation ID and digest is approved; otherwise the catalog's base values remain. They are not an exact revoked-state receipt. For exact current state, the daemon reads capability status for the installation ID and digest. Legacy catalog rows report approval `unknown` and `approved: null`; consult the existing legacy surface for approval verification. |
 | `guide`, `record`, `files` | Manifest guide, retained installation record, and bundle inventory. |
 
 Successful install/recover responses also report `committed: true` and
