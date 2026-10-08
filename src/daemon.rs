@@ -46,6 +46,8 @@ mod connection_test;
 mod connections_rpc;
 #[cfg(all(test, feature = "test-seam"))]
 mod conversations_acceptance;
+#[cfg(test)]
+mod cad1212_acceptance;
 mod conversations_rpc;
 mod crm_send_rpc;
 mod crm_smtp_rpc;
