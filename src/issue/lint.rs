@@ -40,6 +40,104 @@ pub fn run_with(
     approvals: Option<&crate::issue::work::Approvals>,
     delivery_approvals: Option<&crate::issue::delivery_policy::DeliveryApprovals>,
 ) -> Result<Value> {
+    run_inner(pm, only_project, approvals, delivery_approvals, None)
+}
+
+/// Issue folders a scoped lint covers: `(project key, folder name)`.
+type Scope = Vec<(String, String)>;
+
+/// CAD-1256: lint only what the index stages (the commit hook's mode).
+///
+/// Per-issue checks (schema, id/folder, grammar, status/kind, refs,
+/// symlinks, task reports, oversize artifacts, depth, parent and
+/// blocked_by cycles) and the cross-issue checks a changed issue can
+/// break (duplicate id in another project, dangling link targets) run
+/// for the staged issues only, resolving link targets and their
+/// parent/blocked_by chains on demand. The root-symlink and
+/// per-project config checks are cheap and always run. Whole-tracker
+/// facts are skipped: other issues' own errors, and the "has children"
+/// / "blocked_by still open" warnings of untouched issues.
+///
+/// Anything but a plain issue-folder change (a deleted `issue.md`, a
+/// project file, `memory/`, `workflows/`, `apps/`, a path outside a
+/// known project) cannot be bounded to one issue, so it falls back to
+/// the whole-tracker lint. Nothing staged is a no-op.
+pub fn run_staged(pm: &Pm) -> Result<Value> {
+    let staged = staged_paths(pm)?;
+    if staged.is_empty() {
+        return Ok(json!({
+            "ok": true, "errors": [], "warnings": [],
+            "scope": "staged", "projects": 0, "issues": 0,
+        }));
+    }
+    let projects = project::list(&pm.dir)?;
+    match scope_of(&projects, &staged) {
+        Some(scope) => run_inner(pm, None, None, None, Some(scope)),
+        None => run_with(pm, None, None, None),
+    }
+}
+
+/// `(status, path)` of every staged change; `-z` keeps odd names
+/// (spaces, newlines) intact, `--no-renames` turns a rename into a
+/// delete plus an add.
+fn staged_paths(pm: &Pm) -> Result<Vec<(String, String)>> {
+    let out = crate::reaper::output(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&pm.dir)
+            .args(["diff", "--cached", "--name-status", "--no-renames", "-z"]),
+    )?;
+    if !out.status.success() {
+        return Err(crate::error::Error::rejected(format!(
+            "git diff --cached failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let mut parts = text.split('\0').filter(|p| !p.is_empty());
+    let mut rows = Vec::new();
+    while let (Some(status), Some(path)) = (parts.next(), parts.next()) {
+        rows.push((status.to_string(), path.to_string()));
+    }
+    Ok(rows)
+}
+
+/// The staged issue folders, or `None` when a staged path is not a plain
+/// change under `<project>/<issue>/` (see [`run_staged`]).
+fn scope_of(projects: &[project::Project], staged: &[(String, String)]) -> Option<Scope> {
+    let mut scope: Scope = Vec::new();
+    for (status, path) in staged {
+        let mut it = path.splitn(3, '/');
+        let (Some(proj), Some(folder), Some(rest)) = (it.next(), it.next(), it.next()) else {
+            return None;
+        };
+        let special = [
+            "memory",
+            crate::issue::workflow::DIR,
+            crate::issue::app::DIR,
+        ];
+        if !projects.iter().any(|p| p.key == proj)
+            || folder.starts_with('.')
+            || special.contains(&folder)
+            || (status == "D" && rest == "issue.md")
+        {
+            return None;
+        }
+        let entry = (proj.to_string(), folder.to_string());
+        if !scope.contains(&entry) {
+            scope.push(entry);
+        }
+    }
+    Some(scope)
+}
+
+fn run_inner(
+    pm: &Pm,
+    only_project: Option<&str>,
+    approvals: Option<&crate::issue::work::Approvals>,
+    delivery_approvals: Option<&crate::issue::delivery_policy::DeliveryApprovals>,
+    scope: Option<Scope>,
+) -> Result<Value> {
     let mut lint = Lint {
         errors: vec![],
         warnings: vec![],
@@ -148,24 +246,45 @@ pub fn run_with(
             }
         }
         let dir = pm.dir.join(&project.key);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let path = entry.path();
-            // DirEntry::file_type is lstat-style — a symlink is not a dir.
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_symlink() {
+        // (name, path, is_symlink, is_dir). A scoped lint stats only its
+        // staged folders; the full lint lists the whole project dir.
+        let mut candidates: Vec<(String, std::path::PathBuf, bool, bool)> = Vec::new();
+        match &scope {
+            Some(scope) => {
+                for (_, name) in scope.iter().filter(|(p, _)| *p == project.key) {
+                    let path = dir.join(name);
+                    if let Ok(m) = path.symlink_metadata() {
+                        candidates.push((name.clone(), path, m.is_symlink(), m.is_dir()));
+                    }
+                }
+            }
+            None => {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    // DirEntry::file_type is lstat-style — a symlink is not a dir.
+                    let Ok(ft) = entry.file_type() else {
+                        continue;
+                    };
+                    candidates.push((
+                        entry.file_name().to_string_lossy().to_string(),
+                        entry.path(),
+                        ft.is_symlink(),
+                        ft.is_dir(),
+                    ));
+                }
+            }
+        }
+        for (name, path, is_symlink, is_dir) in candidates {
+            if is_symlink {
                 lint.err(format!(
                     "{}/{name}: symlinked issue folder — the board never follows links",
                     project.key
                 ));
                 continue;
             }
-            if !ft.is_dir() || name.starts_with('.') {
+            if !is_dir || name.starts_with('.') {
                 continue;
             }
             // `memory/` holds project-memory files, not an issue —
@@ -288,8 +407,16 @@ pub fn run_with(
         }
     }
 
+    // CAD-1256: ids whose own checks run. Everything else in `fronts`
+    // (scoped lint only) is context loaded to resolve links and chains.
+    let checked: HashSet<String> = fronts.keys().cloned().collect();
+    if scope.is_some() {
+        load_link_context(pm, &projects, &mut fronts, &mut lint);
+    }
+
     // Per-issue field checks + link targets.
-    for (project_key, front, folder) in fronts.values() {
+    for (project_key, front, folder) in fronts.values().filter(|(_, f, _)| checked.contains(&f.id))
+    {
         let id = front.id.as_str();
         if !model::valid_id(id) {
             lint.err(format!("{project_key}/{folder}: bad id grammar '{id}'"));
@@ -437,7 +564,7 @@ pub fn run_with(
     // Contradiction warning: status claims progress while a blocker is
     // still open. File status is what lint audits — derivation is a
     // runtime concern.
-    for (_, front, _) in fronts.values() {
+    for (_, front, _) in fronts.values().filter(|(_, f, _)| checked.contains(&f.id)) {
         // CAD-755: the daemon stamped the claim stale — the holder's
         // agent is dead and the claim no longer counts as live work.
         if let Some(c) = front.claim.as_ref().filter(|c| c.stale.is_some()) {
@@ -477,7 +604,7 @@ pub fn run_with(
         .values()
         .filter_map(|(_, f, _)| f.parent.as_deref())
         .collect();
-    for (id, (_, front, _)) in &fronts {
+    for (id, (_, front, _)) in fronts.iter().filter(|(id, _)| checked.contains(*id)) {
         let kind = model::item_type(front, parents.contains(id.as_str()));
         if kind != "epic" && front.stage.is_some() {
             lint.warn(format!(
@@ -492,7 +619,7 @@ pub fn run_with(
     }
 
     // Depth ≤ 2 and parent acyclicity.
-    for (id, (_, front, _)) in &fronts {
+    for (id, (_, front, _)) in fronts.iter().filter(|(id, _)| checked.contains(*id)) {
         let mut depth = 1;
         let mut cur = front;
         let mut seen = HashSet::from([id.as_str()]);
@@ -513,7 +640,7 @@ pub fn run_with(
         }
     }
     // blocked_by cycles (DFS per node over resolved targets).
-    for id in fronts.keys() {
+    for id in fronts.keys().filter(|id| checked.contains(*id)) {
         let mut seen = HashSet::new();
         let mut stack = vec![id.as_str()];
         let mut cycle = false;
@@ -540,6 +667,60 @@ pub fn run_with(
         "errors": lint.errors,
         "warnings": lint.warnings,
         "projects": projects.len(),
-        "issues": fronts.len(),
+        "issues": checked.len(),
+        "scope": if scope.is_some() { "staged" } else { "all" },
     }))
+}
+
+/// Scoped lint: load the issues the checked ones point at, so dangling
+/// targets, depth and cycles resolve exactly as in the full lint.
+/// `parent` and `blocked_by` chains are followed transitively;
+/// `relates` and `duplicate_of` of the checked issues are only looked up. Also the
+/// cross-project duplicate-id check the folder scan cannot see.
+fn load_link_context(
+    pm: &Pm,
+    projects: &[project::Project],
+    fronts: &mut HashMap<String, (String, model::Front, String)>,
+    lint: &mut Lint,
+) {
+    for (id, (key, _, _)) in fronts.clone() {
+        for other in projects.iter().filter(|p| p.key != key) {
+            if pm.dir.join(&other.key).join(&id).join("issue.md").is_file() {
+                lint.err(format!(
+                    "{id}: duplicated id in {key}/{id} and {}/{id}",
+                    other.key
+                ));
+            }
+        }
+    }
+    let mut work: Vec<String> = Vec::new();
+    for (_, f, _) in fronts.values() {
+        let links = f.blocked_by.iter().chain(f.parent.iter());
+        work.extend(
+            links
+                .chain(f.relates.iter())
+                .chain(f.duplicate_of.iter())
+                .cloned(),
+        );
+    }
+    while let Some(id) = work.pop() {
+        if fronts.contains_key(&id) || !model::valid_id(&id) {
+            continue;
+        }
+        for p in projects {
+            let file = pm.dir.join(&p.key).join(&id).join("issue.md");
+            if file.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let Ok((front, _)) = parse::parse_issue(&text) else {
+                continue;
+            };
+            work.extend(front.blocked_by.iter().chain(front.parent.iter()).cloned());
+            fronts.insert(id.clone(), (p.key.clone(), front, id.clone()));
+            break;
+        }
+    }
 }

@@ -14,10 +14,10 @@ use crate::error::{Error, Result};
 const MARKER: &str = "cadence board tracker";
 
 const PRE_COMMIT: &str = "#!/bin/sh\n\
-# cadence board tracker: refuse a commit that lint rejects.\n\
+# cadence board tracker: refuse a commit that lint rejects (staged issues only).\n\
 set -e\n\
 if command -v cadence >/dev/null 2>&1; then\n\
-  out=$(CADENCE_PM_DIR=\"$(git rev-parse --show-toplevel)\" cadence issue lint 2>&1) || {\n\
+  out=$(CADENCE_PM_DIR=\"$(git rev-parse --show-toplevel)\" cadence issue lint --staged 2>&1) || {\n\
     echo \"cadence issue lint failed; commit refused:\" >&2\n\
     echo \"$out\" | sed -n '1,20p' >&2\n\
     exit 1\n\
@@ -147,6 +147,8 @@ pub fn install(pm_dir: &Path) -> Result<Value> {
 
 #[cfg(test)]
 mod cad1255_acceptance;
+#[cfg(test)]
+mod cad1256_staged_lint;
 
 #[cfg(test)]
 mod tests {
