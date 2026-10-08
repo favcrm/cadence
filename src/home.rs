@@ -252,7 +252,13 @@ fn test_guard(dir: PathBuf, rel: &str, leaf: &str) -> Result<PathBuf> {
 #[cfg(any(test, feature = "test-seam"))]
 fn test_guard_in(dir: PathBuf, real: Option<&Path>, rel: &str, leaf: &str) -> Result<PathBuf> {
     match real {
-        Some(real) => refuse_under(dir, &real.join(rel).join(leaf)),
+        Some(real) => {
+            let mut root = real.to_path_buf();
+            if rel != "." {
+                root.push(rel);
+            }
+            refuse_under(dir, &root.join(leaf))
+        }
         None => Ok(dir),
     }
 }
@@ -269,10 +275,42 @@ pub(crate) fn guard_tracker_in(dir: PathBuf, real: Option<&Path>) -> Result<Path
     test_guard_in(dir, real, ".", "pm")
 }
 
+/// `p` made absolute-comparable: `..`/`.` folded lexically, then the
+/// longest existing ancestor canonicalised (symlinks resolved) and the
+/// not-yet-existing tail re-appended.
+#[cfg(any(test, feature = "test-seam"))]
+fn resolve_for_compare(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut lex = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                lex.pop();
+            }
+            Component::CurDir => {}
+            c => lex.push(c.as_os_str()),
+        }
+    }
+    let mut tail = Vec::new();
+    let mut base = lex.clone();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&base) {
+            return tail.iter().rev().fold(real, |acc, t| acc.join(t));
+        }
+        match (base.file_name().map(|n| n.to_os_string()), base.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                base = parent.to_path_buf();
+            }
+            _ => return lex,
+        }
+    }
+}
+
 #[cfg(any(test, feature = "test-seam"))]
 fn refuse_under(dir: PathBuf, root: &Path) -> Result<PathBuf> {
-    let norm = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    if dir.starts_with(root) || norm(&dir).starts_with(norm(root)) {
+    let root = resolve_for_compare(root);
+    if resolve_for_compare(&dir).starts_with(&root) {
         return Err(Error::rejected(format!(
             "refusing to resolve {}: a test process must not touch the real {} \
              (CAD-1210); point CADENCE_PM_DIR/CADENCE_STATE_DIR at a temp dir",
@@ -318,5 +356,22 @@ mod guard_tests {
         assert!(refuse_under(st.clone(), &st).is_err());
         assert!(refuse_under(fake.join("pm-other"), &pm).is_ok());
         assert!(refuse_under(fake.join("tmp-state"), &st).is_ok());
+    }
+
+    #[test]
+    fn symlinked_and_dotdot_paths_to_the_root_refuse() {
+        let base = std::env::temp_dir().join(format!("c1210-sl-{}", std::process::id()));
+        let pm = base.join("fakehome/pm");
+        std::fs::create_dir_all(&pm).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&pm, &link).unwrap();
+        // symlink to the root with a tail that does not exist yet
+        assert!(refuse_under(link.join("newsub/deeper"), &pm).is_err());
+        // `..` through a missing dir, back into the root
+        let dd = base.join("nope/../fakehome/pm/x");
+        assert!(refuse_under(dd, &pm).is_err());
+        // a sibling that merely shares a prefix still passes
+        assert!(refuse_under(base.join("fakehome/pm-other/x"), &pm).is_ok());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

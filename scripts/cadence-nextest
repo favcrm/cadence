@@ -10,6 +10,14 @@
 # sets CADENCE_REVIEW_SUITE_LOCK_HELD=1, so this wrapper never nests flock.
 set -eu
 
+# CAD-1210: drop every CADENCE_* routing variable before nextest or any test
+# binary runs, except the ones this script reads, so a pane's production
+# CADENCE_PM_DIR/CADENCE_STATE_DIR never reaches the tests (CAD-1197 approach).
+cadence_env_allow=" CADENCE_SUITE_LOCK CADENCE_NEXTTEST_BIN CADENCE_REVIEW_SUITE_LOCK_HELD CADENCE_REVIEW_PR CADENCE_REVIEW_HEAD "
+for v in $(env | sed -n 's/^\(CADENCE_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    case $cadence_env_allow in *" $v "*) ;; *) unset "$v" ;; esac
+done
+
 PINNED_NEXTEST_VERSION=0.9.145
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # CADENCE_NEXTTEST_BIN wins; else the durable tools dir that
