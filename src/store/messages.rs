@@ -1823,6 +1823,21 @@ impl Store {
             .collect())
     }
 
+    /// CAD-1266: every in-flight message (`running` or `submitted`) as
+    /// `(alias, id, state, since)` in one query, `since` being `started`
+    /// else `created`. Replaces loading each agent's whole history to
+    /// filter it in memory; the terminal history is never read.
+    pub fn inflight_messages(&self) -> Result<Vec<(String, String, String, f64)>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "SELECT alias, id, state, COALESCE(started, created) FROM messages
+                 WHERE state IN ('running','submitted')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?)
+        })
+    }
+
     /// CAD-375: every running message's turn token and its agent —
     /// `(alias, turn_id)`. The daemon withholds each from every
     /// connection but the owner's, current or not. Driven from `agents`

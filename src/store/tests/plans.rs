@@ -694,3 +694,47 @@
         task.acceptance = Some("a".repeat(5000));
         assert!(kickoff_body(&job, &task, 1, "m", &worker).is_err());
     }
+
+    /// CAD-1266: the fleet list reads every assignee's open tasks in one
+    /// pass and the daemon's in-flight listing reads only running rows;
+    /// both must say what the per-agent / per-history reads said.
+    #[test]
+    fn fleet_reads_match_the_per_agent_reads() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        s.create_task("j1", "t-open", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        s.create_task("j1", "t-done", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        s.cancel_task("t-done", "test").unwrap();
+        s.create_task("j1", "t-free", None, None, None, None, None, None, None)
+            .unwrap();
+        let fleet = s.open_task_ids_by_assignee().unwrap();
+        for alias in ["w1", "pm", "ghost"] {
+            let per_agent: Vec<String> = s
+                .tasks_for_assignee(alias)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            assert_eq!(
+                fleet.get(alias).cloned().unwrap_or_default(),
+                per_agent,
+                "{alias}"
+            );
+        }
+        assert!(fleet["w1"].contains(&"t-open".to_string()), "{fleet:?}");
+        assert!(!fleet["w1"].contains(&"t-done".to_string()), "{fleet:?}");
+
+        // In flight: only the running kickoff, never completed history.
+        assert!(s.inflight_messages().unwrap().is_empty());
+        let m = run_kickoff(&s, &kickoff);
+        let inflight = s.inflight_messages().unwrap();
+        assert_eq!(inflight.len(), 1, "{inflight:?}");
+        assert_eq!((inflight[0].0.as_str(), inflight[0].1.as_str()), ("w1", m.id.as_str()));
+        assert_eq!(inflight[0].2, "running");
+        s.finish(&m, "completed", &json!({"status": "completed", "text": "x"}), None)
+            .unwrap();
+        assert!(s.inflight_messages().unwrap().is_empty());
+    }
