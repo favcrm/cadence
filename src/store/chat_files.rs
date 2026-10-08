@@ -274,6 +274,18 @@ fn claimed_ext(name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The first 8192 bytes, trimmed back to a UTF-8 boundary when the cut
+/// falls inside a multibyte character (`error_len() == None`: the head
+/// merely ends mid-char). Genuinely invalid bytes are left in, so the
+/// sniff still calls them binary; the full-file decode stays the check.
+fn sniff_head(bytes: &[u8]) -> &[u8] {
+    let head = &bytes[..bytes.len().min(8192)];
+    match std::str::from_utf8(head) {
+        Err(e) if e.error_len().is_none() => &head[..e.valid_up_to()],
+        _ => head,
+    }
+}
+
 /// What the real bytes sniff as, restricted to the v1 allowlist plus
 /// the honest refusal classes (executables, archives, svg/html, zip).
 /// `sniff_mime` is the wiki's magic-byte table.
@@ -428,7 +440,7 @@ impl Store {
             ));
         }
         let sha256 = sha256_hex(&bytes);
-        let head = &bytes[..bytes.len().min(8192)];
+        let head = sniff_head(&bytes);
         let mime = check_kind(&name, head)?.to_string();
         // Text kinds carry the credential scan before retention — the
         // same gate as a wiki text write.
@@ -540,22 +552,6 @@ impl Store {
             .optional()?)
     }
 
-    /// The entries `thread_send` names in `attachments`, resolved to
-    /// metadata rows — every id must exist (the daemon checked the
-    /// grammar); an unknown id refuses the send. Order preserved.
-    /// Existence is NOT readiness: `thread_send` resolves through
-    /// [`Store::chat_file_ready`], which checks the actual bytes.
-    pub fn chat_files_for(&self, ids: &[String]) -> Result<Vec<ChatFile>> {
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            let file = self
-                .chat_file(id)?
-                .ok_or_else(|| Error::rejected(format!("unknown attachment '{id}'")))?;
-            out.push(file);
-        }
-        Ok(out)
-    }
-
     /// The raw persisted app stamp of `message_id`'s enqueue entry —
     /// exactly what was stored at send time, without the live re-proof
     /// [`Store::message_app`] adds. The stamp is provenance, never
@@ -624,7 +620,7 @@ impl Store {
         }
         // The same first-block sniff the upload ran: a row whose bytes
         // now shape as html/svg is not an allowed text source.
-        let head = &bytes[..bytes.len().min(8192)];
+        let head = sniff_head(&bytes);
         if sniffed_kind(head) != "text" {
             return Err(Error::rejected(format!(
                 "attachment '{}' is not ready — the retained bytes do not sniff as \
@@ -835,32 +831,55 @@ fn workspace_blob_dir(workspace: &Path, create: bool) -> Result<Option<PinnedBlo
 }
 
 /// The workspace is the tracker's git working tree: keep custody bytes out
-/// of it with a `*` ignore rule inside the custody directory, created
-/// exclusively through the pinned descriptor (never following a symlink).
-/// An existing entry is left as is.
+/// of it with a `*` ignore rule inside the custody directory, written
+/// through the pinned descriptor (never following a symlink). A missing
+/// rule is created exclusively; an existing entry that is not exactly
+/// `*` is replaced by an atomic rename of a fresh file in the same dir.
 #[cfg(unix)]
 fn ensure_custody_gitignore(dir: std::os::fd::RawFd) -> Result<()> {
-    let fd = unsafe {
+    use std::io::{Read, Write};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let err =
+        |e: std::io::Error| Error::rejected(format!("cannot write the custody ignore rule: {e}"));
+    let open = |name: &std::ffi::CStr, flags: libc::c_int| unsafe {
         libc::openat(
             dir,
-            c".gitignore".as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0o600,
         )
     };
-    if fd < 0 {
-        let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::EEXIST) {
+    let existing = open(c".gitignore", libc::O_RDONLY | libc::O_NONBLOCK);
+    if existing >= 0 {
+        let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(existing) });
+        let mut buf = Vec::new();
+        // Bounded: the rule is two bytes; anything longer is rewritten.
+        let ok = Read::take(&mut file, 16).read_to_end(&mut buf).is_ok();
+        if ok && (buf == b"*\n" || buf == b"*") {
             return Ok(());
         }
-        return Err(Error::rejected(format!(
-            "cannot create the custody ignore rule: {e}"
-        )));
+    } else {
+        let e = std::io::Error::last_os_error();
+        // ELOOP/other: a symlink or odd entry is replaced below by rename,
+        // which never follows it.
+        if e.raw_os_error() != Some(libc::ENOENT) && e.raw_os_error() != Some(libc::ELOOP) {
+            return Err(err(e));
+        }
     }
-    use std::io::Write;
-    use std::os::fd::FromRawFd;
-    let mut file = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
-    file.write_all(b"*\n")?;
+    let tmp = c".gitignore.tmp";
+    unsafe { libc::unlinkat(dir, tmp.as_ptr(), 0) };
+    let fd = open(tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL);
+    if fd < 0 {
+        return Err(err(std::io::Error::last_os_error()));
+    }
+    let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    file.write_all(b"*\n").map_err(err)?;
+    file.sync_all().map_err(err)?;
+    if unsafe { libc::renameat(dir, tmp.as_ptr(), dir, c".gitignore".as_ptr()) } != 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::unlinkat(dir, tmp.as_ptr(), 0) };
+        return Err(err(e));
+    }
     Ok(())
 }
 
@@ -1559,7 +1578,6 @@ fn duplicate_fd(fd: std::os::fd::RawFd) -> Result<std::os::fd::OwnedFd> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use crate::store::NewAgent;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -1706,30 +1724,23 @@ mod tests {
         assert_eq!(f.name, "name.txt");
     }
 
-    // The thread_send seam's round-trip lives in the store tests for
-    // threads; registration required.
+    /// A multibyte character straddling byte 8192 is valid UTF-8, not
+    /// binary: the head sniff trims to the boundary. Genuinely invalid
+    /// bytes in the same place still refuse.
     #[test]
-    fn chat_files_for_resolves_in_order() {
+    fn multibyte_char_across_sniff_window_uploads_invalid_bytes_refuse() {
         let (dir, s) = store();
-        s.register_agent(&NewAgent {
-            alias: "master",
-            provider: "fake",
-            endpoint_kind: "managed",
-            role: "worker",
-            cwd: dir.path().to_str().unwrap(),
-            sandbox: "read-only",
-            instructions: None,
-            params: None,
-            team_role: None,
-            model_policy: None,
-        })
-        .unwrap();
-        let a = put(&s, dir.path(), b"1", "a.txt").unwrap();
-        let b = put(&s, dir.path(), b"2", "b.txt").unwrap();
-        let got = s.chat_files_for(&[b.id.clone(), a.id.clone()]).unwrap();
-        assert_eq!(got[0].id, b.id);
-        assert_eq!(got[1].id, a.id);
-        assert!(s.chat_files_for(&["chf-missing".into()]).is_err());
+        let mut ok = vec![b'a'; 8191];
+        ok.extend_from_slice("中文\n".as_bytes());
+        let f = put(&s, dir.path(), &ok, "names.csv").unwrap();
+        let out = read(&s, dir.path(), &f).unwrap();
+        assert_eq!(out["text"].as_str().unwrap().len(), ok.len());
+        let mut bad = vec![b'a'; 8191];
+        bad.extend_from_slice(&[0xff, b'\n']);
+        let err = put(&s, dir.path(), &bad, "bad.csv")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sniff"), "{err}");
     }
 
     /// The workspace is the tracker's git tree: after an upload the
@@ -1757,5 +1768,18 @@ mod tests {
         );
         let blob = format!(".cadence/{CHAT_FILES_DIR}/{}", f.sha256);
         assert!(git(&["check-ignore", "-q", &blob]).status.success());
+        // A pre-existing rule that is not exactly `*` is rewritten, and a
+        // symlinked `.gitignore` is replaced, never followed.
+        let rule = ws.join(".cadence").join(CHAT_FILES_DIR).join(".gitignore");
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"keep").unwrap();
+        std::fs::remove_file(&rule).unwrap();
+        std::os::unix::fs::symlink(&outside, &rule).unwrap();
+        put(&s, dir.path(), b"c,d\n3,4", "more.csv").unwrap();
+        assert_eq!(std::fs::read(&rule).unwrap(), b"*\n");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        std::fs::write(&rule, b"# nothing\n").unwrap();
+        put(&s, dir.path(), b"e,f\n5,6", "again.csv").unwrap();
+        assert_eq!(std::fs::read(&rule).unwrap(), b"*\n");
     }
 }

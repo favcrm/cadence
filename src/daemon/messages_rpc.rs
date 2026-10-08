@@ -373,6 +373,12 @@ impl Shared {
                      attaches retained files; `cadence send` and `agent_send` carry none",
                 ));
             }
+            Some(_) if !crate::master::is_master(&alias) => {
+                return Err(Error::rejected(
+                    "attachments go only to the master (home or app conversation turns) — \
+                     other agents cannot read retained chat files",
+                ));
+            }
             Some(v) => Some(thread_attachments(self, v, app.as_ref())?),
         };
         // CAD-1098: app conversations are the master's. Another agent has

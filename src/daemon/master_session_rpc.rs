@@ -181,7 +181,7 @@ impl Shared {
             return Value::Null;
         };
         let conversation_id = thread.id.clone();
-        crate::issue::app_catalog::workspace::with_runtime_snapshot(&pm, install, |row, _files| {
+        crate::issue::app_catalog::workspace::with_runtime_read(&pm, install, |row, _files| {
             let Some(digest) = row.get("digest").and_then(Value::as_str) else {
                 return Ok(None);
             };
