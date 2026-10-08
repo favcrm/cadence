@@ -430,19 +430,21 @@ impl Fx {
     fn binding_list(&self, install: &str) -> Value {
         self.op("app_binding_list", json!({"install_id": install}))
     }
-    /// The worker's durable queue via the public `agent_inbox` peek — a
-    /// read that consumes nothing. Returns `(message_ids, unread)`.
+    /// The worker's durable queue. `agent_inbox` only reads mailbox
+    /// (inbox-kind) agents — the fixture's `writer` is a managed
+    /// endpoint, so the queued set is read straight from the store the
+    /// daemon shares (a peek: nothing is consumed). Returns
+    /// `(queued_message_ids, queued_count)`.
     fn inbox_peek(&self, alias: &str) -> (Vec<String>, i64) {
-        let reply = self.op("agent_inbox", json!({"alias": alias, "peek": true}));
-        let ids = reply["messages"]
-            .as_array()
-            .map(|m| {
-                m.iter()
-                    .filter_map(|row| row["id"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        (ids, reply["unread"].as_i64().unwrap_or(0))
+        let store = Store::open(&self.state().join("cadence.sqlite3")).unwrap();
+        let ids = store
+            .messages(alias)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.state == "queued")
+            .map(|m| m.id)
+            .collect();
+        (ids, store.queued_count(alias).unwrap())
     }
     fn wait_state(&self, id: &str, want: &str, what: &str) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -871,12 +873,23 @@ fn agent_unproven_and_forged_fields_are_refused_and_write_nothing() {
         "a refused call changed the queued count"
     );
     // The operator's real approval still lands (gate admits, not a
-    // blanket refuse).
+    // blanket refuse). The target run is already approved, so this
+    // proves it on a fresh run that still awaits its decision.
+    let fresh = fx
+        .rpc(
+            Asserted::Operator,
+            "app_run_create",
+            json!({"install_id": install, "workflow": "read",
+                "inputs": {"handle":"probe","writer":"writer"},
+                "request_id":"gate-final", "owner_pm":"lead"}),
+        )
+        .unwrap();
+    let fresh_id = fresh["id"].as_str().unwrap();
     fx.op(
         "app_run_approve",
-        json!({"run_id": run_id, "digest": target_after["snapshot_digest"]}),
+        json!({"run_id": fresh_id, "digest": fresh["snapshot_digest"]}),
     );
-    assert_eq!(fx.show(&run_id)["state"], "approved");
+    assert_eq!(fx.show(fresh_id)["state"], "approved");
 }
 
 /// A stale binding refuses the run on the daemon's own re-validation —
