@@ -49,7 +49,7 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
     if (!card?.install_id) return;
     setBusy(true); setNotice(null);
     void appExplorer.restore(card.install_id)
-      .then(() => { setNotice("Restored — it's live again."); setCard({ ...card, state: "installed", restorable: undefined }); notifyAppsChanged(); })
+      .then(() => { setNotice("Restored — it's live again."); setCard({ ...card, state: "installed", removed: false, restorable: undefined }); notifyAppsChanged(); })
       .catch((e: unknown) => setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment.")))
       .finally(() => setBusy(false));
   };

@@ -34,6 +34,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
 
   const isOp = viewer.operator && !viewer.readOnly;
 
+  const [reread, setReread] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
     setError(null);
@@ -47,7 +48,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       })
       .catch(() => {});
     return () => controller.abort();
-  }, [installId]);
+  }, [installId, reread]);
 
   if (!isOp) {
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9">
@@ -106,7 +107,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
         setHome((h) => h && { ...h, attention: { state: "removed", message: "Removed — restore within 30 days.", action: "restore", count: 0 } });
         notifyAppsChanged();
       })
-      .catch((e: unknown) => { setRemoveOpen(false); setNotice(appErrorCopy(e, "Remove didn't finish. Nothing was removed.")); })
+      .catch((e: unknown) => { setRemoveOpen(false); setNotice(appErrorCopy(e, "Remove didn't finish. Nothing was removed.")); setReread((n) => n + 1); })
       .finally(() => setRemoving(false));
   };
   const restore = () => {
@@ -118,7 +119,12 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
         setHome((h) => h && { ...h, attention: { state: "ok", message: null, action: null, count: 0 } });
         notifyAppsChanged();
       })
-      .catch((e: unknown) => setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment.")))
+      .catch((e: unknown) => {
+        setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment."));
+        // A refusal means the record is not what the page assumed (the window
+        // closed, or it is already live): read it again rather than guess.
+        setReread((n) => n + 1);
+      })
       .finally(() => setRestoring(false));
   };
 
