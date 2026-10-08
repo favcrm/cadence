@@ -12,7 +12,7 @@ import {
 } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, useModal } from "./shared";
-import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
+import { appErrorCopy, appLoadErrorCopy, isUnchangedUpgradeError } from "./appErrors";
 import "./explorer.css";
 
 /**
@@ -160,7 +160,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       .catch((e: unknown) => {
         if (!isCurrentRequest()) return;
         setNotice(appErrorCopy(e, "The update check didn't finish. Try again in a moment."));
-        setReread((n) => n + 1);
+        if (!isUnchangedUpgradeError(e)) setReread((n) => n + 1);
       })
       .finally(() => { if (isCurrentRequest()) setChecking(false); });
   };
@@ -229,7 +229,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
             <p>Proposed version {upgradeProposal.receipt.version} · {upgradeProposal.receipt.name}</p>
             <p className="hint mt-2">New digest: <code className="break-all">{upgradeProposal.receipt.digest}</code></p>
             {(["added", "changed", "removed"] as const).map((kind) => <p className="hint mt-1" key={kind}>{kind}: {upgradeProposal.receipt.structural_diff[kind].join(", ") || "none"}</p>)}
-            {upgradeProposal.receipt.compatibility != null && <p className="hint mt-2">Compatibility: {typeof upgradeProposal.receipt.compatibility === "string" ? upgradeProposal.receipt.compatibility : JSON.stringify(upgradeProposal.receipt.compatibility)}</p>}
+            {upgradeProposal.receipt.compatibility != null && <CompatibilityLines receipt={upgradeProposal.receipt.compatibility} />}
             {!!upgradeProposal.receipt.notes?.length && <ul className="hint mt-2">{upgradeProposal.receipt.notes.map((note, index) => <li key={index}>{note}</li>)}</ul>}
             {!!upgradeProposal.receipt.secret_warnings?.length && <p className="alert warn mt-2">Package validation reported secret warnings; review the source before applying.</p>}
             <div className="mt-3"><Button className="btn-primary btn-sm" disabled={!proposalMatchesCurrent || applying || !!upgradeProposal.receipt.secret_warnings?.length} onClick={applyPackageUpdate}>{applying ? "Applying…" : "Apply checked update"}</Button></div>
@@ -298,6 +298,29 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       )}
     </main>
   );
+}
+
+/** Render the daemon's compatibility receipt as one readable line per requirement. */
+function CompatibilityLines({ receipt }: { receipt: UpgradeProposal["compatibility"] }) {
+  if (!receipt) return null;
+  if (!receipt.declared) return <p className="hint mt-2">No host requirements declared.</p>;
+  if (receipt.status === "unknown") return <p className="hint mt-2">Compatibility could not be determined.</p>;
+  if (receipt.checks.length === 0) return <p className="hint mt-2">Compatibility requirements could not be read.</p>;
+  return <ul className="hint mt-2" aria-label="Package compatibility">
+    {receipt.checks.map((check, index) => {
+      if (check.kind === "core") {
+        const required = typeof check.required === "string" ? check.required : check.required.join(", ");
+        return <li key={`core-${index}`}>Needs Cadence {required} — this host {check.host ?? "unknown"} {check.ok ? "✓" : "✗"}</li>;
+      }
+      const required = Array.isArray(check.required) ? check.required : [check.required];
+      const supported = check.supported ?? [];
+      return <li key={`contract-${check.contract ?? index}`}>
+        Needs {check.contract ?? "host contract"} {required.map((major) => `v${major}`).join(", ")} — {check.ok
+          ? "supported ✓"
+          : `not supported (host supports ${supported.length ? supported.map((major) => `v${major}`).join(", ") : "none"}) ✗`}
+      </li>;
+    })}
+  </ul>;
 }
 
 /**

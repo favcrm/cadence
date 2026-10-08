@@ -47,6 +47,7 @@ import { useScreenExtras } from "./screen/useScreenExtras";
 import { screenTag, screenProjection, settleIntentRead, type IntentRead } from "./screen/screenProjection";
 import { socialPublish } from "./socialPublish";
 import { supportsSocialContentWorkspace } from "./socialContentSupport";
+import { isUnchangedUpgradeError } from "../explorer/appErrors";
 
 type Section =
   | "Board"
@@ -83,6 +84,7 @@ export default function WorkspaceApp({
   const [data, setData] = useState<Snapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionStatus, setActionStatus] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [section, setSection] = useState<Section>("Board");
   const [contextId, setContextId] = useState(() => rememberedContext(installId) ?? "");
@@ -217,18 +219,25 @@ export default function WorkspaceApp({
     mutationLock.current = true;
     setBusy(true);
     setActionError(null);
+    setActionStatus(null);
     const expectedInstall = installId;
+    let refreshAfterMutation = true;
     try {
       await work();
     } catch (error) {
       if (identity.current === expectedInstall) {
         if (refused(error)) clearPrivate();
-        setActionError(message(error));
+        if (isUnchangedUpgradeError(error)) {
+          setActionStatus("Up to date — this package is the version you have.");
+          refreshAfterMutation = false;
+        } else {
+          setActionError(message(error));
+        }
       }
     } finally {
       mutationLock.current = false;
       setBusy(false);
-      if (identity.current === expectedInstall) await refresh();
+      if (refreshAfterMutation && identity.current === expectedInstall) await refresh();
     }
   };
   // CAD-1025: the mounted screen's publish intents, read with the existing
@@ -644,6 +653,9 @@ export default function WorkspaceApp({
             ? " Showing the last loaded state. Decisions still require current server authority."
             : ""}
         </p>
+      )}
+      {actionStatus && !creating && !run && (
+        <p className="wa-muted" role="status">{actionStatus}</p>
       )}
       {actionError && !creating && !run && (
         <p className="wa-alert" data-tone="fail" role="alert">
