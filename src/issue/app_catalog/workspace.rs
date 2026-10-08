@@ -1402,6 +1402,13 @@ pub(crate) fn with_runtime_read<T>(
         let catalog = Catalog::load(&pm.dir)?;
         no_pending(&root)?;
         let description = describe(&root, &catalog, &id)?;
+        // CAD-1129 H5: the lock-free read funnel refuses a soft-removed
+        // install exactly like `with_runtime_snapshot`.
+        if description["removed"].as_i64().is_some() {
+            return Err(Error::rejected(
+                "installation is removed — restore it before any app action",
+            ));
+        }
         let (bundle, _) = catalog.installations[&id].paths(&id);
         let files = snapshot(&root, &bundle, false)?;
         if bundle_digest(&files) != description["digest"].as_str().unwrap_or("") {
