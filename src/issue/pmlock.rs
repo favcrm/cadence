@@ -50,6 +50,17 @@
 //! whenever another thread spawned a process in between (CAD-948,
 //! `lock_tests::a_forked_child_does_not_keep_the_lock_after_the_guard_drops`).
 //!
+//! CAD-1190: a waiter does not poll. It parks a helper thread in a
+//! blocking `flock(LOCK_EX)` (the kernel queues blocked lockers) and
+//! takes the lock the helper wins, bounded by the same deadline; a
+//! helper whose waiter gave up releases at once. The dirty snapshot
+//! lists untracked directories as one `dir/` entry (`git status
+//! --untracked-files=normal`) instead of one line per file; a crashed
+//! writer's file inside a directory that was already untracked is found
+//! by modification time when a crash needs classifying. A guard held
+//! longer than a second reports `held_ms`, pid, command and declared
+//! paths on stderr when it drops.
+//!
 //! A tracker whose `.git` is a gitfile
 //! (`--separate-git-dir`, a worktree) keeps its coordination files in
 //! the git dir `git rev-parse --git-dir` names.
@@ -60,6 +71,8 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::{Pm, MARKER_LOCK_FILE};
@@ -329,6 +342,18 @@ const FLOCK_FILE: &str = "cadence-write.flock";
 const DIRTY_FILE: &str = "cadence-write.dirty";
 const TMP_PREFIX: &str = "cadence-write.tmp-";
 const WAIT: Duration = Duration::from_secs(15);
+/// A waiter parked in a blocking `flock` re-checks the lease and actor
+/// fences this often.
+const WAIT_SLICE: Duration = Duration::from_millis(250);
+/// Most helper threads parked in a blocking `flock` at once, in this
+/// process. A helper cannot be cancelled: one whose waiter gave up at
+/// the deadline stays parked until the holder releases, then drops the
+/// lock at once. Past this many, a waiter polls instead (the pre-CAD-1190
+/// behaviour), so a long hold cannot pile up threads.
+const MAX_PARKED: usize = 32;
+static PARKED: AtomicUsize = AtomicUsize::new(0);
+/// A hold longer than this is reported when the guard drops.
+const HOLD_REPORT: Duration = Duration::from_secs(1);
 /// A non-waiting acquire retries this often when it sees the kernel
 /// lock taken, so a state probe's instant of ownership is not "busy".
 const PROBE_RETRIES: u32 = 3;
@@ -360,6 +385,8 @@ pub struct PmLock {
     /// must leave it in place so the next attempt checks again.
     armed: bool,
     scope: Scope,
+    /// When this writer took the lock, for the hold-time report.
+    since: Instant,
     _flock: Unlock,
 }
 
@@ -435,8 +462,51 @@ impl Drop for Unlock {
     }
 }
 
+/// One line naming a hold longer than [`HOLD_REPORT`]: how long
+/// (`held_ms`), by which process and binary (the same `pid` and `cmd`
+/// the CAD-1167 marker trailer carries) and, for a scoped write, the
+/// declared paths. `None` for a short hold.
+fn hold_line(held: Duration, scope: &Scope) -> Option<String> {
+    if held <= HOLD_REPORT {
+        return None;
+    }
+    let mut line = format!(
+        "cadence: pm write lock held_ms={} pid={}",
+        held.as_millis(),
+        std::process::id()
+    );
+    if let Some(c) = cmd_name() {
+        line.push_str(&format!(" cmd={c}"));
+    }
+    if let Scope::Paths { admitted, .. } = scope {
+        line.push_str(&format!(" paths={}", admitted.join(",")));
+    }
+    Some(line)
+}
+
+#[cfg(test)]
+thread_local! {
+    static HOLD_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl PmLock {
+    /// Report a long hold on stderr: the daemon's log, a CLI's terminal.
+    /// (No `tracing` subscriber is installed in this crate, so an event
+    /// would go nowhere.) Never panics: a closed stderr is ignored.
+    fn report_hold(&self) {
+        let Some(line) = hold_line(self.since.elapsed(), &self.scope) else {
+            return;
+        };
+        #[cfg(test)]
+        HOLD_LINES.with(|l| l.borrow_mut().push(line.clone()));
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+}
+
 impl Drop for PmLock {
     fn drop(&mut self) {
+        self.report_hold();
         // The kernel lock is released after this body, when `_flock`
         // drops, on the unarmed path as well.
         if !self.armed {
@@ -494,6 +564,42 @@ impl std::fmt::Display for LockState {
             LockState::LegacyUnknown { .. } => write!(f, "legacy lock, owner unknown"),
             LockState::IoUnknown(e) => write!(f, "unknown (I/O error: {e})"),
         }
+    }
+}
+
+/// A helper thread parked in a blocking `flock` on the tracker's
+/// coordination file. The kernel queues blocked lockers, so waiters
+/// are served in turn and the winner takes the lock without a poll
+/// gap; the lock it wins is handed to the waiter, not released. The
+/// wait stays bounded: the waiter times out on the channel, and a
+/// helper that wins after that releases at once.
+struct Waiter {
+    rx: mpsc::Receiver<Unlock>,
+    won: Option<Unlock>,
+    /// The helper ended without a lock (a `flock` error) or its lock
+    /// was taken: this waiter cannot deliver another.
+    spent: bool,
+}
+
+impl Waiter {
+    fn wait(&mut self, slice: Duration) {
+        match self.rx.recv_timeout(slice) {
+            Ok(held) => self.won = Some(held),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => self.spent = true,
+        }
+    }
+
+    fn take(&mut self) -> Option<Unlock> {
+        let held = self.won.take();
+        if held.is_some() {
+            self.spent = true;
+        }
+        held
+    }
+
+    fn spent(&self) -> bool {
+        self.spent
     }
 }
 
@@ -605,6 +711,52 @@ fn read_snapshot(git_dir: &Path) -> Result<HashSet<String>> {
         .collect())
 }
 
+/// When the dirty-path snapshot was written: the moment the last
+/// writer that rewrote it took the lock. `None` without a snapshot.
+fn snapshot_time(git_dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(git_dir.join(DIRTY_FILE))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// Files under `root/rel` (a directory that was already untracked when
+/// the snapshot was taken) modified at or after `since`: a crashed
+/// writer's output inside a foreign directory. `>=` because file times
+/// are coarse; a tie is read as new, the refusing side. Bounded, and
+/// symlinks are not followed.
+///
+/// Returns true when the scan stopped early: the names are then only
+/// a sample, and the caller must block the whole directory.
+fn files_since(
+    root: &Path,
+    rel: &str,
+    since: std::time::SystemTime,
+    out: &mut Vec<String>,
+) -> bool {
+    const CAP: usize = 64;
+    let mut stack = vec![rel.trim_end_matches('/').to_string()];
+    let mut visited = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(root.join(&dir)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            visited += 1;
+            if out.len() >= CAP || visited > 500_000 {
+                return true;
+            }
+            let Ok(m) = e.metadata() else { continue };
+            let name = format!("{dir}/{}", e.file_name().to_string_lossy());
+            if m.is_dir() {
+                stack.push(name);
+            } else if m.modified().map(|t| t >= since).unwrap_or(true) {
+                out.push(name);
+            }
+        }
+    }
+    false
+}
+
 fn write_snapshot(git_dir: &Path, tree: &Tree) -> Result<()> {
     let tmp = git_dir.join(format!("{TMP_PREFIX}dirty-{}", std::process::id()));
     let path = git_dir.join(DIRTY_FILE);
@@ -634,7 +786,12 @@ fn sweep_tmp(git_dir: &Path) {
     }
 }
 
-fn classify(tree: &Tree, snapshot: &HashSet<String>) -> Option<Interruption> {
+fn classify(
+    tree: &Tree,
+    snapshot: &HashSet<String>,
+    inside: &[String],
+    whole: &[String],
+) -> Option<Interruption> {
     let mut named: Vec<String> = Vec::new();
     let mut foreign: Vec<String> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
@@ -648,10 +805,21 @@ fn classify(tree: &Tree, snapshot: &HashSet<String>) -> Option<Interruption> {
     for (kind, p) in &tree.loose {
         if snapshot.contains(p) {
             foreign.push(format!("{kind} {p}"));
+        } else if p.ends_with('/') && inside.iter().any(|f| f.starts_with(p.as_str())) {
+            // Named by the files found inside it, below.
         } else {
             named.push(format!("{kind} {p}"));
-            paths.push(p.clone());
+            paths.push(p.trim_end_matches('/').to_string());
         }
+    }
+    for p in inside {
+        named.push(format!("untracked {p}"));
+        paths.push(p.clone());
+    }
+    // Names are a capped sample; a directory scanned in part blocks
+    // everything under it, so the bound never shrinks the blocked set.
+    for d in whole {
+        paths.push(d.trim_end_matches('/').to_string());
     }
     if named.is_empty() {
         None
@@ -788,7 +956,10 @@ impl Pm {
     }
 
     /// `git status` as the lock sees it (`--no-optional-locks`: the
-    /// check must not take an index lock of its own).
+    /// check must not take an index lock of its own). Untracked
+    /// directories are reported as one `dir/` entry, not one line per
+    /// file (CAD-1190): [`Self::interruption`] looks inside the ones
+    /// that pre-date the crash, on the rare path that needs it.
     fn tree_state(&self, git_dir: &Path) -> Result<Tree> {
         let mut git_state = Vec::new();
         for name in [
@@ -808,7 +979,7 @@ impl Pm {
                 .arg("--no-optional-locks")
                 .arg("-C")
                 .arg(&self.dir)
-                .args(["status", "--porcelain", "-z", "--untracked-files=all"]),
+                .args(["status", "--porcelain", "-z", "--untracked-files=normal"]),
         )
         .map_err(|e| io_unknown(&self.dir, "git status", e))?;
         if !out.status.success() {
@@ -862,7 +1033,30 @@ impl Pm {
     /// by the write path and by `lock_state`/doctor alike. Call it only
     /// with the kernel lock held.
     fn interruption(&self, git_dir: &Path, tree: &Tree) -> Result<Option<Interruption>> {
-        Ok(classify(tree, &read_snapshot(git_dir)?))
+        let snapshot = read_snapshot(git_dir)?;
+        // An untracked directory is one `dir/` line. A new one is the
+        // crash's: name the files in it, as the per-file listing did.
+        // One already in the snapshot cannot be told apart from a crashed
+        // writer's new file inside it by the listing; files modified
+        // since the snapshot can.
+        let mut inside = Vec::new();
+        let mut whole = Vec::new();
+        let taken = snapshot_time(git_dir);
+        for (kind, p) in &tree.loose {
+            if *kind != "untracked" || !p.ends_with('/') {
+                continue;
+            }
+            if !snapshot.contains(p) {
+                // A new directory is the crash's: block all of it.
+                files_since(&self.dir, p, std::time::UNIX_EPOCH, &mut inside);
+                whole.push(p.clone());
+            } else if let Some(since) = taken {
+                if files_since(&self.dir, p, since, &mut inside) {
+                    whole.push(p.clone());
+                }
+            }
+        }
+        Ok(classify(tree, &snapshot, &inside, &whole))
     }
 
     /// One acquisition attempt. `declared` (repo-relative or absolute
@@ -872,19 +1066,28 @@ impl Pm {
     /// write disjoint from the leftovers is admitted with a scope its
     /// commit must stay inside; an overlapping write — and every
     /// unscoped one — is refused. `None` is today's global behavior.
-    fn attempt(&self, declared: Option<&[PathBuf]>) -> Result<Attempt> {
+    ///
+    /// `queued` is a kernel lock a parked waiter already won (see
+    /// [`Waiter`]): it is used as the lock taken, in place of a fresh
+    /// non-blocking `flock`.
+    fn attempt(&self, declared: Option<&[PathBuf]>, queued: Option<Unlock>) -> Result<Attempt> {
         let git_dir = self.lock_git_dir().map_err(|e| self.git_dir_error(e))?;
         let flock_path = git_dir.join(FLOCK_FILE);
-        let file = open_coordination(&flock_path, true)
-            .map_err(|e| io_unknown(&flock_path, "the coordination file", e))?
-            .expect("created");
-        match flock(&file, libc::LOCK_EX) {
-            Ok(true) => {}
-            Ok(false) => return Ok(Attempt::Held),
-            Err(e) => return Err(io_unknown(&flock_path, "flock", e)),
-        }
         // From here every exit releases the lock explicitly.
-        let file = Unlock(file);
+        let file = match queued {
+            Some(held) => held,
+            None => {
+                let file = open_coordination(&flock_path, true)
+                    .map_err(|e| io_unknown(&flock_path, "the coordination file", e))?
+                    .expect("created");
+                match flock(&file, libc::LOCK_EX) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Attempt::Held),
+                    Err(e) => return Err(io_unknown(&flock_path, "flock", e)),
+                }
+                Unlock(file)
+            }
+        };
         // The kernel lock is ours, so any leaked temp marker is stale.
         sweep_tmp(&git_dir);
         let legacy = self.dir.join(MARKER_LOCK_FILE);
@@ -928,6 +1131,7 @@ impl Pm {
             ident,
             armed: !reused,
             scope: Scope::Full,
+            since: Instant::now(),
             _flock: file,
         };
         let tree = self.tree_state(&git_dir)?;
@@ -993,8 +1197,10 @@ impl Pm {
         self.fence_check()?;
         let deadline = wait.map(|w| Instant::now() + w);
         let mut retries = 0;
+        let mut waiter: Option<Waiter> = None;
         loop {
-            let busy = match self.attempt(declared)? {
+            let queued = waiter.as_mut().and_then(Waiter::take);
+            let busy = match self.attempt(declared, queued)? {
                 Attempt::Got(lock) => {
                     self.fence_check()?;
                     return Ok(Some(lock));
@@ -1009,12 +1215,69 @@ impl Pm {
                 }
                 None => return Ok(None),
                 Some(d) if Instant::now() >= d => return Err(self.busy_error(busy)),
-                _ => {
-                    std::thread::sleep(Duration::from_millis(50));
+                Some(d) => {
+                    // A live writer holds the kernel lock: queue behind
+                    // it in the kernel instead of polling. A legacy
+                    // fence file has no kernel lock to queue on, so it
+                    // is polled as before.
+                    if !busy && waiter.as_ref().is_none_or(Waiter::spent) {
+                        waiter = self.park_waiter();
+                    }
+                    match waiter.as_mut().filter(|w| !w.spent()) {
+                        Some(w) => {
+                            w.wait(WAIT_SLICE.min(d.saturating_duration_since(Instant::now())))
+                        }
+                        None => std::thread::sleep(Duration::from_millis(50)),
+                    }
                     self.fence_check()?;
                 }
             }
         }
+    }
+
+    /// Start a helper that blocks in `flock(LOCK_EX)` on its own open
+    /// file description. `None` when the coordination file cannot be
+    /// opened, a thread cannot be started or [`MAX_PARKED`] helpers are
+    /// already parked: the caller polls, and the next [`Self::attempt`]
+    /// reports any real error.
+    fn park_waiter(&self) -> Option<Waiter> {
+        let git_dir = self.lock_git_dir().ok()?;
+        let file = open_coordination(&git_dir.join(FLOCK_FILE), true)
+            .ok()
+            .flatten()?;
+        if PARKED.fetch_add(1, Ordering::SeqCst) >= MAX_PARKED {
+            PARKED.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("pm-lock-wait".into())
+            .spawn(move || {
+                // SAFETY: a valid descriptor owned by `file`.
+                let got = loop {
+                    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                        break true;
+                    }
+                    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                        break false;
+                    }
+                };
+                if got {
+                    // A waiter that gave up has dropped `rx`: the send
+                    // fails and the guard's drop releases the lock.
+                    let _ = tx.send(Unlock(file));
+                }
+                PARKED.fetch_sub(1, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            PARKED.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Waiter {
+            rx,
+            won: None,
+            spent: false,
+        })
     }
 
     pub(super) fn acquire_default(&self) -> Result<PmLock> {
@@ -1184,5 +1447,114 @@ impl Pm {
             named.join(", "),
             self.dir.display()
         ))
+    }
+}
+
+#[cfg(test)]
+mod cad1190_acceptance;
+
+#[cfg(test)]
+mod tests {
+    //! CAD-1190: blocking wait, cheap snapshot, hold-time report. The
+    //! CAD-852 crash proofs stay in `lock_tests`.
+    use super::*;
+
+    fn tracker() -> (tempfile::TempDir, Pm) {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&dir.path().join("pm")).unwrap();
+        (dir, pm)
+    }
+
+    #[test]
+    fn a_waiter_gets_the_lock_when_the_holder_releases_mid_wait() {
+        let (_d, pm) = tracker();
+        let held = pm.lock().unwrap();
+        let t = Instant::now();
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                std::thread::sleep(Duration::from_millis(400));
+                drop(held);
+            });
+            let got = pm.lock_for(Duration::from_secs(10)).unwrap();
+            let waited = t.elapsed();
+            assert!(waited >= Duration::from_millis(350), "waited {waited:?}");
+            assert!(waited < Duration::from_secs(3), "waited {waited:?}");
+            drop(got);
+        });
+    }
+
+    #[test]
+    fn a_waiter_gives_up_at_the_deadline_and_its_helper_frees_the_lock() {
+        let (_d, pm) = tracker();
+        let held = pm.lock().unwrap();
+        let t = Instant::now();
+        let err = pm.lock_for(Duration::from_millis(500)).unwrap_err();
+        assert_eq!(err.code(), Some("resource_busy"), "{err}");
+        assert!(err.to_string().contains("another live writer"), "{err}");
+        let waited = t.elapsed();
+        assert!(waited >= Duration::from_millis(450), "waited {waited:?}");
+        assert!(waited < Duration::from_secs(3), "waited {waited:?}");
+        // The abandoned helper wins the lock when the holder lets go and
+        // must give it straight back.
+        drop(held);
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(l) = pm.try_lock().unwrap() {
+                drop(l);
+                break;
+            }
+            assert!(Instant::now() < end, "the abandoned helper kept the lock");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_hold_over_one_second_reports_held_ms_pid_and_paths() {
+        let (_d, pm) = tracker();
+        HOLD_LINES.with(|l| l.borrow_mut().clear());
+        drop(pm.lock().unwrap());
+        assert!(
+            HOLD_LINES.with(|l| l.borrow().is_empty()),
+            "short hold reported"
+        );
+        let lock = pm.lock_for_paths(&[pm.dir.join("proj")]).unwrap();
+        std::thread::sleep(HOLD_REPORT + Duration::from_millis(100));
+        drop(lock);
+        let lines = HOLD_LINES.with(|l| l.borrow().clone());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("held_ms="), "{line}");
+        assert!(
+            line.contains(&format!("pid={}", std::process::id())),
+            "{line}"
+        );
+        assert!(line.contains("paths=proj"), "{line}");
+    }
+
+    /// The acquire snapshot lists an untracked directory as one entry.
+    /// A crashed writer's new file inside a directory that was already
+    /// untracked must still read as its leftover; the old file must not.
+    #[test]
+    fn a_crash_leftover_inside_a_foreign_untracked_dir_still_refuses() {
+        let (_d, pm) = tracker();
+        std::fs::create_dir_all(pm.dir.join("foreign")).unwrap();
+        std::fs::write(pm.dir.join("foreign/old.txt"), "mine\n").unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let mut lock = pm.lock().unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        // Dying here leaves the fence file behind: a crashed writer.
+        lock.armed = false;
+        drop(lock);
+        let clean = pm.lock().unwrap();
+        // The foreign file alone is not a leftover: that lock was
+        // admitted. Now the crash adds a file inside the foreign dir.
+        std::thread::sleep(Duration::from_millis(30));
+        let mut clean = clean;
+        clean.armed = false;
+        std::fs::write(pm.dir.join("foreign/half-written.md"), "x\n").unwrap();
+        drop(clean);
+        let err = pm.lock().unwrap_err();
+        assert!(err.to_string().contains("foreign/half-written.md"), "{err}");
+        assert!(!err.to_string().contains("foreign/old.txt"), "{err}");
     }
 }
