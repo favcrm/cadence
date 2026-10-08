@@ -699,8 +699,8 @@ fn cad631_authority_loss_invalidates_once_and_keeps_material_receipts() {
     )
     .unwrap();
     s.app_run_dispatch(id, "sha256:bundle").unwrap();
-    s.app_run_invalidate(id).unwrap();
-    s.app_run_invalidate(id).unwrap();
+    s.app_run_invalidate(id, "test authority loss").unwrap();
+    s.app_run_invalidate(id, "test authority loss").unwrap();
     assert_eq!(s.app_run_show(id).unwrap()["state"], "failed");
     assert!(s.app_run_pending().unwrap().is_empty());
     assert!(s.app_run_dispatch(id, "sha256:bundle").is_err());
@@ -1277,4 +1277,171 @@ fn cad1123_run_approval_is_recorded_durably_with_time_and_derived_actor() {
         .unwrap()
         .iter()
         .all(|r| r["id"] == id || r.get("approval").is_none()));
+}
+
+/// CAD-1142: a failed app worker turn's provider error text never
+/// reaches the persisted step reason or the public daemon stream.
+/// `steps[].reason` and `app_run_failed.payload.reason` are readable
+/// via `agent_events` by any caller (Rule::Read), while a provider's
+/// `errorMessage` may carry credentials — the step records a bounded
+/// classification and the private detail stays on the message row.
+#[test]
+fn cad1142_failed_worker_turn_reason_is_classified_not_provider_prose() {
+    let (_dir, s, run) = runtime_fixture();
+    let id = run["id"].as_str().unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
+    let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
+    let writer = start_local_step(&s, &dispatched, 0, "writer");
+    let secret = "provider rejected request; Authorization: Bearer cad1142_SYNTHETIC_SECRET";
+    s.finish(
+        &writer,
+        "failed",
+        &json!({"status":"failed","turn_id":writer.turn_id,"error":secret}),
+        Some(secret),
+    )
+    .unwrap();
+    let shown = s.app_run_show(id).unwrap();
+    assert_eq!(shown["state"], "failed", "{shown}");
+    assert_eq!(shown["steps"][0]["state"], "failed", "{shown}");
+    let reason = shown["steps"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("provider error"),
+        "classified reason names the cause class: {reason}"
+    );
+    assert!(
+        !reason.contains("cad1142_SYNTHETIC_SECRET") && !reason.contains("Bearer"),
+        "provider prose escaped into the step reason: {reason}"
+    );
+    // The same holds on the public daemon-stream event payload.
+    let event = s
+        .events(Store::DAEMON_STREAM, 0, 100)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == "app_run_failed")
+        .expect("app_run_failed event");
+    let payload = event.payload.to_string();
+    assert!(!payload.contains("cad1142_SYNTHETIC_SECRET"), "{payload}");
+    assert!(!payload.contains("Bearer"), "{payload}");
+    assert!(
+        event.payload["reason"]
+            .as_str()
+            .unwrap()
+            .contains("provider error"),
+        "{payload}"
+    );
+    // The private detail is not erased — it stays on the message row
+    // for operator-only inspection.
+    let stored = s.message(&writer.id).unwrap().unwrap();
+    assert_eq!(stored.error.as_deref(), Some(secret));
+}
+
+/// CAD-1142: invalidation reasons are classified onto the bounded
+/// authority-loss vocabulary. Cadence-generated text keeps its class
+/// (binding, price), while arbitrary interpolated text — including a
+/// credential-bearing provider string — can never be persisted or
+/// published verbatim.
+#[test]
+fn cad1142_invalidate_reason_classifies_and_never_echoes_secret_text() {
+    let (_dir, s, run) = runtime_fixture();
+    let id = run["id"].as_str().unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
+    s.app_run_dispatch(id, "sha256:bundle").unwrap();
+    // A genuine Cadence rejection keeps its readable class.
+    s.app_run_invalidate(id, "publication binding is absent or revoked")
+        .unwrap();
+    let reason = s.app_run_show(id).unwrap()["steps"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(reason.contains("binding"), "{reason}");
+    // A credential-bearing provider string never echoes verbatim; it
+    // classifies onto the bounded vocabulary instead.
+    let (_dir2, s2, run2) = runtime_fixture();
+    let id2 = run2["id"].as_str().unwrap();
+    s2.app_run_decide(
+        id2,
+        run2["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
+    s2.app_run_dispatch(id2, "sha256:bundle").unwrap();
+    s2.app_run_invalidate(
+        id2,
+        "quote door answered: Authorization: Bearer cad1142_LEAKED_TOKEN binding revoked",
+    )
+    .unwrap();
+    let shown = s2.app_run_show(id2).unwrap();
+    let reason = shown["steps"][0]["reason"].as_str().unwrap();
+    assert!(!reason.contains("cad1142_LEAKED_TOKEN"), "{reason}");
+    assert!(!reason.contains("Bearer"), "{reason}");
+    assert!(reason.contains("binding"), "{reason}");
+    for event in s2.events(Store::DAEMON_STREAM, 0, 200).unwrap() {
+        assert!(
+            !event.payload.to_string().contains("cad1142_LEAKED_TOKEN"),
+            "secret in {} event: {}",
+            event.kind,
+            event.payload
+        );
+    }
+}
+
+/// CAD-1142: the classification helper is total — every input maps to a
+/// bounded Cadence-authored class and never echoes the input.
+#[test]
+fn cad1142_reason_class_is_bounded_and_never_echoes() {
+    use super::super::app_runs::app_reason_class;
+    let cases = [
+        ("publication binding is absent or revoked", "binding"),
+        ("capability price changed since run creation", "price"),
+        ("run context was updated or archived", "context"),
+        ("connection is unavailable or stale", "connection"),
+        (
+            "registered assignment identity or group changed",
+            "assignment",
+        ),
+        ("run execution approval is absent or stale", "approval"),
+        (
+            "Authorization: Bearer topsecret; unexpected prose",
+            "authority",
+        ),
+    ];
+    // A Cadence literal may classify onto its own canonical text;
+    // free text never passes through verbatim unless it IS the class.
+    const CLASSES: &[&str] = &[
+        "run binding receipt is no longer current",
+        "capability price changed since run approval",
+        "run context was updated or archived",
+        "capability connection receipt is stale or unavailable",
+        "registered assignment identity or group changed",
+        "run execution approval is absent or stale",
+        "app authority or assignment is no longer current",
+    ];
+    for (input, needle) in cases {
+        let class = app_reason_class(input);
+        assert!(class.contains(needle), "{input} -> {class}");
+        assert!(CLASSES.contains(&class), "{input} -> unlisted {class}");
+    }
+    // Arbitrary provider prose with credentials never echoes.
+    for hostile in [
+        "Authorization: Bearer leaked; request rejected",
+        "upstream 500: secret=abc in body",
+        "",
+    ] {
+        let class = app_reason_class(hostile);
+        assert!(CLASSES.contains(&class), "{hostile} -> {class}");
+        assert!(!class.contains("leaked") && !class.contains("abc"));
+    }
 }

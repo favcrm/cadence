@@ -47,6 +47,16 @@ pub struct Structured {
 pub enum Error {
     Rejected(String),
     Provider(String),
+    /// CAD-1142: an actor-fatal error raised on an app-owned turn — the
+    /// actor's own record of which turn died (`source ==
+    /// "app_run_dispatch"` at claim), never a caller claim or an
+    /// error-text guess. `run_actor`'s fatal arm wraps the returned error
+    /// so the public fence text (`agents.error`, the `attention` event)
+    /// can carry a bounded Cadence-authored class; `Display` still
+    /// returns the raw account, and `kind` stays `provider`, so the
+    /// private detail and the wire shape are unchanged. The raw account
+    /// stays on the message row (operator-gated).
+    AppOwnedFatal(String),
     OutcomeUnknown(String),
     Internal(String),
     /// Invalid input or a revision conflict, with a stable code.
@@ -80,6 +90,28 @@ impl Error {
     }
     pub fn provider(message: impl Into<String>) -> Self {
         Self::Provider(message.into())
+    }
+    /// CAD-1142 reason privacy: mark an actor-fatal error as raised on
+    /// an app-owned turn. Only `run_actor`'s fatal arm calls this, with
+    /// the claimed message's proven source — never derived from the
+    /// error text. All other variants pass through unchanged.
+    pub fn into_app_owned_fatal(self) -> Self {
+        match self {
+            // Already stamped, or a variant the actor never reaches the
+            // fatal arm with (outcome-unknown, gate, pre-write,
+            // render-miss are intercepted earlier): keep it as-is.
+            Self::AppOwnedFatal(_)
+            | Self::OutcomeUnknown(_)
+            | Self::GateRefused(_)
+            | Self::PreWrite(_)
+            | Self::NotRendered(_) => self,
+            other => Self::AppOwnedFatal(other.to_string()),
+        }
+    }
+    /// True when this fatal error was provably raised on an app-owned
+    /// turn — the actor-stamped marker, not a text heuristic.
+    pub fn is_app_owned_fatal(&self) -> bool {
+        matches!(self, Self::AppOwnedFatal(_))
     }
     pub fn unknown(message: impl Into<String>) -> Self {
         Self::OutcomeUnknown(message.into())
@@ -165,7 +197,10 @@ impl Error {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Rejected(_) => "rejected",
-            Self::Provider(_) => "provider",
+            // Wire-compatible with `provider`: it is one — the variant
+            // only exists so `run_actor` can classify the public fence
+            // text for an app-owned turn without reading the prose.
+            Self::Provider(_) | Self::AppOwnedFatal(_) => "provider",
             Self::OutcomeUnknown(_) => "unknown",
             Self::Internal(_) => "internal",
             Self::GateRefused(_) => "gate",
@@ -214,6 +249,7 @@ impl fmt::Display for Error {
         match self {
             Self::Rejected(m)
             | Self::Provider(m)
+            | Self::AppOwnedFatal(m)
             | Self::OutcomeUnknown(m)
             | Self::Internal(m)
             | Self::GateRefused(m)

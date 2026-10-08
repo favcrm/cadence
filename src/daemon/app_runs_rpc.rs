@@ -640,11 +640,23 @@ impl Shared {
                     bundle,
                     files,
                 )?;
-                let quote = self.app_capability_quote(&proof)?;
-                if run["snapshot"]["quotes"][slot] != json!(quote) {
-                    return Err(Error::rejected(
-                        "capability price changed since run creation",
-                    ));
+                // CAD-1142: classify the live price probe. The frozen binding
+                // receipt above (local store/descriptor read) is the authority
+                // verdict; the quote below is only a price-liveness probe. A
+                // probe failure — unreachable provider, timeout, refusal — is
+                // NOT authority loss, so it must not reject the run: on Demo
+                // a ~15s quote read outage made `advance_app_runs` mistake it
+                // for stale authority and fail a running run before the
+                // worker's first turn. Skip the drift comparison and leave the
+                // run running; the capability call re-quotes at execution and
+                // enforces the frozen `max_charge_minor` ceiling where money
+                // moves, so a failed call still fails the step with a reason.
+                if let Ok(quote) = self.app_capability_quote(&proof) {
+                    if run["snapshot"]["quotes"][slot] != json!(quote) {
+                        return Err(Error::rejected(
+                            "capability price changed since run creation",
+                        ));
+                    }
                 }
             }
         }
@@ -864,8 +876,14 @@ impl Shared {
         }
         if let Ok(runs) = self.store.app_run_pending() {
             for (id, _, _) in runs {
-                if matches!(self.dispatch_app_run(&id), Err(e) if e.kind() == "rejected") {
-                    let _ = self.store.app_run_invalidate(&id);
+                // CAD-1142: only a rejection — proved authority/assignment
+                // loss — invalidates, and the rejection text becomes the
+                // steps' persisted reason. A transient probe failure never
+                // reaches here as `rejected` (see `app_run_binding_current`).
+                if let Err(e) = self.dispatch_app_run(&id) {
+                    if e.kind() == "rejected" {
+                        let _ = self.store.app_run_invalidate(&id, &e.to_string());
+                    }
                 }
             }
         }
