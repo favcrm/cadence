@@ -448,10 +448,11 @@ fn check_expected_digest(expected: &str, actual: &str) -> Result<()> {
 /// writes nothing: no catalog, journal or lock file is created.
 pub(crate) fn install_check(pm: &Pm, source: &str) -> Result<Value> {
     let (files, validated, provenance) = resolved_bundle(pm, source)?;
-    let _lock = pm.lock()?;
-    let root = Root::open(&pm.dir)?;
-    let (catalog, _) = current(&root)?;
-    same_name_workspace(&catalog, &validated.manifest.app)?;
+    optimistic(|| {
+        let root = Root::open(&pm.dir)?;
+        let (catalog, _) = current(&root)?;
+        same_name_workspace(&catalog, &validated.manifest.app)
+    })?;
     Ok(json!({"schema":1,"name":validated.manifest.app,
         "version":validated.manifest.version,"source":provenance,
         "digest":bundle_digest(&files),
@@ -472,6 +473,7 @@ pub(crate) fn install(
     if let Some(expected) = expected_digest {
         check_expected_digest(expected, &bundle_digest(&files))?;
     }
+    let _apps = super::appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;
     let (mut catalog, before_catalog) = current(&root)?;
@@ -537,34 +539,39 @@ pub(crate) fn upgrade_check(
 ) -> Result<Value> {
     let id = InstallationId::parse(id)?;
     let (files, validated, provenance) = resolved_bundle(pm, source)?;
-    let _lock = pm.lock()?;
-    let root = Root::open(&pm.dir)?;
-    let (catalog, _) = current(&root)?;
-    let entry = catalog
-        .installations
-        .get(&id)
-        .ok_or_else(|| Error::rejected("unknown installation ID"))?;
-    if entry.storage != Storage::Workspace
-        || entry.project.is_some()
-        || entry.app != validated.manifest.app
-    {
-        return Err(Error::rejected(
-            "upgrade proposal changes workspace app identity",
-        ));
-    }
-    if hash(&yaml(&catalog)?) != expected_generation {
-        return Err(Error::rejected("workspace catalog generation is stale"));
-    }
-    let (old_bundle, _) = entry.paths(&id);
-    let old_files = snapshot(&root, &old_bundle, false)?;
-    if bundle_digest(&old_files) != expected_digest {
-        return Err(Error::rejected("workspace installation digest is stale"));
-    }
+    let (entry_name, old_files) = optimistic(|| {
+        let root = Root::open(&pm.dir)?;
+        let (catalog, _) = current(&root)?;
+        let entry = catalog
+            .installations
+            .get(&id)
+            .ok_or_else(|| Error::rejected("unknown installation ID"))?;
+        if entry.storage != Storage::Workspace
+            || entry.project.is_some()
+            || entry.app != validated.manifest.app
+        {
+            return Err(Error::rejected(
+                "upgrade proposal changes workspace app identity",
+            ));
+        }
+        if hash(&yaml(&catalog)?) != expected_generation {
+            return Err(Error::rejected("workspace catalog generation is stale"));
+        }
+        let (old_bundle, _) = entry.paths(&id);
+        let old_files = snapshot(&root, &old_bundle, false)?;
+        if bundle_digest(&old_files) != expected_digest {
+            return Err(Error::rejected("workspace installation digest is stale"));
+        }
+        // Published state must still be what was read.
+        catalog.require_current(&root)?;
+        let name = entry.app.clone();
+        Ok((name, old_files))
+    })?;
     let new_digest = bundle_digest(&files);
     if new_digest == expected_digest {
         return Err(Error::rejected("upgrade bundle is unchanged"));
     }
-    Ok(json!({"schema":1,"install_id":&*id,"name":entry.app,
+    Ok(json!({"schema":1,"install_id":&*id,"name":entry_name,
         "version":validated.manifest.version,"source":provenance,
         "expected_digest":expected_digest,"expected_generation":expected_generation,
         "digest":new_digest,"structural_diff":structural_diff(&old_files,&files),
@@ -593,6 +600,7 @@ pub(crate) fn upgrade(
     validate_source_transport(source)?;
     // Completed request replay must not depend on a mutable/missing source.
     {
+        let _apps = super::appslock::acquire(pm)?;
         let _lock = pm.lock()?;
         let root = Root::open(&pm.dir)?;
         let (catalog, _) = current(&root)?;
@@ -602,6 +610,7 @@ pub(crate) fn upgrade(
     }
     let (files, validated, provenance) = resolved_bundle(pm, source)?;
     let new_digest = bundle_digest(&files);
+    let _apps = super::appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;
     let (mut catalog, before_catalog) = current(&root)?;
@@ -853,6 +862,7 @@ fn apply_upgrade(pm: &Pm, root: &Root, journal: &UpgradeJournal) -> Result<Vec<S
 pub(crate) fn upgrade_recover(pm: &Pm, id: &str, request_id: &str) -> Result<Value> {
     let id = InstallationId::parse(id)?;
     crate::proto::identifier(request_id, "upgrade request ID")?;
+    let _apps = super::appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;
     let journal: UpgradeJournal = decode(&required(
@@ -1023,6 +1033,7 @@ fn apply(pm: &Pm, root: &Root, journal: &InstallJournal) -> Result<Vec<String>> 
 pub(crate) fn recover(pm: &Pm, state: &Path, id: &str) -> Result<Value> {
     let _ = state; // The daemon proves the calling connection before this backend.
     let id = InstallationId::parse(id)?;
+    let _apps = super::appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;
     let journal: InstallJournal = decode(&required(&root, &journal_path(&id), JOURNAL_CAP)?)?;
@@ -1139,24 +1150,65 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
         json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"source":record.source,"installed_at":record.installed_at,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
     )
 }
+/// CAD-1189: catalog reads take no lock. Every writer journals first
+/// (`*-pending.yaml`) and publishes `catalog.yaml` atomically, so a read
+/// that races one fails a freshness check; it is retried a few times and
+/// then answers `busy` (retryable), never a mix of old and new state.
+const READ_ATTEMPTS: u32 = 3;
+
+fn changed_underneath(error: &Error) -> bool {
+    match error {
+        Error::Rejected(m) => {
+            m.contains(" is pending")
+                || m.contains("no longer published")
+                || m.contains("changed during inspection")
+                || m.contains("changed during runtime admission")
+        }
+        _ => false,
+    }
+}
+
+fn optimistic<T>(mut read: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempt = 1;
+    loop {
+        match read() {
+            Err(error) if changed_underneath(&error) => {
+                if attempt >= READ_ATTEMPTS {
+                    return Err(Error::busy(format!(
+                        "app catalog kept changing while it was read; retry ({error})"
+                    )));
+                }
+                let jitter = (uuid::Uuid::new_v4().as_u128() % 20) as u64;
+                std::thread::sleep(std::time::Duration::from_millis(
+                    20 * attempt as u64 + jitter,
+                ));
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 pub fn list(pm: &Pm) -> Result<Value> {
-    let _lock = pm.lock()?;
-    let catalog = Catalog::load(&pm.dir)?;
-    let root = Root::open(&pm.dir)?;
-    let rows = catalog
-        .installations
-        .keys()
-        .map(|id| describe(&root, &catalog, id))
-        .collect::<Result<Vec<_>>>()?;
-    catalog.require_current(&root)?;
-    Ok(json!(rows))
+    optimistic(|| {
+        let catalog = Catalog::load(&pm.dir)?;
+        let root = Root::open(&pm.dir)?;
+        let rows = catalog
+            .installations
+            .keys()
+            .map(|id| describe(&root, &catalog, id))
+            .collect::<Result<Vec<_>>>()?;
+        catalog.require_current(&root)?;
+        Ok(json!(rows))
+    })
 }
 pub fn show(pm: &Pm, id: &str) -> Result<Value> {
-    let _lock = pm.lock()?;
-    let catalog = Catalog::load(&pm.dir)?;
     let id = InstallationId::parse(id)?;
-    let root = Root::open(&pm.dir)?;
-    describe(&root, &catalog, &id)
+    optimistic(|| {
+        let catalog = Catalog::load(&pm.dir)?;
+        let root = Root::open(&pm.dir)?;
+        describe(&root, &catalog, &id)
+    })
 }
 
 /// Delivery happens before pending is removed, under the same PM lock.
@@ -1188,6 +1240,7 @@ fn commit_migration(pm: &Pm, journal: &Journal) -> Result<Vec<String>> {
     .collect())
 }
 pub(crate) fn migrate(pm: &Pm) -> Result<Value> {
+    let _apps = super::appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     let mut foreign = None;
     let catalog = migrate_delivering(pm, |journal| {
@@ -1209,6 +1262,7 @@ pub(crate) fn migrate(pm: &Pm) -> Result<Value> {
     )
 }
 pub(crate) fn migration_recover(pm: &Pm, id: &str, rollback: bool) -> Result<Value> {
+    let _apps = super::appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     let mut foreign = Vec::new();
     recover_delivering(
@@ -1237,18 +1291,24 @@ pub(crate) fn with_runtime_snapshot<T>(
     callback: impl FnOnce(&Value, &BTreeMap<String, String>) -> Result<T>,
 ) -> Result<T> {
     let id = InstallationId::parse(id)?;
-    let _lock = pm.lock()?;
-    let root = Root::open(&pm.dir)?;
-    let catalog = Catalog::load(&pm.dir)?;
-    no_pending(&root)?;
-    let description = describe(&root, &catalog, &id)?;
-    let (bundle, _) = catalog.installations[&id].paths(&id);
-    let files = snapshot(&root, &bundle, false)?;
-    if bundle_digest(&files) != description["digest"].as_str().unwrap_or("") {
-        return Err(Error::rejected(
-            "installation changed during runtime admission",
-        ));
-    }
+    // Callbacks may create run, binding or context state that the upgrade
+    // preflight inspects, so admission is ordered against catalog writers
+    // by the apps lock (never the PM lock). Apps lock, then PM lock.
+    let _apps = super::appslock::acquire(pm)?;
+    let (description, files) = optimistic(|| {
+        let root = Root::open(&pm.dir)?;
+        let catalog = Catalog::load(&pm.dir)?;
+        no_pending(&root)?;
+        let description = describe(&root, &catalog, &id)?;
+        let (bundle, _) = catalog.installations[&id].paths(&id);
+        let files = snapshot(&root, &bundle, false)?;
+        if bundle_digest(&files) != description["digest"].as_str().unwrap_or("") {
+            return Err(Error::rejected(
+                "installation changed during runtime admission",
+            ));
+        }
+        Ok((description, files))
+    })?;
     callback(&description, &files)
 }
 
@@ -1271,45 +1331,48 @@ pub(crate) fn with_completed_bundle_snapshot<T>(
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         })
         .ok_or_else(|| Error::rejected("historical bundle digest is invalid"))?;
-    let _lock = pm.lock()?;
-    let root = Root::open(&pm.dir)?;
-    let catalog = Catalog::load(&pm.dir)?;
-    no_pending(&root)?;
-    let current = describe(&root, &catalog, &id)?;
-    let entry = &catalog.installations[&id];
-    if entry.storage != Storage::Workspace {
-        return Err(Error::rejected(
-            "historical bundle needs a workspace installation",
-        ));
-    }
-    let bundle = if current["digest"] == digest {
-        entry.paths(&id).0
-    } else {
-        let base = Path::new(".apps/installations").join(&*id);
-        let original = base.join("bundle");
-        let old_files = snapshot(&root, &original, false)?;
-        if bundle_digest(&old_files) == digest {
-            original
-        } else {
-            base.join("revisions").join(revision).join("bundle")
+    let _apps = super::appslock::acquire(pm)?;
+    let files = optimistic(|| {
+        let root = Root::open(&pm.dir)?;
+        let catalog = Catalog::load(&pm.dir)?;
+        no_pending(&root)?;
+        let current = describe(&root, &catalog, &id)?;
+        let entry = &catalog.installations[&id];
+        if entry.storage != Storage::Workspace {
+            return Err(Error::rejected(
+                "historical bundle needs a workspace installation",
+            ));
         }
-    };
-    let files = snapshot(&root, &bundle, false)?;
-    if bundle_digest(&files) != digest {
-        return Err(Error::rejected(
-            "retained historical bundle differs from its frozen digest",
-        ));
-    }
-    let manifest = app::parse_manifest(
-        files
-            .get("app.md")
-            .ok_or_else(|| Error::rejected("historical bundle manifest is missing"))?,
-    )?;
-    if manifest.app != entry.app {
-        return Err(Error::rejected(
-            "historical bundle changes installation identity",
-        ));
-    }
+        let bundle = if current["digest"] == digest {
+            entry.paths(&id).0
+        } else {
+            let base = Path::new(".apps/installations").join(&*id);
+            let original = base.join("bundle");
+            let old_files = snapshot(&root, &original, false)?;
+            if bundle_digest(&old_files) == digest {
+                original
+            } else {
+                base.join("revisions").join(revision).join("bundle")
+            }
+        };
+        let files = snapshot(&root, &bundle, false)?;
+        if bundle_digest(&files) != digest {
+            return Err(Error::rejected(
+                "retained historical bundle differs from its frozen digest",
+            ));
+        }
+        let manifest = app::parse_manifest(
+            files
+                .get("app.md")
+                .ok_or_else(|| Error::rejected("historical bundle manifest is missing"))?,
+        )?;
+        if manifest.app != entry.app {
+            return Err(Error::rejected(
+                "historical bundle changes installation identity",
+            ));
+        }
+        Ok(files)
+    })?;
     callback(&json!({"digest":digest}), &files)
 }
 
@@ -1412,5 +1475,24 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
             assert!(show(&pm, forged).is_err(), "admitted {forged}");
         }
         assert!(show(&pm, "0123456789abcdef0123456789abcdef").is_err());
+    }
+
+    /// CAD-1189: reads and runtime admission answer while another handle
+    /// holds the PM write lock. Before, each waited out the 15 s lock
+    /// deadline and failed `resource_busy`.
+    #[test]
+    fn reads_and_admission_do_not_wait_for_the_pm_lock() {
+        let (pm_dir, _state, _sources, id) = installed();
+        let pm = Pm::at(pm_dir.path()).unwrap();
+        let _held = pm.lock().unwrap();
+        let other = Pm::at(pm_dir.path()).unwrap();
+        assert!(other.try_lock().unwrap().is_none(), "lock is really held");
+        let started = std::time::Instant::now();
+        assert_eq!(list(&other).unwrap().as_array().unwrap().len(), 1);
+        let shown = show(&other, &id).unwrap();
+        let digest = shown["digest"].as_str().unwrap().to_string();
+        let seen = with_runtime_snapshot(&other, &id, |row, _| Ok(row["digest"].clone())).unwrap();
+        assert_eq!(seen, json!(digest));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }

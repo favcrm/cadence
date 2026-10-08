@@ -1,5 +1,6 @@
 //! CAD-630 foundation: explicit single-workspace installation catalog.
 //! No daemon/HTTP routing, execution or grant translation is enabled here.
+mod appslock;
 mod fs;
 pub mod workspace;
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,7 @@ pub fn migrate(pm: &Pm, state_dir: &Path) -> Result<Catalog> {
 
 /// Daemon backend; the caller has already proved its connection is operator.
 pub(crate) fn migrate_authorized(pm: &Pm) -> Result<Catalog> {
+    let _apps = appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     migrate_locked(pm)
 }
@@ -213,6 +215,7 @@ pub fn recover(pm: &Pm, state_dir: &Path, id: &str, mode: Recovery) -> Result<()
 }
 
 pub(crate) fn recover_authorized(pm: &Pm, id: &str, mode: Recovery) -> Result<()> {
+    let _apps = appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     recover_locked(pm, id, mode)
 }
