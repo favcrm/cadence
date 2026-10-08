@@ -54,7 +54,9 @@ any other store unlocks nothing. `dev reload` refuses (and stops and starts
 nothing) on a plain `--state-dir`, a marker copied outside the base, the
 production state dir, or an unmarked store with the profile exported.
 Production's rules (lease, backup receipt, attestation) are unchanged.
-A sandbox created before the dev marker existed needs one `dev up` to get it.
+A sandbox created before the dev marker existed (before #831) loses the
+lease exemption until `cadence dev up` re-marks it: run `cadence dev up` once
+per old sandbox after the update that ships this change.
 
 ## Recovery / internals: `rollout` and `upgrade`
 

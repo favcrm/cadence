@@ -872,7 +872,15 @@ fn env_lines(sb: &Sandbox, port: Option<u16>, allow_global: bool) -> String {
 
 /// `<exe> --state-dir <state> <args>` inside the sandbox env. A
 /// sandbox never runs as the caller's pane identity or rollout holder.
-fn child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Command {
+/// The caller's own grant: `CADENCE_SANDBOX_ALLOW_GLOBAL=1` in this env.
+fn env_grant() -> bool {
+    std::env::var(ALLOW_GLOBAL_ENV).is_ok_and(|v| v == "1")
+}
+
+/// `grant` is passed to the child, never read off our own env here, so a
+/// verb that must use the recorded grant (`reload`) cannot be fooled by —
+/// or have to rewrite — the caller's env.
+fn child(sb: &Sandbox, exe: &Path, args: &[&str], grant: bool) -> Command {
     let mut cmd = Command::new(exe);
     cmd.arg("--state-dir")
         .arg(sb.state_dir())
@@ -887,7 +895,7 @@ fn child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Command {
         .env_remove("CADENCE_ROLLOUT_AS")
         .stdin(Stdio::null());
     // Children get exactly the grant `up` records: `1` or nothing.
-    if std::env::var(ALLOW_GLOBAL_ENV).is_ok_and(|v| v == "1") {
+    if grant {
         cmd.env(ALLOW_GLOBAL_ENV, "1");
     } else {
         cmd.env_remove(ALLOW_GLOBAL_ENV);
@@ -896,8 +904,8 @@ fn child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Command {
 }
 
 /// Run one child verb to completion; its JSON stdout is the result.
-fn run_child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Result<Value> {
-    let out = crate::reaper::output(&mut child(sb, exe, args))?;
+fn run_child(sb: &Sandbox, exe: &Path, args: &[&str], grant: bool) -> Result<Value> {
+    let out = crate::reaper::output(&mut child(sb, exe, args, grant))?;
     if !out.status.success() {
         return Err(Error::rejected(format!(
             "`cadence {}` in sandbox '{}' failed: {} — see {}/*.log; \
@@ -1054,10 +1062,10 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
     // CAD-1187: the store itself says it is a dev store, before any
     // daemon starts from it.
     write_dev_marker(sb)?;
-    run_child(sb, exe, &["issue", "init"])?;
-    let daemon = run_child(sb, exe, &["daemon", "start"])?;
+    run_child(sb, exe, &["issue", "init"], allow_global)?;
+    let daemon = run_child(sb, exe, &["daemon", "start"], allow_global)?;
     let port_arg = port.to_string();
-    let ui = run_child(sb, exe, &["ui", "start", "--port", &port_arg])?;
+    let ui = run_child(sb, exe, &["ui", "start", "--port", &port_arg], allow_global)?;
     Ok(json!({
         "name": sb.name,
         "root": sb.root,
@@ -1130,7 +1138,25 @@ fn reload(state_dir: &Path, name: Option<&str>, build: Option<&Path>) -> Result<
     // No name: the store this shell points at, never a fallback to
     // `dev` — a plain `--state-dir` must be refused, not redirected.
     let sb = match name {
-        Some(name) => Sandbox::open(name)?,
+        Some(name) => {
+            let sb = Sandbox::open(name)?;
+            // `--name` picks the store; a `--state-dir` (or exported
+            // CADENCE_STATE_DIR) pointing anywhere else is a second,
+            // conflicting target — refused, never silently ignored. The
+            // untouched default state dir is "no choice made" and loses.
+            let chosen = resolved(state_dir);
+            let default = client::default_state_dir().map(|d| resolved(&d)).ok();
+            if chosen != resolved(&sb.state_dir()) && Some(&chosen) != default.as_ref() {
+                return Err(Error::rejected(format!(
+                    "`dev reload --name {name}` targets {} but --state-dir / \
+                     CADENCE_STATE_DIR points at {} — pass only one of them. \
+                     Nothing was stopped or started",
+                    sb.state_dir().display(),
+                    state_dir.display()
+                )));
+            }
+            sb
+        }
         None => Sandbox::from_state_dir(state_dir).ok_or_else(|| {
             Error::rejected(format!(
                 "{} is not a dev store — `dev reload` only restarts a store that \
@@ -1162,12 +1188,23 @@ fn reload(state_dir: &Path, name: Option<&str>, build: Option<&Path>) -> Result<
         None => runnable(&newest_local_build()?)?,
     };
     // CAD-832: the global-write grant is process env fixed at `up`. A
-    // reload restarts the processes with exactly the recorded grant, never
-    // the caller's env, so it can neither add nor drop a grant.
-    if require_marker(&sb)?["allow_global"].as_bool() == Some(true) {
-        std::env::set_var(ALLOW_GLOBAL_ENV, "1");
-    } else {
-        std::env::remove_var(ALLOW_GLOBAL_ENV);
+    // reload restarts the processes with exactly the recorded grant, passed
+    // to each child, never the caller's env.
+    let grant = require_marker(&sb)?["allow_global"].as_bool() == Some(true);
+    // Same check `up` makes, before anything is stopped: a persisted
+    // tailnet share under an ungranted marker would make `ui start` refuse
+    // after the daemon was already restarted.
+    if !grant && persisted_share(&sb)? {
+        return Err(Error::rejected(format!(
+            "sandbox '{}' still has a persisted tailnet share but its marker records no \
+             {ALLOW_GLOBAL_ENV} grant — `dev reload` would restart the daemon and then \
+             refuse the board. Nothing was stopped or started. Stop sharing under the \
+             grant first: `{ALLOW_GLOBAL_ENV}=1 cadence --state-dir {} ui tailscale stop`, \
+             or `cadence dev reset {}` starts over",
+            sb.name,
+            sb.state_dir().display(),
+            sb.name
+        )));
     }
     let port = persisted_port(&store);
     let had_ui = crate::ui::detached_pid(&store).is_some();
@@ -1176,16 +1213,16 @@ fn reload(state_dir: &Path, name: Option<&str>, build: Option<&Path>) -> Result<
     // the new binary.
     let current = std::env::current_exe()?;
     if had_ui {
-        run_child(&sb, &current, &["ui", "stop"])?;
+        run_child(&sb, &current, &["ui", "stop"], grant)?;
     }
     if had_daemon {
-        run_child(&sb, &current, &["daemon", "stop"])?;
+        run_child(&sb, &current, &["daemon", "stop"], grant)?;
     }
-    let daemon = run_child(&sb, &exe, &["daemon", "start"])?;
+    let daemon = run_child(&sb, &exe, &["daemon", "start"], grant)?;
     let ui = match port {
         Some(port) if had_ui => {
             let port_arg = port.to_string();
-            run_child(&sb, &exe, &["ui", "start", "--port", &port_arg])?["state"].clone()
+            run_child(&sb, &exe, &["ui", "start", "--port", &port_arg], grant)?["state"].clone()
         }
         _ => json!("not_running"),
     };
@@ -1247,13 +1284,13 @@ fn down(sb: &Sandbox) -> Result<Value> {
     let running = daemon_running(&state);
     let agents_stopped = if running { stop_agents(&state) } else { 0 };
     let ui = if crate::ui::detached_pid(&state).is_some() {
-        run_child(sb, &exe, &["ui", "stop"])?;
+        run_child(sb, &exe, &["ui", "stop"], env_grant())?;
         "stopped"
     } else {
         "not_running"
     };
     let daemon = if running {
-        run_child(sb, &exe, &["daemon", "stop"])?;
+        run_child(sb, &exe, &["daemon", "stop"], env_grant())?;
         "stopped"
     } else {
         "not_running"
@@ -1301,7 +1338,7 @@ fn reset(sb: &Sandbox) -> Result<Value> {
             )));
         }
         let exe = std::env::current_exe()?;
-        run_child(sb, &exe, &["ui", "tailscale", "stop"])?;
+        run_child(sb, &exe, &["ui", "tailscale", "stop"], env_grant())?;
     }
     let stopped = down(sb)?;
     removable(sb)?;
