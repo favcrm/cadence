@@ -544,21 +544,41 @@ export default function App() {
   );
   // CAD-561: the draining banner. Cheap (the daemon's own view), polled
   // board-wide so an update is visible on every page, not only Settings.
+  // Reads never overlap: the next one is scheduled after the last settles.
+  // A hidden tab reads nothing; a visible tab reads at once on return.
   useEffect(() => {
     let stop = false;
+    let inFlight = false;
+    let timer: number | null = null;
+    const clear = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
+    };
     const tick = () => {
+      clear();
+      if (stop || inFlight || document.hidden) return;
+      inFlight = true;
       api
         .updateBanner()
         .then((next) => {
           if (!stop) setUpdateBanner(next);
         })
-        .catch(() => undefined);
+        .catch(() => undefined)
+        .finally(() => {
+          inFlight = false;
+          if (!stop && !document.hidden) timer = window.setTimeout(tick, 15000);
+        });
+    };
+    const onVisibility = () => {
+      if (document.hidden) clear();
+      else tick();
     };
     tick();
-    const timer = window.setInterval(tick, 15000);
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       stop = true;
-      window.clearInterval(timer);
+      clear();
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, []);
 
