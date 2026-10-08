@@ -448,10 +448,11 @@ fn check_expected_digest(expected: &str, actual: &str) -> Result<()> {
 /// writes nothing: no catalog, journal or lock file is created.
 pub(crate) fn install_check(pm: &Pm, source: &str) -> Result<Value> {
     let (files, validated, provenance) = resolved_bundle(pm, source)?;
-    let _lock = pm.lock()?;
-    let root = Root::open(&pm.dir)?;
-    let (catalog, _) = current(&root)?;
-    same_name_workspace(&catalog, &validated.manifest.app)?;
+    optimistic(pm, || {
+        let root = Root::open(&pm.dir)?;
+        let (catalog, _) = current(&root)?;
+        same_name_workspace(&catalog, &validated.manifest.app)
+    })?;
     Ok(json!({"schema":1,"name":validated.manifest.app,
         "version":validated.manifest.version,"source":provenance,
         "digest":bundle_digest(&files),
@@ -537,34 +538,39 @@ pub(crate) fn upgrade_check(
 ) -> Result<Value> {
     let id = InstallationId::parse(id)?;
     let (files, validated, provenance) = resolved_bundle(pm, source)?;
-    let _lock = pm.lock()?;
-    let root = Root::open(&pm.dir)?;
-    let (catalog, _) = current(&root)?;
-    let entry = catalog
-        .installations
-        .get(&id)
-        .ok_or_else(|| Error::rejected("unknown installation ID"))?;
-    if entry.storage != Storage::Workspace
-        || entry.project.is_some()
-        || entry.app != validated.manifest.app
-    {
-        return Err(Error::rejected(
-            "upgrade proposal changes workspace app identity",
-        ));
-    }
-    if hash(&yaml(&catalog)?) != expected_generation {
-        return Err(Error::rejected("workspace catalog generation is stale"));
-    }
-    let (old_bundle, _) = entry.paths(&id);
-    let old_files = snapshot(&root, &old_bundle, false)?;
-    if bundle_digest(&old_files) != expected_digest {
-        return Err(Error::rejected("workspace installation digest is stale"));
-    }
+    let (entry_name, old_files) = optimistic(pm, || {
+        let root = Root::open(&pm.dir)?;
+        let (catalog, _) = current(&root)?;
+        let entry = catalog
+            .installations
+            .get(&id)
+            .ok_or_else(|| Error::rejected("unknown installation ID"))?;
+        if entry.storage != Storage::Workspace
+            || entry.project.is_some()
+            || entry.app != validated.manifest.app
+        {
+            return Err(Error::rejected(
+                "upgrade proposal changes workspace app identity",
+            ));
+        }
+        if hash(&yaml(&catalog)?) != expected_generation {
+            return Err(Error::rejected("workspace catalog generation is stale"));
+        }
+        let (old_bundle, _) = entry.paths(&id);
+        let old_files = snapshot(&root, &old_bundle, false)?;
+        if bundle_digest(&old_files) != expected_digest {
+            return Err(Error::rejected("workspace installation digest is stale"));
+        }
+        // Published state must still be what was read.
+        catalog.require_current(&root)?;
+        let name = entry.app.clone();
+        Ok((name, old_files))
+    })?;
     let new_digest = bundle_digest(&files);
     if new_digest == expected_digest {
         return Err(Error::rejected("upgrade bundle is unchanged"));
     }
-    Ok(json!({"schema":1,"install_id":&*id,"name":entry.app,
+    Ok(json!({"schema":1,"install_id":&*id,"name":entry_name,
         "version":validated.manifest.version,"source":provenance,
         "expected_digest":expected_digest,"expected_generation":expected_generation,
         "digest":new_digest,"structural_diff":structural_diff(&old_files,&files),
@@ -1139,24 +1145,101 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
         json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"source":record.source,"installed_at":record.installed_at,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
     )
 }
+/// CAD-1189: catalog reads take no lock. Every writer journals first
+/// (`*-pending.yaml`) and publishes `catalog.yaml` atomically, so a read
+/// that races one fails a freshness check; it is retried a few times and
+/// then answers `busy` (retryable), never a mix of old and new state.
+const READ_ATTEMPTS: u32 = 3;
+
+fn is_pending(error: &Error) -> bool {
+    matches!(error, Error::Rejected(m) if m.contains(" is pending"))
+}
+
+fn changed_underneath(error: &Error) -> bool {
+    match error {
+        Error::Rejected(m) => {
+            m.contains("no longer published")
+                || m.contains("changed during inspection")
+                || m.contains("changed during runtime admission")
+        }
+        _ => false,
+    }
+}
+
+fn optimistic<T>(pm: &Pm, mut read: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempt = 1;
+    loop {
+        match read() {
+            // A pending journal is transient only while a live writer holds
+            // the PM write flock. With no holder it is a crashed leftover:
+            // one more read (the writer may just have finished), then the
+            // original recovery refusal, never `busy`.
+            Err(error) if is_pending(&error) && !pm.write_lock_held() => return read(),
+            Err(error) if is_pending(&error) || changed_underneath(&error) => {
+                if attempt >= READ_ATTEMPTS {
+                    return Err(Error::busy(format!(
+                        "app catalog kept changing while it was read; retry ({error})"
+                    )));
+                }
+                let jitter = (uuid::Uuid::new_v4().as_u128() % 20) as u64;
+                std::thread::sleep(std::time::Duration::from_millis(
+                    20 * attempt as u64 + jitter,
+                ));
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Legacy entries (`<project>/apps/<name>`) are rewritten in place by
+/// `app::update` under the PM lock, with no journal and an unchanged
+/// catalog, so no freshness check can see a torn read. A read that touches
+/// one takes the PM lock exactly as before. The peek is lock-free; if it
+/// cannot read a clean catalog it also takes the lock (the old behaviour).
+fn lock_for_legacy(pm: &Pm, only: Option<&InstallationId>) -> bool {
+    match Catalog::load(&pm.dir) {
+        Ok(catalog) => catalog
+            .installations
+            .iter()
+            .any(|(id, e)| e.storage != Storage::Workspace && only.is_none_or(|o| o == id)),
+        Err(_) => true,
+    }
+}
+
+fn read_catalog<T>(
+    pm: &Pm,
+    only: Option<&InstallationId>,
+    read: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    if lock_for_legacy(pm, only) {
+        let _lock = pm.lock()?;
+        let mut read = read;
+        return read();
+    }
+    optimistic(pm, read)
+}
+
 pub fn list(pm: &Pm) -> Result<Value> {
-    let _lock = pm.lock()?;
-    let catalog = Catalog::load(&pm.dir)?;
-    let root = Root::open(&pm.dir)?;
-    let rows = catalog
-        .installations
-        .keys()
-        .map(|id| describe(&root, &catalog, id))
-        .collect::<Result<Vec<_>>>()?;
-    catalog.require_current(&root)?;
-    Ok(json!(rows))
+    read_catalog(pm, None, || {
+        let catalog = Catalog::load(&pm.dir)?;
+        let root = Root::open(&pm.dir)?;
+        let rows = catalog
+            .installations
+            .keys()
+            .map(|id| describe(&root, &catalog, id))
+            .collect::<Result<Vec<_>>>()?;
+        catalog.require_current(&root)?;
+        Ok(json!(rows))
+    })
 }
 pub fn show(pm: &Pm, id: &str) -> Result<Value> {
-    let _lock = pm.lock()?;
-    let catalog = Catalog::load(&pm.dir)?;
     let id = InstallationId::parse(id)?;
-    let root = Root::open(&pm.dir)?;
-    describe(&root, &catalog, &id)
+    read_catalog(pm, Some(&id), || {
+        let catalog = Catalog::load(&pm.dir)?;
+        let root = Root::open(&pm.dir)?;
+        describe(&root, &catalog, &id)
+    })
 }
 
 /// Delivery happens before pending is removed, under the same PM lock.
@@ -1252,6 +1335,35 @@ pub(crate) fn with_runtime_snapshot<T>(
     callback(&description, &files)
 }
 
+/// CAD-1189: lock-free runtime read for callbacks that write nothing. It
+/// makes the same checks as `with_runtime_snapshot` (pending journal,
+/// catalog generation, record re-read, bundle-digest compare) under the
+/// optimistic retry, but takes no PM lock. A callback that creates or
+/// changes state must use `with_runtime_snapshot`, which the PM lock orders
+/// against install, upgrade, remove and revoke.
+pub(crate) fn with_runtime_read<T>(
+    pm: &Pm,
+    id: &str,
+    callback: impl FnOnce(&Value, &BTreeMap<String, String>) -> Result<T>,
+) -> Result<T> {
+    let id = InstallationId::parse(id)?;
+    let (description, files) = read_catalog(pm, Some(&id), || {
+        let root = Root::open(&pm.dir)?;
+        let catalog = Catalog::load(&pm.dir)?;
+        no_pending(&root)?;
+        let description = describe(&root, &catalog, &id)?;
+        let (bundle, _) = catalog.installations[&id].paths(&id);
+        let files = snapshot(&root, &bundle, false)?;
+        if bundle_digest(&files) != description["digest"].as_str().unwrap_or("") {
+            return Err(Error::rejected(
+                "installation changed during runtime admission",
+            ));
+        }
+        Ok((description, files))
+    })?;
+    callback(&description, &files)
+}
+
 /// Read an immutable installed revision for completed work. The current
 /// catalog still proves the installation identity; only exact retained bundle
 /// bytes may supply the old app contract. Active runs always use the current
@@ -1312,6 +1424,9 @@ pub(crate) fn with_completed_bundle_snapshot<T>(
     }
     callback(&json!({"digest":digest}), &files)
 }
+
+#[cfg(test)]
+mod cad1189_acceptance;
 
 #[cfg(test)]
 mod tests {
@@ -1412,5 +1527,36 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
             assert!(show(&pm, forged).is_err(), "admitted {forged}");
         }
         assert!(show(&pm, "0123456789abcdef0123456789abcdef").is_err());
+    }
+
+    /// CAD-1189: reads and runtime admission answer while another handle
+    /// holds the PM write lock. Before, each waited out the 15 s lock
+    /// deadline and failed `resource_busy`.
+    #[test]
+    fn reads_and_admission_do_not_wait_for_the_pm_lock() {
+        let (pm_dir, _state, _sources, id) = installed();
+        let pm = Pm::at(pm_dir.path()).unwrap();
+        let _held = pm.lock().unwrap();
+        let other = Pm::at(pm_dir.path()).unwrap();
+        assert!(other.try_lock().unwrap().is_none(), "lock is really held");
+        let started = std::time::Instant::now();
+        assert_eq!(list(&other).unwrap().as_array().unwrap().len(), 1);
+        let shown = show(&other, &id).unwrap();
+        let digest = shown["digest"].as_str().unwrap().to_string();
+        let seen = with_runtime_read(&other, &id, |row, _| Ok(row["digest"].clone())).unwrap();
+        assert_eq!(seen, json!(digest));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A crashed leftover journal (no live writer) keeps the recovery
+    /// refusal; it is never reported as retryable `busy`.
+    #[test]
+    fn leftover_pending_journal_is_not_busy() {
+        let (pm_dir, _state, _sources, id) = installed();
+        let pm = Pm::at(pm_dir.path()).unwrap();
+        std::fs::write(pm_dir.path().join(UPGRADE_PENDING), "x: 1\n").unwrap();
+        for err in [list(&pm).unwrap_err(), show(&pm, &id).unwrap_err()] {
+            assert_eq!(err.kind(), "rejected", "{err:?}");
+        }
     }
 }

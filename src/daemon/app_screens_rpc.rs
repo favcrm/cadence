@@ -383,7 +383,7 @@ impl Shared {
     ) -> Result<(String, app_screen_pkg::ScreenPackage)> {
         use crate::issue::app_catalog::workspace;
         let store = &self.store;
-        workspace::with_runtime_snapshot(pm, install_id, |row, files| {
+        workspace::with_runtime_read(pm, install_id, |row, files| {
             let live_digest = row["digest"]
                 .as_str()
                 .ok_or_else(|| Error::rejected("installation digest unavailable"))?

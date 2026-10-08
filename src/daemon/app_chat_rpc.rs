@@ -7,7 +7,7 @@
 //! file is touched. The install id is the only input. The descriptor is
 //! read from the installed bundle at the digest the install consented to through the same
 //! descriptor-confined resolver the screen mount uses
-//! (`workspace::with_runtime_snapshot`: no symlinks, no request path), and
+//! (`workspace::with_runtime_read`: no symlinks, no request path), and
 //! only when `app_capability_status` says that digest is consented (CAD-1119:
 //! an operator install or update records it) and not withdrawn. Everything else — no such install, no descriptor,
 //! withdrawn consent, a stale digest, a bundle that moved during the read —
@@ -36,7 +36,7 @@ impl Shared {
         let pm = self.pm_at(&pm_dir)?;
         let store = &self.store;
         use crate::issue::app_catalog::workspace;
-        let read = workspace::with_runtime_snapshot(&pm, install_id, |row, files| {
+        let read = workspace::with_runtime_read(&pm, install_id, |row, files| {
             let digest = row["digest"]
                 .as_str()
                 .ok_or_else(|| Error::rejected("installation digest unavailable"))?
