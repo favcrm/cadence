@@ -553,18 +553,18 @@ fn poll_deadline(fd: RawFd, events: libc::c_short, deadline: Instant) -> Result<
 /// block far past a read bound on a full listen backlog — this waits
 /// on POLLOUT and reads the verdict from SO_ERROR.
 fn connect_bounded(socket: &Path, deadline: Instant) -> Result<UnixStream> {
+    // Plain SOCK_STREAM: SOCK_NONBLOCK/SOCK_CLOEXEC are not portable
+    // (absent from Darwin's socket(2) API in libc); the descriptor's
+    // O_NONBLOCK + FD_CLOEXEC go on right after, portably.
     // SAFETY: fixed, valid socket(2) arguments.
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    match connect_on(fd, socket, deadline) {
+    match arm_socket(fd)
+        .and_then(|()| no_sigpipe(fd))
+        .and_then(|()| connect_on(fd, socket, deadline))
+    {
         Ok(()) => {
             // SAFETY: `fd` is a live connected descriptor we own.
             Ok(unsafe { UnixStream::from_raw_fd(fd) })
@@ -577,9 +577,72 @@ fn connect_bounded(socket: &Path, deadline: Instant) -> Result<UnixStream> {
     }
 }
 
-/// The connect itself: start it, wait for writability inside
-/// `deadline`, then read SO_ERROR for the kernel's verdict.
-fn connect_on(fd: RawFd, socket: &Path, deadline: Instant) -> Result<()> {
+/// Set O_NONBLOCK + FD_CLOEXEC on `fd` the portable way — fcntl
+/// exists on every unix target; SOCK_NONBLOCK/SOCK_CLOEXEC socket(2)
+/// flags do not (Darwin lacks them).
+fn arm_socket(fd: RawFd) -> Result<()> {
+    // SAFETY: fcntl(2) on a live descriptor with valid flag args.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let fdflags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if fdflags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, fdflags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Apple targets have no MSG_NOSIGNAL send flag; keep socket writes
+/// from ever raising SIGPIPE the way std's own `UnixStream` does:
+/// SO_NOSIGPIPE on the descriptor. No process signal state is
+/// touched. On every other unix target MSG_NOSIGNAL on the send
+/// already covers it and this is a no-op.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
+fn no_sigpipe(fd: RawFd) -> Result<()> {
+    let one: libc::c_int = 1;
+    // SAFETY: `fd` is a live socket; `one` is the proper in-parameter
+    // for SO_NOSIGPIPE.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&one as *const libc::c_int).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// MSG_NOSIGNAL exists on every other unix libc target this code
+/// reaches — no per-socket opt needed there.
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+)))]
+fn no_sigpipe(_fd: RawFd) -> Result<()> {
+    Ok(())
+}
+
+/// Fill a sockaddr_un for `socket`. Returns the connect(2) `len`:
+/// POSIX wants the bytes through the NUL after the path (or the
+/// whole fixed buffer when it fills completely). BSD-family targets
+/// (macOS and the BSDs in CI) additionally take `sun_len` = the same
+/// length; linux-like ABIs have no such field.
+fn unix_addr(socket: &Path) -> Result<(libc::sockaddr_un, libc::socklen_t)> {
     let path = socket.as_os_str().as_bytes();
     // SAFETY: an all-zero sockaddr_un is a valid starting value.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -596,6 +659,46 @@ fn connect_on(fd: RawFd, socket: &Path, deadline: Instant) -> Result<()> {
     }
     let len =
         (std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1) as libc::socklen_t;
+    set_sun_len(&mut addr, len);
+    Ok((addr, len))
+}
+
+/// BSD sockaddr_un carries `sun_len` = the length argument connect(2)
+/// receives; the kernel tolerates 0 but the ABI field must be set for
+/// strict BSD peers (Darwin's sockaddr_un layout is sun_len first).
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn set_sun_len(addr: &mut libc::sockaddr_un, len: libc::socklen_t) {
+    addr.sun_len = len as u8;
+}
+
+/// Linux (and every non-BSD unix here) has no `sun_len` field.
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+fn set_sun_len(_addr: &mut libc::sockaddr_un, _len: libc::socklen_t) {}
+
+/// The connect itself: start it, wait for writability inside
+/// `deadline`, then read SO_ERROR for the kernel's verdict.
+fn connect_on(fd: RawFd, socket: &Path, deadline: Instant) -> Result<()> {
+    let (addr, len) = unix_addr(socket)?;
     // SAFETY: `addr` is a sockaddr_un valid for `len` bytes; `fd` is a
     // live nonblocking unix stream socket.
     let rc = unsafe {
@@ -646,15 +749,45 @@ fn connect_on(fd: RawFd, socket: &Path, deadline: Instant) -> Result<()> {
 /// buffers never drain fails the call at the deadline instead of
 /// holding it, the way the general path's unbounded blocking write
 /// can. Retries on EAGAIN and EINTR — with the deadline re-checked
-/// each round — never grant the peer more time.
+/// each round — never grant the peer more time. send(2), not write(2):
+/// MSG_NOSIGNAL keeps a racing peer-close from raising SIGPIPE,
+/// matching what std's UnixStream does on every unix target that has
+/// the flag; the BSD targets without it get SO_NOSIGPIPE at socket
+/// setup instead ([`no_sigpipe`]).
 fn write_bounded(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> Result<()> {
+    // MSG_NOSIGNAL where send(2) supports it (every unix target here
+    // except Apple); 0 on Apple where SO_NOSIGPIPE on the socket
+    // already did the work.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    const SEND_FLAGS: libc::c_int = 0;
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    )))]
+    const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
     while !bytes.is_empty() {
         if !poll_deadline(fd, libc::POLLOUT, deadline)? {
             return Err(Error::busy("metadata read deadline reached while writing"));
         }
         // SAFETY: `fd` is a live nonblocking socket; `bytes` is a
-        // valid slice advanced only by the count write(2) reports.
-        let n = unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) };
+        // valid slice advanced only by the count send(2) reports.
+        let n = unsafe {
+            libc::send(
+                fd,
+                bytes.as_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+                SEND_FLAGS,
+            )
+        };
         if n > 0 {
             bytes = &bytes[n as usize..];
             continue;
