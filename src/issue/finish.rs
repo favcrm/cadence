@@ -1224,25 +1224,22 @@ fn status_cap_prm(status: &str) -> Option<u64> {
 }
 
 /// CAD-1196: does the kernel's own access rule for `/proc/<pid>/{cwd,fd}`
-/// (ptrace read access) explain a PermissionDenied for this caller? True
-/// when the target has a uid or gid other than the caller's effective ones,
-/// holds permitted capabilities the caller lacks, or is non-dumpable (its
-/// `cwd` entry is then owned by root, not by its uid). A PermissionDenied
-/// none of these explains is an unexplained gap and still refuses.
+/// (ptrace read access) explain a PermissionDenied for this caller? The
+/// kernel itself marks the cases: it gives the process's `cwd` entry to the
+/// process's uid/gid only while the process is dumpable and (for a foreign
+/// uid) otherwise to root, so an entry owned by neither the caller's
+/// effective uid nor gid is a foreign or non-dumpable process. The other
+/// case is a target whose permitted capabilities exceed the caller's.
+/// Status credentials are never trusted for this: a PermissionDenied that
+/// neither the entry's ownership nor the capabilities explain is an
+/// unexplained gap and still refuses.
 #[cfg(target_os = "linux")]
-fn policy_denies_read(status: &str, caller: Caller, cwd_entry_owner: Option<u32>) -> bool {
-    let foreign_id = |key: &str, own: u32| match proc_id_values(status, key, 4) {
-        Some(ids) => ids.iter().any(|id| *id != own),
-        None => false,
-    };
+fn policy_denies_read(status: &str, caller: Caller, cwd_entry_owner: Option<(u32, u32)>) -> bool {
     let extra_caps = match (status_cap_prm(status), caller.cap_prm) {
         (Some(target), Some(own)) => target & !own != 0,
         _ => false,
     };
-    foreign_id("Uid:", caller.euid)
-        || foreign_id("Gid:", caller.egid)
-        || extra_caps
-        || cwd_entry_owner.is_some_and(|owner| owner != caller.euid)
+    extra_caps || cwd_entry_owner.is_some_and(|(uid, gid)| uid != caller.euid || gid != caller.egid)
 }
 
 #[cfg(target_os = "linux")]
@@ -1701,7 +1698,7 @@ fn inspect_pid(view: &ProcView, dir: &Path, pid: u32, use_: &mut ProcessUse, cal
     // PermissionDenied nothing explains, still leaves the scan incomplete.
     let cwd_entry_owner = std::fs::symlink_metadata(proc_dir.join("cwd"))
         .ok()
-        .map(|metadata| metadata.uid());
+        .map(|metadata| (metadata.uid(), metadata.gid()));
     let unreadable_by_policy = |error: &io::Error| {
         error.kind() == io::ErrorKind::PermissionDenied
             && policy_denies_read(&status, caller, cwd_entry_owner)
@@ -3743,9 +3740,9 @@ mod tests {
         assert!(!status_has_single_nspid("NSpid:\t1\nNSpid:\t1\n"));
     }
 
-    /// CAD-1196: PermissionDenied is explained only by a uid/gid mismatch,
-    /// extra permitted capabilities, or a non-dumpable (root-owned) cwd
-    /// entry; an own, dumpable, equally-capable process is not excused.
+    /// CAD-1196: PermissionDenied is explained only by a cwd entry the
+    /// kernel gave to another uid/gid (foreign or non-dumpable process) or
+    /// by extra permitted capabilities; status credentials never excuse.
     #[cfg(target_os = "linux")]
     #[test]
     fn policy_explains_only_what_the_kernel_rule_denies() {
@@ -3754,44 +3751,36 @@ mod tests {
             egid: 1000,
             cap_prm: Some(0),
         };
-        let status =
-            |uid: &str, gid: &str, cap: &str| format!("Uid:\t{uid}\nGid:\t{gid}\nCapPrm:\t{cap}\n");
-        let own = status(
-            "1000\t1000\t1000\t1000",
-            "1000\t1000\t1000\t1000",
-            "0000000000000000",
-        );
-        assert!(!policy_denies_read(&own, caller, Some(1000)));
-        assert!(!policy_denies_read(&own, caller, None));
-        // Non-dumpable: cwd entry owned by root.
-        assert!(policy_denies_read(&own, caller, Some(0)));
-        // Root-owned process.
-        let root = status("0\t0\t0\t0", "0\t0\t0\t0", "0000000000000000");
-        assert!(policy_denies_read(&root, caller, Some(1000)));
-        // One saved uid or one gid differing.
-        let suid = status("1000\t1000\t0\t1000", "1000\t1000\t1000\t1000", "0");
-        assert!(policy_denies_read(&suid, caller, Some(1000)));
-        let gid = status("1000\t1000\t1000\t1000", "1000\t1000\t4\t1000", "0");
-        assert!(policy_denies_read(&gid, caller, Some(1000)));
+        let caps = |cap: &str| format!("CapPrm:\t{cap}\n");
+        let none = caps("0000000000000000");
+        assert!(!policy_denies_read(&none, caller, Some((1000, 1000))));
+        assert!(!policy_denies_read(&none, caller, None));
+        // Entry owned by root (non-dumpable) or by another uid or gid.
+        assert!(policy_denies_read(&none, caller, Some((0, 0))));
+        assert!(policy_denies_read(&none, caller, Some((1001, 1000))));
+        assert!(policy_denies_read(&none, caller, Some((1000, 4))));
+        // A status claiming a foreign uid does not excuse an own-owned entry.
+        let status = "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nCapPrm:\t0\n";
+        assert!(!policy_denies_read(status, caller, Some((1000, 1000))));
         // Extra permitted capability; a subset is not an explanation.
-        let caps = status(
-            "1000\t1000\t1000\t1000",
-            "1000\t1000\t1000\t1000",
-            "0000000800000000",
-        );
-        assert!(policy_denies_read(&caps, caller, Some(1000)));
+        let extra = caps("0000000800000000");
+        assert!(policy_denies_read(&extra, caller, Some((1000, 1000))));
         let held = Caller {
             cap_prm: Some(0x8_0000_0000),
             ..caller
         };
-        assert!(!policy_denies_read(&caps, held, Some(1000)));
-        // Unknown caller caps or malformed ids never excuse.
+        assert!(!policy_denies_read(&extra, held, Some((1000, 1000))));
+        // Unknown caller caps or a malformed target line never excuse.
         let blind = Caller {
             cap_prm: None,
             ..caller
         };
-        assert!(!policy_denies_read(&caps, blind, Some(1000)));
-        assert!(!policy_denies_read("Name:\tx\n", caller, Some(1000)));
+        assert!(!policy_denies_read(&extra, blind, Some((1000, 1000))));
+        assert!(!policy_denies_read(
+            "CapPrm:\tzz\n",
+            caller,
+            Some((1000, 1000))
+        ));
     }
 
     fn repo() -> TempDir {
