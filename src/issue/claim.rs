@@ -301,6 +301,7 @@ fn requester(by: Option<&str>, actor: &str) -> Result<String> {
 /// `backlog|ready` → `doing`, and a comment; `owner` (the lane) is left
 /// alone except on a take-over, which makes the claimant owner. Refused on done/dropped issues and, in
 /// doing/review, when someone else holds it — unless `--take-over`.
+#[track_caller]
 pub fn claim(
     pm: &Pm,
     id: &str,
@@ -405,6 +406,7 @@ pub fn claim(
 /// `issue release <ID> [--by] [--note]` — the holder gives the issue
 /// up: the claim is cleared, and `owner` too when it is the releaser.
 /// Status is left alone. Anyone else is refused, naming the holder.
+#[track_caller]
 pub fn release(
     pm: &Pm,
     id: &str,

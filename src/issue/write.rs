@@ -394,6 +394,7 @@ pub(crate) fn save_front(dir: &Path, front: &Front, body: &str) -> Result<()> {
 /// Validation happens before the PM lock and the body is saved atomically
 /// under that lock, so malformed input and duplicate sections leave the
 /// tracker unchanged.
+#[track_caller]
 pub fn set_acceptance(pm: &Pm, id: &str, source: &Path, actor: &str) -> Result<Value> {
     let input = std::fs::read_to_string(source).map_err(|e| {
         Error::rejected(format!(
@@ -583,6 +584,7 @@ pub fn master_issue_new_limits(
 /// body (CAD-614: the master writes it under `master/tmp` and passes
 /// `--file`).
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn new_issue(
     pm: &Pm,
     cwd: &Path,
@@ -1336,6 +1338,7 @@ pub fn set_fields(
 /// instead of landing. A mismatch answers `Ok` with a `conflict`
 /// payload (the route maps it, like `patch_issue`'s); only callers
 /// passing `if_rev` ever see one.
+#[track_caller]
 pub fn set_fields_if_rev(
     pm: &Pm,
     ids: &[String],
@@ -1451,6 +1454,7 @@ pub fn mark_done_on_merge(
 /// `mark_done_on_merge` for a CLI caller (CAD-1150): a busy tracker lock
 /// is retried with a short backoff for up to `wait` before it is
 /// reported. The daemon passes no wait and keeps the never-wait rule.
+#[track_caller]
 pub fn mark_done_on_merge_waiting(
     pm: &Pm,
     id: &str,
@@ -1562,6 +1566,7 @@ fn check_milestone(pm: &Pm, project: &project::Project, milestone: Option<&str>)
 /// moves. The gate keys apply only as `approvals` allow
 /// ([`crate::issue::work::effective`]); a malformed `PROJECT.md`
 /// refuses: a gate never guesses.
+#[track_caller]
 pub fn move_stage(
     pm: &Pm,
     epic: &str,
@@ -1651,6 +1656,7 @@ pub fn move_stage(
 /// several, same all-or-nothing batch as `set`. Adding a tag an issue
 /// already has, or removing one it lacks, leaves that issue unchanged;
 /// a batch that changes nothing is refused.
+#[track_caller]
 pub fn tag_edit(pm: &Pm, ids: &[String], add: bool, tags: &[String], actor: &str) -> Result<Value> {
     let verb = if add { "add" } else { "rm" };
     if ids.is_empty() || tags.is_empty() {
@@ -1714,6 +1720,7 @@ pub struct IssuePatch {
     pub tags: Option<Vec<String>>,
 }
 
+#[track_caller]
 pub fn patch_issue(
     pm: &Pm,
     id: &str,
@@ -1900,6 +1907,7 @@ pub(crate) fn apply_link(
 /// `issue link` / `issue unlink`. `blocked_by`/`relates` are list
 /// fields; `parent`/`duplicate_of` are scalars.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn link(
     pm: &Pm,
     id: &str,
@@ -1987,6 +1995,7 @@ pub(crate) fn new_ref(
 /// `worktree` scopes a `message` ref to the pair it was dispatched
 /// against; other kinds leave it `None`.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn add_ref(
     pm: &Pm,
     id: &str,
@@ -2038,6 +2047,7 @@ pub fn add_ref(
 /// closing it keeps the attempt's history without letting it read as
 /// a live binding (or a "dispatch recorded during finish" stale
 /// reason) to a concurrent finish.
+#[track_caller]
 pub fn close_ref(pm: &Pm, id: &str, kind: &str, target: &str, actor: &str) -> Result<()> {
     let (_project, dir) = issue_dir(pm, id)?;
     let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
@@ -2091,6 +2101,7 @@ pub(crate) fn comment_author(author: Option<&str>) -> Result<String> {
 
 /// `issue comment <ID> -m|--file` — one create-only file under
 /// `comments/`, named by UTC time + author.
+#[track_caller]
 pub fn add_comment(
     pm: &Pm,
     id: &str,
@@ -2223,6 +2234,7 @@ pub(crate) fn commit_front_with_comment(
 /// file under `reports/`, named by UTC time + agent. Byte-identical
 /// content already on the ticket is not written twice: the existing
 /// file is returned with `duplicate: true` and nothing is committed.
+#[track_caller]
 pub fn add_report(
     pm: &Pm,
     id: &str,
@@ -2313,6 +2325,7 @@ pub fn attach(pm: &Pm, id: &str, file: &Path) -> Result<Value> {
 /// Names follow the read grammar so every stored file is fetchable.
 /// With `autorename` a collision becomes `<stem>-N<ext>` (CLI parity);
 /// without it an existing name is a conflict the route maps to 409.
+#[track_caller]
 pub fn attach_bytes(
     pm: &Pm,
     id: &str,
