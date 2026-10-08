@@ -970,6 +970,10 @@ mod cad1298_readiness_acceptance;
 mod cad1314_acceptance;
 
 #[cfg(test)]
+#[path = "cad1270_screen_decl_acceptance.rs"]
+mod cad1270_screen_decl_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

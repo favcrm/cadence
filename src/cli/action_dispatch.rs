@@ -165,6 +165,15 @@ pub(crate) fn run() -> Result<i32> {
     {
         return app::run_dev(name, source, *port, host, allow_host);
     }
+    // CAD-1270: `app check` is the offline byte validator — it resolves
+    // no org or state dir, adopts no sandbox profile and never reaches
+    // the daemon or a tracker write. Local bytes (or a built-in) only.
+    if let Commands::App {
+        action: app::AppAction::Check { source, json },
+    } = &cli.command
+    {
+        return app::run_check(source, *json);
+    }
     let resolved = org::resolve(
         cli.org.as_deref(),
         cli.state_dir.clone(),

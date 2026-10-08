@@ -488,6 +488,198 @@ pub(crate) fn install_check(pm: &Pm, source: &str) -> Result<Value> {
         "secret_warnings":crate::secret::warnings_json(&validated.secret_warnings)}))
 }
 
+/// CAD-1270: stable refusal codes `cadence app check` reports. The code
+/// names the stage that refused — transport, source, inventory or
+/// content — and is what a caller matches on; the validator's message
+/// stays the detail. A refusal report is byte-stable for the same
+/// bytes: the code never depends on order, paths or wording.
+const CHECK_TRANSPORT: &str = "app_check_transport";
+const CHECK_SOURCE: &str = "app_check_source";
+const CHECK_INVENTORY: &str = "app_check_inventory";
+const CHECK_CONTENT: &str = "app_check_content";
+
+fn check_refusal(mut report: Value, code: &str, error: &Error) -> Value {
+    report["ok"] = json!(false);
+    report["refusal"] = json!({
+        "code": code,
+        "kind": error.kind(),
+        "message": error.to_string(),
+    });
+    report
+}
+
+/// The host block of the check report — this build's own core version
+/// and contract registry, so a refusal can be read against the host it
+/// ran on. `compat::host` is the same descriptor `requires` checks
+/// against; there is no invented compatibility matrix.
+fn check_host_block() -> Result<Value> {
+    let host = app::compat_host()?;
+    Ok(json!({
+        "core": host.core.to_string(),
+        "contracts": host
+            .supported
+            .iter()
+            .map(|(name, majors, _)| (*name, *majors))
+            .collect::<BTreeMap<_, _>>(),
+    }))
+}
+
+/// CAD-1270 `cadence app check <dir|builtin:<id>>`: the bundle's offline
+/// byte-validation report — the identical `snapshot` + `validate_texts`
+/// pipeline `install_check` runs (entry grammar, per-file and aggregate
+/// caps, manifest, descriptors, workflow checks, `requires` against this
+/// build's contracts, the secret guard) and the same `bundle_digest`,
+/// computed with no daemon, no store, no PM read or write and no
+/// transport.
+///
+/// Sources: a local directory (relative paths are canonicalized) or
+/// `builtin:<catalog id>` — the host's embedded bundles, checked as the
+/// same bytes the daemon would embed. A git/URL source is refused: it is
+/// a transport, not bytes in hand, and the daemon vets remote sources.
+///
+/// Stateful admission is deliberately not reproduced — the report's
+/// `stateful_admission` field says so. `install_check`'s catalog read
+/// (same-name workspace install, pending journals, unmigrated legacy
+/// installs), the tracker-self-source guard and the PM agent registry
+/// all consult state the offline check does not have; the registry is
+/// therefore empty and a concrete `agent:` name is the same unverifiable
+/// note `install_check` reports on a host with no registry, never an
+/// offline refusal. A bundle relying on that registry still meets it at
+/// install-check time — offline validation weakens nothing there.
+pub fn check_offline(source: &str) -> Result<Value> {
+    let mut report = json!({
+        "schema": 1,
+        "check": "app-package/1",
+        "input": source,
+        "agent_registry": "none",
+        "stateful_admission": "not reproduced offline — `app catalog install-check` also enforces \
+            catalog state (a same-name install, pending journals, an unmigrated legacy install), \
+            the tracker-self-source guard and the PM agent registry; a pass here installs nothing \
+            and consents to nothing",
+        "host": check_host_block()?,
+    });
+    // A remote source is a transport step — the offline check never
+    // fetches, clones or opens the network.
+    if source.contains("://") || source.starts_with("git@") {
+        return Ok(check_refusal(
+            report,
+            CHECK_TRANSPORT,
+            &Error::rejected(
+                "a git or URL source needs the daemon's checked transport — \
+                 `app check` accepts a local directory or `builtin:<catalog id>`",
+            ),
+        ));
+    }
+
+    // ---- source → a canonical directory, or an embedded builtin bundle.
+    enum Resolved {
+        Builtin(BTreeMap<String, String>),
+        Dir(PathBuf),
+    }
+    let resolved = (|| -> Result<(Resolved, app::Source)> {
+        if let Some(id) = source.strip_prefix(BUILTIN_SOURCE_PREFIX) {
+            let entry = super::builtin::get(id)?
+                .ok_or_else(|| Error::rejected(format!("unknown built-in catalog id '{id}'")))?;
+            let provenance = app::Source::Builtin {
+                id: entry.id.to_string(),
+                digest: bundle_digest(&entry.files),
+            };
+            return Ok((Resolved::Builtin(entry.files), provenance));
+        }
+        let path = Path::new(source);
+        if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+            return Err(Error::rejected(format!(
+                "app source {source} is a symlink — an app is a real folder"
+            )));
+        }
+        if !path.is_dir() {
+            return Err(Error::rejected(if path.exists() {
+                format!("app source {source} is a file — it names a folder")
+            } else {
+                format!(
+                    "app source {source} does not exist — `app check` reads a local \
+                     directory or `builtin:<catalog id>`"
+                )
+            }));
+        }
+        let dir = path
+            .canonicalize()
+            .map_err(|e| Error::rejected(format!("cannot resolve app source {source}: {e}")))?;
+        Ok((
+            Resolved::Dir(dir.clone()),
+            app::Source::Path {
+                path: dir.display().to_string(),
+            },
+        ))
+    })();
+    let (resolved, provenance) = match resolved {
+        Err(error) => return Ok(check_refusal(report, CHECK_SOURCE, &error)),
+        Ok(pair) => pair,
+    };
+    report["provenance"] = json!(provenance);
+
+    // ---- inventory: the install snapshot — descriptor-relative,
+    // grammar-, cap- and UTF-8-checked member reads.
+    let files = match resolved {
+        Resolved::Builtin(files) => files,
+        Resolved::Dir(dir) => {
+            let files = Root::open(&dir).and_then(|root| snapshot(&root, Path::new(""), true));
+            match files {
+                Err(error) => return Ok(check_refusal(report, CHECK_INVENTORY, &error)),
+                Ok(files) => files,
+            }
+        }
+    };
+    // Loaded bytes → the per-file table and the digest install-check
+    // would return for them.
+    report["digest"] = json!(bundle_digest(&files));
+    report["files"] = json!(files
+        .iter()
+        .map(|(rel, text)| json!({
+            "path": rel,
+            "bytes": text.len() as u64,
+            "cap": app::file_cap(rel),
+        }))
+        .collect::<Vec<_>>());
+    report["aggregate"] = json!({
+        "bytes": files.values().map(|t| t.len() as u64).sum::<u64>(),
+        "cap": app::MAX_APP_BYTES,
+    });
+
+    // ---- content: the same `validate_texts` install-check runs, with
+    // the empty registry an offline check always has (see the doc). A
+    // concrete `agent:` name stays an unverifiable note here; install
+    // admission still resolves it against the PM registry.
+    match app::validate_texts(
+        files.iter().map(|(n, t)| (n.clone(), t.clone())).collect(),
+        &Default::default(),
+        &[],
+    ) {
+        Ok(validated) => {
+            report["ok"] = json!(true);
+            report["name"] = json!(validated.manifest.app);
+            report["title"] = json!(validated.manifest.title);
+            report["version"] = json!(validated.manifest.version);
+            report["summary"] = json!(validated.manifest.summary);
+            report["compatibility"] = validated.compatibility;
+            report["notes"] = json!(validated.notes);
+            report["secret_warnings"] = crate::secret::warnings_json(&validated.secret_warnings);
+            Ok(report)
+        }
+        Err(error) => {
+            // A manifest that still parses yields the compat receipt —
+            // the unmet requirement is readable even inside the refusal.
+            if let Some(manifest) = files
+                .get("app.md")
+                .and_then(|text| app::parse_manifest(text).ok())
+            {
+                report["compatibility"] = manifest.requires.report(&app::compat_host()?);
+            }
+            Ok(check_refusal(report, CHECK_CONTENT, &error))
+        }
+    }
+}
+
 pub(crate) fn install(
     pm: &Pm,
     state: &Path,
@@ -1922,6 +2114,8 @@ pub(crate) fn restore(pm: &Pm, install_id: &str) -> Result<Value> {
 mod cad1189_acceptance;
 #[cfg(test)]
 mod cad1254_acceptance;
+#[cfg(test)]
+mod cad1270_parity;
 
 #[cfg(test)]
 mod tests {
