@@ -1192,8 +1192,36 @@ fn optimistic<T>(pm: &Pm, mut read: impl FnMut() -> Result<T>) -> Result<T> {
     }
 }
 
+/// Legacy entries (`<project>/apps/<name>`) are rewritten in place by
+/// `app::update` under the PM lock, with no journal and an unchanged
+/// catalog, so no freshness check can see a torn read. A read that touches
+/// one takes the PM lock exactly as before. The peek is lock-free; if it
+/// cannot read a clean catalog it also takes the lock (the old behaviour).
+fn lock_for_legacy(pm: &Pm, only: Option<&InstallationId>) -> bool {
+    match Catalog::load(&pm.dir) {
+        Ok(catalog) => catalog
+            .installations
+            .iter()
+            .any(|(id, e)| e.storage != Storage::Workspace && only.is_none_or(|o| o == id)),
+        Err(_) => true,
+    }
+}
+
+fn read_catalog<T>(
+    pm: &Pm,
+    only: Option<&InstallationId>,
+    read: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    if lock_for_legacy(pm, only) {
+        let _lock = pm.lock()?;
+        let mut read = read;
+        return read();
+    }
+    optimistic(pm, read)
+}
+
 pub fn list(pm: &Pm) -> Result<Value> {
-    optimistic(pm, || {
+    read_catalog(pm, None, || {
         let catalog = Catalog::load(&pm.dir)?;
         let root = Root::open(&pm.dir)?;
         let rows = catalog
@@ -1207,7 +1235,7 @@ pub fn list(pm: &Pm) -> Result<Value> {
 }
 pub fn show(pm: &Pm, id: &str) -> Result<Value> {
     let id = InstallationId::parse(id)?;
-    optimistic(pm, || {
+    read_catalog(pm, Some(&id), || {
         let catalog = Catalog::load(&pm.dir)?;
         let root = Root::open(&pm.dir)?;
         describe(&root, &catalog, &id)
@@ -1319,7 +1347,7 @@ pub(crate) fn with_runtime_read<T>(
     callback: impl FnOnce(&Value, &BTreeMap<String, String>) -> Result<T>,
 ) -> Result<T> {
     let id = InstallationId::parse(id)?;
-    let (description, files) = optimistic(pm, || {
+    let (description, files) = read_catalog(pm, Some(&id), || {
         let root = Root::open(&pm.dir)?;
         let catalog = Catalog::load(&pm.dir)?;
         no_pending(&root)?;
