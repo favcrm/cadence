@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn fail_once_without_retry() {
-        let path = std::env::var("CADENCE_RETRY_COUNT").unwrap();
+        let path = std::env::var("FIXTURE_RETRY_COUNT").unwrap();
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -184,7 +184,7 @@ mod tests {
     }
 }
 EOF
-if NEXTEST_RETRIES=3 CADENCE_RETRY_COUNT="$TMP/retry.count" \
+if NEXTEST_RETRIES=3 FIXTURE_RETRY_COUNT="$TMP/retry.count" \
     CARGO_BUILD_JOBS=4 CADENCE_NEXTTEST_BIN="$PINNED_BIN" \
     CADENCE_SUITE_LOCK="$TMP/retry.lock" "$FXRUNNER" \
     --manifest-path "$TMP/retry-workspace/Cargo.toml" --no-fail-fast \
@@ -264,7 +264,7 @@ cat >"$TMP/leak-workspace/src/lib.rs" <<'EOF'
 #[cfg(test)]
 mod tests {
     fn leak() {
-        let mark = std::env::var("CADENCE_LEAK_MARK").unwrap();
+        let mark = std::env::var("FIXTURE_LEAK_MARK").unwrap();
         std::process::Command::new("setsid")
             .args(["bash", "-c", "exec -a \"$0\" sleep 120", &mark])
             .stdin(std::process::Stdio::null())
@@ -299,7 +299,7 @@ count_marked() {
     echo "$n"
 }
 trap 'count_marked kill >/dev/null; rm -rf "$TMP"' EXIT HUP INT TERM
-CADENCE_LEAK_MARK="$leak_mark" CARGO_BUILD_JOBS=4 \
+FIXTURE_LEAK_MARK="$leak_mark" CARGO_BUILD_JOBS=4 \
     CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$leak_lock" \
     "$FXRUNNER" --manifest-path "$TMP/leak-workspace/Cargo.toml" --no-fail-fast \
     >"$TMP/leak.out" 2>"$TMP/leak.err" || :
