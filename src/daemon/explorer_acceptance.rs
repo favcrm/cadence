@@ -912,7 +912,7 @@ mod tests {
         };
         assert_eq!(
             ids(fx.op("app_favorites_get", json!({"member_as": "alice"}))),
-            [a.clone()]
+            std::slice::from_ref(&a)
         );
         assert_eq!(
             ids(fx.op("app_favorites_get", json!({"member_as": "bob"}))),
@@ -945,7 +945,7 @@ mod tests {
         }
         assert_eq!(
             ids(fx.op("app_favorites_get", json!({"member_as": "alice"}))),
-            [a.clone()]
+            std::slice::from_ref(&a)
         );
         fx.op("app_workspace_remove", fx.remove_params(&b, "rm-b"));
         let e = err_text(
@@ -960,7 +960,7 @@ mod tests {
         // bob's saved removed app is filtered from his read.
         assert_eq!(
             ids(fx.op("app_favorites_get", json!({"member_as": "bob"}))),
-            [a.clone()]
+            std::slice::from_ref(&a)
         );
         // the workspace default is the operator's: a member scope is refused.
         err_text(
