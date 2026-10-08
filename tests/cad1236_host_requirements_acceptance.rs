@@ -176,6 +176,53 @@ mod acceptance {
             out.insert("<git HEAD>".into(), head.stdout);
             out
         }
+        /// Read consent rows and approval audit evidence without opening a
+        /// second writer or running store migration/recovery against the daemon.
+        fn consent_snapshot(&self, id: &str) -> Value {
+            let conn = rusqlite::Connection::open_with_flags(
+                self.state().join("cadence.sqlite3"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let rows = conn
+                .prepare(
+                    "SELECT 'current',epoch,digest,state,created FROM app_install_capabilities WHERE install_id=?
+                     UNION ALL
+                     SELECT 'history',epoch,digest,state,created FROM app_capability_epochs WHERE install_id=?
+                     ORDER BY 1,2",
+                )
+                .unwrap()
+                .query_map([id, id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, f64>(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let approvals = conn
+                .prepare(
+                    "SELECT seq,payload,at FROM events
+                     WHERE kind='app_install_capability_approved'
+                     AND json_extract(payload,'$.install_id')=? ORDER BY seq",
+                )
+                .unwrap()
+                .query_map([id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            json!({"rows": rows, "approvals": approvals})
+        }
         fn session(&self) -> (String, String) {
             cadence_agent::operator_auth::ensure_secret(&self.state()).unwrap();
             let secret = cadence_agent::operator_auth::read_secret(&self.state()).unwrap();
@@ -510,6 +557,167 @@ mod acceptance {
                 "bindings changed",
             );
         }
+        drop(fx);
+
+        // Each transport gets its own fixture: a broken recovery must not
+        // leave a pending marker that masks the next transport's real guard.
+        for transport in ["rpc", "http"] {
+            let fx = Fx::start();
+            let installed = positive(&fx, "recover-probe", "");
+            let id = installed["install_id"].as_str().unwrap();
+            let src = fx.bundle("recover-probe", "2.0.0", "");
+            let request = "recovery-probe";
+            let mut params = json!({"install_id": id, "source": src,
+                "expected_digest": installed["digest"],
+                "expected_generation": installed["catalog_generation"]});
+            let check = fx.op("app_workspace_upgrade_check", params.clone());
+            params["expected_new_digest"] = check["digest"].clone();
+            params["request_id"] = json!(request);
+            fx.op("app_workspace_upgrade", params);
+
+            // Model an internally consistent retained journal produced by a
+            // newer host, now resumed on this host. Re-pin its exact bytes and
+            // destination revision; otherwise a digest error could mask the
+            // missing host requirement guard. Put publication back at "before"
+            // with no pending marker, the retained-journal recovery case.
+            let journal_path = fx
+                .pm()
+                .join(".apps/upgrade-journals")
+                .join(id)
+                .join(format!("{request}.yaml"));
+            let mut journal: Value =
+                serde_yaml::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
+            journal["files"]["app.md"] = json!(manifest(
+                "recover-probe",
+                "2.0.0",
+                "  requires:\n    core: '>=99.0.0'\n",
+            ));
+            let files: BTreeMap<String, String> =
+                serde_json::from_value(journal["files"].clone()).unwrap();
+            let mut hash = Sha256::new();
+            for (name, body) in files {
+                hash.update((name.len() as u64).to_be_bytes());
+                hash.update(name.as_bytes());
+                hash.update((body.len() as u64).to_be_bytes());
+                hash.update(body.as_bytes());
+            }
+            let digest = format!("sha256:{:x}", hash.finalize());
+            journal["expected_new_digest"] = json!(digest);
+            let mut after: Value =
+                serde_yaml::from_str(journal["after_catalog"].as_str().unwrap()).unwrap();
+            after["installations"][id]["bundle_revision"] =
+                json!(digest.trim_start_matches("sha256:"));
+            journal["after_catalog"] = json!(serde_yaml::to_string(&after).unwrap());
+            std::fs::write(&journal_path, serde_yaml::to_string(&journal).unwrap()).unwrap();
+            std::fs::write(
+                fx.pm().join(".apps/catalog.yaml"),
+                journal["before_catalog"].as_str().unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                fx.pm()
+                    .join(".apps/installations")
+                    .join(id)
+                    .join("record.yaml"),
+                journal["before_record"].as_str().unwrap(),
+            )
+            .unwrap();
+            let pending = fx.pm().join(".apps/upgrade-pending.yaml");
+            assert!(
+                !pending.exists(),
+                "recovery fixture starts without a marker"
+            );
+            let tree = fx.tree();
+            let catalog = fx.op("app_workspace_list", json!({}));
+            let label = format!("recover core {transport}");
+            let reply = if transport == "rpc" {
+                fx.rpc(
+                    "app_workspace_upgrade_recover",
+                    json!({"install_id": id, "request_id": request}),
+                )
+                .map_err(|e| e.to_string())
+            } else {
+                let (status, text) = fx.http(
+                    &format!("/api/app-installations/{id}/upgrade/recover"),
+                    json!({"request_id": request}),
+                );
+                http_reply(status, text)
+            };
+            refusal(&mut errors, &label, reply, "core");
+            record(
+                &mut errors,
+                &format!("{label} tracker unchanged"),
+                fx.tree() == tree,
+                "recovery changed tracker bytes/directories or Git HEAD",
+            );
+            record(
+                &mut errors,
+                &format!("{label} no pending marker"),
+                !pending.exists(),
+                "recovery wrote .apps/upgrade-pending.yaml before refusing",
+            );
+            // Do not panic if the broken path leaves catalog reads blocked:
+            // accumulate that failure so restore and both transports still run.
+            let after = fx.rpc("app_workspace_list", json!({}));
+            record(
+                &mut errors,
+                &format!("{label} catalog remains readable and unchanged"),
+                after.as_ref().is_ok_and(|value| value == &catalog),
+                format!("catalog changed or became unreadable: {after:?}"),
+            );
+        }
+
+        for transport in ["rpc", "http"] {
+            let fx = Fx::start();
+            let installed = positive(&fx, "restore-probe", "");
+            let id = installed["install_id"].as_str().unwrap();
+            let removed = fx.op(
+                "app_workspace_remove",
+                json!({"install_id": id, "expected_digest": installed["digest"],
+                    "expected_generation": installed["catalog_generation"],
+                    "request_id": "remove-restore-probe"}),
+            );
+            assert_eq!(removed["state"], "removed");
+            // Model a removed package persisted by a newer host. Reads must
+            // report incompatibility, while restore must refuse re-admission.
+            std::fs::write(
+                fx.pm()
+                    .join(".apps/installations")
+                    .join(id)
+                    .join("bundle/app.md"),
+                manifest(
+                    "restore-probe",
+                    "1.0.0",
+                    "  requires:\n    core: '>=99.0.0'\n",
+                ),
+            )
+            .unwrap();
+            let shown = fx.op("app_workspace_show", json!({"install_id": id}));
+            assert_eq!(shown["compatibility"]["ok"], false);
+            assert!(shown["removed"].as_i64().is_some());
+            assert_ne!(shown["approval"]["state"], "approved");
+            let tree = fx.tree();
+            let catalog = fx.op("app_workspace_list", json!({}));
+            let consent = fx.consent_snapshot(id);
+            let label = format!("restore core {transport}");
+            let reply = if transport == "rpc" {
+                fx.rpc("app_workspace_restore", json!({"install_id": id}))
+                    .map_err(|e| e.to_string())
+            } else {
+                let (status, text) =
+                    fx.http(&format!("/api/app-installations/{id}/restore"), json!({}));
+                http_reply(status, text)
+            };
+            refusal(&mut errors, &label, reply, "core");
+            unchanged(&fx, &mut errors, &label, &tree, &catalog);
+            record(
+                &mut errors,
+                &format!("{label} no consent recorded"),
+                fx.consent_snapshot(id) == consent,
+                "consent row, approval epoch or approval audit evidence changed",
+            );
+        }
+
         assert!(
             errors.is_empty(),
             "CAD-1236 acceptance failures:\n{}",
