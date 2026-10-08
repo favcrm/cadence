@@ -1797,6 +1797,8 @@ pub(crate) fn restore(pm: &Pm, install_id: &str) -> Result<Value> {
 
 #[cfg(test)]
 mod cad1189_acceptance;
+#[cfg(test)]
+mod cad1254_acceptance;
 
 #[cfg(test)]
 mod tests {
