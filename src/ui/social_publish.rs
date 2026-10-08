@@ -236,16 +236,16 @@ struct AttachIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_id: Option<String>,
 }
-#[derive(Deserialize, Serialize)]
-#[serde(transparent)]
-struct RequiredNullableString(Option<String>);
-/// Status/cancel require all scope keys, including an explicit null context.
+/// Status/cancel require all scope keys, including an explicit
+/// `context_id: null` — an absent key never silently scopes to the
+/// workspace; serde's Option accepts null or omits the field, so the
+/// field is a raw Value checked for null-or-nonempty-string.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PreparedIntentScope {
     prepared_id: String,
     install_id: String,
-    context_id: RequiredNullableString,
+    context_id: Value,
 }
 /// CAD-1123 HP4: reschedule names the intent's own scope, the time the
 /// operator saw and the new time.
@@ -667,6 +667,9 @@ pub(super) fn handle(
                 Ok(value) => value,
                 Err(response) => return response,
             };
+            if !matches!(value.context_id, Value::Null | Value::String(_)) {
+                return err_response(400, "context_id must be null or a scope string");
+            }
             let method = if matches!(route, Route::StatusIntent) {
                 "app_publish_intent_status"
             } else {

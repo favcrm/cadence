@@ -1235,6 +1235,15 @@ pub(super) fn board_caller(
         _ => ("operator_session_required", SESSION_REQUIRED),
     };
     let attribution = attribute(request, state_dir, opts, &origin);
+    // CAD-482/1143: on a seam-armed board the verified assertion IS the
+    // caller — `operator` admits as the operator (the seam token already
+    // binds the fixture credential), `agent:<alias>` as that agent, and
+    // `unproven` stays unattributable. Without the feature `asserted()`
+    // compiles out to None and nothing here changes; OperatorOnly routes
+    // still run `prove_operator_peer` (seam-aware) after this verdict.
+    if let Some(crate::test_seam::Asserted::Operator) = crate::test_seam::asserted() {
+        return Ok(Caller::Operator(UI_ACTOR.to_string()));
+    }
     match decide(held, attribution, required) {
         Verdict::Operator(actor) => Ok(Caller::Operator(actor)),
         Verdict::Named(named) => Ok(Caller::Named(named)),

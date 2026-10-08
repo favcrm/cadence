@@ -807,6 +807,7 @@ fn independent_intent_digest(descriptor: &Value) -> String {
 const WORKFLOW: &str = r#"---
 title: "Owner read brief"
 goal: "One reviewed brief"
+publication_slot: publication
 inputs:
   writer: { ask: "writer" }
   reviewer: { ask: "reviewer" }

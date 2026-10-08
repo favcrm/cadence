@@ -719,4 +719,3 @@ fn http_get_with_session(dir: &Path, path: &str, cookie: &str, key: &str) -> (u1
         text,
     )
 }
-

@@ -466,7 +466,7 @@ impl Shared {
                 || descriptor["mode"].as_str() != Some(mode)
             {
                 return Err(Error::rejected(
-                    "prepared publish request already belongs to a different run or scope",
+                    "publish prepare request already names different run or scope",
                 ));
             }
             let due = descriptor["due_epoch"]

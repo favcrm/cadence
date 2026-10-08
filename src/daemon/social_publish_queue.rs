@@ -102,7 +102,7 @@ impl QueueInspectionError {
         match self {
             Self::Pending => Error::rejected("the matching AOS owner action is still pending"),
             Self::Unknown => Error::rejected(
-                "queue validation is uncertain or the owner action is absent; the intent remains prepared",
+                "queue_validation_uncertain: queue validation is uncertain or the owner action is absent; the intent remains prepared",
             ),
             Self::Refused(error) => error,
         }
@@ -378,9 +378,16 @@ impl Shared {
             .into());
         }
         let frozen = &prepared["descriptor"];
+        // The store persists `material_digest` (sha256:-prefixed); the
+        // queue-verifier grammar is bare 64-hex, so validate the bare
+        // form while keeping the stored value for the attach CAS.
         let prepared_digest = prepared["descriptor_digest"]
             .as_str()
-            .filter(|digest| crate::platform::agenticos_external::publish::valid_digest(digest))
+            .filter(|digest| {
+                crate::platform::agenticos_external::publish::valid_digest(
+                    digest.strip_prefix("sha256:").unwrap_or(digest),
+                )
+            })
             .ok_or_else(|| invalid("prepared descriptor receipt is malformed"))?;
         let context_matches = match context_id {
             Some(expected) => frozen["context_id"].as_str() == Some(expected),

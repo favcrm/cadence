@@ -920,6 +920,7 @@ fn wait_for_driver_tick_after(fx: &Fx, install: &str, previous: f64) {
 const WORKFLOW: &str = r#"---
 title: "Attach brief"
 goal: "One reviewed brief"
+publication_slot: publication
 inputs:
   writer: { ask: "writer" }
   reviewer: { ask: "reviewer" }
@@ -1504,7 +1505,7 @@ fn owner_status_and_cancel_are_scoped_non_consuming_operator_relays() {
     );
     assert_eq!(agent_status, 403, "HTTP status has the same operator gate");
     assert_eq!(fx.auth_ledger(), ledger_before);
-    let (missing_scope_status, _) = board_http_post(
+    let (missing_scope_status, missing_scope_body) = board_http_post(
         &fx.dir(),
         &fx.pm(),
         "operator",
@@ -1513,7 +1514,7 @@ fn owner_status_and_cancel_are_scoped_non_consuming_operator_relays() {
     );
     assert_eq!(
         missing_scope_status, 400,
-        "HTTP status requires explicit null scope"
+        "HTTP status requires explicit null scope: {missing_scope_body}"
     );
     let (forged_scope_status, _) = board_http_post(
         &fx.dir(),
@@ -2611,7 +2612,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
         );
         assert_attach_omission_unchanged();
     }
-    drop(assert_attach_omission_unchanged);
+    assert_attach_omission_unchanged();
     let mut forged_attach = attach_body.clone();
     forged_attach["actor"] = json!("operator");
     forged_attach["grant_id"] = json!("dpq_forged_frame_grant_02");
