@@ -3374,6 +3374,7 @@ fn run_emits_all_checks() {
         vec![
             "disk",
             "provider-state",
+            "provider-pi-command",
             "cadence-store",
             "pipes",
             "memory",

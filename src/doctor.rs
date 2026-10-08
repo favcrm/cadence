@@ -4,6 +4,13 @@
 
 pub mod host;
 
+/// The daemon's provider-command resolution record (CAD-1247): what
+/// the daemon computed for each provider command under its OWN PATH
+/// at start, so `doctor --host` — usually run from a shell whose PATH
+/// differs from the daemon's — reports the daemon's verdict, not the
+/// doctor process's. `<state_dir>/provider-commands.json`.
+pub const PROVIDER_COMMANDS_FILE: &str = "provider-commands.json";
+
 use std::path::Path;
 use std::process::Command;
 

@@ -550,7 +550,7 @@ pub fn run(scan: &Scan) -> Value {
     let checks = [
         check_disk(scan),
         check_provider_state(scan),
-        check_provider_commands(),
+        check_provider_commands(scan),
         check_cadence_store(scan),
         check_pipes(scan),
         check_memory(scan),

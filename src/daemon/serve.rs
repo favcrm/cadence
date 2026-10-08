@@ -812,18 +812,40 @@ pub(crate) fn write_recovery_record(
 /// PATH left `pi` unresolvable and every pi agent fenced with only a
 /// provider log saying why). Resolved against the daemon's own PATH
 /// exactly as the adapter's `execvp` would; a warning only — a daemon
-/// whose workload never touches the provider must still start.
-fn warn_unresolved_provider_commands(env: &ProviderEnv) {
+/// whose workload never touches the provider must still start. The
+/// verdict is also recorded under the state dir so `doctor --host`
+/// reads the daemon's resolution rather than re-probing on the
+/// operator shell's PATH; a failed write logs and never fails startup.
+fn warn_unresolved_provider_commands(state_dir: &Path, env: &ProviderEnv) {
     let path = std::env::var("PATH").ok();
-    if let Err(reason) = crate::adapter::pi::resolve_pi_launch_command(env, path.as_deref()) {
+    let outcome = crate::adapter::pi::resolve_pi_launch_command(env, path.as_deref());
+    if let Err(reason) = &outcome {
         eprintln!("provider pi: {reason}; set CADENCE_PI_COMMAND");
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = json!({
+        "pi": {
+            "resolved": outcome.as_ref().ok(),
+            "reason": outcome.as_ref().err().cloned(),
+            "path": path,
+        },
+        "at": at,
+    });
+    if let Err(e) = write_file_atomic(
+        &state_dir.join(crate::doctor::PROVIDER_COMMANDS_FILE),
+        &record.to_string(),
+    ) {
+        eprintln!("provider-commands: could not record resolution: {e}");
     }
 }
 
 /// Relaunch enabled actors at daemon start; fenced ones land in
 /// `attention` instead.
 pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
-    warn_unresolved_provider_commands(&shared.provider_env);
+    warn_unresolved_provider_commands(&shared.state_dir, &shared.provider_env);
     // Inbox rows are durable mailboxes — enabled or not, they own no
     // actor and keep their pseudo-endpoint across restarts.
     for agent in shared.store.agents()? {

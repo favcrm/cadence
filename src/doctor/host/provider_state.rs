@@ -156,27 +156,72 @@ fn eval_provider_state(stores: &[StoreMeasure], t: &Thresholds) -> Check {
 /// CAD-1247: the pi adapter execs `CADENCE_PI_COMMAND` or bare `pi`
 /// via `execvp` — a daemon started under a minimal service PATH that
 /// lacks pi fences every pi agent with only a provider log saying why.
-/// This check resolves the program exactly the way the launch would
-/// and fails naming the remedy; the same helper runs at daemon start.
-pub(super) fn check_provider_commands() -> Check {
+/// The daemon records its own resolution at start
+/// (`provider-commands.json` in the state dir); this check reports
+/// THAT verdict, because doctor usually runs from a shell whose PATH
+/// is not the daemon's. Only when no daemon of a new-enough build has
+/// written the record does it fall back to resolving on this shell's
+/// own PATH, saying so in the detail.
+pub(super) fn check_provider_commands(scan: &Scan) -> Check {
+    const REMEDY: &str =
+        "set CADENCE_PI_COMMAND to pi's absolute path, or add its directory to the daemon's PATH";
+    let name = "provider-pi-command";
+    let recorded = scan.state_dir.join(crate::doctor::PROVIDER_COMMANDS_FILE);
+    if let Ok(text) = std::fs::read_to_string(&recorded) {
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            let pi = &v["pi"];
+            return match pi["resolved"].as_str() {
+                Some(resolved) => check(
+                    name,
+                    Level::Ok,
+                    json!({"provider": "pi", "resolved": resolved, "source": "daemon"}),
+                    Value::Null,
+                    format!("pi resolves to {resolved} (daemon's PATH)"),
+                    String::new(),
+                ),
+                None => {
+                    let reason = pi["reason"].as_str().unwrap_or("unresolved");
+                    let daemon_path = pi["path"].as_str().unwrap_or_default();
+                    check(
+                        name,
+                        Level::Fail,
+                        json!({"provider": "pi", "resolved": null,
+                               "reason": reason, "source": "daemon",
+                               "daemon_path": daemon_path}),
+                        Value::Null,
+                        format!("pi: {reason} (daemon's PATH)"),
+                        REMEDY.to_string(),
+                    )
+                }
+            };
+        }
+        // An unreadable record is a fact too — fall through to the
+        // local probe rather than fail on a torn write.
+    }
+    // No record: probe this shell's PATH — the answer is about the
+    // DOCTOR process, not necessarily the daemon's environment.
     let env = crate::adapter::ProviderEnv::default();
     let path = std::env::var("PATH").ok();
     match crate::adapter::pi::resolve_pi_launch_command(&env, path.as_deref()) {
         Ok(resolved) => check(
-            "provider-pi-command",
+            name,
             Level::Ok,
-            json!({"provider": "pi", "resolved": resolved}),
+            json!({"provider": "pi", "resolved": resolved, "source": "this shell"}),
             Value::Null,
-            format!("pi resolves to {}", resolved.display()),
+            format!(
+                "pi resolves to {} (this shell's PATH — no daemon record)",
+                resolved.display()
+            ),
             String::new(),
         ),
         Err(reason) => check(
-            "provider-pi-command",
+            name,
             Level::Fail,
-            json!({"provider": "pi", "resolved": null, "reason": reason}),
+            json!({"provider": "pi", "resolved": null, "reason": reason,
+                   "source": "this shell"}),
             Value::Null,
-            format!("pi: {reason}"),
-            "set CADENCE_PI_COMMAND to pi's absolute path, or add its directory to the daemon's PATH".to_string(),
+            format!("pi: {reason} (this shell's PATH — no daemon record)"),
+            REMEDY.to_string(),
         ),
     }
 }
