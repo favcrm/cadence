@@ -775,14 +775,24 @@ fn owner_public_board_at(
 fn board_http_post(
     dir: &std::path::Path,
     pm: &std::path::Path,
-    who: &str,
+    caller: (&str, Option<&BoardSession>),
     path: &str,
     body: &str,
 ) -> (u16, String) {
+    if let Some(session) = caller.1 {
+        return board_http_post_at(
+            dir,
+            session.board.port,
+            caller.0,
+            Some(&session.credentials),
+            path,
+            body,
+        );
+    }
     board_http_post_with_public(
         dir,
         pm,
-        who,
+        caller,
         path,
         body,
         Some(owner_public_board(
@@ -796,51 +806,103 @@ fn board_http_post(
 fn board_http_post_with_public(
     dir: &std::path::Path,
     pm: &std::path::Path,
-    who: &str,
+    caller: (&str, Option<&BoardSession>),
     path: &str,
     body: &str,
     public: Option<cadence_agent::ui::PublicBoard>,
 ) -> (u16, String) {
-    // Select by the board's actual bind, not a probe socket closed before
-    // startup (which races other tests/lanes). Retry only AddrInUse.
-    let (port, stop, board) = (3110..3200)
-        .find_map(|port| {
-            let (startup, ready) = std::sync::mpsc::channel();
-            let stop = Arc::new(AtomicBool::new(false));
-            let opts = cadence_agent::ui::ServeOpts {
-                host: "127.0.0.1".into(),
-                port,
-                stop: Some(Arc::clone(&stop)),
-                startup: Some(startup),
-                public: public.clone(),
-                test_seam: true,
-                ..Default::default()
-            };
-            let (board_dir, board_pm) = (dir.to_path_buf(), pm.to_path_buf());
-            let board =
-                std::thread::spawn(move || cadence_agent::ui::serve(&board_dir, &board_pm, &opts));
-            match ready
-                .recv_timeout(Duration::from_secs(10))
-                .expect("board startup signal")
-            {
-                Ok(()) => Some((port, stop, board)),
-                Err(std::io::ErrorKind::AddrInUse) => {
-                    let _ = board.join();
-                    None
+    let board = Board::start(dir, pm, public);
+    // This helper is used with alternate authoritative portal configurations.
+    // Exchange a fresh link on that exact board rather than moving a cookie
+    // between port-scoped board origins.
+    let credentials = caller.1.map(|_| board_login_at(dir, board.port));
+    board_http_post_at(dir, board.port, caller.0, credentials.as_ref(), path, body)
+}
+
+struct Board {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    board: Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
+}
+
+impl Board {
+    fn start(
+        dir: &std::path::Path,
+        pm: &std::path::Path,
+        public: Option<cadence_agent::ui::PublicBoard>,
+    ) -> Self {
+        // Select by the board's actual bind, not a probe socket closed before
+        // startup (which races other tests/lanes). Retry only AddrInUse.
+        let (port, stop, board) = (3110..3200)
+            .find_map(|port| {
+                let (startup, ready) = std::sync::mpsc::channel();
+                let stop = Arc::new(AtomicBool::new(false));
+                let opts = cadence_agent::ui::ServeOpts {
+                    host: "127.0.0.1".into(),
+                    port,
+                    stop: Some(Arc::clone(&stop)),
+                    startup: Some(startup),
+                    public: public.clone(),
+                    test_seam: true,
+                    ..Default::default()
+                };
+                let (board_dir, board_pm) = (dir.to_path_buf(), pm.to_path_buf());
+                let board = std::thread::spawn(move || {
+                    cadence_agent::ui::serve(&board_dir, &board_pm, &opts)
+                });
+                match ready
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("board startup signal")
+                {
+                    Ok(()) => Some((port, stop, board)),
+                    Err(std::io::ErrorKind::AddrInUse) => {
+                        let _ = board.join();
+                        None
+                    }
+                    Err(error) => {
+                        let _ = board.join();
+                        panic!("board startup: {error:?}")
+                    }
                 }
-                Err(error) => {
-                    let _ = board.join();
-                    panic!("board startup: {error:?}")
-                }
-            }
-        })
-        .expect("isolated board port");
+            })
+            .expect("isolated board port");
+        Self {
+            port,
+            stop,
+            board: Some(board),
+        }
+    }
+}
+
+impl Drop for Board {
+    fn drop(&mut self) {
+        self.stop.store(true, SeqCst);
+        if let Some(board) = self.board.take() {
+            board
+                .join()
+                .expect("fixture board thread")
+                .expect("fixture board shutdown");
+        }
+    }
+}
+
+fn board_http_post_at(
+    dir: &std::path::Path,
+    port: u16,
+    who: &str,
+    session: Option<&(String, String)>,
+    path: &str,
+    body: &str,
+) -> (u16, String) {
+    let session_headers = session
+        .map(|(cookie, key)| format!("Cookie: {cookie}\r\nX-Cadence-Session: {key}\r\n"))
+        .unwrap_or_default();
     let host = format!("cadence-{port}.localhost:{port}");
     let token = Seam::token_at(dir).expect("fixture daemon minted its seam token");
     let request = format!(
         "POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\n\
          X-Cadence-Board: 1\r\nSec-Fetch-Site: same-origin\r\nOrigin: http://{host}\r\n\
-         {}: {who}\r\n{}: {token}\r\nContent-Length: {}\r\n\r\n{body}",
+         {}: {who}\r\n{}: {token}\r\n{session_headers}Content-Length: {}\r\n\r\n{body}",
         cadence_agent::test_seam::AS_HEADER,
         cadence_agent::test_seam::TOKEN_HEADER,
         body.len()
@@ -851,8 +913,6 @@ fn board_http_post_with_public(
         .expect("write fixture request");
     let mut response = String::new();
     std::io::Read::read_to_string(&mut stream, &mut response).expect("read fixture response");
-    stop.store(true, SeqCst);
-    let _ = board.join();
     let status = response
         .split_whitespace()
         .nth(1)
@@ -860,6 +920,67 @@ fn board_http_post_with_public(
         .parse()
         .expect("numeric HTTP status");
     (status, response)
+}
+
+/// A genuine loopback board session, obtained through the daemon's one-use
+/// login link and the real HTTP exchange. The seam substitutes peer identity
+/// only; it does not mint session authority or bypass the board's session gate.
+struct BoardSession {
+    board: Board,
+    credentials: (String, String),
+}
+
+fn board_sign_in(fx: &Fx) -> BoardSession {
+    let board = Board::start(
+        &fx.dir(),
+        &fx.pm(),
+        Some(owner_public_board(
+            &fx.dir(),
+            Some(OWNER_COMPANY_SLUG),
+            OWNER_AUTHORIZE_URL,
+        )),
+    );
+    let credentials = board_login_at(&fx.dir(), board.port);
+    BoardSession { board, credentials }
+}
+
+fn board_login_at(dir: &std::path::Path, port: u16) -> (String, String) {
+    cadence_agent::operator_auth::ensure_secret(dir).unwrap();
+    let secret = cadence_agent::operator_auth::read_secret(dir).unwrap();
+    let mint = scoped(Asserted::Operator, || {
+        client::rpc(
+            dir,
+            "operator_link_mint",
+            json!({"secret": secret, "origin": "loopback"}),
+        )
+    })
+    .expect("mint one-use operator login link");
+    let (status, response) = board_http_post_at(
+        dir,
+        port,
+        "operator",
+        None,
+        "/api/session",
+        &json!({"nonce": mint["nonce"]}).to_string(),
+    );
+    assert_eq!(status, 200, "login-link exchange refused: {response}");
+    let cookie = response
+        .split_once("\r\n\r\n")
+        .unwrap()
+        .0
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+        .and_then(|line| line.split_once(':'))
+        .expect("login-link exchange returns a session cookie")
+        .1
+        .trim()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let session: Value = serde_json::from_str(http_response_body(&response)).unwrap();
+    let key = session["session_key"].as_str().unwrap().to_owned();
+    (cookie, key)
 }
 
 fn http_response_body(response: &str) -> &str {
@@ -1415,6 +1536,7 @@ fn owner_status_and_cancel_are_scoped_non_consuming_operator_relays() {
     let mut fx = Fx::new();
     fx.start();
     let (install, run_id, _) = fx.setup();
+    let session = board_sign_in(&fx);
     let prepared = fx
         .rpc(
             Asserted::Operator,
@@ -1516,16 +1638,32 @@ fn owner_status_and_cancel_are_scoped_non_consuming_operator_relays() {
     let (agent_status, _) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "agent:writer",
+        ("agent:writer", None),
         STATUS_PATH,
         &scope.to_string(),
     );
     assert_eq!(agent_status, 403, "HTTP status has the same operator gate");
     assert_eq!(fx.auth_ledger(), ledger_before);
+    let inspect_before_no_session = fx.sender.inspect_calls.load(SeqCst);
+    let (no_session_status, no_session_response) = board_http_post(
+        &fx.dir(),
+        &fx.pm(),
+        ("operator", None),
+        STATUS_PATH,
+        &scope.to_string(),
+    );
+    assert_eq!(no_session_status, 403, "{no_session_response}");
+    assert!(no_session_response.contains("operator_session_required"));
+    assert_eq!(fx.auth_ledger(), ledger_before);
+    assert_eq!(
+        fx.sender.inspect_calls.load(SeqCst),
+        inspect_before_no_session
+    );
+
     let (missing_scope_status, missing_scope_body) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         STATUS_PATH,
         &json!({"prepared_id":prepared_id,"install_id":install}).to_string(),
     );
@@ -1536,7 +1674,7 @@ fn owner_status_and_cancel_are_scoped_non_consuming_operator_relays() {
     let (forged_scope_status, _) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         STATUS_PATH,
         &json!({"prepared_id":prepared_id,"install_id":install,"context_id":null,"grant_id":"dpq_forged"}).to_string(),
     );
@@ -1544,7 +1682,7 @@ fn owner_status_and_cancel_are_scoped_non_consuming_operator_relays() {
     let (http_status, http_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         STATUS_PATH,
         &scope.to_string(),
     );
@@ -1604,7 +1742,7 @@ fn owner_status_and_cancel_are_scoped_non_consuming_operator_relays() {
     let (missing_cancel_status, _) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         CANCEL_PATH,
         &json!({"prepared_id":prepared_id,"install_id":install}).to_string(),
     );
@@ -1615,7 +1753,7 @@ fn owner_status_and_cancel_are_scoped_non_consuming_operator_relays() {
     let (forged_cancel_status, _) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         CANCEL_PATH,
         &json!({"prepared_id":prepared_id,"install_id":install,"context_id":null,"receipt":"forged"}).to_string(),
     );
@@ -1624,7 +1762,7 @@ fn owner_status_and_cancel_are_scoped_non_consuming_operator_relays() {
     let (cancel_http_status, cancel_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         CANCEL_PATH,
         &scope.to_string(),
     );
@@ -2337,6 +2475,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let mut fx = Fx::new();
     fx.start_driver();
     let (install, run_id, second_run_id) = fx.setup();
+    let session = board_sign_in(&fx);
     let prepared_before = fx.prepared_rows(&install);
     let queue_before = fx.publish_queue(&install);
     let events_before = fx.social_publish_event_count();
@@ -2358,6 +2497,17 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
         assert_eq!(fx.sender.execute_calls.load(SeqCst), execute_before);
         assert_eq!(fx.sender.status_calls.load(SeqCst), status_before);
     };
+
+    let (no_session_status, no_session_response) = board_http_post(
+        &fx.dir(),
+        &fx.pm(),
+        ("operator", None),
+        PREPARE_PATH,
+        &json!({"request_id":"native-owner-no-session","run_id":run_id,"mode":"now"}).to_string(),
+    );
+    assert_eq!(no_session_status, 403, "{no_session_response}");
+    assert!(no_session_response.contains("operator_session_required"));
+    assert_prepare_unchanged();
 
     // Presence is semantically meaningful: explicit null is not omission for
     // `now`, and malformed schedule values must refuse before any prepare
@@ -2416,7 +2566,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (null_now_status, null_now_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         PREPARE_PATH,
         &json!({
             "request_id":"native-owner-http-now-null",
@@ -2435,7 +2585,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (malformed_schedule_status, malformed_schedule_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         PREPARE_PATH,
         &json!({
             "request_id":"native-owner-http-schedule-malformed",
@@ -2465,7 +2615,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
         let (status, response) = board_http_post(
             &fx.dir(),
             &fx.pm(),
-            "operator",
+            ("operator", Some(&session)),
             PREPARE_PATH,
             &body.to_string(),
         );
@@ -2495,7 +2645,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (agent_status, agent_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "agent:writer",
+        ("agent:writer", None),
         PREPARE_PATH,
         &forged_prepare.to_string(),
     );
@@ -2506,7 +2656,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (forged_status, forged_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         PREPARE_PATH,
         &forged_prepare.to_string(),
     );
@@ -2531,7 +2681,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (prepare_status, prepare_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         PREPARE_PATH,
         &prepare_body.to_string(),
     );
@@ -2632,7 +2782,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
         let (status, response) = board_http_post(
             &fx.dir(),
             &fx.pm(),
-            "operator",
+            ("operator", Some(&session)),
             ATTACH_PATH,
             &body.to_string(),
         );
@@ -2651,7 +2801,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (agent_attach_status, agent_attach_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "agent:writer",
+        ("agent:writer", None),
         ATTACH_PATH,
         &forged_attach.to_string(),
     );
@@ -2662,7 +2812,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (forged_attach_status, forged_attach_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         ATTACH_PATH,
         &forged_attach.to_string(),
     );
@@ -2709,7 +2859,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (delayed_prepare_status, delayed_prepare_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         PREPARE_PATH,
         &prepare_body.to_string(),
     );
@@ -2754,7 +2904,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (attach_status, attach_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         ATTACH_PATH,
         &attach_body.to_string(),
     );
@@ -2788,7 +2938,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (retry_status, retry_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         ATTACH_PATH,
         &attach_body.to_string(),
     );
@@ -2879,7 +3029,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (second_prepare_status, second_prepare_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         PREPARE_PATH,
         &json!({
             "request_id":"native-owner-http-maturity",
@@ -2923,7 +3073,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (second_attach_status, second_attach_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         ATTACH_PATH,
         &second_attach_body.to_string(),
     );
@@ -3122,7 +3272,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (third_prepare_status, third_prepare_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         PREPARE_PATH,
         &json!({
             "request_id":"native-owner-http-send-now-maturity",
@@ -3156,7 +3306,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let (third_attach_status, third_attach_response) = board_http_post(
         &fx.dir(),
         &fx.pm(),
-        "operator",
+        ("operator", Some(&session)),
         ATTACH_PATH,
         &third_attach_body.to_string(),
     );
@@ -3725,7 +3875,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
         let (status, response) = board_http_post_with_public(
             &fx.dir(),
             &fx.pm(),
-            "operator",
+            ("operator", Some(&session)),
             PREPARE_PATH,
             &body.to_string(),
             Some(owner_public_board_at(
