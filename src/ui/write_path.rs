@@ -1102,7 +1102,8 @@ pub(crate) fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let response = social_publish::handle(&mut request, state_dir, route, true);
+        let response =
+            social_publish::handle(&mut request, state_dir, route, true, opts.public.as_ref());
         send(request, response);
         return;
     }

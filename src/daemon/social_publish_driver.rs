@@ -661,10 +661,12 @@ impl Shared {
     /// every row behind it.
     fn claim_peeked(&self, due: &Value) -> Result<Option<Value>> {
         let intent = &due["intent"];
+        let now_epoch = (self.social_publish_driver.clock)();
         self.store.social_publish_claim_id(
             intent["intent_id"].as_str().unwrap_or(""),
             intent["frozen"]["install_id"].as_str().unwrap_or(""),
             intent["frozen"]["context_id"].as_str(),
+            now_epoch,
         )
     }
 

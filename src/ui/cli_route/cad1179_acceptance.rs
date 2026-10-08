@@ -159,6 +159,7 @@ fn cad1179_signed_ticket_writes_refuse_read_scope_stale_revision_and_replay_with
             host: "cad1179.board.localhost".into(),
             issuer: issuer.clone(),
             company: "cad1179-fixture".into(),
+            company_slug: None,
             authorize_url: format!("{issuer}/authorize"),
         }),
         ..ServeOpts::default()

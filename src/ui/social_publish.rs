@@ -32,9 +32,23 @@ pub(super) enum Route<'a> {
     /// CAD-1123 HP4: `POST /api/social-publish-starts` → `social_publish_start`.
     /// The body names a run and a mode only; the daemon derives the rest.
     Start,
+    /// CAD-1143: operator-only prepare for an immutable, nondispatchable
+    /// owner-authorized intent. The relay carries no caller-supplied material.
+    PrepareIntent,
+    /// CAD-1143: operator-only attach; the daemon obtains and verifies the
+    /// signed AOS queue receipt before atomically attaching and queueing.
+    AttachIntent,
+    /// Advisory, scoped completion observation; never attach authority.
+    StatusIntent,
+    /// Terminal local cancellation of a prepared or unclaimed attachment.
+    CancelIntent,
     /// CAD-1123 HP4: `POST /api/social-publishes/<id>/reschedule` →
     /// `social_publish_reschedule` (compare-and-swap on the queued intent).
     Reschedule(&'a str),
+    /// AOS-150's dedicated, short-lived issuer assertion read. This route
+    /// returns a bare immutable descriptor and bypasses board cookies only
+    /// because the daemon verifies the separate AOS JWS and consumes its jti.
+    OwnerIntentRead(&'a str),
 }
 fn segment(id: &str) -> bool {
     !id.is_empty()
@@ -44,6 +58,12 @@ fn segment(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 pub(super) fn route(path: &str) -> Option<Route<'_>> {
+    if let Some(intent_id) = path.strip_prefix("/api/social-owner-intent/") {
+        if owner_intent_segment(intent_id) {
+            return Some(Route::OwnerIntentRead(intent_id));
+        }
+        return None;
+    }
     // CAD-979: the operator media-import write route is a distinct path so a
     // mistaken GET on it cannot be read as a `Show` by `is_read`.
     if path == "/api/social-media-imports" {
@@ -51,6 +71,18 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     }
     if path == "/api/social-publish-starts" {
         return Some(Route::Start);
+    }
+    if path == "/api/social-publish-intents/prepare" {
+        return Some(Route::PrepareIntent);
+    }
+    if path == "/api/social-publish-intents/attach" {
+        return Some(Route::AttachIntent);
+    }
+    if path == "/api/social-publish-intents/status" {
+        return Some(Route::StatusIntent);
+    }
+    if path == "/api/social-publish-intents/cancel" {
+        return Some(Route::CancelIntent);
     }
     if path == "/api/social-publishes" {
         return Some(Route::List);
@@ -78,9 +110,27 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     }
     Some(Route::Show(tail))
 }
-impl Route<'_> {
+fn owner_intent_segment(id: &str) -> bool {
+    let Some(first) = id.as_bytes().first() else {
+        return false;
+    };
+    id.len() <= 120
+        && (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+impl<'a> Route<'a> {
     pub(super) fn is_read(self) -> bool {
-        matches!(self, Self::List | Self::Show(_))
+        matches!(self, Self::List | Self::Show(_) | Self::OwnerIntentRead(_))
+    }
+
+    pub(super) fn owner_intent_id(self) -> Option<&'a str> {
+        match self {
+            Self::OwnerIntentRead(id) => Some(id),
+            _ => None,
+        }
     }
 }
 fn present_opt<'de, D>(de: D) -> Result<Option<String>, D::Error>
@@ -88,6 +138,12 @@ where
     D: serde::Deserializer<'de>,
 {
     String::deserialize(de).map(Some)
+}
+fn present_i64<'de, D>(de: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    i64::deserialize(de).map(Some)
 }
 /// Artifact-freeze schedule grammar: digests and connection derive
 /// server-side from the approved run. Unknown fields are refused.
@@ -154,6 +210,42 @@ struct Start {
     mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     due_epoch: Option<i64>,
+}
+/// CAD-1143: prepare names a host-minted request and run only. The daemon
+/// derives scope, artifact, binding, account and all publication material.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareIntent {
+    request_id: String,
+    run_id: String,
+    mode: String,
+    #[serde(
+        default,
+        deserialize_with = "present_i64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    due_epoch: Option<i64>,
+}
+/// CAD-1143: attach carries only the opaque prepared selector and exact
+/// installation/context scope; no grant or owner-exchange result is accepted.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AttachIntent {
+    prepared_id: String,
+    install_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_id: Option<String>,
+}
+/// Status/cancel require all scope keys, including an explicit
+/// `context_id: null` — an absent key never silently scopes to the
+/// workspace; serde's Option accepts null or omits the field, so the
+/// field is a raw Value checked for null-or-nonempty-string.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedIntentScope {
+    prepared_id: String,
+    install_id: String,
+    context_id: Value,
 }
 /// CAD-1123 HP4: reschedule names the intent's own scope, the time the
 /// operator saw and the new time.
@@ -270,18 +362,209 @@ fn enrich_envelope(mut value: Value, state: &Path) -> Value {
     value
 }
 
+fn origin_port(uri: &ureq::http::Uri) -> Option<u16> {
+    let port = uri.port_u16();
+    if uri.authority()?.port().is_some() && port.is_none() {
+        return None;
+    }
+    match (uri.scheme_str()?, port) {
+        ("https", None) => Some(443),
+        ("http", None) => Some(80),
+        (_, Some(port)) => Some(port),
+        _ => None,
+    }
+}
+
+fn same_origin(left: &ureq::http::Uri, right: &ureq::http::Uri) -> bool {
+    left.scheme_str() == right.scheme_str()
+        && left
+            .host()
+            .zip(right.host())
+            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+        && origin_port(left) == origin_port(right)
+}
+
+/// The login redirect's configured app URL is the only portal-origin source.
+/// Use its scheme and authority only; its path/query never reach the launch URL.
+/// Refuse the issuer origin: it is the API/JWKS authority, not the owner UI.
+fn owner_action_origin(public: &super::PublicBoard) -> Option<String> {
+    let uri: ureq::http::Uri = public.authorize_url.parse().ok()?;
+    let issuer_uri: ureq::http::Uri = public.issuer.parse().ok()?;
+    if same_origin(&uri, &issuer_uri) {
+        return None;
+    }
+    let scheme = uri.scheme_str()?;
+    let authority = uri.authority()?;
+    let host = uri.host()?;
+    if authority.as_str().contains('@') || host.is_empty() {
+        return None;
+    }
+    if scheme != "https" || authority.port().is_some() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
+}
+
+/// Owner launch requires the separately resolved canonical `company_slug`.
+/// Cross-check the exact production host form; never infer a slug from a host
+/// prefix, environment suffix, workspace id, or caller-controlled value.
+fn owner_company_slug(public: &super::PublicBoard) -> Option<&str> {
+    let slug = public.company_slug.as_deref()?;
+    if !super::valid_board_company_slug(slug) {
+        return None;
+    }
+    let expected_host = format!("{slug}.cadencecloud.app");
+    (public.host == expected_host).then_some(slug)
+}
+
+fn owner_portal_scope(public: Option<&super::PublicBoard>) -> Result<(String, String), HttpResp> {
+    let Some(public) = public else {
+        return Err(err_response(
+            503,
+            "not configured: owner portal needs a canonical production board host and authorize_url",
+        ));
+    };
+    let Some(origin) = owner_action_origin(public) else {
+        return Err(err_response(
+            503,
+            "not configured: set AGENTICOS_BOARD_AUTHORIZE_URL to a validated HTTPS app origin distinct from PublicBoard.issuer",
+        ));
+    };
+    let Some(slug) = owner_company_slug(public) else {
+        return Err(err_response(
+            503,
+            "not configured: PublicBoard.company_slug must be a valid canonical slug matching the production host",
+        ));
+    };
+    Ok((origin, slug.to_owned()))
+}
+
+fn add_owner_action_url(
+    value: &mut Value,
+    origin: &str,
+    company_slug: &str,
+) -> Result<(), HttpResp> {
+    let prepared = value
+        .get("prepared")
+        .and_then(Value::as_object)
+        .ok_or_else(|| err_response(502, "server returned an invalid prepared owner intent"))?;
+    let prepared_id = prepared
+        .get("prepared_id")
+        .and_then(Value::as_str)
+        .filter(|id| owner_intent_segment(id))
+        .map(str::to_owned)
+        .ok_or_else(|| err_response(502, "server returned an invalid prepared owner selector"))?;
+    let owner = prepared
+        .get("owner_intent")
+        .and_then(Value::as_object)
+        .ok_or_else(|| err_response(502, "server returned an invalid prepared owner selector"))?;
+    let intent_id = owner
+        .get("intent_id")
+        .and_then(Value::as_str)
+        .filter(|id| *id == prepared_id.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| err_response(502, "server returned an invalid prepared owner selector"))?;
+    let intent_digest = owner
+        .get("intent_digest")
+        .and_then(Value::as_str)
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| err_response(502, "server returned an invalid prepared owner digest"))?;
+    value["owner_action_url"] = json!(format!(
+        "{origin}/social-owner-action?company_slug={company_slug}&intent_id={intent_id}&intent_digest={intent_digest}"
+    ));
+    Ok(())
+}
+
+pub(super) fn handle_owner_intent_read(
+    request: &Request,
+    state: &Path,
+    intent_id: &str,
+) -> HttpResp {
+    if !owner_intent_segment(intent_id)
+        || request.url().contains('?')
+        || request
+            .headers()
+            .iter()
+            .filter(|header| header.field.equiv("Authorization"))
+            .count()
+            != 1
+        || request
+            .headers()
+            .iter()
+            .filter(|header| header.field.equiv("Accept"))
+            .count()
+            != 1
+        || super::write_path::header_value(request, "Accept").as_deref() != Some("application/json")
+        || request
+            .headers()
+            .iter()
+            .any(|header| header.field.equiv("Transfer-Encoding"))
+        || request
+            .headers()
+            .iter()
+            .filter(|header| header.field.equiv("Content-Length"))
+            .count()
+            > 1
+        || super::write_path::header_value(request, "Content-Length")
+            .is_some_and(|length| length.trim() != "0")
+    {
+        return err_response(400, "malformed signed owner-intent read");
+    }
+    let authorization =
+        super::write_path::header_value(request, "Authorization").unwrap_or_default();
+    let Some(assertion) = authorization.strip_prefix("Bearer ").filter(|token| {
+        !token.is_empty()
+            && token.len() <= 8 * 1024
+            && !token.bytes().any(|byte| byte.is_ascii_whitespace())
+    }) else {
+        return err_response(401, "owner intent assertion required");
+    };
+    match client::rpc(
+        state,
+        "social_owner_intent_read",
+        json!({"intent_id":intent_id,"assertion":assertion}),
+    ) {
+        Ok(descriptor) => {
+            let mut response = json_response(descriptor);
+            response.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+            response.add_header(Header::from_bytes("Vary", "Authorization").unwrap());
+            response.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
+            response
+        }
+        Err(_) => err_response(403, "owner intent assertion refused"),
+    }
+}
+
 pub(super) fn handle(
     request: &mut Request,
     state: &Path,
     route: Route<'_>,
     write: bool,
+    public: Option<&super::PublicBoard>,
 ) -> HttpResp {
     let route = if write && matches!(route, Route::List) {
         Route::Schedule
     } else {
         route
     };
+    let owner_portal = if matches!(route, Route::PrepareIntent) {
+        Some(match owner_portal_scope(public) {
+            Ok(scope) => scope,
+            Err(response) => return response,
+        })
+    } else {
+        None
+    };
     let (method, params) = match route {
+        Route::OwnerIntentRead(_) => {
+            return err_response(405, "the signed owner-intent read has a dedicated handler");
+        }
         Route::List => {
             let params = match query(request) {
                 Ok(value) => value,
@@ -347,6 +630,56 @@ pub(super) fn handle(
                 serde_json::to_value(value).expect("typed start serializes"),
             )
         }
+        Route::PrepareIntent => {
+            let bytes = match read_body(request, BODY_CAP) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            let value: PrepareIntent = match parse_json(&bytes) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            (
+                "app_publish_intent_prepare",
+                serde_json::to_value(value).expect("typed intent prepare serializes"),
+            )
+        }
+        Route::AttachIntent => {
+            let bytes = match read_body(request, BODY_CAP) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            let value: AttachIntent = match parse_json(&bytes) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            (
+                "app_publish_intent_attach",
+                serde_json::to_value(value).expect("typed intent attach serializes"),
+            )
+        }
+        Route::StatusIntent | Route::CancelIntent => {
+            let bytes = match read_body(request, BODY_CAP) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            let value: PreparedIntentScope = match parse_json(&bytes) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            if !matches!(value.context_id, Value::Null | Value::String(_)) {
+                return err_response(400, "context_id must be null or a scope string");
+            }
+            let method = if matches!(route, Route::StatusIntent) {
+                "app_publish_intent_status"
+            } else {
+                "app_publish_intent_cancel"
+            };
+            (
+                method,
+                serde_json::to_value(value).expect("typed intent scope serializes"),
+            )
+        }
         Route::Reschedule(id) => {
             let bytes = match read_body(request, BODY_CAP) {
                 Ok(bytes) => bytes,
@@ -376,9 +709,17 @@ pub(super) fn handle(
         }
     };
     match client::rpc(state, method, params) {
-        Ok(value) => {
+        Ok(mut value) => {
+            if let Some((origin, slug)) = owner_portal.as_ref() {
+                if let Err(response) = add_owner_action_url(&mut value, origin, slug) {
+                    return response;
+                }
+            }
             let mut response = json_response(enrich_envelope(value, state));
             response.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
+            if matches!(route, Route::StatusIntent) {
+                response.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+            }
             response
         }
         Err(error) => home::rpc_err(&error, method),

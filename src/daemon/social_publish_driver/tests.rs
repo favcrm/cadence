@@ -380,6 +380,7 @@ fn approved_intent(store: &Store, tag: &str, due: i64) -> Value {
             grant_id: "dpq_fake_grant",
             approval_id: &approval,
             due_epoch: due,
+            claim_after_epoch: wall() - 5,
             timezone: "UTC",
         })
         .unwrap()["intent"]
@@ -536,7 +537,7 @@ fn cad1020_overdue_intent_is_held_not_sent() {
     // status from the door takes 800 s.
     let stuck = approved_intent(store, "stuck", now - 1);
     store
-        .social_publish_claim_id(id(&stuck), INSTALL, None)
+        .social_publish_claim_id(id(&stuck), INSTALL, None, now)
         .unwrap()
         .unwrap();
     let late = approved_intent(store, "late", now - 200);
@@ -622,6 +623,7 @@ fn cad1020_explicit_mode_intent_is_held_never_driver_sent() {
             grant_id: "dpq_fake_grant",
             approval_id: "explicit-1",
             due_epoch: clock.load(Ordering::SeqCst) - 1,
+            claim_after_epoch: clock.load(Ordering::SeqCst) - 5,
             timezone: "UTC",
         })
         .unwrap()["intent"]

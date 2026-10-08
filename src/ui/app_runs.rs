@@ -136,6 +136,25 @@ struct Start {
     source_receipt_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     selected_post_id: Option<String>,
+    /// CAD-1143 Redo carry: exactly `{from_run_id, retain}` — the source
+    /// run and the untouched half only. Unknown keys refused; everything
+    /// else derives daemon-side from durable store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    carry: Option<Carry>,
+}
+/// CAD-1143 Redo carry request shape, mirroring the daemon's exact
+/// `{from_run_id, retain}` contract.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Carry {
+    from_run_id: String,
+    retain: Retain,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Retain {
+    Image,
+    Text,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

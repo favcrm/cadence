@@ -56,10 +56,11 @@ export type ChildToHost =
 
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
  *  port. `call` verbs never spend or publish; every spend or publish verb is a
- *  `slot` verb and waits for a tap on a host-drawn button. The `publish.*` slot
- *  verbs arrive with HP4: add them here and in the host's dispatch table. */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link"] as const;
-export const SLOT_VERBS = ["run.start"] as const;
+ *  `slot` verb and waits for a tap on a host-drawn button. CAD-1143 (HP4)
+ *  wires the publish verbs here and in the host's dispatch table; the frame
+ *  only ever sends a verb the PUSH itself advertised in `actions`. */
+export const CALL_VERBS = ["read.run", "context.defaults.save", "publish.accounts.refresh", "publish.settings.save", "open-link"] as const;
+export const SLOT_VERBS = ["run.start", "publish.start", "publish.reschedule", "publish.cancel", "publish.send_now"] as const;
 export type CallVerb = (typeof CALL_VERBS)[number];
 export type SlotVerb = (typeof SLOT_VERBS)[number];
 /** The verbs a screen.v2 PUSH advertises in `actions`. */
@@ -195,6 +196,18 @@ export interface ScreenDefaults {
   values: Record<string, string>;
 }
 
+/** screen.v2 only: the bound publication target the operator set (CAD-1143),
+ *  read-only. Only fields the host verified are present — anything else is
+ *  omitted, never invented. `grant_id` is never pushed: the frame never
+ *  supplies a grant. `revision` is the binding revision the settings were
+ *  read at (the host's compare-and-swap base, not the frame's). */
+export interface ScreenPublishSettings {
+  revision: number;
+  destination_id?: string;
+  destination_label?: string;
+  toolkit?: "instagram" | "facebook";
+  timezone?: string;
+}
 /** `ok`: the complete scoped list (empty rows = honestly nothing planned).
  *  `truncated`: the list hit its cap, so absence proves nothing.
  *  `loading`/`unavailable`: no verified read for this scope; rows are empty.
@@ -261,6 +274,9 @@ export interface ScreenPush {
   }[];
   /** publish-intents.v1 only. */
   publish_intents?: ScreenIntents;
+  /** screen.v2 only: the bound publication target the operator set (CAD-1143).
+   *  Omitted when the publication slot has no bound target; never carries a grant. */
+  publish_settings?: ScreenPublishSettings;
   /** screen.v2 only: the latest finished read of a source slot. */
   sources?: ScreenSources;
   /** screen.v2 only: effective `context_default` values for this scope. */
@@ -377,7 +393,7 @@ export function parseChild(data: unknown): ChildToHost | null {
   return null;
 }
 
-const V2_TOP = ["sources", "defaults", "readiness", "actions"] as const;
+const V2_TOP = ["sources", "defaults", "readiness", "actions", "publish_settings"] as const;
 const V2_RUN = ["created", "closed", "phase", "steps", "inputs_used", "caption_excerpt", "artifact_id",
   "review", "approved", "source_post_id", "refusal", "image_ref"] as const;
 /** The publish-intents.v1 shape: every screen.v2 field is removed. */

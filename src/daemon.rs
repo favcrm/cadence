@@ -85,7 +85,9 @@ mod requests_rpc;
 mod review_evidence_rpc;
 mod serve;
 mod slots_rpc;
+mod social_owner_intent;
 mod social_publish_driver;
+pub(crate) mod social_publish_queue;
 mod social_publish_rpc;
 mod social_publish_start;
 mod supervisor_grant;
@@ -470,6 +472,9 @@ pub struct Shared {
     /// CAD-313: the clock links and sessions expire by (epoch seconds) —
     /// the wall clock in production, injectable in tests.
     operator_clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    /// Queue maturity clock: production samples the store wall clock; an
+    /// injected operator clock keeps attach, claim and driver seams aligned.
+    publish_queue_clock: Arc<dyn Fn() -> f64 + Send + Sync>,
     /// CAD-526: the platform JWKS the board-identity assertions verify
     /// against — short-lived cache, refetched on an unknown `kid`
     /// ([`crate::board_identity::JwksCache`]).
@@ -714,6 +719,13 @@ impl Shared {
                 )
             })
             .collect();
+        let publish_queue_clock: Arc<dyn Fn() -> f64 + Send + Sync> =
+            if let Some(clock) = opts.operator_clock.as_ref() {
+                let clock = Arc::clone(clock);
+                Arc::new(move || clock() as f64)
+            } else {
+                Arc::new(crate::store::now)
+            };
         let shared = Arc::new(Self {
             store,
             changed: Notify::new(),
@@ -780,6 +792,7 @@ impl Shared {
                 .operator_clock
                 .clone()
                 .unwrap_or_else(|| Arc::new(crate::issue::time::now_epoch)),
+            publish_queue_clock,
             board_jwks: Mutex::new(crate::board_identity::JwksCache::default()),
             platform_custody: crate::platform::Custody::open(state_dir)?,
             platform_custody_lock: Box::leak(Box::new(Mutex::new(()))),
@@ -3424,6 +3437,7 @@ impl Shared {
             "app_binding_show" => self.rpc_app_binding(method, params, peer_pid),
             "app_binding_list" => self.rpc_app_binding(method, params, peer_pid),
             "app_binding_publish_set" => self.rpc_app_binding(method, params, peer_pid),
+            "app_publish_destinations_list" => self.rpc_app_binding(method, params, peer_pid),
             "app_effect_stage" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_show" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_list" => self.rpc_app_effect(method, params, peer_pid),
@@ -3440,6 +3454,11 @@ impl Shared {
             "social_publish_report" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_start" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_reschedule" => self.rpc_social_publish(method, params, peer_pid),
+            "app_publish_intent_prepare" => self.rpc_social_publish(method, params, peer_pid),
+            "app_publish_intent_attach" => self.rpc_social_publish(method, params, peer_pid),
+            "app_publish_intent_status" => self.rpc_social_publish(method, params, peer_pid),
+            "app_publish_intent_cancel" => self.rpc_social_publish(method, params, peer_pid),
+            "social_owner_intent_read" => self.rpc_social_owner_intent_read(params),
             "app_context_create" => self.rpc_app_context(method, params, peer_pid),
             "app_context_list" => self.rpc_app_context(method, params, peer_pid),
             "app_context_show" => self.rpc_app_context(method, params, peer_pid),

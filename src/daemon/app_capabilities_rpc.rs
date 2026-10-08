@@ -413,6 +413,54 @@ impl Shared {
                     let alias = self.app_capability_caller(pid, "app capability receipt")?;
                     let receipt_id = required_str(params, "receipt_id")?;
                     let receipt = self.store.app_capability_result(receipt_id)?;
+                    // CAD-1143 carry-read branch: the caller's turn belongs to
+                    // a redo run whose frozen record names this receipt. The
+                    // ordinary same-run path follows otherwise, unchanged.
+                    // A failed probe falls through (fail-closed downstream),
+                    // never around the ordinary checks.
+                    let carry_caller = match self.store.app_message_installation(message)? {
+                        Some((caller_id, _)) => match self.store.app_run_show(&caller_id) {
+                            Ok(caller)
+                                if caller["snapshot"]["carry"]["retain"] == "image"
+                                    && caller["snapshot"]["carry"]["asset_receipt_id"].as_str()
+                                        == Some(receipt_id) =>
+                            {
+                                Some(caller)
+                            }
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    if let Some(caller) = carry_caller {
+                        let pm = self.pm_at(&self.pm_dir()?)?;
+                        return workspace::with_runtime_snapshot(
+                            &pm,
+                            required_str(&caller, "install_id")?,
+                            |bundle, files| {
+                                let _custody = self
+                                    .platform_custody_lock
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                let _release = self
+                                    .app_release_lock
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                self.app_run_binding_current(&caller, bundle, files)?;
+                                self.store.app_capability_carry_receipt_for_turn(
+                                    receipt_id,
+                                    &alias,
+                                    message,
+                                    token,
+                                    required_str(bundle, "digest")?,
+                                )?;
+                                if method == "app_run_capability_asset" {
+                                    self.store.app_capability_asset(receipt_id)
+                                } else {
+                                    Ok(receipt)
+                                }
+                            },
+                        );
+                    }
                     let run = self.store.app_run_show(required_str(&receipt, "run_id")?)?;
                     let pm = self.pm_at(&self.pm_dir()?)?;
                     return workspace::with_runtime_snapshot(

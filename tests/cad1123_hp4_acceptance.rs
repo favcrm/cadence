@@ -10,7 +10,7 @@
 //! binding's `config.publish`, never the request.
 #![cfg(feature = "test-seam")]
 
-use cadence_agent::platform::agenticos_external::media_import::MediaResolver;
+use cadence_agent::platform::agenticos_external::media_import::{DestinationLookup, MediaResolver};
 use cadence_agent::platform::agenticos_external::publish::{self as door, FakeProviderBehavior};
 use cadence_agent::platform::agenticos_external::publish::{
     LedgerOutcome, Preflight, PublishSender, Refusal,
@@ -154,11 +154,11 @@ impl Fx {
     fn arm_resolver(&self) {
         let stub = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = stub.server_addr().to_string();
-        let body = json!({"ok": true, "data": [{
+        let body = json!({"ok": true, "data": {"version": "1", "destinations": [{
             "connectionId": CONN, "toolkit": "facebook",
             "displayName": "Harbour", "destinationId": DEST,
             "status": "active", "available": true, "publishable": true,
-        }]})
+        }]}})
         .to_string();
         std::thread::spawn(move || {
             for request in stub.incoming_requests() {
@@ -720,6 +720,46 @@ fn forged_destination_grant_scope_approval_and_price_are_refused() {
     assert!(reused.is_err(), "a request id reused across runs");
     assert_eq!(fx.execs(), 0, "a forged start reached the provider");
     assert_eq!(fx.state(intent["intent_id"].as_str().unwrap()), "queued");
+}
+
+/// HP4 resolver guard: a canonical version-1 list holding one valid
+/// publishable match plus one malformed row for the same
+/// `(toolkit, destination_id)` refuses the whole lookup — the daemon
+/// must not drop the bad row and manufacture uniqueness.
+#[test]
+fn malformed_second_row_refuses_the_whole_resolver_lookup() {
+    let stub = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = stub.server_addr().to_string();
+    let body = json!({"ok": true, "data": {"version": "1", "destinations": [
+        {
+            "connectionId": CONN, "toolkit": "facebook",
+            "displayName": "Harbour", "destinationId": DEST,
+            "status": "active", "available": true, "publishable": true,
+        },
+        {
+            "connectionId": "connB_hidden_match", "toolkit": "facebook",
+            "displayName": "Hidden", "destinationId": DEST,
+            "status": "bogus-status", "available": true, "publishable": true,
+        },
+    ]}})
+    .to_string();
+    std::thread::spawn(move || {
+        for request in stub.incoming_requests() {
+            let _ = request.respond(tiny_http::Response::from_string(body.clone()));
+        }
+    });
+    let resolver = MediaResolver::new(
+        &format!("http://{addr}"),
+        DeviceCredential::new("read-cred".into()),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            resolver.resolve("facebook", DEST),
+            DestinationLookup::Unavailable
+        ),
+        "a malformed second row must refuse the whole lookup, never resolve the survivor"
+    );
 }
 
 // --------------------------------------------------------------------

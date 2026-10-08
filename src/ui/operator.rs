@@ -115,6 +115,14 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-installations/*/bindings/*/revoke",
         RouteClass::OperatorOnly,
     ),
+    // CAD-1143: the Settings drawer's publish-target write — proven-
+    // operator-only, relayed with the same `operator_connection` gate the
+    // underlying `app_binding_publish_set` verb enforces.
+    route(
+        "POST",
+        "/api/app-installations/*/bindings/*/publish-set",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/app-runs/*/effects", RouteClass::OperatorOnly),
     route(
         "POST",
@@ -1227,6 +1235,12 @@ pub(super) fn board_caller(
         _ => ("operator_session_required", SESSION_REQUIRED),
     };
     let attribution = attribute(request, state_dir, opts, &origin);
+    // CAD-482/1143: the seam substitutes peer identity only — it feeds
+    // `attribute()` (an asserted `operator` reads as `NoAgent`, the same
+    // caller a local un-owned browser proves), never the session
+    // authority `decide` rules on. A request without a live session is
+    // refused exactly as without the seam; `OperatorOnly` routes still
+    // run `prove_operator_peer` (seam-aware) after this verdict.
     match decide(held, attribution, required) {
         Verdict::Operator(actor) => Ok(Caller::Operator(actor)),
         Verdict::Named(named) => Ok(Caller::Named(named)),

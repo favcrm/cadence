@@ -998,7 +998,11 @@ impl Store {
     pub const DAEMON_STREAM: &str = "daemon";
 
     fn events_alias_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<()> {
-        if alias == Self::DAEMON_STREAM {
+        if alias == Self::DAEMON_STREAM
+            || alias == super::platform::PLATFORM_STREAM
+            || alias == APPROVAL_STREAM
+            || alias == VERDICT_STREAM
+        {
             return Ok(());
         }
         self.agent_in(conn, alias).map(|_| ())

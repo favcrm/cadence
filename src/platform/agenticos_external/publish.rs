@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Wire version every v1 document carries.
@@ -167,6 +168,17 @@ impl std::error::Error for Refusal {}
 
 // ---------- shape validators (same bounds as the pinned contract) ----------
 
+pub fn valid_contract_id(raw: &str) -> bool {
+    let Some(first) = raw.as_bytes().first() else {
+        return false;
+    };
+    raw.len() <= 120
+        && (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && raw.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
 pub fn valid_connection_id(raw: &str) -> bool {
     (1..=80).contains(&raw.len())
         && raw
@@ -288,6 +300,54 @@ pub fn media_key_authorizes_connection(media_key: &str, connection: &str, digest
 }
 
 // ---------- frozen send binding ----------
+
+/// Selector-only request for the read-only AOS queue-validation endpoint.
+/// It contains no workspace, owner, grant, role, or execution-window input;
+/// those are resolved from the authenticated AOS workspace and its stored
+/// owner action/grant.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueValidationRequest {
+    pub key: String,
+    pub connection_id: String,
+    pub caption: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_key: Option<String>,
+    pub cadence_run_id: String,
+    pub cadence_effect_id: String,
+    pub expected_intent_id: String,
+    pub expected_intent_digest: String,
+}
+
+impl QueueValidationRequest {
+    pub fn validate(&self) -> Result<(), Refusal> {
+        let bad = || Refusal::new("bad_intent", "queue-validation selector is malformed");
+        if !valid_idempotency_key(&self.key)
+            || !valid_connection_id(&self.connection_id)
+            || !valid_caption(&self.caption)
+            || !valid_contract_id(&self.cadence_run_id)
+            || !valid_contract_id(&self.cadence_effect_id)
+            || !valid_contract_id(&self.expected_intent_id)
+            || !valid_digest(&self.expected_intent_digest)
+            || self
+                .media_key
+                .as_deref()
+                .is_some_and(|key| !valid_media_key(key))
+        {
+            return Err(bad());
+        }
+        Ok(())
+    }
+}
+
+/// Parsed transport envelope only. The receipt is untrusted until the daemon
+/// verifies its distinct-purpose Ed25519 signature and exact frozen scope.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueValidationResponse {
+    pub version: String,
+    pub receipt: String,
+}
 
 /// The exact frozen binding one stable key names: one destination, one
 /// caption digest, one image digest, one approved Cadence run/effect.
@@ -701,6 +761,19 @@ impl Default for FakePublishLedger {
 /// A forged receipt with matching binding fields but fabricated evidence
 /// fails closed against the recorded bytes.
 pub trait PublishSender: Send + Sync {
+    /// Read-only, selector-only AOS check of one frozen queue intent. The
+    /// returned compact receipt is untrusted until the daemon's distinct
+    /// `social.queue-validation.v1` verifier accepts it. No implementation
+    /// may dispatch or consume a grant from this method.
+    fn inspect_queue(
+        &self,
+        _request: &QueueValidationRequest,
+    ) -> Result<QueueValidationResponse, Refusal> {
+        Err(Refusal::new(
+            "queue_validation_unavailable",
+            "publish sender has no read-only queue-validation capability",
+        ))
+    }
     /// Dispatch one exact binding against the provider door. The returned
     /// outcome is daemon-observed evidence, persisted before any report.
     fn execute(&self, binding: &SendBinding) -> Result<LedgerOutcome, Refusal>;

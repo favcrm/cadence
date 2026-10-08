@@ -17,6 +17,20 @@ pub const APP_RUN_APPROVAL_STREAM: &str = "app-run-approvals";
 pub fn artifact_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
+/// CAD-1143 Redo-image byte rule: a retained caption must equal the frozen
+/// carry bytes exactly — a worker echo is verified by digest, never trusted.
+/// Runs without a text carry are unaffected.
+fn carry_text_bytes_ok(run: &Value, text: &str) -> bool {
+    run["snapshot"]["carry"]["retain"]
+        .as_str()
+        .is_none_or(|retain| {
+            retain != "text"
+                || artifact_digest(text.as_bytes())
+                    == run["snapshot"]["carry"]["artifact_digest"]
+                        .as_str()
+                        .unwrap_or_default()
+        })
+}
 pub fn material_digest(value: &Value) -> String {
     // serde_json's default Map is ordered; rebuilding explicitly also fixes
     // behavior if preserve_order is enabled by another dependency later.
@@ -62,22 +76,42 @@ pub struct LocalWorkflow {
     /// click — no owner PM, no assignments).
     #[serde(default = "execution_agent")]
     pub execution: String,
+    /// Redo carry halves this workflow may retain, from its `carries:`
+    /// declaration. Constrained against the run request at start; never a
+    /// step-skip control. Serialized into the frozen snapshot like the
+    /// other declarations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carries: Vec<String>,
 }
 fn execution_agent() -> String {
     "agent".into()
 }
 impl LocalWorkflow {
     pub fn parse(text: &str, inputs: &BTreeMap<String, String>) -> Result<Self> {
+        Self::parse_carry(text, inputs, &BTreeMap::new())
+    }
+
+    /// Parse with a run-owned carry map. CAD-1143 Redo: the retained
+    /// caption is digest-verified material, not a caller input.
+    /// `render_carry_positions` parses and skeleton-checks the plan
+    /// with an opaque token at every carried `{{name}}` — the carried
+    /// bytes never pass through the plan parser, then splices the
+    /// verified material into the parsed ticket fields verbatim —
+    /// while every other input still satisfies the one-line grammar.
+    /// `carry` keys are declared inputs that must not collide with
+    /// `inputs` and each must land in exactly one place.
+    pub fn parse_carry(
+        text: &str,
+        inputs: &BTreeMap<String, String>,
+        carry: &BTreeMap<String, String>,
+    ) -> Result<Self> {
         let template = workflow::parse_template(text)?;
         let publication_slot = template.publication_slot;
         let capability_slots = template.capability_slots;
         let required_asset_slot = template.required_asset_slot;
         let execution = template.execution.as_str().to_string();
-        let rendered = workflow::render(text, inputs)?;
-        let parsed = plan::parse_plan(&rendered)?;
-        let (_, body) =
-            parse::split_front(&rendered).map_err(|e| Error::rejected(e.to_string()))?;
-        let metadata = workflow::ticket_meta(body)?;
+        let carries = template.carries;
+        let (parsed, metadata) = workflow::render_carry_positions(text, inputs, carry)?;
         if parsed.tickets.len() > 16 {
             return Err(Error::rejected("local runs support at most 16 steps"));
         }
@@ -204,6 +238,7 @@ impl LocalWorkflow {
             capability_slots,
             required_asset_slot,
             execution,
+            carries,
         })
     }
 }
@@ -246,6 +281,24 @@ CREATE TABLE IF NOT EXISTS app_run_reviews(
 pub struct LocalRunProvenance<'a> {
     pub selected_source: Option<(&'a str, &'a str)>,
     pub input_origins: &'a BTreeMap<String, String>,
+    /// CAD-1143 Redo carry request: the source run and the retained half.
+    /// The frame names only these two; the store derives everything else
+    /// from durable history inside the creation transaction.
+    pub carry: Option<CarryRequest<'a>>,
+}
+
+/// CAD-1143 Redo carry: `retain_image` names the untouched half — a
+/// retained image for Redo text, a retained caption for Redo image.
+/// `carry_inputs` are the run-owned, digest-verified material values the
+/// daemon resolved from durable history (`carry_caption` for a text
+/// retain, `carry_asset_receipt_id` for an image retain). They are not
+/// caller inputs: the plan is parsed with an opaque token at their
+/// positions and the creation transaction asserts each byte against the
+/// derived material before it is frozen into `snapshot.inputs`.
+pub struct CarryRequest<'a> {
+    pub from_run_id: &'a str,
+    pub retain_image: bool,
+    pub carry_inputs: &'a BTreeMap<String, String>,
 }
 
 impl Store {
@@ -400,6 +453,7 @@ impl Store {
             LocalRunProvenance {
                 selected_source: None,
                 input_origins: &BTreeMap::new(),
+                carry: None,
             },
         )
     }
@@ -415,6 +469,7 @@ impl Store {
         let LocalRunProvenance {
             selected_source,
             input_origins,
+            carry,
         } = provenance;
         let LocalRunRequest {
             install_id,
@@ -566,6 +621,130 @@ impl Store {
                     } else {
                         None
                     };
+                    // CAD-1143 Redo carry: derive the retained half from
+                    // durable history inside this transaction. Render-time
+                    // seeding (daemon, pre-freeze) must equal the derived
+                    // material — asserted here like the selected-post display
+                    // check; subject is overwritten authoritatively when
+                    // frozen. Refuses BEFORE anything is frozen. The record
+                    // is digest-bound once the snapshot below freezes.
+                    let mut seeded: Option<BTreeMap<String, String>> = None;
+                    let mut source_copy: Option<Value> = None;
+                    let carry_record = if let Some(request) = carry {
+                        if selected_source.is_some() {
+                            return Err(Error::rejected(
+                                "carry and source selection conflict; provenance is one or the other",
+                            ));
+                        }
+                        let retain = if request.retain_image { "image" } else { "text" };
+                        if !workflow.carries.iter().any(|half| half == retain) {
+                            return Err(Error::rejected(
+                                "workflow does not carry the requested half",
+                            ));
+                        }
+                        let material = Self::app_carry_material_in(
+                            &tx,
+                            install_id,
+                            context.map(|c| c.id.as_str()),
+                            request.from_run_id,
+                            request.retain_image,
+                        )?;
+                        let mut effective = inputs.clone();
+                        // The render-time seeding above must equal this
+                        // transaction's derived material (mirrors the
+                        // selected-source display check); subject is
+                        // overwritten authoritatively when frozen.
+                        if effective.get("source").map(String::as_str)
+                            != material["source_facts"].as_str()
+                        {
+                            return Err(Error::rejected(
+                                "carry source input differs from frozen source facts",
+                            ));
+                        }
+                        // The retained half travels in `carry_inputs` —
+                        // run-owned material resolved daemon-side, never a
+                        // caller input. Assert each carried byte against the
+                        // transaction's own derived material, then seed it
+                        // into the frozen inputs so the render reflects the
+                        // exact reviewed bytes. A text retain carries the
+                        // caption verbatim; an image retain carries the
+                        // pinned receipt id. Nothing else may be carried.
+                        let expected_carry: BTreeMap<String, String> = if !request.retain_image {
+                            let caption = material["artifact"]["text"]
+                                .as_str()
+                                .ok_or_else(|| {
+                                    Error::rejected("carry source caption is unavailable")
+                                })?;
+                            BTreeMap::from([("carry_caption".to_string(), caption.to_string())])
+                        } else {
+                            let receipt = material["asset"]["receipt_id"]
+                                .as_str()
+                                .ok_or_else(|| {
+                                    Error::rejected("carry source review pins no image")
+                                })?;
+                            BTreeMap::from([(
+                                "carry_asset_receipt_id".to_string(),
+                                receipt.to_string(),
+                            )])
+                        };
+                        if request.carry_inputs != &expected_carry {
+                            return Err(Error::rejected(
+                                "carried material differs from frozen carry bytes",
+                            ));
+                        }
+                        for (key, value) in request.carry_inputs {
+                            effective.insert(key.clone(), value.clone());
+                        }
+                        if let Some(subject) = material["source_subject"].as_str() {
+                            effective.insert("subject".into(), subject.to_owned());
+                        }
+                        if serde_json::to_vec(&effective)
+                            .map_err(|e| Error::internal(e.to_string()))?
+                            .len()
+                            > 32 * 1024
+                        {
+                            return Err(Error::rejected(
+                                "effective inputs exceed encoded byte limit",
+                            ));
+                        }
+                        seeded = Some(effective);
+                        // Redo-image generation needs the broker's
+                        // selected-source provenance: carry the source
+                        // snapshot's frozen record forward, explicitly
+                        // marked (never a fresh selection). Manual-fact
+                        // sources have none; the broker's facts path covers
+                        // them. No provider read is implied or charged.
+                        if !request.retain_image {
+                            if let Some(origin) = material
+                                .get("source_origin")
+                                .filter(|provenance| provenance.is_object())
+                            {
+                                let mut carried = origin.clone();
+                                if let Some(object) = carried.as_object_mut() {
+                                    object.insert(
+                                        "carried_from_run_id".into(),
+                                        json!(request.from_run_id),
+                                    );
+                                }
+                                source_copy = Some(carried);
+                            }
+                        }
+                        Some(json!({
+                            "from_run_id": request.from_run_id,
+                            "retain": retain,
+                            "source_bundle_digest": material["source_bundle_digest"],
+                            "source_snapshot_digest": material["source_snapshot_digest"],
+                            "artifact_id": material["artifact"]["id"],
+                            "artifact_digest": material["artifact"]["digest"],
+                            "asset_receipt_id": material["asset"]["receipt_id"],
+                            "asset_digest": material["asset"]["digest"],
+                            "asset_producer_step": material["asset"]["producer_step"],
+                            "asset_slot": material["asset"]["slot"],
+                            "asset_binding_digest": material["asset"]["binding_digest"],
+                        }))
+                    } else {
+                        None
+                    };
                     let epoch:i64=tx.query_opt("SELECT epoch FROM app_install_capabilities WHERE install_id=? AND digest=? AND state='approved'",params![install_id,bundle_digest],|r|r.get(0))?.ok_or_else(||Error::rejected("installation capability approval is absent or stale"))?;
                     let mut assignments = BTreeMap::new();
                     if workflow.execution == "host" {
@@ -617,7 +796,7 @@ impl Store {
                         assignments.insert(step.id.clone(),json!({"alias":agent.alias,"identity_digest":generation,"identity":Self::app_binding_identity(&agent),"role":agent.role,"provider":agent.provider,"endpoint_kind":agent.endpoint_kind}));
                     }
                     }
-                    let mut snapshot = json!({"schema":1,"install_id":install_id,"bundle_digest":bundle_digest,"epoch":epoch,"workflow":workflow,"inputs":inputs,"assignments":assignments,"owner_pm":owner_pm,"project_link":project_link,"artifact_policy":{"types":["text/plain","text/markdown"],"max_bytes":ARTIFACT_BYTES,"aggregate_bytes":RUN_ARTIFACT_BYTES}});
+                    let mut snapshot = json!({"schema":1,"install_id":install_id,"bundle_digest":bundle_digest,"epoch":epoch,"workflow":workflow,"inputs":seeded.as_ref().unwrap_or(inputs),"assignments":assignments,"owner_pm":owner_pm,"project_link":project_link,"artifact_policy":{"types":["text/plain","text/markdown"],"max_bytes":ARTIFACT_BYTES,"aggregate_bytes":RUN_ARTIFACT_BYTES}});
                     if !input_origins.is_empty() {
                         snapshot["input_origins"] = json!(input_origins);
                     }
@@ -650,6 +829,20 @@ impl Store {
                         snapshot["quotes"] = json!(quotes);
                         snapshot["workflow"]["capability_slots"] = json!(workflow.capability_slots);
                         snapshot["source"] = source;
+                    }
+                    // Schema stays 4: capability turns and the publication
+                    // path keep working unchanged; the `carry` record itself
+                    // marks the redo and is digest-bound by the freeze below.
+                    if let Some(record) = carry_record {
+                        snapshot["carry"] = record;
+                    }
+                    // Redo-image generation needs the broker's selected-source
+                    // provenance: carry the source snapshot's frozen record
+                    // forward, explicitly marked (never a fresh selection).
+                    // Manual-fact sources have none — the broker's facts path
+                    // covers them. No provider read is implied or charged.
+                    if let Some(origin) = source_copy {
+                        snapshot["source"] = origin;
                     }
                     let digest = material_digest(&snapshot);
                     if let Some((id, existing)) = tx
@@ -909,6 +1102,33 @@ impl Store {
                 "immutable app run snapshot receipt is corrupt",
             ));
         }
+        // CAD-1143 Redo carry record: digest-bound by the freeze checked
+        // above; shape-checked here so every currentness gate (approval,
+        // dispatch, fetch, results) sees it. Ordinary snapshots skip this.
+        if run["snapshot"].get("carry").is_some() {
+            let carry = &run["snapshot"]["carry"];
+            let bound = carry
+                .get("from_run_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+                && matches!(
+                    carry.get("retain").and_then(Value::as_str),
+                    Some("image" | "text")
+                )
+                && carry
+                    .get("artifact_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+                && carry
+                    .get("artifact_digest")
+                    .and_then(Value::as_str)
+                    .is_some_and(|digest| !digest.is_empty());
+            if !bound {
+                return Err(Error::rejected(
+                    "carry record is missing its digest-bound provenance",
+                ));
+            }
+        }
         if run["snapshot"]["schema"] == 3
             || (run["snapshot"]["schema"] == 4 && run["snapshot"]["publication"].is_object())
         {
@@ -954,6 +1174,7 @@ impl Store {
             && run["snapshot"]["workflow"]
                 .get("required_asset_slot")
                 .is_some()
+            && run["snapshot"]["carry"]["retain"].as_str() != Some("image")
         {
             return Err(Error::rejected(
                 "required asset slot needs a capability snapshot",
@@ -966,12 +1187,19 @@ impl Store {
                     Error::rejected("capability slots are missing from frozen workflow")
                 })?;
             if let Some(required) = run["snapshot"]["workflow"].get("required_asset_slot") {
-                required
-                    .as_str()
-                    .filter(|slot| declared.iter().any(|candidate| candidate == *slot))
-                    .ok_or_else(|| {
-                        Error::rejected("required asset slot differs from frozen capabilities")
-                    })?;
+                // A carried image satisfies the required slot from proven
+                // retained custody instead of generated capabilities; the
+                // review intake still pins the frozen receipt (never fresh).
+                let carried = required.as_str() == Some("image")
+                    && run["snapshot"]["carry"]["retain"].as_str() == Some("image");
+                if !carried {
+                    required
+                        .as_str()
+                        .filter(|slot| declared.iter().any(|candidate| candidate == *slot))
+                        .ok_or_else(|| {
+                            Error::rejected("required asset slot differs from frozen capabilities")
+                        })?;
+                }
             }
             let frozen = run["snapshot"]["capabilities"]
                 .as_object()
@@ -1898,6 +2126,7 @@ impl Store {
                         && !artifact.text.is_empty()
                         && artifact.text.len() <= ARTIFACT_BYTES
                         && total as usize + artifact.text.len() <= RUN_ARTIFACT_BYTES
+                        && carry_text_bytes_ok(&run, &artifact.text)
                     {
                         let id = format!("artifact-{run_id}-{step_id}");
                         let digest = artifact_digest(artifact.text.as_bytes());
@@ -1953,8 +2182,30 @@ impl Store {
                     if let Some((id,digest,producer))=tx.query_row("SELECT id,digest,producer FROM app_run_artifacts WHERE run_id=? AND step_id=?",params![run_id,producer_step_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? {
                         let required_asset_slot = run["snapshot"]["workflow"]["required_asset_slot"].as_str();
                         let asset_valid = match (&asset_receipt_id,&asset_sha256) {
-                            (None,None) => decision=="revise" || required_asset_slot.is_none(),
+                            (None,None) => {
+                                // An image carry always needs its asset pin —
+                                // no bypass through a missing required_asset_slot
+                                // declaration; a carries entry alone never suffices.
+                                decision=="revise"
+                                    || (required_asset_slot.is_none()
+                                        && run["snapshot"]["carry"]["retain"].as_str() != Some("image"))
+                            }
                             (Some(receipt_id),Some(asset_digest)) if decision=="approve" => {
+                                if run["snapshot"]["carry"]["retain"].as_str() == Some("image") {
+                                    // carried asset: must equal the frozen record with its
+                                    // source chain re-verified — never a fresh receipt
+                                    // relabeled, never another run's bytes.
+                                    let carry = &run["snapshot"]["carry"];
+                                    json!(receipt_id) == carry["asset_receipt_id"]
+                                        && json!(asset_digest) == carry["asset_digest"]
+                                        && super::app_capabilities::asset_material_in(tx,receipt_id)
+                                            .is_ok_and(|(receipt,_)| receipt["receipt_schema"]==2
+                                                && receipt["run_id"]==carry["from_run_id"]
+                                                && receipt["step_id"]==carry["asset_producer_step"].as_str().unwrap_or_default()
+                                                && receipt["slot"]==carry["asset_slot"]
+                                                && receipt["asset"]["digest"]==carry["asset_digest"]
+                                                && receipt["binding_digest"]==carry["asset_binding_digest"])
+                                } else {
                                 super::app_capabilities::asset_material_in(tx,receipt_id)
                                     .is_ok_and(|(receipt,_)| receipt["receipt_schema"]==2
                                         && receipt["run_id"]==run_id
@@ -1962,6 +2213,7 @@ impl Store {
                                         && required_asset_slot.is_none_or(|slot| receipt["slot"]==slot)
                                         && receipt["asset"]["digest"]==*asset_digest
                                         && run["snapshot"]["capabilities"][receipt["slot"].as_str().unwrap_or("")]["digest"]==receipt["binding_digest"])
+                                }
                             },
                             _ => false,
                         };
@@ -2083,7 +2335,15 @@ impl Store {
     }
 }
 
-fn local_token_current(provider: &str, kind: &str, generation: Option<&str>, token: &str) -> bool {
+/// Whether a worker turn token is still current for its provider+endpoint.
+/// Shared by the ordinary capability-turn path and the carry-read branch;
+/// widening visibility changes no behavior.
+pub(super) fn local_token_current(
+    provider: &str,
+    kind: &str,
+    generation: Option<&str>,
+    token: &str,
+) -> bool {
     let Some(spec) = crate::adapter::registry::spec_opt(provider, kind) else {
         return false;
     };

@@ -329,7 +329,11 @@ export default function WorkspaceApp({
   // a scope change remounts the frame and retires any live slot.
   const actionCtx = useRef<ActionContext | null>(null);
   actionCtx.current = data && data.installation.install_id === installId && !accessDenied
-    ? { installation: data.installation, installId, contextId, runs: data.runs, onChanged: () => { void refresh(); } } : null;
+    ? { installation: data.installation, installId, contextId, runs: data.runs,
+      bindings: data.bindings, connections: data.connections,
+      intents: intentRead && intentRead.status === "ok" && intentRead.installId === installId &&
+        intentRead.contextId === contextId ? intentRead.intents : [],
+      onChanged: () => { void refresh(); } } : null;
   const screenActions = useMemo(() => viewer.operator && !viewer.readOnly ? {
     call: (verb: Parameters<typeof runCall>[1], args: Record<string, unknown>, ui: Parameters<typeof runCall>[3]) =>
       actionCtx.current ? runCall(actionCtx.current, verb, args, ui)
@@ -1069,6 +1073,18 @@ export default function WorkspaceApp({
                       {data.installation.digest}
                     </p>
                   </details>
+                </section>
+                <section className="wa-panel wa-stack">
+                  <h2>Advanced</h2>
+                  <p className="wa-muted">
+                    Support-only controls. The installed app screen is the workspace;
+                    open the native view only when asked during support.
+                  </p>
+                  <div className="wa-row">
+                    <Button href={`/app-installations/${encodeURIComponent(installId)}?screen=native`}>
+                      Open native view
+                    </Button>
+                  </div>
                 </section>
               </div>
             )}

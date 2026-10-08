@@ -76,6 +76,17 @@ impl Shared {
                     "expected_due_epoch",
                     "due_epoch",
                 ],
+                // CAD-1143: prepare/attach are operator-only. Prepare names
+                // a host-minted request_id, a run and a mode; scope, artifact,
+                // binding, connection, destination and material all DERIVE
+                // from the run — never a caller body field. Attach names only
+                // the opaque prepared-intent selector and scope ids only;
+                // the owner-exchange result is server-obtained, never a
+                // caller artifact/grant/owner/digest field.
+                "app_publish_intent_prepare" => &["request_id", "run_id", "mode", "due_epoch"],
+                "app_publish_intent_attach" => &["prepared_id", "install_id", "context_id"],
+                "app_publish_intent_status" => &["prepared_id", "install_id", "context_id"],
+                "app_publish_intent_cancel" => &["prepared_id", "install_id", "context_id"],
                 _ => return Err(Error::rejected("unknown social publish method")),
             },
         )?;
@@ -114,6 +125,10 @@ impl Shared {
             "social_publish_send_now" => self.send_now_social_publish(params),
             "social_publish_start" => self.start_social_publish(params),
             "social_publish_reschedule" => self.reschedule_social_publish(params),
+            "app_publish_intent_prepare" => self.prepare_publish_intent(params),
+            "app_publish_intent_attach" => self.attach_publish_intent(params),
+            "app_publish_intent_status" => self.status_publish_intent(params),
+            "app_publish_intent_cancel" => self.cancel_publish_intent(params),
             "social_publish_reconcile" => self.reconcile_social_publish(params),
             "social_publish_report" => self.store.social_publish_report(
                 required_str(params, "intent_id")?,
@@ -143,6 +158,19 @@ impl Shared {
     /// Strict optional param: absent/null → None; a valid nonempty
     /// segment string → Some; any other JSON type or an empty/oversize
     /// string is a rejection, never a silent None.
+    pub(super) fn required_nullable_segment<'a>(
+        params: &'a Value,
+        field: &str,
+    ) -> Result<Option<&'a str>> {
+        if !params
+            .as_object()
+            .is_some_and(|object| object.contains_key(field))
+        {
+            return Err(Error::rejected(format!("Missing '{field}'")));
+        }
+        Self::strict_optional_segment(params, field)
+    }
+
     pub(super) fn strict_optional_segment<'a>(
         params: &'a Value,
         field: &str,
@@ -299,6 +327,9 @@ impl Shared {
             .resolve(toolkit, destination_id)
             .into_result()
             .map_err(|refusal| Error::rejected(refusal.to_string()))?;
+        // The legacy direct-schedule endpoint is not used by the native
+        // owner flow; only its verified atomic attach stamps the Undo floor.
+        let claim_after_epoch = 0;
         self.store
             .social_publish_freeze_from_artifact(&FreezeFromArtifact {
                 request_id: common("request_id")?,
@@ -316,6 +347,7 @@ impl Shared {
                 grant_id: common("grant_id")?,
                 approval_id: common("approval_id")?,
                 due_epoch: due,
+                claim_after_epoch,
                 timezone: common("timezone")?,
             })
     }
@@ -328,10 +360,10 @@ impl Shared {
     /// claimed and immediately held for a new human decision - never
     /// silently published. Backend grant liveness wires at the provider.
     fn claim_social_publish(&self, params: &Value) -> Result<Value> {
-        let now = params
-            .get("now_epoch")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| Error::rejected("Missing or non-integer 'now_epoch'"))?;
+        // Dispatch maturity is server-owned. A caller-supplied `now_epoch`
+        // is accepted only for wire compatibility and never advances the
+        // queue floor.
+        let now = self.operator_now();
         let recheck = params
             .get("recheck")
             .and_then(Value::as_object)
@@ -506,7 +538,7 @@ impl Shared {
             Preflight::Refused(refusal) => {
                 if self
                     .store
-                    .social_publish_claim_id(&id, install, context)?
+                    .social_publish_claim_id(&id, install, context, self.operator_now())?
                     .is_some()
                 {
                     return self.store.social_publish_report(
@@ -522,7 +554,10 @@ impl Shared {
         // concurrent send-now or cancel reads state='processing' and
         // gets `claimed: false`; the single CAS inside `claim_id` is
         // what makes a double-click one provider call, not two.
-        let Some(claimed) = self.store.social_publish_claim_id(&id, install, context)? else {
+        let Some(claimed) =
+            self.store
+                .social_publish_claim_id(&id, install, context, self.operator_now())?
+        else {
             return self.not_sent(&id, "the intent left queued before this claim");
         };
         if !self.store.social_publish_material_current(&id)? {

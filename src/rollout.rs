@@ -46,7 +46,10 @@ use crate::store::{self, Store};
 /// `app_update_checks` for the apps Explorer — new tables only.
 /// v34 (CAD-1246): `events_alias_kind` on `events(alias, kind, seq)` —
 /// an index only, so per-alias lookups stop full-scanning `events`.
-pub const SCHEMA_VERSION: i64 = 34;
+/// v35-38 (CAD-1143): `social_publish_prepared` owner intents,
+/// per-row claim maturity floor, post-commit claim arming, and the
+/// terminal cancellation lifecycle state.
+pub const SCHEMA_VERSION: i64 = 38;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -3331,7 +3334,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 34);
+        assert_eq!(SCHEMA_VERSION, 38);
     }
 
     struct MigrationHolder;

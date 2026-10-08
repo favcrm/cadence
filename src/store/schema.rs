@@ -975,6 +975,225 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=34", [])?;
                 tx.commit()?;
             }
+            if version < 35 {
+                // CAD-1143: prepared immutable owner intents — an
+                // account-only, grant-free, non-dispatchable publication
+                // intent in its own table. New table only; the
+                // queued-only dispatch SQL on `social_publish_intents` is
+                // untouched, so a PREPARED row is structurally invisible
+                // to every claim/dispatch path.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::social_publish::SCHEMA_PREPARED)?;
+                tx.execute("UPDATE schema_version SET version=35", [])?;
+                tx.commit()?;
+            }
+            if version < 37 {
+                // CAD-1143: v36 recorded a host-owned five-second
+                // post-queue maturity floor (`claim_after_epoch`); v37
+                // kept an owner-attached queue row nondispatchable until
+                // a second, post-commit transaction armed claims
+                // (`claim_armed`). Both land together as one validating
+                // rebuild of `social_publish_intents` — there is no
+                // released store between the two numbers. The rebuild is
+                // unconditional (idempotent: an already-converted table
+                // rebuilds to itself) and, like v38's, it VALIDATES the
+                // existing shape instead of parsing CREATE SQL: the copy
+                // names every column explicitly, so a missing or
+                // differently-named column fails `no such column`, a
+                // column carried in a different physical order maps by
+                // name, and a same-named column whose values violate the
+                // canonical CHECK refuses the copy. Either way the
+                // transaction rolls back and the open refuses rather
+                // than certifying drift. Every v29 column is required on
+                // the old table — a missing one fails the copy with
+                // `no such column` inside this transaction and the open
+                // refuses. `claim_after_epoch` defaults every historical
+                // row mature; `claim_armed` defaults them armed (only
+                // owner-attach rows ever carry 0, and none existed
+                // before v37). A half-applied/WIP store that already
+                // carries either claim column has its values copied by
+                // name — detected through `PRAGMA table_xinfo`, never
+                // by parsing CREATE text — so a recorded undo floor or
+                // pending arm is never lost. `table_xinfo`, not
+                // `table_info`: the plain pragma omits generated and
+                // hidden columns, so a guard present as a generated
+                // column would look absent and its recorded fence
+                // would be silently defaulted — instead it is seen,
+                // and only a plain stored column (hidden == 0) rides
+                // the copy; a guard present in any other form refuses
+                // the open and leaves the version unchanged. The match
+                // is ASCII-case-insensitive like SQLite identifier
+                // resolution itself: a `CLAIM_ARMED` spelling still
+                // names the claim column, and its real spelling (quoted
+                // on the SELECT side) carries the recorded values into
+                // the canonical lowercase target — a present guard
+                // column is never silently defaulted, and two
+                // case-varied spellings of one claim refuse the open.
+                // The rename also drops every user index the old table
+                // carried, so the rebuild recreates BOTH v29 indexes:
+                // `social_publish_due` (v37 claim predicate shape) and
+                // `social_publish_install` (its original v29
+                // definition — the store never changed it). No release
+                // ever shipped a trigger on this table.
+                let existing = table_column_kinds(&conn, "social_publish_intents")?;
+                // (target, source) column pairs: for every fixed v29
+                // column both sides are the canonical name. The claim
+                // columns ride the copy only when the old table really
+                // carries them — under any ASCII case — and the source
+                // side then uses the existing spelling; otherwise the
+                // canonical DEFAULTs apply on insert.
+                let mut pairs: Vec<(String, String)> = [
+                    "intent_id",
+                    "request",
+                    "install_id",
+                    "context_id",
+                    "run_id",
+                    "effect_id",
+                    "connection_id",
+                    "destination_id",
+                    "toolkit",
+                    "caption_digest",
+                    "image_digest",
+                    "media_key",
+                    "grant_id",
+                    "approval_id",
+                    "due_epoch",
+                ]
+                .into_iter()
+                .map(|c| (c.to_string(), c.to_string()))
+                .collect();
+                for claim in ["claim_after_epoch", "claim_armed"] {
+                    let mut found = existing
+                        .iter()
+                        .filter(|(c, _)| c.eq_ignore_ascii_case(claim));
+                    match (found.next(), found.next()) {
+                        (None, _) => {}
+                        (Some((name, 0)), None) => pairs.push((claim.to_string(), name.clone())),
+                        (Some((_, hidden)), None) => {
+                            return Err(Error::rejected(format!(
+                                "social_publish_intents carries claim column {claim} \
+                                 in a non-plain form (hidden={hidden}); refusing to default it"
+                            )))
+                        }
+                        (Some(_), Some(_)) => {
+                            return Err(Error::rejected(format!(
+                                "social_publish_intents carries ambiguous claim column {claim}"
+                            )))
+                        }
+                    }
+                }
+                for c in [
+                    "timezone",
+                    "state",
+                    "frozen",
+                    "frozen_digest",
+                    "receipt",
+                    "upstream",
+                    "created",
+                    "updated",
+                ] {
+                    pairs.push((c.to_string(), c.to_string()));
+                }
+                let targets = pairs
+                    .iter()
+                    .map(|(target, _)| target.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                // Quote only a spelled-differently existing name — every
+                // other identifier is a fixed canonical literal.
+                let sources = pairs
+                    .iter()
+                    .map(|(target, source)| {
+                        if source == target {
+                            source.clone()
+                        } else {
+                            format!("\"{}\"", source.replace('"', "\"\""))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(&format!(
+                    "DROP INDEX IF EXISTS social_publish_due;\n\
+                     DROP INDEX IF EXISTS social_publish_install;\n\
+                     ALTER TABLE social_publish_intents RENAME TO social_publish_intents_v35;\n\
+                     CREATE TABLE social_publish_intents(\n\
+                      intent_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,\n\
+                      install_id TEXT NOT NULL, context_id TEXT, run_id TEXT NOT NULL,\n\
+                      effect_id TEXT NOT NULL, connection_id TEXT NOT NULL,\n\
+                      destination_id TEXT NOT NULL, toolkit TEXT NOT NULL\n\
+                        CHECK(toolkit IN ('instagram','facebook')),\n\
+                      caption_digest TEXT NOT NULL, image_digest TEXT, media_key TEXT,\n\
+                      grant_id TEXT NOT NULL, approval_id TEXT NOT NULL,\n\
+                      due_epoch INTEGER NOT NULL CHECK(due_epoch>0),\n\
+                      claim_after_epoch INTEGER NOT NULL DEFAULT 0 CHECK(claim_after_epoch>=0),\n\
+                      claim_armed INTEGER NOT NULL DEFAULT 1 CHECK(claim_armed IN (0,1)),\n\
+                      timezone TEXT NOT NULL,\n\
+                      state TEXT NOT NULL\n\
+                        CHECK(state IN ('queued','cancelled','processing','posted','refused','held')),\n\
+                      frozen TEXT NOT NULL, frozen_digest TEXT NOT NULL,\n\
+                      receipt TEXT, upstream TEXT, created REAL NOT NULL, updated REAL NOT NULL);\n\
+                     INSERT INTO social_publish_intents({targets})\n\
+                     SELECT {sources} FROM social_publish_intents_v35;\n\
+                     DROP TABLE social_publish_intents_v35;\n\
+                     CREATE INDEX social_publish_due\n\
+                      ON social_publish_intents(state,claim_armed,due_epoch,claim_after_epoch,intent_id);\n\
+                     CREATE INDEX social_publish_install\n\
+                      ON social_publish_intents(install_id,context_id,intent_id);",
+                ))?;
+                tx.execute("UPDATE schema_version SET version=37", [])?;
+                tx.commit()?;
+            }
+            if version < 38 {
+                // Cancellation is terminal for a PREPARED owner action and
+                // its attached-but-unclaimed queue row. The rebuild is
+                // unconditional: idempotent (the new table's column set
+                // equals the old's, so the row copy is lossless on an
+                // already-converted table) and data-preserving in one
+                // transaction — and it VALIDATES the existing shape. A
+                // table that merely contains 'cancelled' in an unrelated
+                // position still gets the correct lifecycle CHECK; a
+                // table whose own state CHECK excludes the new state set
+                // fails the INSERT INTO SELECT, rolls back and refuses
+                // the open rather than being marked current. The copy
+                // names every column on BOTH sides, so a predecessor
+                // whose columns sit in a different physical order maps
+                // by name instead of silently swapping fields.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "DROP INDEX IF EXISTS social_publish_prepared_scope;\n\
+                     ALTER TABLE social_publish_prepared RENAME TO social_publish_prepared_v37;\n\
+                     CREATE TABLE social_publish_prepared(\n\
+                      prepared_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,\n\
+                      install_id TEXT NOT NULL, context_id TEXT, run_id TEXT NOT NULL,\n\
+                      effect_id TEXT NOT NULL, connection_id TEXT NOT NULL, aos_connection_id TEXT,\n\
+                      destination_id TEXT NOT NULL, destination_label TEXT NOT NULL, toolkit TEXT NOT NULL, timezone TEXT NOT NULL,\n\
+                      caption_digest TEXT NOT NULL, image_digest TEXT, media_key TEXT, approval_id TEXT NOT NULL,\n\
+                      mode TEXT NOT NULL CHECK(mode IN ('now','schedule')),\n\
+                      due_epoch INTEGER NOT NULL CHECK(due_epoch>0), not_before_epoch INTEGER NOT NULL, expires_epoch INTEGER NOT NULL,\n\
+                      state TEXT NOT NULL CHECK(state IN ('prepared','authorized','cancelled','superseded','refused')),\n\
+                      grant_id TEXT, descriptor TEXT NOT NULL, descriptor_digest TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);\n\
+                     INSERT INTO social_publish_prepared(\n\
+                      prepared_id,request,install_id,context_id,run_id,effect_id,connection_id,\n\
+                      aos_connection_id,destination_id,destination_label,toolkit,timezone,\n\
+                      caption_digest,image_digest,media_key,approval_id,mode,due_epoch,\n\
+                      not_before_epoch,expires_epoch,state,grant_id,descriptor,descriptor_digest,\n\
+                      created,updated)\n\
+                     SELECT\n\
+                      prepared_id,request,install_id,context_id,run_id,effect_id,connection_id,\n\
+                      aos_connection_id,destination_id,destination_label,toolkit,timezone,\n\
+                      caption_digest,image_digest,media_key,approval_id,mode,due_epoch,\n\
+                      not_before_epoch,expires_epoch,state,grant_id,descriptor,descriptor_digest,\n\
+                      created,updated\n\
+                     FROM social_publish_prepared_v37;\n\
+                     DROP TABLE social_publish_prepared_v37;",
+                )?;
+                tx.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS social_publish_prepared_scope ON social_publish_prepared(install_id,context_id,prepared_id);",
+                )?;
+                tx.execute("UPDATE schema_version SET version=38", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(
@@ -1605,6 +1824,28 @@ impl std::fmt::Display for ShutdownDrainError {
             Self::Fenced(e) | Self::Failed(e) => e.fmt(f),
         }
     }
+}
+
+/// `(name, hidden)` for every column `table` declares, in physical
+/// order — the `PRAGMA table_xinfo` fields a rebuild migration uses to
+/// decide whether an already-present (half-applied) claim column's
+/// values ride the row copy or the canonical DEFAULT applies.
+/// `table_xinfo`, not `table_info`: the plain pragma omits generated
+/// and hidden columns, so a guard that exists as a generated column
+/// would look absent and get silently defaulted. Callers carry a
+/// column only when `hidden == 0` (a plain stored column); a guard
+/// present in any other form refuses the open instead. No CREATE-SQL
+/// text is ever parsed: shape is enforced by the named-column copy
+/// into the canonical table.
+fn table_column_kinds(conn: &Connection, table: &str) -> Result<Vec<(String, i64)>> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_xinfo({table})"))?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(6)?))
+        })?
+        .filter_map(std::result::Result::ok)
+        .collect();
+    Ok(columns)
 }
 
 /// sqlite errors worth a fresh shutdown transaction: BUSY — whose
