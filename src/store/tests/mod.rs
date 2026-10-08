@@ -420,6 +420,10 @@ fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
         DROP INDEX app_runs_context;
         ALTER TABLE app_runs DROP COLUMN context_id;
         DROP TABLE app_contexts;
+        DROP TABLE IF EXISTS social_publish_prepared;
+        DROP INDEX IF EXISTS social_publish_due;
+        ALTER TABLE social_publish_intents DROP COLUMN claim_after_epoch;
+        ALTER TABLE social_publish_intents DROP COLUMN claim_armed;
         UPDATE schema_version SET version=20;
         CREATE TRIGGER reject_connection_schema BEFORE UPDATE ON schema_version WHEN NEW.version=21 BEGIN SELECT RAISE(ABORT,'migration denied'); END;").unwrap();
     assert!(Store::open_for_schema_tests(&path).is_err());
