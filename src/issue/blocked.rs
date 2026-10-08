@@ -32,7 +32,7 @@ use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::model::Front;
 use crate::issue::write::{commit_front_with_comment, issue_dir, load_front};
-use crate::issue::{board, time, Pm};
+use crate::issue::{board, line_times, lockseam, time, Pm};
 
 /// Tag the sweep leaves on an auto-parked issue — the durable marker a
 /// later sweep reads to know *this* backlog item wants a resume notice
@@ -45,8 +45,8 @@ pub const PARK_TAG: &str = "blocked-park";
 /// that keeps re-claiming keeps its seat.
 pub const PARK_GRACE_SECS: i64 = 24 * 3600;
 
-/// A sweep may attempt both holder and owner notices while it holds one
-/// issue's PM lock. Bound either send well below the writer's 15s wait.
+/// Bound each notice send so a dead daemon cannot stall the sweep (the
+/// sweep sends after its commit, with the PM lock released).
 const NOTICE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Statuses a blocker must reach to count as closed — the same pair
@@ -221,6 +221,73 @@ pub fn sweep(
     )
 }
 
+/// What the sweep decided to do with one candidate, on a snapshot.
+enum Plan {
+    /// A parked item whose blockers all closed: untag, then tell `to`.
+    Unblock {
+        to: Vec<String>,
+        key: String,
+        line: String,
+    },
+    /// A stale blocked `doing`/`review` leaf: park it.
+    Park { open: Vec<String>, age: Option<i64> },
+}
+
+/// Eligibility for one candidate, a pure read of its view.
+fn plan_for(pm: &Pm, v: &board::View, now: i64, grace_secs: i64) -> Option<Plan> {
+    let front = &v.issue.front;
+    if front.tags.iter().any(|t| t == PARK_TAG) && !v.blocked {
+        // Last blocker closed — tell the last claimer it can resume,
+        // then drop the marker. The send key names the blocker set it
+        // waited on, so a re-park on different blockers is a new notice
+        // while a retry dedupes.
+        return Some(Plan::Unblock {
+            to: holders(front),
+            key: format!("unblocked-{}-{}", front.id, front.blocked_by.join("-")),
+            line: format!(
+                "{} is unblocked — its blockers closed; `cadence issue claim {}` to resume",
+                front.id, front.id
+            ),
+        });
+    }
+    if !(v.blocked
+        && matches!(v.status.as_str(), "doing" | "review")
+        && !v.container
+        && !front.tags.iter().any(|t| t == PARK_TAG))
+    {
+        return None;
+    }
+    let age = claim_age_secs(front, now);
+    if age.is_some_and(|a| a < grace_secs) {
+        return None;
+    }
+    let open = open_blockers(&pm.dir, front);
+    if open.is_empty() {
+        // `View::blocked` also includes a blocked job outcome; only
+        // open `blocked_by` edges justify parking this issue.
+        return None;
+    }
+    Some(Plan::Park { open, age })
+}
+
+/// How many fresh snapshots one candidate gets before the sweep leaves
+/// it to the next pass.
+const SNAPSHOT_ATTEMPTS: usize = 3;
+/// Budget for the tracker HEAD probe that stamps a snapshot.
+const HEAD_BUDGET: Duration = Duration::from_secs(5);
+
+/// Under the PM lock: the ticket on disk is exactly the front the
+/// snapshot decided on.
+pub(super) fn locked_front_matches(pm: &Pm, snapshot: &Front) -> bool {
+    let Ok((_p, dir)) = issue_dir(pm, &snapshot.id) else {
+        return false;
+    };
+    let Ok((current, _body)) = load_front(&dir) else {
+        return false;
+    };
+    serde_json::to_value(&current).ok() == serde_json::to_value(snapshot).ok()
+}
+
 fn sweep_with_hooks(
     pm: &Pm,
     grace_secs: i64,
@@ -230,9 +297,10 @@ fn sweep_with_hooks(
     test_seam: (Option<board::JobOutcomes>, impl FnOnce(), impl FnMut()),
 ) -> Result<Value> {
     let (jobs_override, before_locked_snapshot, mut after_locked_snapshot) = test_seam;
-    // Candidate enumeration is advisory. Every candidate is reloaded
-    // and rechecked while its own PM lock is held, immediately before
-    // the transition. A new candidate can wait for the next sweep.
+    // CAD-1257: eligibility is decided on lock-free snapshots; the PM
+    // lock is taken only to re-validate and write one transition, and
+    // the notice RPC goes out after the commit, outside the lock. A
+    // pass with no eligible candidate takes no lock.
     let issues = board::load_all(&pm.dir, None)?;
     let jobs = jobs_override
         .unwrap_or_else(|| state_dir.map(board::fetch_job_outcomes).unwrap_or_default());
@@ -245,121 +313,110 @@ fn sweep_with_hooks(
         })
         .map(|v| v.issue.front.id.clone())
         .collect();
+    drop(views);
     // Test seam: a competing writer can change a candidate after the
-    // advisory snapshot but before its locked eligibility check.
+    // enumeration but before its eligibility check.
     before_locked_snapshot();
     let now = time::now_epoch();
     let mut parked: Vec<Value> = Vec::new();
     let mut unblocked: Vec<Value> = Vec::new();
-    for id in candidates {
-        let _lock = pm.lock()?;
-        let current = board::views_with_jobs(
-            &pm.config.notes_dir(),
-            board::load_all(&pm.dir, None)?,
-            &jobs,
-        );
-        let Some(v) = current.into_iter().find(|v| v.issue.front.id == id) else {
-            continue;
-        };
-        after_locked_snapshot();
-        let front = &v.issue.front;
-        if front.tags.iter().any(|t| t == PARK_TAG) && !v.blocked {
-            // Last blocker closed — tell the last claimer it can resume,
-            // then drop the marker. The untag commit lands even when the
-            // send fails: the comment records the outcome, and a dead
-            // alias must not retry-storm every pass. The send key names
-            // the blocker set it waited on, so a re-park on different
-            // blockers is a new notice while a retry dedupes.
-            let to = holders(front);
-            let key = format!("unblocked-{}-{}", front.id, front.blocked_by.join("-"));
-            let line = format!(
-                "{} is unblocked — its blockers closed; `cadence issue claim {}` to resume",
-                front.id, front.id
+    'candidates: for id in candidates {
+        for _attempt in 0..SNAPSHOT_ATTEMPTS {
+            let head = line_times::tracker_head(&pm.dir, HEAD_BUDGET).ok();
+            let current = board::views_with_jobs(
+                &pm.config.notes_dir(),
+                board::load_all(&pm.dir, None)?,
+                &jobs,
             );
-            let sent: Vec<Value> = to
-                .iter()
-                .map(|alias| {
-                    if dry_run {
-                        json!({"to": alias, "sent": false, "dry_run": true})
-                    } else if let Some(dir) = state_dir {
-                        send_to(dir, alias, &line, &key)
-                    } else {
-                        json!({"to": alias, "sent": false, "error": "no daemon state dir"})
-                    }
-                })
-                .collect();
-            let note = if sent.is_empty() {
-                "unblocked — no claim holder to notify".to_string()
-            } else {
-                let parts: Vec<String> = sent
-                    .iter()
-                    .map(|s| {
-                        let to = s["to"].as_str().unwrap_or_default();
-                        if s["sent"] == true {
-                            format!("notified {to}")
-                        } else {
-                            format!("could not notify {to}")
-                        }
-                    })
-                    .collect();
-                format!("unblocked — {}", parts.join(", "))
+            let Some(v) = current.iter().find(|v| v.issue.front.id == id) else {
+                continue 'candidates;
             };
+            let front = &v.issue.front;
+            let Some(plan) = plan_for(pm, v, now, grace_secs) else {
+                continue 'candidates;
+            };
+            let (kind_note, edit_subject): (String, String);
+            match &plan {
+                Plan::Unblock { to, .. } => {
+                    kind_note = if to.is_empty() {
+                        "unblocked — no claim holder to notify".to_string()
+                    } else {
+                        format!(
+                            "unblocked — notice to {} follows this commit",
+                            to.join(", ")
+                        )
+                    };
+                    edit_subject = format!("{} unblocked — {} cleared", front.id, PARK_TAG);
+                }
+                Plan::Park { open, .. } => {
+                    kind_note = format!(
+                        "Parked by the blocked-work sweep: still waits on {}. \
+                         The claim stays as the resume address — \
+                         `cadence issue set {} status=doing` resumes by hand.",
+                        open.join(", "),
+                        front.id,
+                    );
+                    edit_subject = format!("parked — blocked by {} (auto)", open.join(", "));
+                }
+            }
+            // Lock only for the write. Re-validate under it: the
+            // ticket's own front and the tracker HEAD (any committed
+            // blocker, child or claim change) must equal the snapshot.
+            let lock = pm.lock()?;
+            let unchanged = head.is_some()
+                && line_times::tracker_head(&pm.dir, HEAD_BUDGET).ok() == head
+                && locked_front_matches(pm, front);
+            if !unchanged {
+                continue; // drop the lock, decide again on a fresh snapshot
+            }
+            after_locked_snapshot();
             write_transition(
                 pm,
                 &front.id,
                 dry_run,
-                |f| f.tags.retain(|t| t != PARK_TAG),
+                |f| match &plan {
+                    Plan::Unblock { .. } => f.tags.retain(|t| t != PARK_TAG),
+                    Plan::Park { .. } => {
+                        f.status = "backlog".to_string();
+                        f.tags.push(PARK_TAG.to_string());
+                    }
+                },
                 "park",
-                &note,
-                &format!("{} unblocked — {} cleared", front.id, PARK_TAG),
+                &kind_note,
+                &edit_subject,
                 actor,
             )?;
-            unblocked.push(json!({"id": front.id, "sent": sent}));
-            continue;
+            drop(lock);
+            // The untag commit landed even if the send fails: a dead
+            // alias must not retry-storm every pass. The send runs here,
+            // outside the lock, and its outcome rides the response.
+            match plan {
+                Plan::Unblock { to, key, line } => {
+                    let sent: Vec<Value> = to
+                        .iter()
+                        .map(|alias| {
+                            if dry_run {
+                                json!({"to": alias, "sent": false, "dry_run": true})
+                            } else if let Some(dir) = state_dir {
+                                lockseam::outside_lock("blocked-notice");
+                                send_to(dir, alias, &line, &key)
+                            } else {
+                                json!({"to": alias, "sent": false, "error": "no daemon state dir"})
+                            }
+                        })
+                        .collect();
+                    unblocked.push(json!({"id": front.id, "sent": sent}));
+                }
+                Plan::Park { open, age } => parked.push(json!({
+                    "id": front.id,
+                    "from": v.status,
+                    "claim_age_secs": age,
+                    "claim": front.claim.as_ref().map(|c| c.by.as_str()),
+                    "open_blockers": open,
+                })),
+            }
+            continue 'candidates;
         }
-        if !(v.blocked
-            && matches!(v.status.as_str(), "doing" | "review")
-            && !v.container
-            && !front.tags.iter().any(|t| t == PARK_TAG))
-        {
-            continue;
-        }
-        let age = claim_age_secs(front, now);
-        if age.is_some_and(|a| a < grace_secs) {
-            continue;
-        }
-        let open = open_blockers(&pm.dir, front);
-        if open.is_empty() {
-            // `View::blocked` also includes a blocked job outcome; only
-            // open `blocked_by` edges justify parking this issue.
-            continue;
-        }
-        write_transition(
-            pm,
-            &front.id,
-            dry_run,
-            |f| {
-                f.status = "backlog".to_string();
-                f.tags.push(PARK_TAG.to_string());
-            },
-            "park",
-            &format!(
-                "Parked by the blocked-work sweep: still waits on {}. \
-                 The claim stays as the resume address — \
-                 `cadence issue set {} status=doing` resumes by hand.",
-                open.join(", "),
-                front.id,
-            ),
-            &format!("parked — blocked by {} (auto)", open.join(", ")),
-            actor,
-        )?;
-        parked.push(json!({
-            "id": front.id,
-            "from": v.status,
-            "claim_age_secs": age,
-            "claim": front.claim.as_ref().map(|c| c.by.as_str()),
-            "open_blockers": open,
-        }));
     }
     Ok(json!({
         "dry_run": dry_run,
