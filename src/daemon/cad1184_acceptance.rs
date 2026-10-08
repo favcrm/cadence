@@ -763,22 +763,74 @@ fn board_http_refuses_agent_permission_decision_and_block() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let port = 3110 + (std::process::id() % 80) as u16;
-    let (ready, rx) = std::sync::mpsc::channel();
-    let board_opts = crate::ui::ServeOpts {
-        host: "127.0.0.1".into(),
-        port,
-        stop: Some(stop.clone()),
-        startup: Some(ready),
-        test_seam: true,
-        ..Default::default()
+    // The board must bind a port of its own: `serve` reports Ok on the
+    // startup channel only after its bind succeeds, so keeping that
+    // thread is proof the listener answering `base` is this fixture's
+    // board — a busy candidate means a neighbor holds it and is never
+    // adopted or signalled. Retry only a real AddrInUse across the
+    // finite candidate window under one shared 20s deadline; any other
+    // startup result fails immediately.
+    let startup_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let first = (std::process::id() % 80) as u16;
+    let port = {
+        let mut offset = 0u16;
+        loop {
+            // The 20s startup deadline is shared by every candidate: no
+            // new board thread starts once it has elapsed.
+            assert!(
+                std::time::Instant::now() < startup_deadline,
+                "fixture board startup deadline elapsed"
+            );
+            let port = 3110 + (first + offset) % 80;
+            let (ready, rx) = std::sync::mpsc::channel();
+            let board_opts = crate::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(stop.clone()),
+                startup: Some(ready),
+                test_seam: true,
+                ..Default::default()
+            };
+            let board_state = state.clone();
+            let board_pm = pm.clone();
+            let board = std::thread::spawn(move || {
+                drop(crate::ui::serve(&board_state, &board_pm, &board_opts))
+            });
+            let remaining = startup_deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(Ok(())) => {
+                    servers.threads.push(board);
+                    break port;
+                }
+                Ok(Err(std::io::ErrorKind::AddrInUse)) => {
+                    // The board's `serve` already returned on the bind
+                    // failure; reap our own thread — surfacing a panic —
+                    // before advancing. The shared stop flag stays unset:
+                    // the fixture daemon still runs on it.
+                    assert!(
+                        board.join().is_ok(),
+                        "fixture board thread panicked after AddrInUse on port {port}"
+                    );
+                    offset += 1;
+                    assert!(offset < 80, "all 80 fixture board candidates busy");
+                }
+                Ok(Err(kind)) => {
+                    assert!(
+                        board.join().is_ok(),
+                        "fixture board thread panicked after {kind:?} on port {port}"
+                    );
+                    panic!("fixture board startup failed on port {port}: {kind:?}");
+                }
+                Err(e) => {
+                    // Channel dropped without a bind result, or the shared
+                    // deadline elapsed — never a reason to try the next
+                    // port. Hand the thread to the guard for cleanup.
+                    servers.threads.push(board);
+                    panic!("fixture board startup failed on port {port}: {e}");
+                }
+            }
+        }
     };
-    let board_state = state.clone();
-    let board_pm = pm.clone();
-    let board =
-        std::thread::spawn(move || drop(crate::ui::serve(&board_state, &board_pm, &board_opts)));
-    servers.threads.push(board);
-    rx.recv_timeout(Duration::from_secs(20)).unwrap().unwrap();
     let token = crate::test_seam::Seam::token_at(&state).unwrap();
     let host = format!("cadence-{port}.localhost:{port}");
     let base = format!("http://127.0.0.1:{port}");
