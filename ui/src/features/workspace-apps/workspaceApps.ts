@@ -66,6 +66,7 @@ export interface UpgradeProposal {
   install_id: string; name: string; version: string; digest: string;
   expected_digest: string; expected_generation: string;
   structural_diff: { added: string[]; changed: string[]; removed: string[] };
+  compatibility?: unknown; notes?: string[];
   secret_warnings: unknown[];
 }
 export interface ArtifactReceipt { id: string; step_id: string; digest: string; media_type: string; size: number }

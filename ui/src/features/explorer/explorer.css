@@ -86,6 +86,7 @@
 .apps-detail .mcard { padding: 14px 16px; }
 .apps-detail .mcard h3 { font-size: var(--text-cardtitle); font-weight: 500; color: var(--color-ink-100); margin: 0 0 8px; }
 .apps-detail .mcard p { color: var(--color-ink-400); font-size: var(--text-label); margin: 0; }
+.apps-detail .mcard .update-source { width: 100%; min-width: 0; padding: 8px 10px; border: 1px solid var(--color-ink-700, #333); border-radius: 8px; background: var(--color-ink-900, #1a1d24); color: var(--color-ink-100); }
 .apps-detail .mgrid { display: grid; gap: 14px; grid-template-columns: 1fr; }
 @media (min-width: 1024px) { .apps-detail .mgrid { grid-template-columns: 1fr 1fr; } }
 .apps-detail .conn { display: flex; align-items: center; gap: 10px; padding: 8px 0; }
