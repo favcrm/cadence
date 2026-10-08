@@ -47,8 +47,8 @@ const MAX_NODES: usize = 4_096;
 /// Most assets, declared and supplied alike.
 const MAX_ASSETS: usize = 32;
 /// Largest single `.js` asset body — the screen entry/leaves get the
-/// larger script budget (the frozen production bundle is ~239 KiB).
-const MAX_JS_BYTES: u64 = 262_144;
+/// larger script budget (CAD-1254: the install gate's screen-asset cap).
+const MAX_JS_BYTES: u64 = crate::issue::app::MAX_SCREEN_ASSET_BYTES;
 /// Largest non-js asset body, UTF-8 bytes.
 const MAX_ASSET_BYTES: u64 = 131_072;
 /// Largest sum of every supplied asset body, bytes.

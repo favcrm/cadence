@@ -66,8 +66,6 @@ struct InstallCheckBody {
     source: String,
 }
 
-/// One file's ceiling (matches `plan::MAX_PLAN_BYTES`).
-const UPLOAD_FILE_BYTES: u64 = crate::issue::plan::MAX_PLAN_BYTES as u64;
 /// At most this many files — the same bound `snapshot` enforces on disk.
 const UPLOAD_MAX_FILES: usize = 128;
 
@@ -167,9 +165,10 @@ impl<'de> Deserialize<'de> for FilesMap {
                     if !seen.insert(key.clone()) {
                         return Err(serde::de::Error::custom(format!("duplicate path '{key}'")));
                     }
-                    if value.len() as u64 > UPLOAD_FILE_BYTES {
+                    let cap = crate::issue::app::file_cap(&key);
+                    if value.len() as u64 > cap {
                         return Err(serde::de::Error::custom(format!(
-                            "file '{key}' is over the {UPLOAD_FILE_BYTES}-byte per-file cap"
+                            "file '{key}' is over the {cap}-byte per-file cap"
                         )));
                     }
                     files.push((key, value));
@@ -474,7 +473,7 @@ fn workspace_upgrade_transport(
                     &format!("bundle path '{path}' is not an allowed flat entry"),
                 ));
             }
-            if text.len() as u64 > crate::issue::plan::MAX_PLAN_BYTES as u64 {
+            if text.len() as u64 > crate::issue::app::file_cap(path) {
                 return Err(err_response(400, "a bundle file exceeds its byte cap"));
             }
             total += text.len() as u64;
