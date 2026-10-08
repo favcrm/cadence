@@ -647,6 +647,11 @@ pub trait UpdateHost {
     /// one that was to answer on the new build: a board that never comes
     /// back is not health, and the pipeline rolls back.
     fn board_running(&self) -> bool;
+    /// Start the board on `binary` (the build just restored by a
+    /// rollback). Blocks until a start succeeds or the host gives up.
+    /// CAD-1251: the restart stops the board by pid and its own start
+    /// can lose to a loaded host, so the rollback starts it itself.
+    fn start_board(&self, binary: &Path) -> Result<()>;
     /// The run's progress log, when the caller asked for one — the
     /// board's detached helper does (`--progress`). `run` truncates it,
     /// records the start and the end; the host appends each progress
@@ -1096,6 +1101,45 @@ fn restart_warning(outcome: Result<RestartOutcome>) -> Option<String> {
     }
 }
 
+/// CAD-1251: after a rollback restored the daemon, a board that was
+/// running must be running on the restored build before the rollback
+/// is declared done. The rollback's own restart may have lost its
+/// board start to a loaded host, so start it here and wait (bounded by
+/// [`HEALTH_TIMEOUT`]) for it to answer on `previous`.
+fn restore_board(
+    host: &dyn UpdateHost,
+    binary: &Path,
+    previous: &str,
+    board_before: bool,
+) -> Result<()> {
+    if !board_before || host.board_build()?.as_deref() == Some(previous) {
+        return Ok(());
+    }
+    host.progress(&format!("rollback: starting the board on {previous}"));
+    let started = host.now();
+    if let Err(e) = host.start_board(binary) {
+        host.progress(&format!("warning: board start on {previous}: {e}"));
+    }
+    let deadline = started + HEALTH_TIMEOUT.as_secs_f64();
+    loop {
+        if host.board_build()?.as_deref() == Some(previous) {
+            host.progress(&format!(
+                "rollback: board answers on {previous} after {:.1}s",
+                host.now() - started
+            ));
+            return Ok(());
+        }
+        if host.now() >= deadline {
+            return Err(Error::rejected(format!(
+                "rolled the daemon back to {previous}, but the board does not answer on it \
+                 after {}s — start it with `cadence ui start` (see ui.log)",
+                HEALTH_TIMEOUT.as_secs()
+            )));
+        }
+        host.sleep(Duration::from_secs(1));
+    }
+}
+
 /// Run the update. `--check`/`status` never reach here.
 ///
 /// Takes the re-entry lock for the whole run and, when the host asked
@@ -1355,15 +1399,7 @@ fn run_inner(
                      not come up either ({e2}) — the daemon and board need an operator"
                 ))
             })?;
-            if board_before && host.board_build()?.is_none() {
-                progress(
-                    host,
-                    format!(
-                        "warning: the board did not come back — start it with \
-                         `cadence ui start` (the daemon is answering on {previous})"
-                    ),
-                );
-            }
+            restore_board(host, &binary, &previous, board_before)?;
             let restore = backup["backup"]["manifest"].as_str().map(|manifest| {
                 format!(
                     "if the schema changed, restore the pre-update backup: \
@@ -1571,17 +1607,12 @@ fn rollback_body(
     // restart that found it (ui.pid still live) starts it again.
     match health_wait(host, previous, HEALTH_TIMEOUT, false, || host.board_build()) {
         Ok(()) => {
+            restore_board(host, &binary, previous, board_before)?;
             let board_up = host.board_build()?.is_some();
             host.progress(&format!(
                 "health: daemon{} answer on {previous}",
                 if board_up { " and board" } else { "" }
             ));
-            if board_before && !board_up {
-                host.progress(&format!(
-                    "warning: the board did not come back — start it with `cadence ui start` \
-                     (the daemon is answering on {previous})"
-                ));
-            }
             if let Some(restore) = &restore {
                 host.progress(restore);
             }

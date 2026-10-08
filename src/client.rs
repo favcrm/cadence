@@ -80,6 +80,13 @@ pub fn daemon_start(state_dir: &Path) -> Result<Value> {
 /// daemon must not hang `daemon start` for the full rpc timeout.
 const START_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long `daemon start` waits for the child it spawned to answer
+/// `health`. CAD-1251: a cold start on a loaded host took over the old
+/// 10 s, and the failed restart rolled a healthy build back. Still
+/// bounded below the update's 90 s health wait; a child that exits
+/// (lost the singleton lock, crashed) ends the wait at once.
+const DAEMON_START_BUDGET: Duration = Duration::from_secs(60);
+
 /// `daemon_start`, forwarding a rollout identity to the child so
 /// `daemon run` can prove the caller holds the lease when the binary
 /// commit differs from the one last recorded.
@@ -125,7 +132,8 @@ pub fn daemon_start_as(state_dir: &Path, as_identity: Option<&str>) -> Result<Va
     )?);
     let child_pid = u64::from(child.id());
     let mut last_error = None;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let began = Instant::now();
+    let deadline = began + DAEMON_START_BUDGET;
     loop {
         // This round's `health` answer, when it came from a daemon that
         // is not our child.
@@ -137,6 +145,12 @@ pub fn daemon_start_as(state_dir: &Path, as_identity: Option<&str>) -> Result<Va
         ) {
             Ok(health) if health["pid"].as_u64() == Some(child_pid) => {
                 child.keep();
+                // CAD-1251: log the cold start so the window can be sized.
+                eprintln!(
+                    "daemon: answered health {:.1}s after start (budget {}s)",
+                    began.elapsed().as_secs_f64(),
+                    DAEMON_START_BUDGET.as_secs()
+                );
                 return Ok(serde_json::json!({
                     "state": "started",
                     "pid": child.id(),
@@ -161,9 +175,14 @@ pub fn daemon_start_as(state_dir: &Path, as_identity: Option<&str>) -> Result<Va
             }
         }
         if timed_out {
-            return Err(
-                last_error.unwrap_or_else(|| Error::internal("daemon did not answer within 10s"))
-            );
+            // A probe that timed out reads as `io: Resource temporarily
+            // unavailable (os error 11)` — the socket's read timeout,
+            // not a lock — so name what happened.
+            return Err(Error::internal(format!(
+                "daemon did not answer health within {}s (last probe: {})",
+                DAEMON_START_BUDGET.as_secs(),
+                last_error.map_or_else(|| "none".to_string(), |e| e.to_string())
+            )));
         }
         std::thread::sleep(Duration::from_millis(100));
     }

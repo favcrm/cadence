@@ -1913,6 +1913,15 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     let withhold_ready = std::env::var_os("CADENCE_TEST_UI_WITHHOLD_READY").is_some();
     #[cfg(not(feature = "test-seam"))]
     let withhold_ready = false;
+    // CAD-1251 test seam: a board whose readiness report comes late (a
+    // loaded host's slow cold start), in milliseconds.
+    #[cfg(feature = "test-seam")]
+    if let Some(ms) = std::env::var("CADENCE_TEST_UI_READY_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     if let Some(nonce) = opts.ready_nonce.as_ref().filter(|_| !withhold_ready) {
         let marker = json!({"pid": std::process::id(), "nonce": nonce});
         // A `ui.json` save owns `ui.tmp`; keep the marker's sidecar apart.
